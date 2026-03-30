@@ -2,6 +2,7 @@ model = "gpt-4o-mini"
 # Localhost-style endpoints such as LM Studio may omit api_key.
 api_key = "replace-me"
 base_url = "https://api.openai.com/v1"
+data_dir = ".egopulse"
 log_level = "info"
 
 # OpenAI-compatible router endpoint example:

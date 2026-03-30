@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use serde_json::Error as JsonError;
 
 use crate::error::EgoPulseError;
@@ -62,7 +60,15 @@ pub async fn process_turn(
         content: response.content.clone(),
     });
 
-    persist_turn(state, chat_id, context, user_input, &response.content, &messages).await?;
+    persist_turn(
+        state,
+        chat_id,
+        context,
+        user_input,
+        &response.content,
+        &messages,
+    )
+    .await?;
     Ok(response.content)
 }
 
@@ -137,9 +143,13 @@ async fn persist_turn(
         is_from_bot: true,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    call_blocking(state.db.clone(), move |db| db.store_message(&assistant_message)).await?;
+    call_blocking(state.db.clone(), move |db| {
+        db.store_message(&assistant_message)
+    })
+    .await?;
 
-    let session_json = serde_json::to_string(messages)?;
+    let session_json =
+        serde_json::to_string(messages).map_err(crate::error::StorageError::SessionSerialize)?;
     let provider = state.config.provider_name().to_string();
     let model = state.config.model.clone();
     call_blocking(state.db.clone(), move |db| {
@@ -227,8 +237,12 @@ mod tests {
         let (state, _dir) = test_state();
         let context = cli_context("local-dev");
 
-        let first = process_turn(&state, &context, "hello").await.expect("first");
-        let second = process_turn(&state, &context, "remember").await.expect("second");
+        let first = process_turn(&state, &context, "hello")
+            .await
+            .expect("first");
+        let second = process_turn(&state, &context, "remember")
+            .await
+            .expect("second");
 
         assert!(first.contains("user:hello"));
         assert!(second.contains("user:hello"));

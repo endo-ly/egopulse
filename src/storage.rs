@@ -20,6 +20,26 @@ pub struct StoredMessage {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSession {
+    pub messages_json: String,
+    pub updated_at: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatIdentity {
+    pub chat_id: i64,
+    pub channel: String,
+    pub external_chat_id: String,
+    pub surface_user: String,
+    pub surface_thread: String,
+    pub chat_title: Option<String>,
+    pub chat_type: String,
+    pub last_message_time: String,
+}
+
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
     T: Send + 'static,
@@ -41,11 +61,16 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
                 chat_title TEXT,
-                chat_type TEXT NOT NULL DEFAULT 'private',
+                chat_type TEXT NOT NULL DEFAULT 'cli',
                 last_message_time TEXT NOT NULL,
-                channel TEXT,
-                external_chat_id TEXT
+                channel TEXT NOT NULL,
+                external_chat_id TEXT NOT NULL,
+                surface_user TEXT NOT NULL DEFAULT '',
+                surface_thread TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external
+                ON chats(channel, external_chat_id);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT NOT NULL,
@@ -63,7 +88,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS sessions (
                 chat_id INTEGER PRIMARY KEY,
                 messages_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT ''
             );",
         )?;
 
@@ -76,6 +103,8 @@ impl Database {
         &self,
         channel: &str,
         external_chat_id: &str,
+        surface_user: &str,
+        surface_thread: &str,
         chat_title: Option<&str>,
         chat_type: &str,
     ) -> Result<i64, StorageError> {
@@ -94,9 +123,18 @@ impl Database {
                 "UPDATE chats
                  SET chat_title = COALESCE(?2, chat_title),
                      chat_type = ?3,
-                     last_message_time = ?4
+                     last_message_time = ?4,
+                     surface_user = ?5,
+                     surface_thread = ?6
                  WHERE chat_id = ?1",
-                params![chat_id, chat_title, chat_type, now],
+                params![
+                    chat_id,
+                    chat_title,
+                    chat_type,
+                    now,
+                    surface_user,
+                    surface_thread
+                ],
             )?;
             return Ok(chat_id);
         }
@@ -113,20 +151,64 @@ impl Database {
                 .is_some();
             if !occupied {
                 conn.execute(
-                    "INSERT INTO chats(chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![chat_id, chat_title, chat_type, now, channel, external_chat_id],
+                    "INSERT INTO chats(chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, surface_user, surface_thread)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        chat_id,
+                        chat_title,
+                        chat_type,
+                        now,
+                        channel,
+                        external_chat_id,
+                        surface_user,
+                        surface_thread
+                    ],
                 )?;
                 return Ok(chat_id);
             }
         }
 
         conn.execute(
-            "INSERT INTO chats(chat_title, chat_type, last_message_time, channel, external_chat_id)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![chat_title, chat_type, now, channel, external_chat_id],
+            "INSERT INTO chats(chat_title, chat_type, last_message_time, channel, external_chat_id, surface_user, surface_thread)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chat_title,
+                chat_type,
+                now,
+                channel,
+                external_chat_id,
+                surface_user,
+                surface_thread
+            ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn load_chat_identity(&self, chat_id: i64) -> Result<Option<ChatIdentity>, StorageError> {
+        let conn = self.lock_conn()?;
+        let result = conn.query_row(
+            "SELECT chat_id, channel, external_chat_id, surface_user, surface_thread, chat_title, chat_type, last_message_time
+             FROM chats
+             WHERE chat_id = ?1",
+            params![chat_id],
+            |row| {
+                Ok(ChatIdentity {
+                    chat_id: row.get(0)?,
+                    channel: row.get(1)?,
+                    external_chat_id: row.get(2)?,
+                    surface_user: row.get(3)?,
+                    surface_thread: row.get(4)?,
+                    chat_title: row.get(5)?,
+                    chat_type: row.get(6)?,
+                    last_message_time: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(identity) => Ok(Some(identity)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
@@ -198,29 +280,46 @@ impl Database {
         .map_err(Into::into)
     }
 
-    pub fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
+    pub fn save_session(
+        &self,
+        chat_id: i64,
+        messages_json: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO sessions (chat_id, messages_json, updated_at)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO sessions (chat_id, messages_json, updated_at, provider, model)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(chat_id) DO UPDATE SET
                 messages_json = ?2,
-                updated_at = ?3",
-            params![chat_id, messages_json, now],
+                updated_at = ?3,
+                provider = ?4,
+                model = ?5",
+            params![chat_id, messages_json, now, provider, model],
         )?;
         Ok(())
     }
 
-    pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
+    pub fn load_session(&self, chat_id: i64) -> Result<Option<StoredSession>, StorageError> {
         let conn = self.lock_conn()?;
         let result = conn.query_row(
-            "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
+            "SELECT messages_json, updated_at, provider, model
+             FROM sessions
+             WHERE chat_id = ?1",
             params![chat_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok(StoredSession {
+                    messages_json: row.get(0)?,
+                    updated_at: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                })
+            },
         );
         match result {
-            Ok(pair) => Ok(Some(pair)),
+            Ok(session) => Ok(Some(session)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -294,23 +393,27 @@ mod tests {
         assert!(db.load_session(100).expect("missing session").is_none());
 
         let json1 = r#"[{"role":"user","content":"hello"}]"#;
-        db.save_session(100, json1).expect("save session");
+        db.save_session(100, json1, "openai_compatible", "gpt-4o-mini")
+            .expect("save session");
 
-        let (loaded, first_updated_at) = db.load_session(100).expect("load session").expect("row");
-        assert_eq!(loaded, json1);
-        assert!(!first_updated_at.is_empty());
+        let first = db.load_session(100).expect("load session").expect("row");
+        assert_eq!(first.messages_json, json1);
+        assert!(!first.updated_at.is_empty());
+        assert_eq!(first.provider, "openai_compatible");
+        assert_eq!(first.model, "gpt-4o-mini");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let json2 = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
-        db.save_session(100, json2).expect("update session");
+        db.save_session(100, json2, "openai_compatible", "gpt-4o-mini")
+            .expect("update session");
 
-        let (loaded_again, second_updated_at) = db
+        let second = db
             .load_session(100)
             .expect("load updated session")
             .expect("row");
-        assert_eq!(loaded_again, json2);
-        assert!(second_updated_at >= first_updated_at);
+        assert_eq!(second.messages_json, json2);
+        assert!(second.updated_at >= first.updated_at);
         assert!(db.load_session(200).expect("other chat").is_none());
     }
 
@@ -319,13 +422,33 @@ mod tests {
         let (db, _dir) = test_db();
 
         let first = db
-            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("local-dev"), "cli")
+            .resolve_or_create_chat_id(
+                "cli",
+                "cli:local_user:local-dev",
+                "local_user",
+                "local-dev",
+                Some("local-dev"),
+                "cli",
+            )
             .expect("create chat");
         let second = db
-            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("renamed"), "cli")
+            .resolve_or_create_chat_id(
+                "cli",
+                "cli:local_user:local-dev",
+                "local_user",
+                "local-dev",
+                Some("renamed"),
+                "cli",
+            )
             .expect("reuse chat");
 
         assert_eq!(first, second);
         assert!(first > 0);
+        let identity = db
+            .load_chat_identity(first)
+            .expect("identity")
+            .expect("chat exists");
+        assert_eq!(identity.surface_user, "local_user");
+        assert_eq!(identity.surface_thread, "local-dev");
     }
 }
