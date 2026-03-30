@@ -30,8 +30,6 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("invalid_provider: {provider}")]
-    InvalidProvider { provider: String },
     #[error("missing_model")]
     MissingModel,
     #[error("missing_base_url")]

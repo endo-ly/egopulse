@@ -20,10 +20,9 @@ EgoPulse は EgoGraph 向けの Rust runtime foundation です。
 
 同じキーが複数箇所にある場合は、上の項目が優先されます。
 
-### Environment variables
+### OpenAI-compatible environment variables
 
 ```bash
-export EGOPULSE_PROVIDER="openai"
 export EGOPULSE_MODEL="gpt-4o-mini"
 export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"
@@ -31,6 +30,31 @@ export EGOPULSE_LOG_LEVEL="info"
 ```
 
 ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
+
+### Preset examples
+
+OpenAI:
+
+```bash
+export EGOPULSE_MODEL="gpt-4o-mini"
+export EGOPULSE_API_KEY="sk-..."
+export EGOPULSE_BASE_URL="https://api.openai.com/v1"
+```
+
+OpenRouter:
+
+```bash
+export EGOPULSE_MODEL="openai/gpt-4o-mini"
+export EGOPULSE_API_KEY="sk-or-..."
+export EGOPULSE_BASE_URL="https://openrouter.ai/api/v1"
+```
+
+LM Studio:
+
+```bash
+export EGOPULSE_MODEL="local-model"
+export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
+```
 
 ### Config file
 
@@ -43,7 +67,6 @@ cargo run -p egopulse -- --config egopulse/egopulse.example.toml ask "hello"
 ## Usage
 
 ```bash
-export EGOPULSE_PROVIDER="openai"
 export EGOPULSE_MODEL="gpt-4o-mini"
 export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"

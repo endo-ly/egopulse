@@ -8,13 +8,8 @@ use url::Url;
 
 use crate::error::ConfigError;
 
-const OPENAI_PROVIDER: &str = "openai";
-const OPENROUTER_PROVIDER: &str = "openrouter";
-const LMSTUDIO_PROVIDER: &str = "lmstudio";
-
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
-    provider: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -23,7 +18,6 @@ struct FileConfig {
 
 #[derive(Clone)]
 pub struct Config {
-    pub llm_provider: String,
     pub model: String,
     pub api_key: Option<SecretString>,
     pub llm_base_url: String,
@@ -33,7 +27,6 @@ pub struct Config {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("llm_provider", &self.llm_provider)
             .field("model", &self.model)
             .field(
                 "api_key",
@@ -53,34 +46,24 @@ impl Config {
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         let file_config = read_file_config(config_path)?;
 
-        let llm_provider = first_non_empty([
-            env_var("EGOPULSE_PROVIDER"),
-            file_config.provider,
-            Some(OPENAI_PROVIDER.to_string()),
-        ])
-        .ok_or_else(|| ConfigError::InvalidProvider {
-            provider: String::new(),
-        })?;
-        let llm_provider = normalize_provider_name(&llm_provider)?;
-
         let model = first_non_empty([
             env_var("EGOPULSE_MODEL"),
             file_config.model,
-            Some(default_model_for_provider_name(&llm_provider).to_string()),
+            Some(default_model().to_string()),
         ])
         .ok_or(ConfigError::MissingModel)?;
 
         let llm_base_url = first_non_empty([
             env_var("EGOPULSE_BASE_URL"),
             file_config.base_url,
-            Some(default_base_url_for_provider_name(&llm_provider).to_string()),
+            Some(default_llm_base_url().to_string()),
         ])
         .ok_or(ConfigError::MissingBaseUrl)?;
         validate_base_url(&llm_base_url)?;
 
         let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_config.api_key])
             .map(|value| SecretString::new(value.into_boxed_str()));
-        if api_key.is_none() && !provider_allows_empty_api_key(&llm_provider, &llm_base_url) {
+        if api_key.is_none() && !base_url_allows_empty_api_key(&llm_base_url) {
             return Err(ConfigError::MissingApiKey);
         }
 
@@ -88,7 +71,6 @@ impl Config {
             .unwrap_or_else(|| "info".to_string());
 
         Ok(Self {
-            llm_provider,
             model,
             api_key,
             llm_base_url,
@@ -97,34 +79,16 @@ impl Config {
     }
 }
 
-pub fn default_model_for_provider_name(provider: &str) -> &'static str {
-    match provider {
-        OPENROUTER_PROVIDER => "openai/gpt-4o-mini",
-        LMSTUDIO_PROVIDER => "local-model",
-        _ => "gpt-4o-mini",
-    }
+fn default_model() -> &'static str {
+    "gpt-4o-mini"
 }
 
-pub fn default_base_url_for_provider_name(provider: &str) -> &'static str {
-    match provider {
-        OPENROUTER_PROVIDER => "https://openrouter.ai/api/v1",
-        LMSTUDIO_PROVIDER => "http://127.0.0.1:1234/v1",
-        _ => "https://api.openai.com/v1",
-    }
+fn default_llm_base_url() -> &'static str {
+    "https://api.openai.com/v1"
 }
 
-pub fn normalize_provider_name(value: &str) -> Result<String, ConfigError> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        OPENAI_PROVIDER | OPENROUTER_PROVIDER | LMSTUDIO_PROVIDER => Ok(normalized),
-        _ => Err(ConfigError::InvalidProvider {
-            provider: value.trim().to_string(),
-        }),
-    }
-}
-
-pub fn provider_allows_empty_api_key(provider: &str, base_url: &str) -> bool {
-    provider == LMSTUDIO_PROVIDER && is_local_url(base_url)
+pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
+    is_local_url(base_url)
 }
 
 fn validate_base_url(value: &str) -> Result<(), ConfigError> {
@@ -199,7 +163,6 @@ mod tests {
 
     fn clear_env() {
         unsafe {
-            std::env::remove_var("EGOPULSE_PROVIDER");
             std::env::remove_var("EGOPULSE_MODEL");
             std::env::remove_var("EGOPULSE_API_KEY");
             std::env::remove_var("EGOPULSE_BASE_URL");
@@ -216,13 +179,12 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "provider = \"openrouter\"\nmodel = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\nlog_level = \"debug\""
+            "model = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\nlog_level = \"debug\""
         )
         .expect("write config");
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
-        assert_eq!(config.llm_provider, "openrouter");
         assert_eq!(config.model, "openai/gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-file"));
         assert_eq!(config.llm_base_url, "https://openrouter.ai/api/v1");
@@ -234,7 +196,6 @@ mod tests {
     fn environment_overrides_file_values() {
         clear_env();
         unsafe {
-            std::env::set_var("EGOPULSE_PROVIDER", "openai");
             std::env::set_var("EGOPULSE_MODEL", "gpt-4o-mini");
             std::env::set_var("EGOPULSE_API_KEY", "sk-env");
             std::env::set_var("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
@@ -246,13 +207,12 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "provider = \"lmstudio\"\nmodel = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
+            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
         )
         .expect("write config");
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
-        assert_eq!(config.llm_provider, "openai");
         assert_eq!(config.model, "gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-env"));
         assert_eq!(config.llm_base_url, "https://api.openai.com/v1");
@@ -265,12 +225,13 @@ mod tests {
     fn allows_lmstudio_without_api_key() {
         clear_env();
         unsafe {
-            std::env::set_var("EGOPULSE_PROVIDER", "lmstudio");
+            std::env::set_var("EGOPULSE_MODEL", "local-model");
+            std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
         }
 
         let config = Config::load(None).expect("load config");
 
-        assert_eq!(config.llm_provider, "lmstudio");
+        assert_eq!(config.model, "local-model");
         assert_eq!(authorization_token(&config), None);
         assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
         clear_env();

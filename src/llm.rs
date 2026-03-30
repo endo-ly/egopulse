@@ -189,10 +189,9 @@ mod tests {
         }]
     }
 
-    fn config(provider: &str, base_url: String, api_key: Option<&str>) -> Config {
+    fn config(model: &str, base_url: String, api_key: Option<&str>) -> Config {
         Config {
-            llm_provider: provider.to_string(),
-            model: "gpt-4o-mini".to_string(),
+            model: model.to_string(),
             api_key: api_key
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             llm_base_url: base_url,
@@ -221,7 +220,7 @@ mod tests {
             .await;
 
         let provider = create_provider(&config(
-            "openai",
+            "gpt-4o-mini",
             format!("{}/v1", server.uri()),
             Some("sk-test"),
         ))
@@ -252,7 +251,7 @@ mod tests {
             .await;
 
         let provider = create_provider(&config(
-            "openrouter",
+            "openai/gpt-4o-mini",
             format!("{}/api/v1", server.uri()),
             Some("sk-openrouter"),
         ))
@@ -281,8 +280,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = create_provider(&config("lmstudio", format!("{}/v1", server.uri()), None))
-            .expect("provider");
+        let provider =
+            create_provider(&config("local-model", format!("{}/v1", server.uri()), None))
+                .expect("provider");
 
         let response = provider
             .send_message("", message("hello"))
