@@ -91,10 +91,6 @@ impl Config {
             log_level,
         })
     }
-
-    pub fn provider_name(&self) -> &'static str {
-        "openai_compatible"
-    }
 }
 
 fn default_model() -> &'static str {

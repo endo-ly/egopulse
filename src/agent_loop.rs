@@ -1,6 +1,4 @@
-use serde_json::Error as JsonError;
-
-use crate::error::EgoPulseError;
+use crate::error::{EgoPulseError, StorageError};
 use crate::llm::Message;
 use crate::runtime::AppState;
 use crate::storage::{StoredMessage, call_blocking};
@@ -17,10 +15,7 @@ pub struct SurfaceContext {
 
 impl SurfaceContext {
     pub fn session_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.channel, self.surface_user, self.surface_thread
-        )
+        format!("{}:{}", self.channel, self.surface_thread)
     }
 }
 
@@ -32,18 +27,10 @@ pub async fn process_turn(
     let chat_id = call_blocking(state.db.clone(), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
-        let surface_user = context.surface_user.clone();
         let surface_thread = context.surface_thread.clone();
         let chat_type = context.chat_type.clone();
         move |db| {
-            db.resolve_or_create_chat_id(
-                &channel,
-                &session_key,
-                &surface_user,
-                &surface_thread,
-                Some(&surface_thread),
-                &chat_type,
-            )
+            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
         }
     })
     .await?;
@@ -54,21 +41,15 @@ pub async fn process_turn(
         content: user_input.to_string(),
     });
 
+    persist_user_message(state, chat_id, context, user_input).await?;
+
     let response = state.llm.send_message("", messages.clone()).await?;
     messages.push(Message {
         role: "assistant".to_string(),
         content: response.content.clone(),
     });
 
-    persist_turn(
-        state,
-        chat_id,
-        context,
-        user_input,
-        &response.content,
-        &messages,
-    )
-    .await?;
+    persist_successful_turn(state, chat_id, &response.content, &messages).await?;
     Ok(response.content)
 }
 
@@ -76,13 +57,13 @@ async fn load_messages_for_turn(
     state: &AppState,
     chat_id: i64,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    let Some(session) = call_blocking(state.db.clone(), move |db| db.load_session(chat_id)).await?
+    let Some((json, _updated_at)) =
+        call_blocking(state.db.clone(), move |db| db.load_session(chat_id)).await?
     else {
         return load_messages_from_db(state, chat_id).await;
     };
 
-    let session_messages = deserialize_session_messages(&session.messages_json);
-    match session_messages {
+    match serde_json::from_str::<Vec<Message>>(&json) {
         Ok(messages) if !messages.is_empty() => Ok(messages),
         _ => load_messages_from_db(state, chat_id).await,
     }
@@ -96,11 +77,8 @@ async fn load_messages_from_db(
         db.get_recent_messages(chat_id, MAX_HISTORY_MESSAGES)
     })
     .await?;
-    Ok(history_to_messages(&history))
-}
 
-fn history_to_messages(history: &[StoredMessage]) -> Vec<Message> {
-    history
+    Ok(history
         .iter()
         .map(|message| Message {
             role: if message.is_from_bot {
@@ -110,20 +88,14 @@ fn history_to_messages(history: &[StoredMessage]) -> Vec<Message> {
             },
             content: message.content.clone(),
         })
-        .collect()
+        .collect())
 }
 
-fn deserialize_session_messages(json: &str) -> Result<Vec<Message>, JsonError> {
-    serde_json::from_str(json)
-}
-
-async fn persist_turn(
+async fn persist_user_message(
     state: &AppState,
     chat_id: i64,
     context: &SurfaceContext,
     user_input: &str,
-    assistant_output: &str,
-    messages: &[Message],
 ) -> Result<(), EgoPulseError> {
     let user_message = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -134,7 +106,15 @@ async fn persist_turn(
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
     call_blocking(state.db.clone(), move |db| db.store_message(&user_message)).await?;
+    Ok(())
+}
 
+async fn persist_successful_turn(
+    state: &AppState,
+    chat_id: i64,
+    assistant_output: &str,
+    messages: &[Message],
+) -> Result<(), EgoPulseError> {
     let assistant_message = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id,
@@ -148,12 +128,9 @@ async fn persist_turn(
     })
     .await?;
 
-    let session_json =
-        serde_json::to_string(messages).map_err(crate::error::StorageError::SessionSerialize)?;
-    let provider = state.config.provider_name().to_string();
-    let model = state.config.model.clone();
+    let session_json = serde_json::to_string(messages).map_err(StorageError::SessionSerialize)?;
     call_blocking(state.db.clone(), move |db| {
-        db.save_session(chat_id, &session_json, &provider, &model)
+        db.save_session(chat_id, &session_json)
     })
     .await?;
     Ok(())
@@ -167,6 +144,7 @@ mod tests {
     use secrecy::SecretString;
 
     use crate::config::Config;
+    use crate::error::{EgoPulseError, LlmError};
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
     use crate::storage::{Database, StoredMessage, call_blocking};
@@ -177,13 +155,15 @@ mod tests {
         response: String,
     }
 
+    struct FailingProvider;
+
     #[async_trait]
     impl LlmProvider for FakeProvider {
         async fn send_message(
             &self,
             _system: &str,
             messages: Vec<Message>,
-        ) -> Result<MessagesResponse, crate::error::LlmError> {
+        ) -> Result<MessagesResponse, LlmError> {
             let prompt = messages
                 .iter()
                 .map(|message| format!("{}:{}", message.role, message.content))
@@ -195,26 +175,25 @@ mod tests {
         }
     }
 
-    fn test_state() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = Database::new(dir.path().to_str().expect("path")).expect("db");
-        let config = Config {
+    #[async_trait]
+    impl LlmProvider for FailingProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+        ) -> Result<MessagesResponse, LlmError> {
+            Err(LlmError::InvalidResponse("simulated failure".to_string()))
+        }
+    }
+
+    fn test_config(data_dir: String) -> Config {
+        Config {
             model: "gpt-4o-mini".to_string(),
             api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
             llm_base_url: "https://api.openai.com/v1".to_string(),
-            data_dir: dir.path().display().to_string(),
+            data_dir,
             log_level: "info".to_string(),
-        };
-        (
-            AppState {
-                config,
-                db: Arc::new(db),
-                llm: Box::new(FakeProvider {
-                    response: "ok".to_string(),
-                }),
-            },
-            dir,
-        )
+        }
     }
 
     fn cli_context(session: &str) -> SurfaceContext {
@@ -226,15 +205,29 @@ mod tests {
         }
     }
 
+    fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+        AppState {
+            db: Arc::new(Database::new(&data_dir).expect("db")),
+            config: test_config(data_dir),
+            llm,
+        }
+    }
+
     #[test]
     fn session_key_is_channel_agnostic_but_surface_stable() {
         let context = cli_context("local-dev");
-        assert_eq!(context.session_key(), "cli:local_user:local-dev");
+        assert_eq!(context.session_key(), "cli:local-dev");
     }
 
     #[tokio::test]
     async fn reuses_saved_session_before_falling_back_to_history() {
-        let (state, _dir) = test_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
         let context = cli_context("local-dev");
 
         let first = process_turn(&state, &context, "hello")
@@ -252,21 +245,18 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_history_when_session_json_is_corrupted() {
-        let (state, _dir) = test_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
         let context = cli_context("recover");
 
         let chat_id = call_blocking(state.db.clone(), {
             let session_key = context.session_key();
-            move |db| {
-                db.resolve_or_create_chat_id(
-                    "cli",
-                    &session_key,
-                    "local_user",
-                    "recover",
-                    Some("recover"),
-                    "cli",
-                )
-            }
+            move |db| db.resolve_or_create_chat_id("cli", &session_key, Some("recover"), "cli")
         })
         .await
         .expect("chat id");
@@ -288,7 +278,7 @@ mod tests {
                 is_from_bot: true,
                 timestamp: "2024-01-01T00:00:01Z".to_string(),
             })?;
-            db.save_session(chat_id, "{not-json", "openai_compatible", "gpt-4o-mini")
+            db.save_session(chat_id, "{not-json")
         })
         .await
         .expect("seed");
@@ -300,5 +290,34 @@ mod tests {
         assert!(response.contains("user:hello"));
         assert!(response.contains("assistant:hi"));
         assert!(response.contains("user:remember"));
+    }
+
+    #[tokio::test]
+    async fn keeps_user_message_in_history_when_provider_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FailingProvider),
+        );
+        let context = cli_context("failure");
+
+        let error = process_turn(&state, &context, "hello")
+            .await
+            .expect_err("provider failure");
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+
+        let chat_id = call_blocking(state.db.clone(), {
+            let session_key = context.session_key();
+            move |db| db.resolve_or_create_chat_id("cli", &session_key, Some("failure"), "cli")
+        })
+        .await
+        .expect("chat id");
+
+        let history = call_blocking(state.db.clone(), move |db| db.get_all_messages(chat_id))
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello");
+        assert!(!history[0].is_from_bot);
     }
 }
