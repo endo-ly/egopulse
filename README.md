@@ -59,9 +59,10 @@ export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 ### Config file
 
 サンプルは [`egopulse.example.toml`](./egopulse.example.toml) を参照してください。
+実運用では、git 管理しないローカル設定として `egopulse.local.toml` を使う想定です。
 
 ```bash
-cargo run -p egopulse -- --config egopulse/egopulse.example.toml ask "hello"
+cargo run -p egopulse -- --config egopulse/egopulse.local.toml ask "hello"
 ```
 
 ## Usage
