@@ -195,6 +195,7 @@ mod tests {
             api_key: api_key
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             llm_base_url: base_url,
+            data_dir: ".egopulse-test".to_string(),
             log_level: "info".to_string(),
         }
     }

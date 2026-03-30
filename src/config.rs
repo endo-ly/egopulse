@@ -13,6 +13,7 @@ struct FileConfig {
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
+    data_dir: Option<String>,
     log_level: Option<String>,
 }
 
@@ -21,6 +22,7 @@ pub struct Config {
     pub model: String,
     pub api_key: Option<SecretString>,
     pub llm_base_url: String,
+    pub data_dir: String,
     pub log_level: String,
 }
 
@@ -37,6 +39,7 @@ impl std::fmt::Debug for Config {
                     .unwrap_or("<none>"),
             )
             .field("llm_base_url", &self.llm_base_url)
+            .field("data_dir", &self.data_dir)
             .field("log_level", &self.log_level)
             .finish()
     }
@@ -70,6 +73,13 @@ impl Config {
             return Err(ConfigError::MissingApiKey);
         }
 
+        let data_dir = first_non_empty([
+            env_var("EGOPULSE_DATA_DIR"),
+            file_config.data_dir,
+            Some(default_data_dir().to_string()),
+        ])
+        .ok_or(ConfigError::MissingDataDir)?;
+
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
             .unwrap_or_else(|| "info".to_string());
 
@@ -77,6 +87,7 @@ impl Config {
             model,
             api_key,
             llm_base_url,
+            data_dir,
             log_level,
         })
     }
@@ -88,6 +99,10 @@ fn default_model() -> &'static str {
 
 fn default_llm_base_url() -> &'static str {
     "https://api.openai.com/v1"
+}
+
+fn default_data_dir() -> &'static str {
+    ".egopulse"
 }
 
 pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
@@ -169,6 +184,7 @@ mod tests {
             std::env::remove_var("EGOPULSE_MODEL");
             std::env::remove_var("EGOPULSE_API_KEY");
             std::env::remove_var("EGOPULSE_BASE_URL");
+            std::env::remove_var("EGOPULSE_DATA_DIR");
             std::env::remove_var("EGOPULSE_LOG_LEVEL");
         }
     }
@@ -182,7 +198,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\nlog_level = \"debug\""
+            "model = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\ndata_dir = \"./runtime\"\nlog_level = \"debug\""
         )
         .expect("write config");
 
@@ -191,6 +207,7 @@ mod tests {
         assert_eq!(config.model, "openai/gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-file"));
         assert_eq!(config.llm_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.data_dir, "./runtime");
         assert_eq!(config.log_level, "debug");
     }
 
@@ -202,6 +219,7 @@ mod tests {
             std::env::set_var("EGOPULSE_MODEL", "gpt-4o-mini");
             std::env::set_var("EGOPULSE_API_KEY", "sk-env");
             std::env::set_var("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
+            std::env::set_var("EGOPULSE_DATA_DIR", "/tmp/egopulse-env");
             std::env::set_var("EGOPULSE_LOG_LEVEL", "trace");
         }
 
@@ -219,6 +237,7 @@ mod tests {
         assert_eq!(config.model, "gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-env"));
         assert_eq!(config.llm_base_url, "https://api.openai.com/v1");
+        assert_eq!(config.data_dir, "/tmp/egopulse-env");
         assert_eq!(config.log_level, "trace");
         clear_env();
     }
@@ -237,6 +256,7 @@ mod tests {
         assert_eq!(config.model, "local-model");
         assert_eq!(authorization_token(&config), None);
         assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(config.data_dir, ".egopulse");
         clear_env();
     }
 }

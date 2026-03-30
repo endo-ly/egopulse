@@ -40,6 +40,8 @@ pub enum ConfigError {
     InvalidBaseUrl,
     #[error("missing_api_key")]
     MissingApiKey,
+    #[error("missing_data_dir")]
+    MissingDataDir,
 }
 
 #[derive(Debug, Error)]
@@ -75,4 +77,6 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("storage_task_join_failed: {0}")]
     TaskJoin(String),
+    #[error("storage_session_serialize_failed: {0}")]
+    SessionSerialize(#[from] serde_json::Error),
 }
