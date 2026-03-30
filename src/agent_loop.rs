@@ -42,6 +42,7 @@ pub async fn process_turn(
     });
 
     persist_user_message(state, chat_id, context, user_input).await?;
+    persist_session_snapshot(state, chat_id, &messages).await?;
 
     let response = state.llm.send_message("", messages.clone()).await?;
     messages.push(Message {
@@ -128,6 +129,14 @@ async fn persist_successful_turn(
     })
     .await?;
 
+    persist_session_snapshot(state, chat_id, messages).await
+}
+
+async fn persist_session_snapshot(
+    state: &AppState,
+    chat_id: i64,
+    messages: &[Message],
+) -> Result<(), EgoPulseError> {
     let session_json = serde_json::to_string(messages).map_err(StorageError::SessionSerialize)?;
     call_blocking(state.db.clone(), move |db| {
         db.save_session(chat_id, &session_json)
@@ -295,29 +304,43 @@ mod tests {
     #[tokio::test]
     async fn keeps_user_message_in_history_when_provider_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_state_with_provider(
+        let failing_state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(FailingProvider),
         );
         let context = cli_context("failure");
 
-        let error = process_turn(&state, &context, "hello")
+        let error = process_turn(&failing_state, &context, "hello")
             .await
             .expect_err("provider failure");
         assert!(matches!(error, EgoPulseError::Llm(_)));
 
-        let chat_id = call_blocking(state.db.clone(), {
+        let chat_id = call_blocking(failing_state.db.clone(), {
             let session_key = context.session_key();
             move |db| db.resolve_or_create_chat_id("cli", &session_key, Some("failure"), "cli")
         })
         .await
         .expect("chat id");
 
-        let history = call_blocking(state.db.clone(), move |db| db.get_all_messages(chat_id))
-            .await
-            .expect("history");
+        let history = call_blocking(failing_state.db.clone(), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
         assert!(!history[0].is_from_bot);
+
+        let recovered_state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let resumed = process_turn(&recovered_state, &context, "retry")
+            .await
+            .expect("resume after failure");
+        assert!(resumed.contains("user:hello"));
+        assert!(resumed.contains("user:retry"));
     }
 }
