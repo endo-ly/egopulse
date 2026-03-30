@@ -40,8 +40,6 @@ pub enum ConfigError {
     InvalidBaseUrl,
     #[error("missing_api_key")]
     MissingApiKey,
-    #[error("missing_data_dir")]
-    MissingDataDir,
 }
 
 #[derive(Debug, Error)]

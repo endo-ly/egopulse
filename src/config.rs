@@ -73,12 +73,8 @@ impl Config {
             return Err(ConfigError::MissingApiKey);
         }
 
-        let data_dir = first_non_empty([
-            env_var("EGOPULSE_DATA_DIR"),
-            file_config.data_dir,
-            Some(default_data_dir().to_string()),
-        ])
-        .ok_or(ConfigError::MissingDataDir)?;
+        let data_dir = first_non_empty([env_var("EGOPULSE_DATA_DIR"), file_config.data_dir])
+            .unwrap_or_else(|| default_data_dir().to_string());
 
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
             .unwrap_or_else(|| "info".to_string());

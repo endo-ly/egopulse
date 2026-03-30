@@ -19,14 +19,14 @@ pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
 }
 
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
-    let state = build_app_state(config)?;
+    let llm = create_provider(&config)?;
     let messages = vec![Message {
         role: "user".to_string(),
         content: prompt.to_string(),
     }];
 
     tokio::select! {
-        response = state.llm.send_message("", messages) => Ok(response?.content),
+        response = llm.send_message("", messages) => Ok(response?.content),
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
 }

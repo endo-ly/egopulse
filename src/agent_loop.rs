@@ -41,8 +41,19 @@ pub async fn process_turn(
         content: user_input.to_string(),
     });
 
-    persist_user_message(state, chat_id, context, user_input).await?;
-    persist_session_snapshot(state, chat_id, &messages).await?;
+    persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: context.surface_user.clone(),
+            content: user_input.to_string(),
+            is_from_bot: false,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        &messages,
+    )
+    .await?;
 
     let response = state.llm.send_message("", messages.clone()).await?;
     messages.push(Message {
@@ -50,7 +61,19 @@ pub async fn process_turn(
         content: response.content.clone(),
     });
 
-    persist_successful_turn(state, chat_id, &response.content, &messages).await?;
+    persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: response.content.clone(),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        &messages,
+    )
+    .await?;
     Ok(response.content)
 }
 
@@ -92,54 +115,14 @@ async fn load_messages_from_db(
         .collect())
 }
 
-async fn persist_user_message(
+async fn persist_phase(
     state: &AppState,
-    chat_id: i64,
-    context: &SurfaceContext,
-    user_input: &str,
-) -> Result<(), EgoPulseError> {
-    let user_message = StoredMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        chat_id,
-        sender_name: context.surface_user.clone(),
-        content: user_input.to_string(),
-        is_from_bot: false,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    call_blocking(state.db.clone(), move |db| db.store_message(&user_message)).await?;
-    Ok(())
-}
-
-async fn persist_successful_turn(
-    state: &AppState,
-    chat_id: i64,
-    assistant_output: &str,
-    messages: &[Message],
-) -> Result<(), EgoPulseError> {
-    let assistant_message = StoredMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        chat_id,
-        sender_name: "egopulse".to_string(),
-        content: assistant_output.to_string(),
-        is_from_bot: true,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    call_blocking(state.db.clone(), move |db| {
-        db.store_message(&assistant_message)
-    })
-    .await?;
-
-    persist_session_snapshot(state, chat_id, messages).await
-}
-
-async fn persist_session_snapshot(
-    state: &AppState,
-    chat_id: i64,
+    message: StoredMessage,
     messages: &[Message],
 ) -> Result<(), EgoPulseError> {
     let session_json = serde_json::to_string(messages).map_err(StorageError::SessionSerialize)?;
     call_blocking(state.db.clone(), move |db| {
-        db.save_session(chat_id, &session_json)
+        db.store_message_with_session(&message, &session_json)
     })
     .await?;
     Ok(())

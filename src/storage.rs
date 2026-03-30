@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 
 use crate::error::StorageError;
@@ -37,6 +37,7 @@ impl Database {
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -46,6 +47,9 @@ impl Database {
                 channel TEXT,
                 external_chat_id TEXT
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
+                ON chats(channel, external_chat_id);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT NOT NULL,
@@ -82,51 +86,41 @@ impl Database {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
-        if let Some(chat_id) = conn
-            .query_row(
-                "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
-                params![channel, external_chat_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
-            conn.execute(
-                "UPDATE chats
-                 SET chat_title = COALESCE(?2, chat_title),
-                     chat_type = ?3,
-                     last_message_time = ?4
-                 WHERE chat_id = ?1",
-                params![chat_id, chat_title, chat_type, now],
-            )?;
-            return Ok(chat_id);
-        }
-
-        let preferred_chat_id = external_chat_id.parse::<i64>().ok();
-        if let Some(chat_id) = preferred_chat_id {
-            let occupied = conn
-                .query_row(
-                    "SELECT 1 FROM chats WHERE chat_id = ?1 LIMIT 1",
-                    params![chat_id],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !occupied {
+        match conn.query_row(
+            "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
+            params![channel, external_chat_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(chat_id) => {
                 conn.execute(
-                    "INSERT INTO chats(chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![chat_id, chat_title, chat_type, now, channel, external_chat_id],
+                    "UPDATE chats
+                     SET chat_title = COALESCE(?2, chat_title),
+                         chat_type = ?3,
+                         last_message_time = ?4
+                     WHERE chat_id = ?1",
+                    params![chat_id, chat_title, chat_type, now],
                 )?;
                 return Ok(chat_id);
             }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(error.into()),
         }
 
         conn.execute(
             "INSERT INTO chats(chat_title, chat_type, last_message_time, channel, external_chat_id)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(channel, external_chat_id) DO UPDATE SET
+                chat_title = COALESCE(excluded.chat_title, chats.chat_title),
+                chat_type = excluded.chat_type,
+                last_message_time = excluded.last_message_time",
             params![chat_title, chat_type, now, channel, external_chat_id],
         )?;
-        Ok(conn.last_insert_rowid())
+        conn.query_row(
+            "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
+            params![channel, external_chat_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
     }
 
     pub fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
@@ -209,6 +203,38 @@ impl Database {
                 updated_at = ?3",
             params![chat_id, messages_json, now],
         )?;
+        Ok(())
+    }
+
+    pub fn store_message_with_session(
+        &self,
+        message: &StoredMessage,
+        messages_json: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message.id,
+                message.chat_id,
+                message.sender_name,
+                message.content,
+                message.is_from_bot as i32,
+                message.timestamp,
+            ],
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO sessions (chat_id, messages_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                messages_json = ?2,
+                updated_at = ?3",
+            params![message.chat_id, messages_json, now],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

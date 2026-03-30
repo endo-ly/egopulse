@@ -14,7 +14,7 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         chat_type: "cli".to_string(),
     };
 
-    writeln!(stdout, "session: {}", context.session_key())
+    writeln!(stdout, "session: {}", session)
         .map_err(crate::error::StorageError::Io)
         .map_err(EgoPulseError::from)?;
     writeln!(stdout, "type `/exit` to leave the chat")
