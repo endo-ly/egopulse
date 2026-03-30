@@ -31,9 +31,9 @@ export EGOPULSE_LOG_LEVEL="info"
 
 ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
 
-### Preset examples
+### Endpoint examples
 
-OpenAI:
+Default OpenAI-compatible endpoint:
 
 ```bash
 export EGOPULSE_MODEL="gpt-4o-mini"
@@ -41,7 +41,7 @@ export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"
 ```
 
-OpenRouter:
+OpenAI-compatible router endpoint example:
 
 ```bash
 export EGOPULSE_MODEL="openai/gpt-4o-mini"
@@ -49,7 +49,7 @@ export EGOPULSE_API_KEY="sk-or-..."
 export EGOPULSE_BASE_URL="https://openrouter.ai/api/v1"
 ```
 
-LM Studio:
+Local OpenAI-compatible endpoint example:
 
 ```bash
 export EGOPULSE_MODEL="local-model"

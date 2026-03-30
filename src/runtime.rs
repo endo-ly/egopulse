@@ -7,6 +7,9 @@ pub struct AppState {
     pub llm: Box<dyn crate::llm::LlmProvider>,
 }
 
+// Issue 1 only establishes the bootstrap seam for Issue 2. Keep this runtime
+// thin so the channel loop and session persistence can be pulled toward
+// MicroClaw's runtime shape instead of extending a one-shot wrapper.
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     let llm = create_provider(&config)?;
     Ok(AppState { config, llm })

@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_openrouter_request() {
+    async fn sends_request_to_router_style_openai_compatible_endpoint() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/chat/completions"))
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_lmstudio_request_without_auth_header() {
+    async fn sends_request_to_local_openai_compatible_endpoint_without_auth_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))

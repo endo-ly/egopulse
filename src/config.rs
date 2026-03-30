@@ -43,6 +43,9 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    // Issue 1 keeps config intentionally narrow so we can align the next phase
+    // with MicroClaw's broader runtime/session config instead of growing a
+    // separate EgoPulse-specific config tree.
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         let file_config = read_file_config(config_path)?;
 
