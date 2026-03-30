@@ -134,17 +134,16 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
 }
 
 fn resolve_data_dir(config_path: Option<&Path>, value: Option<String>) -> Option<String> {
-    value.map(|raw| {
-        let path = PathBuf::from(&raw);
-        if path.is_absolute() {
-            raw
-        } else {
-            let base_dir = config_path
-                .and_then(Path::parent)
-                .unwrap_or_else(|| Path::new("."));
-            base_dir.join(path).to_string_lossy().into_owned()
-        }
-    })
+    let raw = normalize_string(value)?;
+    let path = PathBuf::from(&raw);
+    if path.is_absolute() {
+        return Some(raw);
+    }
+
+    let base_dir = config_path
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    Some(base_dir.join(path).to_string_lossy().into_owned())
 }
 
 fn env_var(key: &str) -> Option<String> {
@@ -273,5 +272,23 @@ mod tests {
         assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
         assert_eq!(config.data_dir, ".egopulse");
         clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn blank_data_dir_falls_back_to_default() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.toml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\"\ndata_dir = \"   \""
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(config.data_dir, ".egopulse");
     }
 }

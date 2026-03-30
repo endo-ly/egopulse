@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StorageError;
 
@@ -18,6 +18,13 @@ pub struct StoredMessage {
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+    pub messages_json: Option<String>,
+    pub updated_at: Option<String>,
+    pub recent_messages: Vec<StoredMessage>,
 }
 
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
@@ -241,17 +248,72 @@ impl Database {
                 return Err(StorageError::SessionSnapshotConflict);
             }
         } else {
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT INTO sessions (chat_id, messages_json, updated_at)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(chat_id) DO UPDATE SET
-                    messages_json = ?2,
-                    updated_at = ?3",
+                 ON CONFLICT(chat_id) DO NOTHING",
                 params![message.chat_id, messages_json, now],
             )?;
+            if inserted == 0 {
+                tx.rollback()?;
+                return Err(StorageError::SessionSnapshotConflict);
+            }
         }
         tx.commit()?;
         Ok(now)
+    }
+
+    pub fn load_session_snapshot(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<SessionSnapshot, StorageError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let session = tx
+            .query_row(
+                "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
+                params![chat_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let recent_messages = {
+            let mut stmt = tx.prepare(
+                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+                 FROM messages
+                 WHERE chat_id = ?1
+                 ORDER BY timestamp DESC
+                 LIMIT ?2",
+            )?;
+            let mut messages = stmt
+                .query_map(params![chat_id, limit as i64], |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        sender_name: row.get(2)?,
+                        content: row.get(3)?,
+                        is_from_bot: row.get::<_, i32>(4)? != 0,
+                        timestamp: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            messages.reverse();
+            messages
+        };
+
+        tx.commit()?;
+
+        let (messages_json, updated_at) = session
+            .map(|(messages_json, updated_at)| (Some(messages_json), Some(updated_at)))
+            .unwrap_or((None, None));
+
+        Ok(SessionSnapshot {
+            messages_json,
+            updated_at,
+            recent_messages,
+        })
     }
 
     pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
@@ -277,6 +339,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::StorageError;
+
     use super::{Database, StoredMessage};
 
     fn test_db() -> (Database, tempfile::TempDir) {
@@ -354,6 +418,40 @@ mod tests {
         assert_eq!(loaded_again, json2);
         assert!(second_updated_at >= first_updated_at);
         assert!(db.load_session(200).expect("other chat").is_none());
+    }
+
+    #[test]
+    fn store_message_with_session_rejects_duplicate_initial_snapshot() {
+        let (db, _dir) = test_db();
+        let message = StoredMessage {
+            id: "msg-1".to_string(),
+            chat_id: 100,
+            sender_name: "alice".to_string(),
+            content: "hello".to_string(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        db.store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
+            .expect("insert session");
+
+        let conflict = db.store_message_with_session(
+            &StoredMessage {
+                id: "msg-2".to_string(),
+                chat_id: 100,
+                sender_name: "alice".to_string(),
+                content: "hello again".to_string(),
+                is_from_bot: false,
+                timestamp: "2024-01-01T00:00:01Z".to_string(),
+            },
+            r#"[{"role":"user","content":"hello again"}]"#,
+            None,
+        );
+
+        assert!(matches!(
+            conflict,
+            Err(StorageError::SessionSnapshotConflict)
+        ));
     }
 
     #[test]

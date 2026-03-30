@@ -1,7 +1,7 @@
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::Message;
 use crate::runtime::AppState;
-use crate::storage::{StoredMessage, call_blocking};
+use crate::storage::{SessionSnapshot, StoredMessage, call_blocking};
 
 const MAX_HISTORY_MESSAGES: usize = 50;
 
@@ -105,56 +105,42 @@ async fn load_messages_for_turn(
     state: &AppState,
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
-    let Some((json, updated_at)) =
-        call_blocking(state.db.clone(), move |db| db.load_session(chat_id)).await?
-    else {
-        return load_canonical_history(state, chat_id).await;
-    };
-
-    match serde_json::from_str::<Vec<Message>>(&json) {
-        Ok(messages) if !messages.is_empty() => Ok(LoadedSession {
-            messages: trim_history(&messages),
-            session_updated_at: Some(updated_at),
-        }),
-        _ => load_canonical_history(state, chat_id)
-            .await
-            .map(|mut loaded| {
-                loaded.session_updated_at = Some(updated_at);
-                loaded
-            }),
-    }
-}
-
-async fn load_canonical_history(
-    state: &AppState,
-    chat_id: i64,
-) -> Result<LoadedSession, EgoPulseError> {
-    let history = call_blocking(state.db.clone(), move |db| {
-        db.get_recent_messages(chat_id, MAX_HISTORY_MESSAGES)
+    let snapshot = call_blocking(state.db.clone(), move |db| {
+        db.load_session_snapshot(chat_id, MAX_HISTORY_MESSAGES)
     })
     .await?;
 
-    let messages = trim_history(
-        &history
-            .iter()
-            .map(|message| Message {
-                role: if message.is_from_bot {
-                    "assistant".to_string()
-                } else {
-                    "user".to_string()
-                },
-                content: message.content.clone(),
-            })
-            .collect::<Vec<_>>(),
-    );
-    let session_updated_at = call_blocking(state.db.clone(), move |db| db.load_session(chat_id))
-        .await?
-        .map(|(_, updated_at)| updated_at);
+    Ok(snapshot_to_loaded(snapshot))
+}
 
-    Ok(LoadedSession {
-        messages,
-        session_updated_at,
-    })
+fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
+    if let Some(json) = snapshot.messages_json
+        && let Ok(messages) = serde_json::from_str::<Vec<Message>>(&json)
+        && !messages.is_empty()
+    {
+        return LoadedSession {
+            messages: trim_history(&messages),
+            session_updated_at: snapshot.updated_at,
+        };
+    }
+
+    LoadedSession {
+        messages: trim_history(
+            &snapshot
+                .recent_messages
+                .iter()
+                .map(|message| Message {
+                    role: if message.is_from_bot {
+                        "assistant".to_string()
+                    } else {
+                        "user".to_string()
+                    },
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>(),
+        ),
+        session_updated_at: snapshot.updated_at,
+    }
 }
 
 async fn persist_phase(
@@ -190,7 +176,7 @@ async fn persist_phase(
                 let LoadedSession {
                     messages,
                     session_updated_at,
-                } = load_canonical_history(state, message.chat_id).await?;
+                } = load_messages_for_turn(state, message.chat_id).await?;
                 let mut refreshed_messages = messages;
                 refreshed_messages.push(phase_message.clone());
                 retry_snapshot = trim_history(&refreshed_messages);
