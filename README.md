@@ -1,7 +1,7 @@
 # EgoPulse
 
 EgoPulse は EgoGraph 向けの Rust runtime foundation です。  
-この MVP では、channel-agnostic な agent loop と SQLite ベースの session 永続化を備えた
+Issue 2 時点では、channel-agnostic な agent loop と SQLite ベースの session 永続化を備えた
 CLI runtime を提供します。
 
 ## Prerequisites
@@ -84,17 +84,32 @@ cargo run -p egopulse -- ask "hello"
 assistant: ...
 ```
 
-永続 session を使う場合:
+継続会話を始める場合:
 
 ```bash
 cargo run -p egopulse -- chat --session local-dev
 ```
 
-別プロセスで再開する場合:
+別プロセスから既存 session を再開する場合:
 
 ```bash
 cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 ```
+
+会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。
+Issue 2 では `cli:<session>` を安定した session key として扱います。
+
+## Current scope
+
+- OpenAI-compatible endpoint に対する `ask`
+- SQLite 永続化付きの `chat --session`
+- `ask --session` による既存 session の再開
+
+次フェーズで追加予定:
+
+- Discord / Telegram / WebUI
+- tools / skills
+- MCP integration
 
 ## Local checks
 
