@@ -210,7 +210,8 @@ impl Database {
         &self,
         message: &StoredMessage,
         messages_json: &str,
-    ) -> Result<(), StorageError> {
+        expected_updated_at: Option<&str>,
+    ) -> Result<String, StorageError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -226,16 +227,31 @@ impl Database {
             ],
         )?;
         let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO sessions (chat_id, messages_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET
-                messages_json = ?2,
-                updated_at = ?3",
-            params![message.chat_id, messages_json, now],
-        )?;
+        if let Some(expected_updated_at) = expected_updated_at {
+            let updated = tx.execute(
+                "UPDATE sessions
+                 SET messages_json = ?2,
+                     updated_at = ?3
+                 WHERE chat_id = ?1
+                   AND updated_at = ?4",
+                params![message.chat_id, messages_json, now, expected_updated_at],
+            )?;
+            if updated == 0 {
+                tx.rollback()?;
+                return Err(StorageError::SessionSnapshotConflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO sessions (chat_id, messages_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                    messages_json = ?2,
+                    updated_at = ?3",
+                params![message.chat_id, messages_json, now],
+            )?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(now)
     }
 
     pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {

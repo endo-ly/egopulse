@@ -73,7 +73,8 @@ impl Config {
             return Err(ConfigError::MissingApiKey);
         }
 
-        let data_dir = first_non_empty([env_var("EGOPULSE_DATA_DIR"), file_config.data_dir])
+        let data_dir = env_var("EGOPULSE_DATA_DIR")
+            .or_else(|| resolve_data_dir(config_path, file_config.data_dir))
             .unwrap_or_else(|| default_data_dir().to_string());
 
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
@@ -132,6 +133,20 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
     })
 }
 
+fn resolve_data_dir(config_path: Option<&Path>, value: Option<String>) -> Option<String> {
+    value.map(|raw| {
+        let path = PathBuf::from(&raw);
+        if path.is_absolute() {
+            raw
+        } else {
+            let base_dir = config_path
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."));
+            base_dir.join(path).to_string_lossy().into_owned()
+        }
+    })
+}
+
 fn env_var(key: &str) -> Option<String> {
     env::var(key)
         .ok()
@@ -170,6 +185,7 @@ pub fn authorization_token(config: &Config) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::path::PathBuf;
 
     use serial_test::serial;
 
@@ -203,7 +219,10 @@ mod tests {
         assert_eq!(config.model, "openai/gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-file"));
         assert_eq!(config.llm_base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(config.data_dir, "./runtime");
+        assert_eq!(
+            PathBuf::from(&config.data_dir),
+            file_path.parent().expect("dir").join("./runtime")
+        );
         assert_eq!(config.log_level, "debug");
     }
 

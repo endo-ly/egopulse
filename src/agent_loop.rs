@@ -19,6 +19,12 @@ impl SurfaceContext {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LoadedSession {
+    messages: Vec<Message>,
+    session_updated_at: Option<String>,
+}
+
 pub async fn process_turn(
     state: &AppState,
     context: &SurfaceContext,
@@ -35,33 +41,49 @@ pub async fn process_turn(
     })
     .await?;
 
-    let mut messages = load_messages_for_turn(state, chat_id).await?;
-    messages.push(Message {
+    let LoadedSession {
+        mut messages,
+        session_updated_at,
+    } = load_messages_for_turn(state, chat_id).await?;
+    let mut session_updated_at = session_updated_at;
+    let user_message = Message {
         role: "user".to_string(),
         content: user_input.to_string(),
+    };
+    messages.push(Message {
+        role: user_message.role.clone(),
+        content: user_message.content.clone(),
     });
 
-    persist_phase(
-        state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: context.surface_user.clone(),
-            content: user_input.to_string(),
-            is_from_bot: false,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-        &messages,
-    )
-    .await?;
+    session_updated_at = Some(
+        persist_phase(
+            state,
+            StoredMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                chat_id,
+                sender_name: context.surface_user.clone(),
+                content: user_input.to_string(),
+                is_from_bot: false,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+            user_message,
+            &messages,
+            session_updated_at,
+        )
+        .await?,
+    );
 
     let response = state.llm.send_message("", messages.clone()).await?;
-    messages.push(Message {
+    let assistant_message = Message {
         role: "assistant".to_string(),
         content: response.content.clone(),
+    };
+    messages.push(Message {
+        role: assistant_message.role.clone(),
+        content: assistant_message.content.clone(),
     });
 
-    persist_phase(
+    let _session_updated_at = persist_phase(
         state,
         StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -71,7 +93,9 @@ pub async fn process_turn(
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         },
+        assistant_message,
         &messages,
+        session_updated_at,
     )
     .await?;
     Ok(response.content)
@@ -80,52 +104,113 @@ pub async fn process_turn(
 async fn load_messages_for_turn(
     state: &AppState,
     chat_id: i64,
-) -> Result<Vec<Message>, EgoPulseError> {
-    let Some((json, _updated_at)) =
+) -> Result<LoadedSession, EgoPulseError> {
+    let Some((json, updated_at)) =
         call_blocking(state.db.clone(), move |db| db.load_session(chat_id)).await?
     else {
-        return load_messages_from_db(state, chat_id).await;
+        return load_canonical_history(state, chat_id).await;
     };
 
     match serde_json::from_str::<Vec<Message>>(&json) {
-        Ok(messages) if !messages.is_empty() => Ok(messages),
-        _ => load_messages_from_db(state, chat_id).await,
+        Ok(messages) if !messages.is_empty() => Ok(LoadedSession {
+            messages: trim_history(&messages),
+            session_updated_at: Some(updated_at),
+        }),
+        _ => load_canonical_history(state, chat_id)
+            .await
+            .map(|mut loaded| {
+                loaded.session_updated_at = Some(updated_at);
+                loaded
+            }),
     }
 }
 
-async fn load_messages_from_db(
+async fn load_canonical_history(
     state: &AppState,
     chat_id: i64,
-) -> Result<Vec<Message>, EgoPulseError> {
+) -> Result<LoadedSession, EgoPulseError> {
     let history = call_blocking(state.db.clone(), move |db| {
         db.get_recent_messages(chat_id, MAX_HISTORY_MESSAGES)
     })
     .await?;
 
-    Ok(history
-        .iter()
-        .map(|message| Message {
-            role: if message.is_from_bot {
-                "assistant".to_string()
-            } else {
-                "user".to_string()
-            },
-            content: message.content.clone(),
-        })
-        .collect())
+    let messages = trim_history(
+        &history
+            .iter()
+            .map(|message| Message {
+                role: if message.is_from_bot {
+                    "assistant".to_string()
+                } else {
+                    "user".to_string()
+                },
+                content: message.content.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let session_updated_at = call_blocking(state.db.clone(), move |db| db.load_session(chat_id))
+        .await?
+        .map(|(_, updated_at)| updated_at);
+
+    Ok(LoadedSession {
+        messages,
+        session_updated_at,
+    })
 }
 
 async fn persist_phase(
     state: &AppState,
     message: StoredMessage,
+    phase_message: Message,
     messages: &[Message],
-) -> Result<(), EgoPulseError> {
-    let session_json = serde_json::to_string(messages).map_err(StorageError::SessionSerialize)?;
-    call_blocking(state.db.clone(), move |db| {
-        db.store_message_with_session(&message, &session_json)
-    })
-    .await?;
-    Ok(())
+    session_updated_at: Option<String>,
+) -> Result<String, EgoPulseError> {
+    let mut retry_snapshot = trim_history(messages);
+    let mut retry_session_updated_at = session_updated_at;
+
+    for attempt in 0..2 {
+        let session_json =
+            serde_json::to_string(&retry_snapshot).map_err(StorageError::SessionSerialize)?;
+        let result = call_blocking(state.db.clone(), {
+            let session_updated_at = retry_session_updated_at.clone();
+            let session_json = session_json.clone();
+            let message = message.clone();
+            move |db| {
+                db.store_message_with_session(
+                    &message,
+                    &session_json,
+                    session_updated_at.as_deref(),
+                )
+            }
+        })
+        .await;
+
+        match result {
+            Ok(updated_at) => return Ok(updated_at),
+            Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
+                let LoadedSession {
+                    messages,
+                    session_updated_at,
+                } = load_canonical_history(state, message.chat_id).await?;
+                let mut refreshed_messages = messages;
+                refreshed_messages.push(phase_message.clone());
+                retry_snapshot = trim_history(&refreshed_messages);
+                retry_session_updated_at = session_updated_at;
+            }
+            Err(error) => return Err(EgoPulseError::Storage(error)),
+        }
+    }
+
+    Err(EgoPulseError::Storage(
+        StorageError::SessionSnapshotConflict,
+    ))
+}
+
+fn trim_history(messages: &[Message]) -> Vec<Message> {
+    if messages.len() <= MAX_HISTORY_MESSAGES {
+        return messages.to_vec();
+    }
+
+    messages[messages.len() - MAX_HISTORY_MESSAGES..].to_vec()
 }
 
 #[cfg(test)]

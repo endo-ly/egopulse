@@ -77,4 +77,6 @@ pub enum StorageError {
     TaskJoin(String),
     #[error("storage_session_serialize_failed: {0}")]
     SessionSerialize(#[from] serde_json::Error),
+    #[error("storage_session_snapshot_conflict")]
+    SessionSnapshotConflict,
 }
