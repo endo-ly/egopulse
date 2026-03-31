@@ -25,6 +25,12 @@ struct LoadedSession {
     session_updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PersistedTurn {
+    updated_at: String,
+    messages: Vec<Message>,
+}
+
 pub async fn process_turn(
     state: &AppState,
     context: &SurfaceContext,
@@ -55,23 +61,23 @@ pub async fn process_turn(
         content: user_message.content.clone(),
     });
 
-    session_updated_at = Some(
-        persist_phase(
-            state,
-            StoredMessage {
-                id: uuid::Uuid::new_v4().to_string(),
-                chat_id,
-                sender_name: context.surface_user.clone(),
-                content: user_input.to_string(),
-                is_from_bot: false,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
-            user_message,
-            &messages,
-            session_updated_at,
-        )
-        .await?,
-    );
+    let persisted_user_turn = persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: context.surface_user.clone(),
+            content: user_input.to_string(),
+            is_from_bot: false,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        user_message,
+        &messages,
+        session_updated_at,
+    )
+    .await?;
+    messages = persisted_user_turn.messages;
+    session_updated_at = Some(persisted_user_turn.updated_at);
 
     let response = state.llm.send_message("", messages.clone()).await?;
     let assistant_message = Message {
@@ -83,7 +89,7 @@ pub async fn process_turn(
         content: assistant_message.content.clone(),
     });
 
-    let _session_updated_at = persist_phase(
+    let _persisted_assistant_turn = persist_phase(
         state,
         StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -149,7 +155,7 @@ async fn persist_phase(
     phase_message: Message,
     messages: &[Message],
     session_updated_at: Option<String>,
-) -> Result<String, EgoPulseError> {
+) -> Result<PersistedTurn, EgoPulseError> {
     let mut retry_snapshot = trim_history(messages);
     let mut retry_session_updated_at = session_updated_at;
 
@@ -171,7 +177,12 @@ async fn persist_phase(
         .await;
 
         match result {
-            Ok(updated_at) => return Ok(updated_at),
+            Ok(updated_at) => {
+                return Ok(PersistedTurn {
+                    updated_at,
+                    messages: retry_snapshot.clone(),
+                });
+            }
             Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
                 let LoadedSession {
                     messages,
@@ -396,5 +407,113 @@ mod tests {
             .expect("resume after failure");
         assert!(resumed.contains("user:hello"));
         assert!(resumed.contains("user:retry"));
+    }
+
+    #[tokio::test]
+    async fn persist_phase_returns_refreshed_snapshot_after_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("conflict");
+
+        let chat_id = call_blocking(state.db.clone(), {
+            let channel = context.channel.clone();
+            let session_key = context.session_key();
+            let surface_thread = context.surface_thread.clone();
+            let chat_type = context.chat_type.clone();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    &channel,
+                    &session_key,
+                    Some(&surface_thread),
+                    &chat_type,
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+
+        let seed_message = StoredMessage {
+            id: "seed-user".to_string(),
+            chat_id,
+            sender_name: context.surface_user.clone(),
+            content: "hello".to_string(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        call_blocking(state.db.clone(), {
+            let message = seed_message.clone();
+            move |db| {
+                db.store_message_with_session(
+                    &message,
+                    r#"[{"role":"user","content":"hello"}]"#,
+                    None,
+                )
+                .map(|_| ())
+            }
+        })
+        .await
+        .expect("seed session");
+
+        let stale_session_updated_at = call_blocking(state.db.clone(), move |db| {
+            db.load_session(chat_id)
+                .map(|session| session.expect("session").1)
+        })
+        .await
+        .expect("stale updated_at");
+
+        let concurrent_message = StoredMessage {
+            id: "seed-assistant".to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: "hi".to_string(),
+            is_from_bot: true,
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+        };
+        call_blocking(state.db.clone(), {
+            let message = concurrent_message.clone();
+            let expected_updated_at = stale_session_updated_at.clone();
+            move |db| {
+                db.store_message_with_session(
+                    &message,
+                    r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
+                    Some(&expected_updated_at),
+                )
+                .map(|_| ())
+            }
+        })
+        .await
+        .expect("advance session");
+
+        let persisted = super::persist_phase(
+            &state,
+            StoredMessage {
+                id: "new-user".to_string(),
+                chat_id,
+                sender_name: context.surface_user.clone(),
+                content: "next".to_string(),
+                is_from_bot: false,
+                timestamp: "2024-01-01T00:00:02Z".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "next".to_string(),
+            },
+            &[Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            Some(stale_session_updated_at),
+        )
+        .await
+        .expect("persist turn");
+
+        assert_eq!(persisted.messages.len(), 3);
+        assert_eq!(persisted.messages[1].content, "hi");
+        assert_eq!(persisted.messages[2].content, "next");
     }
 }
