@@ -75,6 +75,15 @@ cargo run -p egopulse -- --config /path/to/egopulse.toml ask "hello"
 cargo run -p egopulse
 ```
 
+`egopulse` コマンドとして直接使いたい場合は install してください。
+
+```bash
+cargo install --path egopulse --locked
+egopulse
+```
+
+install 済みバイナリを更新したい場合は、同じコマンドを再実行すれば置き換わります。
+
 developer 向けの entrypoint はそのまま残っています。
 
 ```bash
