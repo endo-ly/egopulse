@@ -33,10 +33,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     #[error("config_parse_failed: {path}: {detail}")]
-    ConfigParseFailed {
-        path: PathBuf,
-        detail: String,
-    },
+    ConfigParseFailed { path: PathBuf, detail: String },
     #[error("missing_model")]
     MissingModel,
     #[error("missing_base_url")]
