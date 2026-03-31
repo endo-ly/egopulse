@@ -37,6 +37,18 @@ pub struct SessionSnapshot {
     pub recent_messages: Vec<StoredMessage>,
 }
 
+/// Tool call record for tracking tool execution history.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub chat_id: i64,
+    pub message_id: String,
+    pub tool_name: String,
+    pub tool_input: String,
+    pub tool_output: Option<String>,
+    pub timestamp: String,
+}
+
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
     T: Send + 'static,
@@ -85,7 +97,24 @@ impl Database {
                 chat_id INTEGER PRIMARY KEY,
                 messages_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                tool_output TEXT,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+                ON tool_calls(chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_message_id
+                ON tool_calls(message_id);",
         )?;
 
         Ok(Self {
@@ -384,6 +413,85 @@ impl Database {
         self.conn
             .lock()
             .map_err(|error| StorageError::InitFailed(error.to_string()))
+    }
+
+    /// Store a tool call record.
+    pub fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                tool_call.id,
+                tool_call.chat_id,
+                tool_call.message_id,
+                tool_call.tool_name,
+                tool_call.tool_input,
+                tool_call.tool_output,
+                tool_call.timestamp,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the output of a tool call.
+    pub fn update_tool_call_output(&self, id: &str, output: &str) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE tool_calls SET tool_output = ?1 WHERE id = ?2",
+            params![output, id],
+        )?;
+        Ok(())
+    }
+
+    /// Get all tool calls for a specific message.
+    pub fn get_tool_calls_for_message(&self, message_id: &str) -> Result<Vec<ToolCall>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+             FROM tool_calls WHERE message_id = ?1 ORDER BY timestamp",
+        )?;
+
+        let calls = stmt
+            .query_map(params![message_id], |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input: row.get(4)?,
+                    tool_output: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(calls)
+    }
+
+    /// Get all tool calls for a specific chat.
+    pub fn get_tool_calls_for_chat(&self, chat_id: i64) -> Result<Vec<ToolCall>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+             FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
+        )?;
+
+        let calls = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input: row.get(4)?,
+                    tool_output: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(calls)
     }
 }
 
