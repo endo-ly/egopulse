@@ -303,7 +303,13 @@ async fn run_loop(
                     _ => {}
                 },
                 View::Chat(chat) => match key.code {
-                    KeyCode::Esc => next_action = Some(PendingAction::GoBrowser),
+                    KeyCode::Esc => {
+                        if chat.pending_send.is_some() {
+                            chat.status = "Wait for the current request to finish".to_string();
+                        } else {
+                            next_action = Some(PendingAction::GoBrowser);
+                        }
+                    }
                     KeyCode::Backspace => {
                         backspace_input(chat);
                     }
@@ -503,10 +509,17 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let body_lines = if app.sessions.is_empty() {
         vec![Line::from("No sessions yet. Press n to create one.")]
     } else {
-        app.sessions
+        let available_rows = chunks[1].height.saturating_sub(2) as usize;
+        let window_size = available_rows.max(1);
+        let max_start = app.sessions.len().saturating_sub(window_size);
+        let start = app.selected.saturating_sub(window_size / 2).min(max_start);
+        let end = (start + window_size).min(app.sessions.len());
+
+        app.sessions[start..end]
             .iter()
             .enumerate()
-            .map(|(index, session)| {
+            .map(|(visible_index, session)| {
+                let index = start + visible_index;
                 let prefix = if index == app.selected { ">" } else { " " };
                 let title = session
                     .chat_title
@@ -650,15 +663,29 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         ]),
         Line::from(vec![
             Span::raw("input: "),
-            Span::styled(&chat.input, Style::default().fg(Color::Yellow)),
+            Span::styled(
+                visible_input_window(
+                    &chat.input,
+                    chat.input_cursor,
+                    input_visible_width(chunks[2]),
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
     ])
     .block(Block::default().title("Input").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 
-    let input_x = chunks[2].x.saturating_add(9 + chat.input_cursor as u16);
-    let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
-    let cursor_x = input_x.min(max_x);
+    let left_offset = 9u16;
+    let cursor_offset = input_cursor_offset(
+        &chat.input,
+        chat.input_cursor,
+        input_visible_width(chunks[2]),
+    ) as u16;
+    let cursor_x = chunks[2]
+        .x
+        .saturating_add(left_offset)
+        .saturating_add(cursor_offset);
     let cursor_y = chunks[2].y.saturating_add(3);
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
@@ -747,6 +774,27 @@ fn char_to_byte_index(value: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(index, _)| index)
         .unwrap_or(value.len())
+}
+
+fn input_visible_width(area: ratatui::layout::Rect) -> usize {
+    area.width.saturating_sub(10).max(1) as usize
+}
+
+fn visible_input_window(input: &str, cursor: usize, width: usize) -> String {
+    let start = input_window_start(input.chars().count(), cursor, width);
+    input.chars().skip(start).take(width).collect()
+}
+
+fn input_cursor_offset(input: &str, cursor: usize, width: usize) -> usize {
+    let start = input_window_start(input.chars().count(), cursor, width);
+    cursor.saturating_sub(start).min(width)
+}
+
+fn input_window_start(len: usize, cursor: usize, width: usize) -> usize {
+    if len <= width || cursor <= width {
+        return 0;
+    }
+    cursor.saturating_sub(width)
 }
 
 #[derive(Debug, Clone)]
