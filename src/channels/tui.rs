@@ -78,7 +78,46 @@ impl TuiApp {
             sessions,
             selected: 0,
             view: View::Browser,
-            status: "q to quit, Enter to open, n for new".to_string(),
+            status: "j/k or arrows to move, Enter to open, n for new".to_string(),
+        }
+    }
+
+    fn browser_status(&self) -> String {
+        if self.sessions.is_empty() {
+            "No sessions yet. Press n to create one.".to_string()
+        } else {
+            format!(
+                "{} sessions | selected {}/{}",
+                self.sessions.len(),
+                self.selected.saturating_add(1),
+                self.sessions.len()
+            )
+        }
+    }
+
+    fn browser_help(&self) -> String {
+        "j/k or arrows, Ctrl-N/P, g/G, PgUp/PgDn, Enter open, n new, r refresh, q quit".to_string()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let len = self.sessions.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len.saturating_sub(1));
+        self.selected = next as usize;
+    }
+
+    fn select_first(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = 0;
+        }
+    }
+
+    fn select_last(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = self.sessions.len().saturating_sub(1);
         }
     }
 
@@ -86,11 +125,10 @@ impl TuiApp {
         self.sessions = runtime::list_sessions(&self.state).await?;
         if self.sessions.is_empty() {
             self.selected = 0;
-            self.status = "No sessions yet. Press n to create one.".to_string();
         } else {
             self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
-            self.status = format!("{} sessions loaded", self.sessions.len());
         }
+        self.status = self.browser_status();
         Ok(())
     }
 
@@ -114,7 +152,7 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
-            status: "Enter to send, Esc to go back".to_string(),
+            status: "Enter to send, Esc to go back, /help for commands".to_string(),
             messages: messages
                 .into_iter()
                 .map(|message| RenderedMessage {
@@ -137,7 +175,7 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
-            status: "Enter to send, Esc to go back".to_string(),
+            status: "Enter to send, Esc to go back, /help for commands".to_string(),
             messages: messages
                 .into_iter()
                 .map(|message| RenderedMessage {
@@ -192,17 +230,47 @@ async fn run_loop(
                 View::Browser => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => next_action = Some(PendingAction::RefreshSessions),
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection(5);
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection(-5);
+                        app.status = app.browser_status();
+                    }
                     KeyCode::Char('n') => next_action = Some(PendingAction::NewSession),
                     KeyCode::Enter => next_action = Some(PendingAction::OpenSelected),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.move_selection(1);
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.move_selection(-1);
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::Char('g') => {
+                        app.select_first();
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::Char('G') => {
+                        app.select_last();
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::PageDown => {
+                        app.move_selection(5);
+                        app.status = app.browser_status();
+                    }
+                    KeyCode::PageUp => {
+                        app.move_selection(-5);
+                        app.status = app.browser_status();
+                    }
                     KeyCode::Up => {
-                        if app.selected > 0 {
-                            app.selected -= 1;
-                        }
+                        app.move_selection(-1);
+                        app.status = app.browser_status();
                     }
                     KeyCode::Down => {
-                        if app.selected + 1 < app.sessions.len() {
-                            app.selected += 1;
-                        }
+                        app.move_selection(1);
+                        app.status = app.browser_status();
                     }
                     _ => {}
                 },
@@ -241,7 +309,7 @@ async fn run_loop(
                     PendingAction::GoBrowser => {
                         app.refresh_sessions().await?;
                         app.view = View::Browser;
-                        app.status = "q to quit, Enter to open, n for new".to_string();
+                        app.status = app.browser_status();
                     }
                     PendingAction::SendMessage(prompt) => {
                         let response = send_chat_message(app, prompt).await?;
@@ -310,7 +378,15 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
             Span::raw("  local TUI"),
         ]),
         Line::from(format!("status: {}", app.status)),
-        Line::from(format!("sessions: {}", app.sessions.len())),
+        Line::from(format!(
+            "sessions: {}  selected: {}",
+            app.sessions.len(),
+            if app.sessions.is_empty() {
+                0
+            } else {
+                app.selected.saturating_add(1)
+            }
+        )),
     ])
     .block(Block::default().title("Browser").borders(Borders::ALL))
     .wrap(Wrap { trim: true });
@@ -352,19 +428,24 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(body, chunks[1]);
 
-    let footer = Paragraph::new(vec![Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Green)),
-        Span::raw(" open"),
-        Span::raw("  "),
-        Span::styled("n", Style::default().fg(Color::Green)),
-        Span::raw(" new"),
-        Span::raw("  "),
-        Span::styled("r", Style::default().fg(Color::Green)),
-        Span::raw(" refresh"),
-        Span::raw("  "),
-        Span::styled("q", Style::default().fg(Color::Green)),
-        Span::raw(" quit"),
-    ])])
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("j/k", Style::default().fg(Color::Green)),
+            Span::raw(" or "),
+            Span::styled("↑/↓", Style::default().fg(Color::Green)),
+            Span::raw(" move"),
+            Span::raw("  "),
+            Span::styled("Ctrl-N/P", Style::default().fg(Color::Green)),
+            Span::raw(" page"),
+            Span::raw("  "),
+            Span::styled("g/G", Style::default().fg(Color::Green)),
+            Span::raw(" top/bottom"),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" open"),
+        ]),
+        Line::from(app.browser_help()),
+    ])
     .block(Block::default().title("Controls").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
@@ -438,6 +519,9 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         Span::raw("  "),
         Span::styled("Ctrl-C", Style::default().fg(Color::Green)),
         Span::raw(" quit"),
+        Span::raw("  "),
+        Span::styled("/", Style::default().fg(Color::Green)),
+        Span::raw(" commands"),
         Span::raw("  "),
         Span::raw("input: "),
         Span::styled(&chat.input, Style::default().fg(Color::Yellow)),
