@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,14 @@ use url::Url;
 
 use crate::error::ConfigError;
 
+/// Per-channel configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ChannelConfig {
+    pub enabled: bool,
+    pub port: Option<u16>,
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     model: Option<String>,
@@ -16,6 +25,7 @@ struct FileConfig {
     base_url: Option<String>,
     data_dir: Option<String>,
     log_level: Option<String>,
+    channels: Option<HashMap<String, ChannelConfig>>,
 }
 
 #[derive(Clone)]
@@ -25,6 +35,7 @@ pub struct Config {
     pub llm_base_url: String,
     pub data_dir: String,
     pub log_level: String,
+    pub channels: HashMap<String, ChannelConfig>,
 }
 
 impl std::fmt::Debug for Config {
@@ -85,12 +96,15 @@ impl Config {
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
             .unwrap_or_else(|| "info".to_string());
 
+        let channels = file_config.channels.unwrap_or_default();
+
         Ok(Self {
             model,
             api_key,
             llm_base_url,
             data_dir,
             log_level,
+            channels,
         })
     }
 

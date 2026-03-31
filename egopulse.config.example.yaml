@@ -6,6 +6,13 @@ base_url: https://api.openai.com/v1
 data_dir: .egopulse
 log_level: info
 
+# Channel configuration for multi-channel support.
+channels:
+  web:
+    enabled: true
+    port: 3000
+    host: 127.0.0.1
+
 # OpenAI-compatible router endpoint example:
 # model: openai/gpt-4o-mini
 # api_key: sk-or-...
