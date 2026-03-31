@@ -120,11 +120,12 @@ impl TuiApp {
     }
 
     fn chat_status() -> String {
-        "Enter send | Esc back | PgUp/PgDn scroll | g/G top/bottom | /help".to_string()
+        "Enter to send | Esc back | /help for commands".to_string()
     }
 
     fn chat_help() -> String {
-        "PgUp/PgDn scroll, g/G top/bottom, /new start fresh, /browser go back, /refresh reload, /quit exit, /help show commands".to_string()
+        "/new start fresh, /browser go back, /refresh reload, /quit exit, /help show commands"
+            .to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -330,22 +331,6 @@ async fn run_loop(
                         } else {
                             chat.conversation_scroll = chat.conversation_scroll.saturating_sub(1);
                         }
-                    }
-                    KeyCode::PageUp => {
-                        chat.conversation_scroll = chat
-                            .conversation_scroll
-                            .saturating_add(conversation_page_step());
-                    }
-                    KeyCode::PageDown => {
-                        chat.conversation_scroll = chat
-                            .conversation_scroll
-                            .saturating_sub(conversation_page_step());
-                    }
-                    KeyCode::Char('g') => {
-                        chat.conversation_scroll = usize::MAX;
-                    }
-                    KeyCode::Char('G') => {
-                        chat.conversation_scroll = 0;
                     }
                     KeyCode::Enter => {
                         if chat.pending_send.is_some() {
@@ -654,30 +639,25 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
             "No messages yet. Type something and press Enter.",
         ));
     }
-    let conversation_text = Text::from(lines);
-    let inner_width = chunks[1].width.saturating_sub(2).max(1);
     let visible_line_count = chunks[1].height.saturating_sub(2) as usize;
-    let base_body = Paragraph::new(conversation_text)
+    let start_index = lines
+        .len()
+        .saturating_sub(visible_line_count.saturating_add(chat.conversation_scroll));
+    let end_index = if chat.conversation_scroll == 0 {
+        lines.len()
+    } else {
+        lines.len().saturating_sub(chat.conversation_scroll)
+    };
+    let body = Paragraph::new(Text::from(lines[start_index..end_index].to_vec()))
         .block(Block::default().title("Conversation").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    let total_lines = rendered_conversation_line_count(chat, inner_width as usize);
-    let max_scroll = total_lines.saturating_sub(visible_line_count);
-    let clamped_bottom_offset = chat.conversation_scroll.min(max_scroll);
-    let top_scroll = max_scroll.saturating_sub(clamped_bottom_offset) as u16;
-    frame.render_widget(base_body.scroll((top_scroll, 0)), chunks[1]);
+    frame.render_widget(body, chunks[1]);
 
     let footer = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Esc", Style::default().fg(Color::Green)),
             Span::raw(" back"),
             Span::raw("  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Green)),
-            Span::raw(" scroll"),
-            Span::raw("  "),
-            Span::styled("g/G", Style::default().fg(Color::Green)),
-            Span::raw(" top/bottom"),
-        ]),
-        Line::from(vec![
             Span::styled("Enter", Style::default().fg(Color::Green)),
             Span::raw(" send"),
             Span::raw("  "),
@@ -787,39 +767,6 @@ fn push_input_history(chat: &mut ChatState, raw_input: String) {
         let overflow = chat.input_history.len() - 50;
         chat.input_history.drain(0..overflow);
     }
-}
-
-fn conversation_page_step() -> usize {
-    10
-}
-
-fn rendered_conversation_line_count(chat: &ChatState, width: usize) -> usize {
-    if chat.messages.is_empty() {
-        return wrapped_line_count("No messages yet. Type something and press Enter.", width);
-    }
-
-    chat.messages
-        .iter()
-        .map(|message| {
-            let prefix = if message.role == "assistant" {
-                "assistant: "
-            } else {
-                "you: "
-            };
-            wrapped_line_count(&format!("{prefix}{}", message.content), width)
-        })
-        .sum()
-}
-
-fn wrapped_line_count(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    text.split('\n')
-        .map(|line| {
-            let chars = line.chars().count().max(1);
-            chars.div_ceil(width)
-        })
-        .sum::<usize>()
-        .max(1)
 }
 
 fn char_to_byte_index(value: &str, char_index: usize) -> usize {
