@@ -10,12 +10,22 @@ use crate::storage::{Database, SessionSummary, call_blocking};
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
-    pub llm: Box<dyn crate::llm::LlmProvider>,
+    pub llm: Arc<dyn crate::llm::LlmProvider>,
+}
+
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            config: self.config.clone(),
+            llm: Arc::clone(&self.llm),
+        }
+    }
 }
 
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
-    let llm = create_provider(&config)?;
+    let llm = Arc::from(create_provider(&config)?);
     Ok(AppState { db, config, llm })
 }
 
@@ -91,7 +101,10 @@ pub async fn send_turn(
     context: &SurfaceContext,
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn(state, context, prompt).await
+    tokio::select! {
+        response = process_turn(state, context, prompt) => response,
+        _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
+    }
 }
 
 pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {

@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_loop::SurfaceContext;
@@ -29,10 +30,18 @@ impl TuiSession {
     fn new() -> Result<Self, TuiError> {
         enable_raw_mode().map_err(|error| TuiError::InitFailed(error.to_string()))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
-            .map_err(|error| TuiError::InitFailed(error.to_string()))?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))
-            .map_err(|error| TuiError::InitFailed(error.to_string()))?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(TuiError::InitFailed(error.to_string()));
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                return Err(TuiError::InitFailed(error.to_string()));
+            }
+        };
         Ok(Self { terminal })
     }
 }
@@ -44,13 +53,11 @@ impl Drop for TuiSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum View {
     Browser,
-    Chat(ChatState),
+    Chat(Box<ChatState>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChatState {
     context: SurfaceContext,
     input: String,
@@ -60,12 +67,19 @@ struct ChatState {
     draft_input: Option<String>,
     status: String,
     messages: Vec<RenderedMessage>,
+    pending_send: Option<PendingSend>,
+    conversation_scroll: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenderedMessage {
     role: String,
     content: String,
+}
+
+struct PendingSend {
+    prompt: String,
+    handle: JoinHandle<Result<String, EgoPulseError>>,
 }
 
 struct TuiApp {
@@ -164,7 +178,7 @@ impl TuiApp {
             chat_type: "tui".to_string(),
         };
         let messages = runtime::load_session_messages(&self.state, &context).await?;
-        self.view = View::Chat(ChatState {
+        self.view = View::Chat(Box::new(ChatState {
             context,
             input: String::new(),
             input_cursor: 0,
@@ -179,7 +193,9 @@ impl TuiApp {
                     content: message.content,
                 })
                 .collect(),
-        });
+            pending_send: None,
+            conversation_scroll: 0,
+        }));
         Ok(())
     }
 
@@ -191,7 +207,7 @@ impl TuiApp {
             chat_type: summary.channel,
         };
         let messages = runtime::load_session_messages(&self.state, &context).await?;
-        self.view = View::Chat(ChatState {
+        self.view = View::Chat(Box::new(ChatState {
             context,
             input: String::new(),
             input_cursor: 0,
@@ -206,7 +222,9 @@ impl TuiApp {
                     content: message.content,
                 })
                 .collect(),
-        });
+            pending_send: None,
+            conversation_scroll: 0,
+        }));
         Ok(())
     }
 }
@@ -227,6 +245,7 @@ async fn run_loop(
     app: &mut TuiApp,
 ) -> Result<(), EgoPulseError> {
     loop {
+        poll_pending_send(app).await;
         terminal
             .draw(|frame| draw(frame, app))
             .map_err(|error| TuiError::RenderFailed(error.to_string()))?;
@@ -307,9 +326,17 @@ async fn run_loop(
                         handle_up_arrow(chat);
                     }
                     KeyCode::Down => {
-                        handle_down_arrow(chat);
+                        if chat.history_index.is_some() {
+                            handle_down_arrow(chat);
+                        } else {
+                            chat.conversation_scroll = chat.conversation_scroll.saturating_sub(1);
+                        }
                     }
                     KeyCode::Enter => {
+                        if chat.pending_send.is_some() {
+                            chat.status = "A request is already in progress".to_string();
+                            continue;
+                        }
                         let raw_input = chat.input.trim().to_string();
                         if let Some(parsed) = parse_chat_input(&raw_input) {
                             if !raw_input.is_empty() {
@@ -358,15 +385,7 @@ async fn run_loop(
                         app.status = app.browser_status();
                     }
                     PendingAction::SendMessage(prompt) => {
-                        let response = send_chat_message(app, prompt).await?;
-                        if let View::Chat(chat) = &mut app.view {
-                            chat.messages.push(RenderedMessage {
-                                role: "assistant".to_string(),
-                                content: response,
-                            });
-                            chat.status = "Message sent".to_string();
-                        }
-                        app.refresh_sessions().await?;
+                        start_send(app, prompt);
                     }
                     PendingAction::ChatCommand(command) => {
                         handle_chat_command(app, command).await?;
@@ -384,26 +403,85 @@ async fn run_loop(
     }
 }
 
-async fn send_chat_message(app: &mut TuiApp, prompt: String) -> Result<String, EgoPulseError> {
-    let context = match &app.view {
-        View::Chat(chat) => chat.context.clone(),
-        View::Browser => {
-            return Err(EgoPulseError::Tui(TuiError::EventFailed(
-                "chat view missing".to_string(),
-            )));
-        }
+fn start_send(app: &mut TuiApp, prompt: String) {
+    let View::Chat(chat) = &mut app.view else {
+        return;
     };
 
-    if let View::Chat(chat) = &mut app.view {
-        chat.messages.push(RenderedMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        });
-        chat.status = "Sending...".to_string();
-    }
+    let context = chat.context.clone();
+    let state = app.state.clone();
+    chat.messages.push(RenderedMessage {
+        role: "user".to_string(),
+        content: prompt.clone(),
+    });
+    chat.status = "Sending...".to_string();
+    chat.conversation_scroll = 0;
+    let send_prompt = prompt.clone();
+    let handle =
+        tokio::spawn(async move { runtime::send_turn(&state, &context, &send_prompt).await });
+    chat.pending_send = Some(PendingSend { prompt, handle });
+}
 
-    let response = runtime::send_turn(&app.state, &context, &prompt).await?;
-    Ok(response)
+async fn poll_pending_send(app: &mut TuiApp) {
+    let Some((prompt, handle)) = take_finished_send(app) else {
+        return;
+    };
+
+    let result = match handle.await {
+        Ok(result) => result,
+        Err(error) => Err(EgoPulseError::Tui(TuiError::EventFailed(error.to_string()))),
+    };
+
+    match result {
+        Ok(response) => {
+            if let View::Chat(chat) = &mut app.view {
+                chat.messages.push(RenderedMessage {
+                    role: "assistant".to_string(),
+                    content: response,
+                });
+                chat.status = "Message sent".to_string();
+                chat.conversation_scroll = 0;
+            }
+            if let Err(error) = app.refresh_sessions().await
+                && let View::Chat(chat) = &mut app.view
+            {
+                chat.status = format!("Message sent, but refresh failed: {error}");
+            }
+        }
+        Err(error) => {
+            if let View::Chat(chat) = &mut app.view {
+                chat.status = format!("Send failed: {error}");
+                if chat
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == "user" && message.content == prompt)
+                {
+                    chat.messages.pop();
+                }
+                if chat.input.is_empty() {
+                    chat.input = prompt;
+                    chat.input_cursor = chat.input.chars().count();
+                }
+            }
+        }
+    }
+}
+
+fn take_finished_send(
+    app: &mut TuiApp,
+) -> Option<(String, JoinHandle<Result<String, EgoPulseError>>)> {
+    let View::Chat(chat) = &mut app.view else {
+        return None;
+    };
+    let finished = chat
+        .pending_send
+        .as_ref()
+        .is_some_and(|pending| pending.handle.is_finished());
+    if !finished {
+        return None;
+    }
+    let pending = chat.pending_send.take()?;
+    Some((pending.prompt, pending.handle))
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
@@ -561,7 +639,16 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
             "No messages yet. Type something and press Enter.",
         ));
     }
-    let body = Paragraph::new(Text::from(lines))
+    let visible_line_count = chunks[1].height.saturating_sub(2) as usize;
+    let start_index = lines
+        .len()
+        .saturating_sub(visible_line_count.saturating_add(chat.conversation_scroll));
+    let end_index = if chat.conversation_scroll == 0 {
+        lines.len()
+    } else {
+        lines.len().saturating_sub(chat.conversation_scroll)
+    };
+    let body = Paragraph::new(Text::from(lines[start_index..end_index].to_vec()))
         .block(Block::default().title("Conversation").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(body, chunks[1]);
