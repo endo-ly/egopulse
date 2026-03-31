@@ -630,46 +630,70 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
     .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[0]);
 
+    let mut lines = Vec::new();
+    for message in &chat.messages {
+        let prefix = if message.role == "assistant" {
+            "assistant"
+        } else {
+            "you"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{prefix}: "),
+                Style::default().fg(if message.role == "assistant" {
+                    Color::Cyan
+                } else {
+                    Color::Green
+                }),
+            ),
+            Span::raw(&message.content),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(
+            "No messages yet. Type something and press Enter.",
+        ));
+    }
+    let conversation_text = Text::from(lines);
     let inner_width = chunks[1].width.saturating_sub(2).max(1);
     let visible_line_count = chunks[1].height.saturating_sub(2) as usize;
-    let lines = render_conversation_lines(chat, inner_width as usize);
-    let total_lines = lines.len();
-    let max_scroll = total_lines.saturating_sub(visible_line_count);
-    let clamped_bottom_offset = chat.conversation_scroll.min(max_scroll);
-    let start_index = max_scroll.saturating_sub(clamped_bottom_offset);
-    let end_index = (start_index + visible_line_count).min(total_lines);
-    let visible_lines = if start_index < end_index {
-        lines[start_index..end_index].to_vec()
-    } else {
-        vec![Line::from(
-            "No messages yet. Type something and press Enter.",
-        )]
-    };
-    let body = Paragraph::new(Text::from(visible_lines))
+    let base_body = Paragraph::new(conversation_text)
         .block(Block::default().title("Conversation").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    frame.render_widget(body, chunks[1]);
+    let total_lines = rendered_conversation_line_count(chat, inner_width as usize);
+    let max_scroll = total_lines.saturating_sub(visible_line_count);
+    let clamped_bottom_offset = chat.conversation_scroll.min(max_scroll);
+    let top_scroll = max_scroll.saturating_sub(clamped_bottom_offset) as u16;
+    frame.render_widget(base_body.scroll((top_scroll, 0)), chunks[1]);
 
     let footer = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Esc", Style::default().fg(Color::Green)),
             Span::raw(" back"),
             Span::raw("  "),
+            Span::styled("PgUp/PgDn", Style::default().fg(Color::Green)),
+            Span::raw(" scroll"),
+            Span::raw("  "),
+            Span::styled("g/G", Style::default().fg(Color::Green)),
+            Span::raw(" top/bottom"),
+        ]),
+        Line::from(vec![
             Span::styled("Enter", Style::default().fg(Color::Green)),
             Span::raw(" send"),
             Span::raw("  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Green)),
-            Span::raw(" scroll"),
-        ]),
-        Line::from(vec![
-            Span::styled("g/G", Style::default().fg(Color::Green)),
-            Span::raw(" top/bottom"),
-            Span::raw("  "),
             Span::styled("Ctrl-C", Style::default().fg(Color::Green)),
             Span::raw(" quit"),
-            Span::raw("  "),
-            Span::styled("slash", Style::default().fg(Color::Green)),
-            Span::raw(": "),
+        ]),
+        Line::from(vec![
+            Span::raw("slash: "),
+            Span::styled("/new", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/browser", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/refresh", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/quit", Style::default().fg(Color::Green)),
+            Span::raw(" "),
             Span::styled("/help", Style::default().fg(Color::Green)),
         ]),
         Line::from(vec![
@@ -769,61 +793,33 @@ fn conversation_page_step() -> usize {
     10
 }
 
-fn render_conversation_lines(chat: &ChatState, width: usize) -> Vec<Line<'static>> {
+fn rendered_conversation_line_count(chat: &ChatState, width: usize) -> usize {
     if chat.messages.is_empty() {
-        return vec![Line::from(
-            "No messages yet. Type something and press Enter.",
-        )];
+        return wrapped_line_count("No messages yet. Type something and press Enter.", width);
     }
 
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for message in &chat.messages {
-        let (prefix, color) = if message.role == "assistant" {
-            ("assistant: ", Color::Cyan)
-        } else {
-            ("you: ", Color::Green)
-        };
-        let indent = " ".repeat(prefix.chars().count());
-        let content_lines = wrap_message_lines(&message.content, width, prefix.chars().count());
-        for (index, content_line) in content_lines.into_iter().enumerate() {
-            let label = if index == 0 {
-                prefix.to_string()
+    chat.messages
+        .iter()
+        .map(|message| {
+            let prefix = if message.role == "assistant" {
+                "assistant: "
             } else {
-                indent.clone()
+                "you: "
             };
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(color)),
-                Span::raw(content_line),
-            ]));
-        }
-    }
-    lines
+            wrapped_line_count(&format!("{prefix}{}", message.content), width)
+        })
+        .sum()
 }
 
-fn wrap_message_lines(content: &str, width: usize, prefix_width: usize) -> Vec<String> {
-    let first_width = width.saturating_sub(prefix_width).max(1);
-    let continuation_width = first_width;
-    let mut wrapped = Vec::new();
-
-    for raw_line in content.split('\n') {
-        if raw_line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let mut remaining = raw_line.to_string();
-        let mut current_width = first_width;
-        while !remaining.is_empty() {
-            let take = remaining.chars().take(current_width).collect::<String>();
-            let taken_chars = take.chars().count();
-            wrapped.push(take);
-            remaining = remaining.chars().skip(taken_chars).collect();
-            current_width = continuation_width;
-        }
-    }
-
-    wrapped
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    text.split('\n')
+        .map(|line| {
+            let chars = line.chars().count().max(1);
+            chars.div_ceil(width)
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 fn char_to_byte_index(value: &str, char_index: usize) -> usize {
