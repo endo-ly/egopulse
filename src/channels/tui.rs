@@ -101,7 +101,12 @@ impl TuiApp {
     }
 
     fn chat_status() -> String {
-        "Enter to send, Esc to go back, /help for commands".to_string()
+        "Enter to send | Esc back | /help for commands".to_string()
+    }
+
+    fn chat_help() -> String {
+        "/new start fresh, /browser go back, /refresh reload, /quit exit, /help show commands"
+            .to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -278,12 +283,19 @@ async fn run_loop(
                     }
                     KeyCode::Enter => {
                         let raw_input = chat.input.trim().to_string();
-                        if let Some(command) = parse_chat_command(&raw_input) {
+                        if let Some(parsed) = parse_chat_input(&raw_input) {
                             chat.input.clear();
-                            next_action = Some(PendingAction::ChatCommand(command));
-                        } else if !raw_input.is_empty() {
-                            next_action = Some(PendingAction::SendMessage(raw_input));
-                            chat.input.clear();
+                            next_action = Some(match parsed {
+                                ParsedChatInput::Message(message) => {
+                                    PendingAction::SendMessage(message)
+                                }
+                                ParsedChatInput::Command(command) => {
+                                    PendingAction::ChatCommand(command)
+                                }
+                                ParsedChatInput::UnknownCommand(command) => {
+                                    PendingAction::UnknownCommand(command)
+                                }
+                            });
                         }
                     }
                     KeyCode::Char(c) => {
@@ -324,6 +336,13 @@ async fn run_loop(
                     }
                     PendingAction::ChatCommand(command) => {
                         handle_chat_command(app, command).await?;
+                    }
+                    PendingAction::UnknownCommand(command) => {
+                        if let View::Chat(chat) = &mut app.view {
+                            chat.status = format!(
+                                "Unknown command: {command}. Try /help for available commands."
+                            );
+                        }
                     }
                 }
             }
@@ -513,35 +532,61 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(body, chunks[1]);
 
-    let footer = Paragraph::new(vec![Line::from(vec![
-        Span::styled("Esc", Style::default().fg(Color::Green)),
-        Span::raw(" back"),
-        Span::raw("  "),
-        Span::styled("Enter", Style::default().fg(Color::Green)),
-        Span::raw(" send"),
-        Span::raw("  "),
-        Span::styled("Ctrl-C", Style::default().fg(Color::Green)),
-        Span::raw(" quit"),
-        Span::raw("  "),
-        Span::styled("/", Style::default().fg(Color::Green)),
-        Span::raw(" commands"),
-        Span::raw("  "),
-        Span::raw("input: "),
-        Span::styled(&chat.input, Style::default().fg(Color::Yellow)),
-    ])])
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Esc", Style::default().fg(Color::Green)),
+            Span::raw(" back"),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" send"),
+            Span::raw("  "),
+            Span::styled("Ctrl-C", Style::default().fg(Color::Green)),
+            Span::raw(" quit"),
+        ]),
+        Line::from(vec![
+            Span::raw("slash: "),
+            Span::styled("/new", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/browser", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/refresh", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/quit", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("/help", Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::raw("input: "),
+            Span::styled(&chat.input, Style::default().fg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled(TuiApp::chat_help(), Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
     .block(Block::default().title("Input").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
 
-fn parse_chat_command(input: &str) -> Option<ChatCommand> {
-    match input {
+fn parse_chat_input(input: &str) -> Option<ParsedChatInput> {
+    if input.is_empty() {
+        return None;
+    }
+
+    if let Some(command) = match input {
         "/new" => Some(ChatCommand::New),
         "/browser" => Some(ChatCommand::Browser),
         "/refresh" => Some(ChatCommand::Refresh),
         "/quit" => Some(ChatCommand::Quit),
         "/help" => Some(ChatCommand::Help),
         _ => None,
+    } {
+        return Some(ParsedChatInput::Command(command));
     }
+
+    if input.starts_with('/') {
+        return Some(ParsedChatInput::UnknownCommand(input.to_string()));
+    }
+
+    Some(ParsedChatInput::Message(input.to_string()))
 }
 
 async fn handle_chat_command(app: &mut TuiApp, command: ChatCommand) -> Result<(), EgoPulseError> {
@@ -578,7 +623,7 @@ async fn handle_chat_command(app: &mut TuiApp, command: ChatCommand) -> Result<(
         ChatCommand::Quit => return Err(EgoPulseError::ShutdownRequested),
         ChatCommand::Help => {
             if let View::Chat(chat) = &mut app.view {
-                chat.status = "Commands: /new /browser /refresh /quit /help".to_string();
+                chat.status = TuiApp::chat_help();
             }
         }
     }
@@ -593,6 +638,7 @@ enum PendingAction {
     GoBrowser,
     SendMessage(String),
     ChatCommand(ChatCommand),
+    UnknownCommand(String),
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +648,13 @@ enum ChatCommand {
     Refresh,
     Quit,
     Help,
+}
+
+#[derive(Debug, Clone)]
+enum ParsedChatInput {
+    Message(String),
+    Command(ChatCommand),
+    UnknownCommand(String),
 }
 
 fn session_key(context: &SurfaceContext) -> String {

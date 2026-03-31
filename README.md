@@ -67,9 +67,7 @@ export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 cargo run -p egopulse -- --config /path/to/egopulse.toml ask "hello"
 ```
 
-## Usage
-
-### Supported install story
+## Install
 
 この repo では専用の installer は用意していません。  
 サポートする導線は cargo ベースのみです。
@@ -78,6 +76,10 @@ cargo run -p egopulse -- --config /path/to/egopulse.toml ask "hello"
 cargo install --path egopulse --locked
 egopulse
 ```
+
+`cargo install --path egopulse --locked` を再実行すると、インストール済みバイナリは更新されます。
+
+## Usage
 
 開発中は source checkout からそのまま起動できます。
 
@@ -100,6 +102,29 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 
 会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。  
 Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。
+
+### Local TUI controls
+
+Browser:
+
+- `j/k` or arrows
+- `Ctrl-N/P`
+- `g/G`
+- `PageUp/PageDown`
+- `Enter` open
+- `n` or `/new` new session
+- `r` or `/refresh` refresh sessions
+- `q` or `/quit` quit
+
+Chat:
+
+- `Enter` send
+- `Esc` back
+- `/new`
+- `/browser`
+- `/refresh`
+- `/quit`
+- `/help`
 
 ## Current scope
 
