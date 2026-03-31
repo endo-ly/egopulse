@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
+use crate::channels;
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, create_provider};
@@ -48,4 +49,8 @@ pub async fn ask_in_session(
         response = process_turn(&state, &context, prompt) => response,
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
+}
+
+pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
+    channels::tui::run(&config).await
 }

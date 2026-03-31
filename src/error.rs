@@ -11,6 +11,8 @@ pub enum EgoPulseError {
     #[error(transparent)]
     Logging(#[from] LoggingError),
     #[error(transparent)]
+    Tui(#[from] TuiError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("shutdown_requested")]
     ShutdownRequested,
@@ -44,6 +46,16 @@ pub enum ConfigError {
     InvalidBaseUrl,
     #[error("missing_api_key")]
     MissingApiKey,
+}
+
+#[derive(Debug, Error)]
+pub enum TuiError {
+    #[error("tui_init_failed: {0}")]
+    InitFailed(String),
+    #[error("tui_render_failed: {0}")]
+    RenderFailed(String),
+    #[error("tui_event_failed: {0}")]
+    EventFailed(String),
 }
 
 #[derive(Debug, Error)]

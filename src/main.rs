@@ -16,7 +16,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -48,7 +48,7 @@ async fn run() -> Result<(), EgoPulseError> {
     init_logging(&config.log_level)?;
 
     match cli.command {
-        Command::Ask { session, prompt } => match if let Some(session) = session.as_deref() {
+        Some(Command::Ask { session, prompt }) => match if let Some(session) = session.as_deref() {
             runtime::ask_in_session(config, session, &prompt).await
         } else {
             runtime::ask(config, &prompt).await
@@ -60,7 +60,7 @@ async fn run() -> Result<(), EgoPulseError> {
             Err(EgoPulseError::ShutdownRequested) => Ok(()),
             Err(error) => Err(error),
         },
-        Command::Chat { session } => {
+        Some(Command::Chat { session }) => {
             let state = runtime::build_app_state(config)?;
             let session = session.unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()));
             match cli::run_chat(&state, &session).await {
@@ -68,5 +68,6 @@ async fn run() -> Result<(), EgoPulseError> {
                 Err(error) => Err(error),
             }
         }
+        None => runtime::run_tui(config).await,
     }
 }
