@@ -11,13 +11,13 @@ Issue 2.5 時点では、local TUI と developer 向け CLI を備えた persist
 
 ## Config
 
-環境変数または `egopulse.toml` に対応します。
+環境変数または `egopulse.config.yaml` に対応します。
 
 読み込み順は次の通りです。
 
 1. プロセス環境変数
-2. `--config` で指定した TOML
-3. current directory の `./egopulse.toml` 自動検出
+2. `--config` で指定した YAML
+3. current directory の `./egopulse.config.yaml` 自動検出
 
 同じキーが複数箇所にある場合は、上の項目が優先されます。
 
@@ -60,11 +60,11 @@ export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 
 ### Config file
 
-サンプルは [`egopulse.example.toml`](./egopulse.example.toml) を参照してください。
-`egopulse.toml` は current directory から自動検出されます。明示的に指定したい場合は `--config` を使ってください。
+サンプルは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照してください。
+`egopulse.config.yaml` は current directory から自動検出されます。明示的に指定したい場合は `--config` を使ってください。
 
 ```bash
-cargo run -p egopulse -- --config /path/to/egopulse.toml ask "hello"
+cargo run -p egopulse -- --config /path/to/egopulse.config.yaml ask "hello"
 ```
 
 ## Install
@@ -127,7 +127,7 @@ Chat:
 ## Current scope
 
 - `egopulse` 無引数起動で local TUI
-- `egopulse.toml` 自動検出
+- `egopulse.config.yaml` 自動検出
 - `--config` による明示指定
 - OpenAI-compatible endpoint に対する `ask`
 - SQLite 永続化付きの `chat --session`

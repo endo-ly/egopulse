@@ -94,7 +94,7 @@ impl Config {
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
-        let candidate = PathBuf::from("./egopulse.toml");
+        let candidate = PathBuf::from("./egopulse.config.yaml");
         if candidate.exists() {
             return Ok(Some(candidate));
         }
@@ -104,7 +104,7 @@ impl Config {
         }
 
         Err(ConfigError::AutoConfigNotFound {
-            searched_paths: vec![PathBuf::from("./egopulse.toml")],
+            searched_paths: vec![PathBuf::from("./egopulse.config.yaml")],
         })
     }
 }
@@ -155,7 +155,7 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: PathBuf::from(path),
         source,
     })?;
-    toml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+    serde_yaml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
         path: PathBuf::from(path),
         source,
     })
@@ -235,11 +235,11 @@ mod tests {
     fn loads_from_config_file() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\ndata_dir = \"./runtime\"\nlog_level = \"debug\""
+            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: ./runtime\nlog_level: debug"
         )
         .expect("write config");
 
@@ -268,11 +268,11 @@ mod tests {
         }
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1"
         )
         .expect("write config");
 
@@ -291,11 +291,11 @@ mod tests {
     fn allows_lmstudio_without_api_key() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1"
         )
         .expect("write config");
 
@@ -313,11 +313,11 @@ mod tests {
     fn blank_data_dir_falls_back_to_default() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\"\ndata_dir = \"   \""
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1\ndata_dir: \"   \""
         )
         .expect("write config");
 
@@ -328,15 +328,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn auto_discovers_egopulse_toml_from_current_directory() {
+    fn auto_discovers_egopulse_config_yaml_from_current_directory() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let current_dir = std::env::current_dir().expect("current dir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://api.openai.com/v1\""
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1"
         )
         .expect("write config");
 
@@ -360,7 +360,10 @@ mod tests {
 
         match error {
             ConfigError::AutoConfigNotFound { searched_paths } => {
-                assert_eq!(searched_paths, vec![PathBuf::from("./egopulse.toml")]);
+                assert_eq!(
+                    searched_paths,
+                    vec![PathBuf::from("./egopulse.config.yaml")]
+                );
             }
             other => panic!("unexpected error: {other}"),
         }
