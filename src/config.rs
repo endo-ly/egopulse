@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use serde_yml;
 use url::Url;
 
 use crate::error::ConfigError;
@@ -94,12 +95,16 @@ impl Config {
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
+        // Only used when `Config::load(None)` is called (no `--config` flag).
+        // Checks current directory for egopulse.config.yaml, then falls back
+        // to env vars. This function is NOT used when a config path is
+        // explicitly provided via `--config`.
         let candidate = PathBuf::from("./egopulse.config.yaml");
         if candidate.exists() {
             return Ok(Some(candidate));
         }
 
-        if has_required_runtime_env() {
+        if env_vars_sufficient_for_runtime() {
             return Ok(None);
         }
 
@@ -121,7 +126,7 @@ fn default_data_dir() -> &'static str {
     ".egopulse"
 }
 
-fn has_required_runtime_env() -> bool {
+fn env_vars_sufficient_for_runtime() -> bool {
     let Some(base_url) = env_var("EGOPULSE_BASE_URL") else {
         return false;
     };
@@ -155,9 +160,9 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: PathBuf::from(path),
         source,
     })?;
-    serde_yaml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+    serde_yml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
         path: PathBuf::from(path),
-        source,
+        detail: source.to_string(),
     })
 }
 
@@ -289,6 +294,28 @@ mod tests {
     #[test]
     #[serial]
     fn allows_lmstudio_without_api_key() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        unsafe {
+            std::env::set_var("EGOPULSE_MODEL", "local-model");
+            std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
+        }
+
+        let config = Config::load(None).expect("load config");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        assert_eq!(config.model, "local-model");
+        assert_eq!(authorization_token(&config), None);
+        assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(config.data_dir, ".egopulse");
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn allows_lmstudio_without_api_key_via_file_config() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("egopulse.config.yaml");

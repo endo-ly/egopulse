@@ -32,11 +32,10 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("config_parse_failed: {path}: {source}")]
+    #[error("config_parse_failed: {path}: {detail}")]
     ConfigParseFailed {
         path: PathBuf,
-        #[source]
-        source: serde_yaml::Error,
+        detail: String,
     },
     #[error("missing_model")]
     MissingModel,
