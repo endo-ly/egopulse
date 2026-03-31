@@ -97,16 +97,16 @@ impl TuiApp {
             sessions,
             selected: 0,
             view: View::Browser,
-            status: "j/k or arrows to move, Enter to open, n or /new for a session".to_string(),
+            status: "j/k or arrows to move, Enter to open, n for a session".to_string(),
         }
     }
 
     fn browser_status(&self) -> String {
         if self.sessions.is_empty() {
-            "No sessions yet. Press n or /new to create one.".to_string()
+            "No sessions yet. Press n to create one.".to_string()
         } else {
             format!(
-                "{} sessions | selected {}/{} | Enter open | n /new | r /refresh | q /quit",
+                "{} sessions | selected {}/{} | Enter open | n new | r refresh | q quit",
                 self.sessions.len(),
                 self.selected.saturating_add(1),
                 self.sessions.len()
@@ -115,17 +115,11 @@ impl TuiApp {
     }
 
     fn browser_help(&self) -> String {
-        "j/k or arrows, Ctrl-N/P, g/G, PgUp/PgDn, Enter open, n /new, r /refresh, q /quit"
-            .to_string()
+        "j/k or arrows, Ctrl-N/P, g/G, PgUp/PgDn, Enter open, n new, r refresh, q quit".to_string()
     }
 
     fn chat_status() -> String {
-        "Enter to send | Esc back | /help for commands".to_string()
-    }
-
-    fn chat_help() -> String {
-        "/new start fresh, /browser go back, /refresh reload, /quit exit, /help show commands"
-            .to_string()
+        "Enter to send | Esc back".to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -338,7 +332,7 @@ async fn run_loop(
                             continue;
                         }
                         let raw_input = chat.input.trim().to_string();
-                        if let Some(parsed) = parse_chat_input(&raw_input) {
+                        if !raw_input.is_empty() {
                             if !raw_input.is_empty() {
                                 push_input_history(chat, raw_input.clone());
                             }
@@ -346,17 +340,7 @@ async fn run_loop(
                             chat.input_cursor = 0;
                             chat.history_index = None;
                             chat.draft_input = None;
-                            next_action = Some(match parsed {
-                                ParsedChatInput::Message(message) => {
-                                    PendingAction::SendMessage(message)
-                                }
-                                ParsedChatInput::Command(command) => {
-                                    PendingAction::ChatCommand(command)
-                                }
-                                ParsedChatInput::UnknownCommand(command) => {
-                                    PendingAction::UnknownCommand(command)
-                                }
-                            });
+                            next_action = Some(PendingAction::SendMessage(raw_input));
                         }
                     }
                     KeyCode::Char(c) => {
@@ -386,16 +370,6 @@ async fn run_loop(
                     }
                     PendingAction::SendMessage(prompt) => {
                         start_send(app, prompt);
-                    }
-                    PendingAction::ChatCommand(command) => {
-                        handle_chat_command(app, command).await?;
-                    }
-                    PendingAction::UnknownCommand(command) => {
-                        if let View::Chat(chat) = &mut app.view {
-                            chat.status = format!(
-                                "Unknown command: {command}. Try /help for available commands."
-                            );
-                        }
                     }
                 }
             }
@@ -665,16 +639,14 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
             Span::raw(" quit"),
         ]),
         Line::from(vec![
-            Span::raw("slash: "),
-            Span::styled("/new", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("/browser", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("/refresh", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("/quit", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("/help", Style::default().fg(Color::Green)),
+            Span::styled("n", Style::default().fg(Color::Green)),
+            Span::raw(" new"),
+            Span::raw("  "),
+            Span::styled("r", Style::default().fg(Color::Green)),
+            Span::raw(" refresh"),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" sends plain text"),
         ]),
         Line::from(vec![
             Span::raw("input: "),
@@ -777,70 +749,6 @@ fn char_to_byte_index(value: &str, char_index: usize) -> usize {
         .unwrap_or(value.len())
 }
 
-fn parse_chat_input(input: &str) -> Option<ParsedChatInput> {
-    if input.is_empty() {
-        return None;
-    }
-
-    if let Some(command) = match input {
-        "/new" => Some(ChatCommand::New),
-        "/browser" => Some(ChatCommand::Browser),
-        "/refresh" => Some(ChatCommand::Refresh),
-        "/quit" => Some(ChatCommand::Quit),
-        "/help" => Some(ChatCommand::Help),
-        _ => None,
-    } {
-        return Some(ParsedChatInput::Command(command));
-    }
-
-    if input.starts_with('/') {
-        return Some(ParsedChatInput::UnknownCommand(input.to_string()));
-    }
-
-    Some(ParsedChatInput::Message(input.to_string()))
-}
-
-async fn handle_chat_command(app: &mut TuiApp, command: ChatCommand) -> Result<(), EgoPulseError> {
-    match command {
-        ChatCommand::New => {
-            app.open_new_session().await?;
-        }
-        ChatCommand::Browser => {
-            app.refresh_sessions().await?;
-            app.view = View::Browser;
-            app.status = app.browser_status();
-        }
-        ChatCommand::Refresh => {
-            let context = match &app.view {
-                View::Chat(chat) => chat.context.clone(),
-                View::Browser => {
-                    app.refresh_sessions().await?;
-                    return Ok(());
-                }
-            };
-            let messages = runtime::load_session_messages(&app.state, &context).await?;
-            if let View::Chat(chat) = &mut app.view {
-                chat.messages = messages
-                    .into_iter()
-                    .map(|message| RenderedMessage {
-                        role: message.role,
-                        content: message.content,
-                    })
-                    .collect();
-                chat.status = "Refreshed chat messages".to_string();
-            }
-            app.refresh_sessions().await?;
-        }
-        ChatCommand::Quit => return Err(EgoPulseError::ShutdownRequested),
-        ChatCommand::Help => {
-            if let View::Chat(chat) = &mut app.view {
-                chat.status = TuiApp::chat_help();
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 enum PendingAction {
     RefreshSessions,
@@ -848,24 +756,6 @@ enum PendingAction {
     OpenSelected,
     GoBrowser,
     SendMessage(String),
-    ChatCommand(ChatCommand),
-    UnknownCommand(String),
-}
-
-#[derive(Debug, Clone)]
-enum ChatCommand {
-    New,
-    Browser,
-    Refresh,
-    Quit,
-    Help,
-}
-
-#[derive(Debug, Clone)]
-enum ParsedChatInput {
-    Message(String),
-    Command(ChatCommand),
-    UnknownCommand(String),
 }
 
 fn session_key(context: &SurfaceContext) -> String {

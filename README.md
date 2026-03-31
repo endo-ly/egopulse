@@ -112,19 +112,17 @@ Browser:
 - `g/G`
 - `PageUp/PageDown`
 - `Enter` open
-- `n` or `/new` new session
-- `r` or `/refresh` refresh sessions
-- `q` or `/quit` quit
+- `n` new session
+- `r` refresh sessions
+- `q` quit
 
 Chat:
 
 - `Enter` send
 - `Esc` back
-- `/new`
-- `/browser`
-- `/refresh`
-- `/quit`
-- `/help`
+- `← / →` move cursor
+- `↑` move to input start, then walk input history
+- `↓` move forward through input history
 
 ## Current scope
 
