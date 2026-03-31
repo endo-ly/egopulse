@@ -158,8 +158,7 @@ pub async fn run(state: AppState) -> Result<(), EgoPulseError> {
     }
 
     let mut session = TuiSession::new()?;
-    let result = run_loop(&mut session.terminal, &mut app).await;
-    result
+    run_loop(&mut session.terminal, &mut app).await
 }
 
 async fn run_loop(
