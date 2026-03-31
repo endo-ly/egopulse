@@ -54,6 +54,10 @@ enum View {
 struct ChatState {
     context: SurfaceContext,
     input: String,
+    input_cursor: usize,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
+    draft_input: Option<String>,
     status: String,
     messages: Vec<RenderedMessage>,
 }
@@ -163,6 +167,10 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            draft_input: None,
             status: Self::chat_status(),
             messages: messages
                 .into_iter()
@@ -186,6 +194,10 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            draft_input: None,
             status: Self::chat_status(),
             messages: messages
                 .into_iter()
@@ -280,12 +292,33 @@ async fn run_loop(
                 View::Chat(chat) => match key.code {
                     KeyCode::Esc => next_action = Some(PendingAction::GoBrowser),
                     KeyCode::Backspace => {
-                        chat.input.pop();
+                        backspace_input(chat);
+                    }
+                    KeyCode::Delete => {
+                        delete_input(chat);
+                    }
+                    KeyCode::Left => {
+                        chat.input_cursor = chat.input_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Right => {
+                        chat.input_cursor = (chat.input_cursor + 1).min(chat.input.chars().count());
+                    }
+                    KeyCode::Up => {
+                        handle_up_arrow(chat);
+                    }
+                    KeyCode::Down => {
+                        handle_down_arrow(chat);
                     }
                     KeyCode::Enter => {
                         let raw_input = chat.input.trim().to_string();
                         if let Some(parsed) = parse_chat_input(&raw_input) {
+                            if !raw_input.is_empty() {
+                                push_input_history(chat, raw_input.clone());
+                            }
                             chat.input.clear();
+                            chat.input_cursor = 0;
+                            chat.history_index = None;
+                            chat.draft_input = None;
                             next_action = Some(match parsed {
                                 ParsedChatInput::Message(message) => {
                                     PendingAction::SendMessage(message)
@@ -301,7 +334,7 @@ async fn run_loop(
                     }
                     KeyCode::Char(c) => {
                         if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            chat.input.push(c);
+                            insert_input_char(chat, c);
                         }
                     }
                     _ => {}
@@ -564,13 +597,97 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
     .block(Block::default().title("Input").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 
-    let input_x = chunks[2]
-        .x
-        .saturating_add(9 + chat.input.chars().count() as u16);
+    let input_x = chunks[2].x.saturating_add(9 + chat.input_cursor as u16);
     let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
     let cursor_x = input_x.min(max_x);
     let cursor_y = chunks[2].y.saturating_add(3);
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn insert_input_char(chat: &mut ChatState, value: char) {
+    let byte_index = char_to_byte_index(&chat.input, chat.input_cursor);
+    chat.input.insert(byte_index, value);
+    chat.input_cursor += 1;
+    chat.history_index = None;
+    chat.draft_input = None;
+}
+
+fn backspace_input(chat: &mut ChatState) {
+    if chat.input_cursor == 0 {
+        return;
+    }
+    let end = char_to_byte_index(&chat.input, chat.input_cursor);
+    let start = char_to_byte_index(&chat.input, chat.input_cursor - 1);
+    chat.input.replace_range(start..end, "");
+    chat.input_cursor -= 1;
+}
+
+fn delete_input(chat: &mut ChatState) {
+    if chat.input_cursor >= chat.input.chars().count() {
+        return;
+    }
+    let start = char_to_byte_index(&chat.input, chat.input_cursor);
+    let end = char_to_byte_index(&chat.input, chat.input_cursor + 1);
+    chat.input.replace_range(start..end, "");
+}
+
+fn handle_up_arrow(chat: &mut ChatState) {
+    if chat.input_cursor > 0 {
+        chat.input_cursor = 0;
+        return;
+    }
+
+    if chat.input_history.is_empty() {
+        return;
+    }
+
+    let next_index = match chat.history_index {
+        Some(index) => index.saturating_sub(1),
+        None => {
+            chat.draft_input = Some(chat.input.clone());
+            chat.input_history.len().saturating_sub(1)
+        }
+    };
+    chat.history_index = Some(next_index);
+    chat.input = chat.input_history[next_index].clone();
+    chat.input_cursor = 0;
+}
+
+fn handle_down_arrow(chat: &mut ChatState) {
+    let Some(index) = chat.history_index else {
+        return;
+    };
+
+    if index + 1 < chat.input_history.len() {
+        let next_index = index + 1;
+        chat.history_index = Some(next_index);
+        chat.input = chat.input_history[next_index].clone();
+        chat.input_cursor = 0;
+        return;
+    }
+
+    chat.history_index = None;
+    chat.input = chat.draft_input.take().unwrap_or_default();
+    chat.input_cursor = chat.input.chars().count();
+}
+
+fn push_input_history(chat: &mut ChatState, raw_input: String) {
+    if chat.input_history.last() == Some(&raw_input) {
+        return;
+    }
+    chat.input_history.push(raw_input);
+    if chat.input_history.len() > 50 {
+        let overflow = chat.input_history.len() - 50;
+        chat.input_history.drain(0..overflow);
+    }
+}
+
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
 }
 
 fn parse_chat_input(input: &str) -> Option<ParsedChatInput> {
