@@ -50,7 +50,11 @@ impl Config {
     // with MicroClaw's broader runtime/session config instead of growing a
     // separate EgoPulse-specific config tree.
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let file_config = read_file_config(config_path)?;
+        let resolved_config_path = match config_path {
+            Some(path) => Some(PathBuf::from(path)),
+            None => Self::resolve_config_path()?,
+        };
+        let file_config = read_file_config(resolved_config_path.as_deref())?;
 
         let model = first_non_empty([
             env_var("EGOPULSE_MODEL"),
@@ -74,7 +78,7 @@ impl Config {
         }
 
         let data_dir = env_var("EGOPULSE_DATA_DIR")
-            .or_else(|| resolve_data_dir(config_path, file_config.data_dir))
+            .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
             .unwrap_or_else(|| default_data_dir().to_string());
 
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
@@ -86,6 +90,21 @@ impl Config {
             llm_base_url,
             data_dir,
             log_level,
+        })
+    }
+
+    pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
+        let candidate = PathBuf::from("./egopulse.toml");
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+
+        if has_required_runtime_env() {
+            return Ok(None);
+        }
+
+        Err(ConfigError::AutoConfigNotFound {
+            searched_paths: vec![PathBuf::from("./egopulse.toml")],
         })
     }
 }
@@ -100,6 +119,15 @@ fn default_llm_base_url() -> &'static str {
 
 fn default_data_dir() -> &'static str {
     ".egopulse"
+}
+
+fn has_required_runtime_env() -> bool {
+    let Some(base_url) = env_var("EGOPULSE_BASE_URL") else {
+        return false;
+    };
+
+    env_var("EGOPULSE_MODEL").is_some()
+        && (env_var("EGOPULSE_API_KEY").is_some() || base_url_allows_empty_api_key(&base_url))
 }
 
 pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
@@ -187,6 +215,8 @@ mod tests {
     use std::path::PathBuf;
 
     use serial_test::serial;
+
+    use crate::error::ConfigError;
 
     use super::{Config, authorization_token};
 
@@ -290,5 +320,45 @@ mod tests {
         let config = Config::load(Some(&file_path)).expect("load config");
 
         assert_eq!(config.data_dir, ".egopulse");
+    }
+
+    #[test]
+    #[serial]
+    fn auto_discovers_egopulse_toml_from_current_directory() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        let file_path = temp_dir.path().join("egopulse.toml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model = \"gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://api.openai.com/v1\""
+        )
+        .expect("write config");
+
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        let config = Config::load(None).expect("load config");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(authorization_token(&config), Some("sk-file"));
+    }
+
+    #[test]
+    #[serial]
+    fn missing_auto_discovered_config_reports_guidance() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        let error = Config::load(None).expect_err("missing config should fail");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        match error {
+            ConfigError::AutoConfigNotFound { searched_paths } => {
+                assert_eq!(searched_paths, vec![PathBuf::from("./egopulse.toml")]);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

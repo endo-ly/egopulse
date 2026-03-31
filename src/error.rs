@@ -20,6 +20,10 @@ pub enum EgoPulseError {
 pub enum ConfigError {
     #[error("config_not_found: {path}")]
     ConfigNotFound { path: PathBuf },
+    #[error(
+        "config_auto_discovery_failed: no egopulse.toml found. searched={searched_paths:?}. create ./egopulse.toml, pass --config <PATH>, or set EGOPULSE_MODEL / EGOPULSE_BASE_URL / EGOPULSE_API_KEY explicitly"
+    )]
+    AutoConfigNotFound { searched_paths: Vec<PathBuf> },
     #[error("config_read_failed: {path}: {source}")]
     ConfigReadFailed {
         path: PathBuf,
