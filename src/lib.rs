@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod channel;
 pub mod channels;
 pub mod config;
 pub mod error;

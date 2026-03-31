@@ -14,6 +14,8 @@ pub enum EgoPulseError {
     Tui(#[from] TuiError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
     #[error("shutdown_requested")]
     ShutdownRequested,
 }
@@ -91,4 +93,14 @@ pub enum StorageError {
     SessionSerialize(#[from] serde_json::Error),
     #[error("storage_session_snapshot_conflict")]
     SessionSnapshotConflict,
+}
+
+#[derive(Debug, Error)]
+pub enum ChannelError {
+    #[error("channel_not_found: {0}")]
+    NotFound(String),
+    #[error("channel_send_failed: {0}")]
+    SendFailed(String),
+    #[error("channel_cross_chat_not_allowed")]
+    CrossChatNotAllowed,
 }
