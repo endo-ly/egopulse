@@ -264,7 +264,7 @@ async fn run_loop(
             let mut next_action: Option<PendingAction> = None;
             match &mut app.view {
                 View::Browser => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') | KeyCode::Esc => next_action = Some(PendingAction::Exit),
                     KeyCode::Char('r') => next_action = Some(PendingAction::RefreshSessions),
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.move_selection(5);
@@ -360,6 +360,7 @@ async fn run_loop(
 
             if let Some(action) = next_action {
                 match action {
+                    PendingAction::Exit => return Ok(()),
                     PendingAction::RefreshSessions => {
                         app.refresh_sessions().await?;
                     }
@@ -652,11 +653,11 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
             Span::raw(" quit"),
         ]),
         Line::from(vec![
-            Span::styled("n", Style::default().fg(Color::Green)),
-            Span::raw(" new"),
+            Span::styled("↑", Style::default().fg(Color::Green)),
+            Span::raw(" start/history"),
             Span::raw("  "),
-            Span::styled("r", Style::default().fg(Color::Green)),
-            Span::raw(" refresh"),
+            Span::styled("↓", Style::default().fg(Color::Green)),
+            Span::raw(" history/scroll"),
             Span::raw("  "),
             Span::styled("Enter", Style::default().fg(Color::Green)),
             Span::raw(" sends plain text"),
@@ -799,6 +800,7 @@ fn input_window_start(len: usize, cursor: usize, width: usize) -> usize {
 
 #[derive(Debug, Clone)]
 enum PendingAction {
+    Exit,
     RefreshSessions,
     NewSession,
     OpenSelected,
