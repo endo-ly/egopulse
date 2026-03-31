@@ -290,12 +290,16 @@ mod tests {
     #[serial]
     fn allows_lmstudio_without_api_key() {
         clear_env();
-        unsafe {
-            std::env::set_var("EGOPULSE_MODEL", "local-model");
-            std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
-        }
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.toml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
+        )
+        .expect("write config");
 
-        let config = Config::load(None).expect("load config");
+        let config = Config::load(Some(&file_path)).expect("load config");
 
         assert_eq!(config.model, "local-model");
         assert_eq!(authorization_token(&config), None);

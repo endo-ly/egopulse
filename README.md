@@ -69,20 +69,23 @@ cargo run -p egopulse -- --config /path/to/egopulse.toml ask "hello"
 
 ## Usage
 
-`egopulse` を無引数で起動すると local TUI が開きます。
+### Supported install story
 
-```bash
-cargo run -p egopulse
-```
-
-`egopulse` コマンドとして直接使いたい場合は install してください。
+この repo では専用の installer は用意していません。  
+サポートする導線は cargo ベースのみです。
 
 ```bash
 cargo install --path egopulse --locked
 egopulse
 ```
 
-install 済みバイナリを更新したい場合は、同じコマンドを再実行すれば置き換わります。
+開発中は source checkout からそのまま起動できます。
+
+```bash
+cargo run -p egopulse
+```
+
+`egopulse` を無引数で起動すると local TUI が開きます。
 
 developer 向けの entrypoint はそのまま残っています。
 

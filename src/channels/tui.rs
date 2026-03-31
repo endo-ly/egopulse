@@ -78,16 +78,16 @@ impl TuiApp {
             sessions,
             selected: 0,
             view: View::Browser,
-            status: "j/k or arrows to move, Enter to open, n for new".to_string(),
+            status: "j/k or arrows to move, Enter to open, n or /new for a session".to_string(),
         }
     }
 
     fn browser_status(&self) -> String {
         if self.sessions.is_empty() {
-            "No sessions yet. Press n to create one.".to_string()
+            "No sessions yet. Press n or /new to create one.".to_string()
         } else {
             format!(
-                "{} sessions | selected {}/{}",
+                "{} sessions | selected {}/{} | Enter open | n /new | r /refresh | q /quit",
                 self.sessions.len(),
                 self.selected.saturating_add(1),
                 self.sessions.len()
@@ -96,7 +96,12 @@ impl TuiApp {
     }
 
     fn browser_help(&self) -> String {
-        "j/k or arrows, Ctrl-N/P, g/G, PgUp/PgDn, Enter open, n new, r refresh, q quit".to_string()
+        "j/k or arrows, Ctrl-N/P, g/G, PgUp/PgDn, Enter open, n /new, r /refresh, q /quit"
+            .to_string()
+    }
+
+    fn chat_status() -> String {
+        "Enter to send, Esc to go back, /help for commands".to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -152,7 +157,7 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
-            status: "Enter to send, Esc to go back, /help for commands".to_string(),
+            status: Self::chat_status(),
             messages: messages
                 .into_iter()
                 .map(|message| RenderedMessage {
@@ -175,7 +180,7 @@ impl TuiApp {
         self.view = View::Chat(ChatState {
             context,
             input: String::new(),
-            status: "Enter to send, Esc to go back, /help for commands".to_string(),
+            status: Self::chat_status(),
             messages: messages
                 .into_iter()
                 .map(|message| RenderedMessage {
@@ -264,14 +269,6 @@ async fn run_loop(
                         app.move_selection(-5);
                         app.status = app.browser_status();
                     }
-                    KeyCode::Up => {
-                        app.move_selection(-1);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Down => {
-                        app.move_selection(1);
-                        app.status = app.browser_status();
-                    }
                     _ => {}
                 },
                 View::Chat(chat) => match key.code {
@@ -280,9 +277,12 @@ async fn run_loop(
                         chat.input.pop();
                     }
                     KeyCode::Enter => {
-                        if !chat.input.trim().is_empty() {
-                            next_action =
-                                Some(PendingAction::SendMessage(chat.input.trim().to_string()));
+                        let raw_input = chat.input.trim().to_string();
+                        if let Some(command) = parse_chat_command(&raw_input) {
+                            chat.input.clear();
+                            next_action = Some(PendingAction::ChatCommand(command));
+                        } else if !raw_input.is_empty() {
+                            next_action = Some(PendingAction::SendMessage(raw_input));
                             chat.input.clear();
                         }
                     }
@@ -321,6 +321,9 @@ async fn run_loop(
                             chat.status = "Message sent".to_string();
                         }
                         app.refresh_sessions().await?;
+                    }
+                    PendingAction::ChatCommand(command) => {
+                        handle_chat_command(app, command).await?;
                     }
                 }
             }
@@ -530,6 +533,58 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
     frame.render_widget(footer, chunks[2]);
 }
 
+fn parse_chat_command(input: &str) -> Option<ChatCommand> {
+    match input {
+        "/new" => Some(ChatCommand::New),
+        "/browser" => Some(ChatCommand::Browser),
+        "/refresh" => Some(ChatCommand::Refresh),
+        "/quit" => Some(ChatCommand::Quit),
+        "/help" => Some(ChatCommand::Help),
+        _ => None,
+    }
+}
+
+async fn handle_chat_command(app: &mut TuiApp, command: ChatCommand) -> Result<(), EgoPulseError> {
+    match command {
+        ChatCommand::New => {
+            app.open_new_session().await?;
+        }
+        ChatCommand::Browser => {
+            app.refresh_sessions().await?;
+            app.view = View::Browser;
+            app.status = app.browser_status();
+        }
+        ChatCommand::Refresh => {
+            let context = match &app.view {
+                View::Chat(chat) => chat.context.clone(),
+                View::Browser => {
+                    app.refresh_sessions().await?;
+                    return Ok(());
+                }
+            };
+            let messages = runtime::load_session_messages(&app.state, &context).await?;
+            if let View::Chat(chat) = &mut app.view {
+                chat.messages = messages
+                    .into_iter()
+                    .map(|message| RenderedMessage {
+                        role: message.role,
+                        content: message.content,
+                    })
+                    .collect();
+                chat.status = "Refreshed chat messages".to_string();
+            }
+            app.refresh_sessions().await?;
+        }
+        ChatCommand::Quit => return Err(EgoPulseError::ShutdownRequested),
+        ChatCommand::Help => {
+            if let View::Chat(chat) = &mut app.view {
+                chat.status = "Commands: /new /browser /refresh /quit /help".to_string();
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 enum PendingAction {
     RefreshSessions,
@@ -537,6 +592,16 @@ enum PendingAction {
     OpenSelected,
     GoBrowser,
     SendMessage(String),
+    ChatCommand(ChatCommand),
+}
+
+#[derive(Debug, Clone)]
+enum ChatCommand {
+    New,
+    Browser,
+    Refresh,
+    Quit,
+    Help,
 }
 
 fn session_key(context: &SurfaceContext) -> String {
