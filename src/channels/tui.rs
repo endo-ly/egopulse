@@ -8,6 +8,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -385,7 +386,7 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
@@ -478,7 +479,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         .constraints([
             Constraint::Length(4),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(5),
         ])
         .split(frame.area());
 
@@ -558,12 +559,18 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         Line::from(vec![
             Span::raw("input: "),
             Span::styled(&chat.input, Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled(TuiApp::chat_help(), Style::default().fg(Color::DarkGray)),
         ]),
     ])
     .block(Block::default().title("Input").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
+
+    let input_x = chunks[2]
+        .x
+        .saturating_add(9 + chat.input.chars().count() as u16);
+    let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
+    let cursor_x = input_x.min(max_x);
+    let cursor_y = chunks[2].y.saturating_add(3);
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn parse_chat_input(input: &str) -> Option<ParsedChatInput> {
