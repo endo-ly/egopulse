@@ -20,6 +20,16 @@ pub struct StoredMessage {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub chat_id: i64,
+    pub channel: String,
+    pub surface_thread: String,
+    pub chat_title: Option<String>,
+    pub last_message_time: String,
+    pub last_message_preview: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub messages_json: Option<String>,
@@ -193,6 +203,39 @@ impl Database {
                 content: row.get(3)?,
                 is_from_bot: row.get::<_, i32>(4)? != 0,
                 timestamp: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.chat_id,
+                c.channel,
+                c.external_chat_id,
+                c.chat_title,
+                c.last_message_time,
+                (
+                    SELECT m.content
+                    FROM messages m
+                    WHERE m.chat_id = c.chat_id
+                    ORDER BY m.timestamp DESC
+                    LIMIT 1
+                ) AS last_message_preview
+             FROM chats c
+             ORDER BY c.last_message_time DESC, c.chat_id DESC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(SessionSummary {
+                chat_id: row.get(0)?,
+                channel: row.get(1)?,
+                surface_thread: row.get(2)?,
+                chat_title: row.get(3)?,
+                last_message_time: row.get(4)?,
+                last_message_preview: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
