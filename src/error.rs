@@ -11,6 +11,8 @@ pub enum EgoPulseError {
     #[error(transparent)]
     Logging(#[from] LoggingError),
     #[error(transparent)]
+    Tui(#[from] TuiError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("shutdown_requested")]
     ShutdownRequested,
@@ -20,18 +22,18 @@ pub enum EgoPulseError {
 pub enum ConfigError {
     #[error("config_not_found: {path}")]
     ConfigNotFound { path: PathBuf },
+    #[error(
+        "config_auto_discovery_failed: no egopulse.config.yaml found. searched={searched_paths:?}. create ./egopulse.config.yaml, pass --config <PATH>, or set EGOPULSE_MODEL / EGOPULSE_BASE_URL / EGOPULSE_API_KEY explicitly"
+    )]
+    AutoConfigNotFound { searched_paths: Vec<PathBuf> },
     #[error("config_read_failed: {path}: {source}")]
     ConfigReadFailed {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("config_parse_failed: {path}: {source}")]
-    ConfigParseFailed {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
+    #[error("config_parse_failed: {path}: {detail}")]
+    ConfigParseFailed { path: PathBuf, detail: String },
     #[error("missing_model")]
     MissingModel,
     #[error("missing_base_url")]
@@ -40,6 +42,16 @@ pub enum ConfigError {
     InvalidBaseUrl,
     #[error("missing_api_key")]
     MissingApiKey,
+}
+
+#[derive(Debug, Error)]
+pub enum TuiError {
+    #[error("tui_init_failed: {0}")]
+    InitFailed(String),
+    #[error("tui_render_failed: {0}")]
+    RenderFailed(String),
+    #[error("tui_event_failed: {0}")]
+    EventFailed(String),
 }
 
 #[derive(Debug, Error)]

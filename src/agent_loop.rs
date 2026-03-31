@@ -283,7 +283,7 @@ mod tests {
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: test_config(data_dir),
-            llm,
+            llm: Arc::from(llm),
         }
     }
 

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use serde_yml;
 use url::Url;
 
 use crate::error::ConfigError;
@@ -50,7 +51,11 @@ impl Config {
     // with MicroClaw's broader runtime/session config instead of growing a
     // separate EgoPulse-specific config tree.
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let file_config = read_file_config(config_path)?;
+        let resolved_config_path = match config_path {
+            Some(path) => Some(PathBuf::from(path)),
+            None => Self::resolve_config_path()?,
+        };
+        let file_config = read_file_config(resolved_config_path.as_deref())?;
 
         let model = first_non_empty([
             env_var("EGOPULSE_MODEL"),
@@ -74,7 +79,7 @@ impl Config {
         }
 
         let data_dir = env_var("EGOPULSE_DATA_DIR")
-            .or_else(|| resolve_data_dir(config_path, file_config.data_dir))
+            .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
             .unwrap_or_else(|| default_data_dir().to_string());
 
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
@@ -86,6 +91,25 @@ impl Config {
             llm_base_url,
             data_dir,
             log_level,
+        })
+    }
+
+    pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
+        // Only used when `Config::load(None)` is called (no `--config` flag).
+        // Checks current directory for egopulse.config.yaml, then falls back
+        // to env vars. This function is NOT used when a config path is
+        // explicitly provided via `--config`.
+        let candidate = PathBuf::from("./egopulse.config.yaml");
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+
+        if env_vars_sufficient_for_runtime() {
+            return Ok(None);
+        }
+
+        Err(ConfigError::AutoConfigNotFound {
+            searched_paths: vec![PathBuf::from("./egopulse.config.yaml")],
         })
     }
 }
@@ -100,6 +124,15 @@ fn default_llm_base_url() -> &'static str {
 
 fn default_data_dir() -> &'static str {
     ".egopulse"
+}
+
+fn env_vars_sufficient_for_runtime() -> bool {
+    let Some(base_url) = env_var("EGOPULSE_BASE_URL") else {
+        return false;
+    };
+
+    env_var("EGOPULSE_MODEL").is_some()
+        && (env_var("EGOPULSE_API_KEY").is_some() || base_url_allows_empty_api_key(&base_url))
 }
 
 pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
@@ -127,9 +160,9 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: PathBuf::from(path),
         source,
     })?;
-    toml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+    serde_yml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
         path: PathBuf::from(path),
-        source,
+        detail: source.to_string(),
     })
 }
 
@@ -188,6 +221,8 @@ mod tests {
 
     use serial_test::serial;
 
+    use crate::error::ConfigError;
+
     use super::{Config, authorization_token};
 
     fn clear_env() {
@@ -205,11 +240,11 @@ mod tests {
     fn loads_from_config_file() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"openai/gpt-4o-mini\"\napi_key = \"sk-file\"\nbase_url = \"https://openrouter.ai/api/v1\"\ndata_dir = \"./runtime\"\nlog_level = \"debug\""
+            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: ./runtime\nlog_level: debug"
         )
         .expect("write config");
 
@@ -238,11 +273,11 @@ mod tests {
         }
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\""
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1"
         )
         .expect("write config");
 
@@ -260,12 +295,38 @@ mod tests {
     #[serial]
     fn allows_lmstudio_without_api_key() {
         clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
         unsafe {
             std::env::set_var("EGOPULSE_MODEL", "local-model");
             std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
         }
 
         let config = Config::load(None).expect("load config");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        assert_eq!(config.model, "local-model");
+        assert_eq!(authorization_token(&config), None);
+        assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(config.data_dir, ".egopulse");
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn allows_lmstudio_without_api_key_via_file_config() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
 
         assert_eq!(config.model, "local-model");
         assert_eq!(authorization_token(&config), None);
@@ -279,16 +340,59 @@ mod tests {
     fn blank_data_dir_falls_back_to_default() {
         clear_env();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.toml");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model = \"local-model\"\nbase_url = \"http://127.0.0.1:1234/v1\"\ndata_dir = \"   \""
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1\ndata_dir: \"   \""
         )
         .expect("write config");
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
         assert_eq!(config.data_dir, ".egopulse");
+    }
+
+    #[test]
+    #[serial]
+    fn auto_discovers_egopulse_config_yaml_from_current_directory() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1"
+        )
+        .expect("write config");
+
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        let config = Config::load(None).expect("load config");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(authorization_token(&config), Some("sk-file"));
+    }
+
+    #[test]
+    #[serial]
+    fn missing_auto_discovered_config_reports_guidance() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let current_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        let error = Config::load(None).expect_err("missing config should fail");
+        std::env::set_current_dir(current_dir).expect("restore current dir");
+
+        match error {
+            ConfigError::AutoConfigNotFound { searched_paths } => {
+                assert_eq!(
+                    searched_paths,
+                    vec![PathBuf::from("./egopulse.config.yaml")]
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

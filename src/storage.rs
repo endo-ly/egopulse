@@ -20,6 +20,16 @@ pub struct StoredMessage {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub chat_id: i64,
+    pub channel: String,
+    pub surface_thread: String,
+    pub chat_title: Option<String>,
+    pub last_message_time: String,
+    pub last_message_preview: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub messages_json: Option<String>,
@@ -199,6 +209,46 @@ impl Database {
         .map_err(Into::into)
     }
 
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.chat_id,
+                c.channel,
+                c.external_chat_id,
+                c.chat_title,
+                c.last_message_time,
+                (
+                    SELECT m.content
+                    FROM messages m
+                    WHERE m.chat_id = c.chat_id
+                    ORDER BY m.timestamp DESC
+                    LIMIT 1
+                ) AS last_message_preview
+             FROM chats c
+             ORDER BY c.last_message_time DESC, c.chat_id DESC",
+        )?;
+        stmt.query_map([], |row| {
+            let channel: String = row.get(1)?;
+            let external_chat_id: String = row.get(2)?;
+            let chat_title: Option<String> = row.get(3)?;
+            Ok(SessionSummary {
+                chat_id: row.get(0)?,
+                channel: channel.clone(),
+                surface_thread: logical_session_thread(
+                    &channel,
+                    &external_chat_id,
+                    chat_title.as_deref(),
+                ),
+                chat_title,
+                last_message_time: row.get(4)?,
+                last_message_preview: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
     pub fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -337,6 +387,26 @@ impl Database {
     }
 }
 
+fn logical_session_thread(
+    channel: &str,
+    external_chat_id: &str,
+    chat_title: Option<&str>,
+) -> String {
+    if let Some(title) = chat_title.map(str::trim).filter(|value| !value.is_empty()) {
+        return title.to_string();
+    }
+
+    let prefix = format!("{channel}:");
+    if let Some(stripped) = external_chat_id.strip_prefix(&prefix) {
+        let trimmed = stripped.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    external_chat_id.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::error::StorageError;
@@ -467,5 +537,41 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(first > 0);
+    }
+
+    #[test]
+    fn list_sessions_prefers_logical_session_name() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:demo", Some("demo"), "cli")
+            .expect("create chat");
+        db.store_message(&StoredMessage {
+            id: "msg-1".to_string(),
+            chat_id,
+            sender_name: "local_user".to_string(),
+            content: "hello".to_string(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        })
+        .expect("store message");
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let sessions = db.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].channel, "cli");
+        assert_eq!(sessions[0].surface_thread, "demo");
+        assert_eq!(sessions[0].chat_title.as_deref(), Some("demo"));
+
+        let reopened_chat_id = db
+            .resolve_or_create_chat_id(
+                "cli",
+                &format!("cli:{}", sessions[0].surface_thread),
+                sessions[0].chat_title.as_deref(),
+                "cli",
+            )
+            .expect("reopen chat");
+        assert_eq!(reopened_chat_id, chat_id);
     }
 }
