@@ -1,114 +1,116 @@
-import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { createRoot } from 'react-dom/client'
-import './styles.css'
+import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import "./styles.css";
 
 type SessionItem = {
-  session_key: string
-  label: string
-  chat_id: number
-  channel: string
-  last_message_time?: string
-  last_message_preview?: string | null
-}
+  session_key: string;
+  label: string;
+  chat_id: number;
+  channel: string;
+  last_message_time?: string;
+  last_message_preview?: string | null;
+};
 
 type MessageItem = {
-  id: string
-  sender_name: string
-  content: string
-  is_from_bot: boolean
-  timestamp: string
-}
+  id: string;
+  sender_name: string;
+  content: string;
+  is_from_bot: boolean;
+  timestamp: string;
+};
 
 type ConfigPayload = {
-  model: string
-  base_url: string
-  data_dir: string
-  web_enabled: boolean
-  web_host: string
-  web_port: number
-  has_api_key: boolean
-  config_path: string
-  requires_restart: boolean
-}
+  model: string;
+  base_url: string;
+  data_dir: string;
+  web_enabled: boolean;
+  web_host: string;
+  web_port: number;
+  has_api_key: boolean;
+  config_path: string;
+  requires_restart: boolean;
+};
 
 type HealthPayload = {
-  version?: string
-}
+  version?: string;
+};
 
 type StreamEvent = {
-  event: string
-  payload: Record<string, unknown>
-}
+  event: string;
+  payload: Record<string, unknown>;
+};
 
 type WsReq = {
-  type: 'req'
-  id: string
-  method: string
-  params: Record<string, unknown>
-}
+  type: "req";
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+};
 
 type WsRes = {
-  type: 'res'
-  id: string
-  ok: boolean
-  payload?: Record<string, unknown>
-  error?: { code?: string; message?: string }
-}
+  type: "res";
+  id: string;
+  ok: boolean;
+  payload?: Record<string, unknown>;
+  error?: { code?: string; message?: string };
+};
 
 type WsEvent = {
-  type: 'event'
-  event: string
-  payload?: Record<string, unknown>
-}
+  type: "event";
+  event: string;
+  payload?: Record<string, unknown>;
+};
 
 type UiStatus = {
-  tone: 'idle' | 'ok' | 'error'
-  text: string
-}
+  tone: "idle" | "ok" | "error";
+  text: string;
+};
 
-const defaultStatus: UiStatus = { tone: 'idle', text: 'Ready' }
+const defaultStatus: UiStatus = { tone: "idle", text: "Ready" };
 
 function api<T>(path: string, options?: RequestInit): Promise<T> {
   return fetch(path, {
     ...options,
     headers: {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
       ...(options?.headers || {}),
     },
   }).then(async (res) => {
-    const data = await res.json().catch(() => ({}))
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const payload = data as { error?: string; message?: string }
-      throw new Error(String(payload.error || payload.message || `HTTP ${res.status}`))
+      const payload = data as { error?: string; message?: string };
+      throw new Error(
+        String(payload.error || payload.message || `HTTP ${res.status}`),
+      );
     }
-    return data as T
-  })
+    return data as T;
+  });
 }
 
 function wsUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws`
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws`;
 }
 
 function nowIso(): string {
-  return new Date().toISOString()
+  return new Date().toISOString();
 }
 
 function sessionKeyNow(): string {
-  const d = new Date()
-  const pad = (v: number) => String(v).padStart(2, '0')
-  return `session-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  const d = new Date();
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return `session-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
 function buildDraftId(runId: string): string {
-  return `draft:${runId}`
+  return `draft:${runId}`;
 }
 
-let nextLocalId = 0
+let nextLocalId = 0;
 
 function makeId(prefix: string): string {
-  nextLocalId += 1
-  return `${prefix}:${Date.now().toString(36)}:${nextLocalId.toString(36)}`
+  nextLocalId += 1;
+  return `${prefix}:${Date.now().toString(36)}:${nextLocalId.toString(36)}`;
 }
 
 async function* parseSseFrames(
@@ -116,357 +118,423 @@ async function* parseSseFrames(
   signal: AbortSignal,
 ): AsyncGenerator<StreamEvent, void> {
   if (!response.body) {
-    throw new Error('empty stream body')
+    throw new Error("empty stream body");
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let pending = ''
-  let eventName = 'message'
-  let dataLines: string[] = []
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let eventName = "message";
+  let dataLines: string[] = [];
 
   const flush = (): StreamEvent | null => {
-    if (dataLines.length === 0) return null
-    const raw = dataLines.join('\n')
-    dataLines = []
+    if (dataLines.length === 0) return null;
+    const raw = dataLines.join("\n");
+    dataLines = [];
 
-    let payload: Record<string, unknown> = {}
+    let payload: Record<string, unknown> = {};
     try {
-      payload = JSON.parse(raw) as Record<string, unknown>
+      payload = JSON.parse(raw) as Record<string, unknown>;
     } catch {
-      payload = { raw }
+      payload = { raw };
     }
 
-    const event: StreamEvent = { event: eventName, payload }
-    eventName = 'message'
-    return event
-  }
+    const event: StreamEvent = { event: eventName, payload };
+    eventName = "message";
+    return event;
+  };
 
   const handleLine = (line: string): StreamEvent | null => {
-    if (line === '') return flush()
-    if (line.startsWith(':')) return null
+    if (line === "") return flush();
+    if (line.startsWith(":")) return null;
 
-    const sep = line.indexOf(':')
-    const field = sep >= 0 ? line.slice(0, sep) : line
-    let value = sep >= 0 ? line.slice(sep + 1) : ''
-    if (value.startsWith(' ')) value = value.slice(1)
+    const sep = line.indexOf(":");
+    const field = sep >= 0 ? line.slice(0, sep) : line;
+    let value = sep >= 0 ? line.slice(sep + 1) : "";
+    if (value.startsWith(" ")) value = value.slice(1);
 
-    if (field === 'event') eventName = value
-    if (field === 'data') dataLines.push(value)
+    if (field === "event") eventName = value;
+    if (field === "data") dataLines.push(value);
 
-    return null
-  }
+    return null;
+  };
 
   while (true) {
-    if (signal.aborted) return
+    if (signal.aborted) return;
 
-    const { done, value } = await reader.read()
-    pending += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const { done, value } = await reader.read();
+    pending += decoder.decode(value || new Uint8Array(), { stream: !done });
 
     while (true) {
-      const idx = pending.indexOf('\n')
-      if (idx < 0) break
-      let line = pending.slice(0, idx)
-      pending = pending.slice(idx + 1)
-      if (line.endsWith('\r')) line = line.slice(0, -1)
-      const event = handleLine(line)
-      if (event) yield event
+      const idx = pending.indexOf("\n");
+      if (idx < 0) break;
+      let line = pending.slice(0, idx);
+      pending = pending.slice(idx + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      const event = handleLine(line);
+      if (event) yield event;
     }
 
     if (done) {
       if (pending.length > 0) {
-        let line = pending
-        if (line.endsWith('\r')) line = line.slice(0, -1)
-        const event = handleLine(line)
-        if (event) yield event
+        let line = pending;
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        const event = handleLine(line);
+        if (event) yield event;
       }
-      const event = flush()
-      if (event) yield event
-      return
+      const event = flush();
+      if (event) yield event;
+      return;
     }
   }
 }
 
 function App() {
-  const [sessions, setSessions] = useState<SessionItem[]>([])
-  const [selectedSession, setSelectedSession] = useState<string>('')
-  const [messages, setMessages] = useState<MessageItem[]>([])
-  const [draft, setDraft] = useState('')
-  const [config, setConfig] = useState<ConfigPayload | null>(null)
-  const [configApiKey, setConfigApiKey] = useState('')
-  const [showSettings, setShowSettings] = useState(false)
-  const [health, setHealth] = useState<HealthPayload>({})
-  const [status, setStatus] = useState<UiStatus>(defaultStatus)
-  const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting')
-  const socketRef = useRef<WebSocket | null>(null)
-  const connectPromise = useRef<Promise<void> | null>(null)
-  const connectResolve = useRef<(() => void) | null>(null)
-  const connectReject = useRef<((error: Error) => void) | null>(null)
-  const messageEndRef = useRef<HTMLDivElement | null>(null)
-  const selectedSessionRef = useRef('')
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [selectedSession, setSelectedSession] = useState<string>("");
+  const [messages, setMessages] = useState<MessageItem[]>([]);
+  const [draft, setDraft] = useState("");
+  const [config, setConfig] = useState<ConfigPayload | null>(null);
+  const [configApiKey, setConfigApiKey] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [health, setHealth] = useState<HealthPayload>({});
+  const [status, setStatus] = useState<UiStatus>(defaultStatus);
+  const [wsState, setWsState] = useState<"connecting" | "open" | "closed">(
+    "connecting",
+  );
+  const socketRef = useRef<WebSocket | null>(null);
+  const connectPromise = useRef<Promise<void> | null>(null);
+  const connectResolve = useRef<(() => void) | null>(null);
+  const connectReject = useRef<((error: Error) => void) | null>(null);
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const selectedSessionRef = useRef("");
 
   const selectedLabel = useMemo(() => {
-    return sessions.find((item) => item.session_key === selectedSession)?.label || selectedSession
-  }, [selectedSession, sessions])
+    return (
+      sessions.find((item) => item.session_key === selectedSession)?.label ||
+      selectedSession
+    );
+  }, [selectedSession, sessions]);
 
   useEffect(() => {
-    messageEndRef.current?.scrollIntoView({ block: 'end' })
-  }, [messages])
+    messageEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages]);
 
   useEffect(() => {
-    selectedSessionRef.current = selectedSession
-  }, [selectedSession])
+    selectedSessionRef.current = selectedSession;
+  }, [selectedSession]);
 
   useEffect(() => {
-    void refreshHealth()
-    void refreshConfig()
-    void refreshSessions()
-    void connectGateway()
+    void refreshHealth();
+    void refreshConfig();
+    void refreshSessions();
+    void connectGateway();
     return () => {
-      socketRef.current?.close()
-    }
-  }, [])
+      socketRef.current?.close();
+    };
+  }, []);
 
   async function refreshHealth() {
-    const payload = await api<{ ok: boolean; version: string }>('/api/health')
-    setHealth({ version: payload.version })
+    const payload = await api<{ ok: boolean; version: string }>("/api/health");
+    setHealth({ version: payload.version });
   }
 
   async function refreshConfig() {
-    const payload = await api<{ ok: boolean; config: ConfigPayload }>('/api/config')
-    setConfig(payload.config)
-    setConfigApiKey('')
+    const payload = await api<{ ok: boolean; config: ConfigPayload }>(
+      "/api/config",
+    );
+    setConfig(payload.config);
+    setConfigApiKey("");
   }
 
   async function refreshSessions(preferredKey?: string) {
-    const payload = await api<{ ok: boolean; sessions: SessionItem[] }>('/api/sessions')
-    setSessions(payload.sessions)
+    const payload = await api<{ ok: boolean; sessions: SessionItem[] }>(
+      "/api/sessions",
+    );
+    setSessions(payload.sessions);
 
-    const nextKey = preferredKey || selectedSessionRef.current || payload.sessions[0]?.session_key || sessionKeyNow()
-    selectedSessionRef.current = nextKey
-    setSelectedSession(nextKey)
-    await loadHistory(nextKey)
+    const nextKey =
+      preferredKey ||
+      selectedSessionRef.current ||
+      payload.sessions[0]?.session_key ||
+      sessionKeyNow();
+    selectedSessionRef.current = nextKey;
+    setSelectedSession(nextKey);
+    await loadHistory(nextKey);
   }
 
   async function loadHistory(sessionKey: string) {
-    const payload = await api<{ ok: boolean; messages: MessageItem[] }>(`/api/history?session_key=${encodeURIComponent(sessionKey)}`)
-    setMessages(payload.messages)
+    const payload = await api<{ ok: boolean; messages: MessageItem[] }>(
+      `/api/history?session_key=${encodeURIComponent(sessionKey)}`,
+    );
+    setMessages(payload.messages);
   }
 
   async function connectGateway() {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      return
+      return;
     }
     if (connectPromise.current) {
-      return connectPromise.current
+      return connectPromise.current;
     }
 
-    setWsState('connecting')
+    setWsState("connecting");
     connectPromise.current = new Promise<void>((resolve, reject) => {
-      connectResolve.current = resolve
-      connectReject.current = reject
-      const socket = new WebSocket(wsUrl())
-      socketRef.current = socket
+      connectResolve.current = resolve;
+      connectReject.current = reject;
+      const socket = new WebSocket(wsUrl());
+      socketRef.current = socket;
 
-      socket.addEventListener('message', (event) => {
-        let data: WsRes | WsEvent
+      socket.addEventListener("message", (event) => {
+        let data: WsRes | WsEvent;
         try {
-          data = JSON.parse(String(event.data)) as WsRes | WsEvent
+          data = JSON.parse(String(event.data)) as WsRes | WsEvent;
         } catch {
-          connectReject.current?.(new Error('invalid JSON from server'))
-          connectPromise.current = null
-          connectResolve.current = null
-          connectReject.current = null
-          setWsState('closed')
-          setStatus({ tone: 'error', text: 'Gateway connection failed' })
-          return
+          connectReject.current?.(new Error("invalid JSON from server"));
+          connectPromise.current = null;
+          connectResolve.current = null;
+          connectReject.current = null;
+          setWsState("closed");
+          setStatus({ tone: "error", text: "Gateway connection failed" });
+          return;
         }
 
-        if (data.type === 'event' && data.event === 'connect.challenge') {
+        if (data.type === "event" && data.event === "connect.challenge") {
           const connectReq: WsReq = {
-            type: 'req',
-            id: 'connect',
-            method: 'connect',
+            type: "req",
+            id: "connect",
+            method: "connect",
             params: { minProtocol: 1, maxProtocol: 1 },
-          }
-          socket.send(JSON.stringify(connectReq))
-          return
+          };
+          socket.send(JSON.stringify(connectReq));
+          return;
         }
 
-        if (data.type === 'res' && data.id === 'connect' && data.ok) {
-          setWsState('open')
-          setStatus((current) => current.tone === 'error' ? current : { tone: 'ok', text: 'Gateway connected' })
-          connectPromise.current = null
-          connectResolve.current = null
-          connectReject.current = null
-          resolve()
-          return
+        if (data.type === "res" && data.id === "connect" && data.ok) {
+          setWsState("open");
+          setStatus((current) =>
+            current.tone === "error"
+              ? current
+              : { tone: "ok", text: "Gateway connected" },
+          );
+          connectPromise.current = null;
+          connectResolve.current = null;
+          connectReject.current = null;
+          resolve();
+          return;
         }
 
-        if (data.type === 'res' && data.id === 'connect' && !data.ok) {
-          connectReject.current?.(new Error(data.error?.message || 'connect rejected'))
-          connectPromise.current = null
-          connectResolve.current = null
-          connectReject.current = null
-          setWsState('closed')
-          setStatus({ tone: 'error', text: 'Gateway connection failed' })
-          return
+        if (data.type === "res" && data.id === "connect" && !data.ok) {
+          connectReject.current?.(
+            new Error(data.error?.message || "connect rejected"),
+          );
+          connectPromise.current = null;
+          connectResolve.current = null;
+          connectReject.current = null;
+          setWsState("closed");
+          setStatus({ tone: "error", text: "Gateway connection failed" });
+          return;
         }
-      })
+      });
 
-      socket.addEventListener('close', () => {
-        setWsState('closed')
-        connectPromise.current = null
-        connectResolve.current = null
-        connectReject.current = null
-        socketRef.current = null
-      })
+      socket.addEventListener("close", () => {
+        setWsState("closed");
+        connectPromise.current = null;
+        connectResolve.current = null;
+        connectReject.current = null;
+        socketRef.current = null;
+      });
 
-      socket.addEventListener('error', () => {
-        setWsState('closed')
-        setStatus((current) => current.tone === 'error' ? current : { tone: 'error', text: 'Gateway connection failed' })
-        connectPromise.current = null
-        connectResolve.current = null
-        connectReject.current = null
-        reject(new Error('websocket error'))
-      })
-    })
+      socket.addEventListener("error", () => {
+        setWsState("closed");
+        setStatus((current) =>
+          current.tone === "error"
+            ? current
+            : { tone: "error", text: "Gateway connection failed" },
+        );
+        connectPromise.current = null;
+        connectResolve.current = null;
+        connectReject.current = null;
+        reject(new Error("websocket error"));
+      });
+    });
 
-    return connectPromise.current
+    return connectPromise.current;
   }
 
   async function handleNewSession() {
-    const key = sessionKeyNow()
-    selectedSessionRef.current = key
-    setSelectedSession(key)
-    setMessages([])
-    setSessions((prev) => [{ session_key: key, label: key, chat_id: 0, channel: 'web', last_message_time: nowIso(), last_message_preview: null }, ...prev])
+    const key = sessionKeyNow();
+    selectedSessionRef.current = key;
+    setSelectedSession(key);
+    setMessages([]);
+    setSessions((prev) => [
+      {
+        session_key: key,
+        label: key,
+        chat_id: 0,
+        channel: "web",
+        last_message_time: nowIso(),
+        last_message_preview: null,
+      },
+      ...prev,
+    ]);
   }
 
   async function handleSend(event: FormEvent) {
-    event.preventDefault()
-    const text = draft.trim()
-    if (!text) return
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text) return;
 
-    const sessionKey = selectedSessionRef.current || sessionKeyNow()
+    const sessionKey = selectedSessionRef.current || sessionKeyNow();
     if (!selectedSessionRef.current) {
-      selectedSessionRef.current = sessionKey
-      setSelectedSession(sessionKey)
+      selectedSessionRef.current = sessionKey;
+      setSelectedSession(sessionKey);
     }
 
     const userMessage: MessageItem = {
-      id: makeId('message'),
-      sender_name: 'web-user',
+      id: makeId("message"),
+      sender_name: "web-user",
       content: text,
       is_from_bot: false,
       timestamp: nowIso(),
-    }
+    };
 
-    setMessages((prev) => [...prev, userMessage])
-    setDraft('')
-    setStatus({ tone: 'idle', text: 'Waiting for response…' })
+    setMessages((prev) => [...prev, userMessage]);
+    setDraft("");
+    setStatus({ tone: "idle", text: "Waiting for response…" });
 
-    const abortController = new AbortController()
+    const abortController = new AbortController();
     try {
-      const sendResponse = await api<{ ok: boolean; run_id: string; session_key: string }>('/api/send_stream', {
-        method: 'POST',
+      const sendResponse = await api<{
+        ok: boolean;
+        run_id: string;
+        session_key: string;
+      }>("/api/send_stream", {
+        method: "POST",
         body: JSON.stringify({
           session_key: sessionKey,
           message: text,
         }),
         signal: abortController.signal,
-      })
+      });
 
       if (!sendResponse.run_id) {
-        throw new Error('missing run_id')
+        throw new Error("missing run_id");
       }
 
-      const runId = sendResponse.run_id
-      const draftId = buildDraftId(runId)
-      const query = new URLSearchParams({ run_id: runId })
+      const runId = sendResponse.run_id;
+      const draftId = buildDraftId(runId);
+      const query = new URLSearchParams({ run_id: runId });
       const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
-        method: 'GET',
-        cache: 'no-store',
+        method: "GET",
+        cache: "no-store",
         signal: abortController.signal,
-      })
+      });
 
       if (!streamResponse.ok) {
-        const raw = await streamResponse.text().catch(() => '')
-        throw new Error(raw || `HTTP ${streamResponse.status}`)
+        const raw = await streamResponse.text().catch(() => "");
+        throw new Error(raw || `HTTP ${streamResponse.status}`);
       }
 
-      for await (const streamEvent of parseSseFrames(streamResponse, abortController.signal)) {
-        const payload = streamEvent.payload
+      for await (const streamEvent of parseSseFrames(
+        streamResponse,
+        abortController.signal,
+      )) {
+        const payload = streamEvent.payload;
 
-        if (streamEvent.event === 'replay_meta') {
-          continue
+        if (streamEvent.event === "replay_meta") {
+          continue;
         }
 
-        if (streamEvent.event === 'status') {
-          const message = typeof payload.message === 'string' ? payload.message : ''
+        if (streamEvent.event === "status") {
+          const message =
+            typeof payload.message === "string" ? payload.message : "";
           if (message) {
-            setStatus({ tone: 'idle', text: message })
+            setStatus({ tone: "idle", text: message });
           }
-          continue
+          continue;
         }
 
-        if (streamEvent.event === 'delta') {
-          const delta = typeof payload.delta === 'string' ? payload.delta : ''
-          if (!delta) continue
+        if (streamEvent.event === "delta") {
+          const delta = typeof payload.delta === "string" ? payload.delta : "";
+          if (!delta) continue;
           setMessages((prev) => {
-            const existing = prev.find((item) => item.id === draftId)
+            const existing = prev.find((item) => item.id === draftId);
             if (existing) {
-              return prev.map((item) => item.id === draftId ? { ...item, content: item.content + delta } : item)
+              return prev.map((item) =>
+                item.id === draftId
+                  ? { ...item, content: item.content + delta }
+                  : item,
+              );
             }
-            return [...prev, {
-              id: draftId,
-              sender_name: 'egopulse',
-              content: delta,
-              is_from_bot: true,
-              timestamp: nowIso(),
-            }]
-          })
-          continue
-        }
-
-        if (streamEvent.event === 'error') {
-          const errorMessage = typeof payload.error === 'string' ? payload.error : 'stream error'
-          throw new Error(errorMessage)
-        }
-
-        if (streamEvent.event === 'done') {
-          const responseText = typeof payload.response === 'string' ? payload.response : ''
-          if (responseText) {
-            setMessages((prev) => {
-              const existing = prev.find((item) => item.id === draftId)
-              if (existing) {
-                return prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done`, content: responseText } : item)
-              }
-              return [...prev, {
-                id: `${draftId}:done`,
-                sender_name: 'egopulse',
-                content: responseText,
+            return [
+              ...prev,
+              {
+                id: draftId,
+                sender_name: "egopulse",
+                content: delta,
                 is_from_bot: true,
                 timestamp: nowIso(),
-              }]
-            })
+              },
+            ];
+          });
+          continue;
+        }
+
+        if (streamEvent.event === "error") {
+          const errorMessage =
+            typeof payload.error === "string" ? payload.error : "stream error";
+          throw new Error(errorMessage);
+        }
+
+        if (streamEvent.event === "done") {
+          const responseText =
+            typeof payload.response === "string" ? payload.response : "";
+          if (responseText) {
+            setMessages((prev) => {
+              const existing = prev.find((item) => item.id === draftId);
+              if (existing) {
+                return prev.map((item) =>
+                  item.id === draftId
+                    ? { ...item, id: `${draftId}:done`, content: responseText }
+                    : item,
+                );
+              }
+              return [
+                ...prev,
+                {
+                  id: `${draftId}:done`,
+                  sender_name: "egopulse",
+                  content: responseText,
+                  is_from_bot: true,
+                  timestamp: nowIso(),
+                },
+              ];
+            });
           } else {
-            setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
+            setMessages((prev) =>
+              prev.map((item) =>
+                item.id === draftId ? { ...item, id: `${draftId}:done` } : item,
+              ),
+            );
           }
-          setStatus({ tone: 'ok', text: 'Response received' })
-          break
+          setStatus({ tone: "ok", text: "Response received" });
+          break;
         }
       }
     } catch (error) {
-      setStatus({ tone: 'error', text: error instanceof Error ? error.message : 'Failed to send message' })
+      setStatus({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to send message",
+      });
     } finally {
-      void refreshSessions(sessionKey)
+      void refreshSessions(sessionKey);
     }
   }
 
   async function handleSaveConfig(event: FormEvent) {
-    event.preventDefault()
-    if (!config) return
+    event.preventDefault();
+    if (!config) return;
 
     const payload = {
       model: config.model,
@@ -476,19 +544,31 @@ function App() {
       web_host: config.web_host,
       web_port: config.web_port,
       api_key: configApiKey,
-    }
+    };
 
     try {
-      const response = await api<{ ok: boolean; config: ConfigPayload; requires_restart: boolean }>('/api/config', {
-        method: 'PUT',
+      const response = await api<{
+        ok: boolean;
+        config: ConfigPayload;
+        requires_restart: boolean;
+      }>("/api/config", {
+        method: "PUT",
         body: JSON.stringify(payload),
-      })
-      setConfig(response.config)
-      setConfigApiKey('')
-      setStatus({ tone: 'ok', text: response.requires_restart ? 'Config saved. Restart required for runtime changes.' : 'Config saved.' })
-      setShowSettings(false)
+      });
+      setConfig(response.config);
+      setConfigApiKey("");
+      setStatus({
+        tone: "ok",
+        text: response.requires_restart
+          ? "Config saved. Restart required for runtime changes."
+          : "Config saved.",
+      });
+      setShowSettings(false);
     } catch (error) {
-      setStatus({ tone: 'error', text: error instanceof Error ? error.message : 'Failed to save config' })
+      setStatus({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to save config",
+      });
     }
   }
 
@@ -499,12 +579,22 @@ function App() {
           <img src="/icon.png" alt="EgoPulse" />
           <div>
             <h1>EgoPulse</h1>
-            <p>{health.version ? `v${health.version}` : 'Web'}</p>
+            <p>{health.version ? `v${health.version}` : "Web"}</p>
           </div>
         </div>
 
-        <button className="primary-button" onClick={() => void handleNewSession()}>New Session</button>
-        <button className="secondary-button" onClick={() => setShowSettings(true)}>Runtime Config</button>
+        <button
+          className="primary-button"
+          onClick={() => void handleNewSession()}
+        >
+          New Session
+        </button>
+        <button
+          className="secondary-button"
+          onClick={() => setShowSettings(true)}
+        >
+          Runtime Config
+        </button>
 
         <div className="sidebar-section">
           <div className="sidebar-title-row">
@@ -515,15 +605,19 @@ function App() {
             {sessions.map((item) => (
               <button
                 key={item.session_key}
-                className={item.session_key === selectedSession ? 'session-item active' : 'session-item'}
+                className={
+                  item.session_key === selectedSession
+                    ? "session-item active"
+                    : "session-item"
+                }
                 onClick={() => {
-                  selectedSessionRef.current = item.session_key
-                  setSelectedSession(item.session_key)
-                  void loadHistory(item.session_key)
+                  selectedSessionRef.current = item.session_key;
+                  setSelectedSession(item.session_key);
+                  void loadHistory(item.session_key);
                 }}
               >
                 <strong>{item.label}</strong>
-                <small>{item.last_message_preview || 'No messages yet'}</small>
+                <small>{item.last_message_preview || "No messages yet"}</small>
               </button>
             ))}
           </div>
@@ -533,7 +627,7 @@ function App() {
       <main className="main-panel">
         <header className="chat-header">
           <div>
-            <h2>{selectedLabel || 'Select a session'}</h2>
+            <h2>{selectedLabel || "Select a session"}</h2>
             <p>Gateway: {wsState}</p>
           </div>
           <div className={`status-badge ${status.tone}`}>{status.text}</div>
@@ -541,7 +635,12 @@ function App() {
 
         <section className="timeline">
           {messages.map((message) => (
-            <article key={message.id} className={message.is_from_bot ? 'bubble bubble-bot' : 'bubble bubble-user'}>
+            <article
+              key={message.id}
+              className={
+                message.is_from_bot ? "bubble bubble-bot" : "bubble bubble-user"
+              }
+            >
               <div className="bubble-meta">
                 <span>{message.sender_name}</span>
                 <time>{new Date(message.timestamp).toLocaleTimeString()}</time>
@@ -559,66 +658,126 @@ function App() {
             placeholder="Type a message"
             rows={3}
           />
-          <button className="primary-button" type="submit">Send</button>
+          <button className="primary-button" type="submit">
+            Send
+          </button>
         </form>
       </main>
 
       {showSettings && config ? (
         <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+          <div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="modal-header">
               <div>
                 <h3>Runtime Config</h3>
                 <p>{config.config_path}</p>
               </div>
-              <button className="icon-button" onClick={() => setShowSettings(false)}>×</button>
+              <button
+                className="icon-button"
+                onClick={() => setShowSettings(false)}
+              >
+                ×
+              </button>
             </div>
 
             <form className="config-form" onSubmit={handleSaveConfig}>
               <label>
                 <span>Model</span>
-                <input value={config.model} onChange={(event) => setConfig({ ...config, model: event.target.value })} />
+                <input
+                  value={config.model}
+                  onChange={(event) =>
+                    setConfig({ ...config, model: event.target.value })
+                  }
+                />
               </label>
               <label>
                 <span>Base URL</span>
-                <input value={config.base_url} onChange={(event) => setConfig({ ...config, base_url: event.target.value })} />
+                <input
+                  value={config.base_url}
+                  onChange={(event) =>
+                    setConfig({ ...config, base_url: event.target.value })
+                  }
+                />
               </label>
               <label>
                 <span>API Key</span>
-                <input type="password" value={configApiKey} placeholder={config.has_api_key ? 'Configured. Enter to replace.' : 'Enter API key'} onChange={(event) => setConfigApiKey(event.target.value)} />
+                <input
+                  type="password"
+                  value={configApiKey}
+                  placeholder={
+                    config.has_api_key
+                      ? "Configured. Enter to replace."
+                      : "Enter API key"
+                  }
+                  onChange={(event) => setConfigApiKey(event.target.value)}
+                />
               </label>
               <label>
                 <span>Data Dir</span>
-                <input value={config.data_dir} onChange={(event) => setConfig({ ...config, data_dir: event.target.value })} />
+                <input
+                  value={config.data_dir}
+                  onChange={(event) =>
+                    setConfig({ ...config, data_dir: event.target.value })
+                  }
+                />
               </label>
               <div className="grid-two">
                 <label>
                   <span>Web Host</span>
-                  <input value={config.web_host} onChange={(event) => setConfig({ ...config, web_host: event.target.value })} />
+                  <input
+                    value={config.web_host}
+                    onChange={(event) =>
+                      setConfig({ ...config, web_host: event.target.value })
+                    }
+                  />
                 </label>
                 <label>
                   <span>Web Port</span>
-                  <input type="number" value={config.web_port} onChange={(event) => setConfig({ ...config, web_port: Number(event.target.value) || 0 })} />
+                  <input
+                    type="number"
+                    value={config.web_port}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        web_port: Number(event.target.value) || 0,
+                      })
+                    }
+                  />
                 </label>
               </div>
               <label className="checkbox-row">
-                <input type="checkbox" checked={config.web_enabled} onChange={(event) => setConfig({ ...config, web_enabled: event.target.checked })} />
+                <input
+                  type="checkbox"
+                  checked={config.web_enabled}
+                  onChange={(event) =>
+                    setConfig({ ...config, web_enabled: event.target.checked })
+                  }
+                />
                 <span>Enable web channel</span>
               </label>
               <div className="config-footer">
-                <span>{config.requires_restart ? 'Changes are persisted to disk. Restart EgoPulse to apply runtime changes.' : ''}</span>
-                <button className="primary-button" type="submit">Save</button>
+                <span>
+                  {config.requires_restart
+                    ? "Changes are persisted to disk. Restart EgoPulse to apply runtime changes."
+                    : ""}
+                </span>
+                <button className="primary-button" type="submit">
+                  Save
+                </button>
               </div>
             </form>
           </div>
         </div>
       ) : null}
     </div>
-  )
+  );
 }
 
-createRoot(document.getElementById('root')!).render(
+createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>,
-)
+);
