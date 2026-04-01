@@ -35,16 +35,9 @@ type HealthPayload = {
   version?: string
 }
 
-type GatewayEventPayload = {
-  runId: string
-  sessionKey: string
-  seq: number
-  state: 'delta' | 'done' | 'error'
-  message?: {
-    role: 'assistant'
-    content: Array<{ type: 'text'; text: string }>
-  }
-  errorMessage?: string
+type StreamEvent = {
+  event: string
+  payload: Record<string, unknown>
 }
 
 type WsReq = {
@@ -85,7 +78,8 @@ function api<T>(path: string, options?: RequestInit): Promise<T> {
   }).then(async (res) => {
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
-      throw new Error(String(data.error || data.message || `HTTP ${res.status}`))
+      const payload = data as { error?: string; message?: string }
+      throw new Error(String(payload.error || payload.message || `HTTP ${res.status}`))
     }
     return data as T
   })
@@ -117,6 +111,82 @@ function makeId(prefix: string): string {
   return `${prefix}:${Date.now().toString(36)}:${nextLocalId.toString(36)}`
 }
 
+async function* parseSseFrames(
+  response: Response,
+  signal: AbortSignal,
+): AsyncGenerator<StreamEvent, void> {
+  if (!response.body) {
+    throw new Error('empty stream body')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  let eventName = 'message'
+  let dataLines: string[] = []
+
+  const flush = (): StreamEvent | null => {
+    if (dataLines.length === 0) return null
+    const raw = dataLines.join('\n')
+    dataLines = []
+
+    let payload: Record<string, unknown> = {}
+    try {
+      payload = JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      payload = { raw }
+    }
+
+    const event: StreamEvent = { event: eventName, payload }
+    eventName = 'message'
+    return event
+  }
+
+  const handleLine = (line: string): StreamEvent | null => {
+    if (line === '') return flush()
+    if (line.startsWith(':')) return null
+
+    const sep = line.indexOf(':')
+    const field = sep >= 0 ? line.slice(0, sep) : line
+    let value = sep >= 0 ? line.slice(sep + 1) : ''
+    if (value.startsWith(' ')) value = value.slice(1)
+
+    if (field === 'event') eventName = value
+    if (field === 'data') dataLines.push(value)
+
+    return null
+  }
+
+  while (true) {
+    if (signal.aborted) return
+
+    const { done, value } = await reader.read()
+    pending += decoder.decode(value || new Uint8Array(), { stream: !done })
+
+    while (true) {
+      const idx = pending.indexOf('\n')
+      if (idx < 0) break
+      let line = pending.slice(0, idx)
+      pending = pending.slice(idx + 1)
+      if (line.endsWith('\r')) line = line.slice(0, -1)
+      const event = handleLine(line)
+      if (event) yield event
+    }
+
+    if (done) {
+      if (pending.length > 0) {
+        let line = pending
+        if (line.endsWith('\r')) line = line.slice(0, -1)
+        const event = handleLine(line)
+        if (event) yield event
+      }
+      const event = flush()
+      if (event) yield event
+      return
+    }
+  }
+}
+
 function App() {
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [selectedSession, setSelectedSession] = useState<string>('')
@@ -129,9 +199,7 @@ function App() {
   const [status, setStatus] = useState<UiStatus>(defaultStatus)
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting')
   const socketRef = useRef<WebSocket | null>(null)
-  const connectResolver = useRef<(() => void) | null>(null)
   const connectPromise = useRef<Promise<void> | null>(null)
-  const requestResolvers = useRef(new Map<string, { resolve: (value: WsRes) => void; reject: (error: Error) => void }>())
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const selectedSessionRef = useRef('')
 
@@ -172,7 +240,8 @@ function App() {
     const payload = await api<{ ok: boolean; sessions: SessionItem[] }>('/api/sessions')
     setSessions(payload.sessions)
 
-    const nextKey = preferredKey || selectedSession || payload.sessions[0]?.session_key || sessionKeyNow()
+    const nextKey = preferredKey || selectedSessionRef.current || payload.sessions[0]?.session_key || sessionKeyNow()
+    selectedSessionRef.current = nextKey
     setSelectedSession(nextKey)
     await loadHistory(nextKey)
   }
@@ -192,42 +261,27 @@ function App() {
 
     setWsState('connecting')
     connectPromise.current = new Promise<void>((resolve, reject) => {
-      connectResolver.current = resolve
       const socket = new WebSocket(wsUrl())
       socketRef.current = socket
 
       socket.addEventListener('message', (event) => {
         const data = JSON.parse(String(event.data)) as WsRes | WsEvent
-        if (data.type === 'event') {
-          if (data.event === 'connect.challenge') {
-            const connectReq: WsReq = {
-              type: 'req',
-              id: 'connect',
-              method: 'connect',
-              params: { minProtocol: 1, maxProtocol: 1 },
-            }
-            socket.send(JSON.stringify(connectReq))
-            return
+        if (data.type === 'event' && data.event === 'connect.challenge') {
+          const connectReq: WsReq = {
+            type: 'req',
+            id: 'connect',
+            method: 'connect',
+            params: { minProtocol: 1, maxProtocol: 1 },
           }
-
-          if (data.event === 'chat') {
-            applyGatewayEvent(data.payload as unknown as GatewayEventPayload)
-          }
+          socket.send(JSON.stringify(connectReq))
           return
         }
 
-        const resolver = requestResolvers.current.get(data.id)
-        if (resolver) {
-          requestResolvers.current.delete(data.id)
-          resolver.resolve(data)
-        }
-
-        if (data.id === 'connect' && data.ok) {
+        if (data.type === 'res' && data.id === 'connect' && data.ok) {
           setWsState('open')
-          setStatus({ tone: 'ok', text: 'Gateway connected' })
-          connectResolver.current?.()
-          connectResolver.current = null
+          setStatus((current) => current.tone === 'error' ? current : { tone: 'ok', text: 'Gateway connected' })
           connectPromise.current = null
+          resolve()
         }
       })
 
@@ -239,7 +293,7 @@ function App() {
 
       socket.addEventListener('error', () => {
         setWsState('closed')
-        setStatus({ tone: 'error', text: 'Gateway connection failed' })
+        setStatus((current) => current.tone === 'error' ? current : { tone: 'error', text: 'Gateway connection failed' })
         connectPromise.current = null
         reject(new Error('websocket error'))
       })
@@ -248,60 +302,9 @@ function App() {
     return connectPromise.current
   }
 
-  function sendGatewayRequest(method: string, params: Record<string, unknown>): Promise<WsRes> {
-    const socket = socketRef.current
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('gateway is not connected'))
-    }
-    const id = makeId(method)
-    const request: WsReq = { type: 'req', id, method, params }
-    return new Promise<WsRes>((resolve, reject) => {
-      requestResolvers.current.set(id, { resolve, reject })
-      socket.send(JSON.stringify(request))
-      window.setTimeout(() => {
-        if (requestResolvers.current.has(id)) {
-          requestResolvers.current.delete(id)
-          reject(new Error(`${method} timed out`))
-        }
-      }, 30000)
-    })
-  }
-
-  function applyGatewayEvent(payload: GatewayEventPayload) {
-    const activeSession = selectedSessionRef.current
-    if (!payload || payload.sessionKey !== activeSession) {
-      return
-    }
-
-    const text = payload.message?.content?.map((item) => item.text).join('') || ''
-    const draftId = buildDraftId(payload.runId)
-
-    if (payload.state === 'delta') {
-      setMessages((prev) => {
-        const existing = prev.find((item) => item.id === draftId)
-        if (existing) {
-          return prev.map((item) => item.id === draftId ? { ...item, content: item.content + text } : item)
-        }
-        return [...prev, { id: draftId, sender_name: 'egopulse', content: text, is_from_bot: true, timestamp: nowIso() }]
-      })
-      return
-    }
-
-    if (payload.state === 'done') {
-      setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
-      setStatus({ tone: 'ok', text: 'Response received' })
-      void refreshSessions(activeSession)
-      return
-    }
-
-    if (payload.state === 'error') {
-      setStatus({ tone: 'error', text: payload.errorMessage || 'Gateway run failed' })
-      setMessages((prev) => prev.filter((item) => item.id !== draftId))
-    }
-  }
-
   async function handleNewSession() {
     const key = sessionKeyNow()
+    selectedSessionRef.current = key
     setSelectedSession(key)
     setMessages([])
     setSessions((prev) => [{ session_key: key, label: key, chat_id: 0, channel: 'web', last_message_time: nowIso(), last_message_preview: null }, ...prev])
@@ -312,33 +315,102 @@ function App() {
     const text = draft.trim()
     if (!text) return
 
-    const sessionKey = selectedSession || sessionKeyNow()
-    if (!selectedSession) {
+    const sessionKey = selectedSessionRef.current || sessionKeyNow()
+    if (!selectedSessionRef.current) {
       selectedSessionRef.current = sessionKey
       setSelectedSession(sessionKey)
     }
 
-    setMessages((prev) => [...prev, {
+    const userMessage: MessageItem = {
       id: makeId('message'),
       sender_name: 'web-user',
       content: text,
       is_from_bot: false,
       timestamp: nowIso(),
-    }])
+    }
+
+    setMessages((prev) => [...prev, userMessage])
     setDraft('')
     setStatus({ tone: 'idle', text: 'Waiting for response…' })
 
+    const abortController = new AbortController()
     try {
-      await connectGateway()
-      const response = await sendGatewayRequest('chat.send', {
-        sessionKey,
-        message: text,
+      const sendResponse = await api<{ ok: boolean; run_id: string; session_key: string }>('/api/send_stream', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_key: sessionKey,
+          message: text,
+        }),
+        signal: abortController.signal,
       })
-      if (!response.ok) {
-        throw new Error(response.error?.message || 'chat.send failed')
+
+      if (!sendResponse.run_id) {
+        throw new Error('missing run_id')
+      }
+
+      const runId = sendResponse.run_id
+      const draftId = buildDraftId(runId)
+      const query = new URLSearchParams({ run_id: runId })
+      const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: abortController.signal,
+      })
+
+      if (!streamResponse.ok) {
+        const raw = await streamResponse.text().catch(() => '')
+        throw new Error(raw || `HTTP ${streamResponse.status}`)
+      }
+
+      for await (const streamEvent of parseSseFrames(streamResponse, abortController.signal)) {
+        const payload = streamEvent.payload
+
+        if (streamEvent.event === 'replay_meta') {
+          continue
+        }
+
+        if (streamEvent.event === 'status') {
+          const message = typeof payload.message === 'string' ? payload.message : ''
+          if (message) {
+            setStatus({ tone: 'idle', text: message })
+          }
+          continue
+        }
+
+        if (streamEvent.event === 'delta') {
+          const delta = typeof payload.delta === 'string' ? payload.delta : ''
+          if (!delta) continue
+          setMessages((prev) => {
+            const existing = prev.find((item) => item.id === draftId)
+            if (existing) {
+              return prev.map((item) => item.id === draftId ? { ...item, content: item.content + delta } : item)
+            }
+            return [...prev, {
+              id: draftId,
+              sender_name: 'egopulse',
+              content: delta,
+              is_from_bot: true,
+              timestamp: nowIso(),
+            }]
+          })
+          continue
+        }
+
+        if (streamEvent.event === 'error') {
+          const errorMessage = typeof payload.error === 'string' ? payload.error : 'stream error'
+          throw new Error(errorMessage)
+        }
+
+        if (streamEvent.event === 'done') {
+          setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
+          setStatus({ tone: 'ok', text: 'Response received' })
+          break
+        }
       }
     } catch (error) {
       setStatus({ tone: 'error', text: error instanceof Error ? error.message : 'Failed to send message' })
+    } finally {
+      void refreshSessions(sessionKey)
     }
   }
 

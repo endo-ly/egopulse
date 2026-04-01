@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -9,9 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_loop::{SurfaceContext, process_turn_with_events};
-
-use super::{WebState, sse::AgentEvent, web_session_key};
+use super::stream::{SendRequest, start_stream_run};
+use super::{RunEvent, WEB_ACTOR, WebState};
 
 const PROTOCOL_VERSION: u64 = 1;
 
@@ -155,7 +154,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
         return;
     }
 
-    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connected = Arc::new(AtomicBool::new(false));
 
     while let Some(Ok(message)) = receiver.next().await {
         let Message::Text(text) = message else {
@@ -225,77 +224,89 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                         }
                     };
 
-                    let session_key = web_session_key(&payload.session_key);
-                    let message = payload.message.trim().to_string();
-                    if message.is_empty() {
-                        let _ = send_error(
-                            &out_tx,
-                            &id,
-                            "invalid_params",
-                            "message is required".to_string(),
-                        );
-                        continue;
-                    }
+                    let started = match start_stream_run(
+                        state.clone(),
+                        SendRequest {
+                            session_key: Some(payload.session_key),
+                            message: payload.message,
+                        },
+                        WEB_ACTOR,
+                    )
+                    .await
+                    {
+                        Ok(started) => started,
+                        Err((status, message)) => {
+                            let _ = send_error(
+                                &out_tx,
+                                &id,
+                                if status == axum::http::StatusCode::BAD_REQUEST {
+                                    "invalid_params"
+                                } else {
+                                    "internal_error"
+                                },
+                                message,
+                            );
+                            continue;
+                        }
+                    };
 
-                    let run_id = Uuid::new_v4().to_string();
                     let _ = send_response(
                         &out_tx,
                         &id,
                         ChatAckPayload {
-                            run_id: run_id.clone(),
+                            run_id: started.run_id.clone(),
                             status: "accepted",
                         },
                     );
 
-                    let state_for_task = state.clone();
-                    let out_tx_for_task = out_tx.clone();
+                    let state_for_stream = state.clone();
+                    let out_tx_for_stream = out_tx.clone();
+                    let run_id = started.run_id.clone();
+                    let session_key = started.session_key.clone();
                     tokio::spawn(async move {
-                        let sequence = Arc::new(AtomicU64::new(1));
-                        let context = SurfaceContext {
-                            channel: "web".to_string(),
-                            surface_user: "web-user".to_string(),
-                            surface_thread: session_key.clone(),
-                            chat_type: "web".to_string(),
+                        let Ok((mut rx, replay, done, _, _)) = state_for_stream
+                            .run_hub
+                            .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
+                            .await
+                        else {
+                            return;
                         };
 
-                        let emit =
-                            |state_name: &'static str,
-                             text: Option<String>,
-                             error_message: Option<String>| {
-                                let seq = sequence.fetch_add(1, Ordering::SeqCst);
-                                let payload = GatewayChatEvent {
-                                    run_id: run_id.clone(),
-                                    session_key: session_key.clone(),
-                                    seq,
-                                    state: state_name,
-                                    message: text.map(|text| GatewayChatMessage {
-                                        role: "assistant",
-                                        content: vec![GatewayChatContent { kind: "text", text }],
-                                    }),
-                                    error_message,
-                                };
-                                let _ = send_event(&out_tx_for_task, "chat", payload);
-                            };
+                        let sequence = Arc::new(AtomicU64::new(1));
+                        for event in replay {
+                            if forward_run_event(
+                                &out_tx_for_stream,
+                                &run_id,
+                                &session_key,
+                                &sequence,
+                                event,
+                            ) {
+                                return;
+                            }
+                        }
 
-                        let result = process_turn_with_events(
-                            &state_for_task.app_state,
-                            &context,
-                            &message,
-                            |event| match event {
-                                AgentEvent::TextDelta { delta } => emit("delta", Some(delta), None),
-                                AgentEvent::FinalResponse { text } => {
-                                    emit("done", Some(text), None)
+                        if done {
+                            return;
+                        }
+
+                        loop {
+                            match rx.recv().await {
+                                Ok(event) => {
+                                    if forward_run_event(
+                                        &out_tx_for_stream,
+                                        &run_id,
+                                        &session_key,
+                                        &sequence,
+                                        event,
+                                    ) {
+                                        break;
+                                    }
                                 }
-                                AgentEvent::Error { message } => emit("error", None, Some(message)),
-                                AgentEvent::Iteration { .. }
-                                | AgentEvent::ToolStart { .. }
-                                | AgentEvent::ToolResult { .. } => {}
-                            },
-                        )
-                        .await;
-
-                        if let Err(error) = result {
-                            emit("error", None, Some(error.to_string()));
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
                         }
                     });
                 }
@@ -315,11 +326,96 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     let _ = writer.await;
 }
 
+fn forward_run_event(
+    tx: &mpsc::UnboundedSender<Message>,
+    run_id: &str,
+    session_key: &str,
+    sequence: &AtomicU64,
+    event: RunEvent,
+) -> bool {
+    match event.event.as_str() {
+        "delta" => {
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
+            let text = payload
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if text.is_empty() {
+                return false;
+            }
+            let seq = sequence.fetch_add(1, Ordering::SeqCst);
+            let gateway_event = GatewayChatEvent {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                seq,
+                state: "delta",
+                message: Some(GatewayChatMessage {
+                    role: "assistant",
+                    content: vec![GatewayChatContent { kind: "text", text }],
+                }),
+                error_message: None,
+            };
+            let _ = send_event(tx, "chat", gateway_event);
+            false
+        }
+        "done" => {
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
+            let text = payload
+                .get("response")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let seq = sequence.fetch_add(1, Ordering::SeqCst);
+            let gateway_event = GatewayChatEvent {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                seq,
+                state: "done",
+                message: if text.is_empty() {
+                    None
+                } else {
+                    Some(GatewayChatMessage {
+                        role: "assistant",
+                        content: vec![GatewayChatContent { kind: "text", text }],
+                    })
+                },
+                error_message: None,
+            };
+            let _ = send_event(tx, "chat", gateway_event);
+            true
+        }
+        "error" => {
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
+            let message = payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stream error")
+                .to_string();
+            let seq = sequence.fetch_add(1, Ordering::SeqCst);
+            let gateway_event = GatewayChatEvent {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                seq,
+                state: "error",
+                message: None,
+                error_message: Some(message),
+            };
+            let _ = send_event(tx, "chat", gateway_event);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn send_response<T: Serialize>(
     tx: &mpsc::UnboundedSender<Message>,
     id: &str,
     payload: T,
-) -> Result<(), ()> {
+) -> Result<(), serde_json::Error> {
     let frame = ResponseFrame {
         kind: "res",
         id: id.to_string(),
@@ -327,7 +423,9 @@ fn send_response<T: Serialize>(
         payload: Some(payload),
         error: None,
     };
-    send_message(tx, &frame)
+    let text = serde_json::to_string(&frame)?;
+    let _ = tx.send(Message::Text(text.into()));
+    Ok(())
 }
 
 fn send_error(
@@ -335,7 +433,7 @@ fn send_error(
     id: &str,
     code: &'static str,
     message: String,
-) -> Result<(), ()> {
+) -> Result<(), serde_json::Error> {
     let frame: ResponseFrame<serde_json::Value> = ResponseFrame {
         kind: "res",
         id: id.to_string(),
@@ -343,23 +441,22 @@ fn send_error(
         payload: None,
         error: Some(ErrorShape { code, message }),
     };
-    send_message(tx, &frame)
+    let text = serde_json::to_string(&frame)?;
+    let _ = tx.send(Message::Text(text.into()));
+    Ok(())
 }
 
 fn send_event<T: Serialize>(
     tx: &mpsc::UnboundedSender<Message>,
     event: &'static str,
     payload: T,
-) -> Result<(), ()> {
+) -> Result<(), serde_json::Error> {
     let frame = EventFrame {
         kind: "event",
         event,
         payload: Some(payload),
     };
-    send_message(tx, &frame)
-}
-
-fn send_message<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
-    let text = serde_json::to_string(payload).map_err(|_| ())?;
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+    let text = serde_json::to_string(&frame)?;
+    let _ = tx.send(Message::Text(text.into()));
+    Ok(())
 }

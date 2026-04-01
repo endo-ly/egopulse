@@ -1,7 +1,7 @@
 # EgoPulse
 
 EgoPulse は EgoGraph 向けの Rust runtime foundation です。  
-Issue 2.5 時点では、local TUI と developer 向け CLI に加えて、React/Vite ベースの WebUI と WebSocket gateway を提供します。
+Issue 2.5 時点では、local TUI と developer 向け CLI に加えて、React/Vite ベースの WebUI、SSE によるチャット stream、そして WebSocket gateway を提供します。
 
 ## Prerequisites
 
@@ -116,7 +116,7 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 
 ### HTTP Server with WebUI
 
-`web` サブコマンドで HTTP サーバーを起動し、React/Vite 製 WebUI と WebSocket gateway を公開します。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `channels.web.host` / `channels.web.port` を使います。
+`web` サブコマンドで HTTP サーバーを起動し、React/Vite 製 WebUI、SSE chat stream、WebSocket gateway を公開します。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `channels.web.host` / `channels.web.port` を使います。
 
 ```bash
 cargo run -p egopulse -- web
@@ -131,14 +131,16 @@ Endpoints:
 - `PUT /api/config` - Runtime config 保存
 - `GET /api/sessions` - List sessions
 - `GET /api/history?session_key=...` - Get message history
-- `POST /api/send_stream` - HTTP 経由のチャット送信
+- `POST /api/send_stream` - chat run を開始して `run_id` を返す
+- `GET /api/stream?run_id=...` - SSE で run event を購読
 - `GET /ws` - WebSocket gateway
 
 現在の WebUI では次ができます。
 - セッション一覧の表示
 - セッション履歴の表示
 - Runtime Config の表示と保存
-- WebSocket gateway 経由のチャット
+- SSE 経由の live chat
+- WebSocket gateway への接続確認
 
 会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。  
 Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。
@@ -152,6 +154,7 @@ Issue 2.5 の local TUI では、session 一覧から再開・新規開始がで
 - SQLite 永続化付きの `chat --session`
 - `ask --session` による既存 session の再開
 - `web` による HTTP サーバー + React WebUI
+- `POST /api/send_stream` + `GET /api/stream` による SSE chat
 - `GET /ws` による WebSocket gateway
 
 次フェーズで追加予定:

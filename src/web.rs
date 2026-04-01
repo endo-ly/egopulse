@@ -1,6 +1,8 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::OriginalUri;
@@ -8,6 +10,7 @@ use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Body};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::channel::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
@@ -22,6 +25,10 @@ mod stream;
 mod ws;
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+
+pub(crate) const WEB_ACTOR: &str = "web-user";
+pub(crate) const RUN_HISTORY_LIMIT: usize = 512;
+pub(crate) const RUN_TTL_SECONDS: u64 = 300;
 
 pub struct WebAdapter;
 
@@ -52,6 +59,131 @@ impl ChannelAdapter for WebAdapter {
 pub(crate) struct WebState {
     pub(crate) app_state: Arc<AppState>,
     pub(crate) config_path: Option<PathBuf>,
+    pub(crate) run_hub: RunHub,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RunEvent {
+    pub(crate) id: u64,
+    pub(crate) event: String,
+    pub(crate) data: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RunHub {
+    channels: Arc<Mutex<HashMap<String, RunChannel>>>,
+}
+
+#[derive(Clone)]
+struct RunChannel {
+    sender: broadcast::Sender<RunEvent>,
+    history: VecDeque<RunEvent>,
+    next_id: u64,
+    done: bool,
+    owner_actor: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunLookupError {
+    NotFound,
+    Forbidden,
+}
+
+impl RunHub {
+    pub(crate) async fn create(&self, run_id: &str, owner_actor: String) {
+        let (tx, _) = broadcast::channel(512);
+        let mut guard = self.channels.lock().await;
+        guard.insert(
+            run_id.to_string(),
+            RunChannel {
+                sender: tx,
+                history: VecDeque::new(),
+                next_id: 1,
+                done: false,
+                owner_actor,
+            },
+        );
+    }
+
+    pub(crate) async fn publish(
+        &self,
+        run_id: &str,
+        event: &str,
+        data: String,
+        history_limit: usize,
+    ) {
+        let mut guard = self.channels.lock().await;
+        let Some(channel) = guard.get_mut(run_id) else {
+            return;
+        };
+
+        let evt = RunEvent {
+            id: channel.next_id,
+            event: event.to_string(),
+            data,
+        };
+        channel.next_id = channel.next_id.saturating_add(1);
+        if channel.history.len() >= history_limit {
+            let _ = channel.history.pop_front();
+        }
+        channel.history.push_back(evt.clone());
+        if evt.event == "done" || evt.event == "error" {
+            channel.done = true;
+        }
+        let _ = channel.sender.send(evt);
+    }
+
+    pub(crate) async fn subscribe_with_replay(
+        &self,
+        run_id: &str,
+        last_event_id: Option<u64>,
+        requester_actor: &str,
+        is_admin: bool,
+    ) -> Result<
+        (
+            broadcast::Receiver<RunEvent>,
+            Vec<RunEvent>,
+            bool,
+            bool,
+            Option<u64>,
+        ),
+        RunLookupError,
+    > {
+        let guard = self.channels.lock().await;
+        let Some(channel) = guard.get(run_id) else {
+            return Err(RunLookupError::NotFound);
+        };
+        if !is_admin && channel.owner_actor != requester_actor {
+            return Err(RunLookupError::Forbidden);
+        }
+        let oldest_event_id = channel.history.front().map(|event| event.id);
+        let replay_truncated = matches!(
+            (last_event_id, oldest_event_id),
+            (Some(last), Some(oldest)) if last.saturating_add(1) < oldest
+        );
+        let replay = channel
+            .history
+            .iter()
+            .filter(|event| last_event_id.is_none_or(|id| event.id > id))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok((
+            channel.sender.subscribe(),
+            replay,
+            channel.done,
+            replay_truncated,
+            oldest_event_id,
+        ))
+    }
+
+    pub(crate) async fn remove_later(&self, run_id: String, after_seconds: u64) {
+        let channels = self.channels.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(after_seconds)).await;
+            let mut guard = channels.lock().await;
+            guard.remove(&run_id);
+        });
+    }
 }
 
 pub(crate) fn web_session_key(raw: &str) -> String {
@@ -149,6 +281,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), Eg
     let web_state = WebState {
         config_path: state.config_path.clone(),
         app_state: Arc::new(state),
+        run_hub: RunHub::default(),
     };
 
     let app = Router::new()
@@ -163,6 +296,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), Eg
         .route("/api/sessions", get(sessions::list_sessions))
         .route("/api/history", get(sessions::get_history))
         .route("/api/send_stream", post(stream::api_send_stream))
+        .route("/api/stream", get(stream::api_stream))
         .fallback(get(index_or_asset))
         .with_state(web_state);
 
