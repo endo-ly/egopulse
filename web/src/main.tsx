@@ -133,6 +133,7 @@ function App() {
   const connectPromise = useRef<Promise<void> | null>(null)
   const requestResolvers = useRef(new Map<string, { resolve: (value: WsRes) => void; reject: (error: Error) => void }>())
   const messageEndRef = useRef<HTMLDivElement | null>(null)
+  const selectedSessionRef = useRef('')
 
   const selectedLabel = useMemo(() => {
     return sessions.find((item) => item.session_key === selectedSession)?.label || selectedSession
@@ -141,6 +142,10 @@ function App() {
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ block: 'end' })
   }, [messages])
+
+  useEffect(() => {
+    selectedSessionRef.current = selectedSession
+  }, [selectedSession])
 
   useEffect(() => {
     void refreshHealth()
@@ -263,7 +268,8 @@ function App() {
   }
 
   function applyGatewayEvent(payload: GatewayEventPayload) {
-    if (!payload || payload.sessionKey !== selectedSession) {
+    const activeSession = selectedSessionRef.current
+    if (!payload || payload.sessionKey !== activeSession) {
       return
     }
 
@@ -284,6 +290,7 @@ function App() {
     if (payload.state === 'done') {
       setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
       setStatus({ tone: 'ok', text: 'Response received' })
+      void refreshSessions(activeSession)
       return
     }
 
@@ -307,6 +314,7 @@ function App() {
 
     const sessionKey = selectedSession || sessionKeyNow()
     if (!selectedSession) {
+      selectedSessionRef.current = sessionKey
       setSelectedSession(sessionKey)
     }
 
@@ -329,7 +337,6 @@ function App() {
       if (!response.ok) {
         throw new Error(response.error?.message || 'chat.send failed')
       }
-      await refreshSessions(sessionKey)
     } catch (error) {
       setStatus({ tone: 'error', text: error instanceof Error ? error.message : 'Failed to send message' })
     }
@@ -388,6 +395,7 @@ function App() {
                 key={item.session_key}
                 className={item.session_key === selectedSession ? 'session-item active' : 'session-item'}
                 onClick={() => {
+                  selectedSessionRef.current = item.session_key
                   setSelectedSession(item.session_key)
                   void loadHistory(item.session_key)
                 }}
