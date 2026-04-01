@@ -131,10 +131,10 @@ pub async fn send_stream(
             match handle.wait().await {
                 Ok(Ok(_)) => {},
                 Ok(Err(e)) => {
-                    yield Ok(Event::default().event("error").data(&e.to_string()));
+                    yield Ok(Event::default().event("error").data(e.to_string()));
                 }
                 Err(e) => {
-                    yield Ok(Event::default().event("error").data(&e.to_string()));
+                    yield Ok(Event::default().event("error").data(e.to_string()));
                 }
             }
         } else {

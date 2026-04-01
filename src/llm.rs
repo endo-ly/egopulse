@@ -176,12 +176,12 @@ impl LlmProvider for OpenAiProvider {
                 if data == "[DONE]" {
                     break;
                 }
-                if let Some(piece) = process_openai_stream_event(&data) {
-                    if !piece.is_empty() {
-                        text.push_str(&piece);
-                        if let Some(tx) = text_tx {
-                            let _ = tx.send(piece);
-                        }
+                if let Some(piece) = process_openai_stream_event(&data)
+                    && !piece.is_empty()
+                {
+                    text.push_str(&piece);
+                    if let Some(tx) = text_tx {
+                        let _ = tx.send(piece);
                     }
                 }
             }
@@ -192,12 +192,12 @@ impl LlmProvider for OpenAiProvider {
             if data == "[DONE]" {
                 break;
             }
-            if let Some(piece) = process_openai_stream_event(&data) {
-                if !piece.is_empty() {
-                    text.push_str(&piece);
-                    if let Some(tx) = text_tx {
-                        let _ = tx.send(piece);
-                    }
+            if let Some(piece) = process_openai_stream_event(&data)
+                && !piece.is_empty()
+            {
+                text.push_str(&piece);
+                if let Some(tx) = text_tx {
+                    let _ = tx.send(piece);
                 }
             }
         }
