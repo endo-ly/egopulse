@@ -165,19 +165,39 @@ where
     messages = persisted_user_turn.messages;
     session_updated_at = Some(persisted_user_turn.updated_at);
 
-    // LLM call (streaming not yet supported by provider)
+    // LLM call with streaming
     let start = std::time::Instant::now();
-    let response = state.llm.send_message("", messages.clone()).await?;
+
+    // Create channel for streaming text chunks
+    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Spawn a task to forward text chunks to on_event
+    let response = state
+        .llm
+        .send_message_stream("", messages.clone(), Some(&text_tx))
+        .await?;
+
+    // Collect streaming text and emit TextDelta events in real-time
+    let mut streamed_text = String::new();
+    while let Ok(chunk) = text_rx.try_recv() {
+        if !chunk.is_empty() {
+            streamed_text.push_str(&chunk);
+            on_event(AgentEvent::TextDelta { delta: chunk });
+        }
+    }
+
     let duration_ms = start.elapsed().as_millis();
 
-    // Emit text delta (full response since we don't have true streaming yet)
-    on_event(AgentEvent::TextDelta {
-        delta: response.content.clone(),
-    });
+    // Use streamed text if available, otherwise fall back to response content
+    let final_content = if streamed_text.is_empty() {
+        response.content.clone()
+    } else {
+        streamed_text
+    };
 
     let assistant_message = Message {
         role: "assistant".to_string(),
-        content: response.content.clone(),
+        content: final_content.clone(),
     };
     messages.push(Message {
         role: assistant_message.role.clone(),
@@ -190,7 +210,7 @@ where
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
             sender_name: "egopulse".to_string(),
-            content: response.content.clone(),
+            content: final_content.clone(),
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         },
@@ -201,7 +221,7 @@ where
     .await?;
 
     on_event(AgentEvent::FinalResponse {
-        text: response.content.clone(),
+        text: final_content.clone(),
     });
 
     tracing::debug!(
@@ -211,7 +231,7 @@ where
         "Turn completed"
     );
 
-    Ok(response.content)
+    Ok(final_content)
 }
 
 async fn load_messages_for_turn(
