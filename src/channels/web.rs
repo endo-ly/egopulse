@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 
-use super::{ChannelAdapter, ConversationKind};
+use crate::channel::ConversationKind;
+use crate::channel_adapter::ChannelAdapter;
 
 /// Web adapter for local-only web UI.
 ///

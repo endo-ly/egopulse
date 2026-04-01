@@ -3,12 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConversationKind {
-    Private,
-    Group,
-    Channel,
-}
+use crate::channel::ConversationKind;
 
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {

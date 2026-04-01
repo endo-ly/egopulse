@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
-        use crate::channels::ChannelRegistry;
+        use crate::channel_adapter::ChannelRegistry;
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: test_config(data_dir),

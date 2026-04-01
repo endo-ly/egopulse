@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
+use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
-use crate::channels::{ChannelRegistry, WebAdapter};
+use crate::channels::WebAdapter;
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, create_provider};
