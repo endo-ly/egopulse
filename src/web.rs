@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::OriginalUri;
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Body};
@@ -70,11 +71,24 @@ pub(crate) fn web_external_chat_id(session_key: &str) -> String {
 }
 
 pub(crate) fn web_asset_response(path: &str) -> Response {
-    let Some(file) = WEB_ASSETS.get_file(path) else {
+    let normalized = path.trim_start_matches('/');
+    let candidates = [
+        normalized.to_string(),
+        format!("assets/{normalized}"),
+        normalized
+            .strip_prefix("assets/")
+            .unwrap_or(normalized)
+            .to_string(),
+    ];
+
+    let file = candidates
+        .iter()
+        .find_map(|candidate| WEB_ASSETS.get_file(candidate));
+    let Some(file) = file else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let mime = match path.rsplit('.').next() {
+    let mime = match normalized.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
@@ -99,8 +113,22 @@ async fn index_html() -> impl IntoResponse {
     }
 }
 
-async fn web_asset(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
-    web_asset_response(&path)
+async fn index_or_asset(OriginalUri(uri): OriginalUri) -> impl IntoResponse {
+    asset_or_index(&uri)
+}
+
+fn asset_or_index(uri: &Uri) -> Response {
+    match uri.path() {
+        "/favicon.ico" => web_asset_response("favicon.ico"),
+        "/icon.png" => web_asset_response("icon.png"),
+        path if path.starts_with("/assets/") => web_asset_response(path),
+        _ => match WEB_ASSETS.get_file("index.html") {
+            Some(file) => {
+                Html(String::from_utf8_lossy(file.contents()).into_owned()).into_response()
+            }
+            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+    }
 }
 
 pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
@@ -135,16 +163,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), Eg
         .route("/api/sessions", get(sessions::list_sessions))
         .route("/api/history", get(sessions::get_history))
         .route("/api/send_stream", post(stream::api_send_stream))
-        .route("/assets/{*path}", get(web_asset))
-        .route(
-            "/favicon.ico",
-            get(|| async { web_asset_response("favicon.ico") }),
-        )
-        .route(
-            "/icon.png",
-            get(|| async { web_asset_response("icon.png") }),
-        )
-        .fallback(get(index_html))
+        .fallback(get(index_or_asset))
         .with_state(web_state);
 
     let shutdown_signal = async {
