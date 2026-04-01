@@ -100,6 +100,22 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 `ask` は OpenAI-compatible endpoint に対する単発問い合わせです。  
 `chat --session ...` は persistent SQLite session を使った継続会話です。
 
+### HTTP Server with WebUI
+
+`serve` サブコマンドで HTTP サーバーを起動し、WebUI 経由でチャットできます。
+
+```bash
+cargo run -p egopulse -- serve
+cargo run -p egopulse -- serve --host 0.0.0.0 --port 8080
+```
+
+Endpoints:
+- `GET /` - WebUI
+- `GET /health` - Health check
+- `GET /api/sessions` - List sessions
+- `GET /api/history?session_key=...` - Get message history
+- `POST /api/send_stream` - Send message with SSE streaming
+
 会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。  
 Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。
 
@@ -132,10 +148,11 @@ Chat:
 - OpenAI-compatible endpoint に対する `ask`
 - SQLite 永続化付きの `chat --session`
 - `ask --session` による既存 session の再開
+- `serve` による HTTP サーバー + WebUI (SSE streaming)
 
 次フェーズで追加予定:
 
-- Discord / Telegram / WebUI
+- Discord / Telegram channels
 - tools / skills
 - MCP integration
 
