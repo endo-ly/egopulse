@@ -1,6 +1,7 @@
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::Message;
 use crate::runtime::AppState;
+use crate::server::sse::AgentEvent;
 use crate::storage::{SessionSnapshot, StoredMessage, call_blocking};
 
 const MAX_HISTORY_MESSAGES: usize = 50;
@@ -104,6 +105,112 @@ pub async fn process_turn(
         session_updated_at,
     )
     .await?;
+    Ok(response.content)
+}
+
+/// Process a turn with event callbacks for streaming.
+///
+/// Based on Microclaw's process_turn pattern with event emission.
+pub async fn process_turn_with_events<F>(
+    state: &AppState,
+    context: &SurfaceContext,
+    user_input: &str,
+    on_event: F,
+) -> Result<String, EgoPulseError>
+where
+    F: Fn(AgentEvent) + Send + Sync,
+{
+    on_event(AgentEvent::Iteration { iteration: 1 });
+
+    let chat_id = call_blocking(state.db.clone(), {
+        let channel = context.channel.clone();
+        let session_key = context.session_key();
+        let surface_thread = context.surface_thread.clone();
+        let chat_type = context.chat_type.clone();
+        move |db| {
+            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
+        }
+    })
+    .await?;
+
+    let LoadedSession {
+        mut messages,
+        session_updated_at,
+    } = load_messages_for_turn(state, chat_id).await?;
+    let mut session_updated_at = session_updated_at;
+    let user_message = Message {
+        role: "user".to_string(),
+        content: user_input.to_string(),
+    };
+    messages.push(Message {
+        role: user_message.role.clone(),
+        content: user_message.content.clone(),
+    });
+
+    let persisted_user_turn = persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: context.surface_user.clone(),
+            content: user_input.to_string(),
+            is_from_bot: false,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        user_message,
+        &messages,
+        session_updated_at,
+    )
+    .await?;
+    messages = persisted_user_turn.messages;
+    session_updated_at = Some(persisted_user_turn.updated_at);
+
+    // LLM call (streaming not yet supported by provider)
+    let start = std::time::Instant::now();
+    let response = state.llm.send_message("", messages.clone()).await?;
+    let duration_ms = start.elapsed().as_millis();
+
+    // Emit text delta (full response since we don't have true streaming yet)
+    on_event(AgentEvent::TextDelta {
+        delta: response.content.clone(),
+    });
+
+    let assistant_message = Message {
+        role: "assistant".to_string(),
+        content: response.content.clone(),
+    };
+    messages.push(Message {
+        role: assistant_message.role.clone(),
+        content: assistant_message.content.clone(),
+    });
+
+    let _persisted_assistant_turn = persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: response.content.clone(),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        assistant_message,
+        &messages,
+        session_updated_at,
+    )
+    .await?;
+
+    on_event(AgentEvent::FinalResponse {
+        text: response.content.clone(),
+    });
+
+    tracing::debug!(
+        channel = %context.channel,
+        chat_id = chat_id,
+        duration_ms = duration_ms,
+        "Turn completed"
+    );
+
     Ok(response.content)
 }
 

@@ -22,10 +22,12 @@ pub enum AgentEvent {
         preview: String,
         duration_ms: u128,
     },
-    /// Text delta from LLM.
+    /// Text delta from LLM (streaming).
     TextDelta { delta: String },
     /// Final response.
     FinalResponse { text: String },
+    /// Error occurred.
+    Error { message: String },
 }
 
 #[cfg(test)]

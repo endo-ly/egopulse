@@ -1,14 +1,17 @@
 //! Chat API handlers with SSE streaming.
 
+use std::convert::Infallible;
+
 use axum::extract::State;
 use axum::Json;
 use axum::response::sse::{Event, Sse};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
-use std::convert::Infallible;
+use tokio::sync::mpsc;
 
-use crate::agent_loop::{process_turn, SurfaceContext};
+use crate::agent_loop::{process_turn_with_events, SurfaceContext};
 use crate::runtime::AppState;
+use crate::server::sse::AgentEvent;
 use crate::storage::call_blocking;
 
 #[derive(Debug, Deserialize)]
@@ -18,7 +21,20 @@ pub struct SendRequest {
     pub message: String,
 }
 
-/// Send a message and return SSE stream.
+/// Convert AgentEvent to SSE Event.
+fn event_to_sse(event: AgentEvent) -> Event {
+    let json = serde_json::to_string(&event).unwrap_or_default();
+    match &event {
+        AgentEvent::Iteration { .. } => Event::default().event("iteration").data(&json),
+        AgentEvent::ToolStart { .. } => Event::default().event("tool_start").data(&json),
+        AgentEvent::ToolResult { .. } => Event::default().event("tool_result").data(&json),
+        AgentEvent::TextDelta { .. } => Event::default().event("text_delta").data(&json),
+        AgentEvent::FinalResponse { .. } => Event::default().event("final_response").data(&json),
+        AgentEvent::Error { .. } => Event::default().event("error").data(&json),
+    }
+}
+
+/// Send a message and return SSE stream with events.
 pub async fn send_stream(
     state: State<AppState>,
     Json(request): Json<SendRequest>,
@@ -37,7 +53,10 @@ pub async fn send_stream(
     .ok();
 
     let state_inner = state.0.clone();
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
+
     let stream = async_stream::stream! {
+        // Send initial start event
         yield Ok(Event::default().event("start").data(""));
 
         if let Some(_chat_id) = chat_id {
@@ -48,14 +67,31 @@ pub async fn send_stream(
                 chat_type: "web".to_string(),
             };
 
-            // Process the turn
-            match process_turn(
-                &state_inner,
-                &context,
-                &message,
-            ).await {
-                Ok(response) => {
-                    yield Ok(Event::default().event("done").data(&response));
+            // Clone state for the async task
+            let state_for_task = state_inner.clone();
+            let tx_for_task = tx.clone();
+
+            let handle = tokio::spawn(async move {
+                process_turn_with_events(
+                    &state_for_task,
+                    &context,
+                    &message,
+                    move |event: AgentEvent| {
+                        let _ = tx_for_task.try_send(event);
+                    },
+                ).await
+            });
+
+            // Forward events from channel to SSE stream
+            while let Some(event) = rx.recv().await {
+                yield Ok(event_to_sse(event));
+            }
+
+            // Wait for processing to complete
+            match handle.await {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => {
+                    yield Ok(Event::default().event("error").data(&e.to_string()));
                 }
                 Err(e) => {
                     yield Ok(Event::default().event("error").data(&e.to_string()));
