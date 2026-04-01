@@ -6,9 +6,12 @@
 //! - SSE streaming chat
 //! - WebUI
 
-mod handlers;
+mod chat;
+mod health;
 mod router;
+mod sessions;
 pub mod sse;
+mod ui;
 
 pub use router::build_router;
 
