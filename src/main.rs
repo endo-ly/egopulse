@@ -6,7 +6,7 @@ use egopulse::config::Config;
 use egopulse::error::EgoPulseError;
 use egopulse::logging::init_logging;
 use egopulse::runtime;
-use egopulse::server;
+use egopulse::web;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -96,7 +96,7 @@ async fn run() -> Result<(), EgoPulseError> {
                     .unwrap_or(config.web_port)
             });
             let state = runtime::build_app_state(config)?;
-            server::run_server(state, &bind_host, bind_port).await
+            web::run_server(state, &bind_host, bind_port).await
         }
         None => runtime::run_tui(config).await,
     }

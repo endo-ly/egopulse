@@ -1,8 +1,8 @@
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::Message;
 use crate::runtime::AppState;
-use crate::server::sse::AgentEvent;
 use crate::storage::{SessionSnapshot, StoredMessage, call_blocking};
+use crate::web::sse::AgentEvent;
 
 const MAX_HISTORY_MESSAGES: usize = 50;
 
@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
-        use crate::channel::ChannelRegistry;
+        use crate::channels::ChannelRegistry;
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: test_config(data_dir),

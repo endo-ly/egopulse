@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
-use crate::channel::{ChannelRegistry, WebAdapter};
 use crate::channels;
+use crate::channels::{ChannelRegistry, WebAdapter};
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, create_provider};
@@ -21,7 +21,7 @@ impl Clone for AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
             llm: Arc::clone(&self.llm),
-            channels: ChannelRegistry::new(), // Registry is stateless, create new
+            channels: ChannelRegistry::new(),
         }
     }
 }

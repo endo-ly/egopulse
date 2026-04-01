@@ -12,8 +12,8 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
 use crate::runtime::AppState;
-use crate::server::sse::{AgentEvent, PublicAgentEvent};
 use crate::storage::call_blocking;
+use crate::web::sse::{AgentEvent, PublicAgentEvent};
 
 #[derive(Debug, Deserialize)]
 pub struct SendRequest {

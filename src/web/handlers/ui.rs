@@ -5,7 +5,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use include_dir::{Dir, include_dir};
 
-static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/webui");
+static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/web");
 
 /// Serve WebUI static files.
 pub async fn serve_ui(uri: OriginalUri) -> Response {
