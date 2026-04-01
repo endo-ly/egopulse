@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
+use crate::channel::{ChannelRegistry, WebAdapter};
 use crate::channels;
 use crate::config::Config;
 use crate::error::EgoPulseError;
@@ -11,6 +12,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
     pub llm: Arc<dyn crate::llm::LlmProvider>,
+    pub channels: ChannelRegistry,
 }
 
 impl Clone for AppState {
@@ -19,6 +21,7 @@ impl Clone for AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
             llm: Arc::clone(&self.llm),
+            channels: ChannelRegistry::new(), // Registry is stateless, create new
         }
     }
 }
@@ -26,7 +29,12 @@ impl Clone for AppState {
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let llm = Arc::from(create_provider(&config)?);
-    Ok(AppState { db, config, llm })
+
+    // Build channel registry
+    let mut channels = ChannelRegistry::new();
+    channels.register(Arc::new(WebAdapter));
+
+    Ok(AppState { db, config, llm, channels })
 }
 
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
