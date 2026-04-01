@@ -93,6 +93,8 @@ pub enum StorageError {
     SessionSerialize(#[from] serde_json::Error),
     #[error("storage_session_snapshot_conflict")]
     SessionSnapshotConflict,
+    #[error("storage_not_found: {0}")]
+    NotFound(String),
 }
 
 #[derive(Debug, Error)]

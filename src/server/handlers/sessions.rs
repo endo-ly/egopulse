@@ -28,9 +28,17 @@ pub struct SessionItem {
 /// List all sessions.
 pub async fn list_sessions(state: State<AppState>) -> Json<serde_json::Value> {
     let db = state.db.clone();
-    let sessions = call_blocking(db, |db| db.list_sessions())
-        .await
-        .unwrap_or_default();
+    let sessions = match call_blocking(db, |db| db.list_sessions()).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to list sessions");
+            return Json(json!({
+                "ok": false,
+                "error": "Failed to list sessions",
+                "sessions": []
+            }));
+        }
+    };
 
     let items: Vec<SessionItem> = sessions
         .into_iter()
@@ -72,17 +80,28 @@ pub async fn get_history(
     .await
     {
         Ok(id) => id,
-        Err(_) => {
+        Err(error) => {
+            tracing::warn!(session_key = %session_key, error = %error, "Failed to resolve session");
             return Json(json!({
                 "ok": false,
-                "error": "Failed to resolve session"
+                "error": "Failed to resolve session",
+                "messages": []
             }));
         }
     };
 
-    let messages = call_blocking(db, move |db| db.get_recent_messages(chat_id, limit))
-        .await
-        .unwrap_or_default();
+    let messages = match call_blocking(db, move |db| db.get_recent_messages(chat_id, limit)).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(chat_id = chat_id, error = %error, "Failed to load session history");
+            return Json(json!({
+                "ok": false,
+                "session_key": session_key,
+                "error": "Failed to load session history",
+                "messages": []
+            }));
+        }
+    };
 
     Json(json!({
         "ok": true,

@@ -437,10 +437,13 @@ impl Database {
     /// Update the output of a tool call.
     pub fn update_tool_call_output(&self, id: &str, output: &str) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        let rows_updated = conn.execute(
             "UPDATE tool_calls SET tool_output = ?1 WHERE id = ?2",
             params![output, id],
         )?;
+        if rows_updated == 0 {
+            return Err(StorageError::NotFound(format!("tool_call:{id}")));
+        }
         Ok(())
     }
 
@@ -522,7 +525,7 @@ fn logical_session_thread(
 mod tests {
     use crate::error::StorageError;
 
-    use super::{Database, StoredMessage};
+    use super::{Database, StoredMessage, ToolCall};
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -684,5 +687,43 @@ mod tests {
             )
             .expect("reopen chat");
         assert_eq!(reopened_chat_id, chat_id);
+    }
+
+    #[test]
+    fn update_tool_call_output_fails_when_tool_call_is_missing() {
+        let (db, _dir) = test_db();
+
+        let error = db
+            .update_tool_call_output("missing-tool-call", "output")
+            .expect_err("missing tool call should fail");
+
+        assert!(matches!(error, StorageError::NotFound(_)));
+    }
+
+    #[test]
+    fn update_tool_call_output_updates_existing_record() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .expect("create chat");
+        let tool_call = ToolCall {
+            id: "tool-1".to_string(),
+            chat_id,
+            message_id: "message-1".to_string(),
+            tool_name: "fetch".to_string(),
+            tool_input: "{}".to_string(),
+            tool_output: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        db.store_tool_call(&tool_call).expect("store tool call");
+        db.update_tool_call_output("tool-1", "done")
+            .expect("update tool call");
+
+        let calls = db
+            .get_tool_calls_for_message("message-1")
+            .expect("load tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_output.as_deref(), Some("done"));
     }
 }

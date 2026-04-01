@@ -85,7 +85,7 @@ pub async fn send_stream(
     // Get chat_id
     let db = state.db.clone();
     let session_key_for_resolve = session_key.clone();
-    let chat_id = call_blocking(db, move |db| {
+    let chat_id = match call_blocking(db, move |db| {
         db.resolve_or_create_chat_id(
             "web",
             &session_key_for_resolve,
@@ -94,7 +94,13 @@ pub async fn send_stream(
         )
     })
     .await
-    .ok();
+    {
+        Ok(chat_id) => Some(chat_id),
+        Err(error) => {
+            tracing::warn!(session_key = %session_key, error = %error, "Failed to resolve web session");
+            None
+        }
+    };
 
     let state_inner = state.0.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
