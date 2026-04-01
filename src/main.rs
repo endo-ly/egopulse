@@ -54,11 +54,16 @@ async fn main() {
 
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
+    let is_web = matches!(cli.command, Some(Command::Web { .. }));
     let resolved_config_path = match cli.config.as_deref() {
         Some(path) => Some(path.to_path_buf()),
         None => Config::resolve_config_path()?,
     };
-    let config = Config::load(resolved_config_path.as_deref())?;
+    let config = if is_web {
+        Config::load_allow_missing_api_key(resolved_config_path.as_deref())?
+    } else {
+        Config::load(resolved_config_path.as_deref())?
+    };
     init_logging(&config.log_level)?;
 
     match cli.command {

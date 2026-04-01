@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -191,11 +190,14 @@ pub(crate) fn web_session_key(raw: &str) -> String {
     if trimmed.is_empty() {
         return "main".to_string();
     }
-    trimmed
+    let stripped = trimmed
         .strip_prefix("web:")
         .unwrap_or(trimmed)
-        .trim()
-        .to_string()
+        .trim();
+    if stripped.is_empty() {
+        return "main".to_string();
+    }
+    stripped.to_string()
 }
 
 pub(crate) fn web_external_chat_id(session_key: &str) -> String {
@@ -264,9 +266,16 @@ fn asset_or_index(uri: &Uri) -> Response {
 }
 
 pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
-    let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|error| {
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+                "failed to resolve address: {error}"
+            )))
+        })?;
+    let addr = addrs.next().ok_or_else(|| {
         EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
-            "invalid address: {error}"
+            "no addresses resolved for {host}:{port}"
         )))
     })?;
 

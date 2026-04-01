@@ -166,15 +166,17 @@ impl LlmProvider for OpenAiProvider {
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
         let mut text = String::new();
+        let mut done = false;
 
-        while let Some(chunk_res) = byte_stream.next().await {
+        'outer: while let Some(chunk_res) = byte_stream.next().await {
             let chunk = match chunk_res {
                 Ok(c) => c,
-                Err(_) => break,
+                Err(e) => return Err(LlmError::RequestFailed(e)),
             };
             for data in sse.push_chunk(chunk.as_ref()) {
                 if data == "[DONE]" {
-                    break;
+                    done = true;
+                    break 'outer;
                 }
                 if let Some(piece) = process_openai_stream_event(&data)
                     && !piece.is_empty()
@@ -187,17 +189,19 @@ impl LlmProvider for OpenAiProvider {
             }
         }
 
-        // Flush any remaining data
-        for data in sse.finish() {
-            if data == "[DONE]" {
-                break;
-            }
-            if let Some(piece) = process_openai_stream_event(&data)
-                && !piece.is_empty()
-            {
-                text.push_str(&piece);
-                if let Some(tx) = text_tx {
-                    let _ = tx.send(piece);
+        // Flush any remaining data (skip if [DONE] was already seen)
+        if !done {
+            for data in sse.finish() {
+                if data == "[DONE]" {
+                    break;
+                }
+                if let Some(piece) = process_openai_stream_event(&data)
+                    && !piece.is_empty()
+                {
+                    text.push_str(&piece);
+                    if let Some(tx) = text_tx {
+                        let _ = tx.send(piece);
+                    }
                 }
             }
         }

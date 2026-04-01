@@ -122,6 +122,23 @@ impl Database {
         })
     }
 
+    pub fn resolve_chat_id(
+        &self,
+        channel: &str,
+        external_chat_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
+            params![channel, external_chat_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(chat_id) => Ok(Some(chat_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn resolve_or_create_chat_id(
         &self,
         channel: &str,

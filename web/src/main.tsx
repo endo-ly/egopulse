@@ -200,6 +200,8 @@ function App() {
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting')
   const socketRef = useRef<WebSocket | null>(null)
   const connectPromise = useRef<Promise<void> | null>(null)
+  const connectResolve = useRef<(() => void) | null>(null)
+  const connectReject = useRef<((error: Error) => void) | null>(null)
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const selectedSessionRef = useRef('')
 
@@ -261,11 +263,25 @@ function App() {
 
     setWsState('connecting')
     connectPromise.current = new Promise<void>((resolve, reject) => {
+      connectResolve.current = resolve
+      connectReject.current = reject
       const socket = new WebSocket(wsUrl())
       socketRef.current = socket
 
       socket.addEventListener('message', (event) => {
-        const data = JSON.parse(String(event.data)) as WsRes | WsEvent
+        let data: WsRes | WsEvent
+        try {
+          data = JSON.parse(String(event.data)) as WsRes | WsEvent
+        } catch {
+          connectReject.current?.(new Error('invalid JSON from server'))
+          connectPromise.current = null
+          connectResolve.current = null
+          connectReject.current = null
+          setWsState('closed')
+          setStatus({ tone: 'error', text: 'Gateway connection failed' })
+          return
+        }
+
         if (data.type === 'event' && data.event === 'connect.challenge') {
           const connectReq: WsReq = {
             type: 'req',
@@ -281,13 +297,28 @@ function App() {
           setWsState('open')
           setStatus((current) => current.tone === 'error' ? current : { tone: 'ok', text: 'Gateway connected' })
           connectPromise.current = null
+          connectResolve.current = null
+          connectReject.current = null
           resolve()
+          return
+        }
+
+        if (data.type === 'res' && data.id === 'connect' && !data.ok) {
+          connectReject.current?.(new Error(data.error?.message || 'connect rejected'))
+          connectPromise.current = null
+          connectResolve.current = null
+          connectReject.current = null
+          setWsState('closed')
+          setStatus({ tone: 'error', text: 'Gateway connection failed' })
+          return
         }
       })
 
       socket.addEventListener('close', () => {
         setWsState('closed')
         connectPromise.current = null
+        connectResolve.current = null
+        connectReject.current = null
         socketRef.current = null
       })
 
@@ -295,6 +326,8 @@ function App() {
         setWsState('closed')
         setStatus((current) => current.tone === 'error' ? current : { tone: 'error', text: 'Gateway connection failed' })
         connectPromise.current = null
+        connectResolve.current = null
+        connectReject.current = null
         reject(new Error('websocket error'))
       })
     })
@@ -402,7 +435,24 @@ function App() {
         }
 
         if (streamEvent.event === 'done') {
-          setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
+          const responseText = typeof payload.response === 'string' ? payload.response : ''
+          if (responseText) {
+            setMessages((prev) => {
+              const existing = prev.find((item) => item.id === draftId)
+              if (existing) {
+                return prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done`, content: responseText } : item)
+              }
+              return [...prev, {
+                id: `${draftId}:done`,
+                sender_name: 'egopulse',
+                content: responseText,
+                is_from_bot: true,
+                timestamp: nowIso(),
+              }]
+            })
+          } else {
+            setMessages((prev) => prev.map((item) => item.id === draftId ? { ...item, id: `${draftId}:done` } : item))
+          }
           setStatus({ tone: 'ok', text: 'Response received' })
           break
         }

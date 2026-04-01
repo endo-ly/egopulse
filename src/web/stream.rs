@@ -168,12 +168,12 @@ pub(super) async fn start_stream_run(
                             )
                             .await;
                     }
-                    AgentEvent::ToolStart { name, input } => {
+                    AgentEvent::ToolStart { name, .. } => {
                         run_hub
                             .publish(
                                 &run_id_for_events,
                                 "tool_start",
-                                json!({"name": name, "input": input}).to_string(),
+                                json!({"name": name}).to_string(),
                                 RUN_HISTORY_LIMIT,
                             )
                             .await;
@@ -181,8 +181,8 @@ pub(super) async fn start_stream_run(
                     AgentEvent::ToolResult {
                         name,
                         is_error,
-                        preview,
                         duration_ms,
+                        ..
                     } => {
                         run_hub
                             .publish(
@@ -191,7 +191,6 @@ pub(super) async fn start_stream_run(
                                 json!({
                                     "name": name,
                                     "is_error": is_error,
-                                    "preview": preview,
                                     "duration_ms": duration_ms,
                                 })
                                 .to_string(),
@@ -240,15 +239,9 @@ pub(super) async fn start_stream_run(
             .await;
 
         if let Err(error) = result {
-            state_for_task
-                .run_hub
-                .publish(
-                    &run_id_for_task,
-                    "error",
-                    json!({"error": error.to_string()}).to_string(),
-                    RUN_HISTORY_LIMIT,
-                )
-                .await;
+            let _ = evt_tx.send(super::sse::AgentEvent::Error {
+                message: error.to_string(),
+            });
         }
 
         drop(evt_tx);

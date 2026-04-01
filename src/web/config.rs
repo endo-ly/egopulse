@@ -84,7 +84,8 @@ pub(super) async fn api_put_config(
 
     match request.api_key.as_deref().map(str::trim) {
         Some(value) if !value.is_empty() => set_string(&mut root, "api_key", value),
-        _ => {}
+        Some(_) => remove_key(&mut root, "api_key"),
+        None => {}
     }
 
     let channels = ensure_mapping(entry_mut(&mut root, "channels"));

@@ -164,7 +164,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
         let frame = match serde_json::from_str::<ClientFrame>(&text) {
             Ok(frame) => frame,
             Err(error) => {
-                let _ = send_error(&out_tx, "invalid", "invalid_frame", error.to_string());
+                if send_error(&out_tx, "invalid", "invalid_frame", error.to_string()).is_err() {
+                    break;
+                }
                 continue;
             }
         };
@@ -175,7 +177,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     let payload = match serde_json::from_value::<ConnectParams>(params) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let _ = send_error(&out_tx, &id, "invalid_params", error.to_string());
+                            if send_error(&out_tx, &id, "invalid_params", error.to_string()).is_err() {
+                                break;
+                            }
                             continue;
                         }
                     };
@@ -183,17 +187,19 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     if payload.min_protocol > PROTOCOL_VERSION
                         || payload.max_protocol < PROTOCOL_VERSION
                     {
-                        let _ = send_error(
+                        if send_error(
                             &out_tx,
                             &id,
                             "unsupported_protocol",
                             format!("server supports protocol {PROTOCOL_VERSION}"),
-                        );
+                        ).is_err() {
+                            break;
+                        }
                         continue;
                     }
 
                     connected.store(true, Ordering::SeqCst);
-                    let _ = send_response(
+                    if send_response(
                         &out_tx,
                         &id,
                         ConnectPayload {
@@ -207,19 +213,24 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                                 events: vec!["connect.challenge", "chat"],
                             },
                         },
-                    );
+                    ).is_err() {
+                        break;
+                    }
                 }
                 "chat.send" => {
                     if !connected.load(Ordering::SeqCst) {
-                        let _ =
-                            send_error(&out_tx, &id, "not_connected", "connect first".to_string());
+                        if send_error(&out_tx, &id, "not_connected", "connect first".to_string()).is_err() {
+                            break;
+                        }
                         continue;
                     }
 
                     let payload = match serde_json::from_value::<ChatSendParams>(params) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let _ = send_error(&out_tx, &id, "invalid_params", error.to_string());
+                            if send_error(&out_tx, &id, "invalid_params", error.to_string()).is_err() {
+                                break;
+                            }
                             continue;
                         }
                     };
@@ -236,7 +247,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     {
                         Ok(started) => started,
                         Err((status, message)) => {
-                            let _ = send_error(
+                            if send_error(
                                 &out_tx,
                                 &id,
                                 if status == axum::http::StatusCode::BAD_REQUEST {
@@ -245,19 +256,23 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                                     "internal_error"
                                 },
                                 message,
-                            );
+                            ).is_err() {
+                                break;
+                            }
                             continue;
                         }
                     };
 
-                    let _ = send_response(
+                    if send_response(
                         &out_tx,
                         &id,
                         ChatAckPayload {
                             run_id: started.run_id.clone(),
                             status: "accepted",
                         },
-                    );
+                    ).is_err() {
+                        break;
+                    }
 
                     let state_for_stream = state.clone();
                     let out_tx_for_stream = out_tx.clone();
@@ -311,12 +326,14 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     });
                 }
                 _ => {
-                    let _ = send_error(
+                    if send_error(
                         &out_tx,
                         &id,
                         "unknown_method",
                         format!("unknown method: {method}"),
-                    );
+                    ).is_err() {
+                        break;
+                    }
                 }
             },
         }
@@ -357,8 +374,7 @@ fn forward_run_event(
                 }),
                 error_message: None,
             };
-            let _ = send_event(tx, "chat", gateway_event);
-            false
+            send_event(tx, "chat", gateway_event).is_err()
         }
         "done" => {
             let payload =
@@ -384,7 +400,9 @@ fn forward_run_event(
                 },
                 error_message: None,
             };
-            let _ = send_event(tx, "chat", gateway_event);
+            if send_event(tx, "chat", gateway_event).is_err() {
+                return true;
+            }
             true
         }
         "error" => {
@@ -404,7 +422,9 @@ fn forward_run_event(
                 message: None,
                 error_message: Some(message),
             };
-            let _ = send_event(tx, "chat", gateway_event);
+            if send_event(tx, "chat", gateway_event).is_err() {
+                return true;
+            }
             true
         }
         _ => false,
@@ -415,7 +435,7 @@ fn send_response<T: Serialize>(
     tx: &mpsc::UnboundedSender<Message>,
     id: &str,
     payload: T,
-) -> Result<(), serde_json::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let frame = ResponseFrame {
         kind: "res",
         id: id.to_string(),
@@ -424,7 +444,8 @@ fn send_response<T: Serialize>(
         error: None,
     };
     let text = serde_json::to_string(&frame)?;
-    let _ = tx.send(Message::Text(text.into()));
+    tx.send(Message::Text(text.into()))
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }
 
@@ -433,7 +454,7 @@ fn send_error(
     id: &str,
     code: &'static str,
     message: String,
-) -> Result<(), serde_json::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let frame: ResponseFrame<serde_json::Value> = ResponseFrame {
         kind: "res",
         id: id.to_string(),
@@ -442,7 +463,8 @@ fn send_error(
         error: Some(ErrorShape { code, message }),
     };
     let text = serde_json::to_string(&frame)?;
-    let _ = tx.send(Message::Text(text.into()));
+    tx.send(Message::Text(text.into()))
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }
 
@@ -450,13 +472,14 @@ fn send_event<T: Serialize>(
     tx: &mpsc::UnboundedSender<Message>,
     event: &'static str,
     payload: T,
-) -> Result<(), serde_json::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let frame = EventFrame {
         kind: "event",
         event,
         payload: Some(payload),
     };
     let text = serde_json::to_string(&frame)?;
-    let _ = tx.send(Message::Text(text.into()));
+    tx.send(Message::Text(text.into()))
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }

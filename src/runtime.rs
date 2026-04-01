@@ -15,7 +15,7 @@ pub struct AppState {
     pub config: Config,
     pub config_path: Option<PathBuf>,
     pub llm: Arc<dyn crate::llm::LlmProvider>,
-    pub channels: ChannelRegistry,
+    pub channels: Arc<ChannelRegistry>,
 }
 
 impl Clone for AppState {
@@ -25,7 +25,7 @@ impl Clone for AppState {
             config: self.config.clone(),
             config_path: self.config_path.clone(),
             llm: Arc::clone(&self.llm),
-            channels: ChannelRegistry::new(),
+            channels: Arc::clone(&self.channels),
         }
     }
 }
@@ -50,7 +50,7 @@ pub fn build_app_state_with_path(
         config,
         config_path,
         llm,
-        channels,
+        channels: Arc::new(channels),
     })
 }
 

@@ -93,7 +93,10 @@ fn build_web_assets() {
 
     println!("cargo:warning=building egopulse web assets into web/dist");
 
-    if !Path::new("web/node_modules").is_dir() {
+    let need_npm_install = !Path::new("web/node_modules").is_dir()
+        || web_assets_need_rebuild(source_dist);
+
+    if need_npm_install {
         if Path::new("web/package-lock.json").is_file() {
             run_command(&npm, &["--prefix", "web", "ci"], "install web dependencies");
         } else {
