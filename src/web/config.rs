@@ -113,21 +113,24 @@ pub(super) async fn api_put_config(
     let yaml = serde_yml::to_string(&root).map_err(internal_error)?;
     std::fs::write(&path, yaml).map_err(internal_error)?;
 
-    let display = Config::load(Some(&path)).unwrap_or_else(|_| Config {
-        model: request.model.trim().to_string(),
-        api_key: state.app_state.config.api_key.clone(),
-        llm_base_url: request.base_url.trim().to_string(),
-        data_dir: request.data_dir.trim().to_string(),
-        log_level: state.app_state.config.log_level.clone(),
-        channels: std::collections::HashMap::from([(
-            "web".to_string(),
-            ChannelConfig {
-                enabled: Some(request.web_enabled),
-                host: Some(request.web_host.trim().to_string()),
-                port: Some(request.web_port),
-            },
-        )]),
-    });
+    let display = match Config::load_allow_missing_api_key(Some(&path)) {
+        Ok(config) => config,
+        Err(_) => Config {
+            model: request.model.trim().to_string(),
+            api_key: state.app_state.config.api_key.clone(),
+            llm_base_url: request.base_url.trim().to_string(),
+            data_dir: request.data_dir.trim().to_string(),
+            log_level: state.app_state.config.log_level.clone(),
+            channels: std::collections::HashMap::from([(
+                "web".to_string(),
+                ChannelConfig {
+                    enabled: Some(request.web_enabled),
+                    host: Some(request.web_host.trim().to_string()),
+                    port: Some(request.web_port),
+                },
+            )]),
+        },
+    };
 
     Ok(Json(serde_json::json!({
         "ok": true,

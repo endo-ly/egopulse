@@ -340,8 +340,8 @@ button {
   gap: 14px;
 }
 
-.checkbox-row {
-  flex-direction: row !important;
+.config-form label.checkbox-row {
+  flex-direction: row;
   align-items: center;
 }
 

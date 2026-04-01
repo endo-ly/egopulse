@@ -10,9 +10,7 @@ use uuid::Uuid;
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
 
 use super::sse::AgentEvent;
-use super::{
-    RUN_HISTORY_LIMIT, RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key,
-};
+use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SendRequest {
@@ -141,7 +139,6 @@ pub(super) async fn start_stream_run(
                 &run_id_for_task,
                 "status",
                 json!({"message": "running"}).to_string(),
-                RUN_HISTORY_LIMIT,
             )
             .await;
 
@@ -164,7 +161,6 @@ pub(super) async fn start_stream_run(
                                 &run_id_for_events,
                                 "status",
                                 json!({"message": format!("iteration {iteration}")}).to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }
@@ -174,7 +170,6 @@ pub(super) async fn start_stream_run(
                                 &run_id_for_events,
                                 "tool_start",
                                 json!({"name": name}).to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }
@@ -194,7 +189,6 @@ pub(super) async fn start_stream_run(
                                     "duration_ms": duration_ms,
                                 })
                                 .to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }
@@ -204,7 +198,6 @@ pub(super) async fn start_stream_run(
                                 &run_id_for_events,
                                 "delta",
                                 json!({"delta": delta}).to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }
@@ -214,7 +207,6 @@ pub(super) async fn start_stream_run(
                                 &run_id_for_events,
                                 "done",
                                 json!({"response": text}).to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }
@@ -224,7 +216,6 @@ pub(super) async fn start_stream_run(
                                 &run_id_for_events,
                                 "error",
                                 json!({"error": message}).to_string(),
-                                RUN_HISTORY_LIMIT,
                             )
                             .await;
                     }

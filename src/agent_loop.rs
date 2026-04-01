@@ -187,7 +187,7 @@ where
 
     let response = response_handle.await.map_err(|error| {
         EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
-            "stream task failed: {error}"
+            "stream task join failed: {error}"
         )))
     })??;
 

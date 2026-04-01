@@ -75,16 +75,21 @@ function api<T>(path: string, options?: RequestInit): Promise<T> {
       "Content-Type": "application/json",
       ...(options?.headers || {}),
     },
-  }).then(async (res) => {
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const payload = data as { error?: string; message?: string };
-      throw new Error(
-        String(payload.error || payload.message || `HTTP ${res.status}`),
-      );
-    }
-    return data as T;
-  });
+  })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Network error: ${message}`);
+    })
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const payload = data as { error?: string; message?: string };
+        throw new Error(
+          String(payload.error || payload.message || `HTTP ${res.status}`),
+        );
+      }
+      return data as T;
+    });
 }
 
 function wsUrl(): string {
@@ -206,6 +211,7 @@ function App() {
   const connectPromise = useRef<Promise<void> | null>(null);
   const connectResolve = useRef<(() => void) | null>(null);
   const connectReject = useRef<((error: Error) => void) | null>(null);
+  const sendAbortRef = useRef<AbortController | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const selectedSessionRef = useRef("");
 
@@ -231,6 +237,7 @@ function App() {
     void connectGateway();
     return () => {
       socketRef.current?.close();
+      sendAbortRef.current?.abort();
     };
   }, []);
 
@@ -403,7 +410,9 @@ function App() {
     setDraft("");
     setStatus({ tone: "idle", text: "Waiting for response…" });
 
+    sendAbortRef.current?.abort();
     const abortController = new AbortController();
+    sendAbortRef.current = abortController;
     try {
       const sendResponse = await api<{
         ok: boolean;
@@ -655,6 +664,15 @@ function App() {
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (
+                event.key === "Enter" &&
+                (event.ctrlKey || event.metaKey)
+              ) {
+                event.preventDefault();
+                handleSend(event as unknown as FormEvent);
+              }
+            }}
             placeholder="Type a message"
             rows={3}
           />
@@ -665,19 +683,33 @@ function App() {
       </main>
 
       {showSettings && config ? (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => setShowSettings(false)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setShowSettings(false);
+          }}
+          role="presentation"
+        >
           <div
             className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="modal-title"
             onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setShowSettings(false);
+            }}
           >
             <div className="modal-header">
               <div>
-                <h3>Runtime Config</h3>
+                <h3 id="modal-title">Runtime Config</h3>
                 <p>{config.config_path}</p>
               </div>
               <button
                 className="icon-button"
                 onClick={() => setShowSettings(false)}
+                aria-label="Close modal"
               >
                 ×
               </button>
@@ -739,12 +771,17 @@ function App() {
                   <input
                     type="number"
                     value={config.web_port}
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const parsed = Number(event.target.value);
+                      const clamped =
+                        Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535
+                          ? Math.round(parsed)
+                          : 0;
                       setConfig({
                         ...config,
-                        web_port: Number(event.target.value) || 0,
-                      })
-                    }
+                        web_port: clamped,
+                      });
+                    }}
                   />
                 </label>
               </div>

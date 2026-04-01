@@ -59,96 +59,11 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let resolved_config_path = match config_path {
-            Some(path) => Some(PathBuf::from(path)),
-            None => Self::resolve_config_path()?,
-        };
-        let file_config = read_file_config(resolved_config_path.as_deref())?;
-
-        let model = first_non_empty([
-            env_var("EGOPULSE_MODEL"),
-            file_config.model,
-            Some(default_model().to_string()),
-        ])
-        .ok_or(ConfigError::MissingModel)?;
-
-        let llm_base_url = first_non_empty([
-            env_var("EGOPULSE_BASE_URL"),
-            file_config.base_url,
-            Some(default_llm_base_url().to_string()),
-        ])
-        .ok_or(ConfigError::MissingBaseUrl)?;
-        validate_base_url(&llm_base_url)?;
-
-        let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_config.api_key])
-            .map(|value| SecretString::new(value.into_boxed_str()));
-        if api_key.is_none() && !base_url_allows_empty_api_key(&llm_base_url) {
-            return Err(ConfigError::MissingApiKey);
-        }
-
-        let data_dir = env_var("EGOPULSE_DATA_DIR")
-            .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
-            .unwrap_or_else(|| default_data_dir().to_string());
-
-        let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
-            .unwrap_or_else(|| "info".to_string());
-
-        let mut channels = normalize_channels(file_config.channels.unwrap_or_default());
-        apply_web_channel_env_overrides(&mut channels);
-
-        Ok(Self {
-            model,
-            api_key,
-            llm_base_url,
-            data_dir,
-            log_level,
-            channels,
-        })
+        build_config(config_path, false)
     }
 
     pub fn load_allow_missing_api_key(config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let resolved_config_path = match config_path {
-            Some(path) => Some(PathBuf::from(path)),
-            None => Self::resolve_config_path()?,
-        };
-        let file_config = read_file_config(resolved_config_path.as_deref())?;
-
-        let model = first_non_empty([
-            env_var("EGOPULSE_MODEL"),
-            file_config.model,
-            Some(default_model().to_string()),
-        ])
-        .ok_or(ConfigError::MissingModel)?;
-
-        let llm_base_url = first_non_empty([
-            env_var("EGOPULSE_BASE_URL"),
-            file_config.base_url,
-            Some(default_llm_base_url().to_string()),
-        ])
-        .ok_or(ConfigError::MissingBaseUrl)?;
-        validate_base_url(&llm_base_url)?;
-
-        let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_config.api_key])
-            .map(|value| SecretString::new(value.into_boxed_str()));
-
-        let data_dir = env_var("EGOPULSE_DATA_DIR")
-            .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
-            .unwrap_or_else(|| default_data_dir().to_string());
-
-        let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
-            .unwrap_or_else(|| "info".to_string());
-
-        let mut channels = normalize_channels(file_config.channels.unwrap_or_default());
-        apply_web_channel_env_overrides(&mut channels);
-
-        Ok(Self {
-            model,
-            api_key,
-            llm_base_url,
-            data_dir,
-            log_level,
-            channels,
-        })
+        build_config(config_path, true)
     }
 
     pub fn web_enabled(&self) -> bool {
@@ -246,6 +161,58 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<String, ChannelConfig>
     if web.port.is_none() {
         web.port = Some(default_web_port());
     }
+}
+
+fn build_config(
+    config_path: Option<&Path>,
+    allow_missing_api_key: bool,
+) -> Result<Config, ConfigError> {
+    let resolved_config_path = match config_path {
+        Some(path) => Some(PathBuf::from(path)),
+        None => Config::resolve_config_path()?,
+    };
+    let file_config = read_file_config(resolved_config_path.as_deref())?;
+
+    let model = first_non_empty([
+        env_var("EGOPULSE_MODEL"),
+        file_config.model,
+        Some(default_model().to_string()),
+    ])
+    .ok_or(ConfigError::MissingModel)?;
+
+    let llm_base_url = first_non_empty([
+        env_var("EGOPULSE_BASE_URL"),
+        file_config.base_url,
+        Some(default_llm_base_url().to_string()),
+    ])
+    .ok_or(ConfigError::MissingBaseUrl)?;
+    validate_base_url(&llm_base_url)?;
+
+    let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_config.api_key])
+        .map(|value| SecretString::new(value.into_boxed_str()));
+    if !allow_missing_api_key && api_key.is_none() && !base_url_allows_empty_api_key(&llm_base_url)
+    {
+        return Err(ConfigError::MissingApiKey);
+    }
+
+    let data_dir = env_var("EGOPULSE_DATA_DIR")
+        .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
+        .unwrap_or_else(|| default_data_dir().to_string());
+
+    let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
+        .unwrap_or_else(|| "info".to_string());
+
+    let mut channels = normalize_channels(file_config.channels.unwrap_or_default());
+    apply_web_channel_env_overrides(&mut channels);
+
+    Ok(Config {
+        model,
+        api_key,
+        llm_base_url,
+        data_dir,
+        log_level,
+        channels,
+    })
 }
 
 fn parse_bool(value: &str) -> Option<bool> {

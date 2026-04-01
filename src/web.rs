@@ -104,13 +104,7 @@ impl RunHub {
         );
     }
 
-    pub(crate) async fn publish(
-        &self,
-        run_id: &str,
-        event: &str,
-        data: String,
-        history_limit: usize,
-    ) {
+    pub(crate) async fn publish(&self, run_id: &str, event: &str, data: String) {
         let mut guard = self.channels.lock().await;
         let Some(channel) = guard.get_mut(run_id) else {
             return;
@@ -122,7 +116,7 @@ impl RunHub {
             data,
         };
         channel.next_id = channel.next_id.saturating_add(1);
-        if channel.history.len() >= history_limit {
+        if channel.history.len() >= RUN_HISTORY_LIMIT {
             let _ = channel.history.pop_front();
         }
         channel.history.push_back(evt.clone());
@@ -360,5 +354,15 @@ mod tests {
         assert_eq!(web_session_key("web:main"), "main");
         assert_eq!(web_session_key("main"), "main");
         assert_eq!(web_external_chat_id("main"), "web:main");
+    }
+
+    #[test]
+    fn session_key_edge_cases() {
+        assert_eq!(web_session_key(""), "main");
+        assert_eq!(web_session_key("   "), "main");
+        assert_eq!(web_session_key("web:"), "main");
+        assert_eq!(web_session_key("web:   "), "main");
+        assert_eq!(web_session_key("  web:foo  "), "foo");
+        assert_eq!(web_session_key("web:web:nested"), "web:nested");
     }
 }

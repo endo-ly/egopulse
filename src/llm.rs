@@ -193,6 +193,7 @@ impl LlmProvider for OpenAiProvider {
         if !done {
             for data in sse.finish() {
                 if data == "[DONE]" {
+                    done = true;
                     break;
                 }
                 if let Some(piece) = process_openai_stream_event(&data)
@@ -204,6 +205,12 @@ impl LlmProvider for OpenAiProvider {
                     }
                 }
             }
+        }
+
+        if !done {
+            return Err(LlmError::InvalidResponse(
+                "stream ended before [DONE]".to_string(),
+            ));
         }
 
         let text = text.trim().to_string();

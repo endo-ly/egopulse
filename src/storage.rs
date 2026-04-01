@@ -113,8 +113,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
                 ON tool_calls(chat_id);
 
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_message_id
-                ON tool_calls(message_id);",
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+                ON tool_calls(chat_id, message_id);",
         )?;
 
         Ok(Self {
@@ -464,19 +464,20 @@ impl Database {
         Ok(())
     }
 
-    /// Get all tool calls for a specific message.
+    /// Get all tool calls for a specific message within a chat.
     pub fn get_tool_calls_for_message(
         &self,
+        chat_id: i64,
         message_id: &str,
     ) -> Result<Vec<ToolCall>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
-             FROM tool_calls WHERE message_id = ?1 ORDER BY timestamp",
+             FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 ORDER BY timestamp",
         )?;
 
         let calls = stmt
-            .query_map(params![message_id], |row| {
+            .query_map(params![chat_id, message_id], |row| {
                 Ok(ToolCall {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
@@ -738,7 +739,7 @@ mod tests {
             .expect("update tool call");
 
         let calls = db
-            .get_tool_calls_for_message("message-1")
+            .get_tool_calls_for_message(chat_id, "message-1")
             .expect("load tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool_output.as_deref(), Some("done"));
