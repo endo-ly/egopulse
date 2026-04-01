@@ -167,24 +167,29 @@ where
 
     // LLM call with streaming
     let start = std::time::Instant::now();
+    let llm = state.llm.clone();
+    let messages_for_llm = messages.clone();
 
-    // Create channel for streaming text chunks
+    // Forward text chunks while the provider is still generating them.
     let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response_handle = tokio::spawn(async move {
+        llm.send_message_stream("", messages_for_llm, Some(&text_tx))
+            .await
+    });
 
-    // Spawn a task to forward text chunks to on_event
-    let response = state
-        .llm
-        .send_message_stream("", messages.clone(), Some(&text_tx))
-        .await?;
-
-    // Collect streaming text and emit TextDelta events in real-time
     let mut streamed_text = String::new();
-    while let Ok(chunk) = text_rx.try_recv() {
+    while let Some(chunk) = text_rx.recv().await {
         if !chunk.is_empty() {
             streamed_text.push_str(&chunk);
             on_event(AgentEvent::TextDelta { delta: chunk });
         }
     }
+
+    let response = response_handle.await.map_err(|error| {
+        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+            "stream task failed: {error}"
+        )))
+    })??;
 
     let duration_ms = start.elapsed().as_millis();
 

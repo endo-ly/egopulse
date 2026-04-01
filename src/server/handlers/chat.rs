@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
@@ -65,6 +65,12 @@ fn event_to_sse(event: AgentEvent) -> Event {
     }
 }
 
+fn forward_agent_event(tx: &UnboundedSender<AgentEvent>, event: AgentEvent) {
+    if tx.send(event).is_err() {
+        tracing::debug!("SSE receiver dropped; stop forwarding agent events");
+    }
+}
+
 /// Send a message and return SSE stream with events.
 pub async fn send_stream(
     state: State<AppState>,
@@ -91,7 +97,7 @@ pub async fn send_stream(
     .ok();
 
     let state_inner = state.0.clone();
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     let stream = async_stream::stream! {
         // Send initial start event
@@ -116,7 +122,7 @@ pub async fn send_stream(
                     &context,
                     &message,
                     move |event: AgentEvent| {
-                        let _ = tx_for_task.try_send(event);
+                        forward_agent_event(&tx_for_task, event);
                     },
                 )
                 .await
