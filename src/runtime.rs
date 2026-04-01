@@ -3,11 +3,11 @@ use std::sync::Arc;
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
-use crate::channels::WebAdapter;
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, create_provider};
 use crate::storage::{Database, SessionSummary, call_blocking};
+use crate::web::WebAdapter;
 
 pub struct AppState {
     pub db: Arc<Database>,

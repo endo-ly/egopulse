@@ -74,7 +74,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::channels::WebAdapter;
+    use crate::web::WebAdapter;
 
     #[test]
     fn registry_registers_and_resolves() {
