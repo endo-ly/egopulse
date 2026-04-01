@@ -445,7 +445,10 @@ impl Database {
     }
 
     /// Get all tool calls for a specific message.
-    pub fn get_tool_calls_for_message(&self, message_id: &str) -> Result<Vec<ToolCall>, StorageError> {
+    pub fn get_tool_calls_for_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<ToolCall>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp

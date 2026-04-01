@@ -1,7 +1,7 @@
 //! WebUI static file serving.
 
 use axum::response::{Html, IntoResponse, Response};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/webui");
 

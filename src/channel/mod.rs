@@ -85,7 +85,10 @@ impl ChannelRegistry {
     }
 
     /// Resolve a DB chat_type string to the adapter and conversation kind.
-    pub fn resolve(&self, db_chat_type: &str) -> Option<(&Arc<dyn ChannelAdapter>, ConversationKind)> {
+    pub fn resolve(
+        &self,
+        db_chat_type: &str,
+    ) -> Option<(&Arc<dyn ChannelAdapter>, ConversationKind)> {
         let channel_name = self.type_to_channel.get(db_chat_type)?;
         let adapter = self.adapters.get(channel_name)?;
         let kind = self.type_to_conversation.get(db_chat_type)?;

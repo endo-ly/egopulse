@@ -9,6 +9,7 @@ const messageInput = document.getElementById('message-input');
 const sendBtn = document.getElementById('send-btn');
 const newSessionBtn = document.getElementById('new-session');
 const currentSessionSpan = document.getElementById('current-session');
+let activeAssistantMessage = null;
 
 // Load sessions
 async function loadSessions() {
@@ -68,19 +69,122 @@ async function loadHistory(sessionKey) {
 function addMessage(sender, content, isBot) {
     const div = document.createElement('div');
     div.className = `message ${isBot ? 'bot' : 'user'}`;
-    div.innerHTML = `
-        <div class="sender">${sender}</div>
-        <div class="content">${escapeHtml(content)}</div>
-    `;
+
+    const senderDiv = document.createElement('div');
+    senderDiv.className = 'sender';
+    senderDiv.textContent = sender;
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'content';
+    contentDiv.textContent = content;
+
+    div.appendChild(senderDiv);
+    div.appendChild(contentDiv);
     messagesDiv.appendChild(div);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    return div;
+}
+
+function ensureAssistantMessage() {
+    if (activeAssistantMessage && messagesDiv.contains(activeAssistantMessage)) {
+        return activeAssistantMessage;
+    }
+
+    activeAssistantMessage = addMessage('Assistant', '', true);
+    return activeAssistantMessage;
+}
+
+function appendAssistantDelta(delta) {
+    if (!delta) {
+        return;
+    }
+
+    const messageDiv = ensureAssistantMessage();
+    const contentDiv = messageDiv.querySelector('.content');
+    contentDiv.textContent += delta;
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
-// Escape HTML
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+function finalizeAssistantMessage(text) {
+    if (activeAssistantMessage && messagesDiv.contains(activeAssistantMessage)) {
+        const contentDiv = activeAssistantMessage.querySelector('.content');
+        if (!contentDiv.textContent && text) {
+            contentDiv.textContent = text;
+        }
+        activeAssistantMessage = null;
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        return;
+    }
+
+    if (text) {
+        addMessage('Assistant', text, true);
+    }
+}
+
+function parseJson(data) {
+    try {
+        return JSON.parse(data);
+    } catch {
+        return null;
+    }
+}
+
+function handleSseEvent(eventName, data) {
+    const payload = parseJson(data);
+
+    switch (eventName) {
+        case 'text_delta':
+            appendAssistantDelta(payload?.delta || '');
+            break;
+        case 'final_response':
+            finalizeAssistantMessage(payload?.text || '');
+            break;
+        case 'error':
+            addMessage('System', payload?.message || data || 'Error: Failed to send message', true);
+            activeAssistantMessage = null;
+            break;
+        default:
+            break;
+    }
+}
+
+function processSseBuffer(state, flush = false) {
+    let newlineIndex = state.buffer.indexOf('\n');
+    while (newlineIndex !== -1) {
+        let line = state.buffer.slice(0, newlineIndex);
+        state.buffer = state.buffer.slice(newlineIndex + 1);
+        line = line.replace(/\r$/, '');
+
+        if (line === '') {
+            if (state.dataLines.length > 0) {
+                handleSseEvent(state.eventName, state.dataLines.join('\n'));
+                state.dataLines = [];
+                state.eventName = 'message';
+            }
+        } else if (line.startsWith('event:')) {
+            state.eventName = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+            state.dataLines.push(line.slice(5).trimStart());
+        }
+
+        newlineIndex = state.buffer.indexOf('\n');
+    }
+
+    if (flush && state.buffer) {
+        const line = state.buffer.replace(/\r$/, '');
+        if (line.startsWith('event:')) {
+            state.eventName = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+            state.dataLines.push(line.slice(5).trimStart());
+        }
+        state.buffer = '';
+    }
+
+    if (flush && state.dataLines.length > 0) {
+        handleSseEvent(state.eventName, state.dataLines.join('\n'));
+        state.dataLines = [];
+        state.eventName = 'message';
+    }
 }
 
 // Send a message
@@ -92,6 +196,7 @@ async function sendMessage() {
 
     // Add user message to UI
     addMessage('You', message, false);
+    activeAssistantMessage = null;
 
     try {
         const response = await fetch('/api/send_stream', {
@@ -104,31 +209,42 @@ async function sendMessage() {
             })
         });
 
+        if (!response.ok) {
+            const errorText = (await response.text()).trim();
+            addMessage('System', errorText || `Error: Server returned ${response.status}`, true);
+            return;
+        }
+
+        if (!response.body) {
+            addMessage('System', 'Error: Empty response body', true);
+            return;
+        }
+
         // Read SSE stream
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = '';
+        const sseState = {
+            buffer: '',
+            eventName: 'message',
+            dataLines: []
+        };
 
         while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-                if (line.startsWith('data:')) {
-                    const data = line.slice(5);
-                    if (data) {
-                        addMessage('Assistant', data, true);
-                    }
-                }
+            if (done) {
+                break;
             }
+
+            sseState.buffer += decoder.decode(value, { stream: true });
+            processSseBuffer(sseState);
         }
+
+        sseState.buffer += decoder.decode();
+        processSseBuffer(sseState, true);
     } catch (error) {
         console.error('Failed to send message:', error);
         addMessage('System', 'Error: Failed to send message', true);
+        activeAssistantMessage = null;
     }
 }
 

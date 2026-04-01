@@ -60,6 +60,12 @@ body {
     cursor: pointer;
 }
 
+#new-session:focus-visible,
+#send-btn:focus-visible {
+    outline: 2px solid #bbe1fa;
+    outline-offset: 2px;
+}
+
 #chat {
     flex: 1;
     display: flex;
@@ -119,6 +125,12 @@ body {
     background: #1a1a2e;
     color: white;
     border-radius: 4px;
+}
+
+#message-input:focus-visible {
+    outline: 2px solid #bbe1fa;
+    outline-offset: 2px;
+    border-color: #bbe1fa;
 }
 
 #send-btn {

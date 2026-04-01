@@ -34,7 +34,12 @@ pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
 
-    Ok(AppState { db, config, llm, channels })
+    Ok(AppState {
+        db,
+        config,
+        llm,
+        channels,
+    })
 }
 
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {

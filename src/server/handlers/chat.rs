@@ -2,16 +2,17 @@
 
 use std::convert::Infallible;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
 
-use crate::agent_loop::{process_turn_with_events, SurfaceContext};
+use crate::agent_loop::{SurfaceContext, process_turn_with_events};
 use crate::runtime::AppState;
-use crate::server::sse::AgentEvent;
+use crate::server::sse::{AgentEvent, PublicAgentEvent};
 use crate::storage::call_blocking;
 
 #[derive(Debug, Deserialize)]
@@ -21,16 +22,46 @@ pub struct SendRequest {
     pub message: String,
 }
 
+struct AbortOnDrop<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn wait(mut self) -> Result<T, JoinError> {
+        self.handle
+            .take()
+            .expect("join handle should be present")
+            .await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 /// Convert AgentEvent to SSE Event.
 fn event_to_sse(event: AgentEvent) -> Event {
-    let json = serde_json::to_string(&event).unwrap_or_default();
-    match &event {
-        AgentEvent::Iteration { .. } => Event::default().event("iteration").data(&json),
-        AgentEvent::ToolStart { .. } => Event::default().event("tool_start").data(&json),
-        AgentEvent::ToolResult { .. } => Event::default().event("tool_result").data(&json),
-        AgentEvent::TextDelta { .. } => Event::default().event("text_delta").data(&json),
-        AgentEvent::FinalResponse { .. } => Event::default().event("final_response").data(&json),
-        AgentEvent::Error { .. } => Event::default().event("error").data(&json),
+    let public_event = PublicAgentEvent::from(event);
+    let json = serde_json::to_string(&public_event).unwrap_or_default();
+    match &public_event {
+        PublicAgentEvent::Iteration { .. } => Event::default().event("iteration").data(&json),
+        PublicAgentEvent::ToolStart { .. } => Event::default().event("tool_start").data(&json),
+        PublicAgentEvent::ToolResult { .. } => Event::default().event("tool_result").data(&json),
+        PublicAgentEvent::TextDelta { .. } => Event::default().event("text_delta").data(&json),
+        PublicAgentEvent::FinalResponse { .. } => {
+            Event::default().event("final_response").data(&json)
+        }
+        PublicAgentEvent::Error { .. } => Event::default().event("error").data(&json),
     }
 }
 
@@ -40,14 +71,21 @@ pub async fn send_stream(
     Json(request): Json<SendRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let session_key = request.session_key.unwrap_or_else(|| "main".to_string());
-    let sender_name = request.sender_name.unwrap_or_else(|| "web-user".to_string());
+    let sender_name = request
+        .sender_name
+        .unwrap_or_else(|| "web-user".to_string());
     let message = request.message;
 
     // Get chat_id
     let db = state.db.clone();
     let session_key_for_resolve = session_key.clone();
     let chat_id = call_blocking(db, move |db| {
-        db.resolve_or_create_chat_id("web", &session_key_for_resolve, Some(&session_key_for_resolve), "web")
+        db.resolve_or_create_chat_id(
+            "web",
+            &session_key_for_resolve,
+            Some(&session_key_for_resolve),
+            "web",
+        )
     })
     .await
     .ok();
@@ -70,8 +108,9 @@ pub async fn send_stream(
             // Clone state for the async task
             let state_for_task = state_inner.clone();
             let tx_for_task = tx.clone();
+            drop(tx);
 
-            let handle = tokio::spawn(async move {
+            let handle = AbortOnDrop::new(tokio::spawn(async move {
                 process_turn_with_events(
                     &state_for_task,
                     &context,
@@ -79,8 +118,9 @@ pub async fn send_stream(
                     move |event: AgentEvent| {
                         let _ = tx_for_task.try_send(event);
                     },
-                ).await
-            });
+                )
+                .await
+            }));
 
             // Forward events from channel to SSE stream
             while let Some(event) = rx.recv().await {
@@ -88,7 +128,7 @@ pub async fn send_stream(
             }
 
             // Wait for processing to complete
-            match handle.await {
+            match handle.wait().await {
                 Ok(Ok(_)) => {},
                 Ok(Err(e)) => {
                     yield Ok(Event::default().event("error").data(&e.to_string()));

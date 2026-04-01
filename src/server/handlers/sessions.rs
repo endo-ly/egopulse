@@ -1,7 +1,7 @@
 //! Sessions API handlers.
 
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -26,9 +26,7 @@ pub struct SessionItem {
 }
 
 /// List all sessions.
-pub async fn list_sessions(
-    state: State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn list_sessions(state: State<AppState>) -> Json<serde_json::Value> {
     let db = state.db.clone();
     let sessions = call_blocking(db, |db| db.list_sessions())
         .await
@@ -64,7 +62,12 @@ pub async fn get_history(
     let db = state.db.clone();
     let session_key_for_resolve = session_key.clone();
     let chat_id = match call_blocking(db.clone(), move |db| {
-        db.resolve_or_create_chat_id("web", &session_key_for_resolve, Some(&session_key_for_resolve), "web")
+        db.resolve_or_create_chat_id(
+            "web",
+            &session_key_for_resolve,
+            Some(&session_key_for_resolve),
+            "web",
+        )
     })
     .await
     {
@@ -77,11 +80,9 @@ pub async fn get_history(
         }
     };
 
-    let messages = call_blocking(db, move |db| {
-        db.get_recent_messages(chat_id, limit)
-    })
-    .await
-    .unwrap_or_default();
+    let messages = call_blocking(db, move |db| db.get_recent_messages(chat_id, limit))
+        .await
+        .unwrap_or_default();
 
     Json(json!({
         "ok": true,

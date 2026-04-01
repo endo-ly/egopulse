@@ -14,26 +14,24 @@ pub use router::build_router;
 
 use std::net::SocketAddr;
 
-use crate::runtime::AppState;
 use crate::error::EgoPulseError;
+use crate::runtime::AppState;
 
 /// Run the HTTP server with graceful shutdown.
-pub async fn run_server(
-    state: AppState,
-    host: &str,
-    port: u16,
-) -> Result<(), EgoPulseError> {
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| EgoPulseError::Channel(crate::error::ChannelError::SendFailed(
-            format!("Invalid address: {}", e)
-        )))?;
+pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
+    let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
+        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+            "Invalid address: {}",
+            e
+        )))
+    })?;
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| EgoPulseError::Channel(crate::error::ChannelError::SendFailed(
-            format!("Failed to bind: {}", e)
-        )))?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+            "Failed to bind: {}",
+            e
+        )))
+    })?;
 
     tracing::info!("EgoPulse server listening on http://{}", addr);
 
@@ -64,9 +62,12 @@ pub async fn run_server(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
         .await
-        .map_err(|e| EgoPulseError::Channel(crate::error::ChannelError::SendFailed(
-            format!("Server error: {}", e)
-        )))?;
+        .map_err(|e| {
+            EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+                "Server error: {}",
+                e
+            )))
+        })?;
 
     Ok(())
 }
