@@ -197,6 +197,7 @@ mod tests {
             llm_base_url: base_url,
             data_dir: ".egopulse-test".to_string(),
             log_level: "info".to_string(),
+            channels: std::collections::HashMap::new(),
         }
     }
 

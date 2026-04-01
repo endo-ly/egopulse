@@ -267,6 +267,7 @@ mod tests {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            channels: std::collections::HashMap::new(),
         }
     }
 
@@ -280,10 +281,12 @@ mod tests {
     }
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+        use crate::channel::ChannelRegistry;
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: test_config(data_dir),
             llm: Arc::from(llm),
+            channels: ChannelRegistry::new(),
         }
     }
 
