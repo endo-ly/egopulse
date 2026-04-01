@@ -190,10 +190,7 @@ pub(crate) fn web_session_key(raw: &str) -> String {
     if trimmed.is_empty() {
         return "main".to_string();
     }
-    let stripped = trimmed
-        .strip_prefix("web:")
-        .unwrap_or(trimmed)
-        .trim();
+    let stripped = trimmed.strip_prefix("web:").unwrap_or(trimmed).trim();
     if stripped.is_empty() {
         return "main".to_string();
     }

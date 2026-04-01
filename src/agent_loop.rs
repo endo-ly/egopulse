@@ -426,7 +426,7 @@ mod tests {
             config: test_config(data_dir),
             config_path: None,
             llm: Arc::from(llm),
-            channels: ChannelRegistry::new(),
+            channels: Arc::new(ChannelRegistry::new()),
         }
     }
 

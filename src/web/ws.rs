@@ -177,7 +177,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     let payload = match serde_json::from_value::<ConnectParams>(params) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            if send_error(&out_tx, &id, "invalid_params", error.to_string()).is_err() {
+                            if send_error(&out_tx, &id, "invalid_params", error.to_string())
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -192,7 +194,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                             &id,
                             "unsupported_protocol",
                             format!("server supports protocol {PROTOCOL_VERSION}"),
-                        ).is_err() {
+                        )
+                        .is_err()
+                        {
                             break;
                         }
                         continue;
@@ -213,13 +217,17 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                                 events: vec!["connect.challenge", "chat"],
                             },
                         },
-                    ).is_err() {
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                 }
                 "chat.send" => {
                     if !connected.load(Ordering::SeqCst) {
-                        if send_error(&out_tx, &id, "not_connected", "connect first".to_string()).is_err() {
+                        if send_error(&out_tx, &id, "not_connected", "connect first".to_string())
+                            .is_err()
+                        {
                             break;
                         }
                         continue;
@@ -228,7 +236,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     let payload = match serde_json::from_value::<ChatSendParams>(params) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            if send_error(&out_tx, &id, "invalid_params", error.to_string()).is_err() {
+                            if send_error(&out_tx, &id, "invalid_params", error.to_string())
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -256,7 +266,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                                     "internal_error"
                                 },
                                 message,
-                            ).is_err() {
+                            )
+                            .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -270,7 +282,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                             run_id: started.run_id.clone(),
                             status: "accepted",
                         },
-                    ).is_err() {
+                    )
+                    .is_err()
+                    {
                         break;
                     }
 
@@ -331,7 +345,9 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                         &id,
                         "unknown_method",
                         format!("unknown method: {method}"),
-                    ).is_err() {
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                 }

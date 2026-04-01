@@ -60,8 +60,7 @@ pub(super) async fn list_sessions(
         })
         .collect::<Vec<_>>();
 
-    Json(serde_json::json!({"ok": true, "sessions": items}))
-        .into()
+    Ok(Json(serde_json::json!({"ok": true, "sessions": items})))
 }
 
 pub(super) async fn get_history(
@@ -82,7 +81,9 @@ pub(super) async fn get_history(
     {
         Ok(Some(id)) => id,
         Ok(None) => {
-            return Ok(Json(serde_json::json!({"ok": true, "session_key": session_key, "messages": []})));
+            return Ok(Json(
+                serde_json::json!({"ok": true, "session_key": session_key, "messages": []}),
+            ));
         }
         Err(error) => {
             tracing::warn!(session_key = %session_key, error = %error, "failed to resolve web session");
@@ -99,9 +100,7 @@ pub(super) async fn get_history(
             tracing::warn!(chat_id, error = %error, "failed to load message history");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"ok": false, "messages": [], "error": error.to_string()}),
-                ),
+                Json(serde_json::json!({"ok": false, "messages": [], "error": error.to_string()})),
             ));
         }
     };
@@ -116,5 +115,5 @@ pub(super) async fn get_history(
             "is_from_bot": message.is_from_bot,
             "timestamp": message.timestamp,
         })).collect::<Vec<_>>()
-    }))
+    })))
 }
