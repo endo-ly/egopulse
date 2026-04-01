@@ -1,14 +1,10 @@
-//! Health check handlers.
-
 use axum::Json;
 use axum::extract::State;
-use serde_json::json;
 
-use crate::runtime::AppState;
+use super::WebState;
 
-/// Health check endpoint.
-pub async fn health(_state: State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({
+pub(super) async fn health(_state: State<WebState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION")
     }))

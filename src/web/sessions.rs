@@ -1,22 +1,19 @@
-//! Sessions API handlers.
-
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
-use crate::runtime::AppState;
 use crate::storage::call_blocking;
 
+use super::{WebState, web_external_chat_id, web_session_key};
+
 #[derive(Debug, Deserialize)]
-pub struct HistoryQuery {
+pub(super) struct HistoryQuery {
     pub session_key: Option<String>,
     pub limit: Option<usize>,
 }
 
-/// Session item for API response.
 #[derive(Debug, Serialize)]
-pub struct SessionItem {
+pub(super) struct SessionItem {
     pub session_key: String,
     pub label: String,
     pub chat_id: i64,
@@ -25,54 +22,55 @@ pub struct SessionItem {
     pub last_message_preview: Option<String>,
 }
 
-/// List all sessions.
-pub async fn list_sessions(state: State<AppState>) -> Json<serde_json::Value> {
-    let db = state.db.clone();
+pub(super) async fn list_sessions(State(state): State<WebState>) -> Json<serde_json::Value> {
+    let db = state.app_state.db.clone();
     let sessions = match call_blocking(db, |db| db.list_sessions()).await {
         Ok(sessions) => sessions,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to list sessions");
-            return Json(json!({
-                "ok": false,
-                "error": "Failed to list sessions",
-                "sessions": []
-            }));
+            tracing::warn!(error = %error, "failed to list sessions");
+            return Json(
+                serde_json::json!({"ok": false, "sessions": [], "error": error.to_string()}),
+            );
         }
     };
 
-    let items: Vec<SessionItem> = sessions
+    let items = sessions
         .into_iter()
-        .map(|s| SessionItem {
-            session_key: s.surface_thread.clone(),
-            label: s.chat_title.unwrap_or(s.surface_thread),
-            chat_id: s.chat_id,
-            channel: s.channel,
-            last_message_time: s.last_message_time,
-            last_message_preview: s.last_message_preview,
+        .filter(|session| session.channel == "web")
+        .map(|session| {
+            let session_key = web_session_key(&session.surface_thread);
+            SessionItem {
+                label: session
+                    .chat_title
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| session_key.clone()),
+                session_key,
+                chat_id: session.chat_id,
+                channel: session.channel,
+                last_message_time: session.last_message_time,
+                last_message_preview: session.last_message_preview,
+            }
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    Json(json!({
-        "ok": true,
-        "sessions": items
-    }))
+    Json(serde_json::json!({"ok": true, "sessions": items}))
 }
 
-/// Get message history for a session.
-pub async fn get_history(
-    state: State<AppState>,
+pub(super) async fn get_history(
+    State(state): State<WebState>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<serde_json::Value> {
-    let session_key = query.session_key.unwrap_or_else(|| "main".to_string());
-    let limit = query.limit.unwrap_or(50);
+    let session_key = web_session_key(query.session_key.as_deref().unwrap_or("main"));
+    let external_chat_id = web_external_chat_id(&session_key);
+    let limit = query.limit.unwrap_or(100);
+    let db = state.app_state.db.clone();
 
-    // Resolve chat_id from session_key
-    let db = state.db.clone();
     let session_key_for_resolve = session_key.clone();
     let chat_id = match call_blocking(db.clone(), move |db| {
         db.resolve_or_create_chat_id(
             "web",
-            &session_key_for_resolve,
+            &external_chat_id,
             Some(&session_key_for_resolve),
             "web",
         )
@@ -81,37 +79,32 @@ pub async fn get_history(
     {
         Ok(id) => id,
         Err(error) => {
-            tracing::warn!(session_key = %session_key, error = %error, "Failed to resolve session");
-            return Json(json!({
-                "ok": false,
-                "error": "Failed to resolve session",
-                "messages": []
-            }));
+            tracing::warn!(session_key = %session_key, error = %error, "failed to resolve web session");
+            return Json(
+                serde_json::json!({"ok": false, "messages": [], "error": error.to_string()}),
+            );
         }
     };
 
     let messages = match call_blocking(db, move |db| db.get_recent_messages(chat_id, limit)).await {
         Ok(messages) => messages,
         Err(error) => {
-            tracing::warn!(chat_id = chat_id, error = %error, "Failed to load session history");
-            return Json(json!({
-                "ok": false,
-                "session_key": session_key,
-                "error": "Failed to load session history",
-                "messages": []
-            }));
+            tracing::warn!(chat_id, error = %error, "failed to load message history");
+            return Json(
+                serde_json::json!({"ok": false, "messages": [], "error": error.to_string()}),
+            );
         }
     };
 
-    Json(json!({
+    Json(serde_json::json!({
         "ok": true,
         "session_key": session_key,
-        "messages": messages.iter().map(|m| json!({
-            "id": m.id,
-            "sender_name": m.sender_name,
-            "content": m.content,
-            "is_from_bot": m.is_from_bot,
-            "timestamp": m.timestamp
+        "messages": messages.into_iter().map(|message| serde_json::json!({
+            "id": message.id,
+            "sender_name": message.sender_name,
+            "content": message.content,
+            "is_from_bot": message.is_from_bot,
+            "timestamp": message.timestamp,
         })).collect::<Vec<_>>()
     }))
 }

@@ -42,10 +42,6 @@ pub enum ConfigError {
     MissingBaseUrl,
     #[error("invalid_base_url")]
     InvalidBaseUrl,
-    #[error("invalid_web_enabled")]
-    InvalidWebEnabled,
-    #[error("invalid_web_port")]
-    InvalidWebPort,
     #[error("web_channel_disabled")]
     WebChannelDisabled,
     #[error("missing_api_key")]

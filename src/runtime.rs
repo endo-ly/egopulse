@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
@@ -12,6 +13,7 @@ use crate::web::WebAdapter;
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
+    pub config_path: Option<PathBuf>,
     pub llm: Arc<dyn crate::llm::LlmProvider>,
     pub channels: ChannelRegistry,
 }
@@ -21,6 +23,7 @@ impl Clone for AppState {
         Self {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            config_path: self.config_path.clone(),
             llm: Arc::clone(&self.llm),
             channels: ChannelRegistry::new(),
         }
@@ -28,6 +31,13 @@ impl Clone for AppState {
 }
 
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
+    build_app_state_with_path(config, None)
+}
+
+pub fn build_app_state_with_path(
+    config: Config,
+    config_path: Option<PathBuf>,
+) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let llm = Arc::from(create_provider(&config)?);
 
@@ -38,6 +48,7 @@ pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     Ok(AppState {
         db,
         config,
+        config_path,
         llm,
         channels,
     })

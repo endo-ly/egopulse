@@ -3,11 +3,12 @@ name = "egopulse"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"

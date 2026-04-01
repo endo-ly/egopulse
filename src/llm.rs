@@ -407,10 +407,14 @@ mod tests {
             llm_base_url: base_url,
             data_dir: ".egopulse-test".to_string(),
             log_level: "info".to_string(),
-            web_enabled: true,
-            web_host: "127.0.0.1".to_string(),
-            web_port: 10961,
-            channels: std::collections::HashMap::new(),
+            channels: std::collections::HashMap::from([(
+                "web".to_string(),
+                crate::config::ChannelConfig {
+                    enabled: Some(true),
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(10961),
+                },
+            )]),
         }
     }
 
