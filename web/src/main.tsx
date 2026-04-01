@@ -110,6 +110,22 @@ function buildDraftId(runId: string): string {
   return `draft:${runId}`
 }
 
+function makeId(prefix: string): string {
+  const cryptoApi = globalThis.crypto as Crypto | undefined
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+    return `${prefix}:${cryptoApi.randomUUID()}`
+  }
+
+  if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16)
+    cryptoApi.getRandomValues(bytes)
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+    return `${prefix}:${hex}`
+  }
+
+  return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`
+}
+
 function App() {
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [selectedSession, setSelectedSession] = useState<string>('')
@@ -241,7 +257,7 @@ function App() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('gateway is not connected'))
     }
-    const id = `${method}:${crypto.randomUUID()}`
+    const id = makeId(method)
     const request: WsReq = { type: 'req', id, method, params }
     return new Promise<WsRes>((resolve, reject) => {
       requestResolvers.current.set(id, { resolve, reject })
@@ -304,7 +320,7 @@ function App() {
     }
 
     setMessages((prev) => [...prev, {
-      id: crypto.randomUUID(),
+      id: makeId('message'),
       sender_name: 'web-user',
       content: text,
       is_from_bot: false,
