@@ -1,13 +1,14 @@
 # EgoPulse
 
 EgoPulse は EgoGraph 向けの Rust runtime foundation です。  
-Issue 2.5 時点では、local TUI と developer 向け CLI を備えた persistent runtime を提供します。
+Issue 2.5 時点では、local TUI と developer 向け CLI に加えて、React/Vite ベースの WebUI と WebSocket gateway を提供します。
 
 ## Prerequisites
 
 - Rust stable
 - `cargo fmt`
 - `cargo clippy`
+- Node.js / npm
 
 ## Config
 
@@ -29,12 +30,12 @@ export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"
 export EGOPULSE_DATA_DIR=".egopulse"
 export EGOPULSE_LOG_LEVEL="info"
-export EGOPULSE_WEB_ENABLED="true"
-export EGOPULSE_WEB_HOST="127.0.0.1"
-export EGOPULSE_WEB_PORT="10961"
 ```
 
 ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
+
+Web の有効化や bind 設定は YAML の `channels.web` で管理します。  
+`EGOPULSE_WEB_ENABLED` / `EGOPULSE_WEB_HOST` / `EGOPULSE_WEB_PORT` を使う場合でも、実行時には `channels.web` 相当の値として扱われます。
 
 ### Endpoint examples
 
@@ -63,8 +64,18 @@ export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 
 ### Config file
 
-サンプルは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照してください。
+サンプルは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照してください。  
 `egopulse.config.yaml` は current directory から自動検出されます。明示的に指定したい場合は `--config` を使ってください。
+
+Web の設定は次の形です。
+
+```yaml
+channels:
+  web:
+    enabled: true
+    host: 127.0.0.1
+    port: 10961
+```
 
 ```bash
 cargo run -p egopulse -- --config /path/to/egopulse.config.yaml ask "hello"
@@ -105,43 +116,32 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 
 ### HTTP Server with WebUI
 
-`web` サブコマンドで HTTP サーバーを起動し、WebUI 経由でチャットできます。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `web_host` / `web_port` を使います。
+`web` サブコマンドで HTTP サーバーを起動し、React/Vite 製 WebUI と WebSocket gateway を公開します。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `channels.web.host` / `channels.web.port` を使います。
 
 ```bash
 cargo run -p egopulse -- web
-cargo run -p egopulse -- web --host 0.0.0.0 --port 8080
+cargo run -p egopulse -- --config egopulse.config.yaml web --host 0.0.0.0 --port 8080
 ```
 
 Endpoints:
 - `GET /` - WebUI
 - `GET /health` - Health check
+- `GET /api/health` - Health check
+- `GET /api/config` - Runtime config 取得
+- `PUT /api/config` - Runtime config 保存
 - `GET /api/sessions` - List sessions
 - `GET /api/history?session_key=...` - Get message history
-- `POST /api/send_stream` - Send message with SSE streaming
+- `POST /api/send_stream` - HTTP 経由のチャット送信
+- `GET /ws` - WebSocket gateway
+
+現在の WebUI では次ができます。
+- セッション一覧の表示
+- セッション履歴の表示
+- Runtime Config の表示と保存
+- WebSocket gateway 経由のチャット
 
 会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。  
 Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。
-
-### Local TUI controls
-
-Browser:
-
-- `j/k` or arrows
-- `Ctrl-N/P`
-- `g/G`
-- `PageUp/PageDown`
-- `Enter` open
-- `n` new session
-- `r` refresh sessions
-- `q` quit
-
-Chat:
-
-- `Enter` send
-- `Esc` back
-- `← / →` move cursor
-- `↑` move to input start, then walk input history
-- `↓` move forward through input history
 
 ## Current scope
 
@@ -151,7 +151,8 @@ Chat:
 - OpenAI-compatible endpoint に対する `ask`
 - SQLite 永続化付きの `chat --session`
 - `ask --session` による既存 session の再開
-- `web` による HTTP サーバー + WebUI (SSE streaming)
+- `web` による HTTP サーバー + React WebUI
+- `GET /ws` による WebSocket gateway
 
 次フェーズで追加予定:
 
@@ -162,6 +163,8 @@ Chat:
 ## Local checks
 
 ```bash
+npm install --prefix egopulse/web
+npm run build --prefix egopulse/web
 cargo fmt --check
 cargo check -p egopulse
 cargo clippy --all-targets --all-features -- -D warnings
