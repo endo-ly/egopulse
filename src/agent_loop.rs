@@ -399,6 +399,9 @@ mod tests {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            web_enabled: true,
+            web_host: "127.0.0.1".to_string(),
+            web_port: 10961,
             channels: std::collections::HashMap::new(),
         }
     }

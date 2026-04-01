@@ -34,13 +34,13 @@ enum Command {
         session: Option<String>,
     },
     /// Start the HTTP server with WebUI.
-    Serve {
+    Web {
         /// Host address to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(long)]
+        host: Option<String>,
         /// Port to listen on
-        #[arg(long, default_value_t = 3000)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -78,9 +78,25 @@ async fn run() -> Result<(), EgoPulseError> {
                 Err(error) => Err(error),
             }
         }
-        Some(Command::Serve { host, port }) => {
+        Some(Command::Web { host, port }) => {
+            if !config.channel_enabled("web") {
+                return Err(EgoPulseError::Config(
+                    egopulse::error::ConfigError::WebChannelDisabled,
+                ));
+            }
+            let channel_web = config.channels.get("web");
+            let bind_host = host.unwrap_or_else(|| {
+                channel_web
+                    .and_then(|channel| channel.host.clone())
+                    .unwrap_or_else(|| config.web_host.clone())
+            });
+            let bind_port = port.unwrap_or_else(|| {
+                channel_web
+                    .and_then(|channel| channel.port)
+                    .unwrap_or(config.web_port)
+            });
             let state = runtime::build_app_state(config)?;
-            server::run_server(state, &host, port).await
+            server::run_server(state, &bind_host, bind_port).await
         }
         None => runtime::run_tui(config).await,
     }

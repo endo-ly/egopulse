@@ -29,6 +29,9 @@ export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"
 export EGOPULSE_DATA_DIR=".egopulse"
 export EGOPULSE_LOG_LEVEL="info"
+export EGOPULSE_WEB_ENABLED="true"
+export EGOPULSE_WEB_HOST="127.0.0.1"
+export EGOPULSE_WEB_PORT="10961"
 ```
 
 ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
@@ -102,11 +105,11 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 
 ### HTTP Server with WebUI
 
-`serve` サブコマンドで HTTP サーバーを起動し、WebUI 経由でチャットできます。
+`web` サブコマンドで HTTP サーバーを起動し、WebUI 経由でチャットできます。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `web_host` / `web_port` を使います。
 
 ```bash
-cargo run -p egopulse -- serve
-cargo run -p egopulse -- serve --host 0.0.0.0 --port 8080
+cargo run -p egopulse -- web
+cargo run -p egopulse -- web --host 0.0.0.0 --port 8080
 ```
 
 Endpoints:
@@ -148,7 +151,7 @@ Chat:
 - OpenAI-compatible endpoint に対する `ask`
 - SQLite 永続化付きの `chat --session`
 - `ask --session` による既存 session の再開
-- `serve` による HTTP サーバー + WebUI (SSE streaming)
+- `web` による HTTP サーバー + WebUI (SSE streaming)
 
 次フェーズで追加予定:
 

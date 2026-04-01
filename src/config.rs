@@ -13,7 +13,7 @@ use crate::error::ConfigError;
 /// Per-channel configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ChannelConfig {
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
 }
@@ -25,6 +25,9 @@ struct FileConfig {
     base_url: Option<String>,
     data_dir: Option<String>,
     log_level: Option<String>,
+    web_enabled: Option<bool>,
+    web_host: Option<String>,
+    web_port: Option<u16>,
     channels: Option<HashMap<String, ChannelConfig>>,
 }
 
@@ -35,6 +38,9 @@ pub struct Config {
     pub llm_base_url: String,
     pub data_dir: String,
     pub log_level: String,
+    pub web_enabled: bool,
+    pub web_host: String,
+    pub web_port: u16,
     pub channels: HashMap<String, ChannelConfig>,
 }
 
@@ -53,6 +59,9 @@ impl std::fmt::Debug for Config {
             .field("llm_base_url", &self.llm_base_url)
             .field("data_dir", &self.data_dir)
             .field("log_level", &self.log_level)
+            .field("web_enabled", &self.web_enabled)
+            .field("web_host", &self.web_host)
+            .field("web_port", &self.web_port)
             .finish()
     }
 }
@@ -96,7 +105,38 @@ impl Config {
         let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
             .unwrap_or_else(|| "info".to_string());
 
-        let channels = file_config.channels.unwrap_or_default();
+        let web_enabled = env_var("EGOPULSE_WEB_ENABLED")
+            .map(|value| parse_bool_env(&value))
+            .transpose()?
+            .or(file_config.web_enabled)
+            .unwrap_or_else(default_web_enabled);
+
+        let web_host = first_non_empty([
+            env_var("EGOPULSE_WEB_HOST"),
+            file_config.web_host,
+            Some(default_web_host().to_string()),
+        ])
+        .expect("default web host should be non-empty");
+
+        let web_port = env_var("EGOPULSE_WEB_PORT")
+            .map(|value| parse_u16_env(&value))
+            .transpose()?
+            .or(file_config.web_port)
+            .unwrap_or_else(default_web_port);
+
+        let mut channels = file_config.channels.unwrap_or_default();
+        if web_enabled {
+            let web_channel = channels.entry("web".to_string()).or_default();
+            if web_channel.enabled.is_none() {
+                web_channel.enabled = Some(true);
+            }
+            if web_channel.host.is_none() {
+                web_channel.host = Some(web_host.clone());
+            }
+            if web_channel.port.is_none() {
+                web_channel.port = Some(web_port);
+            }
+        }
 
         Ok(Self {
             model,
@@ -104,8 +144,30 @@ impl Config {
             llm_base_url,
             data_dir,
             log_level,
+            web_enabled,
+            web_host,
+            web_port,
             channels,
         })
+    }
+
+    fn inferred_channel_enabled(&self, channel: &str) -> bool {
+        match channel {
+            "web" => self.web_enabled || self.channels.contains_key("web"),
+            _ => self.channels.contains_key(channel),
+        }
+    }
+
+    fn explicit_channel_enabled(&self, channel: &str) -> Option<bool> {
+        self.channels.get(channel).and_then(|config| config.enabled)
+    }
+
+    pub fn channel_enabled(&self, channel: &str) -> bool {
+        let needle = channel.trim().to_ascii_lowercase();
+        if let Some(explicit) = self.explicit_channel_enabled(&needle) {
+            return explicit;
+        }
+        self.inferred_channel_enabled(&needle)
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
@@ -138,6 +200,18 @@ fn default_llm_base_url() -> &'static str {
 
 fn default_data_dir() -> &'static str {
     ".egopulse"
+}
+
+fn default_web_enabled() -> bool {
+    true
+}
+
+fn default_web_host() -> &'static str {
+    "127.0.0.1"
+}
+
+fn default_web_port() -> u16 {
+    10961
 }
 
 fn env_vars_sufficient_for_runtime() -> bool {
@@ -199,6 +273,21 @@ fn env_var(key: &str) -> Option<String> {
         .and_then(|value| normalize_string(Some(value)))
 }
 
+fn parse_bool_env(value: &str) -> Result<bool, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidWebEnabled),
+    }
+}
+
+fn parse_u16_env(value: &str) -> Result<u16, ConfigError> {
+    value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidWebPort)
+}
+
 fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> Option<String> {
     values.into_iter().find_map(normalize_string)
 }
@@ -246,6 +335,9 @@ mod tests {
             std::env::remove_var("EGOPULSE_BASE_URL");
             std::env::remove_var("EGOPULSE_DATA_DIR");
             std::env::remove_var("EGOPULSE_LOG_LEVEL");
+            std::env::remove_var("EGOPULSE_WEB_ENABLED");
+            std::env::remove_var("EGOPULSE_WEB_HOST");
+            std::env::remove_var("EGOPULSE_WEB_PORT");
         }
     }
 
@@ -272,6 +364,10 @@ mod tests {
             file_path.parent().expect("dir").join("./runtime")
         );
         assert_eq!(config.log_level, "debug");
+        assert!(config.web_enabled);
+        assert_eq!(config.web_host, "127.0.0.1");
+        assert_eq!(config.web_port, 10961);
+        assert!(config.channel_enabled("web"));
     }
 
     #[test]
@@ -284,6 +380,9 @@ mod tests {
             std::env::set_var("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
             std::env::set_var("EGOPULSE_DATA_DIR", "/tmp/egopulse-env");
             std::env::set_var("EGOPULSE_LOG_LEVEL", "trace");
+            std::env::set_var("EGOPULSE_WEB_ENABLED", "false");
+            std::env::set_var("EGOPULSE_WEB_HOST", "0.0.0.0");
+            std::env::set_var("EGOPULSE_WEB_PORT", "8080");
         }
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -302,7 +401,76 @@ mod tests {
         assert_eq!(config.llm_base_url, "https://api.openai.com/v1");
         assert_eq!(config.data_dir, "/tmp/egopulse-env");
         assert_eq!(config.log_level, "trace");
+        assert!(!config.web_enabled);
+        assert_eq!(config.web_host, "0.0.0.0");
+        assert_eq!(config.web_port, 8080);
+        assert!(!config.channel_enabled("web"));
         clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn loads_web_settings_from_config_file() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nweb_enabled: false\nweb_host: 0.0.0.0\nweb_port: 4010"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert!(!config.web_enabled);
+        assert_eq!(config.web_host, "0.0.0.0");
+        assert_eq!(config.web_port, 4010);
+        assert!(!config.channel_enabled("web"));
+    }
+
+    #[test]
+    #[serial]
+    fn synthesizes_web_channel_from_top_level_web_settings() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nweb_enabled: true\nweb_host: 0.0.0.0\nweb_port: 4010"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let web = config.channels.get("web").expect("web channel");
+        assert_eq!(web.enabled, Some(true));
+        assert_eq!(web.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(web.port, Some(4010));
+        assert!(config.channel_enabled("web"));
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_web_channel_enabled_false_overrides_top_level_web_enabled() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nweb_enabled: true\nchannels:\n  web:\n    enabled: false"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let web = config.channels.get("web").expect("web channel");
+        assert_eq!(web.enabled, Some(false));
+        assert_eq!(web.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(web.port, Some(10961));
+        assert!(!config.channel_enabled("web"));
     }
 
     #[test]
