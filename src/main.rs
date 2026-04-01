@@ -6,6 +6,7 @@ use egopulse::config::Config;
 use egopulse::error::EgoPulseError;
 use egopulse::logging::init_logging;
 use egopulse::runtime;
+use egopulse::server;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,6 +32,15 @@ enum Command {
     Chat {
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
+    },
+    /// Start the HTTP server with WebUI.
+    Serve {
+        /// Host address to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
     },
 }
 
@@ -67,6 +77,10 @@ async fn run() -> Result<(), EgoPulseError> {
                 Ok(()) | Err(EgoPulseError::ShutdownRequested) => Ok(()),
                 Err(error) => Err(error),
             }
+        }
+        Some(Command::Serve { host, port }) => {
+            let state = runtime::build_app_state(config)?;
+            server::run_server(state, &host, port).await
         }
         None => runtime::run_tui(config).await,
     }
