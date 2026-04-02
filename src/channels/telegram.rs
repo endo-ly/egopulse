@@ -241,7 +241,6 @@ pub async fn start_telegram_bot(state: Arc<AppState>, token: String) {
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .default_handler(|_| async {})
         .dependencies(dptree::deps![state])
-        .enable_ctrlc_handler()
         .build();
 
     dispatcher

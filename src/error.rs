@@ -46,6 +46,8 @@ pub enum ConfigError {
     WebChannelDisabled,
     #[error("missing_api_key")]
     MissingApiKey,
+    #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
+    NoActiveChannels,
 }
 
 #[derive(Debug, Error)]

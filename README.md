@@ -204,7 +204,7 @@ cargo run -p egopulse -- --config egopulse.config.yaml start
 #### 2. Bot をサーバーに招待
 
 **OAuth2** → **URL Generator**:
-- Scques: `bot`
+- Scopes: `bot`
 - Bot Permissions: `Send Messages`, `Read Message History`, `Use Slash Commands`
 - 生成された URL で対象サーバーに招待
 

@@ -224,7 +224,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
     if !has_active_channels {
         return Err(EgoPulseError::Config(
-            crate::error::ConfigError::MissingApiKey,
+            crate::error::ConfigError::NoActiveChannels,
         ));
     }
 
