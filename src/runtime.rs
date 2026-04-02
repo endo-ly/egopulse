@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tracing::info;
+
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
@@ -44,6 +46,21 @@ pub fn build_app_state_with_path(
     // Build channel registry
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
+
+    #[cfg(feature = "channel-discord")]
+    if let Some(token) = config.discord_bot_token() {
+        channels.register(Arc::new(crate::channels::discord::DiscordAdapter::new(
+            token,
+        )));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    if let Some(token) = config.telegram_bot_token() {
+        let bot = teloxide::Bot::new(&token);
+        channels.register(Arc::new(crate::channels::telegram::TelegramAdapter::new(
+            bot,
+        )));
+    }
 
     Ok(AppState {
         db,
@@ -135,4 +152,79 @@ pub async fn send_turn(
 pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
     let state = build_app_state(config)?;
     channels::tui::run(state).await
+}
+
+/// 全有効チャネルを一括起動 (microclaw 互換)。
+///
+/// `egopulse start` から呼び出される。
+/// microclaw `src/runtime.rs::run()` と同じパターン:
+/// 設定ベースでチャネルを構築 → spawn → ctrl_c 待機。
+pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
+    let mut has_active_channels = false;
+
+    // Web サーバー起動
+    if state.config.web_enabled() {
+        has_active_channels = true;
+        let web_state = state.clone();
+        let host = state.config.web_host();
+        let port = state.config.web_port();
+        info!("Starting Web UI server on {host}:{port}");
+        tokio::spawn(async move {
+            if let Err(e) = crate::web::run_server(web_state, &host, port).await {
+                tracing::error!("Web server error: {e}");
+            }
+        });
+    }
+
+    // Discord bot 起動
+    #[cfg(feature = "channel-discord")]
+    if state.config.channel_enabled("discord") {
+        if let Some(token) = state.config.discord_bot_token() {
+            has_active_channels = true;
+            let discord_state = Arc::new(state.clone());
+            info!("Starting Discord bot...");
+            tokio::spawn(async move {
+                crate::channels::discord::start_discord_bot(discord_state, token).await;
+            });
+        } else {
+            tracing::warn!(
+                "Discord channel is enabled but no bot_token is configured. \
+                 Set channels.discord.bot_token in egopulse.config.yaml \
+                 or set EGOPULSE_DISCORD_BOT_TOKEN environment variable."
+            );
+        }
+    }
+
+    // Telegram bot 起動
+    #[cfg(feature = "channel-telegram")]
+    if state.config.channel_enabled("telegram") {
+        if let Some(token) = state.config.telegram_bot_token() {
+            has_active_channels = true;
+            let telegram_state = Arc::new(state.clone());
+            let bot_username = state.config.telegram_bot_username().unwrap_or_default();
+            info!("Starting Telegram bot as @{bot_username}...");
+            tokio::spawn(async move {
+                crate::channels::telegram::start_telegram_bot(telegram_state, token).await;
+            });
+        } else {
+            tracing::warn!(
+                "Telegram channel is enabled but no bot_token is configured. \
+                 Set channels.telegram.bot_token in egopulse.config.yaml \
+                 or set EGOPULSE_TELEGRAM_BOT_TOKEN environment variable."
+            );
+        }
+    }
+
+    if !has_active_channels {
+        return Err(EgoPulseError::Config(
+            crate::error::ConfigError::MissingApiKey,
+        ));
+    }
+
+    info!("Runtime active; waiting for Ctrl-C");
+    tokio::signal::ctrl_c().await.map_err(|e| {
+        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(e.to_string()))
+    })?;
+
+    Ok(())
 }
