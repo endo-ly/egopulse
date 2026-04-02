@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use teloxide::prelude::*;
-use teloxide::types::ChatAction;
+use teloxide::types::{ChatAction, MessageEntityKind};
 use tracing::{debug, error, info};
 
 use crate::agent_loop::SurfaceContext;
@@ -140,12 +140,21 @@ async fn handle_message(
         }
     }
 
-    // グループ/スーパーグループでは @bot_username メンションを検知
+    // グループ/スーパーグループでは message entity の Mention で正確に判定
     let is_group = chat_type != "telegram_private";
     if is_group {
         let bot_username = state.config.telegram_bot_username();
         let mentioned = match &bot_username {
-            Some(username) => text.contains(&format!("@{username}")),
+            Some(username) => msg
+                .parse_entities()
+                .into_iter()
+                .flatten()
+                .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
+                .any(|e| {
+                    e.text()
+                        .strip_prefix('@')
+                        .is_some_and(|m| m.eq_ignore_ascii_case(username))
+                }),
             None => false,
         };
 

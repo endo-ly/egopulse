@@ -174,7 +174,7 @@ cargo run -p egopulse -- start
 cargo run -p egopulse -- --config egopulse.config.yaml start
 ```
 
-設定ファイルの `channels.*.enabled: true` かつ bot_token が設定されたチャネルが自動的に起動します。Web、Discord、Telegram を同時に稼働でき、Ctrl-C で全チャネルを graceful shutdown します。
+Web は `channels.web.enabled: true` で起動し、Discord / Telegram は `channels.<name>.enabled: true` かつ `bot_token` が設定されていると起動します。Web、Discord、Telegram を同時に稼働でき、Ctrl-C で全チャネルを graceful shutdown します。
 
 各チャネルのメッセージは `SurfaceContext` に正規化され、agent runtime で処理された結果が各プラットフォームの文字数制限に合わせて自動分割されて返信されます。
 
