@@ -237,20 +237,26 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             if handle.is_finished() {
                 any_finished = true;
                 match handle.await {
-                    Ok(()) => tracing::error!("Channel '{name}' exited unexpectedly"),
-                    Err(e) => tracing::error!("Channel '{name}' failed: {e}"),
+                    Ok(()) => {
+                        tracing::error!("Channel '{name}' exited unexpectedly — shutting down");
+                    }
+                    Err(e) => {
+                        tracing::error!("Channel '{name}' failed: {e} — shutting down");
+                    }
                 }
             }
         }
         if any_finished {
-            break;
+            return Err(EgoPulseError::Channel(
+                crate::error::ChannelError::SendFailed(
+                    "a channel task exited unexpectedly".to_string(),
+                ),
+            ));
         }
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
         }
     }
-
-    Ok(())
 }
