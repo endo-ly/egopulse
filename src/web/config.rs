@@ -127,6 +127,7 @@ pub(super) async fn api_put_config(
                     enabled: Some(request.web_enabled),
                     host: Some(request.web_host.trim().to_string()),
                     port: Some(request.web_port),
+                    ..Default::default()
                 },
             )]),
         },

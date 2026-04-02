@@ -15,6 +15,14 @@ pub struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
+    /// Discord / Telegram 共通: bot token
+    pub bot_token: Option<String>,
+    /// Telegram: bot username (group メンション検知用)
+    pub bot_username: Option<String>,
+    /// Telegram: DM 許可ユーザー ID (空 = 全員許可)
+    pub allowed_user_ids: Option<Vec<i64>>,
+    /// Discord: 許可チャンネル ID (空 = 全チャンネル許可)
+    pub allowed_channels: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -109,6 +117,37 @@ impl Config {
             searched_paths: vec![PathBuf::from("./egopulse.config.yaml")],
         })
     }
+
+    /// Discord bot token (env override or config file).
+    pub fn discord_bot_token(&self) -> Option<String> {
+        env::var("EGOPULSE_DISCORD_BOT_TOKEN")
+            .ok()
+            .and_then(|v| normalize_string(Some(v)))
+            .or_else(|| {
+                self.channels
+                    .get("discord")
+                    .and_then(|c| c.bot_token.clone())
+            })
+    }
+
+    /// Telegram bot token (env override or config file).
+    pub fn telegram_bot_token(&self) -> Option<String> {
+        env::var("EGOPULSE_TELEGRAM_BOT_TOKEN")
+            .ok()
+            .and_then(|v| normalize_string(Some(v)))
+            .or_else(|| {
+                self.channels
+                    .get("telegram")
+                    .and_then(|c| c.bot_token.clone())
+            })
+    }
+
+    /// Telegram bot username for group mention detection.
+    pub fn telegram_bot_username(&self) -> Option<String> {
+        self.channels
+            .get("telegram")
+            .and_then(|c| c.bot_username.clone())
+    }
 }
 
 fn normalize_channels(
@@ -133,6 +172,17 @@ fn normalize_channels(
     }
 
     normalized
+}
+
+fn apply_channel_bot_token_env_override(
+    channels: &mut HashMap<String, ChannelConfig>,
+    channel_name: &str,
+    env_key: &str,
+) {
+    if let Some(token) = env_var(env_key) {
+        let channel = channels.entry(channel_name.to_string()).or_default();
+        channel.bot_token = Some(token);
+    }
 }
 
 fn apply_web_channel_env_overrides(channels: &mut HashMap<String, ChannelConfig>) {
@@ -204,6 +254,8 @@ fn build_config(
 
     let mut channels = normalize_channels(file_config.channels.unwrap_or_default());
     apply_web_channel_env_overrides(&mut channels);
+    apply_channel_bot_token_env_override(&mut channels, "discord", "EGOPULSE_DISCORD_BOT_TOKEN");
+    apply_channel_bot_token_env_override(&mut channels, "telegram", "EGOPULSE_TELEGRAM_BOT_TOKEN");
 
     Ok(Config {
         model,

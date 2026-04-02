@@ -424,6 +424,7 @@ mod tests {
                     enabled: Some(true),
                     host: Some("127.0.0.1".to_string()),
                     port: Some(10961),
+                    ..Default::default()
                 },
             )]),
         }
