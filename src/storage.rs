@@ -37,6 +37,18 @@ pub struct SessionSnapshot {
     pub recent_messages: Vec<StoredMessage>,
 }
 
+/// Tool call record for tracking tool execution history.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub chat_id: i64,
+    pub message_id: String,
+    pub tool_name: String,
+    pub tool_input: String,
+    pub tool_output: Option<String>,
+    pub timestamp: String,
+}
+
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
     T: Send + 'static,
@@ -85,12 +97,46 @@ impl Database {
                 chat_id INTEGER PRIMARY KEY,
                 messages_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                tool_output TEXT,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+                ON tool_calls(chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+                ON tool_calls(chat_id, message_id);",
         )?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    pub fn resolve_chat_id(
+        &self,
+        channel: &str,
+        external_chat_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
+            params![channel, external_chat_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(chat_id) => Ok(Some(chat_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn resolve_or_create_chat_id(
@@ -385,6 +431,92 @@ impl Database {
             .lock()
             .map_err(|error| StorageError::InitFailed(error.to_string()))
     }
+
+    /// Store a tool call record.
+    pub fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                tool_call.id,
+                tool_call.chat_id,
+                tool_call.message_id,
+                tool_call.tool_name,
+                tool_call.tool_input,
+                tool_call.tool_output,
+                tool_call.timestamp,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the output of a tool call.
+    pub fn update_tool_call_output(&self, id: &str, output: &str) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let rows_updated = conn.execute(
+            "UPDATE tool_calls SET tool_output = ?1 WHERE id = ?2",
+            params![output, id],
+        )?;
+        if rows_updated == 0 {
+            return Err(StorageError::NotFound(format!("tool_call:{id}")));
+        }
+        Ok(())
+    }
+
+    /// Get all tool calls for a specific message within a chat.
+    pub fn get_tool_calls_for_message(
+        &self,
+        chat_id: i64,
+        message_id: &str,
+    ) -> Result<Vec<ToolCall>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+             FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 ORDER BY timestamp",
+        )?;
+
+        let calls = stmt
+            .query_map(params![chat_id, message_id], |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input: row.get(4)?,
+                    tool_output: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(calls)
+    }
+
+    /// Get all tool calls for a specific chat.
+    pub fn get_tool_calls_for_chat(&self, chat_id: i64) -> Result<Vec<ToolCall>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+             FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
+        )?;
+
+        let calls = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input: row.get(4)?,
+                    tool_output: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(calls)
+    }
 }
 
 fn logical_session_thread(
@@ -411,7 +543,7 @@ fn logical_session_thread(
 mod tests {
     use crate::error::StorageError;
 
-    use super::{Database, StoredMessage};
+    use super::{Database, StoredMessage, ToolCall};
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -573,5 +705,43 @@ mod tests {
             )
             .expect("reopen chat");
         assert_eq!(reopened_chat_id, chat_id);
+    }
+
+    #[test]
+    fn update_tool_call_output_fails_when_tool_call_is_missing() {
+        let (db, _dir) = test_db();
+
+        let error = db
+            .update_tool_call_output("missing-tool-call", "output")
+            .expect_err("missing tool call should fail");
+
+        assert!(matches!(error, StorageError::NotFound(_)));
+    }
+
+    #[test]
+    fn update_tool_call_output_updates_existing_record() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .expect("create chat");
+        let tool_call = ToolCall {
+            id: "tool-1".to_string(),
+            chat_id,
+            message_id: "message-1".to_string(),
+            tool_name: "fetch".to_string(),
+            tool_input: "{}".to_string(),
+            tool_output: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        db.store_tool_call(&tool_call).expect("store tool call");
+        db.update_tool_call_output("tool-1", "done")
+            .expect("update tool call");
+
+        let calls = db
+            .get_tool_calls_for_message(chat_id, "message-1")
+            .expect("load tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_output.as_deref(), Some("done"));
     }
 }

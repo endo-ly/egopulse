@@ -6,6 +6,12 @@ base_url: https://api.openai.com/v1
 data_dir: .egopulse
 log_level: info
 
+channels:
+  web:
+    enabled: true
+    host: 127.0.0.1
+    port: 10961
+
 # OpenAI-compatible router endpoint example:
 # model: openai/gpt-4o-mini
 # api_key: sk-or-...

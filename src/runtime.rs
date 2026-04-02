@@ -1,16 +1,21 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
+use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, create_provider};
 use crate::storage::{Database, SessionSummary, call_blocking};
+use crate::web::WebAdapter;
 
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
+    pub config_path: Option<PathBuf>,
     pub llm: Arc<dyn crate::llm::LlmProvider>,
+    pub channels: Arc<ChannelRegistry>,
 }
 
 impl Clone for AppState {
@@ -18,15 +23,35 @@ impl Clone for AppState {
         Self {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            config_path: self.config_path.clone(),
             llm: Arc::clone(&self.llm),
+            channels: Arc::clone(&self.channels),
         }
     }
 }
 
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
+    build_app_state_with_path(config, None)
+}
+
+pub fn build_app_state_with_path(
+    config: Config,
+    config_path: Option<PathBuf>,
+) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let llm = Arc::from(create_provider(&config)?);
-    Ok(AppState { db, config, llm })
+
+    // Build channel registry
+    let mut channels = ChannelRegistry::new();
+    channels.register(Arc::new(WebAdapter));
+
+    Ok(AppState {
+        db,
+        config,
+        config_path,
+        llm,
+        channels: Arc::new(channels),
+    })
 }
 
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {

@@ -2,6 +2,7 @@ use crate::error::{EgoPulseError, StorageError};
 use crate::llm::Message;
 use crate::runtime::AppState;
 use crate::storage::{SessionSnapshot, StoredMessage, call_blocking};
+use crate::web::sse::AgentEvent;
 
 const MAX_HISTORY_MESSAGES: usize = 50;
 
@@ -105,6 +106,137 @@ pub async fn process_turn(
     )
     .await?;
     Ok(response.content)
+}
+
+/// Process a turn with event callbacks for streaming.
+///
+/// Based on Microclaw's process_turn pattern with event emission.
+pub async fn process_turn_with_events<F>(
+    state: &AppState,
+    context: &SurfaceContext,
+    user_input: &str,
+    on_event: F,
+) -> Result<String, EgoPulseError>
+where
+    F: Fn(AgentEvent) + Send + Sync,
+{
+    on_event(AgentEvent::Iteration { iteration: 1 });
+
+    let chat_id = call_blocking(state.db.clone(), {
+        let channel = context.channel.clone();
+        let session_key = context.session_key();
+        let surface_thread = context.surface_thread.clone();
+        let chat_type = context.chat_type.clone();
+        move |db| {
+            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
+        }
+    })
+    .await?;
+
+    let LoadedSession {
+        mut messages,
+        session_updated_at,
+    } = load_messages_for_turn(state, chat_id).await?;
+    let mut session_updated_at = session_updated_at;
+    let user_message = Message {
+        role: "user".to_string(),
+        content: user_input.to_string(),
+    };
+    messages.push(Message {
+        role: user_message.role.clone(),
+        content: user_message.content.clone(),
+    });
+
+    let persisted_user_turn = persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: context.surface_user.clone(),
+            content: user_input.to_string(),
+            is_from_bot: false,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        user_message,
+        &messages,
+        session_updated_at,
+    )
+    .await?;
+    messages = persisted_user_turn.messages;
+    session_updated_at = Some(persisted_user_turn.updated_at);
+
+    // LLM call with streaming
+    let start = std::time::Instant::now();
+    let llm = state.llm.clone();
+    let messages_for_llm = messages.clone();
+
+    // Forward text chunks while the provider is still generating them.
+    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response_handle = tokio::spawn(async move {
+        llm.send_message_stream("", messages_for_llm, Some(&text_tx))
+            .await
+    });
+
+    let mut streamed_text = String::new();
+    while let Some(chunk) = text_rx.recv().await {
+        if !chunk.is_empty() {
+            streamed_text.push_str(&chunk);
+            on_event(AgentEvent::TextDelta { delta: chunk });
+        }
+    }
+
+    let response = response_handle.await.map_err(|error| {
+        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+            "stream task join failed: {error}"
+        )))
+    })??;
+
+    let duration_ms = start.elapsed().as_millis();
+
+    // Use streamed text if available, otherwise fall back to response content
+    let final_content = if streamed_text.is_empty() {
+        response.content.clone()
+    } else {
+        streamed_text
+    };
+
+    let assistant_message = Message {
+        role: "assistant".to_string(),
+        content: final_content.clone(),
+    };
+    messages.push(Message {
+        role: assistant_message.role.clone(),
+        content: assistant_message.content.clone(),
+    });
+
+    let _persisted_assistant_turn = persist_phase(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: final_content.clone(),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        assistant_message,
+        &messages,
+        session_updated_at,
+    )
+    .await?;
+
+    on_event(AgentEvent::FinalResponse {
+        text: final_content.clone(),
+    });
+
+    tracing::debug!(
+        channel = %context.channel,
+        chat_id = chat_id,
+        duration_ms = duration_ms,
+        "Turn completed"
+    );
+
+    Ok(final_content)
 }
 
 async fn load_messages_for_turn(
@@ -267,6 +399,14 @@ mod tests {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            channels: std::collections::HashMap::from([(
+                "web".to_string(),
+                crate::config::ChannelConfig {
+                    enabled: Some(true),
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(10961),
+                },
+            )]),
         }
     }
 
@@ -280,10 +420,13 @@ mod tests {
     }
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+        use crate::channel_adapter::ChannelRegistry;
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: test_config(data_dir),
+            config_path: None,
             llm: Arc::from(llm),
+            channels: Arc::new(ChannelRegistry::new()),
         }
     }
 

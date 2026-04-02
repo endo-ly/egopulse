@@ -6,6 +6,7 @@ use egopulse::config::Config;
 use egopulse::error::EgoPulseError;
 use egopulse::logging::init_logging;
 use egopulse::runtime;
+use egopulse::web;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -32,6 +33,15 @@ enum Command {
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
+    /// Start the HTTP server with WebUI.
+    Web {
+        /// Host address to bind to
+        #[arg(long)]
+        host: Option<String>,
+        /// Port to listen on
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[tokio::main]
@@ -44,7 +54,16 @@ async fn main() {
 
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
-    let config = Config::load(cli.config.as_deref())?;
+    let is_web = matches!(cli.command, Some(Command::Web { .. }));
+    let resolved_config_path = match cli.config.as_deref() {
+        Some(path) => Some(path.to_path_buf()),
+        None => Config::resolve_config_path()?,
+    };
+    let config = if is_web {
+        Config::load_allow_missing_api_key(resolved_config_path.as_deref())?
+    } else {
+        Config::load(resolved_config_path.as_deref())?
+    };
     init_logging(&config.log_level)?;
 
     match cli.command {
@@ -61,12 +80,23 @@ async fn run() -> Result<(), EgoPulseError> {
             Err(error) => Err(error),
         },
         Some(Command::Chat { session }) => {
-            let state = runtime::build_app_state(config)?;
+            let state = runtime::build_app_state_with_path(config, resolved_config_path.clone())?;
             let session = session.unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()));
             match cli::run_chat(&state, &session).await {
                 Ok(()) | Err(EgoPulseError::ShutdownRequested) => Ok(()),
                 Err(error) => Err(error),
             }
+        }
+        Some(Command::Web { host, port }) => {
+            if !config.channel_enabled("web") {
+                return Err(EgoPulseError::Config(
+                    egopulse::error::ConfigError::WebChannelDisabled,
+                ));
+            }
+            let bind_host = host.unwrap_or_else(|| config.web_host());
+            let bind_port = port.unwrap_or_else(|| config.web_port());
+            let state = runtime::build_app_state_with_path(config, resolved_config_path.clone())?;
+            web::run_server(state, &bind_host, bind_port).await
         }
         None => runtime::run_tui(config).await,
     }

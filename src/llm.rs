@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{Config, authorization_token};
 use crate::error::LlmError;
@@ -15,6 +17,8 @@ pub struct Message {
 struct MessagesRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,11 +28,28 @@ pub struct MessagesResponse {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Non-streaming message send.
     async fn send_message(
         &self,
         _system: &str,
         messages: Vec<Message>,
     ) -> Result<MessagesResponse, LlmError>;
+
+    /// Streaming message send.
+    /// text_tx receives each text chunk as it arrives from the LLM.
+    async fn send_message_stream(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) -> Result<MessagesResponse, LlmError> {
+        // Default: fall back to non-streaming
+        let response = self.send_message(system, messages).await?;
+        if let Some(tx) = text_tx {
+            let _ = tx.send(response.content.clone());
+        }
+        Ok(response)
+    }
 }
 
 pub fn create_provider(config: &Config) -> Result<Box<dyn LlmProvider>, LlmError> {
@@ -81,6 +102,7 @@ impl LlmProvider for OpenAiProvider {
             .json(&MessagesRequest {
                 model: self.model.clone(),
                 messages,
+                stream: None,
             })
             .send()
             .await?;
@@ -102,6 +124,205 @@ impl LlmProvider for OpenAiProvider {
             .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
         let content = extract_text(choice.message.content)?;
         Ok(MessagesResponse { content })
+    }
+
+    async fn send_message_stream(
+        &self,
+        _system: &str,
+        messages: Vec<Message>,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) -> Result<MessagesResponse, LlmError> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(api_key) = &self.api_key {
+            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&MessagesRequest {
+                model: self.model.clone(),
+                messages,
+                stream: Some(true),
+            })
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::ApiError {
+                status,
+                body_preview: preview_body(&body),
+            });
+        }
+
+        // Process streaming response
+        let mut byte_stream = response.bytes_stream();
+        let mut sse = SseEventParser::default();
+        let mut text = String::new();
+        let mut done = false;
+
+        'outer: while let Some(chunk_res) = byte_stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => return Err(LlmError::RequestFailed(e)),
+            };
+            for data in sse.push_chunk(chunk.as_ref()) {
+                if data == "[DONE]" {
+                    done = true;
+                    break 'outer;
+                }
+                if let Some(piece) = process_openai_stream_event(&data)
+                    && !piece.is_empty()
+                {
+                    text.push_str(&piece);
+                    if let Some(tx) = text_tx {
+                        let _ = tx.send(piece);
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining data (skip if [DONE] was already seen)
+        if !done {
+            for data in sse.finish() {
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                if let Some(piece) = process_openai_stream_event(&data)
+                    && !piece.is_empty()
+                {
+                    text.push_str(&piece);
+                    if let Some(tx) = text_tx {
+                        let _ = tx.send(piece);
+                    }
+                }
+            }
+        }
+
+        if !done {
+            return Err(LlmError::InvalidResponse(
+                "stream ended before [DONE]".to_string(),
+            ));
+        }
+
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err(LlmError::InvalidResponse(
+                "assistant content was empty".to_string(),
+            ));
+        }
+
+        Ok(MessagesResponse { content: text })
+    }
+}
+
+/// SSE event parser for streaming responses.
+/// Based on Microclaw's SseEventParser implementation.
+#[derive(Default)]
+struct SseEventParser {
+    pending: Vec<u8>,
+    data_lines: Vec<String>,
+}
+
+impl SseEventParser {
+    fn push_chunk(&mut self, chunk: impl AsRef<[u8]>) -> Vec<String> {
+        self.pending.extend_from_slice(chunk.as_ref());
+        let mut events = Vec::new();
+        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=pos).collect();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = Self::decode_line(line);
+            if let Some(event_data) = self.handle_line(&line) {
+                events.push(event_data);
+            }
+        }
+        events
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let mut line = std::mem::take(&mut self.pending);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = Self::decode_line(line);
+            if let Some(event_data) = self.handle_line(&line) {
+                events.push(event_data);
+            }
+        }
+        if let Some(event_data) = self.flush_event() {
+            events.push(event_data);
+        }
+        events
+    }
+
+    fn decode_line(line: Vec<u8>) -> String {
+        match String::from_utf8(line) {
+            Ok(line) => line,
+            Err(err) => String::from_utf8_lossy(&err.into_bytes()).into_owned(),
+        }
+    }
+
+    fn handle_line(&mut self, line: &str) -> Option<String> {
+        if line.is_empty() {
+            return self.flush_event();
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => {
+                let v = v.strip_prefix(' ').unwrap_or(v);
+                (f, v)
+            }
+            None => (line, ""),
+        };
+        if field == "data" {
+            self.data_lines.push(value.to_string());
+        }
+        None
+    }
+
+    fn flush_event(&mut self) -> Option<String> {
+        if self.data_lines.is_empty() {
+            return None;
+        }
+        let data = self.data_lines.join("\n");
+        self.data_lines.clear();
+        Some(data)
+    }
+}
+
+/// Process a single OpenAI streaming event and extract text delta.
+fn process_openai_stream_event(data: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let choice = v.get("choices")?.as_array()?.first()?;
+    let delta = choice.get("delta")?;
+    let content = delta.get("content")?;
+    match content {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let text: String = arr
+                .iter()
+                .filter_map(|item| item.get("text")?.as_str())
+                .collect();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
     }
 }
 
@@ -197,6 +418,14 @@ mod tests {
             llm_base_url: base_url,
             data_dir: ".egopulse-test".to_string(),
             log_level: "info".to_string(),
+            channels: std::collections::HashMap::from([(
+                "web".to_string(),
+                crate::config::ChannelConfig {
+                    enabled: Some(true),
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(10961),
+                },
+            )]),
         }
     }
 
