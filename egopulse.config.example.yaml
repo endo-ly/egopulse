@@ -11,6 +11,17 @@ channels:
     enabled: true
     host: 127.0.0.1
     port: 10961
+  # discord:
+  #   enabled: true
+  #   bot_token: your-discord-bot-token
+  #   allowed_channels:
+  #     - 1234567890
+  # telegram:
+  #   enabled: true
+  #   bot_token: your-telegram-bot-token
+  #   bot_username: your_bot_username
+  #   allowed_user_ids:
+  #     - 123456789
 
 # OpenAI-compatible router endpoint example:
 # model: openai/gpt-4o-mini
