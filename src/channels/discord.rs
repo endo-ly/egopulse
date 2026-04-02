@@ -90,7 +90,6 @@ impl ChannelAdapter for DiscordAdapter {
 /// serenity EventHandler。インバウンドメッセージを処理する。
 struct Handler {
     app_state: Arc<AppState>,
-    bot_token: String,
 }
 
 #[serenity::async_trait]
@@ -161,7 +160,7 @@ impl EventHandler for Handler {
             Ok(response) => {
                 drop(typing);
                 if !response.is_empty() {
-                    send_discord_response(&ctx, msg.channel_id, &response, &self.bot_token).await;
+                    send_discord_response(&ctx, msg.channel_id, &response).await;
                 }
             }
             Err(e) => {
@@ -174,7 +173,6 @@ impl EventHandler for Handler {
                     &ctx,
                     msg.channel_id,
                     "Sorry, an error occurred.",
-                    &self.bot_token,
                 )
                 .await;
             }
@@ -187,7 +185,7 @@ impl EventHandler for Handler {
 }
 
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
-async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str, _token: &str) {
+async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
         let _ = channel_id.say(&ctx.http, &chunk).await;
     }
@@ -206,7 +204,6 @@ pub async fn start_discord_bot(state: Arc<AppState>, token: String) {
 
     let handler = Handler {
         app_state: state,
-        bot_token: token.clone(),
     };
 
     let mut client = match Client::builder(&token, intents)
