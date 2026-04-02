@@ -19,7 +19,6 @@ use crate::agent_loop::SurfaceContext;
 use crate::channel::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
 use crate::runtime::AppState;
-use crate::storage::call_blocking;
 use crate::text::split_text;
 
 /// Discord メッセージ長制限 (文字数)。
@@ -136,46 +135,19 @@ impl EventHandler for Handler {
         }
 
         let sender_name = msg.author.name.clone();
-        let chat_type = if msg.guild_id.is_some() {
-            "discord_group"
-        } else {
-            "discord_dm"
-        };
 
+        // microclaw パターン: chat_type を "discord" に統一
         let external_chat_id = external_channel_id.to_string();
-        let channel_name = "discord".to_string();
-        let title = format!("discord-{external_channel_id}");
-
-        // session mapping: channel + external_chat_id → chat_id
-        let chat_id = call_blocking(self.app_state.db.clone(), {
-            let external_chat_id = external_chat_id.clone();
-            let channel_name = channel_name.clone();
-            let title = title.clone();
-            let chat_type = chat_type.to_string();
-            move |db| {
-                db.resolve_or_create_chat_id(
-                    &channel_name,
-                    &external_chat_id,
-                    Some(&title),
-                    &chat_type,
-                )
-            }
-        })
-        .await
-        .unwrap_or_else(|e| {
-            error!("Discord: failed to resolve chat_id: {e}");
-            external_channel_id as i64
-        });
 
         let context = SurfaceContext {
-            channel: channel_name,
+            channel: "discord".to_string(),
             surface_user: sender_name,
-            surface_thread: external_chat_id,
-            chat_type: chat_type.to_string(),
+            surface_thread: external_chat_id.clone(),
+            chat_type: "discord".to_string(),
         };
 
         info!(
-            chat_id = chat_id,
+            channel_id = external_chat_id,
             sender = %context.surface_user,
             text_preview = %text.chars().take(100).collect::<String>(),
             "Discord message received"
@@ -184,6 +156,7 @@ impl EventHandler for Handler {
         // タイピングインジケーター開始
         let typing = msg.channel_id.start_typing(&ctx.http);
 
+        // session 解決は process_turn() に一任 (二重解決を避ける)
         match crate::agent_loop::process_turn(&self.app_state, &context, &text).await {
             Ok(response) => {
                 drop(typing);
@@ -193,7 +166,10 @@ impl EventHandler for Handler {
             }
             Err(e) => {
                 drop(typing);
-                error!(chat_id = chat_id, "Discord: error processing message: {e}");
+                error!(
+                    channel_id = external_chat_id,
+                    "Discord: error processing message: {e}"
+                );
                 let _ = send_discord_response(
                     &ctx,
                     msg.channel_id,

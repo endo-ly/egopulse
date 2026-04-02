@@ -17,7 +17,6 @@ use crate::agent_loop::SurfaceContext;
 use crate::channel::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
 use crate::runtime::AppState;
-use crate::storage::call_blocking;
 use crate::text::split_text;
 
 /// Telegram メッセージ長制限 (文字数)。
@@ -46,7 +45,17 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
-        vec![("telegram", ConversationKind::Private)]
+        // microclaw パターン: concrete な chat_type を全て登録
+        vec![
+            ("telegram_private", ConversationKind::Private),
+            ("private", ConversationKind::Private),
+            ("telegram_group", ConversationKind::Group),
+            ("group", ConversationKind::Group),
+            ("supergroup", ConversationKind::Group),
+            ("channel", ConversationKind::Group),
+            ("telegram_supergroup", ConversationKind::Group),
+            ("telegram_channel", ConversationKind::Group),
+        ]
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
@@ -129,37 +138,16 @@ async fn handle_message(
     }
 
     let external_chat_id = raw_chat_id.to_string();
-    let channel_name = "telegram".to_string();
-
-    // session mapping: channel + external_chat_id → chat_id
-    let chat_id = call_blocking(state.db.clone(), {
-        let external_chat_id = external_chat_id.clone();
-        let channel_name = channel_name.clone();
-        let chat_type = chat_type.clone();
-        move |db| {
-            db.resolve_or_create_chat_id(
-                &channel_name,
-                &external_chat_id,
-                Some(&external_chat_id),
-                &chat_type,
-            )
-        }
-    })
-    .await
-    .unwrap_or_else(|e| {
-        error!("Telegram: failed to resolve chat_id: {e}");
-        raw_chat_id
-    });
 
     let context = SurfaceContext {
-        channel: channel_name,
+        channel: "telegram".to_string(),
         surface_user: sender_name,
-        surface_thread: external_chat_id,
+        surface_thread: external_chat_id.clone(),
         chat_type,
     };
 
     info!(
-        chat_id = chat_id,
+        chat_id = raw_chat_id,
         sender = %context.surface_user,
         text_preview = %text.chars().take(100).collect::<String>(),
         "Telegram message received"
@@ -177,6 +165,7 @@ async fn handle_message(
         }
     });
 
+    // session 解決は process_turn() に一任 (二重解決を避ける)
     match crate::agent_loop::process_turn(&state, &context, &text).await {
         Ok(response) => {
             typing_handle.abort();
@@ -186,7 +175,10 @@ async fn handle_message(
         }
         Err(e) => {
             typing_handle.abort();
-            error!(chat_id = chat_id, "Telegram: error processing message: {e}");
+            error!(
+                chat_id = raw_chat_id,
+                "Telegram: error processing message: {e}"
+            );
             let _ = bot
                 .send_message(msg.chat.id, "Sorry, an error occurred.")
                 .await;
@@ -253,8 +245,9 @@ mod tests {
         let bot = Bot::new("test-token");
         let adapter = TelegramAdapter::new(bot);
         let routes = adapter.chat_type_routes();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].0, "telegram");
+        // microclaw パターン: 全 concrete chat_type を登録
+        assert!(routes.len() >= 6);
+        assert_eq!(routes[0].0, "telegram_private");
         assert_eq!(routes[0].1, ConversationKind::Private);
     }
 }
