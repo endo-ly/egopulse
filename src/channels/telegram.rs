@@ -119,6 +119,27 @@ async fn handle_message(
         }
     };
 
+    // アクセス制御: DM の場合、allowed_user_ids が設定されていればチェック
+    if chat_type == "telegram_private" {
+        if let Some(allowed_ids) = state
+            .config
+            .channels
+            .get("telegram")
+            .and_then(|c| c.allowed_user_ids.as_ref())
+        {
+            if !allowed_ids.is_empty() {
+                let sender_id = msg.from.as_ref().and_then(|u| i64::try_from(u.id.0).ok());
+                if !sender_id.is_some_and(|id| allowed_ids.contains(&id)) {
+                    debug!(
+                        chat_id = raw_chat_id,
+                        "Telegram: rejecting unauthorized user in private chat"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // グループ/スーパーグループでは @bot_username メンションを検知
     let is_group = chat_type != "telegram_private";
     if is_group {
