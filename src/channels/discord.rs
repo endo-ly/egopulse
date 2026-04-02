@@ -169,12 +169,8 @@ impl EventHandler for Handler {
                     channel_id = external_chat_id,
                     "Discord: error processing message: {e}"
                 );
-                let _ = send_discord_response(
-                    &ctx,
-                    msg.channel_id,
-                    "Sorry, an error occurred.",
-                )
-                .await;
+                let _ =
+                    send_discord_response(&ctx, msg.channel_id, "Sorry, an error occurred.").await;
             }
         }
     }
@@ -187,7 +183,10 @@ impl EventHandler for Handler {
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
-        let _ = channel_id.say(&ctx.http, &chunk).await;
+        if let Err(e) = channel_id.say(&ctx.http, &chunk).await {
+            error!("Discord: failed to send message chunk: {e}");
+            break;
+        }
     }
 }
 
@@ -202,9 +201,7 @@ pub async fn start_discord_bot(state: Arc<AppState>, token: String) {
 
     info!("Starting Discord bot (requesting MESSAGE_CONTENT intent)...");
 
-    let handler = Handler {
-        app_state: state,
-    };
+    let handler = Handler { app_state: state };
 
     let mut client = match Client::builder(&token, intents)
         .event_handler(handler)
