@@ -42,7 +42,6 @@ pub(super) async fn list_sessions(
 
     let items = sessions
         .into_iter()
-        .filter(|session| session.channel == "web")
         .map(|session| {
             let session_key = web_session_key(&session.surface_thread);
             SessionItem {
