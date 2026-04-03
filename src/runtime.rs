@@ -189,7 +189,11 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let discord_state = Arc::new(state.clone());
             info!("Starting Discord bot...");
             let handle = tokio::spawn(async move {
-                crate::channels::discord::start_discord_bot(discord_state, token).await;
+                if let Err(e) =
+                    crate::channels::discord::start_discord_bot(discord_state, token).await
+                {
+                    tracing::error!("Discord bot task exited with error: {e}");
+                }
             });
             handles.push(("discord", handle));
         } else {

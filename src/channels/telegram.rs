@@ -5,13 +5,14 @@
 //!
 //! Based on: microclaw `src/channels/telegram.rs`
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, MessageEntityKind};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
 use crate::channel::ConversationKind;
@@ -24,6 +25,9 @@ const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
 /// タイピングインジケーターの送信間隔。
 const TYPING_INTERVAL_SECS: u64 = 4;
+
+/// bot_username 未設定警告の一度だけ出力フラグ。
+static BOT_USERNAME_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Telegram チャネルアダプター。
 ///
@@ -63,11 +67,31 @@ impl ChannelAdapter for TelegramAdapter {
             .parse::<i64>()
             .map_err(|_| format!("invalid Telegram external_chat_id: '{external_chat_id}'"))?;
 
+        const MAX_RETRIES: u32 = 3;
+
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
-            self.bot
-                .send_message(ChatId(chat_id), &chunk)
-                .await
-                .map_err(|e| format!("Telegram send_message failed: {e}"))?;
+            let mut attempt = 0;
+            loop {
+                match self.bot.send_message(ChatId(chat_id), &chunk).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        if let teloxide::RequestError::RetryAfter(seconds) = &e {
+                            if attempt < MAX_RETRIES {
+                                let wait = seconds.duration();
+                                debug!(
+                                    attempt = attempt + 1,
+                                    retry_after = wait.as_secs(),
+                                    "Telegram rate limited, retrying after {wait:?}"
+                                );
+                                tokio::time::sleep(wait).await;
+                                attempt += 1;
+                                continue;
+                            }
+                        }
+                        return Err(format!("Telegram send_message failed: {e}"));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -155,7 +179,18 @@ async fn handle_message(
                         .strip_prefix('@')
                         .is_some_and(|m| m.eq_ignore_ascii_case(username))
                 }),
-            None => false,
+            None => {
+                if BOT_USERNAME_WARN_EMITTED
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    warn!(
+                        chat_id = raw_chat_id,
+                        "telegram_bot_username not set; group messages will be ignored"
+                    );
+                }
+                false
+            }
         };
 
         if !mentioned {
@@ -179,7 +214,7 @@ async fn handle_message(
     info!(
         chat_id = raw_chat_id,
         sender = %context.surface_user,
-        text_preview = %text.chars().take(100).collect::<String>(),
+        text_length = text.len(),
         "Telegram message received"
     );
 
@@ -207,7 +242,9 @@ async fn handle_message(
             typing_handle.abort();
             error!(
                 chat_id = raw_chat_id,
-                "Telegram: error processing message: {e}"
+                error = %e,
+                error_debug = ?e,
+                "Telegram: error processing message"
             );
             let _ = bot
                 .send_message(msg.chat.id, "Sorry, an error occurred.")
@@ -222,8 +259,11 @@ async fn handle_message(
 async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
     for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
         if let Err(e) = bot.send_message(chat_id, &chunk).await {
-            error!("Telegram: failed to send message chunk: {e}");
-            break;
+            warn!("Telegram: failed to send message chunk, retrying: {e}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Err(e) = bot.send_message(chat_id, &chunk).await {
+                error!("Telegram: failed to send message chunk after retry: {e}");
+            }
         }
     }
 }

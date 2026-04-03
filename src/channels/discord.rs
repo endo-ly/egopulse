@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
+use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
@@ -44,9 +45,13 @@ pub struct DiscordAdapter {
 
 impl DiscordAdapter {
     pub fn new(token: String) -> Self {
+        Self::with_http_client(token, reqwest::Client::new())
+    }
+
+    pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
         Self {
             token,
-            http_client: reqwest::Client::new(),
+            http_client,
         }
     }
 }
@@ -69,7 +74,10 @@ impl ChannelAdapter for DiscordAdapter {
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
         for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
-            let body = json!({ "content": chunk });
+            let body = json!({
+                "content": chunk,
+                "allowed_mentions": { "parse": [] },
+            });
             let mut attempt = 0;
 
             loop {
@@ -177,7 +185,7 @@ impl EventHandler for Handler {
         info!(
             channel_id = external_chat_id,
             sender = %context.surface_user,
-            text_preview = %text.chars().take(100).collect::<String>(),
+            text_length = text.len(),
             "Discord message received"
         );
 
@@ -211,7 +219,10 @@ impl EventHandler for Handler {
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
-        if let Err(e) = channel_id.say(&ctx.http, &chunk).await {
+        let msg = CreateMessage::new()
+            .content(chunk)
+            .allowed_mentions(CreateAllowedMentions::new());
+        if let Err(e) = channel_id.send_message(&ctx.http, msg).await {
             error!("Discord: failed to send message chunk: {e}");
             break;
         }
@@ -222,7 +233,10 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
 ///
 /// Gateway に接続し、メッセージイベントの受信を開始する。
 /// microclaw `src/channels/discord.rs::start_discord_bot` と同じパターン。
-pub async fn start_discord_bot(state: Arc<AppState>, token: String) {
+pub async fn start_discord_bot(
+    state: Arc<AppState>,
+    token: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
@@ -231,20 +245,20 @@ pub async fn start_discord_bot(state: Arc<AppState>, token: String) {
 
     let handler = Handler { app_state: state };
 
-    let mut client = match Client::builder(&token, intents)
+    let mut client = Client::builder(&token, intents)
         .event_handler(handler)
         .await
-    {
-        Ok(client) => client,
-        Err(e) => {
+        .map_err(|e| {
             error!("Discord bot failed to start: {e}");
-            return;
-        }
-    };
+            e
+        })?;
 
-    if let Err(e) = client.start().await {
+    client.start().await.map_err(|e| {
         error!("Discord bot error: {e}");
-    }
+        e
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
