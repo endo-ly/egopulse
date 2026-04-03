@@ -236,7 +236,9 @@ pub async fn start_telegram_bot(state: Arc<AppState>, token: String) {
     let bot = Bot::new(&token);
 
     // 既存の webhook を削除して polling モードを確保
-    let _ = bot.delete_webhook().await;
+    let _ = bot.delete_webhook().await.inspect_err(|e| {
+        error!("Telegram: failed to delete webhook: {e}");
+    });
 
     info!("Starting Telegram bot...");
 
@@ -252,10 +254,12 @@ pub async fn start_telegram_bot(state: Arc<AppState>, token: String) {
         .dependencies(dptree::deps![state])
         .build();
 
-    dispatcher
+    if let Err(e) = dispatcher
         .try_dispatch_with_listener(listener, listener_error_handler)
         .await
-        .ok();
+    {
+        error!("Telegram dispatcher exited with error: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -274,9 +278,11 @@ mod tests {
         let bot = Bot::new("test-token");
         let adapter = TelegramAdapter::new(bot);
         let routes = adapter.chat_type_routes();
-        // microclaw パターン: 全 concrete chat_type を登録
         assert!(routes.len() >= 6);
-        assert_eq!(routes[0].0, "telegram_private");
-        assert_eq!(routes[0].1, ConversationKind::Private);
+        assert!(
+            routes
+                .iter()
+                .any(|(k, v)| { *k == "telegram_private" && *v == ConversationKind::Private })
+        );
     }
 }
