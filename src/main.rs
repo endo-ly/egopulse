@@ -42,6 +42,9 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Start all enabled channel adapters based on config.
+    /// Microclaw-compatible: starts web, discord, telegram concurrently.
+    Start,
 }
 
 #[tokio::main]
@@ -55,11 +58,12 @@ async fn main() {
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
     let is_web = matches!(cli.command, Some(Command::Web { .. }));
+    let is_start = matches!(cli.command, Some(Command::Start));
     let resolved_config_path = match cli.config.as_deref() {
         Some(path) => Some(path.to_path_buf()),
         None => Config::resolve_config_path()?,
     };
-    let config = if is_web {
+    let config = if is_web || is_start {
         Config::load_allow_missing_api_key(resolved_config_path.as_deref())?
     } else {
         Config::load(resolved_config_path.as_deref())?
@@ -97,6 +101,10 @@ async fn run() -> Result<(), EgoPulseError> {
             let bind_port = port.unwrap_or_else(|| config.web_port());
             let state = runtime::build_app_state_with_path(config, resolved_config_path.clone())?;
             web::run_server(state, &bind_host, bind_port).await
+        }
+        Some(Command::Start) => {
+            let state = runtime::build_app_state_with_path(config, resolved_config_path.clone())?;
+            runtime::start_channels(state).await
         }
         None => runtime::run_tui(config).await,
     }

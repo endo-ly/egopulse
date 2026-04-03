@@ -8,4 +8,5 @@ pub mod llm;
 pub mod logging;
 pub mod runtime;
 pub mod storage;
+pub mod text;
 pub mod web;
