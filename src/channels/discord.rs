@@ -49,10 +49,7 @@ impl DiscordAdapter {
     }
 
     pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
-        Self {
-            token,
-            http_client,
-        }
+        Self { token, http_client }
     }
 }
 
