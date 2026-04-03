@@ -6,6 +6,7 @@
 //! Based on: microclaw `src/channels/discord.rs`
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -20,6 +21,15 @@ use crate::channel::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
 use crate::runtime::AppState;
 use crate::text::split_text;
+
+/// Discord API リクエストのタイムアウト (秒)。
+const DISCORD_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// 429 レート制限時の最大リトライ回数。
+const DISCORD_MAX_RETRIES: u32 = 3;
+
+/// 429 の Retry-After ヘッダがない場合のフォールバック待機時間 (秒)。
+const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
@@ -60,21 +70,40 @@ impl ChannelAdapter for DiscordAdapter {
 
         for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
             let body = json!({ "content": chunk });
-            let resp = self
-                .http_client
-                .post(&url)
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bot {}", self.token),
-                )
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("Discord API request failed: {e}"))?;
+            let mut attempt = 0;
 
-            if !resp.status().is_success() {
+            loop {
+                let resp = self
+                    .http_client
+                    .post(&url)
+                    .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bot {}", self.token),
+                    )
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Discord API request failed: {e}"))?;
+
                 let status = resp.status();
+                if status.is_success() {
+                    break;
+                }
+
+                if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
+                    let retry_after = resp
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
+                    tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                    attempt += 1;
+                    continue;
+                }
+
                 let body = resp.text().await.unwrap_or_default();
                 return Err(format!(
                     "Discord API error: HTTP {status} {}",
@@ -169,8 +198,7 @@ impl EventHandler for Handler {
                     channel_id = external_chat_id,
                     "Discord: error processing message: {e}"
                 );
-                let _ =
-                    send_discord_response(&ctx, msg.channel_id, "Sorry, an error occurred.").await;
+                send_discord_response(&ctx, msg.channel_id, "Sorry, an error occurred.").await;
             }
         }
     }
