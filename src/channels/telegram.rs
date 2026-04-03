@@ -63,9 +63,7 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
-        let chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("invalid Telegram external_chat_id: '{external_chat_id}'"))?;
+        let chat_id = parse_telegram_chat_id(external_chat_id)?;
 
         const MAX_RETRIES: u32 = 3;
 
@@ -268,17 +266,28 @@ async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
     }
 }
 
+fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
+    external_chat_id
+        .strip_prefix("telegram:")
+        .unwrap_or(external_chat_id)
+        .parse::<i64>()
+        .map_err(|_| format!("invalid Telegram external_chat_id: '{external_chat_id}'"))
+}
+
 /// Telegram bot を起動。
 ///
 /// Long polling モードでメッセージの受信を開始する。
 /// microclaw `src/channels/telegram.rs::start_telegram_bot` と同じパターン。
-pub async fn start_telegram_bot(state: Arc<AppState>, token: String) {
+pub async fn start_telegram_bot(
+    state: Arc<AppState>,
+    token: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bot = Bot::new(&token);
 
     // 既存の webhook を削除して polling モードを確保
-    let _ = bot.delete_webhook().await.inspect_err(|e| {
+    bot.delete_webhook().await.inspect_err(|e| {
         error!("Telegram: failed to delete webhook: {e}");
-    });
+    })?;
 
     info!("Starting Telegram bot...");
 
@@ -293,13 +302,27 @@ pub async fn start_telegram_bot(state: Arc<AppState>, token: String) {
         .default_handler(|_| async {})
         .dependencies(dptree::deps![state])
         .build();
+    let shutdown_token = dispatcher.shutdown_token();
+    let shutdown_task = tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Telegram bot failed to listen for Ctrl-C: {e}");
+            return;
+        }
+        if let Ok(wait_for_shutdown) = shutdown_token.shutdown() {
+            wait_for_shutdown.await;
+        }
+    });
 
-    if let Err(e) = dispatcher
+    dispatcher
         .try_dispatch_with_listener(listener, listener_error_handler)
         .await
-    {
-        error!("Telegram dispatcher exited with error: {e}");
-    }
+        .inspect_err(|e| {
+            error!("Telegram dispatcher exited with error: {e}");
+        })?;
+
+    shutdown_task.abort();
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -324,5 +347,15 @@ mod tests {
                 .iter()
                 .any(|(k, v)| { *k == "telegram_private" && *v == ConversationKind::Private })
         );
+    }
+
+    #[test]
+    fn parse_telegram_chat_id_accepts_raw_and_prefixed_values() {
+        assert_eq!(parse_telegram_chat_id("12345").expect("raw chat id"), 12345);
+        assert_eq!(
+            parse_telegram_chat_id("telegram:12345").expect("prefixed chat id"),
+            12345
+        );
+        assert!(parse_telegram_chat_id("telegram:not-a-number").is_err());
     }
 }

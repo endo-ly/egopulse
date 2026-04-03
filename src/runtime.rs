@@ -1,14 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
 use crate::config::Config;
-use crate::error::EgoPulseError;
+use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
 use crate::storage::{Database, SessionSummary, call_blocking};
 use crate::web::WebAdapter;
@@ -164,7 +165,7 @@ pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     let mut has_active_channels = false;
-    let mut handles: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    let mut handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
 
     // Web サーバー起動
     if state.config.web_enabled() {
@@ -173,11 +174,8 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         let host = state.config.web_host();
         let port = state.config.web_port();
         info!("Starting Web UI server on {host}:{port}");
-        let handle = tokio::spawn(async move {
-            if let Err(e) = crate::web::run_server(web_state, &host, port).await {
-                tracing::error!("Web server error: {e}");
-            }
-        });
+        let handle =
+            tokio::spawn(async move { crate::web::run_server(web_state, &host, port).await });
         handles.push(("web", handle));
     }
 
@@ -189,11 +187,13 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let discord_state = Arc::new(state.clone());
             info!("Starting Discord bot...");
             let handle = tokio::spawn(async move {
-                if let Err(e) =
-                    crate::channels::discord::start_discord_bot(discord_state, token).await
-                {
-                    tracing::error!("Discord bot task exited with error: {e}");
-                }
+                crate::channels::discord::start_discord_bot(discord_state, token)
+                    .await
+                    .map_err(|error| {
+                        EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                            "discord bot failed: {error}"
+                        )))
+                    })
             });
             handles.push(("discord", handle));
         } else {
@@ -214,7 +214,13 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let bot_username = state.config.telegram_bot_username().unwrap_or_default();
             info!("Starting Telegram bot as @{bot_username}...");
             let handle = tokio::spawn(async move {
-                crate::channels::telegram::start_telegram_bot(telegram_state, token).await;
+                crate::channels::telegram::start_telegram_bot(telegram_state, token)
+                    .await
+                    .map_err(|error| {
+                        EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                            "telegram bot failed: {error}"
+                        )))
+                    })
             });
             handles.push(("telegram", handle));
         } else {
@@ -236,31 +242,59 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
     // spawn したタスクの即時終了 (起動失敗) を検知
     loop {
-        let mut any_finished = false;
-        for (name, handle) in &mut handles {
-            if handle.is_finished() {
-                any_finished = true;
-                match handle.await {
-                    Ok(()) => {
-                        tracing::error!("Channel '{name}' exited unexpectedly — shutting down");
-                    }
-                    Err(e) => {
-                        tracing::error!("Channel '{name}' failed: {e} — shutting down");
+        if let Some(finished_index) = handles.iter().position(|(_, handle)| handle.is_finished()) {
+            let (name, handle) = handles.swap_remove(finished_index);
+            let result = handle.await;
+            shutdown_channel_tasks(handles).await;
+            return match result {
+                Ok(Ok(())) => Err(EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                    "channel '{name}' exited unexpectedly"
+                )))),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(channel_join_error(name, error)),
+            };
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                shutdown_channel_tasks(handles).await;
+                return Ok(());
+            },
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+    }
+}
+
+async fn shutdown_channel_tasks(
+    handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)>,
+) {
+    for (name, mut handle) in handles {
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(10), &mut handle).await;
+        match shutdown_result {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!("Channel '{name}' exited during shutdown: {error}");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("Channel '{name}' join failed during shutdown: {error}");
+            }
+            Err(_) => {
+                tracing::warn!("Channel '{name}' did not stop in time; aborting task");
+                handle.abort();
+                if let Err(error) = handle.await {
+                    if !error.is_cancelled() {
+                        tracing::warn!(
+                            "Channel '{name}' join failed after abort during shutdown: {error}"
+                        );
                     }
                 }
             }
         }
-        if any_finished {
-            return Err(EgoPulseError::Channel(
-                crate::error::ChannelError::SendFailed(
-                    "a channel task exited unexpectedly".to_string(),
-                ),
-            ));
-        }
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-        }
     }
+}
+
+fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
+    EgoPulseError::Channel(ChannelError::SendFailed(format!(
+        "channel '{name}' task join failed: {error}"
+    )))
 }

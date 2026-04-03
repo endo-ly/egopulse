@@ -64,9 +64,7 @@ impl ChannelAdapter for DiscordAdapter {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
-        let discord_chat_id = external_chat_id
-            .parse::<u64>()
-            .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))?;
+        let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
 
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
@@ -145,7 +143,10 @@ impl EventHandler for Handler {
             .get("discord")
             .and_then(|c| c.allowed_channels.clone())
             .unwrap_or_default();
-        if !allowed_channels.is_empty() && !allowed_channels.contains(&external_channel_id) {
+        if msg.guild_id.is_some()
+            && !allowed_channels.is_empty()
+            && !allowed_channels.contains(&external_channel_id)
+        {
             return;
         }
 
@@ -226,6 +227,14 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
     }
 }
 
+fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
+    external_chat_id
+        .strip_prefix("discord:")
+        .unwrap_or(external_chat_id)
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
+}
+
 /// Discord bot を起動。
 ///
 /// Gateway に接続し、メッセージイベントの受信を開始する。
@@ -250,10 +259,21 @@ pub async fn start_discord_bot(
             e
         })?;
 
+    let shard_manager = client.shard_manager.clone();
+    let shutdown_task = tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Discord bot failed to listen for Ctrl-C: {e}");
+            return;
+        }
+        shard_manager.shutdown_all().await;
+    });
+
     client.start().await.map_err(|e| {
         error!("Discord bot error: {e}");
         e
     })?;
+
+    shutdown_task.abort();
 
     Ok(())
 }
@@ -275,5 +295,15 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].0, "discord");
         assert_eq!(routes[0].1, ConversationKind::Private);
+    }
+
+    #[test]
+    fn parse_discord_chat_id_accepts_raw_and_prefixed_values() {
+        assert_eq!(parse_discord_chat_id("12345").expect("raw chat id"), 12345);
+        assert_eq!(
+            parse_discord_chat_id("discord:12345").expect("prefixed chat id"),
+            12345
+        );
+        assert!(parse_discord_chat_id("discord:not-a-number").is_err());
     }
 }
