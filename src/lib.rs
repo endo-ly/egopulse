@@ -7,6 +7,7 @@ pub mod error;
 pub mod llm;
 pub mod logging;
 pub mod runtime;
+pub mod setup;
 pub mod storage;
 pub mod text;
 pub mod web;

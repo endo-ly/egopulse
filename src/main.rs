@@ -7,6 +7,7 @@ use egopulse::config::Config;
 use egopulse::error::EgoPulseError;
 use egopulse::logging::init_logging;
 use egopulse::runtime;
+use egopulse::setup;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNIT_PATH: &str = "/etc/systemd/system/egopulse.service";
@@ -37,6 +38,8 @@ enum Command {
     /// Start all enabled channel adapters based on config.
     /// Microclaw-compatible: starts web, discord, telegram concurrently.
     Start,
+    /// Interactive setup wizard to create egopulse.config.yaml.
+    Setup,
     Gateway {
         #[command(subcommand)]
         action: Option<GatewayAction>,
@@ -125,6 +128,13 @@ fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoP
 
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Command::Setup)) {
+        return setup::run_setup_wizard()
+            .await
+            .map_err(|e| EgoPulseError::Internal(e));
+    }
+
     let is_start = matches!(cli.command, Some(Command::Start));
     let resolved_config_path = match cli.config.as_deref() {
         Some(path) => Some(path.to_path_buf()),
