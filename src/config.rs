@@ -10,11 +10,15 @@ use url::Url;
 
 use crate::error::ConfigError;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
+    /// Web: browser/client authentication token.
+    pub auth_token: Option<String>,
+    /// Web: allowed Origin values for WebSocket connections.
+    pub allowed_origins: Option<Vec<String>>,
     /// Discord / Telegram 共通: bot token
     pub bot_token: Option<String>,
     /// Telegram: bot username (group メンション検知用)
@@ -23,6 +27,36 @@ pub struct ChannelConfig {
     pub allowed_user_ids: Option<Vec<i64>>,
     /// Discord: 許可チャンネル ID (空 = 全チャンネル許可)
     pub allowed_channels: Option<Vec<u64>>,
+}
+
+impl std::fmt::Debug for ChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field(
+                "auth_token",
+                &self
+                    .auth_token
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
+            .field("allowed_origins", &self.allowed_origins)
+            .field(
+                "bot_token",
+                &self
+                    .bot_token
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
+            .field("bot_username", &self.bot_username)
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("allowed_channels", &self.allowed_channels)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -93,6 +127,24 @@ impl Config {
             .get("web")
             .and_then(|c| c.port)
             .unwrap_or_else(default_web_port)
+    }
+
+    pub fn web_auth_token(&self) -> Option<&str> {
+        self.channels
+            .get("web")
+            .and_then(|c| c.auth_token.as_deref())
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+
+    pub fn web_allowed_origins(&self) -> Vec<String> {
+        self.channels
+            .get("web")
+            .and_then(|c| c.allowed_origins.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|origin| normalize_string(Some(origin)))
+            .collect()
     }
 
     pub fn channel_enabled(&self, channel: &str) -> bool {
@@ -189,8 +241,20 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<String, ChannelConfig>
     let web_host = env_var("EGOPULSE_WEB_HOST");
     let web_port = env_var("EGOPULSE_WEB_PORT").and_then(|value| value.parse::<u16>().ok());
     let web_enabled = env_var("EGOPULSE_WEB_ENABLED").and_then(|value| parse_bool(&value));
+    let web_auth_token = env_var("EGOPULSE_WEB_AUTH_TOKEN");
+    let web_allowed_origins = env_var("EGOPULSE_WEB_ALLOWED_ORIGINS").map(|value| {
+        value
+            .split(',')
+            .filter_map(|origin| normalize_string(Some(origin.to_string())))
+            .collect::<Vec<_>>()
+    });
 
-    if web_host.is_none() && web_port.is_none() && web_enabled.is_none() {
+    if web_host.is_none()
+        && web_port.is_none()
+        && web_enabled.is_none()
+        && web_auth_token.is_none()
+        && web_allowed_origins.is_none()
+    {
         return;
     }
 
@@ -203,6 +267,12 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<String, ChannelConfig>
     }
     if let Some(port) = web_port {
         web.port = Some(port);
+    }
+    if let Some(token) = web_auth_token {
+        web.auth_token = Some(token);
+    }
+    if let Some(origins) = web_allowed_origins {
+        web.allowed_origins = Some(origins);
     }
 
     if web.host.is_none() {
@@ -404,6 +474,8 @@ mod tests {
             std::env::remove_var("EGOPULSE_WEB_ENABLED");
             std::env::remove_var("EGOPULSE_WEB_HOST");
             std::env::remove_var("EGOPULSE_WEB_PORT");
+            std::env::remove_var("EGOPULSE_WEB_AUTH_TOKEN");
+            std::env::remove_var("EGOPULSE_WEB_ALLOWED_ORIGINS");
         }
     }
 
@@ -433,6 +505,8 @@ mod tests {
         assert!(config.web_enabled());
         assert_eq!(config.web_host(), "127.0.0.1");
         assert_eq!(config.web_port(), 10961);
+        assert_eq!(config.web_auth_token(), None);
+        assert!(config.web_allowed_origins().is_empty());
         assert!(config.channel_enabled("web"));
     }
 
@@ -449,6 +523,11 @@ mod tests {
             std::env::set_var("EGOPULSE_WEB_ENABLED", "false");
             std::env::set_var("EGOPULSE_WEB_HOST", "0.0.0.0");
             std::env::set_var("EGOPULSE_WEB_PORT", "8080");
+            std::env::set_var("EGOPULSE_WEB_AUTH_TOKEN", "web-secret");
+            std::env::set_var(
+                "EGOPULSE_WEB_ALLOWED_ORIGINS",
+                "https://egopulse.tailnet.ts.net, http://127.0.0.1:10961",
+            );
         }
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -470,6 +549,14 @@ mod tests {
         assert!(!config.web_enabled());
         assert_eq!(config.web_host(), "0.0.0.0");
         assert_eq!(config.web_port(), 8080);
+        assert_eq!(config.web_auth_token(), Some("web-secret"));
+        assert_eq!(
+            config.web_allowed_origins(),
+            vec![
+                "https://egopulse.tailnet.ts.net".to_string(),
+                "http://127.0.0.1:10961".to_string(),
+            ]
+        );
         assert!(!config.channel_enabled("web"));
         clear_env();
     }
@@ -483,7 +570,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nchannels:\n  web:\n    enabled: false\n    host: 0.0.0.0\n    port: 4010"
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nchannels:\n  web:\n    enabled: false\n    host: 0.0.0.0\n    port: 4010\n    auth_token: web-secret\n    allowed_origins:\n      - https://egopulse.tailnet.ts.net"
         )
         .expect("write config");
 
@@ -492,6 +579,11 @@ mod tests {
         assert!(!config.web_enabled());
         assert_eq!(config.web_host(), "0.0.0.0");
         assert_eq!(config.web_port(), 4010);
+        assert_eq!(config.web_auth_token(), Some("web-secret"));
+        assert_eq!(
+            config.web_allowed_origins(),
+            vec!["https://egopulse.tailnet.ts.net".to_string()]
+        );
         assert!(!config.channel_enabled("web"));
     }
 
@@ -514,6 +606,8 @@ mod tests {
         assert_eq!(web.enabled, Some(true));
         assert_eq!(web.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(web.port, Some(10961));
+        assert_eq!(web.auth_token.as_deref(), None);
+        assert_eq!(web.allowed_origins.as_ref(), None);
         assert!(config.channel_enabled("web"));
     }
 

@@ -35,7 +35,7 @@ export EGOPULSE_LOG_LEVEL="info"
 ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
 
 Web の有効化や bind 設定は YAML の `channels.web` で管理します。
-`EGOPULSE_WEB_ENABLED` / `EGOPULSE_WEB_HOST` / `EGOPULSE_WEB_PORT` を使う場合でも、実行時には `channels.web` 相当の値として扱われます。
+`EGOPULSE_WEB_ENABLED` / `EGOPULSE_WEB_HOST` / `EGOPULSE_WEB_PORT` / `EGOPULSE_WEB_AUTH_TOKEN` / `EGOPULSE_WEB_ALLOWED_ORIGINS` を使う場合でも、実行時には `channels.web` 相当の値として扱われます。
 
 Discord / Telegram の bot token は環境変数で上書きできます。
 
@@ -82,7 +82,15 @@ channels:
     enabled: true
     host: 127.0.0.1
     port: 10961
+    auth_token: "change-this-token"
+    allowed_origins:
+      - "https://egopulse.<tailnet>.ts.net"
+      - "http://127.0.0.1:10961"
 ```
+
+`auth_token` を設定すると、`/api/*` は `Authorization: Bearer <token>`、`/ws` は最初の `connect` frame に `authToken` が必須になります。WebUI は未認証時に token 入力モーダルを表示し、入力値をブラウザの localStorage に保存します。
+
+`allowed_origins` を設定すると `/ws` の `Origin` を allowlist 照合します。未設定の場合は `Origin` と `Host` の host:port が一致する同一ホスト接続だけを許可します。
 
 ```bash
 cargo run -p egopulse -- --config /path/to/egopulse.config.yaml ask "hello"
@@ -146,14 +154,14 @@ cargo run -p egopulse -- --config egopulse.config.yaml web --host 0.0.0.0 --port
 Endpoints:
 - `GET /` - WebUI
 - `GET /health` - Health check
-- `GET /api/health` - Health check
-- `GET /api/config` - Runtime config 取得
-- `PUT /api/config` - Runtime config 保存
-- `GET /api/sessions` - List sessions
-- `GET /api/history?session_key=...` - Get message history
-- `POST /api/send_stream` - chat run を開始して `run_id` を返す
-- `GET /api/stream?run_id=...` - SSE で run event を購読
-- `GET /ws` - WebSocket gateway
+- `GET /api/health` - Health check (`auth_token` 設定時は Bearer 必須)
+- `GET /api/config` - Runtime config 取得 (`auth_token` 設定時は Bearer 必須)
+- `PUT /api/config` - Runtime config 保存 (`auth_token` 設定時は Bearer 必須)
+- `GET /api/sessions` - List sessions (`auth_token` 設定時は Bearer 必須)
+- `GET /api/history?session_key=...` - Get message history (`auth_token` 設定時は Bearer 必須)
+- `POST /api/send_stream` - chat run を開始して `run_id` を返す (`auth_token` 設定時は Bearer 必須)
+- `GET /api/stream?run_id=...` - SSE で run event を購読 (`auth_token` 設定時は Bearer 必須)
+- `GET /ws` - WebSocket gateway (`Origin` 検証 + `connect.authToken` 認証)
 
 現在の WebUI では次ができます。
 - セッション一覧の表示
@@ -161,6 +169,7 @@ Endpoints:
 - Runtime Config の表示と保存
 - SSE 経由の live chat
 - WebSocket gateway への接続確認
+- `channels.web.auth_token` 入力による Web API / WebSocket 認証
 
 会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。
 Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。

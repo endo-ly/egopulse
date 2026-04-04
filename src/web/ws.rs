@@ -1,18 +1,26 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use uuid::Uuid;
 
+use super::auth;
 use super::stream::{SendRequest, start_stream_run};
 use super::{RunEvent, WEB_ACTOR, WebState};
 
 const PROTOCOL_VERSION: u64 = 1;
+const MAX_WS_CONNECTIONS: usize = 64;
+const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
+const MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION: usize = 1;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -58,6 +66,8 @@ struct EventFrame<T: Serialize> {
 struct ConnectParams {
     min_protocol: u64,
     max_protocol: u64,
+    #[serde(default)]
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,12 +133,39 @@ struct GatewayChatContent {
 
 pub(super) async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<WebState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    if !auth::is_ws_origin_allowed(&headers, &state.app_state.config) {
+        return (
+            StatusCode::FORBIDDEN,
+            "invalid_origin: websocket origin not allowed",
+        )
+            .into_response();
+    }
+
+    if state
+        .active_ws_connections
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < MAX_WS_CONNECTIONS).then_some(current + 1)
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_connections: websocket connection limit exceeded",
+        )
+            .into_response();
+    }
+
+    ws.max_message_size(MAX_WS_TEXT_BYTES)
+        .max_frame_size(MAX_WS_TEXT_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, state: WebState) {
+    let _connection_permit = ConnectionPermit::new(state.active_ws_connections.clone());
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
@@ -155,11 +192,25 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     }
 
     let connected = Arc::new(AtomicBool::new(false));
+    let in_flight_chat_sends = Arc::new(AtomicUsize::new(0));
 
-    while let Some(Ok(message)) = receiver.next().await {
+    while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
         let Message::Text(text) = message else {
             continue;
         };
+        if text.len() > MAX_WS_TEXT_BYTES {
+            if send_error(
+                &out_tx,
+                "invalid",
+                "message_too_large",
+                format!("message exceeds {MAX_WS_TEXT_BYTES} bytes"),
+            )
+            .is_err()
+            {
+                break;
+            }
+            continue;
+        }
 
         let frame = match serde_json::from_str::<ClientFrame>(&text) {
             Ok(frame) => frame,
@@ -194,6 +245,23 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                             &id,
                             "unsupported_protocol",
                             format!("server supports protocol {PROTOCOL_VERSION}"),
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if !auth::is_valid_ws_token(
+                        &state.app_state.config,
+                        payload.auth_token.as_deref(),
+                    ) {
+                        if send_error(
+                            &out_tx,
+                            &id,
+                            "unauthorized",
+                            "invalid web auth token".to_string(),
                         )
                         .is_err()
                         {
@@ -245,6 +313,28 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                         }
                     };
 
+                    if in_flight_chat_sends
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                            (current < MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION)
+                                .then_some(current + 1)
+                        })
+                        .is_err()
+                    {
+                        if send_error(
+                            &out_tx,
+                            &id,
+                            "busy",
+                            "another chat.send is still running".to_string(),
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let _in_flight_permit = InFlightChatPermit::new(in_flight_chat_sends.clone());
+
                     let started = match start_stream_run(
                         state.clone(),
                         SendRequest {
@@ -290,9 +380,11 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
 
                     let state_for_stream = state.clone();
                     let out_tx_for_stream = out_tx.clone();
+                    let stream_permit = _in_flight_permit;
                     let run_id = started.run_id.clone();
                     let session_key = started.session_key.clone();
                     tokio::spawn(async move {
+                        let _stream_permit = stream_permit;
                         let Ok((mut rx, replay, done, _, _)) = state_for_stream
                             .run_hub
                             .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
@@ -357,6 +449,20 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
 
     drop(out_tx);
     let _ = writer.await;
+}
+
+async fn receive_next_message(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    connected: &AtomicBool,
+) -> Option<Result<Message, axum::Error>> {
+    if connected.load(Ordering::SeqCst) {
+        return receiver.next().await;
+    }
+
+    timeout(CONNECT_TIMEOUT, receiver.next())
+        .await
+        .ok()
+        .flatten()
 }
 
 fn forward_run_event(
@@ -498,4 +604,40 @@ fn send_event<T: Serialize>(
     tx.send(Message::Text(text.into()))
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
+}
+
+struct ConnectionPermit {
+    active_ws_connections: Arc<AtomicUsize>,
+}
+
+impl ConnectionPermit {
+    fn new(active_ws_connections: Arc<AtomicUsize>) -> Self {
+        Self {
+            active_ws_connections,
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active_ws_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct InFlightChatPermit {
+    in_flight_chat_sends: Arc<AtomicUsize>,
+}
+
+impl InFlightChatPermit {
+    fn new(in_flight_chat_sends: Arc<AtomicUsize>) -> Self {
+        Self {
+            in_flight_chat_sends,
+        }
+    }
+}
+
+impl Drop for InFlightChatPermit {
+    fn drop(&mut self) {
+        self.in_flight_chat_sends.fetch_sub(1, Ordering::SeqCst);
+    }
 }
