@@ -90,6 +90,12 @@ channels:
 
 `channels.web.enabled: true` のとき `auth_token` は必須です。`/api/*` は `Authorization: Bearer <token>`、`/ws` は最初の `connect` frame に `authToken` が必須になります。WebUI は未認証時に token 入力モーダルを表示し、入力値をブラウザの localStorage に保存します。
 
+`auth_token` は利用者が自分で生成して `egopulse.config.yaml` に設定してください。
+
+```bash
+openssl rand -base64 32
+```
+
 `allowed_origins` を設定すると `/ws` の `Origin` を allowlist 照合します。未設定の場合は `Origin` と `Host` の host:port が一致する同一ホスト接続だけを許可します。
 
 ```bash
