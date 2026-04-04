@@ -150,12 +150,14 @@ cargo run -p egopulse -- ask --session local-dev "remember my last question?"
 
 ### HTTP Server with WebUI
 
-`web` サブコマンドで HTTP サーバーを起動し、React/Vite 製 WebUI、SSE chat stream、WebSocket gateway を公開します。`--host` / `--port` を省略した場合は `egopulse.config.yaml` の `channels.web.host` / `channels.web.port` を使います。
+`start` サブコマンドで設定ファイルに基づき有効なチャネルを一括起動します。Web は `channels.web.enabled: true` で起動します。
 
 ```bash
-cargo run -p egopulse -- web
-cargo run -p egopulse -- --config egopulse.config.yaml web --host 0.0.0.0 --port 8080
+cargo run -p egopulse -- start
+cargo run -p egopulse -- --config egopulse.config.yaml start
 ```
+
+Web の bind 設定は `egopulse.config.yaml` の `channels.web` で管理します。
 
 Endpoints:
 - `GET /` - WebUI
@@ -197,6 +199,106 @@ Web は `channels.web.enabled: true` で起動し、Discord / Telegram は `chan
 |----------|-----------|---------|
 | Discord  | 2000文字  | Gateway (WebSocket) |
 | Telegram | 4096文字  | Long Polling |
+
+## systemd 常駐運用
+
+本番環境で `systemd` による常駐化を行う手順。詳細は [docs/40.deploy/egopulse.md](../docs/40.deploy/egopulse.md) を参照。
+
+### 前提
+
+- Rust toolchain がインストール済み
+- 設定ファイルが `/etc/egopulse/egopulse.config.yaml` に配置済み
+- データディレクトリ `/var/lib/egopulse` が作成済み
+
+### サービス登録（自動インストール）
+
+systemd unit ファイルの自動生成・配置・有効化まで一括実行する。
+すでにインストール済みの場合は unit を更新してサービスを再起動する。
+
+```bash
+egopulse gateway install
+```
+
+`--config` を指定した場合、そのパスが unit に埋め込まれる。省略時は `/etc/egopulse/egopulse.config.yaml` が使われる。
+
+削除:
+
+```bash
+egopulse gateway uninstall
+```
+
+状態確認:
+
+```bash
+egopulse gateway status
+```
+
+再起動:
+
+```bash
+egopulse gateway restart
+```
+
+### 手動サービス登録（systemd unit 直書き）
+
+`/etc/systemd/system/egopulse.service`:
+
+```ini
+[Unit]
+Description=EgoPulse Agent Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/.cargo/bin/egopulse --config /etc/egopulse/egopulse.config.yaml start
+Restart=always
+RestartSec=10
+User=root
+Group=root
+Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 起動・確認
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable egopulse
+sudo systemctl start egopulse
+sudo systemctl status egopulse
+journalctl -u egopulse.service -f
+```
+
+### 再起動
+
+systemd で常駐中のサービスを再起動する。
+
+```bash
+egopulse gateway restart
+```
+
+内部で `systemctl restart egopulse` を実行する。開発中（`cargo run`）の場合は不要（Ctrl+C → 再実行で十分）。
+
+### 更新
+
+最新リリースに更新し、サービスを再起動する。
+
+```bash
+egopulse update
+```
+
+内部で install-egopulse.sh を実行して最新バイナリを配置後、systemd を再起動する。
+
+### バイナリ更新
+
+```bash
+cargo install --path egopulse --locked
+sudo systemctl restart egopulse
+```
 
 ## Discord セットアップガイド
 
@@ -302,10 +404,10 @@ Telegram で Bot に DM を送信して動作確認。グループの場合は `
 - OpenAI-compatible endpoint に対する `ask`
 - SQLite 永続化付きの `chat --session`
 - `ask --session` による既存 session の再開
-- `web` による HTTP サーバー + React WebUI
-- `POST /api/send_stream` + `GET /api/stream` による SSE chat
-- `GET /ws` による WebSocket gateway
 - `start` によるチャネル一括起動 (Discord / Telegram / Web)
+  - `channels.web.enabled: true` で HTTP サーバー + React WebUI が起動
+  - `POST /api/send_stream` + `GET /api/stream` による SSE chat
+  - `GET /ws` による WebSocket gateway
 - Discord adapter (serenity 0.12, メッセージ分割 2000文字, DM/Guild 対応)
 - Telegram adapter (teloxide 0.17, メッセージ分割 4096文字, DM/Group 対応)
 

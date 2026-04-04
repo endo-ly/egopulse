@@ -18,6 +18,8 @@ pub enum EgoPulseError {
     Channel(#[from] ChannelError),
     #[error("shutdown_requested")]
     ShutdownRequested,
+    #[error("internal_error: {0}")]
+    Internal(String),
 }
 
 #[derive(Debug, Error)]
