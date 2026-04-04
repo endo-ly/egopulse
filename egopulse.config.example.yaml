@@ -11,6 +11,11 @@ channels:
     enabled: true
     host: 127.0.0.1
     port: 10961
+    # Set this when exposing EgoPulse via Tailscale Serve or any non-local browser.
+    auth_token: replace-web-token
+    allowed_origins:
+      - http://127.0.0.1:10961
+      # - https://egopulse.<tailnet>.ts.net
   # discord:
   #   enabled: true
   #   bot_token: your-discord-bot-token

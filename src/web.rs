@@ -1,11 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::OriginalUri;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Body};
@@ -16,6 +18,7 @@ use crate::channel_adapter::ChannelAdapter;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
+mod auth;
 mod config;
 mod health;
 mod sessions;
@@ -59,6 +62,7 @@ pub(crate) struct WebState {
     pub(crate) app_state: Arc<AppState>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) run_hub: RunHub,
+    pub(crate) active_ws_connections: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,12 +286,10 @@ pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), Eg
         config_path: state.config_path.clone(),
         app_state: Arc::new(state),
         run_hub: RunHub::default(),
+        active_ws_connections: Arc::new(AtomicUsize::new(0)),
     };
 
-    let app = Router::new()
-        .route("/", get(index_html))
-        .route("/ws", get(ws::ws_handler))
-        .route("/health", get(health::health))
+    let api_routes = Router::new()
         .route("/api/health", get(health::health))
         .route(
             "/api/config",
@@ -297,6 +299,16 @@ pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), Eg
         .route("/api/history", get(sessions::get_history))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))
+        .route_layer(middleware::from_fn_with_state(
+            web_state.clone(),
+            auth::require_http_auth,
+        ));
+
+    let app = Router::new()
+        .route("/", get(index_html))
+        .route("/ws", get(ws::ws_handler))
+        .route("/health", get(health::health))
+        .merge(api_routes)
         .fallback(get(index_or_asset))
         .with_state(web_state);
 

@@ -26,6 +26,7 @@ type ConfigPayload = {
   web_enabled: boolean;
   web_host: string;
   web_port: number;
+  web_auth_enabled: boolean;
   has_api_key: boolean;
   config_path: string;
   requires_restart: boolean;
@@ -67,12 +68,39 @@ type UiStatus = {
 };
 
 const defaultStatus: UiStatus = { tone: "idle", text: "Ready" };
+const AUTH_TOKEN_STORAGE_KEY = "egopulse.webAuthToken";
 
-function api<T>(path: string, options?: RequestInit): Promise<T> {
+class AuthRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
+}
+
+function loadAuthToken(): string {
+  return window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+}
+
+function persistAuthToken(token: string) {
+  const trimmed = token.trim();
+  if (trimmed) {
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, trimmed);
+  } else {
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  }
+}
+
+function api<T>(
+  path: string,
+  authToken: string,
+  options?: RequestInit,
+): Promise<T> {
+  const trimmedToken = authToken.trim();
   return fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(trimmedToken ? { Authorization: `Bearer ${trimmedToken}` } : {}),
       ...(options?.headers || {}),
     },
   })
@@ -84,6 +112,11 @@ function api<T>(path: string, options?: RequestInit): Promise<T> {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const payload = data as { error?: string; message?: string };
+        if (res.status === 401) {
+          throw new AuthRequiredError(
+            String(payload.message || payload.error || "Authentication required"),
+          );
+        }
         throw new Error(
           String(payload.error || payload.message || `HTTP ${res.status}`),
         );
@@ -201,6 +234,9 @@ function App() {
   const [draft, setDraft] = useState("");
   const [config, setConfig] = useState<ConfigPayload | null>(null);
   const [configApiKey, setConfigApiKey] = useState("");
+  const [authToken, setAuthToken] = useState(() => loadAuthToken());
+  const [authDraft, setAuthDraft] = useState(() => loadAuthToken());
+  const [showAuth, setShowAuth] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [health, setHealth] = useState<HealthPayload>({});
   const [status, setStatus] = useState<UiStatus>(defaultStatus);
@@ -214,6 +250,7 @@ function App() {
   const sendAbortRef = useRef<AbortController | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const selectedSessionRef = useRef("");
+  const authTokenRef = useRef(authToken);
 
   const selectedLabel = useMemo(() => {
     return (
@@ -231,24 +268,48 @@ function App() {
   }, [selectedSession]);
 
   useEffect(() => {
-    void refreshHealth();
-    void refreshConfig();
-    void refreshSessions();
-    void connectGateway();
+    authTokenRef.current = authToken;
+  }, [authToken]);
+
+  useEffect(() => {
+    void withAuthHandling(async () => {
+      await refreshHealth();
+      await refreshConfig();
+      await refreshSessions();
+      await connectGateway();
+    });
     return () => {
       socketRef.current?.close();
       sendAbortRef.current?.abort();
     };
   }, []);
 
+  async function withAuthHandling(action: () => Promise<void>) {
+    try {
+      await action();
+    } catch (error) {
+      if (error instanceof AuthRequiredError) {
+        setShowAuth(true);
+        setWsState("closed");
+        setStatus({ tone: "error", text: error.message });
+        return;
+      }
+      throw error;
+    }
+  }
+
   async function refreshHealth() {
-    const payload = await api<{ ok: boolean; version: string }>("/api/health");
+    const payload = await api<{ ok: boolean; version: string }>(
+      "/api/health",
+      authTokenRef.current,
+    );
     setHealth({ version: payload.version });
   }
 
   async function refreshConfig() {
     const payload = await api<{ ok: boolean; config: ConfigPayload }>(
       "/api/config",
+      authTokenRef.current,
     );
     setConfig(payload.config);
     setConfigApiKey("");
@@ -257,6 +318,7 @@ function App() {
   async function refreshSessions(preferredKey?: string) {
     const payload = await api<{ ok: boolean; sessions: SessionItem[] }>(
       "/api/sessions",
+      authTokenRef.current,
     );
     setSessions(payload.sessions);
 
@@ -273,6 +335,7 @@ function App() {
   async function loadHistory(sessionKey: string) {
     const payload = await api<{ ok: boolean; messages: MessageItem[] }>(
       `/api/history?session_key=${encodeURIComponent(sessionKey)}`,
+      authTokenRef.current,
     );
     setMessages(payload.messages);
   }
@@ -311,7 +374,11 @@ function App() {
             type: "req",
             id: "connect",
             method: "connect",
-            params: { minProtocol: 1, maxProtocol: 1 },
+            params: {
+              minProtocol: 1,
+              maxProtocol: 1,
+              authToken: authTokenRef.current,
+            },
           };
           socket.send(JSON.stringify(connectReq));
           return;
@@ -332,9 +399,18 @@ function App() {
         }
 
         if (data.type === "res" && data.id === "connect" && !data.ok) {
-          connectReject.current?.(
-            new Error(data.error?.message || "connect rejected"),
-          );
+          if (data.error?.code === "unauthorized") {
+            setShowAuth(true);
+            connectReject.current?.(
+              new AuthRequiredError(
+                data.error?.message || "Authentication required",
+              ),
+            );
+          } else {
+            connectReject.current?.(
+              new Error(data.error?.message || "connect rejected"),
+            );
+          }
           connectPromise.current = null;
           connectResolve.current = null;
           connectReject.current = null;
@@ -418,7 +494,7 @@ function App() {
         ok: boolean;
         run_id: string;
         session_key: string;
-      }>("/api/send_stream", {
+      }>("/api/send_stream", authTokenRef.current, {
         method: "POST",
         body: JSON.stringify({
           session_key: sessionKey,
@@ -437,10 +513,16 @@ function App() {
       const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
         method: "GET",
         cache: "no-store",
+        headers: authTokenRef.current.trim()
+          ? { Authorization: `Bearer ${authTokenRef.current.trim()}` }
+          : {},
         signal: abortController.signal,
       });
 
       if (!streamResponse.ok) {
+        if (streamResponse.status === 401) {
+          throw new AuthRequiredError("Authentication required");
+        }
         const raw = await streamResponse.text().catch(() => "");
         throw new Error(raw || `HTTP ${streamResponse.status}`);
       }
@@ -532,13 +614,32 @@ function App() {
         }
       }
     } catch (error) {
+      if (error instanceof AuthRequiredError) {
+        setShowAuth(true);
+      }
       setStatus({
         tone: "error",
         text: error instanceof Error ? error.message : "Failed to send message",
       });
     } finally {
-      void refreshSessions(sessionKey);
+      void withAuthHandling(async () => {
+        await refreshSessions(sessionKey);
+      });
     }
+  }
+
+  async function handleSaveAuthToken(event: FormEvent) {
+    event.preventDefault();
+    persistAuthToken(authDraft);
+    setAuthToken(authDraft.trim());
+    setShowAuth(false);
+    socketRef.current?.close();
+    await withAuthHandling(async () => {
+      await refreshHealth();
+      await refreshConfig();
+      await refreshSessions();
+      await connectGateway();
+    });
   }
 
   async function handleSaveConfig(event: FormEvent) {
@@ -560,7 +661,7 @@ function App() {
         ok: boolean;
         config: ConfigPayload;
         requires_restart: boolean;
-      }>("/api/config", {
+      }>("/api/config", authTokenRef.current, {
         method: "PUT",
         body: JSON.stringify(payload),
       });
@@ -574,6 +675,9 @@ function App() {
       });
       setShowSettings(false);
     } catch (error) {
+      if (error instanceof AuthRequiredError) {
+        setShowAuth(true);
+      }
       setStatus({
         tone: "error",
         text: error instanceof Error ? error.message : "Failed to save config",
@@ -637,7 +741,10 @@ function App() {
         <header className="chat-header">
           <div>
             <h2>{selectedLabel || "Select a session"}</h2>
-            <p>Gateway: {wsState}</p>
+            <p>
+              Gateway: {wsState}
+              {config?.web_auth_enabled ? " / auth enabled" : ""}
+            </p>
           </div>
           <div className={`status-badge ${status.tone}`}>{status.text}</div>
         </header>
@@ -803,6 +910,42 @@ function App() {
                 </span>
                 <button className="primary-button" type="submit">
                   Save
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {showAuth ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-modal-title"
+          >
+            <div className="modal-header">
+              <div>
+                <h3 id="auth-modal-title">Web Access Token</h3>
+                <p>Enter channels.web.auth_token to access EgoPulse APIs.</p>
+              </div>
+            </div>
+
+            <form className="config-form" onSubmit={handleSaveAuthToken}>
+              <label>
+                <span>Auth Token</span>
+                <input
+                  type="password"
+                  value={authDraft}
+                  autoFocus
+                  onChange={(event) => setAuthDraft(event.target.value)}
+                />
+              </label>
+              <div className="config-footer">
+                <span>Stored locally in this browser only.</span>
+                <button className="primary-button" type="submit">
+                  Unlock
                 </button>
               </div>
             </form>
