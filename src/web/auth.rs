@@ -16,9 +16,18 @@ pub(super) async fn require_http_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Some(expected_token) = state.app_state.config.web_auth_token()
-        && !is_authorized_bearer(&headers, expected_token)
-    {
+    let Some(expected_token) = state.app_state.config.web_auth_token() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({
+                "ok": false,
+                "error": "web_auth_not_configured",
+                "message": "channels.web.auth_token is required"
+            })),
+        )
+            .into_response();
+    };
+    if !is_authorized_bearer(&headers, expected_token) {
         return (
             StatusCode::UNAUTHORIZED,
             axum::Json(json!({
@@ -64,7 +73,7 @@ pub(super) fn is_ws_origin_allowed(headers: &HeaderMap, config: &Config) -> bool
 
 pub(super) fn is_valid_ws_token(config: &Config, token: Option<&str>) -> bool {
     let Some(expected_token) = config.web_auth_token() else {
-        return true;
+        return false;
     };
     token.is_some_and(|candidate| constant_time_eq(candidate.trim(), expected_token))
 }
@@ -183,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn validates_ws_token_only_when_configured() {
+    fn validates_ws_token_and_rejects_missing_server_config() {
         let open_config = config_with_web(None, None);
-        assert!(is_valid_ws_token(&open_config, None));
+        assert!(!is_valid_ws_token(&open_config, None));
 
         let protected_config = config_with_web(Some("web-secret"), None);
         assert!(is_valid_ws_token(&protected_config, Some("web-secret")));

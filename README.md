@@ -88,7 +88,7 @@ channels:
       - "http://127.0.0.1:10961"
 ```
 
-`auth_token` を設定すると、`/api/*` は `Authorization: Bearer <token>`、`/ws` は最初の `connect` frame に `authToken` が必須になります。WebUI は未認証時に token 入力モーダルを表示し、入力値をブラウザの localStorage に保存します。
+`channels.web.enabled: true` のとき `auth_token` は必須です。`/api/*` は `Authorization: Bearer <token>`、`/ws` は最初の `connect` frame に `authToken` が必須になります。WebUI は未認証時に token 入力モーダルを表示し、入力値をブラウザの localStorage に保存します。
 
 `allowed_origins` を設定すると `/ws` の `Origin` を allowlist 照合します。未設定の場合は `Origin` と `Host` の host:port が一致する同一ホスト接続だけを許可します。
 
@@ -154,13 +154,13 @@ cargo run -p egopulse -- --config egopulse.config.yaml web --host 0.0.0.0 --port
 Endpoints:
 - `GET /` - WebUI
 - `GET /health` - Health check
-- `GET /api/health` - Health check (`auth_token` 設定時は Bearer 必須)
-- `GET /api/config` - Runtime config 取得 (`auth_token` 設定時は Bearer 必須)
-- `PUT /api/config` - Runtime config 保存 (`auth_token` 設定時は Bearer 必須)
-- `GET /api/sessions` - List sessions (`auth_token` 設定時は Bearer 必須)
-- `GET /api/history?session_key=...` - Get message history (`auth_token` 設定時は Bearer 必須)
-- `POST /api/send_stream` - chat run を開始して `run_id` を返す (`auth_token` 設定時は Bearer 必須)
-- `GET /api/stream?run_id=...` - SSE で run event を購読 (`auth_token` 設定時は Bearer 必須)
+- `GET /api/health` - Health check (Bearer 必須)
+- `GET /api/config` - Runtime config 取得 (Bearer 必須)
+- `PUT /api/config` - Runtime config 保存 (Bearer 必須)
+- `GET /api/sessions` - List sessions (Bearer 必須)
+- `GET /api/history?session_key=...` - Get message history (Bearer 必須)
+- `POST /api/send_stream` - chat run を開始して `run_id` を返す (Bearer 必須)
+- `GET /api/stream?run_id=...` - SSE で run event を購読 (Bearer 必須)
 - `GET /ws` - WebSocket gateway (`Origin` 検証 + `connect.authToken` 認証)
 
 現在の WebUI では次ができます。

@@ -44,6 +44,8 @@ pub enum ConfigError {
     InvalidBaseUrl,
     #[error("web_channel_disabled")]
     WebChannelDisabled,
+    #[error("missing_web_auth_token")]
+    MissingWebAuthToken,
     #[error("missing_api_key")]
     MissingApiKey,
     #[error("no_active_channels: no enabled channel has a valid bot_token configured")]

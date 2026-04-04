@@ -327,14 +327,20 @@ fn build_config(
     apply_channel_bot_token_env_override(&mut channels, "discord", "EGOPULSE_DISCORD_BOT_TOKEN");
     apply_channel_bot_token_env_override(&mut channels, "telegram", "EGOPULSE_TELEGRAM_BOT_TOKEN");
 
-    Ok(Config {
+    let config = Config {
         model,
         api_key,
         llm_base_url,
         data_dir,
         log_level,
         channels,
-    })
+    };
+
+    if config.web_enabled() && config.web_auth_token().is_none() {
+        return Err(ConfigError::MissingWebAuthToken);
+    }
+
+    Ok(config)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -488,7 +494,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: ./runtime\nlog_level: debug\nchannels:\n  web:\n    enabled: true"
+            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: ./runtime\nlog_level: debug\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
         )
         .expect("write config");
 
@@ -505,7 +511,7 @@ mod tests {
         assert!(config.web_enabled());
         assert_eq!(config.web_host(), "127.0.0.1");
         assert_eq!(config.web_port(), 10961);
-        assert_eq!(config.web_auth_token(), None);
+        assert_eq!(config.web_auth_token(), Some("web-secret"));
         assert!(config.web_allowed_origins().is_empty());
         assert!(config.channel_enabled("web"));
     }
@@ -535,7 +541,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: local-model\nbase_url: http://127.0.0.1:1234/v1\nchannels:\n  web:\n    enabled: true\n    host: 127.0.0.1\n    port: 10961"
+            "model: local-model\nbase_url: http://127.0.0.1:1234/v1\nchannels:\n  web:\n    enabled: true\n    host: 127.0.0.1\n    port: 10961\n    auth_token: web-secret-file"
         )
         .expect("write config");
 
@@ -596,7 +602,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nchannels:\n  web:\n    enabled: true"
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
         )
         .expect("write config");
 
@@ -606,9 +612,26 @@ mod tests {
         assert_eq!(web.enabled, Some(true));
         assert_eq!(web.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(web.port, Some(10961));
-        assert_eq!(web.auth_token.as_deref(), None);
+        assert_eq!(web.auth_token.as_deref(), Some("web-secret"));
         assert_eq!(web.allowed_origins.as_ref(), None);
         assert!(config.channel_enabled("web"));
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_enabled_web_channel_without_auth_token() {
+        clear_env();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nchannels:\n  web:\n    enabled: true\n    host: 127.0.0.1\n    port: 10961"
+        )
+        .expect("write config");
+
+        let error = Config::load(Some(&file_path)).expect_err("missing web auth token");
+        assert!(matches!(error, ConfigError::MissingWebAuthToken));
     }
 
     #[test]
