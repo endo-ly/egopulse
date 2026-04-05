@@ -1,247 +1,241 @@
 # EgoPulse
 
-EgoPulse は EgoGraph 向けの Rust runtime foundation です。
-local TUI と developer 向け CLI に加えて、React/Vite ベースの WebUI、SSE によるチャット stream、WebSocket gateway、そして Discord / Telegram チャネルアダプターを提供します。
+OpenAI互換のLLMエンドポイント1つで動く、永続化AIエージェントランタイム。
 
-## Prerequisites
+ローカルTUI、WebUI（React + SSE + WebSocket）、Discord、Telegramを単一のバイナリで提供。
 
-- Rust stable
-- `cargo fmt`
-- `cargo clippy`
-- Node.js / npm
+## Quick Start
 
-## Config
-
-環境変数または `egopulse.config.yaml` に対応します。
-
-読み込み順は次の通りです。
-
-1. プロセス環境変数
-2. `--config` で指定した YAML
-3. current directory の `./egopulse.config.yaml` 自動検出
-
-同じキーが複数箇所にある場合は、上の項目が優先されます。
-
-### OpenAI-compatible environment variables
+### 1. Install
 
 ```bash
-export EGOPULSE_MODEL="gpt-4o-mini"
-export EGOPULSE_API_KEY="sk-..."
-export EGOPULSE_BASE_URL="https://api.openai.com/v1"
-export EGOPULSE_DATA_DIR=".egopulse"
-export EGOPULSE_LOG_LEVEL="info"
+# リリースから（推奨）
+curl -fsSL https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh | bash
+
+# ソースから
+cargo install --path egopulse --locked
 ```
 
-ローカルの OpenAI-compatible server を使う場合は、`localhost` / `127.0.0.1` / `0.0.0.0` / `::1` の base URL に限り `EGOPULSE_API_KEY` を省略できます。
-
-Web の有効化や bind 設定は YAML の `channels.web` で管理します。
-`EGOPULSE_WEB_ENABLED` / `EGOPULSE_WEB_HOST` / `EGOPULSE_WEB_PORT` / `EGOPULSE_WEB_AUTH_TOKEN` / `EGOPULSE_WEB_ALLOWED_ORIGINS` を使う場合でも、実行時には `channels.web` 相当の値として扱われます。
-
-Discord / Telegram の bot token は環境変数で上書きできます。
+### 2. Setup
 
 ```bash
-export EGOPULSE_DISCORD_BOT_TOKEN="your-discord-bot-token"
-export EGOPULSE_TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
+egopulse setup
 ```
+
+対話型TUIウィザードが `egopulse.config.yaml` を作成。LLMプロバイダの選択、API認証情報の入力、チャネルの設定をガイド。
+
+### 3. Run
+
+```bash
+egopulse          # ローカルTUIを開く
+egopulse start    # 有効なチャネルを一括起動（Web, Discord, Telegram）
+```
+
+## Configuration
+
+### Config resolution
+
+1. 環境変数（最優先）
+2. `--config <PATH>` で指定したYAML
+3. カレントディレクトリの `./egopulse.config.yaml` 自動検出
+
+### YAML config
+
+```yaml
+model: gpt-4o-mini
+api_key: sk-...
+base_url: https://api.openai.com/v1
+data_dir: .egopulse
+log_level: info
+
+channels:
+  web:
+    enabled: true
+    host: 127.0.0.1
+    port: 10961
+    auth_token: <openssl-rand--base64-32で生成>
+    allowed_origins:
+      - http://127.0.0.1:10961
+  discord:
+    enabled: false
+    bot_token: your-discord-bot-token
+  telegram:
+    enabled: false
+    bot_token: your-telegram-bot-token
+    bot_username: your_bot_username
+```
+
+完全なテンプレートは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照。
+
+### Environment variables
+
+| 変数 | 説明 |
+|------|------|
+| `EGOPULSE_MODEL` | モデル名（必須） |
+| `EGOPULSE_API_KEY` | APIキー（`localhost`/`127.0.0.1`/`0.0.0.0`/`::1` のbase_urlなら省略可） |
+| `EGOPULSE_BASE_URL` | OpenAI互換APIエンドポイント |
+| `EGOPULSE_DATA_DIR` | データディレクトリ（デフォルト: `.egopulse`） |
+| `EGOPULSE_LOG_LEVEL` | ログレベル（デフォルト: `info`） |
+| `EGOPULSE_DISCORD_BOT_TOKEN` | Discordボットトークンの上書き |
+| `EGOPULSE_TELEGRAM_BOT_TOKEN` | Telegramボットトークンの上書き |
 
 ### Endpoint examples
 
-Default OpenAI-compatible endpoint:
-
+**OpenAI:**
 ```bash
 export EGOPULSE_MODEL="gpt-4o-mini"
 export EGOPULSE_API_KEY="sk-..."
 export EGOPULSE_BASE_URL="https://api.openai.com/v1"
 ```
 
-OpenAI-compatible router endpoint example:
-
+**OpenRouter:**
 ```bash
 export EGOPULSE_MODEL="openai/gpt-4o-mini"
 export EGOPULSE_API_KEY="sk-or-..."
 export EGOPULSE_BASE_URL="https://openrouter.ai/api/v1"
 ```
 
-Local OpenAI-compatible endpoint example:
-
+**ローカル（APIキー不要）:**
 ```bash
 export EGOPULSE_MODEL="local-model"
 export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 ```
 
-### Config file
+## Commands
 
-サンプルは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照してください。  
-`egopulse.config.yaml` は current directory から自動検出されます。明示的に指定したい場合は `--config` を使ってください。
+### Global options
 
-Web の設定は次の形です。
+| オプション | 説明 |
+|-----------|------|
+| `--config <PATH>` | 設定ファイルのパス（絶対/相対） |
+| `--version` | バージョン表示 |
+| `--help` | ヘルプ表示 |
 
-```yaml
-channels:
-  web:
-    enabled: true
-    host: 127.0.0.1
-    port: 10961
-    auth_token: "change-this-token"
-    allowed_origins:
-      - "https://egopulse.<tailnet>.ts.net"
-      - "http://127.0.0.1:10961"
+### Subcommands
+
+| コマンド | 説明 | 設定必須 |
+|---------|------|:-:|
+| `egopulse` | ローカルTUI（セッションブラウザ + チャット） | 必須 |
+| `egopulse setup` | 対話型設定ウィザード | 不要 |
+| `egopulse ask <PROMPT>` | 単発プロンプト、結果をstdoutに出力 | 必須 |
+| `egopulse chat` | 永続化CLIチャットセッション | 必須 |
+| `egopulse start` | 有効なチャネルを一括起動 | 必須（api_keyは省略可） |
+| `egopulse gateway <ACTION>` | systemdサービス管理 | — |
+| `egopulse update` | 最新リリースに更新 | — |
+
+#### `egopulse ask <PROMPT>`
+
+単発のプロンプト送信。応答を出力して終了。
+
+```bash
+egopulse ask "Rustとは？"
+egopulse ask --session my-session "前回の続き"
 ```
 
-`channels.web.enabled: true` のとき `auth_token` は必須です。`/api/*` は `Authorization: Bearer <token>`、`/ws` は最初の `connect` frame に `authToken` が必須になります。WebUI は未認証時に token 入力モーダルを表示し、入力値をブラウザの localStorage に保存します。
+| オプション | 説明 |
+|-----------|------|
+| `--session <SESSION>` | 既存セッションの再開、または新規作成 |
 
-`auth_token` は利用者が自分で生成して `egopulse.config.yaml` に設定してください。
+#### `egopulse chat`
 
+セッション履歴付きの永続化CLIチャット。
+
+```bash
+egopulse chat
+egopulse chat --session my-session
+```
+
+| オプション | 説明 |
+|-----------|------|
+| `--session <SESSION>` | セッション名（省略時は自動生成 `cli-<uuid>`） |
+
+#### `egopulse start`
+
+設定で `enabled: true` のチャネルを並列起動。Web、Discord、Telegramを同時に稼働。Ctrl+C でgraceful shutdown。
+
+#### `egopulse gateway <ACTION>`
+
+| アクション | 説明 |
+|-----------|------|
+| `install` | systemdユニットを作成・有効化・起動。既存なら更新して再起動。 |
+| `uninstall` | サービスの無効化・停止・削除。 |
+| `status` | `systemctl status` の出力を表示。未起動時はexit 1。 |
+| `restart` | systemdサービスを再起動。 |
+
+設定ファイルが必須。先に `egopulse setup` を実行。
+
+#### `egopulse update`
+
+最新リリースのバイナリをダウンロードし、systemdサービスがあれば再起動。
+
+## Channels
+
+### Web
+
+`channels.web.enabled: true` で有効化。React WebUI、SSEライブチャット、WebSocketゲートウェイを提供。
+
+| エンドポイント | 認証 | 説明 |
+|--------------|:----:|------|
+| `GET /` | 不要 | WebUI |
+| `GET /health` | 不要 | ヘルスチェック |
+| `GET /api/health` | Bearer | ヘルスチェック |
+| `GET /api/config` | Bearer | ランタイム設定の取得 |
+| `PUT /api/config` | Bearer | ランタイム設定の保存 |
+| `GET /api/sessions` | Bearer | セッション一覧 |
+| `GET /api/history?session_key=...` | Bearer | メッセージ履歴の取得 |
+| `POST /api/send_stream` | Bearer | チャットrun開始、`run_id` を返す |
+| `GET /api/stream?run_id=...` | Bearer | SSEでrunイベントを購読 |
+| `GET /ws` | トークン | WebSocketゲートウェイ |
+
+認証: `/api/*` は `Authorization: Bearer <auth_token>`、`/ws` は初回frameの `connect.authToken`。WebUIは初回訪問時にトークン入力モーダルを表示し、localStorageに保存。
+
+auth_tokenの生成:
 ```bash
 openssl rand -base64 32
 ```
 
-`allowed_origins` を設定すると `/ws` の `Origin` を allowlist 照合します。未設定の場合は `Origin` と `Host` の host:port が一致する同一ホスト接続だけを許可します。
+`allowed_origins` を設定すると `/ws` の `Origin` ヘッダーをallowlist照合。未設定の場合は `Host` ヘッダーと一致する同一ホスト接続のみ許可。
+
+### Discord
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) でボットアプリケーション作成
+2. Bot → Privileged Gateway Intents で **Message Content Intent** と **Server Members Intent** をON
+3. OAuth2 URL Generator でボットをサーバーに招待（Scopes: `bot`、Permissions: `Send Messages`, `Read Message History`）
+4. 設定に `channels.discord.bot_token` または `EGOPULSE_DISCORD_BOT_TOKEN` を設定
+
+文字数制限: 2000文字（送信時に自動分割）。受信はGateway（WebSocket）。
+
+### Telegram
+
+1. [@BotFather](https://t.me/BotFather) に `/newbot` を送信
+2. 設定に `channels.telegram.bot_token` と `bot_username`、または `EGOPULSE_TELEGRAM_BOT_TOKEN` を設定
+
+文字数制限: 4096文字（送信時に自動分割）。受信はLong Polling。
+
+`bot_username` はグループでの `@メンション` 検出に使用。DMのみの場合は省略可。
+
+## Deployment
+
+### systemd service
 
 ```bash
-cargo run -p egopulse -- --config /path/to/egopulse.config.yaml ask "hello"
+egopulse gateway install    # インストール・起動
+egopulse gateway status     # 状態確認
+egopulse gateway restart    # 再起動
+egopulse gateway uninstall  # 削除
 ```
 
-Discord / Telegram の設定例:
+ユニットファイルは `/etc/systemd/system/egopulse.service` に配置。`--config` を指定するとそのパスがユニットに埋め込まれる。省略時は `/etc/egopulse/egopulse.config.yaml`。
 
-```yaml
-channels:
-  discord:
-    enabled: true
-    bot_token: your-discord-bot-token
-  telegram:
-    enabled: true
-    bot_token: your-telegram-bot-token
-    bot_username: your_bot_username
-```
-
-## Install
-
-この repo では専用の installer は用意していません。  
-サポートする導線は cargo ベースのみです。
+### Update
 
 ```bash
-cargo install --path egopulse --locked
-egopulse
+egopulse update
 ```
 
-`cargo install --path egopulse --locked` を再実行すると、インストール済みバイナリは更新されます。
+`install-egopulse.sh --skip-run` で最新バイナリを配置し、systemdサービスを再起動。
 
-## Usage
-
-開発中は source checkout からそのまま起動できます。
-
-```bash
-cargo run -p egopulse
-```
-
-`egopulse` を無引数で起動すると local TUI が開きます。
-
-developer 向けの entrypoint はそのまま残っています。
-
-```bash
-cargo run -p egopulse -- ask "hello"
-cargo run -p egopulse -- chat --session local-dev
-cargo run -p egopulse -- ask --session local-dev "remember my last question?"
-```
-
-`ask` は OpenAI-compatible endpoint に対する単発問い合わせです。  
-`chat --session ...` は persistent SQLite session を使った継続会話です。
-
-### HTTP Server with WebUI
-
-`start` サブコマンドで設定ファイルに基づき有効なチャネルを一括起動します。Web は `channels.web.enabled: true` で起動します。
-
-```bash
-cargo run -p egopulse -- start
-cargo run -p egopulse -- --config egopulse.config.yaml start
-```
-
-Web の bind 設定は `egopulse.config.yaml` の `channels.web` で管理します。
-
-Endpoints:
-- `GET /` - WebUI
-- `GET /health` - Health check
-- `GET /api/health` - Health check (Bearer 必須)
-- `GET /api/config` - Runtime config 取得 (Bearer 必須)
-- `PUT /api/config` - Runtime config 保存 (Bearer 必須)
-- `GET /api/sessions` - List sessions (Bearer 必須)
-- `GET /api/history?session_key=...` - Get message history (Bearer 必須)
-- `POST /api/send_stream` - chat run を開始して `run_id` を返す (Bearer 必須)
-- `GET /api/stream?run_id=...` - SSE で run event を購読 (Bearer 必須)
-- `GET /ws` - WebSocket gateway (`Origin` 検証 + `connect.authToken` 認証)
-
-現在の WebUI では次ができます。
-- セッション一覧の表示
-- セッション履歴の表示
-- Runtime Config の表示と保存
-- SSE 経由の live chat
-- WebSocket gateway への接続確認
-- `channels.web.auth_token` 入力による Web API / WebSocket 認証
-
-会話履歴と session snapshot は `EGOPULSE_DATA_DIR/egopulse.db` に保存されます。
-Issue 2.5 の local TUI では、session 一覧から再開・新規開始ができます。
-
-### Channel Server (Discord / Telegram / Web)
-
-`start` サブコマンドで設定ファイルに基づいて有効なチャネルを一括起動します。microclaw 互換の起動パターンです。
-
-```bash
-cargo run -p egopulse -- start
-cargo run -p egopulse -- --config egopulse.config.yaml start
-```
-
-Web は `channels.web.enabled: true` で起動し、Discord / Telegram は `channels.<name>.enabled: true` かつ `bot_token` が設定されていると起動します。Web、Discord、Telegram を同時に稼働でき、Ctrl-C で全チャネルを graceful shutdown します。
-
-各チャネルのメッセージは `SurfaceContext` に正規化され、agent runtime で処理された結果が各プラットフォームの文字数制限に合わせて自動分割されて返信されます。
-
-| チャネル | 文字数制限 | 受信方式 |
-|----------|-----------|---------|
-| Discord  | 2000文字  | Gateway (WebSocket) |
-| Telegram | 4096文字  | Long Polling |
-
-## systemd 常駐運用
-
-本番環境で `systemd` による常駐化を行う手順。詳細は [docs/40.deploy/egopulse.md](../docs/40.deploy/egopulse.md) を参照。
-
-### 前提
-
-- Rust toolchain がインストール済み
-- 設定ファイルが `/etc/egopulse/egopulse.config.yaml` に配置済み
-- データディレクトリ `/var/lib/egopulse` が作成済み
-
-### サービス登録（自動インストール）
-
-systemd unit ファイルの自動生成・配置・有効化まで一括実行する。
-すでにインストール済みの場合は unit を更新してサービスを再起動する。
-
-```bash
-egopulse gateway install
-```
-
-`--config` を指定した場合、そのパスが unit に埋め込まれる。省略時は `/etc/egopulse/egopulse.config.yaml` が使われる。
-
-削除:
-
-```bash
-egopulse gateway uninstall
-```
-
-状態確認:
-
-```bash
-egopulse gateway status
-```
-
-再起動:
-
-```bash
-egopulse gateway restart
-```
-
-### 手動サービス登録（systemd unit 直書き）
-
-`/etc/systemd/system/egopulse.service`:
+### Manual systemd unit
 
 ```ini
 [Unit]
@@ -251,172 +245,24 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/root/.cargo/bin/egopulse --config /etc/egopulse/egopulse.config.yaml start
+ExecStart=/usr/local/bin/egopulse --config /etc/egopulse/egopulse.config.yaml start
 Restart=always
 RestartSec=10
-User=root
-Group=root
-Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=/root
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### 起動・確認
-
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable egopulse
-sudo systemctl start egopulse
-sudo systemctl status egopulse
-journalctl -u egopulse.service -f
+sudo systemctl enable --now egopulse
+journalctl -u egopulse -f
 ```
 
-### 再起動
+## Development
 
-systemd で常駐中のサービスを再起動する。
-
-```bash
-egopulse gateway restart
-```
-
-内部で `systemctl restart egopulse` を実行する。開発中（`cargo run`）の場合は不要（Ctrl+C → 再実行で十分）。
-
-### 更新
-
-最新リリースに更新し、サービスを再起動する。
-
-```bash
-egopulse update
-```
-
-内部で install-egopulse.sh を実行して最新バイナリを配置後、systemd を再起動する。
-
-### バイナリ更新
-
-```bash
-cargo install --path egopulse --locked
-sudo systemctl restart egopulse
-```
-
-## Discord セットアップガイド
-
-### 前提条件
-
-- [Discord Developer Portal](https://discord.com/developers/applications) にアクセス可能な Discord アカウント
-
-### 手順
-
-#### 1. Bot Application の作成
-
-1. [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**
-2. Application 名を入力 (例: `EgoPulse`) → **Create**
-3. 左メニュー **Bot** → **Reset Token** → Token をコピー
-4. **Privileged Gateway Intents** を設定:
-   - **Message Content Intent**: ON (メッセージ本文を読むために必要)
-   - **Server Members Intent**: ON (推奨)
-5. **Save Changes**
-
-#### 2. Bot をサーバーに招待
-
-**OAuth2** → **URL Generator**:
-- Scopes: `bot`
-- Bot Permissions: `Send Messages`, `Read Message History`, `Use Slash Commands`
-- 生成された URL で対象サーバーに招待
-
-#### 3. EgoPulse の設定
-
-`egopulse.config.yaml` に Discord の設定を追加:
-
-```yaml
-channels:
-  discord:
-    enabled: true
-    bot_token: <手順1でコピーしたToken>
-```
-
-または環境変数:
-
-```bash
-export EGOPULSE_DISCORD_BOT_TOKEN="<Token>"
-```
-
-#### 4. 起動と確認
-
-```bash
-cargo run -p egopulse -- start
-```
-
-ログに `Starting Discord bot...` が表示されたら接続成功。
-Discord サーバーで `@EgoPulse hello` または DM でメッセージを送信して動作確認。
-
-## Telegram セットアップガイド
-
-### 前提条件
-
-- Telegram アカウント
-
-### 手順
-
-#### 1. Bot の作成
-
-1. Telegram で [@BotFather](https://t.me/BotFather) を開く
-2. `/newbot` を送信
-3. Bot の表示名を入力 (例: `EgoPulse Bot`)
-4. Bot の username を入力 (例: `my_egopulse_bot`) — `bot` で終わる必要あり
-5. 発行された **HTTP API Token** をコピー (`123456789:ABCdefGHIjklMNOpqrSTUvwxYZ` 形式)
-
-#### 2. EgoPulse の設定
-
-`egopulse.config.yaml` に Telegram の設定を追加:
-
-```yaml
-channels:
-  telegram:
-    enabled: true
-    bot_token: "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
-    bot_username: "my_egopulse_bot"
-```
-
-または環境変数:
-
-```bash
-export EGOPULSE_TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
-```
-
-> **注意**: `bot_username` はグループでの @メンション検出に使用します。DM のみの場合は省略可能です。
-
-#### 3. 起動と確認
-
-```bash
-cargo run -p egopulse -- start
-```
-
-ログに `Starting Telegram bot as @my_egopulse_bot...` が表示されたら接続成功。
-Telegram で Bot に DM を送信して動作確認。グループの場合は `@my_egopulse_bot hello` でメンション。
-
-## Current scope
-
-- `egopulse` 無引数起動で local TUI
-- `egopulse.config.yaml` 自動検出
-- `--config` による明示指定
-- OpenAI-compatible endpoint に対する `ask`
-- SQLite 永続化付きの `chat --session`
-- `ask --session` による既存 session の再開
-- `start` によるチャネル一括起動 (Discord / Telegram / Web)
-  - `channels.web.enabled: true` で HTTP サーバー + React WebUI が起動
-  - `POST /api/send_stream` + `GET /api/stream` による SSE chat
-  - `GET /ws` による WebSocket gateway
-- Discord adapter (serenity 0.12, メッセージ分割 2000文字, DM/Guild 対応)
-- Telegram adapter (teloxide 0.17, メッセージ分割 4096文字, DM/Group 対応)
-
-次フェーズで追加予定:
-
-- tools / skills
-- MCP integration
-
-## Local checks
+### Local checks
 
 ```bash
 npm install --prefix egopulse/web
@@ -426,3 +272,22 @@ cargo check -p egopulse
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test -p egopulse
 ```
+
+### Run from source
+
+```bash
+cargo run -p egopulse                    # TUI
+cargo run -p egopulse -- ask "hello"     # 単発
+cargo run -p egopulse -- start            # 全チャネル
+```
+
+### Install script options
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh | bash -s -- --setup
+```
+
+| オプション | 説明 |
+|-----------|------|
+| `--skip-run` | インストール後の `--version` 確認をスキップ |
+| `--setup` | インストール直後に `egopulse setup` ウィザードを起動 |
