@@ -4,10 +4,12 @@ use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -63,7 +65,10 @@ impl SetupApp {
             Field {
                 key: "MODEL".into(),
                 label: "LLM model".into(),
-                value: existing.get("MODEL").cloned().unwrap_or_else(|| "gpt-4o-mini".into()),
+                value: existing
+                    .get("MODEL")
+                    .cloned()
+                    .unwrap_or_else(|| "gpt-4o-mini".into()),
                 required: false,
                 secret: false,
                 help: Some("Model name for your LLM provider".into()),
@@ -71,7 +76,10 @@ impl SetupApp {
             Field {
                 key: "BASE_URL".into(),
                 label: "API base URL".into(),
-                value: existing.get("BASE_URL").cloned().unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                value: existing
+                    .get("BASE_URL")
+                    .cloned()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
                 required: true,
                 secret: false,
                 help: Some("OpenAI-compatible API endpoint".into()),
@@ -87,7 +95,10 @@ impl SetupApp {
             Field {
                 key: "DISCORD_ENABLED".into(),
                 label: "Enable Discord channel".into(),
-                value: existing.get("DISCORD_ENABLED").cloned().unwrap_or_else(|| "false".into()),
+                value: existing
+                    .get("DISCORD_ENABLED")
+                    .cloned()
+                    .unwrap_or_else(|| "false".into()),
                 required: false,
                 secret: false,
                 help: Some("true/false".into()),
@@ -95,7 +106,10 @@ impl SetupApp {
             Field {
                 key: "DISCORD_BOT_TOKEN".into(),
                 label: "Discord bot token".into(),
-                value: existing.get("DISCORD_BOT_TOKEN").cloned().unwrap_or_default(),
+                value: existing
+                    .get("DISCORD_BOT_TOKEN")
+                    .cloned()
+                    .unwrap_or_default(),
                 required: false,
                 secret: true,
                 help: Some("From Discord Developer Portal".into()),
@@ -103,7 +117,10 @@ impl SetupApp {
             Field {
                 key: "TELEGRAM_ENABLED".into(),
                 label: "Enable Telegram channel".into(),
-                value: existing.get("TELEGRAM_ENABLED").cloned().unwrap_or_else(|| "false".into()),
+                value: existing
+                    .get("TELEGRAM_ENABLED")
+                    .cloned()
+                    .unwrap_or_else(|| "false".into()),
                 required: false,
                 secret: false,
                 help: Some("true/false".into()),
@@ -111,7 +128,10 @@ impl SetupApp {
             Field {
                 key: "TELEGRAM_BOT_TOKEN".into(),
                 label: "Telegram bot token".into(),
-                value: existing.get("TELEGRAM_BOT_TOKEN").cloned().unwrap_or_default(),
+                value: existing
+                    .get("TELEGRAM_BOT_TOKEN")
+                    .cloned()
+                    .unwrap_or_default(),
                 required: false,
                 secret: true,
                 help: Some("From @BotFather on Telegram".into()),
@@ -119,7 +139,10 @@ impl SetupApp {
             Field {
                 key: "TELEGRAM_BOT_USERNAME".into(),
                 label: "Telegram bot username".into(),
-                value: existing.get("TELEGRAM_BOT_USERNAME").cloned().unwrap_or_default(),
+                value: existing
+                    .get("TELEGRAM_BOT_USERNAME")
+                    .cloned()
+                    .unwrap_or_default(),
                 required: false,
                 secret: false,
                 help: Some("Without @, e.g. my_egopulse_bot".into()),
@@ -209,26 +232,20 @@ impl SetupApp {
                     }
 
                     // Extract discord
-                    if let Some(discord) =
-                        ch_map.get(&serde_yml::Value::String("discord".into()))
-                    {
+                    if let Some(discord) = ch_map.get(&serde_yml::Value::String("discord".into())) {
                         if let Some(d_map) = discord.as_mapping() {
                             if let Some(enabled) =
                                 d_map.get(&serde_yml::Value::String("enabled".into()))
                             {
                                 if let Some(b) = enabled.as_bool() {
-                                    result.insert(
-                                        "DISCORD_ENABLED".into(),
-                                        b.to_string(),
-                                    );
+                                    result.insert("DISCORD_ENABLED".into(), b.to_string());
                                 }
                             }
                             if let Some(token) =
                                 d_map.get(&serde_yml::Value::String("bot_token".into()))
                             {
                                 if let Some(t) = token.as_str() {
-                                    result
-                                        .insert("DISCORD_BOT_TOKEN".into(), t.to_string());
+                                    result.insert("DISCORD_BOT_TOKEN".into(), t.to_string());
                                 }
                             }
                         }
@@ -241,28 +258,21 @@ impl SetupApp {
                                 tg_map.get(&serde_yml::Value::String("enabled".into()))
                             {
                                 if let Some(b) = enabled.as_bool() {
-                                    result.insert(
-                                        "TELEGRAM_ENABLED".into(),
-                                        b.to_string(),
-                                    );
+                                    result.insert("TELEGRAM_ENABLED".into(), b.to_string());
                                 }
                             }
                             if let Some(token) =
                                 tg_map.get(&serde_yml::Value::String("bot_token".into()))
                             {
                                 if let Some(t) = token.as_str() {
-                                    result
-                                        .insert("TELEGRAM_BOT_TOKEN".into(), t.to_string());
+                                    result.insert("TELEGRAM_BOT_TOKEN".into(), t.to_string());
                                 }
                             }
                             if let Some(username) =
                                 tg_map.get(&serde_yml::Value::String("bot_username".into()))
                             {
                                 if let Some(u) = username.as_str() {
-                                    result.insert(
-                                        "TELEGRAM_BOT_USERNAME".into(),
-                                        u.to_string(),
-                                    );
+                                    result.insert("TELEGRAM_BOT_USERNAME".into(), u.to_string());
                                 }
                             }
                         }
@@ -279,22 +289,18 @@ impl SetupApp {
 
         for field in self.fields.iter().enumerate() {
             let should_skip = match field.1.key.as_str() {
-                "DISCORD_BOT_TOKEN" => {
-                    !self
-                        .fields
-                        .iter()
-                        .find(|f| f.key == "DISCORD_ENABLED")
-                        .map(|f| parse_bool(&f.value).unwrap_or(false))
-                        .unwrap_or(false)
-                }
-                "TELEGRAM_BOT_TOKEN" | "TELEGRAM_BOT_USERNAME" => {
-                    !self
-                        .fields
-                        .iter()
-                        .find(|f| f.key == "TELEGRAM_ENABLED")
-                        .map(|f| parse_bool(&f.value).unwrap_or(false))
-                        .unwrap_or(false)
-                }
+                "DISCORD_BOT_TOKEN" => !self
+                    .fields
+                    .iter()
+                    .find(|f| f.key == "DISCORD_ENABLED")
+                    .map(|f| parse_bool(&f.value).unwrap_or(false))
+                    .unwrap_or(false),
+                "TELEGRAM_BOT_TOKEN" | "TELEGRAM_BOT_USERNAME" => !self
+                    .fields
+                    .iter()
+                    .find(|f| f.key == "TELEGRAM_ENABLED")
+                    .map(|f| parse_bool(&f.value).unwrap_or(false))
+                    .unwrap_or(false),
                 _ => false,
             };
 
@@ -317,9 +323,7 @@ impl SetupApp {
             .position(|&idx| idx == self.selected)
             .unwrap_or(0);
 
-        let next_pos = (current_pos as isize + delta)
-            .clamp(0, visible.len() as isize - 1)
-            as usize;
+        let next_pos = (current_pos as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
 
         self.selected = visible[next_pos];
     }
@@ -426,9 +430,7 @@ impl SetupApp {
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
 
-        let existing_token = Self::load_existing_config()
-            .get("WEB_AUTH_TOKEN")
-            .cloned();
+        let existing_token = Self::load_existing_config().get("WEB_AUTH_TOKEN").cloned();
         let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
         let discord_enabled = self
@@ -494,13 +496,19 @@ impl SetupApp {
         if discord_enabled {
             yaml.push_str("  discord:\n");
             yaml.push_str("    enabled: true\n");
-            yaml.push_str(&format!("    bot_token: {}\n", yaml_quoted(&discord_bot_token)));
+            yaml.push_str(&format!(
+                "    bot_token: {}\n",
+                yaml_quoted(&discord_bot_token)
+            ));
         }
 
         if telegram_enabled {
             yaml.push_str("  telegram:\n");
             yaml.push_str("    enabled: true\n");
-            yaml.push_str(&format!("    bot_token: {}\n", yaml_quoted(&telegram_bot_token)));
+            yaml.push_str(&format!(
+                "    bot_token: {}\n",
+                yaml_quoted(&telegram_bot_token)
+            ));
             if !telegram_bot_username.is_empty() {
                 yaml.push_str(&format!(
                     "    bot_username: {}\n",
@@ -522,8 +530,22 @@ impl SetupApp {
                 format!("API key: {}", mask_secret(&api_key))
             },
             "Web channel: enabled (auth_token auto-generated)".into(),
-            format!("Discord channel: {}", if discord_enabled { "enabled" } else { "disabled" }),
-            format!("Telegram channel: {}", if telegram_enabled { "enabled" } else { "disabled" }),
+            format!(
+                "Discord channel: {}",
+                if discord_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            format!(
+                "Telegram channel: {}",
+                if telegram_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
         ];
 
         if let Some(ref backup) = self.backup_path {
@@ -547,32 +569,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 fn generate_auth_token() -> String {
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
-    base64_encode(&bytes)
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
+    STANDARD.encode(&bytes)
 }
 
 fn mask_secret(value: &str) -> String {
@@ -587,14 +584,47 @@ fn yaml_value(value: &str) -> String {
     if value.is_empty() {
         return "\"\"".into();
     }
-    if value.contains(|c: char| c == ':' || c == '#' || c == '\'' || c == '"' || c == '{' || c == '}' || c == '[' || c == ']' || c == ',' || c == '&' || c == '*' || c == '?' || c == '|' || c == '-' || c == '<' || c == '>' || c == '=' || c == '!' || c == '%' || c == '@' || c == '`') {
+    if value.contains(|c: char| {
+        matches!(
+            c,
+            ':' | '#'
+                | '\''
+                | '"'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | ','
+                | '&'
+                | '*'
+                | '?'
+                | '|'
+                | '-'
+                | '<'
+                | '>'
+                | '='
+                | '!'
+                | '%'
+                | '@'
+                | '`'
+                | '\n'
+                | '\r'
+                | '\t'
+        )
+    }) {
         return yaml_quoted(value);
     }
     value.to_string()
 }
 
 fn yaml_quoted(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn backup_config(path: &Path) -> Result<String, String> {
@@ -602,8 +632,7 @@ fn backup_config(path: &Path) -> Result<String, String> {
         .parent()
         .unwrap_or(Path::new("."))
         .join(CONFIG_BACKUP_DIR);
-    fs::create_dir_all(&backup_dir)
-        .map_err(|e| format!("Failed to create backup dir: {e}"))?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("Failed to create backup dir: {e}"))?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -617,8 +646,7 @@ fn backup_config(path: &Path) -> Result<String, String> {
     let backup_name = format!("{file_name}.{timestamp}.bak");
     let backup_path = backup_dir.join(&backup_name);
 
-    fs::copy(path, &backup_path)
-        .map_err(|e| format!("Failed to backup config: {e}"))?;
+    fs::copy(path, &backup_path).map_err(|e| format!("Failed to backup config: {e}"))?;
 
     // Clean old backups
     cleanup_old_backups(&backup_dir, file_name)?;
@@ -630,11 +658,7 @@ fn cleanup_old_backups(backup_dir: &Path, file_name: &str) -> Result<(), String>
     let mut entries: Vec<_> = fs::read_dir(backup_dir)
         .map_err(|e| format!("Failed to read backup dir: {e}"))?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(file_name)
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with(file_name))
         .collect();
 
     entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
@@ -665,14 +689,12 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
 
         // Header
         let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "EgoPulse Setup Wizard",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                "EgoPulse Setup Wizard",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from("Configure egopulse.config.yaml interactively"),
         ])
         .block(Block::default().borders(Borders::ALL))
@@ -720,13 +742,20 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
                     .unwrap_or(0);
 
                 let content_height = chunks[1].height.saturating_sub(2) as usize;
-                let window_start = 0usize;
+                let mut window_start = 0usize;
+                if field_pos < window_start {
+                    window_start = field_pos;
+                } else if field_pos >= window_start + content_height {
+                    window_start = field_pos - content_height + 1;
+                }
                 let window_end = window_start + content_height;
 
                 if (window_start..window_end).contains(&field_pos) {
                     let row = chunks[1].y + 1 + (field_pos - window_start) as u16;
                     let label_width = max_label_width(&app.fields, &visible);
-                    let cursor_x = chunks[1].x + label_width + 2
+                    let cursor_x = chunks[1].x
+                        + label_width
+                        + 2
                         + if field.secret && !app.editing {
                             8
                         } else if field.secret {
@@ -826,7 +855,10 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
         } else if field.secret && !display.is_empty() {
             spans.push(Span::styled(display, Style::default().fg(Color::DarkGray)));
         } else if display.is_empty() {
-            spans.push(Span::styled("(empty)", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "(empty)",
+                Style::default().fg(Color::DarkGray),
+            ));
         } else {
             spans.push(Span::raw(display));
         }
@@ -848,20 +880,14 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
     frame.render_widget(body, area);
 }
 
-fn draw_completion_summary(
-    frame: &mut ratatui::Frame<'_>,
-    app: &SetupApp,
-    area: Rect,
-) {
+fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Setup Complete!",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "Setup Complete!",
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )]));
     lines.push(Line::from(""));
 
     for item in &app.completion_summary {
@@ -872,11 +898,7 @@ fn draw_completion_summary(
     }
 
     let body = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("Summary")
-                .borders(Borders::ALL),
-        )
+        .block(Block::default().title("Summary").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
@@ -924,18 +946,17 @@ async fn run_inner(
         draw(terminal, app);
 
         if app.completed {
-            // Wait for any key to exit
-            if event::poll(std::time::Duration::from_millis(200))
-                .map_err(|e| e.to_string())?
-            {
-                return Ok(());
+            if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
+                if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
+                    if key.kind == KeyEventKind::Press {
+                        return Ok(());
+                    }
+                }
             }
             continue;
         }
 
-        if event::poll(std::time::Duration::from_millis(200))
-            .map_err(|e| e.to_string())?
-        {
+        if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
             let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
                 continue;
             };

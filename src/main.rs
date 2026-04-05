@@ -163,11 +163,9 @@ async fn run() -> Result<(), EgoPulseError> {
                     eprintln!("No configuration found. Run 'egopulse setup' to create one.");
                     return Ok(());
                 }
-                return Err(EgoPulseError::Config(
-                    ConfigError::AutoConfigNotFound {
-                        searched_paths: vec!["./egopulse.config.yaml".into()],
-                    },
-                ));
+                return Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound {
+                    searched_paths: vec!["./egopulse.config.yaml".into()],
+                }));
             }
             Err(e) => return Err(EgoPulseError::Config(e)),
         },
@@ -246,7 +244,15 @@ ACTIONS:
                     let unit_content =
                         render_systemd_unit(&exe_path.to_string_lossy(), Some(&config_path));
                     std::fs::write(UNIT_PATH, &unit_content).map_err(|e| {
-                        EgoPulseError::Internal(format!("failed to write unit file: {e}"))
+                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            format!(
+                                "failed to write unit file: permission denied. \
+                                 Run as root or with sudo, or grant write access to {UNIT_PATH}"
+                            )
+                        } else {
+                            format!("failed to write unit file: {e}")
+                        };
+                        EgoPulseError::Internal(msg)
                     })?;
 
                     ensure_success(systemctl_cmd(&["daemon-reload"])?, "daemon-reload")?;
@@ -295,19 +301,16 @@ ACTIONS:
                     }
                 }
                 GatewayAction::Restart => {
-                    let status = ProcessCommand::new("systemctl")
-                        .args(["restart", "egopulse"])
-                        .status()
-                        .map_err(|e| {
-                            EgoPulseError::Internal(format!("failed to run systemctl: {e}"))
-                        })?;
-                    if !status.success() {
-                        return Err(EgoPulseError::Internal(format!(
-                            "systemctl restart egopulse exited with code {status:?}"
-                        )));
+                    let output = systemctl_cmd(&["restart", "egopulse"])?;
+                    if output.status.success() {
+                        println!("egopulse service restarted");
+                        Ok(())
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        Err(EgoPulseError::Internal(format!(
+                            "failed to restart egopulse service: {stderr}"
+                        )))
                     }
-                    println!("egopulse service restarted");
-                    Ok(())
                 }
             }
         }
@@ -315,8 +318,7 @@ ACTIONS:
             println!("Current version: {VERSION}");
             println!("Updating EgoPulse from latest release...");
 
-            let script_url =
-                "https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh";
+            let script_url = "https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh";
             let cmd = format!(
                 "(curl -fsSL '{url}' || wget -qO- '{url}') | bash -s -- --skip-run",
                 url = script_url
