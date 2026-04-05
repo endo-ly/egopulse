@@ -4,7 +4,7 @@ use std::process::Command as ProcessCommand;
 use clap::{Parser, Subcommand};
 use egopulse::channels::cli;
 use egopulse::config::Config;
-use egopulse::error::EgoPulseError;
+use egopulse::error::{ConfigError, EgoPulseError};
 use egopulse::logging::init_logging;
 use egopulse::runtime;
 use egopulse::setup;
@@ -126,6 +126,24 @@ fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoP
     )))
 }
 
+fn restart_service() -> Result<(), EgoPulseError> {
+    if !std::path::Path::new(UNIT_PATH).exists() {
+        println!("Service not installed, skipping restart");
+        return Ok(());
+    }
+
+    let output = systemctl_cmd(&["restart", "egopulse"])?;
+    if output.status.success() {
+        println!("egopulse service restarted");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(EgoPulseError::Internal(format!(
+            "failed to restart egopulse service: {stderr}"
+        )))
+    }
+}
+
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
 
@@ -138,7 +156,21 @@ async fn run() -> Result<(), EgoPulseError> {
     let is_start = matches!(cli.command, Some(Command::Start));
     let resolved_config_path = match cli.config.as_deref() {
         Some(path) => Some(path.to_path_buf()),
-        None => Config::resolve_config_path()?,
+        None => match Config::resolve_config_path() {
+            Ok(path) => path,
+            Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound { .. })) => {
+                if matches!(cli.command, None) {
+                    eprintln!("No configuration found. Run 'egopulse setup' to create one.");
+                    return Ok(());
+                }
+                return Err(EgoPulseError::Config(
+                    ConfigError::AutoConfigNotFound {
+                        searched: vec!["./egopulse.config.yaml".into()],
+                    },
+                ));
+            }
+            Err(e) => return Err(e),
+        },
     };
     let config = if is_start {
         Config::load_allow_missing_api_key(resolved_config_path.as_deref())?
@@ -196,6 +228,19 @@ ACTIONS:
                         EgoPulseError::Internal(format!("failed to resolve binary path: {e}"))
                     })?;
                     let config_path = resolve_config_for_service(cli.config.as_ref());
+
+                    if config_path.is_none() {
+                        eprintln!("No configuration found.");
+                        eprintln!("Run 'egopulse setup' first, then retry.");
+                        return Ok(());
+                    }
+
+                    let config_path = config_path.unwrap();
+                    if !config_path.exists() {
+                        eprintln!("Config not found at: {}", config_path.display());
+                        eprintln!("Run 'egopulse setup' first, then retry.");
+                        return Ok(());
+                    }
 
                     let already_installed = std::path::Path::new(UNIT_PATH).exists();
                     let unit_content =
@@ -290,9 +335,7 @@ ACTIONS:
             }
 
             println!("Update completed. Restarting service...");
-            let _ = ProcessCommand::new("systemctl")
-                .args(["restart", "egopulse"])
-                .status();
+            restart_service()?;
             Ok(())
         }
         None => runtime::run_tui(config).await,
