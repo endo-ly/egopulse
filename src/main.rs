@@ -3,7 +3,7 @@ use std::process::Command as ProcessCommand;
 
 use clap::{Parser, Subcommand};
 use egopulse::channels::cli;
-use egopulse::config::Config;
+use egopulse::config::{Config, default_config_path, default_workspace_dir};
 use egopulse::error::{ConfigError, EgoPulseError};
 use egopulse::logging::init_logging;
 use egopulse::runtime;
@@ -69,19 +69,26 @@ async fn main() {
 
 fn resolve_config_for_service(cli_config: Option<&PathBuf>) -> Option<PathBuf> {
     if let Some(path) = cli_config {
-        return Some(if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir().ok()?.join(path)
-        });
+        return Some(resolve_cli_config_path(path));
     }
     Config::resolve_config_path().ok().flatten()
+}
+
+fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 fn render_systemd_unit(
     exe_path: &str,
     config_path: &std::path::Path,
     data_dir: &std::path::Path,
+    workspace_dir: &std::path::Path,
 ) -> String {
     let config_arg = config_path.to_string_lossy();
     let config_dir = config_path
@@ -89,6 +96,7 @@ fn render_systemd_unit(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/etc/egopulse".into());
     let data_dir_str = data_dir.to_string_lossy();
+    let workspace_dir_str = workspace_dir.to_string_lossy();
 
     format!(
         "[Unit]
@@ -106,8 +114,8 @@ Environment=HOME=/root
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths={config_dir} {data_dir_str}
-ProtectHome=true
+ReadWritePaths={config_dir} {data_dir_str} {workspace_dir_str}
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
@@ -209,14 +217,17 @@ ACTIONS:
                 )));
             }
 
-            let data_dir = config_path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join(".egopulse");
+            let config = Config::load_allow_missing_api_key(Some(&config_path))?;
+            let data_dir = PathBuf::from(&config.data_dir);
+            let workspace_dir = default_workspace_dir();
 
             let already_installed = std::path::Path::new(UNIT_PATH).exists();
-            let unit_content =
-                render_systemd_unit(&exe_path.to_string_lossy(), &config_path, &data_dir);
+            let unit_content = render_systemd_unit(
+                &exe_path.to_string_lossy(),
+                &config_path,
+                &data_dir,
+                &workspace_dir,
+            );
             std::fs::write(UNIT_PATH, &unit_content).map_err(|e| {
                 let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
                     format!(
@@ -315,7 +326,7 @@ async fn run_update() -> Result<(), EgoPulseError> {
 async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
     let is_start = matches!(cli.command, Some(Command::Start));
     let resolved_config_path = match cli.config.as_deref() {
-        Some(path) => Some(path.to_path_buf()),
+        Some(path) => Some(resolve_cli_config_path(path)),
         None => match Config::resolve_config_path() {
             Ok(path) => path,
             Err(ConfigError::AutoConfigNotFound { .. }) => {
@@ -324,7 +335,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                     return Ok(());
                 }
                 return Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound {
-                    searched_paths: vec!["./egopulse.config.yaml".into()],
+                    searched_paths: vec![default_config_path()],
                 }));
             }
             Err(e) => return Err(EgoPulseError::Config(e)),

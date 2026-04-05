@@ -2,8 +2,6 @@ model: gpt-4o-mini
 # Localhost-style endpoints such as LM Studio may omit api_key.
 api_key: replace-me
 base_url: https://api.openai.com/v1
-# Session and message history are stored under data_dir/egopulse.db.
-data_dir: .egopulse
 log_level: info
 
 channels:

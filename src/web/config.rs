@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_yml::{Mapping, Value};
 
-use crate::config::{ChannelConfig, Config};
+use crate::config::{ChannelConfig, Config, default_config_path};
 
 use super::WebState;
 
@@ -16,6 +16,7 @@ struct ConfigPayload {
     model: String,
     base_url: String,
     data_dir: String,
+    workspace_dir: String,
     web_enabled: bool,
     web_host: String,
     web_port: u16,
@@ -29,7 +30,6 @@ struct ConfigPayload {
 pub(super) struct ConfigUpdateRequest {
     model: String,
     base_url: String,
-    data_dir: String,
     web_enabled: bool,
     web_host: String,
     web_port: u16,
@@ -60,9 +60,6 @@ pub(super) async fn api_put_config(
     if request.base_url.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "base_url is required".to_string()));
     }
-    if request.data_dir.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "data_dir is required".to_string()));
-    }
     if request.web_host.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "web_host is required".to_string()));
     }
@@ -78,7 +75,8 @@ pub(super) async fn api_put_config(
 
     set_string(&mut root, "model", request.model.trim());
     set_string(&mut root, "base_url", request.base_url.trim());
-    set_string(&mut root, "data_dir", request.data_dir.trim());
+    remove_key(&mut root, "data_dir");
+    remove_key(&mut root, "workspace_dir");
     remove_key(&mut root, "web_enabled");
     remove_key(&mut root, "web_host");
     remove_key(&mut root, "web_port");
@@ -120,7 +118,9 @@ pub(super) async fn api_put_config(
             model: request.model.trim().to_string(),
             api_key: state.app_state.config.api_key.clone(),
             llm_base_url: request.base_url.trim().to_string(),
-            data_dir: request.data_dir.trim().to_string(),
+            data_dir: crate::config::default_data_dir()
+                .to_string_lossy()
+                .into_owned(),
             log_level: state.app_state.config.log_level.clone(),
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
@@ -147,7 +147,7 @@ fn config_path_for_save(state: &WebState) -> PathBuf {
     state
         .config_path
         .clone()
-        .unwrap_or_else(|| PathBuf::from("./egopulse.config.yaml"))
+        .unwrap_or_else(default_config_path)
 }
 
 fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload {
@@ -155,6 +155,9 @@ fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload
         model: config.model.clone(),
         base_url: config.llm_base_url.clone(),
         data_dir: config.data_dir.clone(),
+        workspace_dir: crate::config::default_workspace_dir()
+            .to_string_lossy()
+            .into_owned(),
         web_enabled: config.web_enabled(),
         web_host: config.web_host(),
         web_port: config.web_port(),
