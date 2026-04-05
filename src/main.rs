@@ -155,7 +155,7 @@ async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
 
     if matches!(cli.command, Some(Command::Setup)) {
-        return setup::run_setup_wizard()
+        return setup::run_setup_wizard(cli.config.clone())
             .await
             .map_err(EgoPulseError::Internal);
     }
@@ -196,16 +196,17 @@ ACTIONS:
             let config_path = resolve_config_for_service(cli_config);
 
             if config_path.is_none() {
-                eprintln!("No configuration found.");
-                eprintln!("Run 'egopulse setup' first, then retry.");
-                return Ok(());
+                return Err(EgoPulseError::Internal(
+                    "No configuration found. Run 'egopulse setup' first, then retry.".into(),
+                ));
             }
 
             let config_path = config_path.unwrap();
             if !config_path.exists() {
-                eprintln!("Config not found at: {}", config_path.display());
-                eprintln!("Run 'egopulse setup' first, then retry.");
-                return Ok(());
+                return Err(EgoPulseError::Internal(format!(
+                    "Config not found at: {}. Run 'egopulse setup' first, then retry.",
+                    config_path.display()
+                )));
             }
 
             let data_dir = config_path

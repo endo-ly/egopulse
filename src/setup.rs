@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use url::Url;
 
-use crate::config::{Config, base_url_allows_empty_api_key};
+use crate::config::base_url_allows_empty_api_key;
 
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
@@ -55,11 +55,14 @@ struct SetupApp {
     completed: bool,
     backup_path: Option<String>,
     completion_summary: Vec<String>,
+    config_path: PathBuf,
+    original_yaml: Option<serde_yml::Value>,
 }
 
 impl SetupApp {
-    fn new() -> Self {
-        let existing = Self::load_existing_config();
+    fn new(config_path: Option<PathBuf>) -> Self {
+        let config_path = config_path.unwrap_or_else(|| PathBuf::from("./egopulse.config.yaml"));
+        let (existing, original_yaml) = Self::load_existing_config(&config_path);
 
         let mut fields = vec![
             Field {
@@ -160,6 +163,8 @@ impl SetupApp {
             completed: false,
             backup_path: None,
             completion_summary: Vec::new(),
+            config_path,
+            original_yaml,
         }
     }
 
@@ -189,22 +194,19 @@ impl SetupApp {
         }
     }
 
-    fn load_existing_config() -> HashMap<String, String> {
+    fn load_existing_config(
+        config_path: &Path,
+    ) -> (HashMap<String, String>, Option<serde_yml::Value>) {
         let mut result = HashMap::new();
 
-        let config_path = match Config::resolve_config_path() {
-            Ok(Some(path)) => path,
-            _ => return result,
-        };
-
-        let contents = match fs::read_to_string(&config_path) {
+        let contents = match fs::read_to_string(config_path) {
             Ok(c) => c,
-            Err(_) => return result,
+            Err(_) => return (result, None),
         };
 
         let parsed: serde_yml::Value = match serde_yml::from_str(&contents) {
             Ok(v) => v,
-            Err(_) => return result,
+            Err(_) => return (result, None),
         };
 
         if let Some(map) = parsed.as_mapping() {
@@ -281,7 +283,7 @@ impl SetupApp {
             }
         }
 
-        result
+        (result, Some(parsed))
     }
 
     fn visible_fields(&self) -> Vec<usize> {
@@ -430,7 +432,17 @@ impl SetupApp {
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
 
-        let existing_token = Self::load_existing_config().get("WEB_AUTH_TOKEN").cloned();
+        let existing_token = self
+            .original_yaml
+            .as_ref()
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get(serde_yml::Value::String("channels".into())))
+            .and_then(|c| c.as_mapping())
+            .and_then(|m| m.get(serde_yml::Value::String("web".into())))
+            .and_then(|w| w.as_mapping())
+            .and_then(|m| m.get(serde_yml::Value::String("auth_token".into())))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
         let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
         let discord_enabled = self
@@ -468,55 +480,106 @@ impl SetupApp {
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
 
-        let config_path = PathBuf::from("./egopulse.config.yaml");
+        let config_path = &self.config_path;
 
         if config_path.exists() {
-            self.backup_path = Some(backup_config(&config_path)?);
+            self.backup_path = Some(backup_config(config_path)?);
         }
 
-        // Build YAML output
-        let mut yaml = String::new();
+        let mut yaml_value = self
+            .original_yaml
+            .clone()
+            .unwrap_or(serde_yml::Value::Mapping(Default::default()));
 
-        yaml.push_str(&format!("model: {}\n", yaml_value(&model)));
+        let map = yaml_value.as_mapping_mut().unwrap();
+
+        map.insert(
+            serde_yml::Value::String("model".into()),
+            serde_yml::Value::String(model.clone()),
+        );
         if !api_key.is_empty() {
-            yaml.push_str(&format!("api_key: {}\n", yaml_quoted(&api_key)));
+            map.insert(
+                serde_yml::Value::String("api_key".into()),
+                serde_yml::Value::String(api_key.clone()),
+            );
+        } else {
+            map.remove(serde_yml::Value::String("api_key".into()));
         }
-        yaml.push_str(&format!("base_url: {}\n", yaml_value(&base_url)));
-        yaml.push_str("data_dir: .egopulse\n");
-        yaml.push_str("log_level: info\n");
-        yaml.push('\n');
-        yaml.push_str("channels:\n");
-        yaml.push_str("  web:\n");
-        yaml.push_str("    enabled: true\n");
-        yaml.push_str("    host: 127.0.0.1\n");
-        yaml.push_str("    port: 10961\n");
-        yaml.push_str(&format!("    auth_token: {}\n", yaml_quoted(&auth_token)));
+        map.insert(
+            serde_yml::Value::String("base_url".into()),
+            serde_yml::Value::String(base_url.clone()),
+        );
+        map.insert(
+            serde_yml::Value::String("data_dir".into()),
+            serde_yml::Value::String(".egopulse".into()),
+        );
+        map.insert(
+            serde_yml::Value::String("log_level".into()),
+            serde_yml::Value::String("info".into()),
+        );
+
+        let mut channels = serde_yml::Value::Mapping(Default::default());
+        let channels_map = channels.as_mapping_mut().unwrap();
+
+        let mut web = serde_yml::Value::Mapping(Default::default());
+        let web_map = web.as_mapping_mut().unwrap();
+        web_map.insert(
+            serde_yml::Value::String("enabled".into()),
+            serde_yml::Value::Bool(true),
+        );
+        web_map.insert(
+            serde_yml::Value::String("host".into()),
+            serde_yml::Value::String("127.0.0.1".into()),
+        );
+        web_map.insert(
+            serde_yml::Value::String("port".into()),
+            serde_yml::Value::Number(serde_yml::Number::from(10961)),
+        );
+        web_map.insert(
+            serde_yml::Value::String("auth_token".into()),
+            serde_yml::Value::String(auth_token),
+        );
+        channels_map.insert(serde_yml::Value::String("web".into()), web);
 
         if discord_enabled {
-            yaml.push_str("  discord:\n");
-            yaml.push_str("    enabled: true\n");
-            yaml.push_str(&format!(
-                "    bot_token: {}\n",
-                yaml_quoted(&discord_bot_token)
-            ));
+            let mut discord = serde_yml::Value::Mapping(Default::default());
+            let d_map = discord.as_mapping_mut().unwrap();
+            d_map.insert(
+                serde_yml::Value::String("enabled".into()),
+                serde_yml::Value::Bool(true),
+            );
+            d_map.insert(
+                serde_yml::Value::String("bot_token".into()),
+                serde_yml::Value::String(discord_bot_token),
+            );
+            channels_map.insert(serde_yml::Value::String("discord".into()), discord);
         }
 
         if telegram_enabled {
-            yaml.push_str("  telegram:\n");
-            yaml.push_str("    enabled: true\n");
-            yaml.push_str(&format!(
-                "    bot_token: {}\n",
-                yaml_quoted(&telegram_bot_token)
-            ));
+            let mut telegram = serde_yml::Value::Mapping(Default::default());
+            let tg_map = telegram.as_mapping_mut().unwrap();
+            tg_map.insert(
+                serde_yml::Value::String("enabled".into()),
+                serde_yml::Value::Bool(true),
+            );
+            tg_map.insert(
+                serde_yml::Value::String("bot_token".into()),
+                serde_yml::Value::String(telegram_bot_token),
+            );
             if !telegram_bot_username.is_empty() {
-                yaml.push_str(&format!(
-                    "    bot_username: {}\n",
-                    yaml_value(&telegram_bot_username)
-                ));
+                tg_map.insert(
+                    serde_yml::Value::String("bot_username".into()),
+                    serde_yml::Value::String(telegram_bot_username),
+                );
             }
+            channels_map.insert(serde_yml::Value::String("telegram".into()), telegram);
         }
 
-        fs::write(&config_path, &yaml).map_err(|e| format!("Failed to write config: {e}"))?;
+        map.insert(serde_yml::Value::String("channels".into()), channels);
+
+        let yaml = serde_yml::to_string(&yaml_value)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        fs::write(config_path, &yaml).map_err(|e| format!("Failed to write config: {e}"))?;
 
         // Build completion summary
         self.completion_summary = vec![
@@ -577,53 +640,6 @@ fn mask_secret(value: &str) -> String {
     }
     let visible = &value[..4];
     format!("{visible}********")
-}
-
-fn yaml_value(value: &str) -> String {
-    if value.is_empty() {
-        return "\"\"".into();
-    }
-    if value.contains(|c: char| {
-        matches!(
-            c,
-            ':' | '#'
-                | '\''
-                | '"'
-                | '{'
-                | '}'
-                | '['
-                | ']'
-                | ','
-                | '&'
-                | '*'
-                | '?'
-                | '|'
-                | '-'
-                | '<'
-                | '>'
-                | '='
-                | '!'
-                | '%'
-                | '@'
-                | '`'
-                | '\n'
-                | '\r'
-                | '\t'
-        )
-    }) {
-        return yaml_quoted(value);
-    }
-    value.to_string()
-}
-
-fn yaml_quoted(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-        .replace('"', "\\\"");
-    format!("\"{escaped}\"")
 }
 
 fn backup_config(path: &Path) -> Result<String, String> {
@@ -752,16 +768,12 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
                 if (window_start..window_end).contains(&field_pos) {
                     let row = chunks[1].y + 1 + (field_pos - window_start) as u16;
                     let label_width = max_label_width(&app.fields, &visible);
-                    let cursor_x = chunks[1].x
-                        + label_width
-                        + 2
-                        + if field.secret && !app.editing {
-                            8
-                        } else if field.secret {
-                            field.value.chars().count().min(4) as u16
-                        } else {
-                            field.value.chars().count() as u16
-                        };
+                    let displayed_len = if field.value.is_empty() {
+                        "(type value...)".chars().count()
+                    } else {
+                        field.value.chars().count()
+                    };
+                    let cursor_x = chunks[1].x + label_width + 3 + displayed_len as u16;
                     let cursor_y = row;
                     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
                 }
@@ -901,8 +913,8 @@ fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area:
     frame.render_widget(body, area);
 }
 
-pub async fn run_setup_wizard() -> Result<(), String> {
-    let mut app = SetupApp::new();
+pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), String> {
+    let mut app = SetupApp::new(config_path);
     let terminal = init_terminal()?;
 
     run_loop(terminal, &mut app).await
