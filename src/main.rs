@@ -158,7 +158,7 @@ async fn run() -> Result<(), EgoPulseError> {
         Some(path) => Some(path.to_path_buf()),
         None => match Config::resolve_config_path() {
             Ok(path) => path,
-            Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound { .. })) => {
+            Err(ConfigError::AutoConfigNotFound { .. }) => {
                 if matches!(cli.command, None) {
                     eprintln!("No configuration found. Run 'egopulse setup' to create one.");
                     return Ok(());
@@ -169,7 +169,7 @@ async fn run() -> Result<(), EgoPulseError> {
                     },
                 ));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(EgoPulseError::Config(e)),
         },
     };
     let config = if is_start {
@@ -244,7 +244,7 @@ ACTIONS:
 
                     let already_installed = std::path::Path::new(UNIT_PATH).exists();
                     let unit_content =
-                        render_systemd_unit(&exe_path.to_string_lossy(), config_path.as_ref());
+                        render_systemd_unit(&exe_path.to_string_lossy(), Some(&config_path));
                     std::fs::write(UNIT_PATH, &unit_content).map_err(|e| {
                         EgoPulseError::Internal(format!("failed to write unit file: {e}"))
                     })?;
@@ -338,6 +338,7 @@ ACTIONS:
             restart_service()?;
             Ok(())
         }
+        Some(Command::Setup) => unreachable!("handled before config loading"),
         None => runtime::run_tui(config).await,
     }
 }

@@ -651,7 +651,7 @@ fn cleanup_old_backups(backup_dir: &Path, file_name: &str) -> Result<(), String>
     Ok(())
 }
 
-fn draw(terminal: &Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
+fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
     let _ = terminal.draw(|frame| {
         let area = frame.area();
         let chunks = Layout::default()
@@ -881,51 +881,47 @@ fn draw_completion_summary(
     frame.render_widget(body, area);
 }
 
-struct TuiSession {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-}
-
-impl TuiSession {
-    fn new() -> Result<Self, String> {
-        enable_raw_mode().map_err(|e| e.to_string())?;
-        let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(e.to_string());
-        }
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::new(backend) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-                let _ = disable_raw_mode();
-                return Err(e.to_string());
-            }
-        };
-        Ok(Self { terminal })
-    }
-}
-
-impl Drop for TuiSession {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-    }
-}
-
 pub async fn run_setup_wizard() -> Result<(), String> {
     let mut app = SetupApp::new();
-    let session = TuiSession::new()?;
+    let terminal = init_terminal()?;
 
-    run_loop(session.terminal, &mut app).await
+    run_loop(terminal, &mut app).await
+}
+
+fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, String> {
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let mut stdout = io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.to_string());
+    }
+    let backend = CrosstermBackend::new(stdout);
+    match Terminal::new(backend) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(e.to_string())
+        }
+    }
 }
 
 async fn run_loop(
     mut terminal: Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut SetupApp,
 ) -> Result<(), String> {
+    let result = run_inner(&mut terminal, app).await;
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    result
+}
+
+async fn run_inner(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut SetupApp,
+) -> Result<(), String> {
     loop {
-        draw(&terminal, app);
+        draw(terminal, app);
 
         if app.completed {
             // Wait for any key to exit
