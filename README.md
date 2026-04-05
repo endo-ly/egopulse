@@ -53,7 +53,7 @@ channels:
     enabled: true
     host: 127.0.0.1
     port: 10961
-    auth_token: <openssl-rand--base64-32で生成>
+    auth_token: <openssl rand -base64 32 で生成した値>
     allowed_origins:
       - http://127.0.0.1:10961
   discord:
@@ -233,7 +233,7 @@ egopulse gateway uninstall  # 削除
 egopulse update
 ```
 
-`install-egopulse.sh --skip-run` で最新バイナリを配置し、systemdサービスを再起動。
+`install-egopulse.sh --skip-run` で最新バイナリを配置します。`--skip-run` はインストール後の自動実行（`--version` チェック）をスキップするのみで、systemdサービスの再起動は `egopulse update` 側で別途実行されます。
 
 ### Manual systemd unit
 

@@ -426,7 +426,10 @@ impl SetupApp {
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
 
-        let auth_token = generate_auth_token();
+        let existing_token = Self::load_existing_config()
+            .get("WEB_AUTH_TOKEN")
+            .cloned();
+        let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
         let discord_enabled = self
             .fields

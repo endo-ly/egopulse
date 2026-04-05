@@ -165,7 +165,7 @@ async fn run() -> Result<(), EgoPulseError> {
                 }
                 return Err(EgoPulseError::Config(
                     ConfigError::AutoConfigNotFound {
-                        searched: vec!["./egopulse.config.yaml".into()],
+                        searched_paths: vec!["./egopulse.config.yaml".into()],
                     },
                 ));
             }
