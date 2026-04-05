@@ -211,7 +211,7 @@ impl SetupApp {
             for (key, value) in map {
                 if let Some(key_str) = key.as_str() {
                     if let Some(val_str) = value.as_str() {
-                        result.insert(key_str.to_string(), val_str.to_string());
+                        result.insert(key_str.to_ascii_uppercase(), val_str.to_string());
                     }
                 }
             }
@@ -470,9 +470,8 @@ impl SetupApp {
 
         let config_path = PathBuf::from("./egopulse.config.yaml");
 
-        // Backup existing config
         if config_path.exists() {
-            self.backup_path = backup_config(&config_path).ok();
+            self.backup_path = Some(backup_config(&config_path)?);
         }
 
         // Build YAML output
@@ -663,7 +662,7 @@ fn cleanup_old_backups(backup_dir: &Path, file_name: &str) -> Result<(), String>
 
     entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
 
-    while entries.len() >= MAX_CONFIG_BACKUPS {
+    while entries.len() > MAX_CONFIG_BACKUPS {
         if let Some(oldest) = entries.first() {
             let _ = fs::remove_file(oldest.path());
             entries.remove(0);
@@ -969,14 +968,27 @@ async fn run_inner(
                 match key.code {
                     KeyCode::Esc | KeyCode::Enter => {
                         app.editing = false;
-                        // Update field visibility when toggling channel enabled
                         if let Some(field) = app.current_field() {
                             if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
                                 SetupApp::update_field_visibility(&mut app.fields);
                             }
                         }
                     }
-                    KeyCode::Char(c) => {
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match app.save() {
+                            Ok(()) => {
+                                app.editing = false;
+                                app.status = "Config saved successfully!".into();
+                            }
+                            Err(e) => {
+                                app.status = format!("Save failed: {e}");
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err("Setup cancelled".into());
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(field) = app.current_field_mut() {
                             field.value.push(c);
                         }
@@ -1004,13 +1016,9 @@ async fn run_inner(
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(field) = app.current_field() {
-                            if field.required && field.value.trim().is_empty() {
-                                app.status = format!("{} is required", field.label);
-                            } else {
-                                app.editing = true;
-                                app.status = "Editing... (Enter/Esc to finish)".into();
-                            }
+                        if app.current_field().is_some() {
+                            app.editing = true;
+                            app.status = "Editing... (Enter/Esc to finish)".into();
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
