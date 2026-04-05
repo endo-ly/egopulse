@@ -157,7 +157,7 @@ async fn run() -> Result<(), EgoPulseError> {
     if matches!(cli.command, Some(Command::Setup)) {
         return setup::run_setup_wizard()
             .await
-            .map_err(|e| EgoPulseError::Internal(e));
+            .map_err(EgoPulseError::Internal);
     }
 
     match cli.command {
@@ -318,7 +318,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         None => match Config::resolve_config_path() {
             Ok(path) => path,
             Err(ConfigError::AutoConfigNotFound { .. }) => {
-                if matches!(cli.command, None) {
+                if cli.command.is_none() {
                     eprintln!("No configuration found. Run 'egopulse setup' to create one.");
                     return Ok(());
                 }
@@ -338,9 +338,9 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
 
     match &cli.command {
         Some(Command::Ask { session, prompt }) => match if let Some(session) = session.as_deref() {
-            runtime::ask_in_session(config, session, &prompt).await
+            runtime::ask_in_session(config, session, prompt).await
         } else {
-            runtime::ask(config, &prompt).await
+            runtime::ask(config, prompt).await
         } {
             Ok(response) => {
                 println!("assistant: {response}");

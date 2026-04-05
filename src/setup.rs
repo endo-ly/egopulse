@@ -163,7 +163,7 @@ impl SetupApp {
         }
     }
 
-    fn update_field_visibility(fields: &mut Vec<Field>) {
+    fn update_field_visibility(fields: &mut [Field]) {
         let discord_enabled = fields
             .iter()
             .find(|f| f.key == "DISCORD_ENABLED")
@@ -217,12 +217,12 @@ impl SetupApp {
             }
 
             // Extract channels.web.auth_token
-            if let Some(channels) = map.get(&serde_yml::Value::String("channels".into())) {
+            if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
                 if let Some(ch_map) = channels.as_mapping() {
-                    if let Some(web) = ch_map.get(&serde_yml::Value::String("web".into())) {
+                    if let Some(web) = ch_map.get(serde_yml::Value::String("web".into())) {
                         if let Some(web_map) = web.as_mapping() {
                             if let Some(token) =
-                                web_map.get(&serde_yml::Value::String("auth_token".into()))
+                                web_map.get(serde_yml::Value::String("auth_token".into()))
                             {
                                 if let Some(token_str) = token.as_str() {
                                     result.insert("WEB_AUTH_TOKEN".into(), token_str.to_string());
@@ -232,17 +232,17 @@ impl SetupApp {
                     }
 
                     // Extract discord
-                    if let Some(discord) = ch_map.get(&serde_yml::Value::String("discord".into())) {
+                    if let Some(discord) = ch_map.get(serde_yml::Value::String("discord".into())) {
                         if let Some(d_map) = discord.as_mapping() {
                             if let Some(enabled) =
-                                d_map.get(&serde_yml::Value::String("enabled".into()))
+                                d_map.get(serde_yml::Value::String("enabled".into()))
                             {
                                 if let Some(b) = enabled.as_bool() {
                                     result.insert("DISCORD_ENABLED".into(), b.to_string());
                                 }
                             }
                             if let Some(token) =
-                                d_map.get(&serde_yml::Value::String("bot_token".into()))
+                                d_map.get(serde_yml::Value::String("bot_token".into()))
                             {
                                 if let Some(t) = token.as_str() {
                                     result.insert("DISCORD_BOT_TOKEN".into(), t.to_string());
@@ -252,24 +252,24 @@ impl SetupApp {
                     }
 
                     // Extract telegram
-                    if let Some(tg) = ch_map.get(&serde_yml::Value::String("telegram".into())) {
+                    if let Some(tg) = ch_map.get(serde_yml::Value::String("telegram".into())) {
                         if let Some(tg_map) = tg.as_mapping() {
                             if let Some(enabled) =
-                                tg_map.get(&serde_yml::Value::String("enabled".into()))
+                                tg_map.get(serde_yml::Value::String("enabled".into()))
                             {
                                 if let Some(b) = enabled.as_bool() {
                                     result.insert("TELEGRAM_ENABLED".into(), b.to_string());
                                 }
                             }
                             if let Some(token) =
-                                tg_map.get(&serde_yml::Value::String("bot_token".into()))
+                                tg_map.get(serde_yml::Value::String("bot_token".into()))
                             {
                                 if let Some(t) = token.as_str() {
                                     result.insert("TELEGRAM_BOT_TOKEN".into(), t.to_string());
                                 }
                             }
                             if let Some(username) =
-                                tg_map.get(&serde_yml::Value::String("bot_username".into()))
+                                tg_map.get(serde_yml::Value::String("bot_username".into()))
                             {
                                 if let Some(u) = username.as_str() {
                                     result.insert("TELEGRAM_BOT_USERNAME".into(), u.to_string());
@@ -810,8 +810,7 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
     let window_end = (window_start + content_height).min(visible.len());
 
     let mut lines = Vec::new();
-    for pos in window_start..window_end {
-        let idx = visible[pos];
+    for &idx in visible.iter().take(window_end).skip(window_start) {
         let field = &app.fields[idx];
         let is_selected = idx == app.selected;
         let is_editing = is_selected && app.editing;
