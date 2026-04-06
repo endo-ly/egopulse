@@ -84,9 +84,22 @@ fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
+fn runtime_default_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".egopulse").join("egopulse.config.yaml"))
+}
+
+fn escape_systemd_exec_arg(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn escape_systemd_path(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(' ', "\\s")
+}
+
 fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String {
+    let uses_runtime_default_config = runtime_default_config_path().as_deref() == Some(config_path);
     let default_config_arg = "%h/.egopulse/egopulse.config.yaml";
-    let config_arg = if config_path == default_config_path() {
+    let config_arg = if uses_runtime_default_config {
         default_config_arg.to_string()
     } else {
         config_path.to_string_lossy().to_string()
@@ -96,11 +109,15 @@ fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String 
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/etc/egopulse".into());
     let state_root = "%h/.egopulse";
-    let read_write_paths = if config_path == default_config_path() {
+    let read_write_paths = if uses_runtime_default_config {
         format!("{state_root} {state_root}/data {state_root}/workspace")
     } else {
-        format!("{config_dir} {state_root} {state_root}/data {state_root}/workspace")
+        format!(
+            "{} {state_root} {state_root}/data {state_root}/workspace",
+            escape_systemd_path(&config_dir)
+        )
     };
+    let config_arg = escape_systemd_exec_arg(&config_arg);
 
     format!(
         "[Unit]
@@ -110,7 +127,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exe_path} --config {config_arg} start
+ExecStart={exe_path} --config \"{config_arg}\" start
 Restart=always
 RestartSec=10
 Environment=HOME=%h
@@ -376,5 +393,40 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
             unreachable!("handled without config")
         }
         None => runtime::run_tui(config).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_systemd_unit, runtime_default_config_path};
+    use std::path::PathBuf;
+
+    #[test]
+    fn render_systemd_unit_uses_runtime_home_placeholder_for_default_config() {
+        let default_config_path =
+            runtime_default_config_path().expect("home directory should resolve in tests");
+
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &default_config_path);
+
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/egopulse --config \"%h/.egopulse/egopulse.config.yaml\" start"
+        ));
+        assert!(
+            unit.contains("ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace")
+        );
+    }
+
+    #[test]
+    fn render_systemd_unit_quotes_exec_path_and_escapes_read_write_paths() {
+        let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
+
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
+
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/egopulse --config \"/tmp/ego pulse/config dir/egopulse.config.yaml\" start"
+        ));
+        assert!(unit.contains(
+            "ReadWritePaths=/tmp/ego\\spulse/config\\sdir %h/.egopulse %h/.egopulse/data %h/.egopulse/workspace"
+        ));
     }
 }

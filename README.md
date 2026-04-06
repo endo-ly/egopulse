@@ -243,7 +243,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/egopulse --config %h/.egopulse/egopulse.config.yaml start
+ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" start
 Restart=always
 RestartSec=10
 Environment=HOME=%h
