@@ -1,35 +1,39 @@
-use crate::error::{EgoPulseError, StorageError};
+use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::session::{load_messages_for_turn, persist_phase, resolve_chat_id};
+use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::Message;
-use crate::runtime::AppState;
-use crate::storage::{SessionSnapshot, StoredMessage, call_blocking};
+use crate::runtime::{AppState, build_app_state};
+use crate::storage::StoredMessage;
 use crate::web::sse::AgentEvent;
 
-const MAX_HISTORY_MESSAGES: usize = 50;
+pub async fn ask_in_session(
+    config: crate::config::Config,
+    session: &str,
+    prompt: &str,
+) -> Result<String, EgoPulseError> {
+    let state = build_app_state(config)?;
+    let context = SurfaceContext {
+        channel: "cli".to_string(),
+        surface_user: "local_user".to_string(),
+        surface_thread: session.to_string(),
+        chat_type: "cli".to_string(),
+    };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SurfaceContext {
-    pub channel: String,
-    pub surface_user: String,
-    pub surface_thread: String,
-    pub chat_type: String,
-}
-
-impl SurfaceContext {
-    pub fn session_key(&self) -> String {
-        format!("{}:{}", self.channel, self.surface_thread)
+    tokio::select! {
+        response = process_turn(&state, &context, prompt) => response,
+        _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
 }
 
-#[derive(Debug, Clone)]
-struct LoadedSession {
-    messages: Vec<Message>,
-    session_updated_at: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PersistedTurn {
-    updated_at: String,
-    messages: Vec<Message>,
+pub async fn send_turn(
+    state: &AppState,
+    context: &SurfaceContext,
+    prompt: &str,
+) -> Result<String, EgoPulseError> {
+    tokio::select! {
+        response = process_turn(state, context, prompt) => response,
+        _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
+    }
 }
 
 pub async fn process_turn(
@@ -37,18 +41,9 @@ pub async fn process_turn(
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    let chat_id = call_blocking(state.db.clone(), {
-        let channel = context.channel.clone();
-        let session_key = context.session_key();
-        let surface_thread = context.surface_thread.clone();
-        let chat_type = context.chat_type.clone();
-        move |db| {
-            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
-        }
-    })
-    .await?;
+    let chat_id = resolve_chat_id(state, context).await?;
 
-    let LoadedSession {
+    let crate::agent_loop::session::LoadedSession {
         mut messages,
         session_updated_at,
     } = load_messages_for_turn(state, chat_id).await?;
@@ -108,9 +103,6 @@ pub async fn process_turn(
     Ok(response.content)
 }
 
-/// Process a turn with event callbacks for streaming.
-///
-/// Based on Microclaw's process_turn pattern with event emission.
 pub async fn process_turn_with_events<F>(
     state: &AppState,
     context: &SurfaceContext,
@@ -122,18 +114,9 @@ where
 {
     on_event(AgentEvent::Iteration { iteration: 1 });
 
-    let chat_id = call_blocking(state.db.clone(), {
-        let channel = context.channel.clone();
-        let session_key = context.session_key();
-        let surface_thread = context.surface_thread.clone();
-        let chat_type = context.chat_type.clone();
-        move |db| {
-            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
-        }
-    })
-    .await?;
+    let chat_id = resolve_chat_id(state, context).await?;
 
-    let LoadedSession {
+    let crate::agent_loop::session::LoadedSession {
         mut messages,
         session_updated_at,
     } = load_messages_for_turn(state, chat_id).await?;
@@ -165,12 +148,10 @@ where
     messages = persisted_user_turn.messages;
     session_updated_at = Some(persisted_user_turn.updated_at);
 
-    // LLM call with streaming
     let start = std::time::Instant::now();
     let llm = state.llm.clone();
     let messages_for_llm = messages.clone();
 
-    // Forward text chunks while the provider is still generating them.
     let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let response_handle = tokio::spawn(async move {
         llm.send_message_stream("", messages_for_llm, Some(&text_tx))
@@ -186,14 +167,13 @@ where
     }
 
     let response = response_handle.await.map_err(|error| {
-        EgoPulseError::Channel(crate::error::ChannelError::SendFailed(format!(
+        EgoPulseError::Channel(ChannelError::SendFailed(format!(
             "stream task join failed: {error}"
         )))
     })??;
 
     let duration_ms = start.elapsed().as_millis();
 
-    // Use streamed text if available, otherwise fall back to response content
     let final_content = if streamed_text.is_empty() {
         response.content.clone()
     } else {
@@ -239,109 +219,6 @@ where
     Ok(final_content)
 }
 
-async fn load_messages_for_turn(
-    state: &AppState,
-    chat_id: i64,
-) -> Result<LoadedSession, EgoPulseError> {
-    let snapshot = call_blocking(state.db.clone(), move |db| {
-        db.load_session_snapshot(chat_id, MAX_HISTORY_MESSAGES)
-    })
-    .await?;
-
-    Ok(snapshot_to_loaded(snapshot))
-}
-
-fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
-    if let Some(json) = snapshot.messages_json
-        && let Ok(messages) = serde_json::from_str::<Vec<Message>>(&json)
-        && !messages.is_empty()
-    {
-        return LoadedSession {
-            messages: trim_history(&messages),
-            session_updated_at: snapshot.updated_at,
-        };
-    }
-
-    LoadedSession {
-        messages: trim_history(
-            &snapshot
-                .recent_messages
-                .iter()
-                .map(|message| Message {
-                    role: if message.is_from_bot {
-                        "assistant".to_string()
-                    } else {
-                        "user".to_string()
-                    },
-                    content: message.content.clone(),
-                })
-                .collect::<Vec<_>>(),
-        ),
-        session_updated_at: snapshot.updated_at,
-    }
-}
-
-async fn persist_phase(
-    state: &AppState,
-    message: StoredMessage,
-    phase_message: Message,
-    messages: &[Message],
-    session_updated_at: Option<String>,
-) -> Result<PersistedTurn, EgoPulseError> {
-    let mut retry_snapshot = trim_history(messages);
-    let mut retry_session_updated_at = session_updated_at;
-
-    for attempt in 0..2 {
-        let session_json =
-            serde_json::to_string(&retry_snapshot).map_err(StorageError::SessionSerialize)?;
-        let result = call_blocking(state.db.clone(), {
-            let session_updated_at = retry_session_updated_at.clone();
-            let session_json = session_json.clone();
-            let message = message.clone();
-            move |db| {
-                db.store_message_with_session(
-                    &message,
-                    &session_json,
-                    session_updated_at.as_deref(),
-                )
-            }
-        })
-        .await;
-
-        match result {
-            Ok(updated_at) => {
-                return Ok(PersistedTurn {
-                    updated_at,
-                    messages: retry_snapshot.clone(),
-                });
-            }
-            Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
-                let LoadedSession {
-                    messages,
-                    session_updated_at,
-                } = load_messages_for_turn(state, message.chat_id).await?;
-                let mut refreshed_messages = messages;
-                refreshed_messages.push(phase_message.clone());
-                retry_snapshot = trim_history(&refreshed_messages);
-                retry_session_updated_at = session_updated_at;
-            }
-            Err(error) => return Err(EgoPulseError::Storage(error)),
-        }
-    }
-
-    Err(EgoPulseError::Storage(
-        StorageError::SessionSnapshotConflict,
-    ))
-}
-
-fn trim_history(messages: &[Message]) -> Vec<Message> {
-    if messages.len() <= MAX_HISTORY_MESSAGES {
-        return messages.to_vec();
-    }
-
-    messages[messages.len() - MAX_HISTORY_MESSAGES..].to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -349,13 +226,12 @@ mod tests {
     use async_trait::async_trait;
     use secrecy::SecretString;
 
+    use crate::agent_loop::{SurfaceContext, process_turn};
     use crate::config::Config;
     use crate::error::{EgoPulseError, LlmError};
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
     use crate::storage::{Database, StoredMessage, call_blocking};
-
-    use super::{SurfaceContext, process_turn};
 
     struct FakeProvider {
         response: String,
@@ -551,113 +427,5 @@ mod tests {
             .expect("resume after failure");
         assert!(resumed.contains("user:hello"));
         assert!(resumed.contains("user:retry"));
-    }
-
-    #[tokio::test]
-    async fn persist_phase_returns_refreshed_snapshot_after_conflict() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                response: "ok".to_string(),
-            }),
-        );
-        let context = cli_context("conflict");
-
-        let chat_id = call_blocking(state.db.clone(), {
-            let channel = context.channel.clone();
-            let session_key = context.session_key();
-            let surface_thread = context.surface_thread.clone();
-            let chat_type = context.chat_type.clone();
-            move |db| {
-                db.resolve_or_create_chat_id(
-                    &channel,
-                    &session_key,
-                    Some(&surface_thread),
-                    &chat_type,
-                )
-            }
-        })
-        .await
-        .expect("chat id");
-
-        let seed_message = StoredMessage {
-            id: "seed-user".to_string(),
-            chat_id,
-            sender_name: context.surface_user.clone(),
-            content: "hello".to_string(),
-            is_from_bot: false,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-        call_blocking(state.db.clone(), {
-            let message = seed_message.clone();
-            move |db| {
-                db.store_message_with_session(
-                    &message,
-                    r#"[{"role":"user","content":"hello"}]"#,
-                    None,
-                )
-                .map(|_| ())
-            }
-        })
-        .await
-        .expect("seed session");
-
-        let stale_session_updated_at = call_blocking(state.db.clone(), move |db| {
-            db.load_session(chat_id)
-                .map(|session| session.expect("session").1)
-        })
-        .await
-        .expect("stale updated_at");
-
-        let concurrent_message = StoredMessage {
-            id: "seed-assistant".to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: "hi".to_string(),
-            is_from_bot: true,
-            timestamp: "2024-01-01T00:00:01Z".to_string(),
-        };
-        call_blocking(state.db.clone(), {
-            let message = concurrent_message.clone();
-            let expected_updated_at = stale_session_updated_at.clone();
-            move |db| {
-                db.store_message_with_session(
-                    &message,
-                    r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
-                    Some(&expected_updated_at),
-                )
-                .map(|_| ())
-            }
-        })
-        .await
-        .expect("advance session");
-
-        let persisted = super::persist_phase(
-            &state,
-            StoredMessage {
-                id: "new-user".to_string(),
-                chat_id,
-                sender_name: context.surface_user.clone(),
-                content: "next".to_string(),
-                is_from_bot: false,
-                timestamp: "2024-01-01T00:00:02Z".to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: "next".to_string(),
-            },
-            &[Message {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
-            Some(stale_session_updated_at),
-        )
-        .await
-        .expect("persist turn");
-
-        assert_eq!(persisted.messages.len(), 3);
-        assert_eq!(persisted.messages[1].content, "hi");
-        assert_eq!(persisted.messages[2].content, "next");
     }
 }
