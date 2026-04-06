@@ -64,7 +64,6 @@ struct FileConfig {
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
-    data_dir: Option<String>,
     log_level: Option<String>,
     channels: Option<HashMap<String, ChannelConfig>>,
 }
@@ -156,7 +155,7 @@ impl Config {
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
-        let candidate = PathBuf::from("./egopulse.config.yaml");
+        let candidate = default_config_path();
         if candidate.exists() {
             return Ok(Some(candidate));
         }
@@ -166,7 +165,7 @@ impl Config {
         }
 
         Err(ConfigError::AutoConfigNotFound {
-            searched_paths: vec![PathBuf::from("./egopulse.config.yaml")],
+            searched_paths: vec![default_config_path()],
         })
     }
 
@@ -200,6 +199,24 @@ impl Config {
             .get("telegram")
             .and_then(|c| c.bot_username.clone())
     }
+}
+
+pub fn default_config_path() -> PathBuf {
+    default_state_root().join("egopulse.config.yaml")
+}
+
+pub fn default_state_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| panic!("failed to resolve OS home directory for EgoPulse state root"))
+        .join(".egopulse")
+}
+
+pub fn default_data_dir() -> PathBuf {
+    default_state_root().join("data")
+}
+
+pub fn default_workspace_dir() -> PathBuf {
+    default_state_root().join("workspace")
 }
 
 fn normalize_channels(
@@ -315,9 +332,7 @@ fn build_config(
         return Err(ConfigError::MissingApiKey);
     }
 
-    let data_dir = env_var("EGOPULSE_DATA_DIR")
-        .or_else(|| resolve_data_dir(resolved_config_path.as_deref(), file_config.data_dir))
-        .unwrap_or_else(|| default_data_dir().to_string());
+    let data_dir = default_data_dir().to_string_lossy().into_owned();
 
     let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -357,10 +372,6 @@ fn default_model() -> &'static str {
 
 fn default_llm_base_url() -> &'static str {
     "https://api.openai.com/v1"
-}
-
-fn default_data_dir() -> &'static str {
-    ".egopulse"
 }
 
 fn default_web_host() -> &'static str {
@@ -411,19 +422,6 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
     })
 }
 
-fn resolve_data_dir(config_path: Option<&Path>, value: Option<String>) -> Option<String> {
-    let raw = normalize_string(value)?;
-    let path = PathBuf::from(&raw);
-    if path.is_absolute() {
-        return Some(raw);
-    }
-
-    let base_dir = config_path
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new("."));
-    Some(base_dir.join(path).to_string_lossy().into_owned())
-}
-
 fn env_var(key: &str) -> Option<String> {
     env::var(key)
         .ok()
@@ -462,39 +460,98 @@ pub fn authorization_token(config: &Config) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use serial_test::serial;
 
-    use super::{Config, authorization_token};
+    use super::{Config, authorization_token, default_config_path, default_data_dir};
     use crate::error::ConfigError;
 
-    fn clear_env() {
-        unsafe {
-            std::env::remove_var("EGOPULSE_MODEL");
-            std::env::remove_var("EGOPULSE_API_KEY");
-            std::env::remove_var("EGOPULSE_BASE_URL");
-            std::env::remove_var("EGOPULSE_DATA_DIR");
-            std::env::remove_var("EGOPULSE_LOG_LEVEL");
-            std::env::remove_var("EGOPULSE_WEB_ENABLED");
-            std::env::remove_var("EGOPULSE_WEB_HOST");
-            std::env::remove_var("EGOPULSE_WEB_PORT");
-            std::env::remove_var("EGOPULSE_WEB_AUTH_TOKEN");
-            std::env::remove_var("EGOPULSE_WEB_ALLOWED_ORIGINS");
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    const TEST_ENV_KEYS: &[&str] = &[
+        "EGOPULSE_MODEL",
+        "EGOPULSE_API_KEY",
+        "EGOPULSE_BASE_URL",
+        "EGOPULSE_LOG_LEVEL",
+        "EGOPULSE_WEB_ENABLED",
+        "EGOPULSE_WEB_HOST",
+        "EGOPULSE_WEB_PORT",
+        "EGOPULSE_WEB_AUTH_TOKEN",
+        "EGOPULSE_WEB_ALLOWED_ORIGINS",
+        "HOME",
+    ];
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: HashMap<&'static str, Option<std::ffi::OsString>>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_MUTEX.lock().expect("lock env mutex");
+            let original = TEST_ENV_KEYS
+                .iter()
+                .copied()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+
+            let guard = Self {
+                _lock: lock,
+                original,
+            };
+            guard.clear();
+            guard
+        }
+
+        fn clear(&self) {
+            for key in TEST_ENV_KEYS {
+                self.remove(key);
+            }
+        }
+
+        fn set<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(&self, key: K, value: V) {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        fn remove<K: AsRef<std::ffi::OsStr>>(&self, key: K) {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.original {
+                match value {
+                    Some(value) => unsafe {
+                        std::env::set_var(key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(key);
+                    },
+                }
+            }
         }
     }
 
     #[test]
     #[serial]
     fn loads_from_config_file() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: ./runtime\nlog_level: debug\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\nlog_level: debug\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
         )
         .expect("write config");
 
@@ -503,10 +560,7 @@ mod tests {
         assert_eq!(config.model, "openai/gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-file"));
         assert_eq!(config.llm_base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(
-            PathBuf::from(&config.data_dir),
-            file_path.parent().expect("dir").join("./runtime")
-        );
+        assert_eq!(PathBuf::from(&config.data_dir), default_data_dir());
         assert_eq!(config.log_level, "debug");
         assert!(config.web_enabled());
         assert_eq!(config.web_host(), "127.0.0.1");
@@ -519,22 +573,20 @@ mod tests {
     #[test]
     #[serial]
     fn environment_overrides_file_values() {
-        clear_env();
-        unsafe {
-            std::env::set_var("EGOPULSE_MODEL", "gpt-4o-mini");
-            std::env::set_var("EGOPULSE_API_KEY", "sk-env");
-            std::env::set_var("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
-            std::env::set_var("EGOPULSE_DATA_DIR", "/tmp/egopulse-env");
-            std::env::set_var("EGOPULSE_LOG_LEVEL", "trace");
-            std::env::set_var("EGOPULSE_WEB_ENABLED", "false");
-            std::env::set_var("EGOPULSE_WEB_HOST", "0.0.0.0");
-            std::env::set_var("EGOPULSE_WEB_PORT", "8080");
-            std::env::set_var("EGOPULSE_WEB_AUTH_TOKEN", "web-secret");
-            std::env::set_var(
-                "EGOPULSE_WEB_ALLOWED_ORIGINS",
-                "https://egopulse.tailnet.ts.net, http://127.0.0.1:10961",
-            );
-        }
+        let env = EnvGuard::new();
+        env.set("HOME", "/tmp/egopulse-home");
+        env.set("EGOPULSE_MODEL", "gpt-4o-mini");
+        env.set("EGOPULSE_API_KEY", "sk-env");
+        env.set("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
+        env.set("EGOPULSE_LOG_LEVEL", "trace");
+        env.set("EGOPULSE_WEB_ENABLED", "false");
+        env.set("EGOPULSE_WEB_HOST", "0.0.0.0");
+        env.set("EGOPULSE_WEB_PORT", "8080");
+        env.set("EGOPULSE_WEB_AUTH_TOKEN", "web-secret");
+        env.set(
+            "EGOPULSE_WEB_ALLOWED_ORIGINS",
+            "https://egopulse.tailnet.ts.net, http://127.0.0.1:10961",
+        );
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("egopulse.config.yaml");
@@ -550,7 +602,7 @@ mod tests {
         assert_eq!(config.model, "gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-env"));
         assert_eq!(config.llm_base_url, "https://api.openai.com/v1");
-        assert_eq!(config.data_dir, "/tmp/egopulse-env");
+        assert_eq!(config.data_dir, "/tmp/egopulse-home/.egopulse/data");
         assert_eq!(config.log_level, "trace");
         assert!(!config.web_enabled());
         assert_eq!(config.web_host(), "0.0.0.0");
@@ -564,14 +616,14 @@ mod tests {
             ]
         );
         assert!(!config.channel_enabled("web"));
-        clear_env();
     }
 
     #[test]
     #[serial]
     fn loads_web_settings_from_config_file() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
@@ -596,8 +648,9 @@ mod tests {
     #[test]
     #[serial]
     fn injects_default_host_and_port_for_web_channel() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
@@ -620,8 +673,9 @@ mod tests {
     #[test]
     #[serial]
     fn rejects_enabled_web_channel_without_auth_token() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
@@ -637,30 +691,25 @@ mod tests {
     #[test]
     #[serial]
     fn allows_lmstudio_without_api_key() {
-        clear_env();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let current_dir = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
-        unsafe {
-            std::env::set_var("EGOPULSE_MODEL", "local-model");
-            std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
-        }
+        let env = EnvGuard::new();
+        env.set("HOME", "/tmp/egopulse-local-home");
+        env.set("EGOPULSE_MODEL", "local-model");
+        env.set("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
 
         let config = Config::load(None).expect("load config");
-        std::env::set_current_dir(current_dir).expect("restore current dir");
 
         assert_eq!(config.model, "local-model");
         assert_eq!(authorization_token(&config), None);
         assert_eq!(config.llm_base_url, "http://127.0.0.1:1234/v1");
-        assert_eq!(config.data_dir, ".egopulse");
-        clear_env();
+        assert_eq!(config.data_dir, "/tmp/egopulse-local-home/.egopulse/data");
     }
 
     #[test]
     #[serial]
     fn allows_lmstudio_without_api_key_via_file_config() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
@@ -679,8 +728,9 @@ mod tests {
     #[test]
     #[serial]
     fn rejects_missing_api_key_for_remote_base_url() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
@@ -695,56 +745,46 @@ mod tests {
 
     #[test]
     #[serial]
-    fn auto_config_path_prefers_project_file() {
-        clear_env();
+    fn auto_config_path_prefers_default_config_location() {
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        env.set("HOME", temp_dir.path());
+        let file_path = default_config_path();
+        std::fs::create_dir_all(file_path.parent().expect("config dir"))
+            .expect("create config dir");
         std::fs::write(
             &file_path,
             "model: gpt-4o-mini\napi_key: sk\nbase_url: https://api.openai.com/v1",
         )
         .expect("write config");
 
-        let current_dir = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
-
         let resolved = Config::resolve_config_path().expect("resolve config path");
 
-        std::env::set_current_dir(current_dir).expect("restore current dir");
-        assert_eq!(resolved, Some(PathBuf::from("./egopulse.config.yaml")));
+        assert_eq!(resolved, Some(file_path));
     }
 
     #[test]
     #[serial]
     fn auto_config_path_accepts_env_only_runtime() {
-        clear_env();
-        unsafe {
-            std::env::set_var("EGOPULSE_MODEL", "local-model");
-            std::env::set_var("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
-        }
-
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let current_dir = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        let env = EnvGuard::new();
+        env.set("HOME", "/tmp/egopulse-auto-home");
+        env.set("EGOPULSE_MODEL", "local-model");
+        env.set("EGOPULSE_BASE_URL", "http://127.0.0.1:1234/v1");
 
         let resolved = Config::resolve_config_path().expect("resolve config path");
 
-        std::env::set_current_dir(current_dir).expect("restore current dir");
         assert_eq!(resolved, None);
-        clear_env();
     }
 
     #[test]
     #[serial]
     fn auto_config_path_errors_when_missing_file_and_env() {
-        clear_env();
+        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let current_dir = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(temp_dir.path()).expect("set current dir");
+        env.set("HOME", temp_dir.path());
 
         let error = Config::resolve_config_path().expect_err("resolve failure");
 
-        std::env::set_current_dir(current_dir).expect("restore current dir");
         assert!(matches!(error, ConfigError::AutoConfigNotFound { .. }));
     }
 }

@@ -23,6 +23,7 @@ type ConfigPayload = {
   model: string;
   base_url: string;
   data_dir: string;
+  workspace_dir: string;
   web_enabled: boolean;
   web_host: string;
   web_port: number;
@@ -649,7 +650,6 @@ function App() {
     const payload = {
       model: config.model,
       base_url: config.base_url,
-      data_dir: config.data_dir,
       web_enabled: config.web_enabled,
       web_host: config.web_host,
       web_port: config.web_port,
@@ -852,15 +852,6 @@ function App() {
                       : "Enter API key"
                   }
                   onChange={(event) => setConfigApiKey(event.target.value)}
-                />
-              </label>
-              <label>
-                <span>Data Dir</span>
-                <input
-                  value={config.data_dir}
-                  onChange={(event) =>
-                    setConfig({ ...config, data_dir: event.target.value })
-                  }
                 />
               </label>
               <div className="grid-two">

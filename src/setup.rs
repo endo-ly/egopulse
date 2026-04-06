@@ -19,7 +19,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use url::Url;
 
-use crate::config::base_url_allows_empty_api_key;
+use crate::config::{
+    base_url_allows_empty_api_key, default_config_path, default_data_dir, default_workspace_dir,
+};
 
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
@@ -61,7 +63,7 @@ struct SetupApp {
 
 impl SetupApp {
     fn new(config_path: Option<PathBuf>) -> Self {
-        let config_path = config_path.unwrap_or_else(|| PathBuf::from("./egopulse.config.yaml"));
+        let config_path = config_path.unwrap_or_else(default_config_path);
         let (existing, original_yaml) = Self::load_existing_config(&config_path);
 
         let mut fields = vec![
@@ -481,6 +483,14 @@ impl SetupApp {
             .unwrap_or_default();
 
         let config_path = &self.config_path;
+        if let Some(config_dir) = config_path.parent() {
+            fs::create_dir_all(config_dir)
+                .map_err(|e| format!("Failed to create config directory: {e}"))?;
+        }
+        fs::create_dir_all(default_data_dir())
+            .map_err(|e| format!("Failed to create data directory: {e}"))?;
+        fs::create_dir_all(default_workspace_dir())
+            .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
 
         if config_path.exists() {
             self.backup_path = Some(backup_config(config_path)?);
@@ -509,10 +519,8 @@ impl SetupApp {
             serde_yml::Value::String("base_url".into()),
             serde_yml::Value::String(base_url.clone()),
         );
-        map.insert(
-            serde_yml::Value::String("data_dir".into()),
-            serde_yml::Value::String(".egopulse".into()),
-        );
+        map.remove(serde_yml::Value::String("data_dir".into()));
+        map.remove(serde_yml::Value::String("workspace_dir".into()));
         map.insert(
             serde_yml::Value::String("log_level".into()),
             serde_yml::Value::String("info".into()),

@@ -22,7 +22,7 @@ cargo run -p egopulse
 egopulse setup
 ```
 
-対話型TUIウィザードが `egopulse.config.yaml` を作成。LLMプロバイダの選択、API認証情報の入力、チャネルの設定をガイド。
+対話型TUIウィザードが `~/.egopulse/egopulse.config.yaml` を作成。LLMプロバイダの選択、API認証情報の入力、チャネルの設定をガイド。
 
 ### 3. Run
 
@@ -37,7 +37,7 @@ egopulse start    # 有効なチャネルを一括起動（Web, Discord, Telegra
 
 1. 環境変数（最優先）
 2. `--config <PATH>` で指定したYAML
-3. カレントディレクトリの `./egopulse.config.yaml` 自動検出
+3. `~/.egopulse/egopulse.config.yaml` 自動検出
 
 ### YAML config
 
@@ -45,7 +45,6 @@ egopulse start    # 有効なチャネルを一括起動（Web, Discord, Telegra
 model: gpt-4o-mini
 api_key: sk-...
 base_url: https://api.openai.com/v1
-data_dir: .egopulse
 log_level: info
 
 channels:
@@ -74,7 +73,6 @@ channels:
 | `EGOPULSE_MODEL` | モデル名（必須） |
 | `EGOPULSE_API_KEY` | APIキー（`localhost`/`127.0.0.1`/`0.0.0.0`/`::1` のbase_urlなら省略可） |
 | `EGOPULSE_BASE_URL` | OpenAI互換APIエンドポイント |
-| `EGOPULSE_DATA_DIR` | データディレクトリ（デフォルト: `.egopulse`） |
 | `EGOPULSE_LOG_LEVEL` | ログレベル（デフォルト: `info`） |
 | `EGOPULSE_DISCORD_BOT_TOKEN` | Discordボットトークンの上書き |
 | `EGOPULSE_TELEGRAM_BOT_TOKEN` | Telegramボットトークンの上書き |
@@ -225,7 +223,7 @@ egopulse gateway restart    # 再起動
 egopulse gateway uninstall  # 削除
 ```
 
-ユニットファイルは `/etc/systemd/system/egopulse.service` に配置。`--config` を指定するとそのパスがユニットに埋め込まれる。省略時は `/etc/egopulse/egopulse.config.yaml`。
+ユニットファイルは `/etc/systemd/system/egopulse.service` に配置。`--config` を指定するとその絶対パスがユニットに埋め込まれる。省略時は `~/.egopulse/egopulse.config.yaml` を自動検出する。
 
 ### Update
 
@@ -245,14 +243,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/egopulse --config /etc/egopulse/egopulse.config.yaml start
+ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" start
 Restart=always
 RestartSec=10
-Environment=HOME=/root
+Environment=HOME=%h
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`User=root` 相当で動かす場合の設定ファイル例は `/root/.egopulse/egopulse.config.yaml`。固定ディレクトリは `/root/.egopulse/data` と `/root/.egopulse/workspace`。
 
 ```bash
 sudo systemctl daemon-reload
