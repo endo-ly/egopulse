@@ -64,6 +64,7 @@ struct FileConfig {
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
+    data_dir: Option<String>,
     log_level: Option<String>,
     channels: Option<HashMap<String, ChannelConfig>>,
 }
@@ -340,7 +341,12 @@ fn build_config(
         return Err(ConfigError::MissingApiKey);
     }
 
-    let data_dir = default_data_dir().to_string_lossy().into_owned();
+    let data_dir = first_non_empty([
+        env_var("EGOPULSE_DATA_DIR"),
+        file_config.data_dir,
+        Some(default_data_dir().to_string_lossy().into_owned()),
+    ])
+    .expect("default data_dir");
 
     let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -474,9 +480,7 @@ mod tests {
 
     use serial_test::serial;
 
-    use std::path::PathBuf;
-
-    use super::{Config, authorization_token, default_config_path, default_data_dir};
+    use super::{Config, authorization_token, default_config_path};
     use crate::error::ConfigError;
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -485,6 +489,7 @@ mod tests {
         "EGOPULSE_MODEL",
         "EGOPULSE_API_KEY",
         "EGOPULSE_BASE_URL",
+        "EGOPULSE_DATA_DIR",
         "EGOPULSE_LOG_LEVEL",
         "EGOPULSE_WEB_ENABLED",
         "EGOPULSE_WEB_HOST",
@@ -560,7 +565,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\nlog_level: debug\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+            "model: openai/gpt-4o-mini\napi_key: sk-file\nbase_url: https://openrouter.ai/api/v1\ndata_dir: /tmp/egopulse-config-data\nlog_level: debug\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
         )
         .expect("write config");
 
@@ -569,7 +574,7 @@ mod tests {
         assert_eq!(config.model, "openai/gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-file"));
         assert_eq!(config.llm_base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(PathBuf::from(&config.data_dir), default_data_dir());
+        assert_eq!(config.data_dir, "/tmp/egopulse-config-data");
         assert_eq!(config.log_level, "debug");
         assert!(config.web_enabled());
         assert_eq!(config.web_host(), "127.0.0.1");
@@ -587,6 +592,7 @@ mod tests {
         env.set("EGOPULSE_MODEL", "gpt-4o-mini");
         env.set("EGOPULSE_API_KEY", "sk-env");
         env.set("EGOPULSE_BASE_URL", "https://api.openai.com/v1");
+        env.set("EGOPULSE_DATA_DIR", "/tmp/egopulse-env-data");
         env.set("EGOPULSE_LOG_LEVEL", "trace");
         env.set("EGOPULSE_WEB_ENABLED", "false");
         env.set("EGOPULSE_WEB_HOST", "0.0.0.0");
@@ -611,7 +617,7 @@ mod tests {
         assert_eq!(config.model, "gpt-4o-mini");
         assert_eq!(authorization_token(&config), Some("sk-env"));
         assert_eq!(config.llm_base_url, "https://api.openai.com/v1");
-        assert_eq!(config.data_dir, "/tmp/egopulse-home/.egopulse/data");
+        assert_eq!(config.data_dir, "/tmp/egopulse-env-data");
         assert_eq!(config.log_level, "trace");
         assert!(!config.web_enabled());
         assert_eq!(config.web_host(), "0.0.0.0");
