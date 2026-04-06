@@ -28,7 +28,7 @@ egopulse setup
 
 ```bash
 egopulse          # ローカルTUIを開く
-egopulse start    # 有効なチャネルを一括起動（Web, Discord, Telegram）
+egopulse run
 ```
 
 ## Configuration
@@ -117,7 +117,7 @@ export EGOPULSE_BASE_URL="http://127.0.0.1:1234/v1"
 | `egopulse setup` | 対話型設定ウィザード | 不要 |
 | `egopulse ask <PROMPT>` | 単発プロンプト、結果をstdoutに出力 | 必須 |
 | `egopulse chat` | 永続化CLIチャットセッション | 必須 |
-| `egopulse start` | 有効なチャネルを一括起動 | 必須（api_keyは省略可） |
+| `egopulse run` | 有効なチャネルを一括起動（前景実行） | 必須（api_keyは省略可） |
 | `egopulse gateway <ACTION>` | systemdサービス管理 | — |
 | `egopulse update` | 最新リリースに更新 | — |
 
@@ -147,7 +147,7 @@ egopulse chat --session my-session
 |-----------|------|
 | `--session <SESSION>` | セッション名（省略時は自動生成 `cli-<uuid>`） |
 
-#### `egopulse start`
+#### `egopulse run`
 
 設定で `enabled: true` のチャネルを並列起動。Web、Discord、Telegramを同時に稼働。Ctrl+C でgraceful shutdown。
 
@@ -156,6 +156,8 @@ egopulse chat --session my-session
 | アクション | 説明 |
 |-----------|------|
 | `install` | systemdユニットを作成・有効化・起動。既存なら更新して再起動。 |
+| `start` | インストール済みのsystemdサービスを起動。 |
+| `stop` | systemdサービスを停止。 |
 | `uninstall` | サービスの無効化・停止・削除。 |
 | `status` | `systemctl status` の出力を表示。未起動時はexit 1。 |
 | `restart` | systemdサービスを再起動。 |
@@ -217,7 +219,10 @@ openssl rand -base64 32
 ### systemd service
 
 ```bash
+egopulse run                # 前景実行
 egopulse gateway install    # インストール・起動
+egopulse gateway start      # サービス起動
+egopulse gateway stop       # サービス停止
 egopulse gateway status     # 状態確認
 egopulse gateway restart    # 再起動
 egopulse gateway uninstall  # 削除
@@ -243,7 +248,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" start
+ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
 Restart=always
 RestartSec=10
 Environment=HOME=%h
@@ -285,7 +290,7 @@ cargo test -p egopulse
 cargo run -p egopulse                    # TUI
 cargo run -p egopulse -- setup           # 初回セットアップ
 cargo run -p egopulse -- ask "hello"     # 単発
-cargo run -p egopulse -- start           # 全チャネル
+cargo run -p egopulse -- run             # 全チャネル
 ```
 
 ### Install script options

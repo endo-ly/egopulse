@@ -35,9 +35,8 @@ enum Command {
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
-    /// Start all enabled channel adapters based on config.
-    /// Microclaw-compatible: starts web, discord, telegram concurrently.
-    Start,
+    /// Run all enabled channel adapters in the foreground.
+    Run,
     /// Interactive setup wizard to create egopulse.config.yaml.
     Setup,
     Gateway {
@@ -51,6 +50,10 @@ enum Command {
 enum GatewayAction {
     /// Install and enable the systemd service
     Install,
+    /// Start the installed systemd service
+    Start,
+    /// Stop the installed systemd service
+    Stop,
     /// Disable and remove the systemd service
     Uninstall,
     /// Show systemd service status
@@ -127,7 +130,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exe_path} --config \"{config_arg}\" start
+ExecStart={exe_path} --config \"{config_arg}\" run
 Restart=always
 RestartSec=10
 Environment=HOME=%h
@@ -180,6 +183,17 @@ fn restart_service() -> Result<(), EgoPulseError> {
     }
 }
 
+async fn run_foreground(cli_config: Option<&PathBuf>) -> Result<(), EgoPulseError> {
+    let resolved_config_path = match cli_config {
+        Some(path) => Some(resolve_cli_config_path(path)),
+        None => Config::resolve_config_path().map_err(EgoPulseError::Config)?,
+    };
+    let config = Config::load_allow_missing_api_key(resolved_config_path.as_deref())?;
+    init_logging(&config.log_level)?;
+    let state = runtime::build_app_state_with_path(config, resolved_config_path)?;
+    runtime::start_channels(state).await
+}
+
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
 
@@ -190,6 +204,7 @@ async fn run() -> Result<(), EgoPulseError> {
     }
 
     match cli.command {
+        Some(Command::Run) => run_foreground(cli.config.as_ref()).await,
         Some(Command::Gateway { action }) => run_gateway(cli.config.as_ref(), action).await,
         Some(Command::Update) => run_update().await,
         _ => run_with_config(&cli).await,
@@ -209,6 +224,8 @@ USAGE:
 
 ACTIONS:
     install      Install and enable the systemd service
+    start        Start the installed systemd service
+    stop         Stop the installed systemd service
     uninstall    Disable and remove the systemd service
     status       Show systemd service status
     restart      Restart the systemd service
@@ -264,6 +281,16 @@ ACTIONS:
                 )?;
                 println!("Installed and started egopulse service: {UNIT_PATH}");
             }
+            Ok(())
+        }
+        GatewayAction::Start => {
+            ensure_success(systemctl_cmd(&["start", "egopulse"])?, "start service")?;
+            println!("egopulse service started");
+            Ok(())
+        }
+        GatewayAction::Stop => {
+            ensure_success(systemctl_cmd(&["stop", "egopulse"])?, "stop service")?;
+            println!("egopulse service stopped");
             Ok(())
         }
         GatewayAction::Uninstall => {
@@ -336,7 +363,6 @@ async fn run_update() -> Result<(), EgoPulseError> {
 }
 
 async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
-    let is_start = matches!(cli.command, Some(Command::Start));
     let resolved_config_path = match cli.config.as_deref() {
         Some(path) => Some(resolve_cli_config_path(path)),
         None => match Config::resolve_config_path() {
@@ -353,11 +379,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
             Err(e) => return Err(EgoPulseError::Config(e)),
         },
     };
-    let config = if is_start {
-        Config::load_allow_missing_api_key(resolved_config_path.as_deref())?
-    } else {
-        Config::load(resolved_config_path.as_deref())?
-    };
+    let config = Config::load(resolved_config_path.as_deref())?;
     init_logging(&config.log_level)?;
 
     match &cli.command {
@@ -384,10 +406,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                 Err(error) => Err(error),
             }
         }
-        Some(Command::Start) => {
-            let state = runtime::build_app_state_with_path(config, resolved_config_path.clone())?;
-            runtime::start_channels(state).await
-        }
+        Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
@@ -409,7 +428,7 @@ mod tests {
         let unit = render_systemd_unit("/usr/local/bin/egopulse", &default_config_path);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/egopulse --config \"%h/.egopulse/egopulse.config.yaml\" start"
+            "ExecStart=/usr/local/bin/egopulse --config \"%h/.egopulse/egopulse.config.yaml\" run"
         ));
         assert!(
             unit.contains("ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace")
@@ -423,7 +442,7 @@ mod tests {
         let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/egopulse --config \"/tmp/ego pulse/config dir/egopulse.config.yaml\" start"
+            "ExecStart=/usr/local/bin/egopulse --config \"/tmp/ego pulse/config dir/egopulse.config.yaml\" run"
         ));
         assert!(unit.contains(
             "ReadWritePaths=/tmp/ego\\spulse/config\\sdir %h/.egopulse %h/.egopulse/data %h/.egopulse/workspace"

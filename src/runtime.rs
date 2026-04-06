@@ -158,7 +158,7 @@ pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
 
 /// 全有効チャネルを一括起動 (microclaw 互換)。
 ///
-/// `egopulse start` から呼び出される。
+/// `egopulse run` から呼び出される。
 /// microclaw `src/runtime.rs::run()` と同じパターン:
 /// 設定ベースでチャネルを構築 → spawn → ctrl_c 待機。
 ///

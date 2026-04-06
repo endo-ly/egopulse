@@ -733,7 +733,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
         // Footer
         let footer_text = if app.completed {
             vec![Line::from(
-                "Setup complete. Run egopulse to start the TUI, or egopulse start for channels.",
+                "Setup complete. Run egopulse for the TUI, or egopulse run for channels.",
             )]
         } else {
             vec![
