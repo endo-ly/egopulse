@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use egopulse::agent_loop;
 use egopulse::channels::cli;
 use egopulse::config::{Config, default_config_path};
 use egopulse::error::{ConfigError, EgoPulseError};
@@ -64,7 +65,9 @@ async fn run() -> Result<(), EgoPulseError> {
 
     match cli.command {
         Some(Command::Run) => run_foreground(cli.config.as_ref()).await,
-        Some(Command::Gateway { action }) => gateway::run_gateway(cli.config.as_ref(), action).await,
+        Some(Command::Gateway { action }) => {
+            gateway::run_gateway(cli.config.as_ref(), action).await
+        }
         Some(Command::Update) => gateway::run_update().await,
         _ => run_with_config(&cli).await,
     }
@@ -103,7 +106,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
 
     match &cli.command {
         Some(Command::Ask { session, prompt }) => match if let Some(session) = session.as_deref() {
-            runtime::ask_in_session(config, session, prompt).await
+            agent_loop::ask_in_session(config, session, prompt).await
         } else {
             runtime::ask(config, prompt).await
         } {
