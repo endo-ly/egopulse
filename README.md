@@ -243,15 +243,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/egopulse --config /root/.egopulse/egopulse.config.yaml start
+ExecStart=/usr/local/bin/egopulse --config %h/.egopulse/egopulse.config.yaml start
 Restart=always
 RestartSec=10
-Environment=HOME=/root
+Environment=HOME=%h
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/root/.egopulse
+ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace
 ProtectHome=read-only
 
 [Install]

@@ -3,7 +3,7 @@ use std::process::Command as ProcessCommand;
 
 use clap::{Parser, Subcommand};
 use egopulse::channels::cli;
-use egopulse::config::{Config, default_config_path, default_workspace_dir};
+use egopulse::config::{Config, default_config_path};
 use egopulse::error::{ConfigError, EgoPulseError};
 use egopulse::logging::init_logging;
 use egopulse::runtime;
@@ -84,19 +84,23 @@ fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
-fn render_systemd_unit(
-    exe_path: &str,
-    config_path: &std::path::Path,
-    data_dir: &std::path::Path,
-    workspace_dir: &std::path::Path,
-) -> String {
-    let config_arg = config_path.to_string_lossy();
+fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String {
+    let default_config_arg = "%h/.egopulse/egopulse.config.yaml";
+    let config_arg = if config_path == default_config_path() {
+        default_config_arg.to_string()
+    } else {
+        config_path.to_string_lossy().to_string()
+    };
     let config_dir = config_path
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/etc/egopulse".into());
-    let data_dir_str = data_dir.to_string_lossy();
-    let workspace_dir_str = workspace_dir.to_string_lossy();
+    let state_root = "%h/.egopulse";
+    let read_write_paths = if config_path == default_config_path() {
+        format!("{state_root} {state_root}/data {state_root}/workspace")
+    } else {
+        format!("{config_dir} {state_root} {state_root}/data {state_root}/workspace")
+    };
 
     format!(
         "[Unit]
@@ -109,12 +113,12 @@ Type=simple
 ExecStart={exe_path} --config {config_arg} start
 Restart=always
 RestartSec=10
-Environment=HOME=/root
+Environment=HOME=%h
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths={config_dir} {data_dir_str} {workspace_dir_str}
+ReadWritePaths={read_write_paths}
 ProtectHome=read-only
 
 [Install]
@@ -217,17 +221,8 @@ ACTIONS:
                 )));
             }
 
-            let config = Config::load_allow_missing_api_key(Some(&config_path))?;
-            let data_dir = PathBuf::from(&config.data_dir);
-            let workspace_dir = default_workspace_dir();
-
             let already_installed = std::path::Path::new(UNIT_PATH).exists();
-            let unit_content = render_systemd_unit(
-                &exe_path.to_string_lossy(),
-                &config_path,
-                &data_dir,
-                &workspace_dir,
-            );
+            let unit_content = render_systemd_unit(&exe_path.to_string_lossy(), &config_path);
             std::fs::write(UNIT_PATH, &unit_content).map_err(|e| {
                 let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
                     format!(
