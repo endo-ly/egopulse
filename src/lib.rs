@@ -1,9 +1,9 @@
 pub mod agent_loop;
-pub mod channel;
 pub mod channel_adapter;
 pub mod channels;
 pub mod config;
 pub mod error;
+pub mod gateway;
 pub mod llm;
 pub mod logging;
 pub mod runtime;

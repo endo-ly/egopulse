@@ -18,7 +18,7 @@ use serenity::prelude::*;
 use tracing::{error, info};
 
 use crate::agent_loop::SurfaceContext;
-use crate::channel::ConversationKind;
+use crate::channel_adapter::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
 use crate::runtime::AppState;
 use crate::text::split_text;
