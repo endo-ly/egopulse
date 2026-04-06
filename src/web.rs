@@ -13,8 +13,8 @@ use axum::routing::{get, post};
 use axum::{Router, body::Body};
 use tokio::sync::{Mutex, broadcast};
 
-use crate::channel_adapter::ConversationKind;
 use crate::channel_adapter::ChannelAdapter;
+use crate::channel_adapter::ConversationKind;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 

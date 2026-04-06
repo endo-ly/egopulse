@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
-use clap::Subcommand;
 use crate::config::Config;
 use crate::error::EgoPulseError;
+use clap::Subcommand;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNIT_PATH: &str = "/etc/systemd/system/egopulse.service";
