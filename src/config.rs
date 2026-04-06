@@ -199,6 +199,14 @@ impl Config {
             .get("telegram")
             .and_then(|c| c.bot_username.clone())
     }
+
+    pub fn skills_dir(&self) -> PathBuf {
+        PathBuf::from(&self.data_dir).join("skills")
+    }
+
+    pub fn workspace_dir(&self) -> PathBuf {
+        PathBuf::from(&self.data_dir).join("workspace")
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -462,10 +470,11 @@ pub fn authorization_token(config: &Config) -> Option<&str> {
 mod tests {
     use std::collections::HashMap;
     use std::io::Write;
-    use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use serial_test::serial;
+
+    use std::path::PathBuf;
 
     use super::{Config, authorization_token, default_config_path, default_data_dir};
     use crate::error::ConfigError;

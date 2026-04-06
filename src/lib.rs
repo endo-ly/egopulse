@@ -8,6 +8,8 @@ pub mod llm;
 pub mod logging;
 pub mod runtime;
 pub mod setup;
+pub mod skills;
 pub mod storage;
 pub mod text;
+pub mod tools;
 pub mod web;

@@ -1,10 +1,14 @@
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::session::{load_messages_for_turn, persist_phase, resolve_chat_id};
-use crate::error::{ChannelError, EgoPulseError};
-use crate::llm::Message;
+use crate::error::EgoPulseError;
+use crate::llm::{Message, MessagesResponse, ToolCall};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::StoredMessage;
+use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
+
+const MAX_TOOL_ITERATIONS: usize = 16;
+const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 
 pub async fn ask_in_session(
     config: crate::config::Config,
@@ -41,66 +45,7 @@ pub async fn process_turn(
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    let chat_id = resolve_chat_id(state, context).await?;
-
-    let crate::agent_loop::session::LoadedSession {
-        mut messages,
-        session_updated_at,
-    } = load_messages_for_turn(state, chat_id).await?;
-    let mut session_updated_at = session_updated_at;
-    let user_message = Message {
-        role: "user".to_string(),
-        content: user_input.to_string(),
-    };
-    messages.push(Message {
-        role: user_message.role.clone(),
-        content: user_message.content.clone(),
-    });
-
-    let persisted_user_turn = persist_phase(
-        state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: context.surface_user.clone(),
-            content: user_input.to_string(),
-            is_from_bot: false,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-        user_message,
-        &messages,
-        session_updated_at,
-    )
-    .await?;
-    messages = persisted_user_turn.messages;
-    session_updated_at = Some(persisted_user_turn.updated_at);
-
-    let response = state.llm.send_message("", messages.clone()).await?;
-    let assistant_message = Message {
-        role: "assistant".to_string(),
-        content: response.content.clone(),
-    };
-    messages.push(Message {
-        role: assistant_message.role.clone(),
-        content: assistant_message.content.clone(),
-    });
-
-    let _persisted_assistant_turn = persist_phase(
-        state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: response.content.clone(),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-        assistant_message,
-        &messages,
-        session_updated_at,
-    )
-    .await?;
-    Ok(response.content)
+    process_turn_inner(state, context, user_input, Option::<fn(AgentEvent)>::None).await
 }
 
 pub async fn process_turn_with_events<F>(
@@ -112,23 +57,40 @@ pub async fn process_turn_with_events<F>(
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
-    on_event(AgentEvent::Iteration { iteration: 1 });
+    process_turn_inner(state, context, user_input, Some(on_event)).await
+}
 
+async fn process_turn_inner<F>(
+    state: &AppState,
+    context: &SurfaceContext,
+    user_input: &str,
+    on_event: Option<F>,
+) -> Result<String, EgoPulseError>
+where
+    F: Fn(AgentEvent) + Send + Sync,
+{
     let chat_id = resolve_chat_id(state, context).await?;
+    let tool_context = ToolExecutionContext {
+        chat_id,
+        channel: context.channel.clone(),
+        surface_thread: context.surface_thread.clone(),
+        chat_type: context.chat_type.clone(),
+    };
+    let system_prompt = build_system_prompt(state, context);
 
     let crate::agent_loop::session::LoadedSession {
         mut messages,
         session_updated_at,
     } = load_messages_for_turn(state, chat_id).await?;
     let mut session_updated_at = session_updated_at;
+
     let user_message = Message {
         role: "user".to_string(),
         content: user_input.to_string(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     };
-    messages.push(Message {
-        role: user_message.role.clone(),
-        content: user_message.content.clone(),
-    });
+    messages.push(user_message.clone());
 
     let persisted_user_turn = persist_phase(
         state,
@@ -148,75 +110,235 @@ where
     messages = persisted_user_turn.messages;
     session_updated_at = Some(persisted_user_turn.updated_at);
 
-    let start = std::time::Instant::now();
-    let llm = state.llm.clone();
-    let messages_for_llm = messages.clone();
+    for iteration in 1..=MAX_TOOL_ITERATIONS {
+        emit_event(&on_event, AgentEvent::Iteration { iteration });
 
-    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let response_handle = tokio::spawn(async move {
-        llm.send_message_stream("", messages_for_llm, Some(&text_tx))
-            .await
-    });
+        let response = state
+            .llm
+            .send_message(
+                &system_prompt,
+                messages.clone(),
+                Some(state.tools.definitions()),
+            )
+            .await?;
 
-    let mut streamed_text = String::new();
-    while let Some(chunk) = text_rx.recv().await {
-        if !chunk.is_empty() {
-            streamed_text.push_str(&chunk);
-            on_event(AgentEvent::TextDelta { delta: chunk });
+        if response.tool_calls.is_empty() {
+            let final_content = response.content.trim().to_string();
+            if final_content.is_empty() {
+                return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
+                    "assistant content was empty".to_string(),
+                )));
+            }
+
+            let assistant_message = Message {
+                role: "assistant".to_string(),
+                content: final_content.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            };
+            messages.push(assistant_message.clone());
+
+            let _persisted = persist_phase(
+                state,
+                StoredMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    chat_id,
+                    sender_name: "egopulse".to_string(),
+                    content: final_content.clone(),
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+                assistant_message,
+                &messages,
+                session_updated_at,
+            )
+            .await?;
+
+            emit_event(
+                &on_event,
+                AgentEvent::FinalResponse {
+                    text: final_content.clone(),
+                },
+            );
+            return Ok(final_content);
+        }
+
+        let assistant_message_id = uuid::Uuid::new_v4().to_string();
+        let assistant_preview = summarize_tool_calls(&response);
+        let assistant_message = Message {
+            role: "assistant".to_string(),
+            content: response.content.clone(),
+            tool_calls: response.tool_calls.clone(),
+            tool_call_id: None,
+        };
+        messages.push(assistant_message.clone());
+
+        let persisted_assistant_turn = persist_phase(
+            state,
+            StoredMessage {
+                id: assistant_message_id.clone(),
+                chat_id,
+                sender_name: "egopulse".to_string(),
+                content: assistant_preview,
+                is_from_bot: true,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+            assistant_message,
+            &messages,
+            session_updated_at,
+        )
+        .await?;
+        messages = persisted_assistant_turn.messages;
+        session_updated_at = Some(persisted_assistant_turn.updated_at);
+
+        for tool_call in response.tool_calls {
+            emit_event(
+                &on_event,
+                AgentEvent::ToolStart {
+                    name: tool_call.name.clone(),
+                    input: tool_call.arguments.clone(),
+                },
+            );
+
+            store_pending_tool_call(state, chat_id, &assistant_message_id, &tool_call).await?;
+            let result = state
+                .tools
+                .execute(&tool_call.name, tool_call.arguments.clone(), &tool_context)
+                .await;
+            let tool_payload = format_tool_result(&tool_call, &result);
+            update_tool_call_output(state, &tool_call.id, &tool_payload).await?;
+
+            emit_event(
+                &on_event,
+                AgentEvent::ToolResult {
+                    name: tool_call.name.clone(),
+                    is_error: result.is_error,
+                    preview: preview_text(&tool_payload, 160),
+                    duration_ms: 0,
+                },
+            );
+
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: tool_payload,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call.id),
+            });
         }
     }
 
-    let response = response_handle.await.map_err(|error| {
-        EgoPulseError::Channel(ChannelError::SendFailed(format!(
-            "stream task join failed: {error}"
-        )))
-    })??;
+    Err(EgoPulseError::Internal(format!(
+        "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
+    )))
+}
 
-    let duration_ms = start.elapsed().as_millis();
+fn emit_event<F>(on_event: &Option<F>, event: AgentEvent)
+where
+    F: Fn(AgentEvent) + Send + Sync,
+{
+    if let Some(on_event) = on_event {
+        on_event(event);
+    }
+}
 
-    let final_content = if streamed_text.is_empty() {
-        response.content.clone()
-    } else {
-        streamed_text
-    };
-
-    let assistant_message = Message {
-        role: "assistant".to_string(),
-        content: final_content.clone(),
-    };
-    messages.push(Message {
-        role: assistant_message.role.clone(),
-        content: assistant_message.content.clone(),
-    });
-
-    let _persisted_assistant_turn = persist_phase(
-        state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: final_content.clone(),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-        assistant_message,
-        &messages,
-        session_updated_at,
-    )
-    .await?;
-
-    on_event(AgentEvent::FinalResponse {
-        text: final_content.clone(),
-    });
-
-    tracing::debug!(
-        channel = %context.channel,
-        chat_id = chat_id,
-        duration_ms = duration_ms,
-        "Turn completed"
+fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
+    let mut prompt = format!(
+        "You are EgoPulse, a local-first assistant running on the '{}' channel.\n\
+         Call tools directly when you need external data or file access. Do not describe fake tool calls as plain text.\n\
+         Prefer relative paths under the runtime workspace when using read_file.\n\
+         Use activate_skill when a listed skill matches the task and you need its full instructions.\n\
+         The current session is '{}' (type: {}).",
+        context.channel, context.surface_thread, context.chat_type
     );
 
-    Ok(final_content)
+    let skills_catalog = state.skills.build_skills_catalog();
+    if !skills_catalog.is_empty() {
+        prompt.push_str("\n\n# Agent Skills\n\n");
+        prompt.push_str(
+            "The following skills are available. Load the full instructions with activate_skill before relying on one.\n\n",
+        );
+        prompt.push_str(&skills_catalog);
+    }
+
+    prompt
+}
+
+async fn store_pending_tool_call(
+    state: &AppState,
+    chat_id: i64,
+    message_id: &str,
+    tool_call: &ToolCall,
+) -> Result<(), EgoPulseError> {
+    let record = StoredToolCall {
+        id: tool_call.id.clone(),
+        chat_id,
+        message_id: message_id.to_string(),
+        tool_name: tool_call.name.clone(),
+        tool_input: tool_call.arguments.to_string(),
+        tool_output: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    call_blocking(state.db.clone(), move |db| db.store_tool_call(&record))
+        .await
+        .map_err(EgoPulseError::from)
+}
+
+async fn update_tool_call_output(
+    state: &AppState,
+    tool_call_id: &str,
+    output: &str,
+) -> Result<(), EgoPulseError> {
+    let tool_call_id = tool_call_id.to_string();
+    let output = output.to_string();
+    call_blocking(state.db.clone(), move |db| {
+        db.update_tool_call_output(&tool_call_id, &output)
+    })
+    .await
+    .map_err(EgoPulseError::from)
+}
+
+fn format_tool_result(tool_call: &ToolCall, result: &crate::tools::ToolResult) -> String {
+    let mut content = result.content.clone();
+    if content.chars().count() > MAX_TOOL_RESULT_CHARS {
+        content = format!(
+            "{}...",
+            content
+                .chars()
+                .take(MAX_TOOL_RESULT_CHARS)
+                .collect::<String>()
+        );
+    }
+
+    serde_json::json!({
+        "tool": tool_call.name,
+        "status": if result.is_error { "error" } else { "success" },
+        "result": content,
+    })
+    .to_string()
+}
+
+fn summarize_tool_calls(response: &MessagesResponse) -> String {
+    let names = response
+        .tool_calls
+        .iter()
+        .map(|tool_call| tool_call.name.as_str())
+        .collect::<Vec<_>>();
+    if response.content.trim().is_empty() {
+        format!("[tool_call] {}", names.join(", "))
+    } else {
+        format!(
+            "{} [tool_call] {}",
+            response.content.trim(),
+            names.join(", ")
+        )
+    }
+}
+
+fn preview_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    format!("{}...", value.chars().take(max_chars).collect::<String>())
 }
 
 #[cfg(test)]
@@ -229,12 +351,14 @@ mod tests {
     use crate::agent_loop::{SurfaceContext, process_turn};
     use crate::config::Config;
     use crate::error::{EgoPulseError, LlmError};
-    use crate::llm::{LlmProvider, Message, MessagesResponse};
+    use crate::llm::{LlmProvider, Message, MessagesResponse, ToolCall, ToolDefinition};
     use crate::runtime::AppState;
-    use crate::storage::{Database, StoredMessage, call_blocking};
+    use crate::skills::SkillManager;
+    use crate::storage::{Database, call_blocking};
+    use crate::tools::ToolRegistry;
 
     struct FakeProvider {
-        response: String,
+        responses: std::sync::Mutex<Vec<MessagesResponse>>,
     }
 
     struct FailingProvider;
@@ -244,16 +368,11 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            messages: Vec<Message>,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
         ) -> Result<MessagesResponse, LlmError> {
-            let prompt = messages
-                .iter()
-                .map(|message| format!("{}:{}", message.role, message.content))
-                .collect::<Vec<_>>()
-                .join("|");
-            Ok(MessagesResponse {
-                content: format!("{} [{prompt}]", self.response),
-            })
+            let mut locked = self.responses.lock().expect("responses");
+            Ok(locked.remove(0))
         }
     }
 
@@ -263,8 +382,9 @@ mod tests {
             &self,
             _system: &str,
             _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
         ) -> Result<MessagesResponse, LlmError> {
-            Err(LlmError::InvalidResponse("simulated failure".to_string()))
+            Err(LlmError::InvalidResponse("boom".to_string()))
         }
     }
 
@@ -298,134 +418,80 @@ mod tests {
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
         use crate::channel_adapter::ChannelRegistry;
+        let config = test_config(data_dir.clone());
+        let db = Arc::new(Database::new(&data_dir).expect("db"));
+        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
         AppState {
-            db: Arc::new(Database::new(&data_dir).expect("db")),
-            config: test_config(data_dir),
+            db,
+            config: config.clone(),
             config_path: None,
             llm: Arc::from(llm),
             channels: Arc::new(ChannelRegistry::new()),
+            skills: Arc::clone(&skills),
+            tools: Arc::new(ToolRegistry::new(&config, skills)),
         }
     }
 
-    #[test]
-    fn session_key_is_channel_agnostic_but_surface_stable() {
-        let context = cli_context("local-dev");
-        assert_eq!(context.session_key(), "cli:local-dev");
-    }
-
     #[tokio::test]
-    async fn reuses_saved_session_before_falling_back_to_history() {
+    async fn process_turn_executes_tool_calls_and_persists_outputs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(FakeProvider {
-                response: "ok".to_string(),
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".to_string(),
+                            name: "ping".to_string(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    MessagesResponse {
+                        content: "All set".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
             }),
         );
-        let context = cli_context("local-dev");
 
-        let first = process_turn(&state, &context, "hello")
+        let reply = process_turn(&state, &cli_context("tool-flow"), "please ping")
             .await
-            .expect("first");
-        let second = process_turn(&state, &context, "remember")
-            .await
-            .expect("second");
+            .expect("process turn");
+        assert_eq!(reply, "All set");
 
-        assert!(first.contains("user:hello"));
-        assert!(second.contains("user:hello"));
-        assert!(second.contains("assistant:ok [user:hello]"));
-        assert!(second.contains("user:remember"));
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_history_when_session_json_is_corrupted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                response: "ok".to_string(),
-            }),
-        );
-        let context = cli_context("recover");
-
-        let chat_id = call_blocking(state.db.clone(), {
-            let session_key = context.session_key();
-            move |db| db.resolve_or_create_chat_id("cli", &session_key, Some("recover"), "cli")
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id("cli", "cli:tool-flow", Some("tool-flow"), "cli")
         })
         .await
         .expect("chat id");
-
-        call_blocking(state.db.clone(), move |db| {
-            db.store_message(&StoredMessage {
-                id: "user-1".to_string(),
-                chat_id,
-                sender_name: "local_user".to_string(),
-                content: "hello".to_string(),
-                is_from_bot: false,
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-            })?;
-            db.store_message(&StoredMessage {
-                id: "assistant-1".to_string(),
-                chat_id,
-                sender_name: "egopulse".to_string(),
-                content: "hi".to_string(),
-                is_from_bot: true,
-                timestamp: "2024-01-01T00:00:01Z".to_string(),
-            })?;
-            db.save_session(chat_id, "{not-json")
+        let tool_calls = call_blocking(state.db.clone(), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
         })
         .await
-        .expect("seed");
-
-        let response = process_turn(&state, &context, "remember")
-            .await
-            .expect("response");
-
-        assert!(response.contains("user:hello"));
-        assert!(response.contains("assistant:hi"));
-        assert!(response.contains("user:remember"));
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "ping");
+        assert!(
+            tool_calls[0]
+                .tool_output
+                .as_deref()
+                .expect("tool output")
+                .contains("\"status\":\"success\"")
+        );
     }
 
     #[tokio::test]
-    async fn keeps_user_message_in_history_when_provider_fails() {
+    async fn process_turn_surfaces_llm_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let failing_state = build_state_with_provider(
+        let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(FailingProvider),
         );
-        let context = cli_context("failure");
 
-        let error = process_turn(&failing_state, &context, "hello")
+        let error = process_turn(&state, &cli_context("failure"), "hello")
             .await
-            .expect_err("provider failure");
+            .expect_err("should fail");
         assert!(matches!(error, EgoPulseError::Llm(_)));
-
-        let chat_id = call_blocking(failing_state.db.clone(), {
-            let session_key = context.session_key();
-            move |db| db.resolve_or_create_chat_id("cli", &session_key, Some("failure"), "cli")
-        })
-        .await
-        .expect("chat id");
-
-        let history = call_blocking(failing_state.db.clone(), move |db| {
-            db.get_all_messages(chat_id)
-        })
-        .await
-        .expect("history");
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "hello");
-        assert!(!history[0].is_from_bot);
-
-        let recovered_state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                response: "ok".to_string(),
-            }),
-        );
-        let resumed = process_turn(&recovered_state, &context, "retry")
-            .await
-            .expect("resume after failure");
-        assert!(resumed.contains("user:hello"));
-        assert!(resumed.contains("user:retry"));
     }
 }

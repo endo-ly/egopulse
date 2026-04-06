@@ -56,6 +56,8 @@ pub async fn load_session_messages(
                 "user".to_string()
             },
             content: message.content,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         })
         .collect())
 }
@@ -148,6 +150,8 @@ fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
                         "user".to_string()
                     },
                     content: message.content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -176,7 +180,9 @@ mod tests {
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
+    use crate::skills::SkillManager;
     use crate::storage::{Database, StoredMessage, call_blocking};
+    use crate::tools::ToolRegistry;
 
     struct FakeProvider {
         response: String,
@@ -188,6 +194,7 @@ mod tests {
             &self,
             _system: &str,
             messages: Vec<Message>,
+            _tools: Option<Vec<crate::llm::ToolDefinition>>,
         ) -> Result<MessagesResponse, LlmError> {
             let prompt = messages
                 .iter()
@@ -196,6 +203,7 @@ mod tests {
                 .join("|");
             Ok(MessagesResponse {
                 content: format!("{} [{prompt}]", self.response),
+                tool_calls: Vec::new(),
             })
         }
     }
@@ -230,12 +238,16 @@ mod tests {
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
         use crate::channel_adapter::ChannelRegistry;
+        let config = test_config(data_dir.clone());
+        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
-            config: test_config(data_dir),
+            config: config.clone(),
             config_path: None,
             llm: Arc::from(llm),
             channels: Arc::new(ChannelRegistry::new()),
+            skills: Arc::clone(&skills),
+            tools: Arc::new(ToolRegistry::new(&config, skills)),
         }
     }
 
@@ -332,10 +344,14 @@ mod tests {
             Message {
                 role: "user".to_string(),
                 content: "next".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             },
             &[Message {
                 role: "user".to_string(),
                 content: "hello".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             }],
             Some(stale_session_updated_at),
         )

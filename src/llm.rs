@@ -7,45 +7,56 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{Config, authorization_token};
 use crate::error::LlmError;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
     pub content: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct MessagesRequest {
-    model: String,
-    messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessagesResponse {
     pub content: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    /// Non-streaming message send.
     async fn send_message(
         &self,
-        _system: &str,
+        system: &str,
         messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError>;
 
-    /// Streaming message send.
-    /// text_tx receives each text chunk as it arrives from the LLM.
     async fn send_message_stream(
         &self,
         system: &str,
         messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, LlmError> {
-        // Default: fall back to non-streaming
-        let response = self.send_message(system, messages).await?;
-        if let Some(tx) = text_tx {
+        let response = self.send_message(system, messages, tools).await?;
+        if let Some(tx) = text_tx
+            && !response.content.is_empty()
+        {
             let _ = tx.send(response.content.clone());
         }
         Ok(response)
@@ -83,8 +94,9 @@ impl OpenAiProvider {
 impl LlmProvider for OpenAiProvider {
     async fn send_message(
         &self,
-        _system: &str,
+        system: &str,
         messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut headers = HeaderMap::new();
@@ -99,11 +111,13 @@ impl LlmProvider for OpenAiProvider {
             .http
             .post(url)
             .headers(headers)
-            .json(&MessagesRequest {
-                model: self.model.clone(),
-                messages,
-                stream: None,
-            })
+            .json(&build_request_body(
+                &self.model,
+                system,
+                &messages,
+                tools.as_deref(),
+                None,
+            ))
             .send()
             .await?;
 
@@ -117,21 +131,26 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let body: OpenAiResponse = response.json().await?;
-        let choice = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-        let content = extract_text(choice.message.content)?;
-        Ok(MessagesResponse { content })
+        parse_openai_response(body)
     }
 
     async fn send_message_stream(
         &self,
-        _system: &str,
+        system: &str,
         messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, LlmError> {
+        if tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            let response = self.send_message(system, messages, None).await?;
+            if let Some(tx) = text_tx
+                && !response.content.is_empty()
+            {
+                let _ = tx.send(response.content.clone());
+            }
+            return Ok(response);
+        }
+
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -145,11 +164,13 @@ impl LlmProvider for OpenAiProvider {
             .http
             .post(url)
             .headers(headers)
-            .json(&MessagesRequest {
-                model: self.model.clone(),
-                messages,
-                stream: Some(true),
-            })
+            .json(&build_request_body(
+                &self.model,
+                system,
+                &messages,
+                None,
+                Some(true),
+            ))
             .send()
             .await?;
 
@@ -162,7 +183,6 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        // Process streaming response
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
         let mut text = String::new();
@@ -171,7 +191,7 @@ impl LlmProvider for OpenAiProvider {
         'outer: while let Some(chunk_res) = byte_stream.next().await {
             let chunk = match chunk_res {
                 Ok(c) => c,
-                Err(e) => return Err(LlmError::RequestFailed(e)),
+                Err(error) => return Err(LlmError::RequestFailed(error)),
             };
             for data in sse.push_chunk(chunk.as_ref()) {
                 if data == "[DONE]" {
@@ -189,7 +209,6 @@ impl LlmProvider for OpenAiProvider {
             }
         }
 
-        // Flush any remaining data (skip if [DONE] was already seen)
         if !done {
             for data in sse.finish() {
                 if data == "[DONE]" {
@@ -220,12 +239,141 @@ impl LlmProvider for OpenAiProvider {
             ));
         }
 
-        Ok(MessagesResponse { content: text })
+        Ok(MessagesResponse {
+            content: text,
+            tool_calls: Vec::new(),
+        })
     }
 }
 
-/// SSE event parser for streaming responses.
-/// Based on Microclaw's SseEventParser implementation.
+fn build_request_body(
+    model: &str,
+    system: &str,
+    messages: &[Message],
+    tools: Option<&[ToolDefinition]>,
+    stream: Option<bool>,
+) -> serde_json::Value {
+    let mut translated = Vec::new();
+    if !system.trim().is_empty() {
+        translated.push(serde_json::json!({
+            "role": "system",
+            "content": system,
+        }));
+    }
+    translated.extend(messages.iter().map(translate_message_to_openai));
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": translated,
+    });
+    if let Some(stream) = stream {
+        body["stream"] = serde_json::Value::Bool(stream);
+    }
+    if let Some(tools) = tools
+        && !tools.is_empty()
+    {
+        body["tools"] = serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    body
+}
+
+fn translate_message_to_openai(message: &Message) -> serde_json::Value {
+    match message.role.as_str() {
+        "assistant" if !message.tool_calls.is_empty() => serde_json::json!({
+            "role": "assistant",
+            "content": if message.content.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(message.content.clone())
+            },
+            "tool_calls": message.tool_calls.iter().map(|tool_call| {
+                serde_json::json!({
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments.to_string(),
+                    }
+                })
+            }).collect::<Vec<_>>(),
+        }),
+        "tool" => serde_json::json!({
+            "role": "tool",
+            "content": message.content,
+            "tool_call_id": message.tool_call_id,
+        }),
+        _ => serde_json::json!({
+            "role": message.role,
+            "content": message.content,
+        }),
+    }
+}
+
+fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
+    let choice = body
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
+    let tool_calls = choice
+        .message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(parse_tool_call)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let content = extract_text(
+        choice
+            .message
+            .content
+            .unwrap_or(MessageContent::Text(String::new())),
+    );
+    if content.is_empty() && tool_calls.is_empty() {
+        return Err(LlmError::InvalidResponse(
+            "assistant content was empty".to_string(),
+        ));
+    }
+
+    Ok(MessagesResponse {
+        content,
+        tool_calls,
+    })
+}
+
+fn parse_tool_call(raw: OaiToolCall) -> Result<ToolCall, LlmError> {
+    let arguments = if raw.function.arguments.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str::<serde_json::Value>(&raw.function.arguments).map_err(|error| {
+            LlmError::InvalidResponse(format!(
+                "invalid tool arguments for '{}': {error}",
+                raw.function.name
+            ))
+        })?
+    };
+
+    Ok(ToolCall {
+        id: raw.id,
+        name: raw.function.name,
+        arguments,
+    })
+}
+
 #[derive(Default)]
 struct SseEventParser {
     pending: Vec<u8>,
@@ -236,7 +384,7 @@ impl SseEventParser {
     fn push_chunk(&mut self, chunk: impl AsRef<[u8]>) -> Vec<String> {
         self.pending.extend_from_slice(chunk.as_ref());
         let mut events = Vec::new();
-        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
+        while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
             let mut line: Vec<u8> = self.pending.drain(..=pos).collect();
             if line.last() == Some(&b'\n') {
                 line.pop();
@@ -273,7 +421,7 @@ impl SseEventParser {
     fn decode_line(line: Vec<u8>) -> String {
         match String::from_utf8(line) {
             Ok(line) => line,
-            Err(err) => String::from_utf8_lossy(&err.into_bytes()).into_owned(),
+            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
         }
     }
 
@@ -285,10 +433,7 @@ impl SseEventParser {
             return None;
         }
         let (field, value) = match line.split_once(':') {
-            Some((f, v)) => {
-                let v = v.strip_prefix(' ').unwrap_or(v);
-                (f, v)
-            }
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
             None => (line, ""),
         };
         if field == "data" {
@@ -307,28 +452,27 @@ impl SseEventParser {
     }
 }
 
-/// Process a single OpenAI streaming event and extract text delta.
 fn process_openai_stream_event(data: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(data).ok()?;
-    let choice = v.get("choices")?.as_array()?.first()?;
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let choice = value.get("choices")?.as_array()?.first()?;
     let delta = choice.get("delta")?;
     let content = delta.get("content")?;
     match content {
-        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-        serde_json::Value::Array(arr) => {
-            let text: String = arr
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
                 .iter()
-                .filter_map(|item| item.get("text")?.as_str())
-                .collect();
+                .filter_map(|part| part.get("text")?.as_str())
+                .collect::<String>();
             if text.is_empty() { None } else { Some(text) }
         }
         _ => None,
     }
 }
 
-fn extract_text(content: MessageContent) -> Result<String, LlmError> {
-    let text = match content {
-        MessageContent::Text(text) => text,
+fn extract_text(content: MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.trim().to_string(),
         MessageContent::Parts(parts) => parts
             .into_iter()
             .filter_map(|part| match part {
@@ -337,15 +481,10 @@ fn extract_text(content: MessageContent) -> Result<String, LlmError> {
                 ContentPart::Ignored => None,
             })
             .collect::<Vec<_>>()
-            .join("\n"),
-    };
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err(LlmError::InvalidResponse(
-            "assistant content was empty".to_string(),
-        ));
+            .join("\n")
+            .trim()
+            .to_string(),
     }
-    Ok(text)
 }
 
 fn preview_body(body: &str) -> String {
@@ -373,7 +512,10 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct AssistantMessage {
-    content: MessageContent,
+    #[serde(default)]
+    content: Option<MessageContent>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OaiToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,6 +536,18 @@ enum ContentPart {
     Ignored,
 }
 
+#[derive(Debug, Deserialize)]
+struct OaiToolCall {
+    id: String,
+    function: OaiFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiFunction {
+    name: String,
+    arguments: String,
+}
+
 #[cfg(test)]
 mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -401,12 +555,14 @@ mod tests {
 
     use crate::config::Config;
 
-    use super::{Message, create_provider};
+    use super::{Message, ToolCall, ToolDefinition, create_provider};
 
     fn message(content: &str) -> Vec<Message> {
         vec![Message {
             role: "user".to_string(),
             content: content.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }]
     }
 
@@ -458,11 +614,12 @@ mod tests {
         .expect("provider");
 
         let response = provider
-            .send_message("", message("hello"))
+            .send_message("", message("hello"), None)
             .await
             .expect("response");
 
         assert_eq!(response.content, "hello back");
+        assert!(response.tool_calls.is_empty());
     }
 
     #[tokio::test]
@@ -489,7 +646,7 @@ mod tests {
         .expect("provider");
 
         let response = provider
-            .send_message("", message("hello"))
+            .send_message("", message("hello"), None)
             .await
             .expect("response");
 
@@ -516,10 +673,70 @@ mod tests {
                 .expect("provider");
 
         let response = provider
-            .send_message("", message("hello"))
+            .send_message("", message("hello"), None)
             .await
             .expect("response");
 
         assert_eq!(response.content, "local answer");
+    }
+
+    #[tokio::test]
+    async fn sends_tools_and_parses_tool_calls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file"
+                    }
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"README.md\"}"
+                            }
+                        }]
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = create_provider(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let response = provider
+            .send_message(
+                "system prompt",
+                message("read it"),
+                Some(vec![ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }]),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.tool_calls,
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }]
+        );
     }
 }

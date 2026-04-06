@@ -10,7 +10,9 @@ use crate::channels;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
+use crate::skills::SkillManager;
 use crate::storage::Database;
+use crate::tools::ToolRegistry;
 use crate::web::WebAdapter;
 
 pub struct AppState {
@@ -19,6 +21,8 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     pub llm: Arc<dyn crate::llm::LlmProvider>,
     pub channels: Arc<ChannelRegistry>,
+    pub skills: Arc<SkillManager>,
+    pub tools: Arc<ToolRegistry>,
 }
 
 impl Clone for AppState {
@@ -29,6 +33,8 @@ impl Clone for AppState {
             config_path: self.config_path.clone(),
             llm: Arc::clone(&self.llm),
             channels: Arc::clone(&self.channels),
+            skills: Arc::clone(&self.skills),
+            tools: Arc::clone(&self.tools),
         }
     }
 }
@@ -43,6 +49,7 @@ pub fn build_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let llm = Arc::from(create_provider(&config)?);
+    let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
 
     // Build channel registry
     let mut channels = ChannelRegistry::new();
@@ -63,12 +70,17 @@ pub fn build_app_state_with_path(
         )));
     }
 
+    let channels = Arc::new(channels);
+    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&skills)));
+
     Ok(AppState {
         db,
         config,
         config_path,
         llm,
-        channels: Arc::new(channels),
+        channels,
+        skills,
+        tools,
     })
 }
 
@@ -77,10 +89,12 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
     let messages = vec![Message {
         role: "user".to_string(),
         content: prompt.to_string(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     }];
 
     tokio::select! {
-        response = llm.send_message("", messages) => Ok(response?.content),
+        response = llm.send_message("", messages, None) => Ok(response?.content),
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
 }
