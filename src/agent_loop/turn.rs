@@ -7,7 +7,7 @@ use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
 
-const MAX_TOOL_ITERATIONS: usize = 16;
+const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 
 pub async fn ask_in_session(
