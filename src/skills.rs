@@ -218,6 +218,7 @@ fn should_skip_directory(path: &Path, prioritized_skills_dir: &Path) -> bool {
 }
 
 fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, String)> {
+    let content = content.replace("\r\n", "\n");
     let trimmed = content.trim_start();
     let rest = trimmed.strip_prefix("---")?;
     let rest = rest.strip_prefix('\n')?;
@@ -288,6 +289,41 @@ fn missing_deps(deps: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
+fn command_exists(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return true;
+    }
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    let pathext_default = ".COM;.EXE;.BAT;.CMD";
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| pathext_default.to_string());
+    let executable_extensions: Vec<&str> = pathext.split(';').collect();
+
+    let command_candidates: Vec<std::path::PathBuf> = if command.contains('.') {
+        vec![command.into()]
+    } else {
+        let mut candidates = vec![command.into()];
+        candidates.extend(
+            executable_extensions
+                .iter()
+                .map(|ext| format!("{command}{ext}").into()),
+        );
+        candidates
+    };
+
+    std::env::split_paths(&path_var).any(|base| {
+        command_candidates.iter().any(|candidate| {
+            let full_path = base.join(candidate);
+            full_path.is_file() && is_executable(&full_path)
+        })
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
 fn command_exists(command: &str) -> bool {
     if command.trim().is_empty() {
         return true;

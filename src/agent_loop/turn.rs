@@ -291,25 +291,55 @@ async fn update_tool_call_output(
 
 fn format_tool_result(tool_call: &ToolCall, result: &crate::tools::ToolResult) -> String {
     let mut content = result.content.clone();
-    if content.chars().count() > MAX_TOOL_RESULT_CHARS {
-        content = format!(
-            "{}...",
-            content
-                .chars()
-                .take(MAX_TOOL_RESULT_CHARS)
-                .collect::<String>()
-        );
-    }
+    let details = result.details.clone();
 
-    let mut payload = serde_json::json!({
-        "tool": tool_call.name,
-        "status": if result.is_error { "error" } else { "success" },
-        "result": content,
-    });
-    if let Some(details) = &result.details {
-        payload["details"] = details.clone();
+    loop {
+        let mut payload = serde_json::json!({
+            "tool": tool_call.name,
+            "status": if result.is_error { "error" } else { "success" },
+            "result": content,
+        });
+        if let Some(ref d) = details {
+            payload["details"] = d.clone();
+        }
+
+        let serialized = payload.to_string();
+        let char_count = serialized.chars().count();
+
+        if char_count <= MAX_TOOL_RESULT_CHARS {
+            return serialized;
+        }
+
+        // If over limit, first try removing details
+        if details.is_some() {
+            let payload_no_details = serde_json::json!({
+                "tool": tool_call.name,
+                "status": if result.is_error { "error" } else { "success" },
+                "result": content,
+            });
+            let no_details_str = payload_no_details.to_string();
+            if no_details_str.chars().count() <= MAX_TOOL_RESULT_CHARS {
+                return no_details_str;
+            }
+        }
+
+        // Still over limit, truncate content further
+        // Calculate how much we need to reduce content by
+        let excess = char_count.saturating_sub(MAX_TOOL_RESULT_CHARS);
+        let current_content_len = content.chars().count();
+        // Reduce content by excess + buffer for JSON overhead
+        let new_len = current_content_len.saturating_sub(excess + 100);
+        if new_len == 0 {
+            // Can't truncate further, return minimal payload
+            return serde_json::json!({
+                "tool": tool_call.name,
+                "status": if result.is_error { "error" } else { "success" },
+                "result": "...",
+            })
+            .to_string();
+        }
+        content = format!("{}...", content.chars().take(new_len).collect::<String>());
     }
-    payload.to_string()
 }
 
 fn tool_message_content(

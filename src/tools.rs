@@ -1,6 +1,6 @@
 use std::cmp::min;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ const DEFAULT_FIND_LIMIT: usize = 1000;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
@@ -347,6 +348,16 @@ fn normalize_for_fuzzy_match(value: &str) -> String {
         .collect()
 }
 
+fn fuzzy_byte_pos_to_original_byte_pos(original: &str, fuzzy_byte_pos: usize) -> usize {
+    let fuzzy = normalize_for_fuzzy_match(original);
+    let fuzzy_char_pos = fuzzy[..fuzzy_byte_pos].chars().count();
+    original
+        .char_indices()
+        .nth(fuzzy_char_pos)
+        .map(|(pos, _)| pos)
+        .unwrap_or(original.len())
+}
+
 fn normalize_fuzzy_char(value: char) -> char {
     match value {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
@@ -480,23 +491,46 @@ fn apply_edits_to_normalized_content(
         .iter()
         .map(|edit| fuzzy_find_text(normalized_content, &edit.old_text))
         .collect::<Vec<_>>();
-    let base_content = if initial_matches
-        .iter()
-        .any(|result| result.is_some_and(|(_, _, used_fuzzy)| used_fuzzy))
-    {
-        normalize_for_fuzzy_match(normalized_content)
-    } else {
-        normalized_content.to_string()
-    };
 
+    let mut base_content = normalized_content.to_string();
     let mut matched_edits = Vec::with_capacity(normalized_edits.len());
-    for (index, edit) in normalized_edits.iter().enumerate() {
-        let Some((match_index, match_length, _)) = fuzzy_find_text(&base_content, &edit.old_text)
-        else {
+    let mut cumulative_offset: isize = 0;
+
+    for (index, result) in initial_matches.iter().enumerate() {
+        let Some((fuzzy_pos, fuzzy_len, used_fuzzy)) = result else {
             return Err(get_not_found_error(path, index, normalized_edits.len()));
         };
 
-        let occurrences = count_occurrences(&base_content, &edit.old_text);
+        let (span_start, span_end, match_len) = if *used_fuzzy {
+            let orig_start = fuzzy_byte_pos_to_original_byte_pos(normalized_content, *fuzzy_pos);
+            let fuzzy_old_text = normalize_for_fuzzy_match(&normalized_edits[index].old_text);
+            let char_count = fuzzy_old_text.chars().count();
+            let orig_end = normalized_content[orig_start..]
+                .char_indices()
+                .nth(char_count)
+                .map(|(pos, _)| orig_start + pos)
+                .unwrap_or(normalized_content.len());
+            (orig_start, orig_end, fuzzy_old_text.len())
+        } else {
+            (*fuzzy_pos, *fuzzy_pos + *fuzzy_len, *fuzzy_len)
+        };
+
+        let adjusted_start = (span_start as isize + cumulative_offset) as usize;
+        let adjusted_end = (span_end as isize + cumulative_offset) as usize;
+
+        if *used_fuzzy {
+            let original_span = &base_content[adjusted_start..adjusted_end];
+            let normalized_span = normalize_for_fuzzy_match(original_span);
+            cumulative_offset += normalized_span.len() as isize - (span_end - span_start) as isize;
+            base_content = format!(
+                "{}{}{}",
+                &base_content[..adjusted_start],
+                normalized_span,
+                &base_content[adjusted_end..]
+            );
+        }
+
+        let occurrences = count_occurrences(&base_content, &normalized_edits[index].old_text);
         if occurrences > 1 {
             return Err(get_duplicate_error(
                 path,
@@ -508,9 +542,9 @@ fn apply_edits_to_normalized_content(
 
         matched_edits.push(MatchedEdit {
             edit_index: index,
-            match_index,
-            match_length,
-            new_text: edit.new_text.clone(),
+            match_index: adjusted_start,
+            match_length: match_len,
+            new_text: normalized_edits[index].new_text.clone(),
         });
     }
 
@@ -970,7 +1004,7 @@ impl Tool for BashTool {
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in seconds (optional, no default timeout)"
+                        "description": "Timeout in seconds (optional, default: 30)"
                     }
                 }),
                 &["command"],
@@ -986,7 +1020,10 @@ impl Tool for BashTool {
         let Some(command) = input.get("command").and_then(|value| value.as_str()) else {
             return ToolResult::error("Missing required parameter: command".to_string());
         };
-        let timeout_secs = input.get("timeout").and_then(|value| value.as_u64());
+        let timeout_secs = input
+            .get("timeout")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let temp_path =
             std::env::temp_dir().join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
@@ -1007,22 +1044,15 @@ impl Tool for BashTool {
             }
         };
 
-        let status = if let Some(timeout_secs) = timeout_secs {
-            match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => Ok(status),
-                Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let output = read_temp_output(&temp_path);
-                    return bash_error_result(output, &temp_path, Some(timeout_secs), None);
-                }
+        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let output = read_temp_output(&temp_path);
+                return bash_error_result(output, &temp_path, Some(timeout_secs), None);
             }
-        } else {
-            child
-                .wait()
-                .await
-                .map_err(|error| format!("Failed to execute bash command: {error}"))
         };
 
         let status = match status {
@@ -1768,27 +1798,42 @@ fn resolve_workspace_path(workspace_dir: &Path, requested_path: &str) -> Result<
         workspace_dir.join(requested)
     };
 
-    let mut normalized = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                normalized.push(component.as_os_str())
-            }
-        }
-    }
+    let canonical_workspace = std::fs::canonicalize(workspace_dir)
+        .map_err(|e| format!("Failed to resolve workspace path: {e}"))?;
 
-    if !normalized.starts_with(workspace_dir) {
+    let canonical_candidate = match std::fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            let parent = candidate.parent().ok_or_else(|| {
+                format!("Invalid path (no parent): {}", candidate.display())
+            })?;
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
+                format!(
+                    "Parent directory does not exist: {}",
+                    parent.display()
+                )
+            })?;
+            if !canonical_parent.starts_with(&canonical_workspace) {
+                return Err(format!(
+                    "Refusing to access path outside workspace: {}",
+                    candidate.display()
+                ));
+            }
+            let file_name = candidate
+                .file_name()
+                .ok_or_else(|| format!("Invalid path (no file name): {}", candidate.display()))?;
+            return Ok(canonical_parent.join(file_name));
+        }
+    };
+
+    if !canonical_candidate.starts_with(&canonical_workspace) {
         return Err(format!(
             "Refusing to access path outside workspace: {}",
-            normalized.display()
+            canonical_candidate.display()
         ));
     }
 
-    Ok(normalized)
+    Ok(canonical_candidate)
 }
 
 fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
@@ -1941,6 +1986,8 @@ mod tests {
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
+
+        std::fs::create_dir_all(config.workspace_dir().join("src")).expect("create src dir");
 
         let result = registry
             .execute(
