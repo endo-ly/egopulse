@@ -689,7 +689,7 @@ mod tests {
                 "tools": [{
                     "type": "function",
                     "function": {
-                        "name": "read_file"
+                        "name": "read"
                     }
                 }]
             })))
@@ -700,7 +700,7 @@ mod tests {
                         "tool_calls": [{
                             "id": "call_1",
                             "function": {
-                                "name": "read_file",
+                                "name": "read",
                                 "arguments": "{\"path\":\"README.md\"}"
                             }
                         }]
@@ -722,7 +722,7 @@ mod tests {
                 "system prompt",
                 message("read it"),
                 Some(vec![ToolDefinition {
-                    name: "read_file".to_string(),
+                    name: "read".to_string(),
                     description: "Read a file".to_string(),
                     parameters: serde_json::json!({"type": "object"}),
                 }]),
@@ -734,7 +734,7 @@ mod tests {
             response.tool_calls,
             vec![ToolCall {
                 id: "call_1".to_string(),
-                name: "read_file".to_string(),
+                name: "read".to_string(),
                 arguments: serde_json::json!({"path": "README.md"}),
             }]
         );

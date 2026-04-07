@@ -245,7 +245,7 @@ fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
     let mut prompt = format!(
         "You are EgoPulse, a local-first assistant running on the '{}' channel.\n\
          Call tools directly when you need external data or file access. Do not describe fake tool calls as plain text.\n\
-         Prefer relative paths under the runtime workspace when using read_file.\n\
+         Prefer relative paths under the runtime workspace when using read, write, edit, find, ls, and grep.\n\
          Use activate_skill when a listed skill matches the task and you need its full instructions.\n\
          The current session is '{}' (type: {}).",
         context.channel, context.surface_thread, context.chat_type
@@ -443,8 +443,8 @@ mod tests {
                         content: String::new(),
                         tool_calls: vec![ToolCall {
                             id: "call-1".to_string(),
-                            name: "ping".to_string(),
-                            arguments: serde_json::json!({}),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": "notes.txt"}),
                         }],
                     },
                     MessagesResponse {
@@ -454,8 +454,11 @@ mod tests {
                 ]),
             }),
         );
+        let workspace = state.config.workspace_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("notes.txt"), "hello from tool").expect("notes");
 
-        let reply = process_turn(&state, &cli_context("tool-flow"), "please ping")
+        let reply = process_turn(&state, &cli_context("tool-flow"), "please read the note")
             .await
             .expect("process turn");
         assert_eq!(reply, "All set");
@@ -471,13 +474,20 @@ mod tests {
         .await
         .expect("tool calls");
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].tool_name, "ping");
+        assert_eq!(tool_calls[0].tool_name, "read");
         assert!(
             tool_calls[0]
                 .tool_output
                 .as_deref()
                 .expect("tool output")
                 .contains("\"status\":\"success\"")
+        );
+        assert!(
+            tool_calls[0]
+                .tool_output
+                .as_deref()
+                .expect("tool output")
+                .contains("hello from tool")
         );
     }
 
