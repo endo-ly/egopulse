@@ -86,12 +86,7 @@ pub fn build_app_state_with_path(
 
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
     let llm = create_provider(&config)?;
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: prompt.to_string(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    }];
+    let messages = vec![Message::text("user", prompt)];
 
     tokio::select! {
         response = llm.send_message("", messages, None) => Ok(response?.content),

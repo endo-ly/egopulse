@@ -184,7 +184,7 @@ impl TuiApp {
                 .into_iter()
                 .map(|message| RenderedMessage {
                     role: message.role,
-                    content: message.content,
+                    content: message.content.as_text_lossy(),
                 })
                 .collect(),
             pending_send: None,
@@ -213,7 +213,7 @@ impl TuiApp {
                 .into_iter()
                 .map(|message| RenderedMessage {
                     role: message.role,
-                    content: message.content,
+                    content: message.content.as_text_lossy(),
                 })
                 .collect(),
             pending_send: None,

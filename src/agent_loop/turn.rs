@@ -84,12 +84,7 @@ where
     } = load_messages_for_turn(state, chat_id).await?;
     let mut session_updated_at = session_updated_at;
 
-    let user_message = Message {
-        role: "user".to_string(),
-        content: user_input.to_string(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    };
+    let user_message = Message::text("user", user_input);
     messages.push(user_message.clone());
 
     let persisted_user_turn = persist_phase(
@@ -130,12 +125,7 @@ where
                 )));
             }
 
-            let assistant_message = Message {
-                role: "assistant".to_string(),
-                content: final_content.clone(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            };
+            let assistant_message = Message::text("assistant", final_content.clone());
             messages.push(assistant_message.clone());
 
             let _persisted = persist_phase(
@@ -167,7 +157,7 @@ where
         let assistant_preview = summarize_tool_calls(&response);
         let assistant_message = Message {
             role: "assistant".to_string(),
-            content: response.content.clone(),
+            content: crate::llm::MessageContent::text(response.content.clone()),
             tool_calls: response.tool_calls.clone(),
             tool_call_id: None,
         };
@@ -220,7 +210,7 @@ where
 
             messages.push(Message {
                 role: "tool".to_string(),
-                content: tool_payload,
+                content: tool_message_content(&tool_payload, &result),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id),
             });
@@ -318,6 +308,31 @@ fn format_tool_result(tool_call: &ToolCall, result: &crate::tools::ToolResult) -
         payload["details"] = details.clone();
     }
     payload.to_string()
+}
+
+fn tool_message_content(
+    payload: &str,
+    result: &crate::tools::ToolResult,
+) -> crate::llm::MessageContent {
+    match &result.llm_content {
+        crate::llm::MessageContent::Text(_) => crate::llm::MessageContent::text(payload),
+        crate::llm::MessageContent::Parts(parts) => {
+            let mut content = Vec::with_capacity(parts.len() + 1);
+            content.push(crate::llm::MessageContentPart::InputText {
+                text: payload.to_string(),
+            });
+            content.extend(parts.iter().filter_map(|part| match part {
+                crate::llm::MessageContentPart::InputText { .. } => None,
+                crate::llm::MessageContentPart::InputImage { image_url, detail } => {
+                    Some(crate::llm::MessageContentPart::InputImage {
+                        image_url: image_url.clone(),
+                        detail: detail.clone(),
+                    })
+                }
+            }));
+            crate::llm::MessageContent::parts(content)
+        }
+    }
 }
 
 fn summarize_tool_calls(response: &MessagesResponse) -> String {

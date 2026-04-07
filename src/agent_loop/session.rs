@@ -49,15 +49,15 @@ pub async fn load_session_messages(
     let history = call_blocking(state.db.clone(), move |db| db.get_all_messages(chat_id)).await?;
     Ok(history
         .into_iter()
-        .map(|message| Message {
-            role: if message.is_from_bot {
-                "assistant".to_string()
-            } else {
-                "user".to_string()
-            },
-            content: message.content,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
+        .map(|message| {
+            Message::text(
+                if message.is_from_bot {
+                    "assistant"
+                } else {
+                    "user"
+                },
+                message.content,
+            )
         })
         .collect())
 }
@@ -143,15 +143,15 @@ fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
             &snapshot
                 .recent_messages
                 .iter()
-                .map(|message| Message {
-                    role: if message.is_from_bot {
-                        "assistant".to_string()
-                    } else {
-                        "user".to_string()
-                    },
-                    content: message.content.clone(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
+                .map(|message| {
+                    Message::text(
+                        if message.is_from_bot {
+                            "assistant"
+                        } else {
+                            "user"
+                        },
+                        message.content.clone(),
+                    )
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -198,7 +198,7 @@ mod tests {
         ) -> Result<MessagesResponse, LlmError> {
             let prompt = messages
                 .iter()
-                .map(|message| format!("{}:{}", message.role, message.content))
+                .map(|message| format!("{}:{}", message.role, message.content.as_text_lossy()))
                 .collect::<Vec<_>>()
                 .join("|");
             Ok(MessagesResponse {
@@ -341,25 +341,15 @@ mod tests {
                 is_from_bot: false,
                 timestamp: "2024-01-01T00:00:02Z".to_string(),
             },
-            Message {
-                role: "user".to_string(),
-                content: "next".to_string(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            },
-            &[Message {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }],
+            Message::text("user", "next"),
+            &[Message::text("user", "hello")],
             Some(stale_session_updated_at),
         )
         .await
         .expect("persist turn");
 
         assert_eq!(persisted.messages.len(), 3);
-        assert_eq!(persisted.messages[1].content, "hi");
-        assert_eq!(persisted.messages[2].content, "next");
+        assert_eq!(persisted.messages[1].content.as_text_lossy(), "hi");
+        assert_eq!(persisted.messages[2].content.as_text_lossy(), "next");
     }
 }

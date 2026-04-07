@@ -5,13 +5,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use serde_json::json;
 use similar::TextDiff;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
-use crate::llm::ToolDefinition;
+use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
 use crate::skills::{LoadedSkill, SkillManager};
 
 const DEFAULT_MAX_LINES: usize = 2000;
@@ -34,11 +35,13 @@ pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
     pub details: Option<serde_json::Value>,
+    pub llm_content: MessageContent,
 }
 
 impl ToolResult {
     pub fn success(content: String) -> Self {
         Self {
+            llm_content: MessageContent::text(content.clone()),
             content,
             is_error: false,
             details: None,
@@ -47,14 +50,25 @@ impl ToolResult {
 
     pub fn success_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
+            llm_content: MessageContent::text(content.clone()),
             content,
             is_error: false,
             details: Some(details),
         }
     }
 
+    pub fn success_with_llm_content(content: String, llm_content: MessageContent) -> Self {
+        Self {
+            content,
+            is_error: false,
+            details: None,
+            llm_content,
+        }
+    }
+
     pub fn error(content: String) -> Self {
         Self {
+            llm_content: MessageContent::text(content.clone()),
             content,
             is_error: true,
             details: None,
@@ -63,6 +77,7 @@ impl ToolResult {
 
     pub fn error_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
+            llm_content: MessageContent::text(content.clone()),
             content,
             is_error: true,
             details: Some(details),
@@ -641,9 +656,21 @@ impl Tool for ReadTool {
         };
 
         if let Some(mime_type) = detect_supported_image_mime_type(&bytes, &resolved) {
-            return ToolResult::success(format!(
-                "Read image file [{mime_type}]\n[Image omitted: inline image output is not supported by egopulse yet.]"
-            ));
+            let preview = format!("Read image file [{mime_type}]");
+            let data_url = format!(
+                "data:{mime_type};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            return ToolResult::success_with_llm_content(
+                preview.clone(),
+                MessageContent::parts(vec![
+                    MessageContentPart::InputText { text: preview },
+                    MessageContentPart::InputImage {
+                        image_url: data_url,
+                        detail: Some("auto".to_string()),
+                    },
+                ]),
+            );
         }
 
         let content = match String::from_utf8(bytes) {
@@ -1894,6 +1921,16 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.content.contains("Read image file [image/png]"));
+        match result.llm_content {
+            crate::llm::MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(
+                    &parts[1],
+                    crate::llm::MessageContentPart::InputImage { .. }
+                ));
+            }
+            other => panic!("expected multimodal llm_content, got {other:?}"),
+        }
     }
 
     #[tokio::test]
