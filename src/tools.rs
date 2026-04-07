@@ -380,7 +380,35 @@ mod tests {
     use crate::skills::SkillManager;
 
     use serde_json::json;
+    use serial_test::serial;
     use std::sync::Arc;
+
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let original = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+        }
+    }
 
     fn test_config(data_dir: &str) -> Config {
         Config {
@@ -409,8 +437,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn read_file_respects_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir();
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -428,8 +458,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn activate_skill_loads_skill_instructions() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let skills_dir = config.skills_dir();
         std::fs::create_dir_all(skills_dir.join("pdf")).expect("skill dir");
