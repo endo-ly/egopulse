@@ -30,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yml = "0.0.12"
 serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "cache", "rustls_backend"] }
+sha2 = "0.10"
 teloxide = { version = "0.17", optional = true, default-features = false, features = ["rustls", "macros", "ctrlc_handler"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }

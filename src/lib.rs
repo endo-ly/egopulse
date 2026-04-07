@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod assets;
 pub mod channel_adapter;
 pub mod channels;
 pub mod config;

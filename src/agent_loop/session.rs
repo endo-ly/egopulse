@@ -1,6 +1,11 @@
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
 use crate::agent_loop::SurfaceContext;
+use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
-use crate::llm::Message;
+use crate::llm::{Message, MessageContent, MessageContentPart};
 use crate::runtime::AppState;
 use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
@@ -16,6 +21,37 @@ pub(crate) struct LoadedSession {
 pub(crate) struct PersistedTurn {
     pub(crate) updated_at: String,
     pub(crate) messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedMessage {
+    role: String,
+    content: PersistedMessageContent,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<crate::llm::ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum PersistedMessageContent {
+    Text(String),
+    Parts(Vec<PersistedMessageContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+enum PersistedMessageContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "input_image_ref")]
+    InputImageRef {
+        image_ref: String,
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 pub(crate) async fn resolve_chat_id(
@@ -71,7 +107,7 @@ pub(crate) async fn load_messages_for_turn(
     })
     .await?;
 
-    Ok(snapshot_to_loaded(snapshot))
+    snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
 }
 
 pub(crate) async fn persist_phase(
@@ -86,7 +122,7 @@ pub(crate) async fn persist_phase(
 
     for attempt in 0..2 {
         let session_json =
-            serde_json::to_string(&retry_snapshot).map_err(StorageError::SessionSerialize)?;
+            serialize_snapshot(Arc::clone(&state.assets), retry_snapshot.clone()).await?;
         let result = call_blocking(state.db.clone(), {
             let session_updated_at = retry_session_updated_at.clone();
             let session_json = session_json.clone();
@@ -127,18 +163,29 @@ pub(crate) async fn persist_phase(
     ))
 }
 
-fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
-    if let Some(json) = snapshot.messages_json
-        && let Ok(messages) = serde_json::from_str::<Vec<Message>>(&json)
-        && !messages.is_empty()
-    {
-        return LoadedSession {
-            messages: trim_history(&messages),
-            session_updated_at: snapshot.updated_at,
-        };
+async fn snapshot_to_loaded(
+    snapshot: SessionSnapshot,
+    assets: Arc<AssetStore>,
+) -> Result<LoadedSession, EgoPulseError> {
+    if let Some(json) = snapshot.messages_json {
+        let assets = Arc::clone(&assets);
+        let restored =
+            tokio::task::spawn_blocking(move || restore_snapshot_messages(&assets, &json))
+                .await
+                .map_err(|error| {
+                    EgoPulseError::Storage(StorageError::TaskJoin(error.to_string()))
+                })?;
+        if let Ok(restored) = restored
+            && !restored.is_empty()
+        {
+            return Ok(LoadedSession {
+                messages: trim_history(&restored),
+                session_updated_at: snapshot.updated_at,
+            });
+        }
     }
 
-    LoadedSession {
+    Ok(LoadedSession {
         messages: trim_history(
             &snapshot
                 .recent_messages
@@ -156,6 +203,122 @@ fn snapshot_to_loaded(snapshot: SessionSnapshot) -> LoadedSession {
                 .collect::<Vec<_>>(),
         ),
         session_updated_at: snapshot.updated_at,
+    })
+}
+
+async fn serialize_snapshot(
+    assets: Arc<AssetStore>,
+    messages: Vec<Message>,
+) -> Result<String, EgoPulseError> {
+    tokio::task::spawn_blocking(move || {
+        let persisted = persist_messages(&assets, &messages)?;
+        serde_json::to_string(&persisted).map_err(StorageError::SessionSerialize)
+    })
+    .await
+    .map_err(|error| EgoPulseError::Storage(StorageError::TaskJoin(error.to_string())))?
+    .map_err(EgoPulseError::Storage)
+}
+
+fn persist_messages(
+    assets: &AssetStore,
+    messages: &[Message],
+) -> Result<Vec<PersistedMessage>, StorageError> {
+    messages
+        .iter()
+        .map(|message| {
+            Ok(PersistedMessage {
+                role: message.role.clone(),
+                content: persist_content(assets, &message.content)?,
+                tool_calls: message.tool_calls.clone(),
+                tool_call_id: message.tool_call_id.clone(),
+            })
+        })
+        .collect()
+}
+
+fn persist_content(
+    assets: &AssetStore,
+    content: &MessageContent,
+) -> Result<PersistedMessageContent, StorageError> {
+    match content {
+        MessageContent::Text(text) => Ok(PersistedMessageContent::Text(text.clone())),
+        MessageContent::Parts(parts) => Ok(PersistedMessageContent::Parts(
+            parts
+                .iter()
+                .map(|part| persist_part(assets, part))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+    }
+}
+
+fn persist_part(
+    assets: &AssetStore,
+    part: &MessageContentPart,
+) -> Result<PersistedMessageContentPart, StorageError> {
+    match part {
+        MessageContentPart::InputText { text } => {
+            Ok(PersistedMessageContentPart::InputText { text: text.clone() })
+        }
+        MessageContentPart::InputImage { image_url, detail } => {
+            let stored = assets.persist_image_data_url(image_url)?;
+            Ok(PersistedMessageContentPart::InputImageRef {
+                image_ref: stored.image_ref,
+                mime_type: stored.mime_type,
+                detail: detail.clone(),
+            })
+        }
+    }
+}
+
+fn restore_snapshot_messages(
+    assets: &AssetStore,
+    json: &str,
+) -> Result<Vec<Message>, StorageError> {
+    let persisted: Vec<PersistedMessage> =
+        serde_json::from_str(json).map_err(StorageError::SessionSerialize)?;
+    persisted
+        .into_iter()
+        .map(|message| {
+            Ok(Message {
+                role: message.role,
+                content: restore_content(assets, message.content),
+                tool_calls: message.tool_calls,
+                tool_call_id: message.tool_call_id,
+            })
+        })
+        .collect()
+}
+
+fn restore_content(assets: &AssetStore, content: PersistedMessageContent) -> MessageContent {
+    match content {
+        PersistedMessageContent::Text(text) => MessageContent::text(text),
+        PersistedMessageContent::Parts(parts) => MessageContent::parts(
+            parts
+                .into_iter()
+                .map(|part| restore_part(assets, part))
+                .collect(),
+        ),
+    }
+}
+
+fn restore_part(assets: &AssetStore, part: PersistedMessageContentPart) -> MessageContentPart {
+    match part {
+        PersistedMessageContentPart::InputText { text } => MessageContentPart::InputText { text },
+        PersistedMessageContentPart::InputImageRef {
+            image_ref,
+            mime_type,
+            detail,
+        } => match assets.load_image_data_url(&image_ref, &mime_type) {
+            Ok(image_url) => MessageContentPart::InputImage { image_url, detail },
+            Err(StorageError::NotFound(_)) => MessageContentPart::InputText {
+                text: format!(
+                    "Previously attached image could not be restored: missing image_ref {image_ref}"
+                ),
+            },
+            Err(error) => MessageContentPart::InputText {
+                text: format!("Previously attached image could not be restored: {error}"),
+            },
+        },
     }
 }
 
@@ -174,11 +337,12 @@ mod tests {
     use async_trait::async_trait;
     use secrecy::SecretString;
 
-    use super::persist_phase;
+    use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::SurfaceContext;
+    use crate::assets::AssetStore;
     use crate::config::Config;
     use crate::error::LlmError;
-    use crate::llm::{LlmProvider, Message, MessagesResponse};
+    use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
     use crate::runtime::AppState;
     use crate::skills::SkillManager;
     use crate::storage::{Database, StoredMessage, call_blocking};
@@ -248,6 +412,7 @@ mod tests {
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
+            assets: Arc::new(AssetStore::new(&data_dir).expect("assets")),
         }
     }
 
@@ -351,5 +516,113 @@ mod tests {
         assert_eq!(persisted.messages.len(), 3);
         assert_eq!(persisted.messages[1].content.as_text_lossy(), "hi");
         assert_eq!(persisted.messages[2].content.as_text_lossy(), "next");
+    }
+
+    #[tokio::test]
+    async fn persists_image_refs_and_rehydrates_them_for_next_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("images");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+        let data_url = "data:image/png;base64,AAAA";
+
+        let messages = vec![Message {
+            role: "tool".to_string(),
+            content: MessageContent::parts(vec![
+                MessageContentPart::InputText {
+                    text: "Read image file [image/png]".to_string(),
+                },
+                MessageContentPart::InputImage {
+                    image_url: data_url.to_string(),
+                    detail: Some("auto".to_string()),
+                },
+            ]),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".to_string()),
+        }];
+
+        persist_phase(
+            &state,
+            StoredMessage {
+                id: "tool-msg".to_string(),
+                chat_id,
+                sender_name: "egopulse".to_string(),
+                content: "Read image file [image/png]".to_string(),
+                is_from_bot: true,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            },
+            messages[0].clone(),
+            &messages,
+            None,
+        )
+        .await
+        .expect("persist image turn");
+
+        let (session_json, _) = call_blocking(state.db.clone(), move |db| {
+            db.load_session(chat_id)
+                .map(|session| session.expect("session row"))
+        })
+        .await
+        .expect("load session row");
+        assert!(!session_json.contains("data:image/png;base64"));
+        assert!(session_json.contains("\"type\":\"input_image_ref\""));
+
+        let loaded = load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("load messages");
+        match &loaded.messages[0].content {
+            MessageContent::Parts(parts) => {
+                assert!(matches!(
+                    parts[1],
+                    MessageContentPart::InputImage { ref image_url, .. } if image_url == data_url
+                ));
+            }
+            other => panic!("expected multimodal content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_image_refs_turn_into_explicit_text_notes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("missing-image");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(
+                chat_id,
+                r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"missing-ref","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
+            )
+        })
+        .await
+        .expect("save snapshot");
+
+        let loaded = load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("load messages");
+        match &loaded.messages[0].content {
+            MessageContent::Parts(parts) => {
+                assert!(matches!(
+                    parts[1],
+                    MessageContentPart::InputText { ref text }
+                    if text.contains("missing image_ref missing-ref")
+                ));
+            }
+            other => panic!("expected restored parts, got {other:?}"),
+        }
     }
 }

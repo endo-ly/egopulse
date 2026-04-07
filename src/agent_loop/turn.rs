@@ -435,6 +435,7 @@ mod tests {
     }
 
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+        use crate::assets::AssetStore;
         use crate::channel_adapter::ChannelRegistry;
         let config = test_config(data_dir.clone());
         let db = Arc::new(Database::new(&data_dir).expect("db"));
@@ -447,6 +448,7 @@ mod tests {
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
+            assets: Arc::new(AssetStore::new(&data_dir).expect("assets")),
         }
     }
 

@@ -91,6 +91,8 @@ pub enum LoggingError {
 pub enum StorageError {
     #[error("storage_init_failed: {0}")]
     InitFailed(String),
+    #[error("storage_invalid_asset: {0}")]
+    InvalidAsset(String),
     #[error("storage_io_failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage_sqlite_failed: {0}")]

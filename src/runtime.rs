@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
+use crate::assets::AssetStore;
 use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
 use crate::config::Config;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub channels: Arc<ChannelRegistry>,
     pub skills: Arc<SkillManager>,
     pub tools: Arc<ToolRegistry>,
+    pub assets: Arc<AssetStore>,
 }
 
 impl Clone for AppState {
@@ -35,6 +37,7 @@ impl Clone for AppState {
             channels: Arc::clone(&self.channels),
             skills: Arc::clone(&self.skills),
             tools: Arc::clone(&self.tools),
+            assets: Arc::clone(&self.assets),
         }
     }
 }
@@ -48,6 +51,7 @@ pub fn build_app_state_with_path(
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
+    let assets = Arc::new(AssetStore::new(&config.data_dir)?);
     let llm = Arc::from(create_provider(&config)?);
     let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
 
@@ -81,6 +85,7 @@ pub fn build_app_state_with_path(
         channels,
         skills,
         tools,
+        assets,
     })
 }
 
