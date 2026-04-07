@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,34 +49,21 @@ impl SkillManager {
     }
 
     pub fn discover_skills(&self) -> Vec<SkillMetadata> {
-        let mut skills = Vec::new();
-        let entries = match std::fs::read_dir(&self.skills_dir) {
-            Ok(entries) => entries,
-            Err(_) => return skills,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.exists() {
-                continue;
-            }
+        let mut skills_by_name = BTreeMap::new();
+        for candidate in self.discover_skill_dirs() {
+            let skill_md = candidate.join("SKILL.md");
             let Ok(content) = std::fs::read_to_string(&skill_md) else {
                 continue;
             };
-            let Some((meta, _body)) = parse_skill_md(&content, &path) else {
+            let Some((meta, _body)) = parse_skill_md(&content, &candidate) else {
                 continue;
             };
             if self.skill_is_available(&meta) {
-                skills.push(meta);
+                skills_by_name.entry(meta.name.clone()).or_insert(meta);
             }
         }
 
-        skills.sort_by(|left, right| left.name.cmp(&right.name));
-        skills
+        skills_by_name.into_values().collect()
     }
 
     pub fn load_skill_checked(&self, name: &str) -> Result<LoadedSkill, String> {
@@ -153,6 +141,80 @@ impl SkillManager {
     fn skill_is_available(&self, skill: &SkillMetadata) -> bool {
         platform_allowed(&skill.platforms) && missing_deps(&skill.deps).is_empty()
     }
+
+    fn discover_skill_dirs(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        // Highest priority: ~/.egopulse/workspace/skills/*
+        collect_skill_dirs_direct_children(&self.skills_dir, &mut candidates);
+
+        // Then recursively scan the rest of workspace for SKILL.md files.
+        let Some(workspace_root) = self.skills_dir.parent() else {
+            return candidates;
+        };
+        let Ok(skills_dir_canonical) = std::fs::canonicalize(&self.skills_dir) else {
+            collect_skill_dirs_recursive(workspace_root, &self.skills_dir, &mut candidates);
+            return candidates;
+        };
+
+        collect_skill_dirs_recursive(workspace_root, &skills_dir_canonical, &mut candidates);
+        candidates
+    }
+}
+
+fn collect_skill_dirs_direct_children(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("SKILL.md").is_file() {
+            out.push(path);
+        }
+    }
+}
+
+fn collect_skill_dirs_recursive(
+    root: &Path,
+    prioritized_skills_dir: &Path,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if should_skip_directory(&path, prioritized_skills_dir) {
+            continue;
+        }
+        if path.join("SKILL.md").is_file() {
+            out.push(path.clone());
+        }
+        collect_skill_dirs_recursive(&path, prioritized_skills_dir, out);
+    }
+}
+
+fn should_skip_directory(path: &Path, prioritized_skills_dir: &Path) -> bool {
+    if path == prioritized_skills_dir {
+        return true;
+    }
+
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        name,
+        ".git" | ".gradle" | "node_modules" | "target" | "build" | "dist"
+    )
 }
 
 fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, String)> {
@@ -255,12 +317,22 @@ mod tests {
         .expect("write skill");
     }
 
+    fn create_skill_at(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).expect("create skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Description for {name}\n---\n{body}\n"),
+        )
+        .expect("write skill");
+    }
+
     #[test]
     fn discovers_and_loads_skill() {
         let dir = tempfile::tempdir().expect("tempdir");
-        create_skill(dir.path(), "pdf", "Use the PDF workflow.");
+        let skills_dir = dir.path().join("workspace").join("skills");
+        create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
 
-        let manager = SkillManager::from_skills_dir(dir.path());
+        let manager = SkillManager::from_skills_dir(skills_dir);
         let skills = manager.discover_skills();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "pdf");
@@ -273,11 +345,73 @@ mod tests {
     #[test]
     fn builds_catalog_for_prompt() {
         let dir = tempfile::tempdir().expect("tempdir");
-        create_skill(dir.path(), "pdf", "Use the PDF workflow.");
-        let manager = SkillManager::from_skills_dir(dir.path());
+        let skills_dir = dir.path().join("workspace").join("skills");
+        create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
+        let manager = SkillManager::from_skills_dir(skills_dir);
 
         let catalog = manager.build_skills_catalog();
         assert!(catalog.contains("<available_skills>"));
         assert!(catalog.contains("pdf: Description for pdf"));
+    }
+
+    #[test]
+    fn discovers_skills_recursively_under_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let skills_dir = workspace.join("skills");
+        create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
+        create_skill_at(
+            &workspace.join("features").join("images").join("resize"),
+            "resize",
+            "Use the resize workflow.",
+        );
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let skills = manager.discover_skills();
+
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|skill| skill.name == "pdf"));
+        assert!(skills.iter().any(|skill| skill.name == "resize"));
+    }
+
+    #[test]
+    fn prefers_workspace_skills_dir_on_duplicate_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let skills_dir = workspace.join("skills");
+        create_skill(&skills_dir, "pdf", "Preferred instructions.");
+        create_skill_at(
+            &workspace.join("notes").join("pdf-copy"),
+            "pdf",
+            "Fallback instructions.",
+        );
+
+        let manager = SkillManager::from_skills_dir(skills_dir.clone());
+        let loaded = manager.load_skill_checked("pdf").expect("load skill");
+
+        assert_eq!(loaded.metadata.dir_path, skills_dir.join("pdf"));
+        assert!(loaded.instructions.contains("Preferred instructions."));
+    }
+
+    #[test]
+    fn ignores_skills_inside_excluded_build_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let skills_dir = workspace.join("skills");
+        create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
+        create_skill_at(
+            &workspace
+                .join("node_modules")
+                .join("some-package")
+                .join("skill"),
+            "ignored",
+            "Should not be discovered.",
+        );
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let skills = manager.discover_skills();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "pdf");
     }
 }
