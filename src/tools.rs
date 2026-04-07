@@ -1,10 +1,12 @@
 use std::cmp::min;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use similar::TextDiff;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
@@ -17,6 +19,7 @@ const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 const DEFAULT_FIND_LIMIT: usize = 1000;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_LS_LIMIT: usize = 500;
+const GREP_MAX_LINE_LENGTH: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
@@ -30,6 +33,7 @@ pub struct ToolExecutionContext {
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    pub details: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -37,6 +41,15 @@ impl ToolResult {
         Self {
             content,
             is_error: false,
+            details: None,
+        }
+    }
+
+    pub fn success_with_details(content: String, details: serde_json::Value) -> Self {
+        Self {
+            content,
+            is_error: false,
+            details: Some(details),
         }
     }
 
@@ -44,6 +57,15 @@ impl ToolResult {
         Self {
             content,
             is_error: true,
+            details: None,
+        }
+    }
+
+    pub fn error_with_details(content: String, details: serde_json::Value) -> Self {
+        Self {
+            content,
+            is_error: true,
+            details: Some(details),
         }
     }
 }
@@ -103,15 +125,39 @@ impl ToolRegistry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TruncationResult {
     content: String,
     truncated: bool,
     truncated_by: Option<&'static str>,
     total_lines: usize,
+    total_bytes: usize,
     output_lines: usize,
-    max_bytes: usize,
+    output_bytes: usize,
+    last_line_partial: bool,
     first_line_exceeds_limit: bool,
+    max_lines: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditSpec {
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedEditsResult {
+    base_content: String,
+    new_content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatchedEdit {
+    edit_index: usize,
+    match_index: usize,
+    match_length: usize,
+    new_text: String,
 }
 
 fn format_size(bytes: usize) -> String {
@@ -135,25 +181,30 @@ fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Truncatio
             truncated: false,
             truncated_by: None,
             total_lines,
+            total_bytes,
             output_lines: total_lines,
-            max_bytes,
+            output_bytes: total_bytes,
+            last_line_partial: false,
             first_line_exceeds_limit: false,
+            max_lines,
+            max_bytes,
         };
     }
 
-    if lines
-        .first()
-        .map(|line| line.len() > max_bytes)
-        .unwrap_or(false)
-    {
+    let first_line_bytes = lines.first().map(|line| line.len()).unwrap_or(0);
+    if first_line_bytes > max_bytes {
         return TruncationResult {
             content: String::new(),
             truncated: true,
             truncated_by: Some("bytes"),
             total_lines,
+            total_bytes,
             output_lines: 0,
-            max_bytes,
+            output_bytes: 0,
+            last_line_partial: false,
             first_line_exceeds_limit: true,
+            max_lines,
+            max_bytes,
         };
     }
 
@@ -176,14 +227,30 @@ fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Truncatio
 
     let output = selected.join("\n");
     TruncationResult {
-        output_lines: selected.len(),
-        content: output,
+        content: output.clone(),
         truncated: true,
         truncated_by,
         total_lines,
-        max_bytes,
+        total_bytes,
+        output_lines: selected.len(),
+        output_bytes: output.len(),
+        last_line_partial: false,
         first_line_exceeds_limit: false,
+        max_lines,
+        max_bytes,
     }
+}
+
+fn truncate_string_to_bytes_from_end(value: &str, max_bytes: usize) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = bytes.len() - max_bytes;
+    while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    String::from_utf8_lossy(&bytes[start..]).to_string()
 }
 
 fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
@@ -197,38 +264,318 @@ fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Truncatio
             truncated: false,
             truncated_by: None,
             total_lines,
+            total_bytes,
             output_lines: total_lines,
-            max_bytes,
+            output_bytes: total_bytes,
+            last_line_partial: false,
             first_line_exceeds_limit: false,
+            max_lines,
+            max_bytes,
         };
     }
 
     let mut selected = Vec::new();
     let mut bytes = 0usize;
     let mut truncated_by = Some("lines");
-    for (reverse_index, line) in lines.iter().rev().enumerate() {
-        if reverse_index >= max_lines {
+    let mut last_line_partial = false;
+
+    for line in lines.iter().rev() {
+        if selected.len() >= max_lines {
             truncated_by = Some("lines");
             break;
         }
-        let line_bytes = line.len() + usize::from(reverse_index > 0);
+        let line_bytes = line.len() + usize::from(!selected.is_empty());
         if bytes + line_bytes > max_bytes {
             truncated_by = Some("bytes");
+            if selected.is_empty() {
+                selected.push(truncate_string_to_bytes_from_end(line, max_bytes));
+                last_line_partial = true;
+            }
             break;
         }
-        selected.push(*line);
+        selected.push((*line).to_string());
         bytes += line_bytes;
     }
     selected.reverse();
     let output = selected.join("\n");
     TruncationResult {
-        output_lines: selected.len(),
-        content: output,
+        content: output.clone(),
         truncated: true,
         truncated_by,
         total_lines,
-        max_bytes,
+        total_bytes,
+        output_lines: selected.len(),
+        output_bytes: output.len(),
+        last_line_partial,
         first_line_exceeds_limit: false,
+        max_lines,
+        max_bytes,
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn normalize_newlines(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn normalize_for_fuzzy_match(value: &str) -> String {
+    normalize_newlines(value)
+        .split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .map(normalize_fuzzy_char)
+        .collect()
+}
+
+fn normalize_fuzzy_char(value: char) -> char {
+    match value {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' => ' ',
+        _ => value,
+    }
+}
+
+fn detect_line_ending(content: &str) -> &'static str {
+    let crlf_idx = content.find("\r\n");
+    let lf_idx = content.find('\n');
+    match (crlf_idx, lf_idx) {
+        (Some(crlf), Some(lf)) if crlf < lf => "\r\n",
+        _ => "\n",
+    }
+}
+
+fn restore_line_endings(content: &str, ending: &str) -> String {
+    if ending == "\r\n" {
+        content.replace('\n', "\r\n")
+    } else {
+        content.to_string()
+    }
+}
+
+fn strip_bom(content: &str) -> (&str, &str) {
+    if let Some(rest) = content.strip_prefix('\u{feff}') {
+        ("\u{feff}", rest)
+    } else {
+        ("", content)
+    }
+}
+
+fn fuzzy_find_text(content: &str, old_text: &str) -> Option<(usize, usize, bool)> {
+    if let Some(index) = content.find(old_text) {
+        return Some((index, old_text.len(), false));
+    }
+
+    let fuzzy_content = normalize_for_fuzzy_match(content);
+    let fuzzy_old_text = normalize_for_fuzzy_match(old_text);
+    fuzzy_content
+        .find(&fuzzy_old_text)
+        .map(|index| (index, fuzzy_old_text.len(), true))
+}
+
+fn count_occurrences(content: &str, needle: &str) -> usize {
+    let normalized_content = normalize_for_fuzzy_match(content);
+    let normalized_needle = normalize_for_fuzzy_match(needle);
+    if normalized_needle.is_empty() {
+        return 0;
+    }
+    normalized_content.match_indices(&normalized_needle).count()
+}
+
+fn get_not_found_error(path: &str, edit_index: usize, total_edits: usize) -> String {
+    if total_edits == 1 {
+        format!(
+            "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
+        )
+    } else {
+        format!(
+            "Could not find edits[{edit_index}] in {path}. The oldText must match exactly including all whitespace and newlines."
+        )
+    }
+}
+
+fn get_duplicate_error(
+    path: &str,
+    edit_index: usize,
+    total_edits: usize,
+    occurrences: usize,
+) -> String {
+    if total_edits == 1 {
+        format!(
+            "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
+        )
+    } else {
+        format!(
+            "Found {occurrences} occurrences of edits[{edit_index}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
+        )
+    }
+}
+
+fn get_empty_old_text_error(path: &str, edit_index: usize, total_edits: usize) -> String {
+    if total_edits == 1 {
+        format!("oldText must not be empty in {path}.")
+    } else {
+        format!("edits[{edit_index}].oldText must not be empty in {path}.")
+    }
+}
+
+fn get_no_change_error(path: &str, total_edits: usize) -> String {
+    if total_edits == 1 {
+        format!(
+            "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+        )
+    } else {
+        format!("No changes made to {path}. The replacements produced identical content.")
+    }
+}
+
+fn apply_edits_to_normalized_content(
+    normalized_content: &str,
+    edits: &[EditSpec],
+    path: &str,
+) -> Result<AppliedEditsResult, String> {
+    let normalized_edits = edits
+        .iter()
+        .map(|edit| EditSpec {
+            old_text: normalize_newlines(&edit.old_text),
+            new_text: normalize_newlines(&edit.new_text),
+        })
+        .collect::<Vec<_>>();
+
+    for (index, edit) in normalized_edits.iter().enumerate() {
+        if edit.old_text.is_empty() {
+            return Err(get_empty_old_text_error(
+                path,
+                index,
+                normalized_edits.len(),
+            ));
+        }
+    }
+
+    let initial_matches = normalized_edits
+        .iter()
+        .map(|edit| fuzzy_find_text(normalized_content, &edit.old_text))
+        .collect::<Vec<_>>();
+    let base_content = if initial_matches
+        .iter()
+        .any(|result| result.is_some_and(|(_, _, used_fuzzy)| used_fuzzy))
+    {
+        normalize_for_fuzzy_match(normalized_content)
+    } else {
+        normalized_content.to_string()
+    };
+
+    let mut matched_edits = Vec::with_capacity(normalized_edits.len());
+    for (index, edit) in normalized_edits.iter().enumerate() {
+        let Some((match_index, match_length, _)) = fuzzy_find_text(&base_content, &edit.old_text)
+        else {
+            return Err(get_not_found_error(path, index, normalized_edits.len()));
+        };
+
+        let occurrences = count_occurrences(&base_content, &edit.old_text);
+        if occurrences > 1 {
+            return Err(get_duplicate_error(
+                path,
+                index,
+                normalized_edits.len(),
+                occurrences,
+            ));
+        }
+
+        matched_edits.push(MatchedEdit {
+            edit_index: index,
+            match_index,
+            match_length,
+            new_text: edit.new_text.clone(),
+        });
+    }
+
+    matched_edits.sort_by_key(|edit| edit.match_index);
+    for pair in matched_edits.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if previous.match_index + previous.match_length > current.match_index {
+            return Err(format!(
+                "edits[{}] and edits[{}] overlap in {}. Merge them into one edit or target disjoint regions.",
+                previous.edit_index, current.edit_index, path
+            ));
+        }
+    }
+
+    let mut new_content = base_content.clone();
+    for edit in matched_edits.iter().rev() {
+        new_content = format!(
+            "{}{}{}",
+            &new_content[..edit.match_index],
+            edit.new_text,
+            &new_content[edit.match_index + edit.match_length..]
+        );
+    }
+
+    if new_content == base_content {
+        return Err(get_no_change_error(path, normalized_edits.len()));
+    }
+
+    Ok(AppliedEditsResult {
+        base_content,
+        new_content,
+    })
+}
+
+fn generate_diff_string(path: &str, base_content: &str, new_content: &str) -> String {
+    let diff = TextDiff::from_lines(base_content, new_content);
+    diff.unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
+}
+
+fn first_changed_line(base_content: &str, new_content: &str) -> Option<usize> {
+    let base_lines = base_content.split('\n').collect::<Vec<_>>();
+    let new_lines = new_content.split('\n').collect::<Vec<_>>();
+    let max_len = base_lines.len().max(new_lines.len());
+    for index in 0..max_len {
+        if base_lines.get(index) != new_lines.get(index) {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+fn detect_supported_image_mime_type(bytes: &[u8], path: &Path) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
     }
 }
 
@@ -251,7 +598,7 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_string(),
-            description: "Read the contents of a file. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.".to_string(),
+            description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.".to_string(),
             parameters: schema_object(
                 json!({
                     "path": {
@@ -292,11 +639,18 @@ impl Tool for ReadTool {
             }
             Err(error) => return ToolResult::error(format!("Failed to read file: {error}")),
         };
+
+        if let Some(mime_type) = detect_supported_image_mime_type(&bytes, &resolved) {
+            return ToolResult::success(format!(
+                "Read image file [{mime_type}]\n[Image omitted: inline image output is not supported by egopulse yet.]"
+            ));
+        }
+
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(_) => {
                 return ToolResult::error(
-                    "Only UTF-8 text files are supported by read in egopulse right now."
+                    "Failed to read file: file is not valid UTF-8 text or a supported image."
                         .to_string(),
                 );
             }
@@ -334,10 +688,17 @@ impl Tool for ReadTool {
         let start_display = start_line + 1;
         let total_lines = all_lines.len();
         let mut output = if truncation.first_line_exceeds_limit {
+            let first_line_size = format_size(
+                all_lines
+                    .get(start_line)
+                    .map(|line| line.len())
+                    .unwrap_or(0),
+            );
             format!(
-                "[Line {} exceeds {} limit. Use a more targeted offset/limit.]",
-                start_display,
-                format_size(DEFAULT_MAX_BYTES)
+                "[Line {start_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {}]",
+                format_size(DEFAULT_MAX_BYTES),
+                path,
+                DEFAULT_MAX_BYTES
             )
         } else {
             truncation.content.clone()
@@ -356,7 +717,15 @@ impl Tool for ReadTool {
                     format_size(DEFAULT_MAX_BYTES)
                 ));
             }
-        } else if let Some(limit) = user_limit
+            return ToolResult::success_with_details(
+                output,
+                json!({
+                    "truncation": truncation_json(&truncation)
+                }),
+            );
+        }
+
+        if let Some(limit) = user_limit
             && start_line + limit < all_lines.len()
         {
             let remaining = all_lines.len() - (start_line + limit);
@@ -427,16 +796,14 @@ impl Tool for WriteTool {
             return ToolResult::error(format!("Failed to create directories: {error}"));
         }
         match tokio::fs::write(&resolved, content).await {
-            Ok(()) => ToolResult::success(format!("Successfully wrote {}", resolved.display())),
+            Ok(()) => ToolResult::success(format!(
+                "Successfully wrote {} bytes to {}",
+                content.len(),
+                path
+            )),
             Err(error) => ToolResult::error(format!("Failed to write file: {error}")),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EditSpec {
-    old_text: String,
-    new_text: String,
 }
 
 struct EditTool {
@@ -458,7 +825,7 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit".to_string(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".to_string(),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".to_string(),
             parameters: schema_object(
                 json!({
                     "path": {
@@ -467,13 +834,13 @@ impl Tool for EditTool {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "One or more targeted replacements matched against the original file.",
+                        "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "oldText": {
                                     "type": "string",
-                                    "description": "Exact text for one targeted replacement. It must be unique in the original file."
+                                    "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
                                 },
                                 "newText": {
                                     "type": "string",
@@ -505,6 +872,7 @@ impl Tool for EditTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+
         let raw_content = match tokio::fs::read_to_string(&resolved).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -513,38 +881,35 @@ impl Tool for EditTool {
             Err(error) => return ToolResult::error(format!("Failed to read file: {error}")),
         };
 
-        let has_bom = raw_content.starts_with('\u{feff}');
-        let content_without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
-        let uses_crlf = content_without_bom.contains("\r\n");
-        let normalized_original = content_without_bom.replace("\r\n", "\n");
-        let normalized_edits = edits
-            .into_iter()
-            .map(|edit| EditSpec {
-                old_text: edit.old_text.replace("\r\n", "\n"),
-                new_text: edit.new_text.replace("\r\n", "\n"),
-            })
-            .collect::<Vec<_>>();
-
-        let updated = match apply_edits_to_original(&normalized_original, &normalized_edits) {
-            Ok(updated) => updated,
+        let (bom, content_without_bom) = strip_bom(&raw_content);
+        let original_ending = detect_line_ending(content_without_bom);
+        let normalized_original = normalize_newlines(content_without_bom);
+        let applied = match apply_edits_to_normalized_content(&normalized_original, &edits, path) {
+            Ok(applied) => applied,
             Err(error) => return ToolResult::error(error),
         };
-        let restored = if uses_crlf {
-            updated.replace('\n', "\r\n")
-        } else {
-            updated
-        };
-        let final_content = if has_bom {
-            format!("\u{feff}{restored}")
-        } else {
-            restored
-        };
+
+        let final_content = format!(
+            "{bom}{}",
+            restore_line_endings(&applied.new_content, original_ending)
+        );
         match tokio::fs::write(&resolved, final_content).await {
-            Ok(()) => ToolResult::success(format!(
-                "Successfully replaced {} block(s) in {}.",
-                normalized_edits.len(),
-                path
-            )),
+            Ok(()) => {
+                let diff = generate_diff_string(path, &applied.base_content, &applied.new_content);
+                let first_changed_line =
+                    first_changed_line(&applied.base_content, &applied.new_content);
+                ToolResult::success_with_details(
+                    format!(
+                        "Successfully edited {} with {} replacement(s).",
+                        path,
+                        edits.len()
+                    ),
+                    json!({
+                        "diff": diff,
+                        "firstChangedLine": first_changed_line
+                    }),
+                )
+            }
             Err(error) => ToolResult::error(format!("Failed to write file: {error}")),
         }
     }
@@ -569,7 +934,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_string(),
-            description: "Execute a bash command in the workspace. Returns the tail of stdout/stderr, truncated to 2000 lines or 50KB.".to_string(),
+            description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.".to_string(),
             parameters: schema_object(
                 json!({
                     "command": {
@@ -595,71 +960,149 @@ impl Tool for BashTool {
             return ToolResult::error("Missing required parameter: command".to_string());
         };
         let timeout_secs = input.get("timeout").and_then(|value| value.as_u64());
-        let mut command_builder = Command::new("bash");
-        command_builder
-            .arg("-lc")
-            .arg(command)
-            .current_dir(&self.workspace_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let temp_path = std::env::temp_dir().join(format!("pi-bash-{}.log", uuid::Uuid::new_v4()));
+        let quoted_temp = shell_quote(&temp_path.to_string_lossy());
+        let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
-        let output = if let Some(timeout_secs) = timeout_secs {
-            match timeout(Duration::from_secs(timeout_secs), command_builder.output()).await {
-                Ok(Ok(output)) => output,
-                Ok(Err(error)) => {
-                    return ToolResult::error(format!("Failed to execute bash command: {error}"));
-                }
-                Err(_) => {
-                    return ToolResult::error(format!(
-                        "Command timed out after {timeout_secs} seconds"
-                    ));
-                }
-            }
-        } else {
-            match command_builder.output().await {
-                Ok(output) => output,
-                Err(error) => {
-                    return ToolResult::error(format!("Failed to execute bash command: {error}"));
-                }
+        let mut child = match Command::new("bash")
+            .arg("-lc")
+            .arg(&wrapped_command)
+            .current_dir(&self.workspace_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return ToolResult::error(format!("Failed to execute bash command: {error}"));
             }
         };
 
-        let combined = combine_command_output(&output.stdout, &output.stderr);
-        let truncation = truncate_tail(&combined, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let status = if let Some(timeout_secs) = timeout_secs {
+            match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let output = read_temp_output(&temp_path);
+                    return bash_error_result(output, &temp_path, Some(timeout_secs), None);
+                }
+            }
+        } else {
+            child
+                .wait()
+                .await
+                .map_err(|error| format!("Failed to execute bash command: {error}"))
+        };
+
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => return ToolResult::error(error),
+        };
+
+        let output = read_temp_output(&temp_path);
+        let truncation = truncate_tail(&output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let details = if truncation.truncated {
+            Some(json!({
+                "truncation": truncation_json(&truncation),
+                "fullOutputPath": temp_path.to_string_lossy()
+            }))
+        } else {
+            None
+        };
         let mut text = if truncation.content.is_empty() {
             "(no output)".to_string()
         } else {
-            truncation.content
+            truncation.content.clone()
         };
+
         if truncation.truncated {
             let start_line = truncation
                 .total_lines
                 .saturating_sub(truncation.output_lines)
                 + 1;
             let end_line = truncation.total_lines;
-            if truncation.truncated_by == Some("lines") {
+            if truncation.last_line_partial {
+                let last_line_size =
+                    format_size(output.split('\n').next_back().unwrap_or_default().len());
                 text.push_str(&format!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {}.]",
-                    truncation.total_lines
+                    "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {}]",
+                    format_size(truncation.output_bytes),
+                    temp_path.to_string_lossy()
+                ));
+            } else if truncation.truncated_by == Some("lines") {
+                text.push_str(&format!(
+                    "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {}]",
+                    truncation.total_lines,
+                    temp_path.to_string_lossy()
                 ));
             } else {
                 text.push_str(&format!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit).]",
+                    "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {}]",
                     truncation.total_lines,
-                    format_size(truncation.max_bytes)
+                    format_size(DEFAULT_MAX_BYTES),
+                    temp_path.to_string_lossy()
                 ));
             }
+        } else {
+            let _ = fs::remove_file(&temp_path);
         }
-        if !output.status.success() {
-            if let Some(code) = output.status.code() {
+
+        if !status.success() {
+            if let Some(code) = status.code() {
                 text.push_str(&format!("\n\nCommand exited with code {code}"));
+            }
+            if let Some(details) = details {
+                return ToolResult::error_with_details(text, details);
             }
             return ToolResult::error(text);
         }
 
-        ToolResult::success(text)
+        if let Some(details) = details {
+            ToolResult::success_with_details(text, details)
+        } else {
+            ToolResult::success(text)
+        }
     }
+}
+
+fn bash_error_result(
+    output: String,
+    temp_path: &Path,
+    timeout_secs: Option<u64>,
+    aborted: Option<bool>,
+) -> ToolResult {
+    let truncation = truncate_tail(&output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let details = json!({
+        "truncation": if truncation.truncated { Some(truncation_json(&truncation)) } else { None::<serde_json::Value> },
+        "fullOutputPath": if truncation.truncated { Some(temp_path.to_string_lossy().to_string()) } else { None::<String> }
+    });
+    let mut text = if truncation.content.is_empty() {
+        "(no output)".to_string()
+    } else {
+        truncation.content.clone()
+    };
+    if let Some(true) = aborted {
+        text.push_str("\n\nCommand aborted");
+    } else if let Some(timeout_secs) = timeout_secs {
+        text.push_str(&format!(
+            "\n\nCommand timed out after {timeout_secs} seconds"
+        ));
+    }
+    if truncation.truncated {
+        ToolResult::error_with_details(text, details)
+    } else {
+        let _ = fs::remove_file(temp_path);
+        ToolResult::error(text)
+    }
+}
+
+fn read_temp_output(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
+        .unwrap_or_default()
 }
 
 struct GrepTool {
@@ -681,7 +1124,7 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".to_string(),
-            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore.".to_string(),
+            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.".to_string(),
             parameters: schema_object(
                 json!({
                     "pattern": {
@@ -737,10 +1180,11 @@ impl Tool for GrepTool {
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
+
         let limit = input
             .get("limit")
             .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
+            .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_GREP_LIMIT);
         let ignore_case = input
             .get("ignoreCase")
@@ -786,22 +1230,38 @@ impl Tool for GrepTool {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ToolResult::error(
-                    "ripgrep (rg) is not available. Install rg to use grep.".to_string(),
+                    "ripgrep (rg) is not available and could not be downloaded".to_string(),
                 );
             }
-            Err(error) => return ToolResult::error(format!("Failed to run rg: {error}")),
+            Err(error) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
         if stdout.trim().is_empty() && output.status.code() == Some(1) {
-            return ToolResult::success("No matches found.".to_string());
+            return ToolResult::success("No matches found".to_string());
         }
         if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return ToolResult::error(format!("Search failed: {}", stderr.trim()));
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return ToolResult::error(if stderr.is_empty() {
+                format!(
+                    "ripgrep exited with code {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            } else {
+                stderr
+            });
         }
 
-        let lines = stdout.lines().map(truncate_grep_line).collect::<Vec<_>>();
+        let mut lines_truncated = false;
+        let lines = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (truncated, was_truncated) = truncate_grep_line(line);
+                lines_truncated |= was_truncated;
+                truncated
+            })
+            .collect::<Vec<_>>();
         let result_limit_reached = lines.len() > limit;
         let limited = if result_limit_reached {
             lines[..limit].to_vec()
@@ -811,19 +1271,36 @@ impl Tool for GrepTool {
         let raw_output = limited.join("\n");
         let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
         let mut text = if truncation.content.is_empty() {
-            "No matches found.".to_string()
+            "No matches found".to_string()
         } else {
-            truncation.content
+            truncation.content.clone()
         };
+
         let mut notices = Vec::new();
         if result_limit_reached {
-            notices.push(format!("{limit} matches limit"));
+            notices.push(format!(
+                "{limit} matches limit reached. Use limit={} for more, or refine pattern",
+                limit * 2
+            ));
         }
         if truncation.truncated {
-            notices.push(format!("{} limit", format_size(DEFAULT_MAX_BYTES)));
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+        }
+        if lines_truncated {
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
         }
         if !notices.is_empty() {
-            text.push_str(&format!("\n\n[Truncated: {}]", notices.join(", ")));
+            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+            return ToolResult::success_with_details(
+                text,
+                json!({
+                    "truncation": if truncation.truncated { Some(truncation_json(&truncation)) } else { None::<serde_json::Value> },
+                    "matchLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> },
+                    "linesTruncated": lines_truncated
+                }),
+            );
         }
 
         ToolResult::success(text)
@@ -849,7 +1326,7 @@ impl Tool for FindTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "find".to_string(),
-            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore.".to_string(),
+            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).".to_string(),
             parameters: schema_object(
                 json!({
                     "pattern": {
@@ -889,6 +1366,7 @@ impl Tool for FindTool {
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
+
         let limit = input
             .get("limit")
             .and_then(|value| value.as_u64())
@@ -909,31 +1387,53 @@ impl Tool for FindTool {
             .arg("--color=never")
             .arg("--hidden")
             .arg("--max-results")
-            .arg(limit.to_string())
+            .arg(limit.to_string());
+        for ignore_file in collect_gitignore_files(&search_dir) {
+            command.arg("--ignore-file").arg(ignore_file);
+        }
+        command
             .arg(pattern)
-            .arg(".")
-            .current_dir(&search_dir)
+            .arg(search_dir.to_string_lossy().to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
         let output = match command.output().await {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ToolResult::error(
-                    "fd is not available. Install fd to use find.".to_string(),
+                    "fd is not available and could not be downloaded".to_string(),
                 );
             }
             Err(error) => return ToolResult::error(format!("Failed to run fd: {error}")),
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return ToolResult::error(format!("Search failed: {}", stderr.trim()));
+
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        if !output.status.success() && stdout.trim().is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return ToolResult::error(if stderr.is_empty() {
+                format!("fd exited with code {}", output.status.code().unwrap_or(-1))
+            } else {
+                stderr
+            });
         }
 
-        let results = String::from_utf8_lossy(&output.stdout)
-            .replace("\r\n", "\n")
+        let results = stdout
             .lines()
-            .map(|line| line.trim_end_matches('/').to_string())
+            .map(str::trim)
             .filter(|line| !line.is_empty())
+            .map(|line| {
+                let path = Path::new(line);
+                let relative = path
+                    .strip_prefix(&search_dir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if line.ends_with('/') || line.ends_with('\\') {
+                    format!("{relative}/")
+                } else {
+                    relative
+                }
+            })
             .collect::<Vec<_>>();
         if results.is_empty() {
             return ToolResult::success("No files found matching pattern".to_string());
@@ -942,19 +1442,62 @@ impl Tool for FindTool {
         let result_limit_reached = results.len() >= limit;
         let raw_output = results.join("\n");
         let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content;
+        let mut text = truncation.content.clone();
         let mut notices = Vec::new();
         if result_limit_reached {
-            notices.push(format!("{limit} results limit reached"));
+            notices.push(format!(
+                "{limit} results limit reached. Use limit={} for more, or refine pattern",
+                limit * 2
+            ));
         }
         if truncation.truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+            return ToolResult::success_with_details(
+                text,
+                json!({
+                    "truncation": if truncation.truncated { Some(truncation_json(&truncation)) } else { None::<serde_json::Value> },
+                    "resultLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> }
+                }),
+            );
         }
+
         ToolResult::success(text)
     }
+}
+
+fn collect_gitignore_files(root: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                if name == ".git" || name == "node_modules" {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.file_name().and_then(|value| value.to_str()) == Some(".gitignore")
+            {
+                results.push(path);
+            }
+        }
+    }
+    results.sort();
+    results
 }
 
 struct LsTool {
@@ -976,7 +1519,7 @@ impl Tool for LsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "ls".to_string(),
-            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles.".to_string(),
+            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).".to_string(),
             parameters: schema_object(
                 json!({
                     "path": {
@@ -1023,7 +1566,8 @@ impl Tool for LsTool {
                 .filter_map(Result::ok)
                 .filter_map(|entry| {
                     let mut name = entry.file_name().to_string_lossy().to_string();
-                    if entry.file_type().ok()?.is_dir() {
+                    let file_type = entry.file_type().ok()?;
+                    if file_type.is_dir() {
                         name.push('/');
                     }
                     Some(name)
@@ -1045,7 +1589,7 @@ impl Tool for LsTool {
         };
         let raw_output = limited.join("\n");
         let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content;
+        let mut text = truncation.content.clone();
         let mut notices = Vec::new();
         if entry_limit_reached {
             notices.push(format!(
@@ -1058,6 +1602,13 @@ impl Tool for LsTool {
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+            return ToolResult::success_with_details(
+                text,
+                json!({
+                    "truncation": if truncation.truncated { Some(truncation_json(&truncation)) } else { None::<serde_json::Value> },
+                    "entryLimitReached": if entry_limit_reached { Some(limit) } else { None::<usize> }
+                }),
+            );
         }
         ToolResult::success(text)
     }
@@ -1121,14 +1672,8 @@ impl Tool for ActivateSkillTool {
 }
 
 fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, String> {
+    let mut parsed = Vec::new();
     if let Some(edits) = input.get("edits").and_then(|value| value.as_array()) {
-        if edits.is_empty() {
-            return Err(
-                "Edit tool input is invalid. edits must contain at least one replacement."
-                    .to_string(),
-            );
-        }
-        let mut parsed = Vec::with_capacity(edits.len());
         for edit in edits {
             let Some(old_text) = edit.get("oldText").and_then(|value| value.as_str()) else {
                 return Err("Each edit must include oldText".to_string());
@@ -1141,67 +1686,36 @@ fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, String> {
                 new_text: new_text.to_string(),
             });
         }
-        return Ok(parsed);
     }
 
     if let (Some(old_text), Some(new_text)) = (
         input.get("oldText").and_then(|value| value.as_str()),
         input.get("newText").and_then(|value| value.as_str()),
     ) {
-        return Ok(vec![EditSpec {
+        parsed.push(EditSpec {
             old_text: old_text.to_string(),
             new_text: new_text.to_string(),
-        }]);
+        });
     }
 
-    Err("Edit tool input is invalid. edits must contain at least one replacement.".to_string())
+    if parsed.is_empty() {
+        return Err(
+            "Edit tool input is invalid. edits must contain at least one replacement.".to_string(),
+        );
+    }
+    Ok(parsed)
 }
 
-fn apply_edits_to_original(original: &str, edits: &[EditSpec]) -> Result<String, String> {
-    let mut ranges = Vec::with_capacity(edits.len());
-    for edit in edits {
-        let matches = original.match_indices(&edit.old_text).collect::<Vec<_>>();
-        if matches.is_empty() {
-            return Err("oldText not found in file. Make sure it matches exactly.".to_string());
-        }
-        if matches.len() > 1 {
-            return Err(format!(
-                "oldText found {} times in file. It must be unique.",
-                matches.len()
-            ));
-        }
-        let (start, matched) = matches[0];
-        let end = start + matched.len();
-        ranges.push((start, end, edit.new_text.as_str()));
-    }
-    ranges.sort_by_key(|(start, _, _)| *start);
-    for pair in ranges.windows(2) {
-        if pair[0].1 > pair[1].0 {
-            return Err(
-                "Edit ranges overlap. Merge nearby changes into one edit instead.".to_string(),
-            );
-        }
-    }
-
-    let mut result = String::with_capacity(original.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in ranges {
-        result.push_str(&original[cursor..start]);
-        result.push_str(replacement);
-        cursor = end;
-    }
-    result.push_str(&original[cursor..]);
-    Ok(result)
-}
-
-fn truncate_grep_line(line: &str) -> String {
-    const GREP_MAX_LINE_LENGTH: usize = 500;
+fn truncate_grep_line(line: &str) -> (String, bool) {
     if line.chars().count() <= GREP_MAX_LINE_LENGTH {
-        return line.to_string();
+        return (line.to_string(), false);
     }
-    format!(
-        "{}...",
-        line.chars().take(GREP_MAX_LINE_LENGTH).collect::<String>()
+    (
+        format!(
+            "{}...",
+            line.chars().take(GREP_MAX_LINE_LENGTH).collect::<String>()
+        ),
+        true,
     )
 }
 
@@ -1215,17 +1729,6 @@ fn command_scope_for_path(path: &Path) -> (&Path, &str) {
                 .and_then(|name| name.to_str())
                 .unwrap_or("."),
         )
-    }
-}
-
-fn combine_command_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout).replace("\r\n", "\n");
-    let stderr = String::from_utf8_lossy(stderr).replace("\r\n", "\n");
-    match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-        (false, false) => format!("{}\n{}", stdout.trim_end(), stderr.trim_end()),
-        (false, true) => stdout.trim_end().to_string(),
-        (true, false) => stderr.trim_end().to_string(),
-        (true, true) => String::new(),
     }
 }
 
@@ -1258,6 +1761,21 @@ fn resolve_workspace_path(workspace_dir: &Path, requested_path: &str) -> Result<
     }
 
     Ok(normalized)
+}
+
+fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
+    json!({
+        "truncated": truncation.truncated,
+        "truncatedBy": truncation.truncated_by,
+        "totalLines": truncation.total_lines,
+        "totalBytes": truncation.total_bytes,
+        "outputLines": truncation.output_lines,
+        "outputBytes": truncation.output_bytes,
+        "lastLinePartial": truncation.last_line_partial,
+        "firstLineExceedsLimit": truncation.first_line_exceeds_limit,
+        "maxLines": truncation.max_lines,
+        "maxBytes": truncation.max_bytes
+    })
 }
 
 fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
@@ -1354,7 +1872,28 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.content.contains("hello"));
-        assert!(!result.content.contains("1\t"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn read_reports_supported_images() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let workspace = config.workspace_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("pixel.png"),
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .expect("png");
+        let registry = test_registry(&config);
+
+        let result = registry
+            .execute("read", json!({"path": "pixel.png"}), &test_context())
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("Read image file [image/png]"));
     }
 
     #[tokio::test]
@@ -1373,6 +1912,7 @@ mod tests {
             )
             .await;
         assert!(!result.is_error);
+        assert!(result.content.contains("Successfully wrote 11 bytes"));
         assert_eq!(
             std::fs::read_to_string(config.workspace_dir().join("src/demo.txt")).expect("read"),
             "hello world"
@@ -1381,7 +1921,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn edit_replaces_exact_match() {
+    async fn edit_replaces_exact_match_and_returns_diff() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
@@ -1400,10 +1940,26 @@ mod tests {
                 &test_context(),
             )
             .await;
-        assert!(!result.is_error);
+        assert!(!result.is_error, "{}", result.content);
         let content = std::fs::read_to_string(workspace.join("notes.txt")).expect("read");
         assert!(content.contains("delta"));
-        assert!(!content.contains("beta"));
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("firstChangedLine"))
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("diff"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .contains("-beta")
+        );
     }
 
     #[tokio::test]

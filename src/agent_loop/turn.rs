@@ -309,12 +309,15 @@ fn format_tool_result(tool_call: &ToolCall, result: &crate::tools::ToolResult) -
         );
     }
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "tool": tool_call.name,
         "status": if result.is_error { "error" } else { "success" },
         "result": content,
-    })
-    .to_string()
+    });
+    if let Some(details) = &result.details {
+        payload["details"] = details.clone();
+    }
+    payload.to_string()
 }
 
 fn summarize_tool_calls(response: &MessagesResponse) -> String {
