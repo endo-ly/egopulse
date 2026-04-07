@@ -690,6 +690,14 @@ impl Tool for ReadTool {
         };
 
         if let Some(mime_type) = detect_supported_image_mime_type(&bytes, &resolved) {
+            const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+            if bytes.len() > MAX_IMAGE_SIZE {
+                return ToolResult::error(format!(
+                    "Image file too large ({}). Maximum size is {}.",
+                    format_size(bytes.len()),
+                    format_size(MAX_IMAGE_SIZE)
+                ));
+            }
             let preview = format!("Read image file [{mime_type}]");
             let data_url = format!(
                 "data:{mime_type};base64,{}",
@@ -1446,7 +1454,13 @@ impl Tool for FindTool {
             .arg("--hidden")
             .arg("--max-results")
             .arg(limit.to_string());
-        for ignore_file in collect_gitignore_files(&search_dir) {
+        let ignore_files = tokio::task::spawn_blocking({
+            let search_dir = search_dir.clone();
+            move || collect_gitignore_files(&search_dir)
+        })
+        .await
+        .unwrap_or_default();
+        for ignore_file in ignore_files {
             command.arg("--ignore-file").arg(ignore_file);
         }
         command
@@ -1619,18 +1633,20 @@ impl Tool for LsTool {
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_LS_LIMIT);
 
-        let mut entries = match std::fs::read_dir(&resolved) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| {
+        let mut entries = match tokio::fs::read_dir(&resolved).await {
+            Ok(mut dir) => {
+                let mut names = Vec::new();
+                while let Some(entry) = dir.next_entry().await.ok().flatten() {
                     let mut name = entry.file_name().to_string_lossy().to_string();
-                    let file_type = entry.file_type().ok()?;
-                    if file_type.is_dir() {
-                        name.push('/');
+                    if let Ok(file_type) = entry.file_type().await {
+                        if file_type.is_dir() {
+                            name.push('/');
+                        }
                     }
-                    Some(name)
-                })
-                .collect::<Vec<_>>(),
+                    names.push(name);
+                }
+                names
+            }
             Err(error) => return ToolResult::error(format!("Cannot read directory: {error}")),
         };
 
