@@ -1804,15 +1804,11 @@ fn resolve_workspace_path(workspace_dir: &Path, requested_path: &str) -> Result<
     let canonical_candidate = match std::fs::canonicalize(&candidate) {
         Ok(path) => path,
         Err(_) => {
-            let parent = candidate.parent().ok_or_else(|| {
-                format!("Invalid path (no parent): {}", candidate.display())
-            })?;
-            let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
-                format!(
-                    "Parent directory does not exist: {}",
-                    parent.display()
-                )
-            })?;
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| format!("Invalid path (no parent): {}", candidate.display()))?;
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|_| format!("Parent directory does not exist: {}", parent.display()))?;
             if !canonical_parent.starts_with(&canonical_workspace) {
                 return Err(format!(
                     "Refusing to access path outside workspace: {}",
