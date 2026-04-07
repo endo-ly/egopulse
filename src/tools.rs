@@ -987,7 +987,8 @@ impl Tool for BashTool {
             return ToolResult::error("Missing required parameter: command".to_string());
         };
         let timeout_secs = input.get("timeout").and_then(|value| value.as_u64());
-        let temp_path = std::env::temp_dir().join(format!("pi-bash-{}.log", uuid::Uuid::new_v4()));
+        let temp_path =
+            std::env::temp_dir().join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
         let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 

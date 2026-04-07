@@ -258,7 +258,7 @@ impl LlmProvider for OpenAiProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, LlmError> {
         if tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-            let response = self.send_message(system, messages, None).await?;
+            let response = self.send_message(system, messages, tools).await?;
             if let Some(tx) = text_tx
                 && !response.content.is_empty()
             {

@@ -299,8 +299,21 @@ fn command_exists(command: &str) -> bool {
 
     std::env::split_paths(&path_var).any(|base| {
         let candidate = base.join(command);
-        candidate.is_file()
+        candidate.is_file() && is_executable(&candidate)
     })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &std::path::Path) -> bool {
+    true
 }
 
 #[cfg(test)]

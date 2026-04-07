@@ -99,11 +99,11 @@ impl AssetStore {
                 continue;
             }
 
-            std::fs::remove_file(&path)?;
             let metadata_path = self.image_metadata_path(stem);
             if metadata_path.exists() {
-                std::fs::remove_file(metadata_path)?;
+                std::fs::remove_file(&metadata_path)?;
             }
+            std::fs::remove_file(&path)?;
             removed.push(stem.to_string());
         }
 

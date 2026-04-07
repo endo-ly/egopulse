@@ -191,10 +191,12 @@ where
             );
 
             store_pending_tool_call(state, chat_id, &assistant_message_id, &tool_call).await?;
+            let tool_start = std::time::Instant::now();
             let result = state
                 .tools
                 .execute(&tool_call.name, tool_call.arguments.clone(), &tool_context)
                 .await;
+            let duration_ms = tool_start.elapsed().as_millis();
             let tool_payload = format_tool_result(&tool_call, &result);
             update_tool_call_output(state, &tool_call.id, &tool_payload).await?;
 
@@ -204,7 +206,7 @@ where
                     name: tool_call.name.clone(),
                     is_error: result.is_error,
                     preview: preview_text(&tool_payload, 160),
-                    duration_ms: 0,
+                    duration_ms,
                 },
             );
 
