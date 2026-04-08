@@ -1,3 +1,8 @@
+//! SQLite ベースの会話永続化レイヤー。
+//!
+//! チャットセッション・メッセージ履歴・ツールコール記録を単一の SQLite DB に保存する。
+//! WAL モードで排他制御し、`Mutex<Connection>` でスレッド安全性を担保する。
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,10 +11,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StorageError;
 
+/// Thread-safe SQLite database wrapper for conversation persistence.
 pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// A single chat message persisted in the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
     pub id: String,
@@ -20,6 +27,7 @@ pub struct StoredMessage {
     pub timestamp: String,
 }
 
+/// Metadata for listing sessions without loading full message history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub chat_id: i64,
@@ -30,6 +38,7 @@ pub struct SessionSummary {
     pub last_message_preview: Option<String>,
 }
 
+/// Combined session snapshot: serialized messages JSON plus recent message records.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub messages_json: Option<String>,
@@ -37,7 +46,7 @@ pub struct SessionSnapshot {
     pub recent_messages: Vec<StoredMessage>,
 }
 
-/// Tool call record for tracking tool execution history.
+/// Persisted tool call record for tracking tool execution history.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -49,6 +58,7 @@ pub struct ToolCall {
     pub timestamp: String,
 }
 
+/// Run a blocking database operation on a tokio blocking thread.
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
     T: Send + 'static,
@@ -60,6 +70,7 @@ where
 }
 
 impl Database {
+    /// Open (or create) the database at `{data_dir}/egopulse.db` and initialize schema.
     pub fn new(data_dir: &str) -> Result<Self, StorageError> {
         let db_path = Path::new(data_dir).join("egopulse.db");
         std::fs::create_dir_all(data_dir)?;
@@ -122,6 +133,8 @@ impl Database {
         })
     }
 
+    /// Look up the internal chat_id for a (channel, external_chat_id) pair.
+    /// Returns `None` if no matching chat exists.
     pub fn resolve_chat_id(
         &self,
         channel: &str,
@@ -139,6 +152,7 @@ impl Database {
         }
     }
 
+    /// Resolve or create a chat row. Updates title/type/timestamp on existing rows.
     pub fn resolve_or_create_chat_id(
         &self,
         channel: &str,
@@ -186,6 +200,7 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Insert or replace a message record.
     pub fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -203,6 +218,7 @@ impl Database {
         Ok(())
     }
 
+    /// Fetch the most recent `limit` messages for a chat, ordered oldest-first.
     pub fn get_recent_messages(
         &self,
         chat_id: i64,
@@ -233,6 +249,7 @@ impl Database {
         Ok(messages)
     }
 
+    /// Fetch all messages for a chat, ordered by timestamp ascending.
     pub fn get_all_messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -255,6 +272,7 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// List all chats with their last message preview, ordered by most recent activity.
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -295,6 +313,7 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Upsert the serialized session JSON for a chat.
     pub fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -309,6 +328,9 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically store a message and update the session snapshot.
+    /// Uses optimistic concurrency via `expected_updated_at`; returns
+    /// `SessionSnapshotConflict` on stale writes.
     pub fn store_message_with_session(
         &self,
         message: &StoredMessage,
@@ -359,6 +381,7 @@ impl Database {
         Ok(now)
     }
 
+    /// Load the session snapshot: serialized messages JSON plus recent message records.
     pub fn load_session_snapshot(
         &self,
         chat_id: i64,
@@ -412,6 +435,8 @@ impl Database {
         })
     }
 
+    /// Load the raw session JSON and `updated_at` timestamp for a chat.
+    /// Returns `None` if the chat has no saved session.
     pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
         let conn = self.lock_conn()?;
         let result = conn.query_row(
@@ -519,6 +544,7 @@ impl Database {
     }
 }
 
+// セッション一覧の表示名: chat_title → external_chat_id のチャネルプレフィクス除去 → そのまま
 fn logical_session_thread(
     channel: &str,
     external_chat_id: &str,

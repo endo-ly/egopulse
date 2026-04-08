@@ -1,7 +1,14 @@
+//! スキルの発見・読み込み・カタログ生成。
+//!
+//! ワークスペース配下の `SKILL.md` を再帰的に走査し、frontmatter から
+//! メタデータを抽出して利用可能スキルとして登録する。プロンプト予算に応じた
+//! コンパクトモードでのカタログ出力も行う。
+
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Parsed skill metadata extracted from a SKILL.md frontmatter block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillMetadata {
     pub name: String,
@@ -22,12 +29,14 @@ struct SkillFrontmatter {
     deps: Vec<String>,
 }
 
+/// A fully loaded skill with both metadata and the instruction body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedSkill {
     pub metadata: SkillMetadata,
     pub instructions: String,
 }
 
+/// Discovers, validates, and loads skills from the workspace skill directories.
 #[derive(Debug, Clone)]
 pub struct SkillManager {
     skills_dir: PathBuf,
@@ -38,6 +47,7 @@ const MAX_SKILL_DESCRIPTION_CHARS: usize = 120;
 const COMPACT_SKILLS_MODE_THRESHOLD: usize = 20;
 
 impl SkillManager {
+    /// Create a manager rooted at the given skills directory.
     pub fn from_skills_dir(skills_dir: impl Into<PathBuf>) -> Self {
         Self {
             skills_dir: skills_dir.into(),
@@ -48,6 +58,7 @@ impl SkillManager {
         &self.skills_dir
     }
 
+    /// Scan the workspace for available skills, filtering by platform and dependency availability.
     pub fn discover_skills(&self) -> Vec<SkillMetadata> {
         let mut skills_by_name = BTreeMap::new();
         for candidate in self.discover_skill_dirs() {
@@ -66,6 +77,7 @@ impl SkillManager {
         skills_by_name.into_values().collect()
     }
 
+    /// Load a skill by name. Returns an error listing available skills if not found.
     pub fn load_skill_checked(&self, name: &str) -> Result<LoadedSkill, String> {
         let mut available_names = Vec::new();
 
@@ -98,6 +110,8 @@ impl SkillManager {
         }
     }
 
+    /// Build an XML-formatted skills catalog for injection into the system prompt.
+    /// Switches to compact mode (name-only) when skill count exceeds threshold.
     pub fn build_skills_catalog(&self) -> String {
         let mut skills = self.discover_skills();
         if skills.is_empty() {

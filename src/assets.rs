@@ -8,11 +8,13 @@ use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
 
+/// Content-addressable file store for image assets under `{data_dir}/assets/images/`.
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
 }
 
+/// Reference to a stored image, keyed by SHA-256 hash of the original bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredImageAsset {
     pub image_ref: String,
@@ -29,12 +31,14 @@ struct ImageAssetMetadata {
 }
 
 impl AssetStore {
+    /// Create the asset store, ensuring the `assets/images/` directory tree exists.
     pub fn new(data_dir: &str) -> Result<Self, StorageError> {
         let root = Path::new(data_dir).join("assets");
         std::fs::create_dir_all(root.join("images"))?;
         Ok(Self { root })
     }
 
+    /// Parse a `data:<mime>;base64,...` URL, write the decoded bytes to disk (deduplicated by SHA-256).
     pub fn persist_image_data_url(&self, data_url: &str) -> Result<StoredImageAsset, StorageError> {
         let (mime_type, bytes) = parse_image_data_url(data_url)?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -63,6 +67,7 @@ impl AssetStore {
         })
     }
 
+    /// Read a stored image back as a `data:<mime>;base64,...` URL.
     pub fn load_image_data_url(
         &self,
         image_ref: &str,
@@ -76,6 +81,7 @@ impl AssetStore {
         ))
     }
 
+    /// Garbage-collect image assets not present in `referenced`. Returns the list of removed refs.
     pub fn sweep_unreferenced_images(
         &self,
         referenced: &HashSet<String>,
@@ -152,6 +158,11 @@ fn map_missing_asset(error: std::io::Error, image_ref: &str) -> StorageError {
 
 #[cfg(test)]
 mod tests {
+    //! ファイルベースの画像アセットストレージ。
+    //!
+    //! data URL 形式の画像を SHA-256 ハッシュで内容アドレス指定し、
+    //! 重複排除付きでファイルシステムに永続化する。未参照アセットの GC も提供する。
+
     use std::collections::HashSet;
 
     use super::AssetStore;

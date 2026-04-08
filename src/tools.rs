@@ -1,3 +1,9 @@
+//! LLM エージェント向けファイル操作・シェルツール群。
+//!
+//! ワークスペース内で動作する read / write / edit / bash / grep / find / ls の
+//! 7 種のファイル操作ツールと、スキル遅延読み込み用の activate_skill を提供する。
+//! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
+
 use std::cmp::min;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +29,7 @@ const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
+/// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
     pub chat_id: i64,
@@ -31,6 +38,7 @@ pub struct ToolExecutionContext {
     pub chat_type: String,
 }
 
+/// Uniform result type returned by all tool implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     pub content: String,
@@ -40,6 +48,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// Create a successful result with plain text content.
     pub fn success(content: String) -> Self {
         Self {
             llm_content: MessageContent::text(content.clone()),
@@ -49,6 +58,7 @@ impl ToolResult {
         }
     }
 
+    /// Create a successful result with structured details (e.g. truncation metadata).
     pub fn success_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
             llm_content: MessageContent::text(content.clone()),
@@ -58,6 +68,7 @@ impl ToolResult {
         }
     }
 
+    /// Create a successful result with separate LLM-facing multimodal content (e.g. images).
     pub fn success_with_llm_content(content: String, llm_content: MessageContent) -> Self {
         Self {
             content,
@@ -67,6 +78,7 @@ impl ToolResult {
         }
     }
 
+    /// Create an error result with plain text content.
     pub fn error(content: String) -> Self {
         Self {
             llm_content: MessageContent::text(content.clone()),
@@ -76,6 +88,7 @@ impl ToolResult {
         }
     }
 
+    /// Create an error result with structured details.
     pub fn error_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
             llm_content: MessageContent::text(content.clone()),
@@ -86,6 +99,7 @@ impl ToolResult {
     }
 }
 
+/// Trait implemented by every tool available to the LLM agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -94,11 +108,13 @@ pub trait Tool: Send + Sync {
     -> ToolResult;
 }
 
+/// Owns all tool instances and dispatches execution by tool name.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
 }
 
 impl ToolRegistry {
+    /// Instantiate all built-in tools scoped to the configured workspace.
     pub fn new(config: &Config, skill_manager: Arc<SkillManager>) -> Self {
         let workspace_dir = config.workspace_dir();
         if let Err(error) = std::fs::create_dir_all(&workspace_dir) {
@@ -122,10 +138,12 @@ impl ToolRegistry {
         }
     }
 
+    /// Collect tool definitions for registration with the LLM provider.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(|tool| tool.definition()).collect()
     }
 
+    /// Find and execute a tool by name. Returns an error result for unknown tools.
     pub async fn execute(
         &self,
         name: &str,
@@ -262,6 +280,7 @@ fn truncate_string_to_bytes_from_end(value: &str, max_bytes: usize) -> String {
     if bytes.len() <= max_bytes {
         return value.to_string();
     }
+    // UTF-8 境界まで前方にシフトしてマルチバイト文字の切断を防ぐ
     let mut start = bytes.len() - max_bytes;
     while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
         start += 1;
@@ -494,6 +513,8 @@ fn apply_edits_to_normalized_content(
 
     let mut base_content = normalized_content.to_string();
     let mut matched_edits = Vec::with_capacity(normalized_edits.len());
+    // 編集適用位置を補正するための累積オフセット。fuzzy 置換で元と正規化後の
+    // バイト長が異なる場合に差分を蓄積し、後続編集の開始位置を調整する。
     let mut cumulative_offset: isize = 0;
 
     for (index, result) in initial_matches.iter().enumerate() {
@@ -628,6 +649,7 @@ fn detect_supported_image_mime_type(bytes: &[u8], path: &Path) -> Option<&'stati
     }
 }
 
+/// Reads text files and images from the workspace, with line/byte truncation.
 struct ReadTool {
     workspace_dir: PathBuf,
 }
@@ -808,6 +830,7 @@ impl Tool for ReadTool {
     }
 }
 
+/// Writes content to a file, creating parent directories as needed.
 struct WriteTool {
     workspace_dir: PathBuf,
 }
@@ -875,6 +898,7 @@ impl Tool for WriteTool {
     }
 }
 
+/// Applies exact-match text replacements with fuzzy Unicode normalization and overlap detection.
 struct EditTool {
     workspace_dir: PathBuf,
 }
@@ -984,6 +1008,7 @@ impl Tool for EditTool {
     }
 }
 
+/// Executes bash commands in the workspace with configurable timeout and output capture.
 struct BashTool {
     workspace_dir: PathBuf,
 }
@@ -991,6 +1016,10 @@ struct BashTool {
 impl BashTool {
     fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        self.workspace_dir.join(".tmp").join("bash")
     }
 }
 
@@ -1171,6 +1200,7 @@ fn read_temp_output(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Searches file contents via ripgrep with regex/literal and context line support.
 struct GrepTool {
     workspace_dir: PathBuf,
 }
@@ -1373,6 +1403,7 @@ impl Tool for GrepTool {
     }
 }
 
+/// Finds files by glob pattern via fd, respecting .gitignore.
 struct FindTool {
     workspace_dir: PathBuf,
 }
@@ -1572,6 +1603,7 @@ fn collect_gitignore_files(root: &Path) -> Vec<PathBuf> {
     results
 }
 
+/// Lists directory entries alphabetically with `/` suffix for subdirectories.
 struct LsTool {
     workspace_dir: PathBuf,
 }
@@ -1688,6 +1720,7 @@ impl Tool for LsTool {
     }
 }
 
+/// Loads a skill's full instructions on demand by name.
 struct ActivateSkillTool {
     skill_manager: Arc<SkillManager>,
 }
@@ -2134,6 +2167,14 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("ok"));
         assert!(result.content.contains("hello"));
+        let bash_temp_dir = workspace.join(".tmp").join("bash");
+        assert!(bash_temp_dir.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&bash_temp_dir)
+                .expect("bash temp dir entries")
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
