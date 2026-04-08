@@ -977,9 +977,13 @@ fn extract_raw_tool_use_blocks(text: &str) -> Option<Vec<RawToolUseBlock>> {
     let mut calls = Vec::new();
     let mut rest = normalized.as_str();
     while let Some(pos) = rest.find("[tool_use:") {
-        let (call, tail) = parse_raw_tool_use_block(&rest[pos..], calls.len() + 1)?;
-        calls.push(call);
-        rest = tail;
+        if let Some((call, tail)) = parse_raw_tool_use_block(&rest[pos..], calls.len() + 1) {
+            calls.push(call);
+            rest = tail;
+        } else {
+            // Skip malformed block and continue scanning
+            rest = &rest[pos + "[tool_use:".len()..];
+        }
     }
 
     if calls.is_empty() { None } else { Some(calls) }

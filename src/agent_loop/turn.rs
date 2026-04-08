@@ -147,7 +147,7 @@ where
                 messages.push(Message::text("assistant", raw_content.clone()));
                 messages.push(Message::text(
                     "user",
-                    "[runtime_guard]: Your previous reply had no user-visible text.                      Reply again now with a concise visible answer.                      If tools are required, execute them first and then provide the visible result.",
+                    "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
                 ));
                 continue;
             }
@@ -164,7 +164,7 @@ where
                 messages.push(Message::text("assistant", raw_content.clone()));
                 messages.push(Message::text(
                     "user",
-                    "[runtime_guard]: Your previous reply only declared what you would do                      without actually executing any tools. If the user\'s request requires                      tool calls, execute them NOW instead of just describing what you plan to do.                      Then provide the result.",
+                    "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
                 ));
                 continue;
             }
