@@ -1,3 +1,7 @@
+//! Web のストリーミング送信 API を提供するモジュール。
+//!
+//! チャット run の開始と SSE 購読を仲介し、RunHub と agent loop を接続する。
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -13,23 +17,27 @@ use super::sse::AgentEvent;
 use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
 
 #[derive(Debug, Clone, Deserialize)]
+/// Represents a chat message request sent from the web UI.
 pub(super) struct SendRequest {
     pub session_key: Option<String>,
     pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
+/// Captures SSE subscription parameters for a streaming run.
 pub(super) struct StreamQuery {
     pub run_id: String,
     pub last_event_id: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
+/// Identifies a newly accepted streaming run.
 pub(super) struct StartedRun {
     pub run_id: String,
     pub session_key: String,
 }
 
+/// Starts a streaming run and returns its identifiers.
 pub(super) async fn api_send_stream(
     State(state): State<WebState>,
     Json(request): Json<SendRequest>,
@@ -43,6 +51,7 @@ pub(super) async fn api_send_stream(
     })))
 }
 
+/// Streams run events over SSE, including replay when available.
 pub(super) async fn api_stream(
     State(state): State<WebState>,
     Query(query): Query<StreamQuery>,
@@ -114,6 +123,7 @@ pub(super) async fn api_stream(
     ))
 }
 
+/// Creates a run and spawns the background task that publishes its events.
 pub(super) async fn start_stream_run(
     state: WebState,
     request: SendRequest,

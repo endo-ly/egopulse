@@ -1,3 +1,7 @@
+//! Web UI 用のセッション一覧・履歴取得 API。
+//!
+//! 保存済みセッションを Web 向けのキー形式に正規化して返す。
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -10,12 +14,14 @@ use super::{WebState, web_external_chat_id, web_session_key};
 const MAX_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
+/// Captures query parameters for loading web chat history.
 pub(super) struct HistoryQuery {
     pub session_key: Option<String>,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
+/// Describes one persisted session as exposed to the web UI.
 pub(super) struct SessionItem {
     pub session_key: String,
     pub label: String,
@@ -25,6 +31,7 @@ pub(super) struct SessionItem {
     pub last_message_preview: Option<String>,
 }
 
+/// Lists persisted sessions that can be opened from the web UI.
 pub(super) async fn list_sessions(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -62,6 +69,7 @@ pub(super) async fn list_sessions(
     Ok(Json(serde_json::json!({"ok": true, "sessions": items})))
 }
 
+/// Returns recent messages for a normalized web session.
 pub(super) async fn get_history(
     State(state): State<WebState>,
     Query(query): Query<HistoryQuery>,

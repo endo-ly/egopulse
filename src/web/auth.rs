@@ -1,3 +1,7 @@
+//! Web 層の認証・Origin 検証を扱うモジュール。
+//!
+//! HTTP Bearer 認証と WebSocket 接続時の安全性チェックを提供する。
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -10,6 +14,7 @@ use crate::config::Config;
 
 use super::WebState;
 
+/// Enforces bearer-token authentication for protected HTTP routes.
 pub(super) async fn require_http_auth(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -42,6 +47,7 @@ pub(super) async fn require_http_auth(
     next.run(request).await
 }
 
+/// Validates whether the WebSocket origin is allowed by configuration.
 pub(super) fn is_ws_origin_allowed(headers: &HeaderMap, config: &Config) -> bool {
     let Some(origin) = headers
         .get(header::ORIGIN)
@@ -71,6 +77,7 @@ pub(super) fn is_ws_origin_allowed(headers: &HeaderMap, config: &Config) -> bool
     OriginParts::parse_host(host).is_some_and(|expected| expected == origin_parts)
 }
 
+/// Validates a WebSocket auth token with constant-time comparison.
 pub(super) fn is_valid_ws_token(config: &Config, token: Option<&str>) -> bool {
     let Some(expected_token) = config.web_auth_token() else {
         return false;

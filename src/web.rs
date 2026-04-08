@@ -1,3 +1,7 @@
+//! Web UI サーバーと共有状態を提供するモジュール。
+//!
+//! HTTP API、静的アセット配信、SSE / WebSocket 用の実行状態を束ねる。
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,10 +32,14 @@ mod ws;
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
+/// Identifies messages initiated from the web surface.
 pub(crate) const WEB_ACTOR: &str = "web-user";
+/// Caps the number of events retained per streaming run.
 pub(crate) const RUN_HISTORY_LIMIT: usize = 512;
+/// Defines how long completed runs remain replayable.
 pub(crate) const RUN_TTL_SECONDS: u64 = 300;
 
+/// Adapts the local web surface to the shared channel interface.
 pub struct WebAdapter;
 
 #[async_trait]
@@ -58,6 +66,7 @@ impl ChannelAdapter for WebAdapter {
 }
 
 #[derive(Clone)]
+/// Holds shared state for the web server and its live transports.
 pub(crate) struct WebState {
     pub(crate) app_state: Arc<AppState>,
     pub(crate) config_path: Option<PathBuf>,
@@ -66,6 +75,7 @@ pub(crate) struct WebState {
 }
 
 #[derive(Clone, Debug)]
+/// Represents one replayable SSE event emitted for a run.
 pub(crate) struct RunEvent {
     pub(crate) id: u64,
     pub(crate) event: String,
@@ -73,6 +83,7 @@ pub(crate) struct RunEvent {
 }
 
 #[derive(Clone, Default)]
+/// Tracks active streaming runs and their replay buffers.
 pub(crate) struct RunHub {
     channels: Arc<Mutex<HashMap<String, RunChannel>>>,
 }
@@ -87,6 +98,7 @@ struct RunChannel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Describes why a run subscription lookup failed.
 pub(crate) enum RunLookupError {
     NotFound,
     Forbidden,
@@ -130,6 +142,7 @@ impl RunHub {
         let _ = channel.sender.send(evt);
     }
 
+    /// Subscribes to a run and returns any replayable events after `last_event_id`.
     pub(crate) async fn subscribe_with_replay(
         &self,
         run_id: &str,
@@ -183,6 +196,7 @@ impl RunHub {
     }
 }
 
+/// Normalizes a raw web session identifier into its storage key.
 pub(crate) fn web_session_key(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -195,10 +209,12 @@ pub(crate) fn web_session_key(raw: &str) -> String {
     stripped.to_string()
 }
 
+/// Formats the external chat identifier used for persisted web sessions.
 pub(crate) fn web_external_chat_id(session_key: &str) -> String {
     format!("web:{}", web_session_key(session_key))
 }
 
+/// Serves an embedded static asset response for the requested path.
 pub(crate) fn web_asset_response(path: &str) -> Response {
     let normalized = path.trim_start_matches('/');
     let candidates = [
@@ -260,6 +276,7 @@ fn asset_or_index(uri: &Uri) -> Response {
     }
 }
 
+/// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
 pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await

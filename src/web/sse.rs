@@ -1,10 +1,10 @@
-//! SSE (Server-Sent Events) utilities.
+//! SSE イベント表現を定義するモジュール。
 //!
-//! Based on Microclaw's implementation.
+//! agent loop の内部イベントと、クライアントへ公開できる整形済みイベントを分けて扱う。
 
 use serde::Serialize;
 
-/// Events emitted during agent processing.
+/// Represents internal events emitted while the agent processes a turn.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -30,7 +30,7 @@ pub enum AgentEvent {
     Error { message: String },
 }
 
-/// Sanitized events exposed to browser clients over SSE.
+/// Represents the sanitized event payloads exposed to browser clients.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublicAgentEvent {

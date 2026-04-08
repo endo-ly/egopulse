@@ -1,3 +1,7 @@
+//! Web 設定 API を扱うモジュール。
+//!
+//! ランタイム設定の参照と YAML への保存を HTTP エンドポイントとして公開する。
+
 use std::path::PathBuf;
 
 use axum::Json;
@@ -27,6 +31,7 @@ struct ConfigPayload {
 }
 
 #[derive(Debug, Deserialize)]
+/// Accepts mutable web-related config values from the browser client.
 pub(super) struct ConfigUpdateRequest {
     model: String,
     base_url: String,
@@ -37,6 +42,7 @@ pub(super) struct ConfigUpdateRequest {
     api_key: Option<String>,
 }
 
+/// Returns the persisted configuration visible to the web UI.
 pub(super) async fn api_get_config(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -50,6 +56,7 @@ pub(super) async fn api_get_config(
     })))
 }
 
+/// Persists a partial config update from the web UI.
 pub(super) async fn api_put_config(
     State(state): State<WebState>,
     Json(request): Json<ConfigUpdateRequest>,

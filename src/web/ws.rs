@@ -1,3 +1,7 @@
+//! WebSocket ゲートウェイを実装するモジュール。
+//!
+//! 接続ハンドシェイク、chat.send の受付、RunHub からのイベント転送を担う。
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -131,6 +135,7 @@ struct GatewayChatContent {
     text: String,
 }
 
+/// Upgrades an authenticated request into the web gateway WebSocket.
 pub(super) async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -194,6 +199,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     let connected = Arc::new(AtomicBool::new(false));
     let in_flight_chat_sends = Arc::new(AtomicUsize::new(0));
 
+    // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
         let Message::Text(text) = message else {
             continue;
@@ -394,6 +400,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                         };
 
                         let sequence = Arc::new(AtomicU64::new(1));
+                        // まず保持済みイベントを流し、その後に live イベントへ追従する。
                         for event in replay {
                             if forward_run_event(
                                 &out_tx_for_stream,
@@ -447,6 +454,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
         }
     }
 
+    // writer を閉じて送信タスクも終了させ、接続ライフサイクルをここで完結させる。
     drop(out_tx);
     let _ = writer.await;
 }
@@ -472,6 +480,7 @@ fn forward_run_event(
     sequence: &AtomicU64,
     event: RunEvent,
 ) -> bool {
+    // WebSocket では UI が必要とする chat イベントだけに射影して forward する。
     match event.event.as_str() {
         "delta" => {
             let payload =
