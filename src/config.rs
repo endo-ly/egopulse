@@ -501,7 +501,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        authorization_token, default_config_path, default_data_dir, default_workspace_dir, Config,
+        Config, authorization_token, default_config_path, default_data_dir, default_workspace_dir,
     };
     use crate::error::ConfigError;
 

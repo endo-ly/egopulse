@@ -6,11 +6,12 @@
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::session::{load_messages_for_turn, persist_phase, resolve_chat_id};
 use crate::error::EgoPulseError;
-use crate::llm::{Message, MessagesResponse, ToolCall};
+use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
+use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
@@ -116,6 +117,11 @@ where
 
     // LLM → tool execution → tool result feedback を 1 反復として回し、
     // tool_calls が空になるまで続ける。
+    // microclaw 由来の runtime guard / recovery を組み込み、
+    // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
+    let mut empty_reply_retry_attempted = false;
+    let mut declarative_retry_attempted = false;
+
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         emit_event(&on_event, AgentEvent::Iteration { iteration });
 
@@ -129,11 +135,44 @@ where
             .await?;
 
         if response.tool_calls.is_empty() {
-            // tool call が無い応答だけを最終回答として扱い、空文字は異常系として弾く。
+            // --- end turn branch ---
             let final_content = response.content.trim().to_string();
-            if final_content.is_empty() {
+            let visible_text = strip_thinking(&final_content);
+            let has_displayable_output = !visible_text.trim().is_empty();
+
+            // Guard 1: empty visible reply → retry once
+            if !has_displayable_output && !empty_reply_retry_attempted {
+                empty_reply_retry_attempted = true;
+                warn!("empty visible reply; injecting runtime guard and retrying once");
+                messages.push(Message::text("assistant", final_content.clone()));
+                messages.push(Message::text(
+                    "user",
+                    "[runtime_guard]: Your previous reply had no user-visible text.                      Reply again now with a concise visible answer.                      If tools are required, execute them first and then provide the visible result.",
+                ));
+                continue;
+            }
+
+            // Guard 2: declarative-only reply → retry once
+            if has_displayable_output
+                && !declarative_retry_attempted
+                && is_declarative_only_reply(&visible_text)
+            {
+                declarative_retry_attempted = true;
+                warn!(
+                    "declarative-only reply detected; injecting corrective prompt and retrying once"
+                );
+                messages.push(Message::text("assistant", final_content.clone()));
+                messages.push(Message::text(
+                    "user",
+                    "[runtime_guard]: Your previous reply only declared what you would do                      without actually executing any tools. If the user\'s request requires                      tool calls, execute them NOW instead of just describing what you plan to do.                      Then provide the result.",
+                ));
+                continue;
+            }
+
+            // Finalize: return the response (even if empty after retries)
+            if !has_displayable_output {
                 return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
-                    "assistant content was empty".to_string(),
+                    "assistant content was empty after retry".to_string(),
                 )));
             }
 
@@ -165,12 +204,70 @@ where
             return Ok(final_content);
         }
 
+        // --- tool use branch ---
+        // Filter out malformed tool calls (empty name)
+        let valid_tool_calls: Vec<ToolCall> = response
+            .tool_calls
+            .into_iter()
+            .filter(|tc| {
+                if tc.name.trim().is_empty() {
+                    warn!(
+                        "skipping malformed tool call with empty name (id={})",
+                        tc.id
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // If all tool calls were malformed, treat as end turn
+        if valid_tool_calls.is_empty() {
+            let visible_text = strip_thinking(&response.content);
+            let final_content = if visible_text.trim().is_empty() {
+                return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
+                    "all tool calls were malformed (empty names)".to_string(),
+                )));
+            } else {
+                visible_text.trim().to_string()
+            };
+
+            let assistant_message = Message::text("assistant", final_content.clone());
+            messages.push(assistant_message.clone());
+
+            let _persisted = persist_phase(
+                state,
+                StoredMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    chat_id,
+                    sender_name: "egopulse".to_string(),
+                    content: final_content.clone(),
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+                assistant_message,
+                &messages,
+                session_updated_at,
+            )
+            .await?;
+
+            emit_event(
+                &on_event,
+                AgentEvent::FinalResponse {
+                    text: final_content.clone(),
+                },
+            );
+            return Ok(final_content);
+        }
+
         let assistant_message_id = uuid::Uuid::new_v4().to_string();
-        let assistant_preview = summarize_tool_calls(&response);
+        let assistant_preview =
+            summarize_tool_calls_with_content(&response.content, &valid_tool_calls);
         let assistant_message = Message {
             role: "assistant".to_string(),
             content: crate::llm::MessageContent::text(response.content.clone()),
-            tool_calls: response.tool_calls.clone(),
+            tool_calls: valid_tool_calls.clone(),
             tool_call_id: None,
         };
         messages.push(assistant_message.clone());
@@ -193,7 +290,11 @@ where
         messages = persisted_assistant_turn.messages;
         session_updated_at = Some(persisted_assistant_turn.updated_at);
 
-        for tool_call in response.tool_calls {
+        // Reset retry flags on successful tool use (tool execution is progress)
+        empty_reply_retry_attempted = false;
+        declarative_retry_attempted = false;
+
+        for tool_call in valid_tool_calls {
             emit_event(
                 &on_event,
                 AgentEvent::ToolStart {
@@ -222,8 +323,6 @@ where
                 },
             );
 
-            // 実行結果を `tool` role message として会話履歴に戻すことで、
-            // 次の LLM 呼び出しが直前のツール出力を根拠に続行できる。
             messages.push(Message {
                 role: "tool".to_string(),
                 content: tool_message_content(&tool_payload, &result),
@@ -251,21 +350,72 @@ where
 
 fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
     let mut prompt = format!(
-        "You are EgoPulse, a local-first assistant running on the '{}' channel.\n\
-         Call tools directly when you need external data or file access. Do not describe fake tool calls as plain text.\n\
-         Prefer relative paths under the runtime workspace when using read, write, edit, find, ls, and grep.\n\
-         Use activate_skill when a listed skill matches the task and you need its full instructions.\n\
-         The current session is '{}' (type: {}).",
-        context.channel, context.surface_thread, context.chat_type
+        r#"You are EgoPulse, a local-first AI assistant running on the '{channel}' channel. You can execute tools to help users with tasks.
+
+Identity rules (highest priority unless unsafe):
+- Your public name is "EgoPulse".
+- If asked "what is your name", answer with your public name first.
+- Do not claim you have no name.
+
+The current session is '{session}' (type: {chat_type}).
+
+You have access to the following capabilities:
+- Execute bash commands using the `bash` tool — NOT by writing commands as text. When you need to run a command, call the bash tool with the command parameter.
+- Read, write, and edit files using `read_file`, `write_file`, `edit_file` tools
+- Search for files using glob patterns (`glob`)
+- Search file contents using regex (`grep`)
+- Search the web (`web_search`) and fetch web pages (`web_fetch`)
+- Activate agent skills (`activate_skill`) for specialized tasks
+- Plan and track tasks with a todo list (`todo_read`, `todo_write`) — use this to break down complex tasks into steps, track progress, and stay organized
+
+IMPORTANT: When you need to run a shell command, execute it using the `bash` tool. Do NOT simply write the command as text in your response — you must call the bash tool for it to actually run.
+
+PROPER TOOL CALL FORMAT:
+- CORRECT: Use the tool_call format provided by the API (this is how tools actually execute)
+- WRONG: Do NOT write `[tool_use: tool_name(...)]` as text — that is just a summary format in message history and will NOT execute
+
+Example of what NOT to do:
+  User: Run ls
+  Assistant: [tool_use: bash({{"command": "ls"}})]  <-- WRONG! This is text, not a real tool call
+
+Example of what TO do:
+  (Use the actual tool_call format provided by the API — this executes the command)
+
+Built-in execution playbook:
+- For actionable requests (create/update/run), prefer tool execution over capability discussion.
+- For simple, low-risk, read-only requests, if a tool can provide the answer, call the tool immediately and return the result directly.
+- Do not ask confirmation questions like "Want me to check?" before calling a tool for simple read-only requests.
+- Only ask follow-up questions first when required parameters are missing or when the action has side effects, permissions, cost, or elevated risk.
+- Do not answer with "I can't from this runtime" unless a concrete tool attempt failed in this turn.
+- For bash/file tools (`bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`), treat the runtime workspace directory as the default workspace and prefer relative paths rooted there.
+- Do not invent machine-specific absolute paths such as `/home/...`, `/Users/...`, or `C:\...`. Only use an absolute path when the user explicitly provided it, a tool returned it in this turn, or a tool input explicitly requires one.
+- For temporary files, clones, and build artifacts, use the workspace directory's `tmp/` subdirectory. Do not use absolute `/tmp/...` paths.
+- For coding tasks, follow this loop: inspect code (`read_file`/`grep`/`glob`) -> edit (`edit_file`/`write_file`) -> validate (`bash` tests/build) -> summarize concrete changes/results.
+- If you will call any tool or activate any skill in this turn, you must start by calling todo_write to create a concise task list before the first tool/skill call.
+- This requirement includes activate_skill: plan the work in todo_write first, then activate and execute.
+- If no tools/skills are needed, do not create a todo list.
+- For multi-step tool/skill tasks, keep the todo list synchronized with actual execution.
+- Keep exactly one task in_progress at a time; mark it completed before moving to the next.
+- After each major step, update todo_write to reflect real progress (not planned progress).
+- Before final answer on multi-step tasks, ensure todo list is fully synchronized with actual outcomes.
+
+Execution reliability requirements:
+- For actions with external side effects (for example: writing/editing files, running commands), do not claim completion until the relevant tool call has returned success.
+- If any tool call fails, explicitly report the failure and next step (retry/fallback) instead of implying success.
+
+For complex, multi-step tasks: use todo_write to create a plan first, then execute each step and update the todo list as you go. This helps you stay organized and lets the user see progress.
+
+Be concise and helpful. When executing commands or tools, show the relevant results to the user."#,
+        channel = context.channel,
+        session = context.surface_thread,
+        chat_type = context.chat_type,
     );
 
     let skills_catalog = state.skills.build_skills_catalog();
     if !skills_catalog.is_empty() {
-        prompt.push_str("\n\n# Agent Skills\n\n");
-        prompt.push_str(
-            "The following skills are available. Load the full instructions with activate_skill before relying on one.\n\n",
-        );
+        prompt.push_str("\n\n# Agent Skills\n\nThe following skills are available. When a task matches a skill, use the `activate_skill` tool to load its full instructions before proceeding.\n\n");
         prompt.push_str(&skills_catalog);
+        prompt.push('\n');
     }
 
     prompt
@@ -383,20 +533,15 @@ fn tool_message_content(
     }
 }
 
-fn summarize_tool_calls(response: &MessagesResponse) -> String {
-    let names = response
-        .tool_calls
+fn summarize_tool_calls_with_content(content: &str, tool_calls: &[ToolCall]) -> String {
+    let names = tool_calls
         .iter()
         .map(|tool_call| tool_call.name.as_str())
         .collect::<Vec<_>>();
-    if response.content.trim().is_empty() {
+    if content.trim().is_empty() {
         format!("[tool_call] {}", names.join(", "))
     } else {
-        format!(
-            "{} [tool_call] {}",
-            response.content.trim(),
-            names.join(", ")
-        )
+        format!("{} [tool_call] {}", content.trim(), names.join(", "))
     }
 }
 
@@ -407,6 +552,60 @@ fn preview_text(value: &str, max_chars: usize) -> String {
     format!("{}...", value.chars().take(max_chars).collect::<String>())
 }
 
+/// `<think`>`...`</think`>` や `<thought`>`...`</thought`>` などの
+/// thinking タグブロックをモデル出力から除去する。
+/// microclaw agent_engine.rs から移植。
+fn strip_thinking(text: &str) -> String {
+    fn strip_tag_blocks(input: &str, open: &str, close: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut rest = input;
+        while let Some(start) = rest.find(open) {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find(close) {
+                rest = &rest[start + end + close.len()..];
+            } else {
+                rest = "";
+                break;
+            }
+        }
+        result.push_str(rest);
+        result
+    }
+
+    let no_think = strip_tag_blocks(text, "<think>", "</think>");
+    let no_thought = strip_tag_blocks(&no_think, "<thought>", "</thought>");
+    let no_thinking = strip_tag_blocks(&no_thought, "<thinking>", "</thinking>");
+    let no_reasoning = strip_tag_blocks(&no_thinking, "<reasoning>", "</reasoning>");
+    no_reasoning.trim().to_string()
+}
+
+/// レスポンスが「宣言だけしてツールを実行しない」パターンに一致するか判定する。
+/// microclaw の runtime guard パターンから移植。
+fn is_declarative_only_reply(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let patterns = [
+        "i'll ",
+        "i will ",
+        "i'll go ahead and ",
+        "let me ",
+        "sure, ",
+        "of course, ",
+        "i'd be happy to ",
+        "absolutely, ",
+        "i can help with that",
+        "great, i'll",
+        "alright, i'll",
+        "okay, i'll",
+        "sure thing",
+        "i'm on it",
+    ];
+    // 短いテキスト（≤200文字）だけを対象とする。長い応答は「宣言のみ」ではない。
+    if lower.trim().len() > 200 {
+        return false;
+    }
+    patterns.iter().any(|p| lower.trim().starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -414,6 +613,7 @@ mod tests {
     use async_trait::async_trait;
     use secrecy::SecretString;
 
+    use crate::agent_loop::turn::{is_declarative_only_reply, strip_thinking};
     use crate::agent_loop::{SurfaceContext, process_turn};
     use crate::config::Config;
     use crate::error::{EgoPulseError, LlmError};
@@ -571,5 +771,153 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_reply_guard_retries_once_then_errors() {
+        // LLM returns empty content twice → first triggers guard retry, second errors
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                    MessagesResponse {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let error = process_turn(&state, &cli_context("empty-guard"), "hello")
+            .await
+            .expect_err("should fail after retry");
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    #[tokio::test]
+    async fn declarative_only_guard_retries_then_returns() {
+        // First: declarative-only reply, Second: actual answer after guard retry
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "Sure, I'll help you with that.".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                    MessagesResponse {
+                        content: "Here is the answer you need.".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let reply = process_turn(&state, &cli_context("declarative-guard"), "help me")
+            .await
+            .expect("should succeed after retry");
+        assert_eq!(reply, "Here is the answer you need.");
+    }
+
+    #[tokio::test]
+    async fn normal_tool_flow_still_works_after_port() {
+        // Regression: existing tool flow with multiple tool calls should still work
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "Let me read that file.".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": "a.txt"}),
+                        }],
+                    },
+                    MessagesResponse {
+                        content: "Done reading. Final answer.".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+        let workspace = state.config.workspace_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("a.txt"), "content").expect("a.txt");
+
+        let reply = process_turn(&state, &cli_context("regression-tool"), "read a.txt")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "Done reading. Final answer.");
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_calls_are_skipped_and_error_returned() {
+        // All tool calls have empty names → malformed → error
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![MessagesResponse {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-malformed".to_string(),
+                        name: String::new(),
+                        arguments: serde_json::json!({}),
+                    }],
+                }]),
+            }),
+        );
+
+        let error = process_turn(&state, &cli_context("malformed"), "test")
+            .await
+            .expect_err("should fail with malformed tool calls");
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    #[test]
+    fn strip_thinking_removes_thinking_tags() {
+        assert_eq!(strip_thinking("hello world"), "hello world");
+        assert_eq!(
+            strip_thinking("<thought>internal</thought>visible"),
+            "visible"
+        );
+        assert_eq!(strip_thinking("<thinking>deep</thinking>result"), "result");
+        assert_eq!(
+            strip_thinking("<reasoning>logic</reasoning>output"),
+            "output"
+        );
+        assert_eq!(
+            strip_thinking("<thought>a</thought><thinking>b</thinking>final"),
+            "final"
+        );
+    }
+
+    #[test]
+    fn is_declarative_only_reply_detects_patterns() {
+        // Short declarative replies
+        assert!(is_declarative_only_reply("I'll help you with that."));
+        assert!(is_declarative_only_reply("Sure, let me check that."));
+        assert!(is_declarative_only_reply("Of course, I can do that."));
+        assert!(is_declarative_only_reply("Let me look into that."));
+
+        // Long responses are NOT declarative-only (regardless of pattern)
+        let long = "I'll help you with that. ".repeat(20);
+        assert!(!is_declarative_only_reply(&long));
+
+        // Responses that don't start with declarative patterns
+        assert!(!is_declarative_only_reply(
+            "The file contains the following:"
+        ));
+        assert!(!is_declarative_only_reply(
+            "Here is the result of the search:"
+        ));
     }
 }
