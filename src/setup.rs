@@ -1,3 +1,8 @@
+//! 対話型セットアップウィザード。
+//!
+//! Ratatui ベースのローカル UI で設定値を収集し、既存 YAML を必要最小限だけ保ちながら
+//! `egopulse.config.yaml` を生成・更新する。
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self};
@@ -220,7 +225,7 @@ impl SetupApp {
                 }
             }
 
-            // Extract channels.web.auth_token
+            // Web の auth_token は既存値を再利用し、ブラウザ側の再ログインを避ける。
             if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
                 if let Some(ch_map) = channels.as_mapping() {
                     if let Some(web) = ch_map.get(serde_yml::Value::String("web".into())) {
@@ -363,6 +368,7 @@ impl SetupApp {
             .map(|f| f.value.trim())
             .unwrap_or("");
 
+        // ローカル推論サーバーだけは API キー未設定を許可する。
         if !base_url_allows_empty_api_key(base_url) && api_key.is_empty() {
             return Err(
                 "API key is required for non-local endpoints. Use a local URL (localhost/127.0.0.1) to skip.".into(),
@@ -383,6 +389,7 @@ impl SetupApp {
                 .find(|f| f.key == "DISCORD_BOT_TOKEN")
                 .map(|f| f.value.trim())
                 .unwrap_or("");
+            // 有効化したチャネルだけ必須入力にし、未使用チャネルの秘密情報は求めない。
             if discord_token.is_empty() {
                 return Err("Discord bot token is required when Discord is enabled".into());
             }
@@ -402,6 +409,7 @@ impl SetupApp {
                 .find(|f| f.key == "TELEGRAM_BOT_TOKEN")
                 .map(|f| f.value.trim())
                 .unwrap_or("");
+            // 有効化したチャネルだけ必須入力にし、未使用チャネルの秘密情報は求めない。
             if telegram_token.is_empty() {
                 return Err("Telegram bot token is required when Telegram is enabled".into());
             }
@@ -445,6 +453,7 @@ impl SetupApp {
             .and_then(|m| m.get(serde_yml::Value::String("auth_token".into())))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string());
+        // 既存トークンがあれば維持し、初回作成時のみ新規生成する。
         let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
         let discord_enabled = self
@@ -496,6 +505,7 @@ impl SetupApp {
             self.backup_path = Some(backup_config(config_path)?);
         }
 
+        // 未知の top-level キーは保持しつつ、ウィザード管理対象だけを更新する。
         let mut yaml_value = self
             .original_yaml
             .clone()
@@ -589,7 +599,7 @@ impl SetupApp {
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
         fs::write(config_path, &yaml).map_err(|e| format!("Failed to write config: {e}"))?;
 
-        // Build completion summary
+        // 保存後の確認を端末上で完結できるよう、反映内容を要約して残す。
         self.completion_summary = vec![
             format!("Config saved to: {}", config_path.display()),
             format!("Model: {model}"),
@@ -671,7 +681,7 @@ fn backup_config(path: &Path) -> Result<String, String> {
 
     fs::copy(path, &backup_path).map_err(|e| format!("Failed to backup config: {e}"))?;
 
-    // Clean old backups
+    // バックアップを無制限に増やさないため、古い世代から間引く。
     cleanup_old_backups(&backup_dir, file_name)?;
 
     Ok(backup_path.to_string_lossy().to_string())
@@ -755,7 +765,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
             .wrap(Wrap { trim: true });
         frame.render_widget(footer, chunks[2]);
 
-        // Cursor
+        // 編集中だけカーソルを明示し、非編集時のノイズを避ける。
         if app.editing && !app.completed {
             if let Some(field) = app.current_field() {
                 let visible = app.visible_fields();
@@ -921,6 +931,7 @@ fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area:
     frame.render_widget(body, area);
 }
 
+/// Runs the interactive setup wizard and writes the resulting configuration file.
 pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), String> {
     let mut app = SetupApp::new(config_path);
     let terminal = init_terminal()?;
@@ -964,6 +975,7 @@ async fn run_inner(
         draw(terminal, app);
 
         if app.completed {
+            // 完了後はサマリーを読めるよう即終了せず、任意キーで閉じる。
             if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                     if key.kind == KeyEventKind::Press {
@@ -988,6 +1000,7 @@ async fn run_inner(
                     KeyCode::Esc | KeyCode::Enter => {
                         app.editing = false;
                         if let Some(field) = app.current_field() {
+                            // トグル変更は編集終了時にだけ反映し、入力中の項目飛びを防ぐ。
                             if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
                                 SetupApp::update_field_visibility(&mut app.fields);
                             }
@@ -1037,6 +1050,7 @@ async fn run_inner(
                     KeyCode::Enter => {
                         if app.current_field().is_some() {
                             app.editing = true;
+                            // 画面遷移を増やさず、その場でインライン編集に入る。
                             app.status = "Editing... (Enter/Esc to finish)".into();
                         }
                     }

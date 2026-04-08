@@ -1,3 +1,8 @@
+//! EgoPulse CLI エントリーポイント。
+//!
+//! `run` で有効チャネルを一括起動し、`ask` と `chat` でローカル対話を実行する。
+//! `setup` は初期設定ウィザード、`gateway` は systemd 管理、`update` は自己更新を担当する。
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -46,6 +51,7 @@ enum Command {
     Update,
 }
 
+/// Parses the CLI, runs the requested command, and exits with status 1 on failure.
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -57,6 +63,7 @@ async fn main() {
 async fn run() -> Result<(), EgoPulseError> {
     let cli = Cli::parse();
 
+    // setup は設定ファイル未作成でも実行できるよう、通常の設定解決フローに入る前に分岐する。
     if matches!(cli.command, Some(Command::Setup)) {
         return setup::run_setup_wizard(cli.config.clone())
             .await
@@ -90,6 +97,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         None => match Config::resolve_config_path() {
             Ok(path) => path,
             Err(ConfigError::AutoConfigNotFound { .. }) => {
+                // 引数なし起動だけは初回体験を優先し、エラーではなく setup への案内を返す。
                 if cli.command.is_none() {
                     eprintln!("No configuration found. Run 'egopulse setup' to create one.");
                     return Ok(());

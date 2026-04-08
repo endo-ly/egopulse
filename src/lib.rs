@@ -1,3 +1,8 @@
+//! EgoPulse クレート。
+//!
+//! 永続セッションを共有する AI エージェントランタイムとして、TUI / Web / Discord / Telegram
+//! の各チャネルと設定・ストレージ・エージェント実行基盤をまとめて提供する。
+
 pub mod agent_loop;
 pub mod assets;
 pub mod channel_adapter;

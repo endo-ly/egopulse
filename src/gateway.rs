@@ -1,3 +1,8 @@
+//! systemd ゲートウェイ管理と自己更新処理。
+//!
+//! `egopulse gateway` サブコマンド向けに unit file の生成・systemctl 実行・
+//! 最新リリースへの更新処理をまとめる。
+
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -8,6 +13,7 @@ use clap::Subcommand;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNIT_PATH: &str = "/etc/systemd/system/egopulse.service";
 
+/// Supported systemd service management actions for `egopulse gateway`.
 #[derive(Debug, Subcommand)]
 pub enum GatewayAction {
     /// Install and enable the systemd service
@@ -31,6 +37,7 @@ fn resolve_config_for_service(cli_config: Option<&PathBuf>) -> Option<PathBuf> {
     Config::resolve_config_path().ok().flatten()
 }
 
+/// Resolves a CLI config path to an absolute filesystem path.
 pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -137,6 +144,7 @@ fn restart_service() -> Result<(), EgoPulseError> {
     }
 }
 
+/// Executes the requested gateway action for the EgoPulse systemd service.
 pub async fn run_gateway(
     cli_config: Option<&PathBuf>,
     action: Option<GatewayAction>,
@@ -262,6 +270,7 @@ ACTIONS:
     }
 }
 
+/// Updates the installed EgoPulse binary from the latest GitHub release.
 pub async fn run_update() -> Result<(), EgoPulseError> {
     println!("Current version: {VERSION}");
     println!("Updating EgoPulse from latest release...");
