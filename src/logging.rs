@@ -1,7 +1,12 @@
+//! ロギング初期化。
+//!
+//! tracing-subscriber を用いたグローバルロガーのセットアップを提供する。
+
 use tracing_subscriber::EnvFilter;
 
 use crate::error::LoggingError;
 
+/// Initialize the global tracing subscriber with the given log level.
 pub fn init_logging(level: &str) -> Result<(), LoggingError> {
     let filter = EnvFilter::try_new(level)
         .or_else(|_| EnvFilter::try_new(level.to_ascii_lowercase()))

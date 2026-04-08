@@ -1,7 +1,13 @@
+//! アプリケーション全体で使用するエラー型。
+//!
+//! thiserror を用いて各ドメイン (Config / LLM / Storage / Channel / TUI / Logging) ごとに
+//! エラーエニュームを定義し、`EgoPulseError` で統一的に扱う。
+
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Top-level error type aggregating all domain-specific errors.
 #[derive(Debug, Error)]
 pub enum EgoPulseError {
     #[error(transparent)]
@@ -22,6 +28,7 @@ pub enum EgoPulseError {
     Internal(String),
 }
 
+/// Configuration loading and validation errors.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("config_not_found: {path}")]
@@ -54,6 +61,7 @@ pub enum ConfigError {
     NoActiveChannels,
 }
 
+/// TUI (Terminal User Interface) rendering and event errors.
 #[derive(Debug, Error)]
 pub enum TuiError {
     #[error("tui_init_failed: {0}")]
@@ -64,6 +72,7 @@ pub enum TuiError {
     EventFailed(String),
 }
 
+/// LLM provider request and response errors.
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("llm_init_failed: {0}")]
@@ -81,12 +90,14 @@ pub enum LlmError {
     RequestConstructionFailed(String),
 }
 
+/// Logging subsystem initialization errors.
 #[derive(Debug, Error)]
 pub enum LoggingError {
     #[error("logging_init_failed: {0}")]
     InitFailed(String),
 }
 
+/// SQLite storage and session persistence errors.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("storage_init_failed: {0}")]
@@ -107,6 +118,7 @@ pub enum StorageError {
     NotFound(String),
 }
 
+/// Channel (Web / Discord / Telegram) operational errors.
 #[derive(Debug, Error)]
 pub enum ChannelError {
     #[error("channel_not_found: {0}")]

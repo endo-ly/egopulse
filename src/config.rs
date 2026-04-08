@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::error::ConfigError;
 
+/// Per-channel configuration (web, discord, telegram).
 #[derive(Clone, Deserialize, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
@@ -68,6 +69,7 @@ struct FileConfig {
     channels: Option<HashMap<String, ChannelConfig>>,
 }
 
+/// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
     pub model: String,
@@ -99,14 +101,17 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    /// Load configuration, requiring an API key for remote endpoints.
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         build_config(config_path, false)
     }
 
+    /// Load configuration, allowing a missing API key (used by `run` subcommand).
     pub fn load_allow_missing_api_key(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         build_config(config_path, true)
     }
 
+    /// Returns `true` if the web channel is enabled.
     pub fn web_enabled(&self) -> bool {
         self.channels
             .get("web")
@@ -114,6 +119,7 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Returns the web channel host, defaulting to `127.0.0.1`.
     pub fn web_host(&self) -> String {
         self.channels
             .get("web")
@@ -121,6 +127,7 @@ impl Config {
             .unwrap_or_else(|| default_web_host().to_string())
     }
 
+    /// Returns the web channel port, defaulting to `10961`.
     pub fn web_port(&self) -> u16 {
         self.channels
             .get("web")
@@ -128,6 +135,7 @@ impl Config {
             .unwrap_or_else(default_web_port)
     }
 
+    /// Returns the web auth token if configured and non-empty.
     pub fn web_auth_token(&self) -> Option<&str> {
         self.channels
             .get("web")
@@ -136,6 +144,7 @@ impl Config {
             .filter(|token| !token.is_empty())
     }
 
+    /// Returns the list of allowed WebSocket origins for the web channel.
     pub fn web_allowed_origins(&self) -> Vec<String> {
         self.channels
             .get("web")
@@ -146,6 +155,7 @@ impl Config {
             .collect()
     }
 
+    /// Returns `true` if the named channel is enabled.
     pub fn channel_enabled(&self, channel: &str) -> bool {
         let needle = channel.trim().to_ascii_lowercase();
         self.channels
@@ -154,6 +164,7 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Locate the config file, or return `Ok(None)` when env vars alone are sufficient.
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
         let candidate = default_config_path();
         if candidate.exists() {
@@ -200,29 +211,35 @@ impl Config {
             .and_then(|c| c.bot_username.clone())
     }
 
+    /// Directory containing skill definitions.
     pub fn skills_dir(&self) -> PathBuf {
         default_workspace_dir().join("skills")
     }
 
+    /// Workspace directory for agent file operations.
     pub fn workspace_dir(&self) -> PathBuf {
         default_workspace_dir()
     }
 }
 
+/// Default config file path: `~/.egopulse/egopulse.config.yaml`.
 pub fn default_config_path() -> PathBuf {
     default_state_root().join("egopulse.config.yaml")
 }
 
+/// Default state root directory: `~/.egopulse`.
 pub fn default_state_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| panic!("failed to resolve OS home directory for EgoPulse state root"))
         .join(".egopulse")
 }
 
+/// Default data directory: `~/.egopulse/data`.
 pub fn default_data_dir() -> PathBuf {
     default_state_root().join("data")
 }
 
+/// Default workspace directory: `~/.egopulse/workspace`.
 pub fn default_workspace_dir() -> PathBuf {
     default_state_root().join("workspace")
 }
@@ -399,6 +416,7 @@ fn env_vars_sufficient_for_runtime() -> bool {
         && (env_var("EGOPULSE_API_KEY").is_some() || base_url_allows_empty_api_key(&base_url))
 }
 
+/// Returns `true` if the base URL points to a local address that does not require an API key.
 pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
     is_local_url(base_url)
 }
@@ -462,12 +480,18 @@ fn is_local_url(value: &str) -> bool {
     )
 }
 
+/// Extract the API key from the config as a plain string (for LLM Authorization header).
 pub fn authorization_token(config: &Config) -> Option<&str> {
     config.api_key.as_ref().map(ExposeSecret::expose_secret)
 }
 
 #[cfg(test)]
 mod tests {
+    //! アプリケーション設定の読み込みと検証。
+    //!
+    //! YAML 設定ファイルと環境変数をマージして `Config` を構築する。
+    //! 環境変数がファイル値より優先される。ローカル LLM では API キーを省略可能。
+
     use std::collections::HashMap;
     use std::io::Write;
     use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -477,7 +501,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Config, authorization_token, default_config_path, default_data_dir, default_workspace_dir,
+        authorization_token, default_config_path, default_data_dir, default_workspace_dir, Config,
     };
     use crate::error::ConfigError;
 

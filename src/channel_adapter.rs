@@ -1,4 +1,10 @@
+//! チャネルアダプターの登録とルーティング。
+//!
+//! 各チャネル (Web / Discord / Telegram) が実装する `ChannelAdapter` トレイトと、
+//! データベース上の chat_type 文字列から適切なアダプターへ解決する `ChannelRegistry` を提供する。
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Conversation type a channel can represent.
 pub enum ConversationKind {
     Private,
     Group,
@@ -10,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+/// Trait that each channel (Web, Discord, Telegram) implements for outbound message delivery.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {
     fn name(&self) -> &str;
@@ -26,6 +33,7 @@ pub trait ChannelAdapter: Send + Sync {
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
 }
 
+/// Registry mapping database chat types to their channel adapters.
 #[derive(Default)]
 pub struct ChannelRegistry {
     adapters: HashMap<String, Arc<dyn ChannelAdapter>>,
@@ -34,10 +42,12 @@ pub struct ChannelRegistry {
 }
 
 impl ChannelRegistry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register a channel adapter and index all its chat type routes.
     pub fn register(&mut self, adapter: Arc<dyn ChannelAdapter>) {
         let name = adapter.name().to_string();
         for (chat_type, kind) in adapter.chat_type_routes() {
@@ -49,10 +59,12 @@ impl ChannelRegistry {
         self.adapters.insert(name, adapter);
     }
 
+    /// Look up an adapter by its channel name.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ChannelAdapter>> {
         self.adapters.get(name)
     }
 
+    /// Resolve a database chat type to its adapter and conversation kind.
     pub fn resolve(
         &self,
         db_chat_type: &str,
@@ -63,12 +75,14 @@ impl ChannelRegistry {
         Some((adapter, *kind))
     }
 
+    /// Resolve a database chat type to a channel name and conversation kind (no adapter lookup).
     pub fn resolve_routing(&self, db_chat_type: &str) -> Option<(&str, ConversationKind)> {
         let channel_name = self.type_to_channel.get(db_chat_type)?;
         let kind = self.type_to_conversation.get(db_chat_type)?;
         Some((channel_name.as_str(), *kind))
     }
 
+    /// Returns `true` if at least one adapter has been registered.
     pub fn has_any(&self) -> bool {
         !self.adapters.is_empty()
     }

@@ -1,3 +1,8 @@
+//! LLM プロバイダークライアント。
+//!
+//! OpenAI 互換 Chat Completions API および Responses API へのリクエスト構築・送信・
+//! レスポンス解析を行う。ストリーミング (SSE) とツールコールに対応する。
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -7,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{Config, authorization_token};
 use crate::error::LlmError;
 
+/// A single tool call requested by the LLM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
@@ -14,6 +20,7 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Tool definition passed to the LLM for function calling.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -21,6 +28,7 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// Chat message in a conversation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
@@ -31,6 +39,7 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+/// Message content: either plain text or multimodal parts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -38,6 +47,7 @@ pub enum MessageContent {
     Parts(Vec<MessageContentPart>),
 }
 
+/// A single part of a multimodal message.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum MessageContentPart {
@@ -58,18 +68,22 @@ impl Default for MessageContent {
 }
 
 impl MessageContent {
+    /// Wrap plain text into `MessageContent::Text`.
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
     }
 
+    /// Wrap multimodal parts into `MessageContent::Parts`.
     pub fn parts(parts: Vec<MessageContentPart>) -> Self {
         Self::Parts(parts)
     }
 
+    /// Returns `true` if the content includes at least one image part.
     pub fn is_multimodal(&self) -> bool {
         matches!(self, Self::Parts(parts) if parts.iter().any(|part| matches!(part, MessageContentPart::InputImage { .. })))
     }
 
+    /// Extract all text, discarding images (lossy conversion).
     pub fn as_text_lossy(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
@@ -84,12 +98,14 @@ impl MessageContent {
         }
     }
 
+    /// Returns `true` if there is no textual content after trimming.
     pub fn is_empty_textual(&self) -> bool {
         self.as_text_lossy().trim().is_empty()
     }
 }
 
 impl Message {
+    /// Create a plain-text message with the given role.
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
@@ -100,12 +116,14 @@ impl Message {
     }
 }
 
+/// Parsed response from the LLM containing text and/or tool calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessagesResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Trait for LLM providers supporting non-streaming and streaming message sending.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn send_message(
@@ -132,10 +150,12 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// Create the default LLM provider based on the current configuration.
 pub fn create_provider(config: &Config) -> Result<Box<dyn LlmProvider>, LlmError> {
     Ok(Box::new(OpenAiProvider::new(config)?))
 }
 
+/// OpenAI-compatible LLM provider using Chat Completions and Responses APIs.
 pub struct OpenAiProvider {
     http: reqwest::Client,
     api_key: Option<String>,
@@ -144,6 +164,7 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Build a new provider from the given configuration.
     pub fn new(config: &Config) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
