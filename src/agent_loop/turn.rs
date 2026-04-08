@@ -1,3 +1,8 @@
+//! エージェントの 1 ターン処理を実行するモジュール。
+//!
+//! セッション復元、LLM 応答、ツール呼び出し、イベント通知、永続化を
+//! 1 本の turn loop としてまとめて扱う。
+
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::session::{load_messages_for_turn, persist_phase, resolve_chat_id};
 use crate::error::EgoPulseError;
@@ -10,6 +15,7 @@ use crate::web::sse::AgentEvent;
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 
+/// Sends a one-shot prompt within a named persistent session.
 pub async fn ask_in_session(
     config: crate::config::Config,
     session: &str,
@@ -29,6 +35,7 @@ pub async fn ask_in_session(
     }
 }
 
+/// Processes a turn and aborts cleanly when Ctrl-C is received.
 pub async fn send_turn(
     state: &AppState,
     context: &SurfaceContext,
@@ -40,6 +47,7 @@ pub async fn send_turn(
     }
 }
 
+/// Processes one user turn against the persisted session state.
 pub async fn process_turn(
     state: &AppState,
     context: &SurfaceContext,
@@ -48,6 +56,7 @@ pub async fn process_turn(
     process_turn_inner(state, context, user_input, Option::<fn(AgentEvent)>::None).await
 }
 
+/// Processes one user turn and emits lifecycle events for streaming consumers.
 pub async fn process_turn_with_events<F>(
     state: &AppState,
     context: &SurfaceContext,
@@ -105,6 +114,8 @@ where
     messages = persisted_user_turn.messages;
     session_updated_at = Some(persisted_user_turn.updated_at);
 
+    // LLM → tool execution → tool result feedback を 1 反復として回し、
+    // tool_calls が空になるまで続ける。
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         emit_event(&on_event, AgentEvent::Iteration { iteration });
 
@@ -118,6 +129,7 @@ where
             .await?;
 
         if response.tool_calls.is_empty() {
+            // tool call が無い応答だけを最終回答として扱い、空文字は異常系として弾く。
             let final_content = response.content.trim().to_string();
             if final_content.is_empty() {
                 return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
@@ -210,6 +222,8 @@ where
                 },
             );
 
+            // 実行結果を `tool` role message として会話履歴に戻すことで、
+            // 次の LLM 呼び出しが直前のツール出力を根拠に続行できる。
             messages.push(Message {
                 role: "tool".to_string(),
                 content: tool_message_content(&tool_payload, &result),
@@ -228,6 +242,8 @@ fn emit_event<F>(on_event: &Option<F>, event: AgentEvent)
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
+    // TUI/Web などイベント購読者がいる場合だけ副作用を流し、
+    // 通常 CLI ではロジック本体を分岐させない。
     if let Some(on_event) = on_event {
         on_event(event);
     }

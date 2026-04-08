@@ -1,3 +1,7 @@
+//! EgoPulse ランタイム全体の依存を組み立てるモジュール。
+//!
+//! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +20,7 @@ use crate::storage::Database;
 use crate::tools::ToolRegistry;
 use crate::web::WebAdapter;
 
+/// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
@@ -42,10 +47,12 @@ impl Clone for AppState {
     }
 }
 
+/// Builds the application state without recording a config file path.
 pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
     build_app_state_with_path(config, None)
 }
 
+/// Builds the application state and keeps the config path for later saves.
 pub fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
@@ -89,6 +96,7 @@ pub fn build_app_state_with_path(
     })
 }
 
+/// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
     let llm = create_provider(&config)?;
     let messages = vec![Message::text("user", prompt)];
@@ -99,6 +107,7 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
     }
 }
 
+/// Starts the local TUI channel with a fully built application state.
 pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
     let state = build_app_state(config)?;
     channels::tui::run(state).await
@@ -111,6 +120,7 @@ pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
 /// 設定ベースでチャネルを構築 → spawn → ctrl_c 待機。
 ///
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
+/// Starts all enabled channels and supervises them until shutdown or failure.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     let mut has_active_channels = false;
     let mut handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();

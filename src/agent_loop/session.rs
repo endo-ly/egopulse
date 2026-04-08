@@ -1,3 +1,8 @@
+//! セッション履歴の解決・復元・永続化を担うモジュール。
+//!
+//! SQLite 上の chat/session snapshot と LLM 用の `Message` 表現を相互変換し、
+//! 1 ターンごとの楽観的同時実行制御つき保存を提供する。
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -12,12 +17,14 @@ use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocki
 const MAX_HISTORY_MESSAGES: usize = 50;
 
 #[derive(Debug, Clone)]
+/// Holds the messages loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
     pub(crate) messages: Vec<Message>,
     pub(crate) session_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
+/// Represents the updated snapshot returned after persisting one phase.
 pub(crate) struct PersistedTurn {
     pub(crate) updated_at: String,
     pub(crate) messages: Vec<Message>,
@@ -54,6 +61,7 @@ enum PersistedMessageContentPart {
     },
 }
 
+/// Resolves or creates the internal chat ID for a conversation surface.
 pub(crate) async fn resolve_chat_id(
     state: &AppState,
     context: &SurfaceContext,
@@ -71,12 +79,14 @@ pub(crate) async fn resolve_chat_id(
     .map_err(EgoPulseError::from)
 }
 
+/// Lists all persisted sessions available in the local database.
 pub async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary>, EgoPulseError> {
     call_blocking(state.db.clone(), move |db| db.list_sessions())
         .await
         .map_err(EgoPulseError::from)
 }
 
+/// Loads a session history and converts it into plain LLM messages.
 pub async fn load_session_messages(
     state: &AppState,
     context: &SurfaceContext,
@@ -98,6 +108,7 @@ pub async fn load_session_messages(
         .collect())
 }
 
+/// Loads the trimmed session snapshot used as input for the next agent turn.
 pub(crate) async fn load_messages_for_turn(
     state: &AppState,
     chat_id: i64,
@@ -110,6 +121,7 @@ pub(crate) async fn load_messages_for_turn(
     snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
 }
 
+/// Persists one turn phase with optimistic concurrency and a single conflict retry.
 pub(crate) async fn persist_phase(
     state: &AppState,
     message: StoredMessage,
@@ -145,6 +157,8 @@ pub(crate) async fn persist_phase(
                 });
             }
             Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
+                // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
+                // 今回の phase だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
                 let LoadedSession {
                     messages,
                     session_updated_at,
