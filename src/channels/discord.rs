@@ -35,19 +35,19 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
 
-/// Discord チャネルアダプター。
-///
-/// アウトバウンドメッセージ送信用。REST API 経由で Discord にメッセージを送信する。
+/// Sends outbound messages to Discord via the REST API.
 pub struct DiscordAdapter {
     token: String,
     http_client: reqwest::Client,
 }
 
 impl DiscordAdapter {
+    /// Creates a Discord adapter with the default HTTP client.
     pub fn new(token: String) -> Self {
         Self::with_http_client(token, reqwest::Client::new())
     }
 
+    /// Creates a Discord adapter with a caller-provided HTTP client.
     pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
         Self { token, http_client }
     }
@@ -69,6 +69,7 @@ impl ChannelAdapter for DiscordAdapter {
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
         for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
+            // メンション展開を無効化し、LLM 出力が意図せず通知を飛ばすのを防ぐ。
             let body = json!({
                 "content": chunk,
                 "allowed_mentions": { "parse": [] },
@@ -135,7 +136,7 @@ impl EventHandler for Handler {
         let text = msg.content.clone();
         let external_channel_id = msg.channel_id.get();
 
-        // 許可チャンネルチェック (設定が空なら全許可)
+        // allowed_channels は guild 向け制御だけに使い、DM は個人チャネルとして常に通す。
         let allowed_channels = self
             .app_state
             .config
@@ -150,13 +151,13 @@ impl EventHandler for Handler {
             return;
         }
 
-        // メンション検知 (guild の場合のみ)
+        // guild では bot への明示メンション時のみ応答し、雑談チャンネルへの常時反応を避ける。
         let should_respond = if msg.guild_id.is_some() {
             let cache = &ctx.cache;
             let bot_id = cache.current_user().id;
             msg.mentions.iter().any(|u| u.id == bot_id)
         } else {
-            // DM は常に応答
+            // DM は bot 宛て会話しか流れてこないため常時応答でよい。
             true
         };
 
@@ -235,10 +236,7 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
 }
 
-/// Discord bot を起動。
-///
-/// Gateway に接続し、メッセージイベントの受信を開始する。
-/// microclaw `src/channels/discord.rs::start_discord_bot` と同じパターン。
+/// Starts the Discord bot and supervises its gateway lifecycle.
 pub async fn start_discord_bot(
     state: Arc<AppState>,
     token: String,

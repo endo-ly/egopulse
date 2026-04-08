@@ -1,3 +1,8 @@
+//! ローカル TUI チャネル。
+//!
+//! Ratatui ベースのセッションブラウザとチャット画面を提供し、保存済み会話の切り替えと
+//! ローカル対話を 1 つの端末 UI で扱う。
+
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -22,6 +27,7 @@ use crate::error::{EgoPulseError, TuiError};
 use crate::runtime::AppState;
 use crate::storage::SessionSummary;
 
+/// Owns terminal setup and teardown for the TUI lifecycle.
 struct TuiSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -58,6 +64,7 @@ enum View {
     Chat(Box<ChatState>),
 }
 
+/// Holds chat-specific UI state for one opened session.
 struct ChatState {
     context: SurfaceContext,
     input: String,
@@ -82,6 +89,7 @@ struct PendingSend {
     handle: JoinHandle<Result<String, EgoPulseError>>,
 }
 
+/// Owns browser and chat state for the TUI application.
 struct TuiApp {
     state: AppState,
     sessions: Vec<SessionSummary>,
@@ -223,6 +231,7 @@ impl TuiApp {
     }
 }
 
+/// Starts the Ratatui application for browsing and chatting with sessions.
 pub async fn run(state: AppState) -> Result<(), EgoPulseError> {
     let sessions = agent_loop::list_sessions(&state).await?;
     let mut app = TuiApp::new(state, sessions);
@@ -239,6 +248,7 @@ async fn run_loop(
     app: &mut TuiApp,
 ) -> Result<(), EgoPulseError> {
     loop {
+        // 描画前に完了済みタスクを取り込み、UI を別スレッド同期なしで更新する。
         poll_pending_send(app).await;
         terminal
             .draw(|frame| draw(frame, app))
@@ -329,6 +339,7 @@ async fn run_loop(
                         if chat.history_index.is_some() {
                             handle_down_arrow(chat);
                         } else {
+                            // 入力履歴の走査中でなければ、会話ログのスクロールとして扱う。
                             chat.conversation_scroll = chat.conversation_scroll.saturating_sub(1);
                         }
                     }
@@ -372,6 +383,7 @@ async fn run_loop(
                     }
                     PendingAction::GoBrowser => {
                         app.refresh_sessions().await?;
+                        // ブラウザ復帰時に再読込し、直前の送受信を一覧へ即反映する。
                         app.view = View::Browser;
                         app.status = app.browser_status();
                     }
@@ -398,6 +410,7 @@ fn start_send(app: &mut TuiApp, prompt: String) {
     chat.status = "Sending...".to_string();
     chat.conversation_scroll = 0;
     let send_prompt = prompt.clone();
+    // 送信はバックグラウンド task に逃がし、描画ループを止めない。
     let handle =
         tokio::spawn(async move { agent_loop::send_turn(&state, &context, &send_prompt).await });
     chat.pending_send = Some(PendingSend { prompt, handle });
@@ -423,6 +436,7 @@ async fn poll_pending_send(app: &mut TuiApp) {
                 chat.status = "Message sent".to_string();
                 chat.conversation_scroll = 0;
             }
+            // 一覧のプレビュー更新は送信成功後にだけ行い、未確定入力を履歴へ混ぜない。
             if let Err(error) = app.refresh_sessions().await
                 && let View::Chat(chat) = &mut app.view
             {
@@ -437,9 +451,11 @@ async fn poll_pending_send(app: &mut TuiApp) {
                     .last()
                     .is_some_and(|message| message.role == "user" && message.content == prompt)
                 {
+                    // 永続化に失敗した送信だけをローカル表示から巻き戻し、画面と実データを一致させる。
                     chat.messages.pop();
                 }
                 if chat.input.is_empty() {
+                    // 再送しやすいよう、失敗した入力は composer に戻す。
                     chat.input = prompt;
                     chat.input_cursor = chat.input.chars().count();
                 }
@@ -513,6 +529,7 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let available_rows = chunks[1].height.saturating_sub(2) as usize;
         let window_size = available_rows.max(1);
         let max_start = app.sessions.len().saturating_sub(window_size);
+        // 選択中セッションを中央寄せ気味に保ち、長い一覧でも現在地を見失いにくくする。
         let start = app.selected.saturating_sub(window_size / 2).min(max_start);
         let end = (start + window_size).min(app.sessions.len());
 
@@ -628,6 +645,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         ));
     }
     let visible_line_count = chunks[1].height.saturating_sub(2) as usize;
+    // 下端を最新メッセージに固定しつつ、conversation_scroll でだけ過去へ遡る。
     let start_index = lines
         .len()
         .saturating_sub(visible_line_count.saturating_add(chat.conversation_scroll));
@@ -720,6 +738,7 @@ fn delete_input(chat: &mut ChatState) {
 
 fn handle_up_arrow(chat: &mut ChatState) {
     if chat.input_cursor > 0 {
+        // まず行頭移動を優先し、履歴遷移は同じキーで段階的に行う。
         chat.input_cursor = 0;
         return;
     }
@@ -754,6 +773,7 @@ fn handle_down_arrow(chat: &mut ChatState) {
     }
 
     chat.history_index = None;
+    // 履歴を抜けたら編集中ドラフトを復元し、途中入力を失わないようにする。
     chat.input = chat.draft_input.take().unwrap_or_default();
     chat.input_cursor = chat.input.chars().count();
 }

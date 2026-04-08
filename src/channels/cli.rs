@@ -1,9 +1,14 @@
+//! CLI チャットチャネル。
+//!
+//! 標準入出力を使った永続化チャットセッションを提供し、入力ごとに agent loop を実行する。
+
 use std::io::{self, BufRead, Write};
 
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
+/// Runs an interactive CLI chat loop for the given persistent session.
 pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();

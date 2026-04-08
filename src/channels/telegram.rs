@@ -37,6 +37,7 @@ pub struct TelegramAdapter {
 }
 
 impl TelegramAdapter {
+    /// Creates a Telegram adapter backed by the provided bot client.
     pub fn new(bot: Bot) -> Self {
         Self { bot }
     }
