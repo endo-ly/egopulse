@@ -959,7 +959,7 @@ fn parse_raw_tool_use_block(input: &str, call_number: usize) -> Option<(RawToolU
 
     Some((
         RawToolUseBlock {
-            id: format!("raw_tool_call_{call_number}"),
+            id: format!("raw_tool_call_{call_number}_{}", uuid::Uuid::new_v4()),
             name: name.to_string(),
             input_json: if args.is_empty() {
                 "{}".to_string()
@@ -973,18 +973,11 @@ fn parse_raw_tool_use_block(input: &str, call_number: usize) -> Option<(RawToolU
 
 fn extract_raw_tool_use_blocks(text: &str) -> Option<Vec<RawToolUseBlock>> {
     let normalized = strip_minimax_tool_wrappers(text);
-    if !normalized.contains("[tool_use:") {
-        return None;
-    }
 
     let mut calls = Vec::new();
     let mut rest = normalized.as_str();
-    loop {
-        let trimmed = rest.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        let (call, tail) = parse_raw_tool_use_block(trimmed, calls.len() + 1)?;
+    while let Some(pos) = rest.find("[tool_use:") {
+        let (call, tail) = parse_raw_tool_use_block(&rest[pos..], calls.len() + 1)?;
         calls.push(call);
         rest = tail;
     }
@@ -1470,5 +1463,13 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.content, "Let me help with that");
+    }
+
+    #[test]
+    fn extracts_raw_tool_use_embedded_in_normal_text() {
+        let text = "了解。[tool_use: bash({\"command\": \"ls\"})] を実行します。";
+        let blocks = extract_raw_tool_use_blocks(text).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "bash");
     }
 }

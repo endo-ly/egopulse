@@ -136,15 +136,15 @@ where
 
         if response.tool_calls.is_empty() {
             // --- end turn branch ---
-            let final_content = response.content.trim().to_string();
-            let visible_text = strip_thinking(&final_content);
+            let raw_content = response.content.trim().to_string();
+            let visible_text = strip_thinking(&raw_content);
             let has_displayable_output = !visible_text.trim().is_empty();
 
             // Guard 1: empty visible reply → retry once
             if !has_displayable_output && !empty_reply_retry_attempted {
                 empty_reply_retry_attempted = true;
                 warn!("empty visible reply; injecting runtime guard and retrying once");
-                messages.push(Message::text("assistant", final_content.clone()));
+                messages.push(Message::text("assistant", raw_content.clone()));
                 messages.push(Message::text(
                     "user",
                     "[runtime_guard]: Your previous reply had no user-visible text.                      Reply again now with a concise visible answer.                      If tools are required, execute them first and then provide the visible result.",
@@ -161,7 +161,7 @@ where
                 warn!(
                     "declarative-only reply detected; injecting corrective prompt and retrying once"
                 );
-                messages.push(Message::text("assistant", final_content.clone()));
+                messages.push(Message::text("assistant", raw_content.clone()));
                 messages.push(Message::text(
                     "user",
                     "[runtime_guard]: Your previous reply only declared what you would do                      without actually executing any tools. If the user\'s request requires                      tool calls, execute them NOW instead of just describing what you plan to do.                      Then provide the result.",
@@ -176,6 +176,7 @@ where
                 )));
             }
 
+            let final_content = visible_text.trim().to_string();
             let assistant_message = Message::text("assistant", final_content.clone());
             messages.push(assistant_message.clone());
 
@@ -600,7 +601,7 @@ fn is_declarative_only_reply(text: &str) -> bool {
         "i'm on it",
     ];
     // 短いテキスト（≤200文字）だけを対象とする。長い応答は「宣言のみ」ではない。
-    if lower.trim().len() > 200 {
+    if lower.trim().chars().count() > 200 {
         return false;
     }
     patterns.iter().any(|p| lower.trim().starts_with(p))
