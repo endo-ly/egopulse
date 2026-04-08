@@ -1061,8 +1061,14 @@ impl Tool for BashTool {
             .get("timeout")
             .and_then(|value| value.as_u64())
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
-        let temp_path =
-            std::env::temp_dir().join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
+        let temp_dir = self.temp_dir();
+        if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
+            return ToolResult::error(format!(
+                "Failed to prepare bash temp directory {}: {error}",
+                temp_dir.display()
+            ));
+        }
+        let temp_path = temp_dir.join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
         let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
