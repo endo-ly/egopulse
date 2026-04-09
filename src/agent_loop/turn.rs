@@ -783,18 +783,15 @@ mod tests {
         .expect("tool calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].tool_name, "read");
+        let tool_output = tool_calls[0].tool_output.as_deref().expect("tool output");
+        let payload: serde_json::Value =
+            serde_json::from_str(tool_output).expect("tool output json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["tool"], "read");
         assert!(
-            tool_calls[0]
-                .tool_output
-                .as_deref()
-                .expect("tool output")
-                .contains("\"status\":\"success\"")
-        );
-        assert!(
-            tool_calls[0]
-                .tool_output
-                .as_deref()
-                .expect("tool output")
+            payload["result"]
+                .as_str()
+                .expect("tool result string")
                 .contains("hello from tool")
         );
     }
