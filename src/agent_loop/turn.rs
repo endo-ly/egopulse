@@ -11,7 +11,6 @@ use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
-use crate::text::floor_char_boundary;
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
 use tracing::{info, warn};
@@ -669,6 +668,7 @@ async fn maybe_compact_messages(
 
 fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
     let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let unique_suffix = uuid::Uuid::new_v4().simple();
     let channel_dir = if channel.trim().is_empty() {
         "unknown"
     } else {
@@ -685,7 +685,7 @@ fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &
         return;
     }
 
-    let path = dir.join(format!("{now}.md"));
+    let path = dir.join(format!("{now}-{unique_suffix}.md"));
     let mut content = String::new();
     for message in messages {
         let role = &message.role;
@@ -707,12 +707,20 @@ fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &
     }
 }
 
+/// Truncate the compaction summary input by character count, not by bytes.
+///
+/// The limit keeps UTF-8 text intact and appends `\n... (truncated)` when the
+/// input exceeds `MAX_COMPACTION_SUMMARY_CHARS` characters.
 fn truncate_compaction_summary_input(mut summary_input: String) -> String {
-    if summary_input.len() <= MAX_COMPACTION_SUMMARY_CHARS {
+    if summary_input.chars().count() <= MAX_COMPACTION_SUMMARY_CHARS {
         return summary_input;
     }
 
-    let cutoff = floor_char_boundary(&summary_input, MAX_COMPACTION_SUMMARY_CHARS);
+    let cutoff = summary_input
+        .char_indices()
+        .nth(MAX_COMPACTION_SUMMARY_CHARS)
+        .map(|(idx, _)| idx)
+        .unwrap_or(summary_input.len());
     summary_input.truncate(cutoff);
     summary_input.push_str("\n... (truncated)");
     summary_input
@@ -1630,11 +1638,19 @@ mod tests {
     }
 
     #[test]
-    fn truncate_compaction_summary_input_respects_char_boundaries() {
+    fn truncate_compaction_summary_input_keeps_exact_character_limit() {
         let input = format!("{}{}{}", "a".repeat(19_998), "あ", "い");
+        let truncated = truncate_compaction_summary_input(input.clone());
+
+        assert_eq!(truncated, input);
+    }
+
+    #[test]
+    fn truncate_compaction_summary_input_truncates_by_character_count() {
+        let input = format!("{}{}{}", "a".repeat(19_999), "あ", "い");
         let truncated = truncate_compaction_summary_input(input);
 
-        let expected = format!("{}\n... (truncated)", "a".repeat(19_998));
+        let expected = format!("{}\n... (truncated)", "a".repeat(19_999) + "あ");
         assert_eq!(truncated, expected);
     }
 

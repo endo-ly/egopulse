@@ -121,30 +121,28 @@ pub(super) async fn api_put_config(
 
     let display = match Config::load_allow_missing_api_key(Some(&path)) {
         Ok(config) => config,
-        Err(_) => Config {
-            model: request.model.trim().to_string(),
-            api_key: state.app_state.config.api_key.clone(),
-            llm_base_url: request.base_url.trim().to_string(),
-            data_dir: crate::config::default_data_dir()
+        Err(_) => {
+            let mut config = state.app_state.config.clone();
+            config.model = request.model.trim().to_string();
+            config.llm_base_url = request.base_url.trim().to_string();
+            config.data_dir = crate::config::default_data_dir()
                 .to_string_lossy()
-                .into_owned(),
-            log_level: state.app_state.config.log_level.clone(),
-            compaction_timeout_secs: state.app_state.config.compaction_timeout_secs,
-            max_history_messages: state.app_state.config.max_history_messages,
-            max_session_messages: state.app_state.config.max_session_messages,
-            compact_keep_recent: state.app_state.config.compact_keep_recent,
-            channels: std::collections::HashMap::from([(
+                .into_owned();
+            let web_auth_token = config.web_auth_token().map(str::to_string);
+            let allowed_origins = config.web_allowed_origins();
+            config.channels.insert(
                 "web".to_string(),
                 ChannelConfig {
                     enabled: Some(request.web_enabled),
                     host: Some(request.web_host.trim().to_string()),
                     port: Some(request.web_port),
-                    auth_token: state.app_state.config.web_auth_token().map(str::to_string),
-                    allowed_origins: Some(state.app_state.config.web_allowed_origins()),
+                    auth_token: web_auth_token,
+                    allowed_origins: Some(allowed_origins),
                     ..Default::default()
                 },
-            )]),
-        },
+            );
+            config
+        }
     };
 
     Ok(Json(serde_json::json!({

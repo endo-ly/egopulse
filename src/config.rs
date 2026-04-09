@@ -889,16 +889,33 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         env.set("HOME", temp_dir.path());
         let file_path = temp_dir.path().join("egopulse.config.yaml");
-        let mut file = std::fs::File::create(&file_path).expect("create config");
-        writeln!(
-            file,
-            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 0\ncompact_keep_recent: 1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
-        )
-        .expect("write config");
+        let cases = [
+            (
+                "compaction_timeout_secs",
+                "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\ncompaction_timeout_secs: 0\nmax_history_messages: 1\nmax_session_messages: 2\ncompact_keep_recent: 1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret",
+            ),
+            (
+                "max_history_messages",
+                "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\ncompaction_timeout_secs: 1\nmax_history_messages: 0\nmax_session_messages: 2\ncompact_keep_recent: 1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret",
+            ),
+            (
+                "max_session_messages",
+                "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\ncompaction_timeout_secs: 1\nmax_history_messages: 1\nmax_session_messages: 0\ncompact_keep_recent: 1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret",
+            ),
+            (
+                "compact_keep_recent",
+                "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\ncompaction_timeout_secs: 1\nmax_history_messages: 1\nmax_session_messages: 2\ncompact_keep_recent: 0\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret",
+            ),
+        ];
 
-        let error = Config::load(Some(&file_path)).expect_err("invalid compaction config");
-
-        assert!(matches!(error, ConfigError::InvalidCompactionConfig(_)));
+        for (label, contents) in cases {
+            std::fs::write(&file_path, contents).expect("write config");
+            let error = Config::load(Some(&file_path)).expect_err(label);
+            assert!(
+                matches!(error, ConfigError::InvalidCompactionConfig(_)),
+                "{label}"
+            );
+        }
     }
 
     #[test]

@@ -72,7 +72,7 @@ channels:
 
 ### Session compaction
 
-EgoPulse は MicroClaw スタイルの自動 compaction を持ち、LLM 実行前に長い session を要約して recent context を残します。compaction が走る直前の全文会話は `data_dir/groups/<channel>/<chat_id>/conversations/<timestamp>.md` に archive されます。
+EgoPulse は自動 compaction を持ち、LLM 実行前に長い session を要約して recent context を残します。compaction が走る直前の全文会話は `data_dir/groups/<channel>/<chat_id>/conversations/<timestamp>-<unique_suffix>.md` に archive されます。
 
 | 設定 | デフォルト | 説明 |
 |------|-----------:|------|
