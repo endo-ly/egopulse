@@ -259,11 +259,12 @@ where
         }
 
         let assistant_message_id = uuid::Uuid::new_v4().to_string();
+        let assistant_text = sanitize_assistant_response_text(&response.content);
         let assistant_preview =
-            summarize_tool_calls_with_content(&response.content, &valid_tool_calls);
+            summarize_tool_calls_with_content(&assistant_text, &valid_tool_calls);
         let assistant_message = Message {
             role: "assistant".to_string(),
-            content: crate::llm::MessageContent::text(response.content.clone()),
+            content: crate::llm::MessageContent::text(assistant_text.clone()),
             tool_calls: valid_tool_calls.clone(),
             tool_call_id: None,
         };
@@ -647,13 +648,16 @@ async fn maybe_compact_messages(
         return recent_messages.to_vec();
     }
 
-    let mut compacted = vec![
-        Message::text("user", format!("[Conversation Summary]\n{summary}")),
-        Message::text(
+    let mut compacted = vec![Message::text(
+        "user",
+        format!("[Conversation Summary]\n{summary}"),
+    )];
+    if !matches!(recent_messages.first(), Some(message) if message.role == "assistant") {
+        compacted.push(Message::text(
             "assistant",
             "Understood, I have the conversation context. How can I help?",
-        ),
-    ];
+        ));
+    }
 
     for message in recent_messages {
         append_compacted_message(&mut compacted, message);
@@ -779,12 +783,25 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 }
 
 fn message_to_text(message: &Message) -> String {
+    let should_strip_thinking = should_strip_thinking_for_role(&message.role);
     let content = match &message.content {
-        crate::llm::MessageContent::Text(text) => strip_thinking(text),
+        crate::llm::MessageContent::Text(text) => {
+            if should_strip_thinking {
+                strip_thinking(text)
+            } else {
+                text.clone()
+            }
+        }
         crate::llm::MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                crate::llm::MessageContentPart::InputText { text } => strip_thinking(text),
+                crate::llm::MessageContentPart::InputText { text } => {
+                    if should_strip_thinking {
+                        strip_thinking(text)
+                    } else {
+                        text.clone()
+                    }
+                }
                 crate::llm::MessageContentPart::InputImage { .. } => "[image]".to_string(),
             })
             .collect::<Vec<_>>()
@@ -841,13 +858,34 @@ fn tool_result_body(payload: &str) -> String {
     }
 }
 
+fn sanitize_assistant_response_text(content: &str) -> String {
+    strip_thinking(content.trim())
+}
+
+fn should_strip_thinking_for_role(role: &str) -> bool {
+    matches!(role, "assistant" | "tool")
+}
+
 fn message_to_archive_text(message: &Message) -> String {
+    let should_strip_thinking = should_strip_thinking_for_role(&message.role);
     let content = match &message.content {
-        crate::llm::MessageContent::Text(text) => strip_thinking(text),
+        crate::llm::MessageContent::Text(text) => {
+            if should_strip_thinking {
+                strip_thinking(text)
+            } else {
+                text.clone()
+            }
+        }
         crate::llm::MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                crate::llm::MessageContentPart::InputText { text } => strip_thinking(text),
+                crate::llm::MessageContentPart::InputText { text } => {
+                    if should_strip_thinking {
+                        strip_thinking(text)
+                    } else {
+                        text.clone()
+                    }
+                }
                 crate::llm::MessageContentPart::InputImage { image_url, detail } => match detail {
                     Some(detail) => format!("[image: {image_url} detail={detail}]"),
                     None => format!("[image: {image_url}]"),
@@ -1178,24 +1216,26 @@ mod tests {
     async fn process_turn_executes_tool_calls_and_persists_outputs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let relative_path = format!("tests/{}/notes.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Let me check this. <thinking>internal</thinking>".to_string(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                }),
+                Ok(MessagesResponse {
+                    content: "All set".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+            vec![0, 0],
+        );
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                responses: std::sync::Mutex::new(vec![
-                    MessagesResponse {
-                        content: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path}),
-                        }],
-                    },
-                    MessagesResponse {
-                        content: "All set".to_string(),
-                        tool_calls: Vec::new(),
-                    },
-                ]),
-            }),
+            Box::new(provider.clone()),
         );
         let workspace = state.config.workspace_dir();
         let note_path = workspace.join(&relative_path);
@@ -1229,6 +1269,19 @@ mod tests {
                 .as_str()
                 .expect("tool result string")
                 .contains("hello from tool")
+        );
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert_eq!(
+            seen_messages[1][1].content.as_text_lossy(),
+            "Let me check this."
+        );
+        assert!(
+            !seen_messages[1][1]
+                .content
+                .as_text_lossy()
+                .contains("<thinking>")
         );
     }
 
@@ -1475,6 +1528,11 @@ mod tests {
             seen_messages[1][0].content.as_text_lossy(),
             "[Conversation Summary]\nsummary text"
         );
+        assert_eq!(seen_messages[1][1].role, "assistant");
+        assert_eq!(
+            seen_messages[1][1].content.as_text_lossy(),
+            "old-assistant-2"
+        );
         assert_eq!(
             seen_messages[1]
                 .last()
@@ -1623,6 +1681,16 @@ mod tests {
     }
 
     #[test]
+    fn message_to_text_preserves_user_literal_thinking_tags() {
+        let message = Message::text("user", "hello <think>literal</think> world");
+
+        assert_eq!(
+            message_to_text(&message),
+            "hello <think>literal</think> world"
+        );
+    }
+
+    #[test]
     fn message_to_text_renders_multimodal_images() {
         let message = Message {
             role: "user".to_string(),
@@ -1720,7 +1788,7 @@ mod tests {
     #[test]
     fn message_to_archive_text_renders_full_image_and_text_content() {
         let message = Message {
-            role: "user".to_string(),
+            role: "assistant".to_string(),
             content: MessageContent::parts(vec![
                 MessageContentPart::InputText {
                     text: "hello <thinking>internal</thinking> world".to_string(),
@@ -1741,6 +1809,16 @@ mod tests {
         assert_eq!(
             message_to_archive_text(&message),
             "hello  world\n[image: data:image/png;base64,abc detail=high]\n[tool_use: search({\"query\":\"egopulse\"})]"
+        );
+    }
+
+    #[test]
+    fn message_to_archive_text_preserves_user_literal_thinking_tags() {
+        let message = Message::text("user", "hello <thought>literal</thought> world");
+
+        assert_eq!(
+            message_to_archive_text(&message),
+            "hello <thought>literal</thought> world"
         );
     }
 
