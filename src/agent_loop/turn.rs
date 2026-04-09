@@ -652,6 +652,7 @@ mod tests {
 
     use async_trait::async_trait;
     use secrecy::SecretString;
+    use serial_test::serial;
 
     use crate::agent_loop::turn::{is_declarative_only_reply, strip_thinking};
     use crate::agent_loop::{SurfaceContext, process_turn};
@@ -741,6 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn process_turn_executes_tool_calls_and_persists_outputs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let relative_path = format!("tests/{}/notes.txt", uuid::Uuid::new_v4());
@@ -799,6 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn process_turn_surfaces_llm_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_state_with_provider(
@@ -813,6 +816,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn empty_reply_guard_retries_once_then_errors() {
         // LLM returns empty content twice → first triggers guard retry, second errors
         let dir = tempfile::tempdir().expect("tempdir");
@@ -839,6 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn declarative_only_guard_retries_then_returns() {
         // First: declarative-only reply, Second: actual answer after guard retry
         let dir = tempfile::tempdir().expect("tempdir");
@@ -885,6 +890,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn normal_tool_flow_still_works_after_port() {
         // Regression: existing tool flow with multiple tool calls should still work
         let dir = tempfile::tempdir().expect("tempdir");
@@ -924,6 +930,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn malformed_tool_calls_are_skipped_and_error_returned() {
         // All tool calls have empty names → malformed → error
         let dir = tempfile::tempdir().expect("tempdir");
@@ -948,6 +955,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn malformed_declarative_tool_reply_retries_then_returns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_state_with_provider(
