@@ -11,9 +11,10 @@ use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::text::floor_char_boundary;
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
-use tracing::warn;
+use tracing::{info, warn};
 
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
@@ -612,15 +613,7 @@ async fn maybe_compact_messages(
         let text = message_to_text(message);
         summary_input.push_str(&format!("[{role}]: {text}\n\n"));
     }
-    if summary_input.chars().count() > MAX_COMPACTION_SUMMARY_CHARS {
-        summary_input = format!(
-            "{}\n... (truncated)",
-            summary_input
-                .chars()
-                .take(MAX_COMPACTION_SUMMARY_CHARS)
-                .collect::<String>()
-        );
-    }
+    summary_input = truncate_compaction_summary_input(summary_input);
 
     let summarize_prompt = "Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.";
     let summarize_messages = vec![Message::text(
@@ -688,10 +681,7 @@ fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &
         .join("conversations");
 
     if let Err(error) = std::fs::create_dir_all(&dir) {
-        warn!(
-            "failed to create compaction archive dir {}: {error}",
-            dir.display()
-        );
+        warn!("failed to create archive dir {}: {error}", dir.display());
         return;
     }
 
@@ -705,10 +695,27 @@ fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &
 
     if let Err(error) = std::fs::write(&path, content) {
         warn!(
-            "failed to archive compacted conversation to {}: {error}",
+            "failed to archive conversation to {}: {error}",
+            path.display()
+        );
+    } else {
+        info!(
+            "archived conversation ({} messages) to {}",
+            messages.len(),
             path.display()
         );
     }
+}
+
+fn truncate_compaction_summary_input(mut summary_input: String) -> String {
+    if summary_input.len() <= MAX_COMPACTION_SUMMARY_CHARS {
+        return summary_input;
+    }
+
+    let cutoff = floor_char_boundary(&summary_input, MAX_COMPACTION_SUMMARY_CHARS);
+    summary_input.truncate(cutoff);
+    summary_input.push_str("\n... (truncated)");
+    summary_input
 }
 
 fn append_compacted_message(compacted: &mut Vec<Message>, message: &Message) {
@@ -919,7 +926,10 @@ mod tests {
     use secrecy::SecretString;
     use serial_test::serial;
 
-    use crate::agent_loop::turn::{is_declarative_only_reply, message_to_text, strip_thinking};
+    use crate::agent_loop::turn::{
+        is_declarative_only_reply, message_to_text, strip_thinking,
+        truncate_compaction_summary_input,
+    };
     use crate::agent_loop::{SurfaceContext, process_turn};
     use crate::config::Config;
     use crate::error::{EgoPulseError, LlmError};
@@ -1617,6 +1627,15 @@ mod tests {
             message_to_text(&message),
             r#"[tool_result]: {"tool":"read","status":"success"}"#
         );
+    }
+
+    #[test]
+    fn truncate_compaction_summary_input_respects_char_boundaries() {
+        let input = format!("{}{}{}", "a".repeat(19_998), "あ", "い");
+        let truncated = truncate_compaction_summary_input(input);
+
+        let expected = format!("{}\n... (truncated)", "a".repeat(19_998));
+        assert_eq!(truncated, expected);
     }
 
     #[test]

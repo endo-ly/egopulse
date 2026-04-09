@@ -500,11 +500,6 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
             "compact_keep_recent must be at least 1".to_string(),
         ));
     }
-    if config.compact_keep_recent >= config.max_session_messages {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compact_keep_recent must be less than max_session_messages".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -889,7 +884,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn rejects_invalid_compaction_settings() {
+    fn rejects_zero_compaction_settings() {
         let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         env.set("HOME", temp_dir.path());
@@ -897,7 +892,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).expect("create config");
         writeln!(
             file,
-            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 2\ncompact_keep_recent: 3\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 0\ncompact_keep_recent: 1\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
         )
         .expect("write config");
 
@@ -908,7 +903,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn rejects_equal_compaction_thresholds() {
+    fn allows_equal_compaction_thresholds() {
         let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         env.set("HOME", temp_dir.path());
@@ -920,13 +915,28 @@ mod tests {
         )
         .expect("write config");
 
-        let error = Config::load(Some(&file_path)).expect_err("equal compaction thresholds");
+        let config = Config::load(Some(&file_path)).expect("equal compaction thresholds");
+        assert_eq!(config.max_session_messages, 3);
+        assert_eq!(config.compact_keep_recent, 3);
+    }
 
-        assert!(matches!(
-            error,
-            ConfigError::InvalidCompactionConfig(ref message)
-            if message == "compact_keep_recent must be less than max_session_messages"
-        ));
+    #[test]
+    #[serial]
+    fn allows_greater_compaction_thresholds() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 2\ncompact_keep_recent: 3\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("greater compaction thresholds");
+        assert_eq!(config.max_session_messages, 2);
+        assert_eq!(config.compact_keep_recent, 3);
     }
 
     #[test]
