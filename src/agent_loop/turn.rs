@@ -18,6 +18,7 @@ use tracing::warn;
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 const MAX_COMPACTION_SUMMARY_CHARS: usize = 20_000;
+const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
 
 /// Sends a one-shot prompt within a named persistent session.
 pub async fn ask_in_session(
@@ -740,7 +741,6 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 }
 
 fn message_to_text(message: &Message) -> String {
-    let mut parts = Vec::new();
     let content = match &message.content {
         crate::llm::MessageContent::Text(text) => text.clone(),
         crate::llm::MessageContent::Parts(parts) => parts
@@ -752,6 +752,19 @@ fn message_to_text(message: &Message) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     };
+    if message.tool_call_id.is_some() {
+        let payload = tool_result_payload(message).unwrap_or_default();
+        let body = tool_result_body(payload);
+        let truncated = truncate_summary_text(&body, MAX_TOOL_RESULT_TEXT_CHARS);
+        let prefix = if is_tool_error_message(message) {
+            "[tool_error]: "
+        } else {
+            "[tool_result]: "
+        };
+        return format!("{prefix}{truncated}");
+    }
+
+    let mut parts = Vec::new();
     if !content.trim().is_empty() {
         parts.push(content);
     }
@@ -762,6 +775,51 @@ fn message_to_text(message: &Message) -> String {
         ));
     }
     parts.join("\n")
+}
+
+fn is_tool_error_message(message: &Message) -> bool {
+    let Some(payload) = tool_result_payload(message) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(|status| status.as_str())
+                .map(|status| status == "error")
+        })
+        .unwrap_or(false)
+}
+
+fn tool_result_body(payload: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => value
+            .get("result")
+            .and_then(|result| result.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| payload.to_string()),
+        Err(_) => payload.to_string(),
+    }
+}
+
+fn tool_result_payload(message: &Message) -> Option<&str> {
+    match &message.content {
+        crate::llm::MessageContent::Text(text) => Some(text.as_str()),
+        crate::llm::MessageContent::Parts(parts) => parts.iter().find_map(|part| match part {
+            crate::llm::MessageContentPart::InputText { text } => Some(text.as_str()),
+            crate::llm::MessageContentPart::InputImage { .. } => None,
+        }),
+    }
+}
+
+fn truncate_summary_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let truncated = text.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn runtime_guard_messages(
@@ -861,11 +919,14 @@ mod tests {
     use secrecy::SecretString;
     use serial_test::serial;
 
-    use crate::agent_loop::turn::{is_declarative_only_reply, strip_thinking};
+    use crate::agent_loop::turn::{is_declarative_only_reply, message_to_text, strip_thinking};
     use crate::agent_loop::{SurfaceContext, process_turn};
     use crate::config::Config;
     use crate::error::{EgoPulseError, LlmError};
-    use crate::llm::{LlmProvider, Message, MessagesResponse, ToolCall, ToolDefinition};
+    use crate::llm::{
+        LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
+        ToolDefinition,
+    };
     use crate::runtime::AppState;
     use crate::skills::SkillManager;
     use crate::storage::{Database, call_blocking};
@@ -990,6 +1051,22 @@ mod tests {
             surface_user: "local_user".to_string(),
             surface_thread: session.to_string(),
             chat_type: "cli".to_string(),
+        }
+    }
+
+    fn tool_result_message(status: &str, result: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: MessageContent::text(
+                serde_json::json!({
+                    "tool": "read",
+                    "status": status,
+                    "result": result,
+                })
+                .to_string(),
+            ),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
         }
     }
 
@@ -1447,6 +1524,98 @@ mod tests {
                 .content
                 .as_text_lossy(),
             "final answer"
+        );
+    }
+
+    #[test]
+    fn message_to_text_preserves_plain_text() {
+        let message = Message::text("assistant", "hello world");
+
+        assert_eq!(message_to_text(&message), "hello world");
+    }
+
+    #[test]
+    fn message_to_text_renders_multimodal_images() {
+        let message = Message {
+            role: "user".to_string(),
+            content: MessageContent::parts(vec![
+                MessageContentPart::InputText {
+                    text: "hello".to_string(),
+                },
+                MessageContentPart::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: None,
+                },
+            ]),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+
+        assert_eq!(message_to_text(&message), "hello\n[image]");
+    }
+
+    #[test]
+    fn message_to_text_renders_tool_use() {
+        let message = Message {
+            role: "assistant".to_string(),
+            content: MessageContent::text(""),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "egopulse"}),
+            }],
+            tool_call_id: None,
+        };
+
+        assert_eq!(
+            message_to_text(&message),
+            "[tool_use: search({\"query\":\"egopulse\"})]"
+        );
+    }
+
+    #[test]
+    fn message_to_text_renders_tool_result() {
+        let message = tool_result_message("success", "all good");
+
+        assert_eq!(message_to_text(&message), "[tool_result]: all good");
+    }
+
+    #[test]
+    fn message_to_text_renders_tool_error() {
+        let message = tool_result_message("error", "something went wrong");
+
+        assert_eq!(
+            message_to_text(&message),
+            "[tool_error]: something went wrong"
+        );
+    }
+
+    #[test]
+    fn message_to_text_truncates_tool_result_to_200_chars() {
+        let result = "あ".repeat(260);
+        let message = tool_result_message("success", &result);
+        let rendered = message_to_text(&message);
+        let prefix = "[tool_result]: ";
+        assert!(rendered.starts_with(prefix));
+
+        let body = &rendered[prefix.len()..];
+        assert!(body.ends_with("..."));
+        assert_eq!(body.chars().count(), 203);
+        assert_eq!(body[..body.len() - 3].chars().count(), 200);
+    }
+
+    #[test]
+    fn message_to_text_falls_back_to_raw_payload_when_result_is_missing() {
+        let message = Message {
+            role: "tool".to_string(),
+            content: MessageContent::text(r#"{"tool":"read","status":"success"}"#),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
+        };
+
+        assert_eq!(
+            message_to_text(&message),
+            r#"[tool_result]: {"tool":"read","status":"success"}"#
         );
     }
 
