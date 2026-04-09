@@ -743,6 +743,7 @@ mod tests {
     #[tokio::test]
     async fn process_turn_executes_tool_calls_and_persists_outputs() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/notes.txt", uuid::Uuid::new_v4());
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(FakeProvider {
@@ -752,7 +753,7 @@ mod tests {
                         tool_calls: vec![ToolCall {
                             id: "call-1".to_string(),
                             name: "read".to_string(),
-                            arguments: serde_json::json!({"path": "notes.txt"}),
+                            arguments: serde_json::json!({"path": relative_path}),
                         }],
                     },
                     MessagesResponse {
@@ -763,8 +764,9 @@ mod tests {
             }),
         );
         let workspace = state.config.workspace_dir();
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::write(workspace.join("notes.txt"), "hello from tool").expect("notes");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
+        std::fs::write(&note_path, "hello from tool").expect("notes");
 
         let reply = process_turn(&state, &cli_context("tool-flow"), "please read the note")
             .await
@@ -886,6 +888,7 @@ mod tests {
     async fn normal_tool_flow_still_works_after_port() {
         // Regression: existing tool flow with multiple tool calls should still work
         let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(FakeProvider {
@@ -895,7 +898,7 @@ mod tests {
                         tool_calls: vec![ToolCall {
                             id: "call-1".to_string(),
                             name: "read".to_string(),
-                            arguments: serde_json::json!({"path": "a.txt"}),
+                            arguments: serde_json::json!({"path": relative_path}),
                         }],
                     },
                     MessagesResponse {
@@ -906,12 +909,17 @@ mod tests {
             }),
         );
         let workspace = state.config.workspace_dir();
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::write(workspace.join("a.txt"), "content").expect("a.txt");
+        let file_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
+        std::fs::write(&file_path, "content").expect("a.txt");
 
-        let reply = process_turn(&state, &cli_context("regression-tool"), "read a.txt")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state,
+            &cli_context("regression-tool"),
+            &format!("read {relative_path}"),
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "Done reading. Final answer.");
     }
 
