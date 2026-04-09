@@ -57,6 +57,8 @@ pub enum ConfigError {
     MissingWebAuthToken,
     #[error("missing_api_key")]
     MissingApiKey,
+    #[error("invalid_compaction_config: {0}")]
+    InvalidCompactionConfig(String),
     #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
     NoActiveChannels,
 }

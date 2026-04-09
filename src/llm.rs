@@ -1165,6 +1165,10 @@ mod tests {
             llm_base_url: base_url,
             data_dir: ".egopulse-test".to_string(),
             log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
                 crate::config::ChannelConfig {

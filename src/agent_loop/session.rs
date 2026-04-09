@@ -14,8 +14,6 @@ use crate::llm::{Message, MessageContent, MessageContentPart};
 use crate::runtime::AppState;
 use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
-const MAX_HISTORY_MESSAGES: usize = 50;
-
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
@@ -113,12 +111,24 @@ pub(crate) async fn load_messages_for_turn(
     state: &AppState,
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
+    let max_history_messages = state.config.max_history_messages;
     let snapshot = call_blocking(state.db.clone(), move |db| {
-        db.load_session_snapshot(chat_id, MAX_HISTORY_MESSAGES)
+        db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
 
     snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
+}
+
+pub(crate) async fn persist_phase_once(
+    state: &AppState,
+    message: StoredMessage,
+    messages: &[Message],
+    session_updated_at: Option<String>,
+) -> Result<PersistedTurn, EgoPulseError> {
+    store_phase_snapshot(state, message, messages.to_vec(), session_updated_at)
+        .await
+        .map_err(EgoPulseError::Storage)
 }
 
 /// Persists one turn phase with optimistic concurrency and a single conflict retry.
@@ -129,33 +139,19 @@ pub(crate) async fn persist_phase(
     messages: &[Message],
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    let mut retry_snapshot = trim_history(messages);
+    let mut retry_snapshot = messages.to_vec();
     let mut retry_session_updated_at = session_updated_at;
 
     for attempt in 0..2 {
-        let session_json =
-            serialize_snapshot(Arc::clone(&state.assets), retry_snapshot.clone()).await?;
-        let result = call_blocking(state.db.clone(), {
-            let session_updated_at = retry_session_updated_at.clone();
-            let session_json = session_json.clone();
-            let message = message.clone();
-            move |db| {
-                db.store_message_with_session(
-                    &message,
-                    &session_json,
-                    session_updated_at.as_deref(),
-                )
-            }
-        })
-        .await;
-
-        match result {
-            Ok(updated_at) => {
-                return Ok(PersistedTurn {
-                    updated_at,
-                    messages: retry_snapshot.clone(),
-                });
-            }
+        match store_phase_snapshot(
+            state,
+            message.clone(),
+            retry_snapshot.clone(),
+            retry_session_updated_at.clone(),
+        )
+        .await
+        {
+            Ok(persisted) => return Ok(persisted),
             Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
                 // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
                 // 今回の phase だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
@@ -165,7 +161,7 @@ pub(crate) async fn persist_phase(
                 } = load_messages_for_turn(state, message.chat_id).await?;
                 let mut refreshed_messages = messages;
                 refreshed_messages.push(phase_message.clone());
-                retry_snapshot = trim_history(&refreshed_messages);
+                retry_snapshot = refreshed_messages;
                 retry_session_updated_at = session_updated_at;
             }
             Err(error) => return Err(EgoPulseError::Storage(error)),
@@ -193,29 +189,27 @@ async fn snapshot_to_loaded(
             && !restored.is_empty()
         {
             return Ok(LoadedSession {
-                messages: trim_history(&restored),
+                messages: restored,
                 session_updated_at: snapshot.updated_at,
             });
         }
     }
 
     Ok(LoadedSession {
-        messages: trim_history(
-            &snapshot
-                .recent_messages
-                .iter()
-                .map(|message| {
-                    Message::text(
-                        if message.is_from_bot {
-                            "assistant"
-                        } else {
-                            "user"
-                        },
-                        message.content.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ),
+        messages: snapshot
+            .recent_messages
+            .iter()
+            .map(|message| {
+                Message::text(
+                    if message.is_from_bot {
+                        "assistant"
+                    } else {
+                        "user"
+                    },
+                    message.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
         session_updated_at: snapshot.updated_at,
     })
 }
@@ -336,12 +330,26 @@ fn restore_part(assets: &AssetStore, part: PersistedMessageContentPart) -> Messa
     }
 }
 
-fn trim_history(messages: &[Message]) -> Vec<Message> {
-    if messages.len() <= MAX_HISTORY_MESSAGES {
-        return messages.to_vec();
-    }
-
-    messages[messages.len() - MAX_HISTORY_MESSAGES..].to_vec()
+async fn store_phase_snapshot(
+    state: &AppState,
+    message: StoredMessage,
+    snapshot_messages: Vec<Message>,
+    session_updated_at: Option<String>,
+) -> Result<PersistedTurn, StorageError> {
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
+        .await
+        .map_err(|error| match error {
+            EgoPulseError::Storage(storage) => storage,
+            other => StorageError::TaskJoin(other.to_string()),
+        })?;
+    let updated_at = call_blocking(state.db.clone(), move |db| {
+        db.store_message_with_session(&message, &session_json, session_updated_at.as_deref())
+    })
+    .await?;
+    Ok(PersistedTurn {
+        updated_at,
+        messages: snapshot_messages,
+    })
 }
 
 #[cfg(test)]
@@ -393,6 +401,10 @@ mod tests {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
                 crate::config::ChannelConfig {
@@ -638,5 +650,128 @@ mod tests {
             }
             other => panic!("expected restored parts, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn load_messages_for_turn_restores_full_snapshot_without_fixed_trim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("full-snapshot");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+        let snapshot = (0..55)
+            .map(|index| {
+                Message::text(
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    format!("message-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
+
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(chat_id, &snapshot_json)
+        })
+        .await
+        .expect("save snapshot");
+
+        let loaded = load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("load messages");
+        assert_eq!(loaded.messages.len(), 55);
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "message-0");
+        assert_eq!(loaded.messages[54].content.as_text_lossy(), "message-54");
+    }
+
+    #[tokio::test]
+    async fn persist_phase_conflict_retry_keeps_full_refreshed_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("conflict-full");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+        let seed_messages = (0..51)
+            .map(|index| {
+                Message::text(
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    format!("seed-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed_json = serde_json::to_string(&seed_messages).expect("seed json");
+
+        call_blocking(state.db.clone(), {
+            let seed_json = seed_json.clone();
+            move |db| db.save_session(chat_id, &seed_json)
+        })
+        .await
+        .expect("save seed snapshot");
+
+        let stale_session_updated_at = call_blocking(state.db.clone(), move |db| {
+            db.load_session(chat_id)
+                .map(|session| session.expect("session").1)
+        })
+        .await
+        .expect("stale updated_at");
+
+        let concurrent_message = StoredMessage {
+            id: "concurrent-assistant".to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: "concurrent".to_string(),
+            is_from_bot: true,
+            timestamp: "2024-01-01T00:00:52Z".to_string(),
+        };
+        let mut latest_messages = seed_messages.clone();
+        latest_messages.push(Message::text("assistant", "concurrent"));
+        let latest_json = serde_json::to_string(&latest_messages).expect("latest json");
+
+        call_blocking(state.db.clone(), {
+            let message = concurrent_message.clone();
+            let latest_json = latest_json.clone();
+            let expected_updated_at = stale_session_updated_at.clone();
+            move |db| {
+                db.store_message_with_session(&message, &latest_json, Some(&expected_updated_at))
+                    .map(|_| ())
+            }
+        })
+        .await
+        .expect("advance session");
+
+        let mut stale_messages = seed_messages.clone();
+        stale_messages.push(Message::text("user", "next"));
+        let persisted = persist_phase(
+            &state,
+            StoredMessage {
+                id: "new-user-full".to_string(),
+                chat_id,
+                sender_name: context.surface_user.clone(),
+                content: "next".to_string(),
+                is_from_bot: false,
+                timestamp: "2024-01-01T00:00:53Z".to_string(),
+            },
+            Message::text("user", "next"),
+            &stale_messages,
+            Some(stale_session_updated_at),
+        )
+        .await
+        .expect("persist turn");
+
+        assert_eq!(persisted.messages.len(), 53);
+        assert_eq!(persisted.messages[0].content.as_text_lossy(), "seed-0");
+        assert_eq!(persisted.messages[51].content.as_text_lossy(), "concurrent");
+        assert_eq!(persisted.messages[52].content.as_text_lossy(), "next");
     }
 }

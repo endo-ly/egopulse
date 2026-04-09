@@ -46,6 +46,10 @@ model: gpt-4o-mini
 api_key: sk-...
 base_url: https://api.openai.com/v1
 log_level: info
+compaction_timeout_secs: 180
+max_history_messages: 50
+max_session_messages: 40
+compact_keep_recent: 20
 
 channels:
   web:
@@ -65,6 +69,17 @@ channels:
 ```
 
 完全なテンプレートは [`egopulse.config.example.yaml`](./egopulse.config.example.yaml) を参照。
+
+### Session compaction
+
+EgoPulse は MicroClaw スタイルの自動 compaction を持ち、LLM 実行前に長い session を要約して recent context を残します。compaction が走る直前の全文会話は `data_dir/groups/<channel>/<chat_id>/conversations/<timestamp>.md` に archive されます。
+
+| 設定 | デフォルト | 説明 |
+|------|-----------:|------|
+| `compaction_timeout_secs` | `180` | 要約 compaction の LLM タイムアウト秒数 |
+| `max_history_messages` | `50` | session snapshot が壊れている/未保存時に messages テーブルから復元する件数 |
+| `max_session_messages` | `40` | compaction を発火させる message 数の閾値 |
+| `compact_keep_recent` | `20` | compaction 後にそのまま残す recent messages 数 |
 
 ### Environment variables
 

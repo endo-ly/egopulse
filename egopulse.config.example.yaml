@@ -3,6 +3,10 @@ model: gpt-4o-mini
 api_key: replace-me
 base_url: https://api.openai.com/v1
 log_level: info
+compaction_timeout_secs: 180
+max_history_messages: 50
+max_session_messages: 40
+compact_keep_recent: 20
 
 channels:
   web:

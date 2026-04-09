@@ -129,6 +129,10 @@ pub(super) async fn api_put_config(
                 .to_string_lossy()
                 .into_owned(),
             log_level: state.app_state.config.log_level.clone(),
+            compaction_timeout_secs: state.app_state.config.compaction_timeout_secs,
+            max_history_messages: state.app_state.config.max_history_messages,
+            max_session_messages: state.app_state.config.max_session_messages,
+            compact_keep_recent: state.app_state.config.compact_keep_recent,
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
                 ChannelConfig {

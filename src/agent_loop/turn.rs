@@ -4,8 +4,10 @@
 //! 1 本の turn loop としてまとめて扱う。
 
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::session::{load_messages_for_turn, persist_phase, resolve_chat_id};
-use crate::error::EgoPulseError;
+use crate::agent_loop::session::{
+    load_messages_for_turn, persist_phase, persist_phase_once, resolve_chat_id,
+};
+use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
@@ -15,6 +17,7 @@ use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
+const MAX_COMPACTION_SUMMARY_CHARS: usize = 20_000;
 
 /// Sends a one-shot prompt within a named persistent session.
 pub async fn ask_in_session(
@@ -88,32 +91,10 @@ where
     };
     let system_prompt = build_system_prompt(state, context);
 
-    let crate::agent_loop::session::LoadedSession {
-        mut messages,
-        session_updated_at,
-    } = load_messages_for_turn(state, chat_id).await?;
-    let mut session_updated_at = session_updated_at;
-
     let user_message = Message::text("user", user_input);
-    messages.push(user_message.clone());
-
-    let persisted_user_turn = persist_phase(
-        state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: context.surface_user.clone(),
-            content: user_input.to_string(),
-            is_from_bot: false,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-        user_message,
-        &messages,
-        session_updated_at,
-    )
-    .await?;
-    messages = persisted_user_turn.messages;
-    session_updated_at = Some(persisted_user_turn.updated_at);
+    let (mut messages, mut session_updated_at) =
+        persist_user_turn_with_compaction(state, context, chat_id, &user_message, user_input)
+            .await?;
 
     // LLM → tool execution → tool result feedback を 1 反復として回し、
     // tool_calls が空になるまで続ける。
@@ -557,6 +538,232 @@ fn preview_text(value: &str, max_chars: usize) -> String {
     format!("{}...", value.chars().take(max_chars).collect::<String>())
 }
 
+async fn persist_user_turn_with_compaction(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    user_message: &Message,
+    user_input: &str,
+) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
+    let mut loaded = load_messages_for_turn(state, chat_id).await?;
+    let stored_message = StoredMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        chat_id,
+        sender_name: context.surface_user.clone(),
+        content: user_input.to_string(),
+        is_from_bot: false,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    for attempt in 0..2 {
+        let mut candidate_messages = loaded.messages.clone();
+        candidate_messages.push(user_message.clone());
+        let candidate_messages =
+            maybe_compact_messages(state, context, chat_id, &candidate_messages).await;
+
+        match persist_phase_once(
+            state,
+            stored_message.clone(),
+            &candidate_messages,
+            loaded.session_updated_at.clone(),
+        )
+        .await
+        {
+            Ok(persisted) => {
+                return Ok((persisted.messages, Some(persisted.updated_at)));
+            }
+            Err(EgoPulseError::Storage(StorageError::SessionSnapshotConflict)) if attempt == 0 => {
+                loaded = load_messages_for_turn(state, chat_id).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(EgoPulseError::Storage(
+        StorageError::SessionSnapshotConflict,
+    ))
+}
+
+async fn maybe_compact_messages(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    messages: &[Message],
+) -> Vec<Message> {
+    if messages.len() <= state.config.max_session_messages {
+        return messages.to_vec();
+    }
+
+    archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages);
+
+    let keep_recent = state.config.compact_keep_recent.min(messages.len());
+    if keep_recent == messages.len() {
+        return messages.to_vec();
+    }
+
+    let split_at = messages.len() - keep_recent;
+    let old_messages = &messages[..split_at];
+    let recent_messages = &messages[split_at..];
+
+    let mut summary_input = String::new();
+    for message in old_messages {
+        let role = &message.role;
+        let text = message_to_text(message);
+        summary_input.push_str(&format!("[{role}]: {text}\n\n"));
+    }
+    if summary_input.chars().count() > MAX_COMPACTION_SUMMARY_CHARS {
+        summary_input = format!(
+            "{}\n... (truncated)",
+            summary_input
+                .chars()
+                .take(MAX_COMPACTION_SUMMARY_CHARS)
+                .collect::<String>()
+        );
+    }
+
+    let summarize_prompt = "Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.";
+    let summarize_messages = vec![Message::text(
+        "user",
+        format!("{summarize_prompt}\n\n---\n\n{summary_input}"),
+    )];
+    let timeout_secs = state.config.compaction_timeout_secs;
+    let summary_result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        state
+            .llm
+            .send_message("You are a helpful summarizer.", summarize_messages, None),
+    )
+    .await;
+
+    let summary = match summary_result {
+        Ok(Ok(response)) => strip_thinking(&response.content),
+        Ok(Err(error)) => {
+            warn!("compaction summarization failed: {error}; falling back to recent messages");
+            return recent_messages.to_vec();
+        }
+        Err(_) => {
+            warn!(
+                "compaction summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
+                context.channel, chat_id
+            );
+            return recent_messages.to_vec();
+        }
+    };
+    if summary.trim().is_empty() {
+        warn!("compaction summarization returned empty text; falling back to recent messages");
+        return recent_messages.to_vec();
+    }
+
+    let mut compacted = vec![
+        Message::text("user", format!("[Conversation Summary]\n{summary}")),
+        Message::text(
+            "assistant",
+            "Understood, I have the conversation context. How can I help?",
+        ),
+    ];
+
+    for message in recent_messages {
+        append_compacted_message(&mut compacted, message);
+    }
+
+    if matches!(compacted.last(), Some(last) if last.role == "assistant") {
+        compacted.pop();
+    }
+
+    compacted
+}
+
+fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
+    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let channel_dir = if channel.trim().is_empty() {
+        "unknown"
+    } else {
+        channel.trim()
+    };
+    let dir = std::path::PathBuf::from(data_dir)
+        .join("groups")
+        .join(channel_dir)
+        .join(chat_id.to_string())
+        .join("conversations");
+
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(
+            "failed to create compaction archive dir {}: {error}",
+            dir.display()
+        );
+        return;
+    }
+
+    let path = dir.join(format!("{now}.md"));
+    let mut content = String::new();
+    for message in messages {
+        let role = &message.role;
+        let text = message_to_text(message);
+        content.push_str(&format!("## {role}\n\n{text}\n\n---\n\n"));
+    }
+
+    if let Err(error) = std::fs::write(&path, content) {
+        warn!(
+            "failed to archive compacted conversation to {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn append_compacted_message(compacted: &mut Vec<Message>, message: &Message) {
+    let Some(last) = compacted.last_mut() else {
+        compacted.push(message.clone());
+        return;
+    };
+
+    if can_merge_compacted_messages(last, message) {
+        let merged = format!(
+            "{}\n{}",
+            last.content.as_text_lossy(),
+            message.content.as_text_lossy()
+        );
+        last.content = crate::llm::MessageContent::text(merged);
+        return;
+    }
+
+    compacted.push(message.clone());
+}
+
+fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.tool_calls.is_empty()
+        && right.tool_calls.is_empty()
+        && left.tool_call_id.is_none()
+        && right.tool_call_id.is_none()
+        && matches!(left.content, crate::llm::MessageContent::Text(_))
+        && matches!(right.content, crate::llm::MessageContent::Text(_))
+}
+
+fn message_to_text(message: &Message) -> String {
+    let mut parts = Vec::new();
+    let content = match &message.content {
+        crate::llm::MessageContent::Text(text) => text.clone(),
+        crate::llm::MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                crate::llm::MessageContentPart::InputText { text } => text.clone(),
+                crate::llm::MessageContentPart::InputImage { .. } => "[image]".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    if !content.trim().is_empty() {
+        parts.push(content);
+    }
+    for tool_call in &message.tool_calls {
+        parts.push(format!(
+            "[tool_use: {}({})]",
+            tool_call.name, tool_call.arguments
+        ));
+    }
+    parts.join("\n")
+}
+
 fn runtime_guard_messages(
     messages: &[Message],
     assistant_text: &str,
@@ -670,6 +877,14 @@ mod tests {
 
     struct FailingProvider;
 
+    #[derive(Clone)]
+    struct RecordingProvider {
+        responses: Arc<std::sync::Mutex<Vec<Result<MessagesResponse, LlmError>>>>,
+        seen_messages: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        seen_systems: Arc<std::sync::Mutex<Vec<String>>>,
+        delays_ms: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
     #[async_trait]
     impl LlmProvider for FakeProvider {
         async fn send_message(
@@ -695,6 +910,46 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        async fn send_message(
+            &self,
+            system: &str,
+            messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, LlmError> {
+            self.seen_systems
+                .lock()
+                .expect("systems")
+                .push(system.to_string());
+            self.seen_messages.lock().expect("messages").push(messages);
+            let delay_ms = self.delays_ms.lock().expect("delays").remove(0);
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            self.responses.lock().expect("responses").remove(0)
+        }
+    }
+
+    impl RecordingProvider {
+        fn new(responses: Vec<Result<MessagesResponse, LlmError>>, delays_ms: Vec<u64>) -> Self {
+            Self {
+                responses: Arc::new(std::sync::Mutex::new(responses)),
+                seen_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+                seen_systems: Arc::new(std::sync::Mutex::new(Vec::new())),
+                delays_ms: Arc::new(std::sync::Mutex::new(delays_ms)),
+            }
+        }
+
+        fn seen_messages(&self) -> Vec<Vec<Message>> {
+            self.seen_messages.lock().expect("messages").clone()
+        }
+
+        fn seen_systems(&self) -> Vec<String> {
+            self.seen_systems.lock().expect("systems").clone()
+        }
+    }
+
     fn test_config(data_dir: String) -> Config {
         Config {
             model: "gpt-4o-mini".to_string(),
@@ -702,6 +957,10 @@ mod tests {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
                 crate::config::ChannelConfig {
@@ -714,6 +973,17 @@ mod tests {
         }
     }
 
+    fn test_config_with_compaction(
+        data_dir: String,
+        max_session_messages: usize,
+        compact_keep_recent: usize,
+    ) -> Config {
+        let mut config = test_config(data_dir);
+        config.max_session_messages = max_session_messages;
+        config.compact_keep_recent = compact_keep_recent;
+        config
+    }
+
     fn cli_context(session: &str) -> SurfaceContext {
         SurfaceContext {
             channel: "cli".to_string(),
@@ -723,10 +993,10 @@ mod tests {
         }
     }
 
-    fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+    fn build_state(config: Config, llm: Box<dyn LlmProvider>) -> AppState {
         use crate::assets::AssetStore;
         use crate::channel_adapter::ChannelRegistry;
-        let config = test_config(data_dir.clone());
+        let data_dir = config.data_dir.clone();
         let db = Arc::new(Database::new(&data_dir).expect("db"));
         let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
         AppState {
@@ -739,6 +1009,10 @@ mod tests {
             tools: Arc::new(ToolRegistry::new(&config, skills)),
             assets: Arc::new(AssetStore::new(&data_dir).expect("assets")),
         }
+    }
+
+    fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+        build_state(test_config(data_dir), llm)
     }
 
     #[tokio::test]
@@ -982,6 +1256,198 @@ mod tests {
             .await
             .expect("should recover after retry");
         assert_eq!(reply, "実行結果です。");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_summarizes_old_messages_and_persists_summary_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "summary text".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-success");
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-success",
+                Some("compaction-success"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "final answer");
+
+        let seen_systems = provider.seen_systems();
+        assert_eq!(seen_systems.len(), 2);
+        assert_eq!(seen_systems[0], "You are a helpful summarizer.");
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert_eq!(
+            seen_messages[1][0].content.as_text_lossy(),
+            "[Conversation Summary]\nsummary text"
+        );
+        assert_eq!(
+            seen_messages[1]
+                .last()
+                .expect("final request")
+                .content
+                .as_text_lossy(),
+            "fresh question"
+        );
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert_eq!(
+            loaded.messages[0].content.as_text_lossy(),
+            "[Conversation Summary]\nsummary text"
+        );
+        assert_eq!(
+            loaded
+                .messages
+                .last()
+                .expect("session last")
+                .content
+                .as_text_lossy(),
+            "final answer"
+        );
+
+        let archive_dir = dir
+            .path()
+            .join("groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        let archives = std::fs::read_dir(&archive_dir)
+            .expect("archive dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("archive entries");
+        assert_eq!(archives.len(), 1);
+        let archive_body = std::fs::read_to_string(archives[0].path()).expect("archive body");
+        assert!(archive_body.contains("old-user-1"));
+        assert!(archive_body.contains("fresh question"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_falls_back_to_recent_messages_when_summary_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(LlmError::InvalidResponse("summary failed".to_string())),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-fallback");
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-fallback",
+                Some("compaction-fallback"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "final answer");
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert!(seen_messages[1].iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains("[Conversation Summary]")
+        }));
+        assert_eq!(
+            seen_messages[1][0].content.as_text_lossy(),
+            "old-assistant-2"
+        );
+        assert_eq!(
+            seen_messages[1]
+                .last()
+                .expect("final request")
+                .content
+                .as_text_lossy(),
+            "fresh question"
+        );
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert!(loaded.messages.iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains("[Conversation Summary]")
+        }));
+        assert_eq!(
+            loaded.messages[0].content.as_text_lossy(),
+            "old-assistant-2"
+        );
+        assert_eq!(
+            loaded
+                .messages
+                .last()
+                .expect("session last")
+                .content
+                .as_text_lossy(),
+            "final answer"
+        );
     }
 
     #[test]

@@ -66,6 +66,10 @@ struct FileConfig {
     api_key: Option<String>,
     base_url: Option<String>,
     log_level: Option<String>,
+    compaction_timeout_secs: Option<u64>,
+    max_history_messages: Option<usize>,
+    max_session_messages: Option<usize>,
+    compact_keep_recent: Option<usize>,
     channels: Option<HashMap<String, ChannelConfig>>,
 }
 
@@ -77,6 +81,10 @@ pub struct Config {
     pub llm_base_url: String,
     pub data_dir: String,
     pub log_level: String,
+    pub compaction_timeout_secs: u64,
+    pub max_history_messages: usize,
+    pub max_session_messages: usize,
+    pub compact_keep_recent: usize,
     pub channels: HashMap<String, ChannelConfig>,
 }
 
@@ -95,6 +103,10 @@ impl std::fmt::Debug for Config {
             .field("llm_base_url", &self.llm_base_url)
             .field("data_dir", &self.data_dir)
             .field("log_level", &self.log_level)
+            .field("compaction_timeout_secs", &self.compaction_timeout_secs)
+            .field("max_history_messages", &self.max_history_messages)
+            .field("max_session_messages", &self.max_session_messages)
+            .field("compact_keep_recent", &self.compact_keep_recent)
             .field("channels", &self.channels)
             .finish()
     }
@@ -333,24 +345,34 @@ fn build_config(
         Some(path) => Some(PathBuf::from(path)),
         None => Config::resolve_config_path()?,
     };
-    let file_config = read_file_config(resolved_config_path.as_deref())?;
+    let FileConfig {
+        model: file_model,
+        api_key: file_api_key,
+        base_url: file_base_url,
+        log_level: file_log_level,
+        compaction_timeout_secs: file_compaction_timeout_secs,
+        max_history_messages: file_max_history_messages,
+        max_session_messages: file_max_session_messages,
+        compact_keep_recent: file_compact_keep_recent,
+        channels: file_channels,
+    } = read_file_config(resolved_config_path.as_deref())?;
 
     let model = first_non_empty([
         env_var("EGOPULSE_MODEL"),
-        file_config.model,
+        file_model,
         Some(default_model().to_string()),
     ])
     .ok_or(ConfigError::MissingModel)?;
 
     let llm_base_url = first_non_empty([
         env_var("EGOPULSE_BASE_URL"),
-        file_config.base_url,
+        file_base_url,
         Some(default_llm_base_url().to_string()),
     ])
     .ok_or(ConfigError::MissingBaseUrl)?;
     validate_base_url(&llm_base_url)?;
 
-    let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_config.api_key])
+    let api_key = first_non_empty([env_var("EGOPULSE_API_KEY"), file_api_key])
         .map(|value| SecretString::new(value.into_boxed_str()));
     if !allow_missing_api_key && api_key.is_none() && !base_url_allows_empty_api_key(&llm_base_url)
     {
@@ -359,10 +381,18 @@ fn build_config(
 
     let data_dir = default_data_dir().to_string_lossy().into_owned();
 
-    let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_config.log_level])
+    let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
 
-    let mut channels = normalize_channels(file_config.channels.unwrap_or_default());
+    let compaction_timeout_secs =
+        file_compaction_timeout_secs.unwrap_or_else(default_compaction_timeout_secs);
+    let max_history_messages =
+        file_max_history_messages.unwrap_or_else(default_max_history_messages);
+    let max_session_messages =
+        file_max_session_messages.unwrap_or_else(default_max_session_messages);
+    let compact_keep_recent = file_compact_keep_recent.unwrap_or_else(default_compact_keep_recent);
+
+    let mut channels = normalize_channels(file_channels.unwrap_or_default());
     apply_web_channel_env_overrides(&mut channels);
     apply_channel_bot_token_env_override(&mut channels, "discord", "EGOPULSE_DISCORD_BOT_TOKEN");
     apply_channel_bot_token_env_override(&mut channels, "telegram", "EGOPULSE_TELEGRAM_BOT_TOKEN");
@@ -373,8 +403,14 @@ fn build_config(
         llm_base_url,
         data_dir,
         log_level,
+        compaction_timeout_secs,
+        max_history_messages,
+        max_session_messages,
+        compact_keep_recent,
         channels,
     };
+
+    validate_compaction_config(&config)?;
 
     if config.web_enabled() && config.web_auth_token().is_none() {
         return Err(ConfigError::MissingWebAuthToken);
@@ -397,6 +433,22 @@ fn default_model() -> &'static str {
 
 fn default_llm_base_url() -> &'static str {
     "https://api.openai.com/v1"
+}
+
+fn default_compaction_timeout_secs() -> u64 {
+    180
+}
+
+fn default_max_history_messages() -> usize {
+    50
+}
+
+fn default_max_session_messages() -> usize {
+    40
+}
+
+fn default_compact_keep_recent() -> usize {
+    20
 }
 
 fn default_web_host() -> &'static str {
@@ -425,6 +477,35 @@ fn validate_base_url(value: &str) -> Result<(), ConfigError> {
     Url::parse(value)
         .map(|_| ())
         .map_err(|_| ConfigError::InvalidBaseUrl)
+}
+
+fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
+    if config.compaction_timeout_secs == 0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compaction_timeout_secs must be at least 1".to_string(),
+        ));
+    }
+    if config.max_history_messages == 0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "max_history_messages must be at least 1".to_string(),
+        ));
+    }
+    if config.max_session_messages == 0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "max_session_messages must be at least 1".to_string(),
+        ));
+    }
+    if config.compact_keep_recent == 0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compact_keep_recent must be at least 1".to_string(),
+        ));
+    }
+    if config.compact_keep_recent >= config.max_session_messages {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compact_keep_recent must be less than max_session_messages".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
@@ -599,12 +680,38 @@ mod tests {
         assert_eq!(config.workspace_dir(), default_workspace_dir());
         assert_eq!(config.skills_dir(), default_workspace_dir().join("skills"));
         assert_eq!(config.log_level, "debug");
+        assert_eq!(config.compaction_timeout_secs, 180);
+        assert_eq!(config.max_history_messages, 50);
+        assert_eq!(config.max_session_messages, 40);
+        assert_eq!(config.compact_keep_recent, 20);
         assert!(config.web_enabled());
         assert_eq!(config.web_host(), "127.0.0.1");
         assert_eq!(config.web_port(), 10961);
         assert_eq!(config.web_auth_token(), Some("web-secret"));
         assert!(config.web_allowed_origins().is_empty());
         assert!(config.channel_enabled("web"));
+    }
+
+    #[test]
+    #[serial]
+    fn loads_compaction_settings_from_config_file() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\ncompaction_timeout_secs: 12\nmax_history_messages: 77\nmax_session_messages: 8\ncompact_keep_recent: 3\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+        )
+        .expect("write config");
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(config.compaction_timeout_secs, 12);
+        assert_eq!(config.max_history_messages, 77);
+        assert_eq!(config.max_session_messages, 8);
+        assert_eq!(config.compact_keep_recent, 3);
     }
 
     #[test]
@@ -778,6 +885,48 @@ mod tests {
 
         let error = Config::load(Some(&file_path)).expect_err("missing api key");
         assert!(matches!(error, ConfigError::MissingApiKey));
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_invalid_compaction_settings() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 2\ncompact_keep_recent: 3\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+        )
+        .expect("write config");
+
+        let error = Config::load(Some(&file_path)).expect_err("invalid compaction config");
+
+        assert!(matches!(error, ConfigError::InvalidCompactionConfig(_)));
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_equal_compaction_thresholds() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = temp_dir.path().join("egopulse.config.yaml");
+        let mut file = std::fs::File::create(&file_path).expect("create config");
+        writeln!(
+            file,
+            "model: gpt-4o-mini\napi_key: sk-file\nbase_url: https://api.openai.com/v1\nmax_session_messages: 3\ncompact_keep_recent: 3\nchannels:\n  web:\n    enabled: true\n    auth_token: web-secret"
+        )
+        .expect("write config");
+
+        let error = Config::load(Some(&file_path)).expect_err("equal compaction thresholds");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidCompactionConfig(ref message)
+            if message == "compact_keep_recent must be less than max_session_messages"
+        ));
     }
 
     #[test]

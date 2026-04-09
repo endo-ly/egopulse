@@ -1954,6 +1954,10 @@ mod tests {
             llm_base_url: "http://127.0.0.1:1234/v1".to_string(),
             data_dir: data_dir.to_string(),
             log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
                 "web".to_string(),
                 ChannelConfig {
