@@ -595,7 +595,7 @@ async fn maybe_compact_messages(
         return messages.to_vec();
     }
 
-    archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages);
+    archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages).await;
 
     let keep_recent = state.config.compact_keep_recent.min(messages.len());
     if keep_recent == messages.len() {
@@ -666,7 +666,30 @@ async fn maybe_compact_messages(
     compacted
 }
 
-fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
+async fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
+    let data_dir = data_dir.to_string();
+    let channel = channel.to_string();
+    let messages = messages.to_vec();
+    let join_channel = channel.clone();
+    let join_result = tokio::task::spawn_blocking(move || {
+        archive_conversation_blocking(&data_dir, &channel, chat_id, &messages);
+    })
+    .await;
+
+    if let Err(error) = join_result {
+        warn!(
+            "failed to join archive task for {}:{}: {error}",
+            join_channel, chat_id
+        );
+    }
+}
+
+fn archive_conversation_blocking(
+    data_dir: &str,
+    channel: &str,
+    chat_id: i64,
+    messages: &[Message],
+) {
     let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let unique_suffix = uuid::Uuid::new_v4().simple();
     let channel_dir = if channel.trim().is_empty() {
@@ -689,7 +712,7 @@ fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &
     let mut content = String::new();
     for message in messages {
         let role = &message.role;
-        let text = message_to_text(message);
+        let text = message_to_archive_text(message);
         content.push_str(&format!("## {role}\n\n{text}\n\n---\n\n"));
     }
 
@@ -757,11 +780,11 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 
 fn message_to_text(message: &Message) -> String {
     let content = match &message.content {
-        crate::llm::MessageContent::Text(text) => text.clone(),
+        crate::llm::MessageContent::Text(text) => strip_thinking(text),
         crate::llm::MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                crate::llm::MessageContentPart::InputText { text } => text.clone(),
+                crate::llm::MessageContentPart::InputText { text } => strip_thinking(text),
                 crate::llm::MessageContentPart::InputImage { .. } => "[image]".to_string(),
             })
             .collect::<Vec<_>>()
@@ -769,7 +792,7 @@ fn message_to_text(message: &Message) -> String {
     };
     if message.tool_call_id.is_some() {
         let payload = tool_result_payload(message).unwrap_or_default();
-        let body = tool_result_body(payload);
+        let body = strip_thinking(&tool_result_body(payload));
         let truncated = truncate_summary_text(&body, MAX_TOOL_RESULT_TEXT_CHARS);
         let prefix = if is_tool_error_message(message) {
             "[tool_error]: "
@@ -816,6 +839,46 @@ fn tool_result_body(payload: &str) -> String {
             .unwrap_or_else(|| payload.to_string()),
         Err(_) => payload.to_string(),
     }
+}
+
+fn message_to_archive_text(message: &Message) -> String {
+    let content = match &message.content {
+        crate::llm::MessageContent::Text(text) => strip_thinking(text),
+        crate::llm::MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                crate::llm::MessageContentPart::InputText { text } => strip_thinking(text),
+                crate::llm::MessageContentPart::InputImage { image_url, detail } => match detail {
+                    Some(detail) => format!("[image: {image_url} detail={detail}]"),
+                    None => format!("[image: {image_url}]"),
+                },
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+
+    if message.tool_call_id.is_some() {
+        let payload = tool_result_payload(message).unwrap_or_default();
+        let body = strip_thinking(payload);
+        let prefix = if is_tool_error_message(message) {
+            "[tool_error]: "
+        } else {
+            "[tool_result]: "
+        };
+        return format!("{prefix}{body}");
+    }
+
+    let mut parts = Vec::new();
+    if !content.trim().is_empty() {
+        parts.push(content);
+    }
+    for tool_call in &message.tool_calls {
+        parts.push(format!(
+            "[tool_use: {}({})]",
+            tool_call.name, tool_call.arguments
+        ));
+    }
+    parts.join("\n")
 }
 
 fn tool_result_payload(message: &Message) -> Option<&str> {
@@ -935,7 +998,7 @@ mod tests {
     use serial_test::serial;
 
     use crate::agent_loop::turn::{
-        is_declarative_only_reply, message_to_text, strip_thinking,
+        is_declarative_only_reply, message_to_archive_text, message_to_text, strip_thinking,
         truncate_compaction_summary_input,
     };
     use crate::agent_loop::{SurfaceContext, process_turn};
@@ -1553,6 +1616,13 @@ mod tests {
     }
 
     #[test]
+    fn message_to_text_strips_hidden_reasoning_from_text() {
+        let message = Message::text("assistant", "hello <thought>secret</thought> world");
+
+        assert_eq!(message_to_text(&message), "hello  world");
+    }
+
+    #[test]
     fn message_to_text_renders_multimodal_images() {
         let message = Message {
             role: "user".to_string(),
@@ -1570,6 +1640,20 @@ mod tests {
         };
 
         assert_eq!(message_to_text(&message), "hello\n[image]");
+    }
+
+    #[test]
+    fn message_to_text_strips_hidden_reasoning_from_input_text_and_tool_results() {
+        let message = Message {
+            role: "tool".to_string(),
+            content: MessageContent::parts(vec![MessageContentPart::InputText {
+                text: "prefix <think>secret</think> suffix".to_string(),
+            }]),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
+        };
+
+        assert_eq!(message_to_text(&message), "[tool_result]: prefix  suffix");
     }
 
     #[test]
@@ -1620,6 +1704,44 @@ mod tests {
         assert!(body.ends_with("..."));
         assert_eq!(body.chars().count(), 203);
         assert_eq!(body[..body.len() - 3].chars().count(), 200);
+    }
+
+    #[test]
+    fn message_to_archive_text_preserves_full_tool_payload() {
+        let result = "a".repeat(260);
+        let message = tool_result_message("success", &result);
+
+        let rendered = message_to_archive_text(&message);
+        assert!(rendered.starts_with("[tool_result]: "));
+        assert!(rendered.contains(&result));
+        assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn message_to_archive_text_renders_full_image_and_text_content() {
+        let message = Message {
+            role: "user".to_string(),
+            content: MessageContent::parts(vec![
+                MessageContentPart::InputText {
+                    text: "hello <thinking>internal</thinking> world".to_string(),
+                },
+                MessageContentPart::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: Some("high".to_string()),
+                },
+            ]),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "egopulse"}),
+            }],
+            tool_call_id: None,
+        };
+
+        assert_eq!(
+            message_to_archive_text(&message),
+            "hello  world\n[image: data:image/png;base64,abc detail=high]\n[tool_use: search({\"query\":\"egopulse\"})]"
+        );
     }
 
     #[test]
