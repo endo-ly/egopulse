@@ -121,15 +121,17 @@ where
     // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
     let mut empty_reply_retry_attempted = false;
     let mut declarative_retry_attempted = false;
+    let mut retry_messages: Option<Vec<Message>> = None;
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         emit_event(&on_event, AgentEvent::Iteration { iteration });
+        let request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
         let response = state
             .llm
             .send_message(
                 &system_prompt,
-                messages.clone(),
+                request_messages,
                 Some(state.tools.definitions()),
             )
             .await?;
@@ -144,9 +146,9 @@ where
             if !has_displayable_output && !empty_reply_retry_attempted {
                 empty_reply_retry_attempted = true;
                 warn!("empty visible reply; injecting runtime guard and retrying once");
-                messages.push(Message::text("assistant", raw_content.clone()));
-                messages.push(Message::text(
-                    "user",
+                retry_messages = Some(runtime_guard_messages(
+                    &messages,
+                    &raw_content,
                     "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
                 ));
                 continue;
@@ -161,9 +163,9 @@ where
                 warn!(
                     "declarative-only reply detected; injecting corrective prompt and retrying once"
                 );
-                messages.push(Message::text("assistant", raw_content.clone()));
-                messages.push(Message::text(
-                    "user",
+                retry_messages = Some(runtime_guard_messages(
+                    &messages,
+                    &raw_content,
                     "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
                 ));
                 continue;
@@ -225,14 +227,26 @@ where
 
         // If all tool calls were malformed, treat as end turn
         if valid_tool_calls.is_empty() {
-            let visible_text = strip_thinking(&response.content);
-            let final_content = if visible_text.trim().is_empty() {
+            let raw_content = response.content.trim().to_string();
+            let visible_text = strip_thinking(&raw_content);
+            if visible_text.trim().is_empty() {
                 return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
                     "all tool calls were malformed (empty names)".to_string(),
                 )));
-            } else {
-                visible_text.trim().to_string()
-            };
+            }
+            if !declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
+                declarative_retry_attempted = true;
+                warn!(
+                    "all tool calls were malformed and reply was declarative-only; retrying once"
+                );
+                retry_messages = Some(runtime_guard_messages(
+                    &messages,
+                    &raw_content,
+                    "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
+                ));
+                continue;
+            }
+            let final_content = visible_text.trim().to_string();
 
             let assistant_message = Message::text("assistant", final_content.clone());
             messages.push(assistant_message.clone());
@@ -553,6 +567,17 @@ fn preview_text(value: &str, max_chars: usize) -> String {
     format!("{}...", value.chars().take(max_chars).collect::<String>())
 }
 
+fn runtime_guard_messages(
+    messages: &[Message],
+    assistant_text: &str,
+    guard_text: &str,
+) -> Vec<Message> {
+    let mut retry_messages = messages.to_vec();
+    retry_messages.push(Message::text("assistant", assistant_text.to_string()));
+    retry_messages.push(Message::text("user", guard_text.to_string()));
+    retry_messages
+}
+
 /// `<think`>`...`</think`>` や `<thought`>`...`</thought`>` などの
 /// thinking タグブロックをモデル出力から除去する。
 /// microclaw agent_engine.rs から移植。
@@ -584,7 +609,7 @@ fn strip_thinking(text: &str) -> String {
 /// microclaw の runtime guard パターンから移植。
 fn is_declarative_only_reply(text: &str) -> bool {
     let lower = text.to_lowercase();
-    let patterns = [
+    let english_patterns = [
         "i'll ",
         "i will ",
         "i'll go ahead and ",
@@ -600,11 +625,35 @@ fn is_declarative_only_reply(text: &str) -> bool {
         "sure thing",
         "i'm on it",
     ];
+    let japanese_prefixes = [
+        "了解しました",
+        "承知しました",
+        "わかりました",
+        "かしこまりました",
+        "はい、",
+        "では、",
+        "それでは、",
+        "今から",
+    ];
+    let japanese_action_markers = [
+        "実行します",
+        "確認します",
+        "試してみます",
+        "やってみます",
+        "見てみます",
+        "調べます",
+        "作成します",
+        "書き込みます",
+        "進めます",
+    ];
     // 短いテキスト（≤200文字）だけを対象とする。長い応答は「宣言のみ」ではない。
     if lower.trim().chars().count() > 200 {
         return false;
     }
-    patterns.iter().any(|p| lower.trim().starts_with(p))
+    let trimmed = text.trim();
+    english_patterns.iter().any(|p| lower.trim().starts_with(p))
+        || japanese_prefixes.iter().any(|p| trimmed.starts_with(p))
+        || japanese_action_markers.iter().any(|p| trimmed.contains(p))
 }
 
 #[cfg(test)]
@@ -824,6 +873,26 @@ mod tests {
             .await
             .expect("should succeed after retry");
         assert_eq!(reply, "Here is the answer you need.");
+
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:declarative-guard",
+                Some("declarative-guard"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .all(|message| !message.content.as_text_lossy().contains("[runtime_guard]"))
+        );
     }
 
     #[tokio::test]
@@ -883,6 +952,35 @@ mod tests {
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
+    #[tokio::test]
+    async fn malformed_declarative_tool_reply_retries_then_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "了解しました。実行します。".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-malformed".to_string(),
+                            name: String::new(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    MessagesResponse {
+                        content: "実行結果です。".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let reply = process_turn(&state, &cli_context("malformed-declarative"), "test")
+            .await
+            .expect("should recover after retry");
+        assert_eq!(reply, "実行結果です。");
+    }
+
     #[test]
     fn strip_thinking_removes_thinking_tags() {
         assert_eq!(strip_thinking("hello world"), "hello world");
@@ -908,6 +1006,9 @@ mod tests {
         assert!(is_declarative_only_reply("Sure, let me check that."));
         assert!(is_declarative_only_reply("Of course, I can do that."));
         assert!(is_declarative_only_reply("Let me look into that."));
+        assert!(is_declarative_only_reply("了解しました。実行します。"));
+        assert!(is_declarative_only_reply("承知しました。確認します。"));
+        assert!(is_declarative_only_reply("今から試してみます。"));
 
         // Long responses are NOT declarative-only (regardless of pattern)
         let long = "I'll help you with that. ".repeat(20);
