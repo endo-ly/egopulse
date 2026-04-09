@@ -611,7 +611,7 @@ fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmEr
         .into_iter()
         .next()
         .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-    let tool_calls = choice
+    let mut tool_calls = choice
         .message
         .tool_calls
         .unwrap_or_default()
@@ -619,12 +619,31 @@ fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmEr
         .map(parse_tool_call)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let content = extract_text(
+    let mut content = extract_text(
         choice
             .message
             .content
             .unwrap_or(OpenAiMessageContent::Text(String::new())),
     );
+
+    if tool_calls.is_empty() {
+        if let Some(raw_calls) = extract_raw_tool_use_blocks(&content) {
+            for raw in raw_calls {
+                let arguments = if raw.input_json.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&raw.input_json).unwrap_or_else(|_| serde_json::json!({}))
+                };
+                tool_calls.push(ToolCall {
+                    id: raw.id,
+                    name: raw.name,
+                    arguments,
+                });
+            }
+            content = strip_raw_tool_use_text(&content);
+        }
+    }
+
     if content.is_empty() && tool_calls.is_empty() {
         return Err(LlmError::InvalidResponse(
             "assistant content was empty".to_string(),
@@ -677,7 +696,26 @@ fn parse_responses_response(body: ResponsesApiResponse) -> Result<MessagesRespon
         }
     }
 
-    let content = content_parts.join("\n").trim().to_string();
+    let mut content = content_parts.join("\n").trim().to_string();
+
+    if tool_calls.is_empty() {
+        if let Some(raw_calls) = extract_raw_tool_use_blocks(&content) {
+            for raw in raw_calls {
+                let arguments = if raw.input_json.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&raw.input_json).unwrap_or_else(|_| serde_json::json!({}))
+                };
+                tool_calls.push(ToolCall {
+                    id: raw.id,
+                    name: raw.name,
+                    arguments,
+                });
+            }
+            content = strip_raw_tool_use_text(&content);
+        }
+    }
+
     if content.is_empty() && tool_calls.is_empty() {
         return Err(LlmError::InvalidResponse(
             "assistant content was empty".to_string(),
@@ -841,6 +879,186 @@ fn preview_body(body: &str) -> String {
     }
 }
 
+// Raw tool-use rescue: some LLM providers emit tool calls as raw text
+// `[tool_use: name(args)]` instead of structured `tool_calls` fields.
+
+struct RawToolUseBlock {
+    id: String,
+    name: String,
+    input_json: String,
+}
+
+fn strip_minimax_tool_wrappers(text: &str) -> String {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"</?(?:minimax:tool_call|invoke|parameter)>")
+            .expect("MiniMax tool wrapper regex must compile")
+    });
+    RE.replace_all(text, " ").into_owned()
+}
+
+fn parse_raw_tool_use_block(input: &str, call_number: usize) -> Option<(RawToolUseBlock, &str)> {
+    let rest = input.trim_start();
+    let prefix = "[tool_use:";
+    if !rest.starts_with(prefix) {
+        return None;
+    }
+
+    let mut cursor = prefix.len();
+    let after_prefix = &rest[cursor..];
+    let name_and_args = after_prefix.trim_start();
+    cursor += after_prefix.len().saturating_sub(name_and_args.len());
+
+    let open_paren_rel = name_and_args.find('(')?;
+    let name = name_and_args[..open_paren_rel].trim();
+    if name.is_empty() {
+        return None;
+    }
+    cursor += open_paren_rel + 1;
+
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaping = false;
+    let mut close_paren_at: Option<usize> = None;
+
+    for (offset, ch) in rest[cursor..].char_indices() {
+        if in_string {
+            if escaping {
+                escaping = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaping = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_paren_at = Some(cursor + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let close_paren_at = close_paren_at?;
+    let args = rest[cursor..close_paren_at].trim();
+    let mut tail = &rest[close_paren_at + 1..];
+    tail = tail.trim_start();
+    if !tail.starts_with(']') {
+        return None;
+    }
+
+    Some((
+        RawToolUseBlock {
+            id: format!("raw_tool_call_{call_number}_{}", uuid::Uuid::new_v4()),
+            name: name.to_string(),
+            input_json: if args.is_empty() {
+                "{}".to_string()
+            } else {
+                args.to_string()
+            },
+        },
+        &tail[1..],
+    ))
+}
+
+fn extract_raw_tool_use_blocks(text: &str) -> Option<Vec<RawToolUseBlock>> {
+    let normalized = strip_minimax_tool_wrappers(text);
+
+    let mut calls = Vec::new();
+    let mut rest = normalized.as_str();
+    while let Some(pos) = rest.find("[tool_use:") {
+        if let Some((call, tail)) = parse_raw_tool_use_block(&rest[pos..], calls.len() + 1) {
+            calls.push(call);
+            rest = tail;
+        } else {
+            // Skip malformed block and continue scanning
+            rest = &rest[pos + "[tool_use:".len()..];
+        }
+    }
+
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
+/// Removes raw `[tool_use: ...]` blocks from text, returning cleaned text.
+fn strip_raw_tool_use_text(text: &str) -> String {
+    let normalized = strip_minimax_tool_wrappers(text);
+    let mut result = String::with_capacity(normalized.len());
+    let mut rest = normalized.as_str();
+
+    while let Some(pos) = rest.find("[tool_use:") {
+        result.push_str(&rest[..pos]);
+        let remaining = &rest[pos..];
+        if let Some(close) = find_raw_tool_use_end(remaining) {
+            rest = &remaining[close..];
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_string()
+}
+
+/// Finds the end position (after `]`) of a `[tool_use: ...]` block.
+fn find_raw_tool_use_end(text: &str) -> Option<usize> {
+    let prefix = "[tool_use:";
+    if !text.starts_with(prefix) {
+        return None;
+    }
+    let after_prefix = &text[prefix.len()..].trim_start();
+    let open_paren = after_prefix.find('(')?;
+    let offset_to_open_paren = text[prefix.len()..].len() - after_prefix.len();
+    let cursor = prefix.len() + offset_to_open_paren + open_paren + 1;
+
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaping = false;
+
+    for (offset, ch) in text[cursor..].char_indices() {
+        if in_string {
+            if escaping {
+                escaping = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaping = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let after_close = cursor + offset + 1;
+                    let remaining = &text[after_close..];
+                    let trimmed = remaining.trim_start();
+                    let skipped = remaining.len() - trimmed.len();
+                    if trimmed.starts_with(']') {
+                        return Some(after_close + skipped + 1);
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAiResponse {
     choices: Vec<Choice>,
@@ -932,6 +1150,7 @@ mod tests {
 
     use super::{
         Message, MessageContent, MessageContentPart, ToolCall, ToolDefinition, create_provider,
+        extract_raw_tool_use_blocks,
     };
 
     fn message(content: &str) -> Vec<Message> {
@@ -1176,5 +1395,85 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.content, "I can see the image");
+    }
+
+    #[test]
+    fn extracts_raw_tool_use_from_text() {
+        let text = "[tool_use: bash({\"command\": \"ls\"})]";
+        let blocks = extract_raw_tool_use_blocks(text);
+        assert!(blocks.is_some());
+        let blocks = blocks.unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(blocks[0].input_json, "{\"command\": \"ls\"}");
+    }
+
+    #[test]
+    fn extracts_multiple_raw_tool_use_blocks() {
+        let text = "[tool_use: bash({\"command\": \"ls\"})]\n[tool_use: read_file({\"path\": \"test.txt\"})]";
+        let blocks = extract_raw_tool_use_blocks(text).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(blocks[1].name, "read_file");
+    }
+
+    #[test]
+    fn ignores_text_without_raw_tool_use() {
+        let text = "This is just regular text";
+        assert!(extract_raw_tool_use_blocks(text).is_none());
+    }
+
+    #[test]
+    fn raw_tool_use_rescue_in_parse_openai_response() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "[tool_use: bash({\"command\": \"pwd\"})]",
+                    "tool_calls": null
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "bash");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"command": "pwd"})
+        );
+        assert!(response.content.is_empty() || response.content.trim().is_empty());
+    }
+
+    #[test]
+    fn explicit_tool_calls_take_priority_over_raw() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Let me help with that",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\": \"test.txt\"}"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.content, "Let me help with that");
+    }
+
+    #[test]
+    fn extracts_raw_tool_use_embedded_in_normal_text() {
+        let text = "了解。[tool_use: bash({\"command\": \"ls\"})] を実行します。";
+        let blocks = extract_raw_tool_use_blocks(text).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "bash");
     }
 }
