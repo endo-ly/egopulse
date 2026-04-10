@@ -13,6 +13,10 @@ use super::{WebState, web_external_chat_id, web_session_key};
 
 const MAX_LIMIT: usize = 500;
 
+fn parse_chat_id_from_session_key(key: &str) -> Option<i64> {
+    key.strip_prefix("chat:")?.parse::<i64>().ok()
+}
+
 #[derive(Debug, Deserialize)]
 /// Captures query parameters for loading web chat history.
 pub(super) struct HistoryQuery {
@@ -50,7 +54,11 @@ pub(super) async fn list_sessions(
     let items = sessions
         .into_iter()
         .map(|session| {
-            let session_key = web_session_key(&session.surface_thread);
+            let session_key = if session.channel == "web" {
+                web_session_key(&session.surface_thread)
+            } else {
+                format!("chat:{}", session.chat_id)
+            };
             SessionItem {
                 label: session
                     .chat_title
@@ -74,30 +82,41 @@ pub(super) async fn get_history(
     State(state): State<WebState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let session_key = web_session_key(query.session_key.as_deref().unwrap_or("main"));
-    let external_chat_id = web_external_chat_id(&session_key);
+    let requested_session_key = query.session_key.as_deref().unwrap_or("main");
+    let parsed_chat_id = parse_chat_id_from_session_key(requested_session_key);
+    let session_key = parsed_chat_id
+        .map(|chat_id| format!("chat:{chat_id}"))
+        .unwrap_or_else(|| web_session_key(requested_session_key));
     let limit = std::cmp::min(query.limit.unwrap_or(100), MAX_LIMIT);
     let db = state.app_state.db.clone();
 
-    let chat_id = match call_blocking(db.clone(), {
-        let channel = "web".to_string();
-        let external_chat_id = external_chat_id.clone();
-        move |db| db.resolve_chat_id(&channel, &external_chat_id)
-    })
-    .await
-    {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Ok(Json(
-                serde_json::json!({"ok": true, "session_key": session_key, "messages": []}),
-            ));
-        }
-        Err(error) => {
-            tracing::warn!(session_key = %session_key, error = %error, "failed to resolve web session");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "messages": [], "error": error.to_string()})),
-            ));
+    let chat_id = match parsed_chat_id {
+        Some(chat_id) => chat_id,
+        None => {
+            let external_chat_id = web_external_chat_id(&session_key);
+            match call_blocking(db.clone(), {
+                let channel = "web".to_string();
+                let external_chat_id = external_chat_id.clone();
+                move |db| db.resolve_chat_id(&channel, &external_chat_id)
+            })
+            .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return Ok(Json(
+                        serde_json::json!({"ok": true, "session_key": session_key, "messages": []}),
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(session_key = %session_key, error = %error, "failed to resolve web session");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({"ok": false, "messages": [], "error": error.to_string()}),
+                        ),
+                    ));
+                }
+            }
         }
     };
 
@@ -123,4 +142,23 @@ pub(super) async fn get_history(
             "timestamp": message.timestamp,
         })).collect::<Vec<_>>()
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_chat_id_from_session_key;
+
+    #[test]
+    fn parses_chat_session_keys() {
+        assert_eq!(parse_chat_id_from_session_key("chat:42"), Some(42));
+        assert_eq!(parse_chat_id_from_session_key("chat:-7"), Some(-7));
+    }
+
+    #[test]
+    fn rejects_non_chat_session_keys() {
+        assert_eq!(parse_chat_id_from_session_key("main"), None);
+        assert_eq!(parse_chat_id_from_session_key("web:main"), None);
+        assert_eq!(parse_chat_id_from_session_key("chat:"), None);
+        assert_eq!(parse_chat_id_from_session_key("chat:abc"), None);
+    }
 }

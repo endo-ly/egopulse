@@ -730,6 +730,7 @@ function App() {
                 }}
               >
                 <strong>{item.label}</strong>
+                <span className="session-channel-badge">{item.channel}</span>
                 <small>{item.last_message_preview || "No messages yet"}</small>
               </button>
             ))}
