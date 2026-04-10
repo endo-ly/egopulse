@@ -1,13 +1,13 @@
 :root {
   color-scheme: dark;
-  --bg: #05110f;
-  --panel: #0b1d19;
-  --panel-2: #102823;
-  --border: rgba(148, 163, 184, 0.18);
-  --text: #e6f4f0;
-  --muted: #8aa6a0;
-  --accent: #4ade80;
-  --accent-2: #22c55e;
+  --bg: #040812;
+  --panel: #081020;
+  --panel-2: #0e1830;
+  --border: rgba(0, 212, 255, 0.10);
+  --text: #dce4f0;
+  --muted: #6b7fa8;
+  --accent: #00d4ff;
+  --accent-2: #c084fc;
   --danger: #f87171;
 }
 
@@ -30,10 +30,10 @@ body,
   background:
     radial-gradient(
       circle at top left,
-      rgba(34, 197, 94, 0.15),
-      transparent 28%
+      rgba(0, 212, 255, 0.06),
+      transparent 32%
     ),
-    linear-gradient(180deg, #071512 0%, #030806 100%);
+    linear-gradient(180deg, #060a14 0%, #030508 100%);
   color: var(--text);
 }
 
@@ -50,7 +50,8 @@ button {
 .app-shell {
   display: grid;
   grid-template-columns: 320px 1fr;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -59,8 +60,9 @@ button {
   gap: 12px;
   padding: 20px;
   border-right: 1px solid var(--border);
-  background: rgba(4, 11, 10, 0.82);
+  background: rgba(4, 8, 18, 0.85);
   backdrop-filter: blur(20px);
+  overflow: hidden;
 }
 
 .brand {
@@ -100,8 +102,8 @@ button {
 }
 
 .primary-button {
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #04110d;
+  background: var(--accent-2);
+  color: #040812;
   font-weight: 700;
   padding: 12px 14px;
 }
@@ -165,29 +167,75 @@ button {
   width: 100%;
   padding: 12px;
   text-align: left;
-  background: rgba(11, 29, 25, 0.8);
+  background: rgba(8, 16, 32, 0.8);
   color: var(--text);
 }
 
 .session-item.active {
-  border-color: rgba(74, 222, 128, 0.45);
-  box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.18);
+  border-color: rgba(192, 132, 252, 0.45);
+  box-shadow: 0 0 0 1px rgba(192, 132, 252, 0.18);
+  border-left: 3px solid rgba(192, 132, 252, 0.7);
+  padding-left: 9px;
 }
 
-.session-item strong,
+.session-item strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
 .session-item small {
   display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
 }
 
-.session-item small {
-  margin-top: 4px;
+.session-channel-badge {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.session-channel-badge[data-channel="web"],
+.session-item [data-channel="web"] .session-channel-badge {
+  background: rgba(0, 212, 255, 0.10);
+  color: #4de0ff;
+}
+
+.session-channel-badge[data-channel="discord"],
+.session-item [data-channel="discord"] .session-channel-badge {
+  background: rgba(192, 132, 252, 0.10);
+  color: #c084fc;
+}
+
+.session-channel-badge[data-channel="telegram"],
+.session-item [data-channel="telegram"] .session-channel-badge {
+  background: rgba(107, 127, 168, 0.12);
+  color: #8fa4c8;
+}
+
+.session-channel-badge[data-channel="cli"],
+.session-item [data-channel="cli"] .session-channel-badge {
+  background: var(--panel-2);
   color: var(--muted);
 }
 
 .main-panel {
   display: grid;
   grid-template-rows: auto 1fr auto;
-  min-height: 100vh;
+  overflow: hidden;
 }
 
 .chat-header {
@@ -197,7 +245,7 @@ button {
   gap: 12px;
   padding: 24px;
   border-bottom: 1px solid var(--border);
-  background: rgba(6, 15, 13, 0.5);
+  background: rgba(6, 10, 22, 0.5);
   backdrop-filter: blur(16px);
 }
 
@@ -210,7 +258,7 @@ button {
 }
 
 .status-badge.ok {
-  color: #bbf7d0;
+  color: #5ceaff;
 }
 
 .status-badge.error {
@@ -222,6 +270,7 @@ button {
   flex-direction: column;
   gap: 16px;
   overflow: auto;
+  min-height: 0;
   padding: 24px;
 }
 
@@ -230,17 +279,14 @@ button {
   padding: 16px 18px;
   border: 1px solid var(--border);
   border-radius: 20px;
-  background: rgba(10, 27, 23, 0.85);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+  background: rgba(8, 16, 32, 0.85);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
 }
 
 .bubble-user {
   align-self: flex-end;
-  background: linear-gradient(
-    135deg,
-    rgba(74, 222, 128, 0.2),
-    rgba(34, 197, 94, 0.16)
-  );
+  border-color: rgba(192, 132, 252, 0.18);
+  background: rgba(192, 132, 252, 0.06);
 }
 
 .bubble-bot {
@@ -269,7 +315,7 @@ button {
   gap: 14px;
   padding: 24px;
   border-top: 1px solid var(--border);
-  background: rgba(6, 15, 13, 0.68);
+  background: rgba(6, 10, 22, 0.7);
   backdrop-filter: blur(16px);
 }
 
@@ -278,7 +324,7 @@ button {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 16px;
-  background: rgba(10, 22, 19, 0.86);
+  background: rgba(8, 14, 30, 0.86);
   color: var(--text);
   padding: 14px 16px;
 }
@@ -288,12 +334,18 @@ button {
   min-height: 72px;
 }
 
+.composer textarea:focus {
+  outline: none;
+  border-color: rgba(192, 132, 252, 0.5);
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.12);
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(2, 6, 5, 0.7);
+  background: rgba(3, 5, 12, 0.75);
   padding: 20px;
 }
 
@@ -303,8 +355,8 @@ button {
   border-radius: 28px;
   background: linear-gradient(
     180deg,
-    rgba(8, 22, 19, 0.98),
-    rgba(5, 14, 12, 0.98)
+    rgba(10, 16, 30, 0.98),
+    rgba(6, 10, 20, 0.98)
   );
   box-shadow: 0 28px 60px rgba(0, 0, 0, 0.3);
 }
