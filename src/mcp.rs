@@ -415,9 +415,10 @@ async fn connect_stdio(
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
     );
 
-    let client = client_info
-        .into_dyn()
-        .serve(child)
+    let client =
+        client_info
+            .into_dyn()
+            .serve(child)
             .await
             .map_err(|error| McpError::ConnectionFailed {
                 server: name.to_string(),
