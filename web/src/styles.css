@@ -410,29 +410,6 @@ button {
   font-size: 0.88rem;
 }
 
-@media (max-width: 960px) {
-  .app-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .sidebar {
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .main-panel {
-    min-height: auto;
-  }
-
-  .composer {
-    grid-template-columns: 1fr;
-  }
-
-  .bubble {
-    max-width: 100%;
-  }
-
-  .grid-two,
 .config-form select {
   width: 100%;
   border: 1px solid var(--border);
@@ -545,8 +522,34 @@ button {
   letter-spacing: 0.04em;
 }
 
-.config-footer {
+@media (max-width: 960px) {
+  .app-shell {
     grid-template-columns: 1fr;
-    display: grid;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .main-panel {
+    min-height: auto;
+  }
+
+  .composer {
+    grid-template-columns: 1fr;
+  }
+
+  .bubble {
+    max-width: 100%;
+  }
+
+  .grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .config-footer {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }

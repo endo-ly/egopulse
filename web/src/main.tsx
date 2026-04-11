@@ -877,6 +877,7 @@ function App() {
                     const provider = config.providers.find(
                       (item) => item.id === providerId,
                     );
+                    setConfigApiKey("");
                     setConfig({
                       ...config,
                       default_provider: providerId,
@@ -1019,6 +1020,9 @@ function App() {
                           value={override.provider || ""}
                           onChange={(event) => {
                             const value = event.target.value;
+                            const provider = config.providers.find(
+                              (item) => item.id === value,
+                            );
                             setConfig({
                               ...config,
                               channel_overrides: {
@@ -1026,6 +1030,7 @@ function App() {
                                 [channel]: {
                                   ...override,
                                   provider: value || undefined,
+                                  model: provider?.default_model || undefined,
                                 },
                               },
                             });
