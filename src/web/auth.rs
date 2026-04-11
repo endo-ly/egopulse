@@ -163,7 +163,7 @@ impl OriginParts {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use crate::config::{ChannelConfig, Config};
+    use crate::config::{ChannelConfig, Config, ProviderConfig};
 
     use super::{
         OriginParts, constant_time_eq, is_authorized_bearer, is_valid_ws_token,
@@ -172,9 +172,17 @@ mod tests {
 
     fn config_with_web(auth_token: Option<&str>, allowed_origins: Option<Vec<String>>) -> Config {
         Config {
-            model: "gpt-4o-mini".to_string(),
-            api_key: None,
-            llm_base_url: "http://127.0.0.1:1234/v1".to_string(),
+            default_provider: "local".to_string(),
+            providers: std::collections::HashMap::from([(
+                "local".to_string(),
+                ProviderConfig {
+                    label: "Local".to_string(),
+                    base_url: "http://127.0.0.1:1234/v1".to_string(),
+                    api_key: None,
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
             data_dir: ".egopulse".to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,

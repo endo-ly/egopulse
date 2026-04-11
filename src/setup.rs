@@ -441,6 +441,8 @@ impl SetupApp {
             .find(|f| f.key == "API_KEY")
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
+        let provider_id = infer_provider_id(&base_url);
+        let provider_label = infer_provider_label(&provider_id);
 
         let existing_token = self
             .original_yaml
@@ -513,28 +515,52 @@ impl SetupApp {
 
         let map = yaml_value.as_mapping_mut().unwrap();
 
-        map.insert(
-            serde_yml::Value::String("model".into()),
-            serde_yml::Value::String(model.clone()),
-        );
-        if !api_key.is_empty() {
-            map.insert(
-                serde_yml::Value::String("api_key".into()),
-                serde_yml::Value::String(api_key.clone()),
-            );
-        } else {
-            map.remove(serde_yml::Value::String("api_key".into()));
-        }
-        map.insert(
-            serde_yml::Value::String("base_url".into()),
-            serde_yml::Value::String(base_url.clone()),
-        );
+        map.remove(serde_yml::Value::String("model".into()));
+        map.remove(serde_yml::Value::String("api_key".into()));
+        map.remove(serde_yml::Value::String("base_url".into()));
         map.remove(serde_yml::Value::String("data_dir".into()));
         map.remove(serde_yml::Value::String("workspace_dir".into()));
+        map.insert(
+            serde_yml::Value::String("default_provider".into()),
+            serde_yml::Value::String(provider_id.clone()),
+        );
         map.insert(
             serde_yml::Value::String("log_level".into()),
             serde_yml::Value::String("info".into()),
         );
+
+        let providers_value = map
+            .entry(serde_yml::Value::String("providers".into()))
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        let providers_map = providers_value.as_mapping_mut().unwrap();
+        let provider_value = providers_map
+            .entry(serde_yml::Value::String(provider_id.clone()))
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        let provider_map = provider_value.as_mapping_mut().unwrap();
+        provider_map.insert(
+            serde_yml::Value::String("label".into()),
+            serde_yml::Value::String(provider_label.clone()),
+        );
+        provider_map.insert(
+            serde_yml::Value::String("base_url".into()),
+            serde_yml::Value::String(base_url.clone()),
+        );
+        provider_map.insert(
+            serde_yml::Value::String("default_model".into()),
+            serde_yml::Value::String(model.clone()),
+        );
+        provider_map.insert(
+            serde_yml::Value::String("models".into()),
+            serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]),
+        );
+        if !api_key.is_empty() {
+            provider_map.insert(
+                serde_yml::Value::String("api_key".into()),
+                serde_yml::Value::String(api_key.clone()),
+            );
+        } else {
+            provider_map.remove(serde_yml::Value::String("api_key".into()));
+        }
 
         let mut channels = serde_yml::Value::Mapping(Default::default());
         let channels_map = channels.as_mapping_mut().unwrap();
@@ -602,6 +628,7 @@ impl SetupApp {
         // 保存後の確認を端末上で完結できるよう、反映内容を要約して残す。
         self.completion_summary = vec![
             format!("Config saved to: {}", config_path.display()),
+            format!("Provider: {provider_label} ({provider_id})"),
             format!("Model: {model}"),
             format!("Base URL: {base_url}"),
             if api_key.is_empty() {
@@ -650,6 +677,29 @@ fn generate_auth_token() -> String {
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
     STANDARD.encode(&bytes)
+}
+
+fn infer_provider_id(base_url: &str) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+    if normalized == "https://api.openai.com/v1" {
+        "openai".to_string()
+    } else if normalized == "https://openrouter.ai/api/v1" {
+        "openrouter".to_string()
+    } else if base_url_allows_empty_api_key(normalized) {
+        "local".to_string()
+    } else {
+        "custom".to_string()
+    }
+}
+
+fn infer_provider_label(provider_id: &str) -> String {
+    match provider_id {
+        "openai" => "OpenAI".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        "local" => "Local OpenAI-compatible".to_string(),
+        "custom" => "Custom OpenAI-compatible".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn mask_secret(value: &str) -> String {

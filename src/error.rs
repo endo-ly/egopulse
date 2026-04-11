@@ -34,7 +34,7 @@ pub enum ConfigError {
     #[error("config_not_found: {path}")]
     ConfigNotFound { path: PathBuf },
     #[error(
-        "config_auto_discovery_failed: no egopulse.config.yaml found. searched={searched_paths:?}. run 'egopulse setup', pass --config <PATH>, or set EGOPULSE_MODEL / EGOPULSE_BASE_URL / EGOPULSE_API_KEY explicitly"
+        "config_auto_discovery_failed: no egopulse.config.yaml found. searched={searched_paths:?}. run 'egopulse setup' or pass --config <PATH>"
     )]
     AutoConfigNotFound { searched_paths: Vec<PathBuf> },
     #[error("config_read_failed: {path}: {source}")]
@@ -45,18 +45,26 @@ pub enum ConfigError {
     },
     #[error("config_parse_failed: {path}: {detail}")]
     ConfigParseFailed { path: PathBuf, detail: String },
-    #[error("missing_model")]
-    MissingModel,
-    #[error("missing_base_url")]
-    MissingBaseUrl,
+    #[error("missing_default_provider")]
+    MissingDefaultProvider,
+    #[error("missing_providers")]
+    MissingProviders,
+    #[error("missing_provider")]
+    MissingProvider,
+    #[error("missing_provider_base_url: {provider}")]
+    MissingProviderBaseUrl { provider: String },
+    #[error("missing_provider_default_model: {provider}")]
+    MissingProviderDefaultModel { provider: String },
+    #[error("invalid_provider_reference: {provider}")]
+    InvalidProviderReference { provider: String },
     #[error("invalid_base_url")]
     InvalidBaseUrl,
     #[error("web_channel_disabled")]
     WebChannelDisabled,
     #[error("missing_web_auth_token")]
     MissingWebAuthToken,
-    #[error("missing_api_key")]
-    MissingApiKey,
+    #[error("missing_provider_api_key: {provider}")]
+    MissingProviderApiKey { provider: String },
     #[error("invalid_compaction_config: {0}")]
     InvalidCompactionConfig(String),
     #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
