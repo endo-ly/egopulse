@@ -151,8 +151,24 @@ pub(super) async fn api_put_config(
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string())),
     };
 
+    let selected_provider_default_model = config
+        .providers
+        .get(default_provider)
+        .map(|provider| provider.default_model.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unknown provider: {default_provider}"),
+            )
+        })?;
+
     config.default_provider = default_provider.to_string();
-    config.default_model = default_model.to_string();
+    config.default_model =
+        if config.default_model.is_none() && default_model == selected_provider_default_model {
+            None
+        } else {
+            Some(default_model.to_string())
+        };
 
     let web_enabled = request.web_enabled;
     let web_host = request.web_host.trim().to_string();

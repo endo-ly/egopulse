@@ -26,10 +26,14 @@ pub struct ChannelConfig {
     pub model: Option<String>,
     /// Web: browser/client authentication token.
     pub auth_token: Option<String>,
+    #[serde(skip)]
+    pub file_auth_token: Option<String>,
     /// Web: allowed Origin values for WebSocket connections.
     pub allowed_origins: Option<Vec<String>>,
     /// Discord / Telegram 共通: bot token
     pub bot_token: Option<String>,
+    #[serde(skip)]
+    pub file_bot_token: Option<String>,
     /// Telegram: bot username (group メンション検知用)
     pub bot_username: Option<String>,
     /// Telegram: DM 許可ユーザー ID (空 = 全員許可)
@@ -164,8 +168,8 @@ struct FileConfig {
 #[derive(Clone)]
 pub struct Config {
     pub default_provider: String,
-    /// Resolved global default model (YAML `default_model` or provider's `default_model`).
-    pub default_model: String,
+    /// Optional global model override (YAML `default_model`).
+    pub default_model: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
     pub data_dir: String,
     pub log_level: String,
@@ -220,7 +224,10 @@ impl Config {
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
-            model: self.default_model.clone(),
+            model: self
+                .default_model
+                .clone()
+                .unwrap_or_else(|| provider.default_model.clone()),
         }
     }
 
@@ -246,7 +253,11 @@ impl Config {
             .channels
             .get(&channel_key)
             .and_then(|config| config.model.clone())
-            .unwrap_or_else(|| self.default_model.clone());
+            .unwrap_or_else(|| {
+                self.default_model
+                    .clone()
+                    .unwrap_or_else(|| provider.default_model.clone())
+            });
 
         Ok(ResolvedLlmConfig {
             provider: provider_name,
@@ -416,6 +427,8 @@ fn normalize_channels(
         if key.is_empty() {
             continue;
         }
+        config.file_auth_token = normalize_string(config.auth_token.clone());
+        config.file_bot_token = normalize_string(config.bot_token.clone());
         config.provider = normalize_string(config.provider);
         config.model = normalize_string(config.model);
         normalized.insert(key, config);
@@ -578,13 +591,7 @@ fn build_config(
         });
     }
 
-    let default_model = normalize_string(file_default_model).unwrap_or_else(|| {
-        providers
-            .get(&default_provider)
-            .expect("validated above")
-            .default_model
-            .clone()
-    });
+    let default_model = normalize_string(file_default_model);
 
     let data_dir = default_data_dir().to_string_lossy().into_owned();
 
@@ -775,7 +782,8 @@ fn is_local_url(value: &str) -> bool {
 #[derive(Serialize)]
 struct SerializableConfig {
     default_provider: String,
-    default_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
     data_dir: String,
     log_level: String,
     compaction_timeout_secs: u64,
@@ -857,9 +865,9 @@ impl From<&Config> for SerializableConfig {
                         host: c.host.clone(),
                         provider: c.provider.clone(),
                         model: c.model.clone(),
-                        auth_token: c.auth_token.clone(),
+                        auth_token: c.file_auth_token.clone(),
                         allowed_origins: c.allowed_origins.clone(),
-                        bot_token: c.bot_token.clone(),
+                        bot_token: c.file_bot_token.clone(),
                         bot_username: c.bot_username.clone(),
                         allowed_user_ids: c.allowed_user_ids.clone(),
                         allowed_channels: c.allowed_channels.clone(),
@@ -1240,8 +1248,8 @@ channels:
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
-        // config.default_model takes the YAML-level value
-        assert_eq!(config.default_model, "gpt-5");
+        // config.default_model preserves the YAML-level override as Some
+        assert_eq!(config.default_model, Some("gpt-5".to_string()));
 
         // resolve_global_llm uses config.default_model
         let global = config.resolve_global_llm();
@@ -1275,7 +1283,7 @@ channels:
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
-        assert_eq!(config.default_model, "gpt-4o-mini");
+        assert_eq!(config.default_model, None);
         let global = config.resolve_global_llm();
         assert_eq!(global.model, "gpt-4o-mini");
     }

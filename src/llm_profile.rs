@@ -111,11 +111,7 @@ async fn handle_provider_command(
     let mut config = Config::load_allow_missing_api_key(Some(path))?;
     if scope == GLOBAL_SCOPE {
         config.default_provider = value.to_string();
-        config.default_model = config
-            .providers
-            .get(value)
-            .map(|p| p.default_model.clone())
-            .unwrap_or_default();
+        config.default_model = None;
     } else {
         let channel = config.channels.entry(scope.clone()).or_default();
         channel.provider = Some(value.to_string());
@@ -149,13 +145,12 @@ async fn handle_model_command(
     let value = first_non_scope_arg(&parts[1..]).unwrap_or_default();
     if value == "reset" {
         if scope == GLOBAL_SCOPE {
-            let provider = config.global_provider();
             let mut config = Config::load_allow_missing_api_key(Some(config_path(state)?))?;
-            config.default_model = provider.default_model.clone();
+            config.default_model = None;
             config.save_yaml(config_path(state)?)?;
             return Ok(format!(
                 "scope={scope} model reset -> {}",
-                provider.default_model
+                config.global_provider().default_model
             ));
         }
         let path = config_path(state)?;
@@ -172,7 +167,7 @@ async fn handle_model_command(
     let path = config_path(state)?;
     let mut config = Config::load_allow_missing_api_key(Some(path))?;
     if scope == GLOBAL_SCOPE {
-        config.default_model = value.to_string();
+        config.default_model = Some(value.to_string());
         if let Some(provider) = config.providers.get_mut(&config.default_provider) {
             if !provider.models.iter().any(|m| m == value) {
                 provider.models.push(value.to_string());
