@@ -38,6 +38,15 @@ pub struct SessionSummary {
     pub last_message_preview: Option<String>,
 }
 
+/// chat_id から引けるチャネル識別情報。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatInfo {
+    pub chat_id: i64,
+    pub channel: String,
+    pub external_chat_id: String,
+    pub chat_type: String,
+}
+
 /// Combined session snapshot: serialized messages JSON plus recent message records.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
@@ -147,6 +156,27 @@ impl Database {
             |row| row.get::<_, i64>(0),
         ) {
             Ok(chat_id) => Ok(Some(chat_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// chat_id からチャネル・外部 ID の情報を取得する。
+    pub fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT channel, external_chat_id, chat_type FROM chats WHERE chat_id = ?1 LIMIT 1",
+            params![chat_id],
+            |row| {
+                Ok(ChatInfo {
+                    chat_id,
+                    channel: row.get(0)?,
+                    external_chat_id: row.get(1)?,
+                    chat_type: row.get(2)?,
+                })
+            },
+        ) {
+            Ok(info) => Ok(Some(info)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }

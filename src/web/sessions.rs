@@ -13,7 +13,7 @@ use super::{WebState, web_external_chat_id, web_session_key};
 
 const MAX_LIMIT: usize = 500;
 
-fn parse_chat_id_from_session_key(key: &str) -> Option<i64> {
+pub(crate) fn parse_chat_id_from_session_key(key: &str) -> Option<i64> {
     key.strip_prefix("chat:")?.parse::<i64>().ok()
 }
 
