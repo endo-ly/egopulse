@@ -12,6 +12,7 @@ use serde_yml::{Mapping, Value};
 
 use crate::config::{Config, default_config_path};
 use crate::config_store::update_yaml;
+use crate::error::ConfigError;
 
 use super::WebState;
 
@@ -61,6 +62,8 @@ pub(super) struct ConfigUpdateRequest {
     web_port: u16,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    clear_api_key: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,8 +78,11 @@ pub(super) async fn api_get_config(
     Query(query): Query<ConfigQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = config_path_for_save(&state);
-    let display = Config::load_allow_missing_api_key(Some(&path))
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let display = match Config::load_allow_missing_api_key(Some(&path)) {
+        Ok(config) => Some(config),
+        Err(ConfigError::ConfigNotFound { .. }) => None,
+        Err(error) => return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+    };
     let scope = query
         .scope
         .as_deref()
@@ -86,7 +92,10 @@ pub(super) async fn api_get_config(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path, &scope)?,
+        "config": match display.as_ref() {
+            Some(display) => payload_from_config(display, &path, &scope)?,
+            None => default_payload(&path, &scope),
+        },
     })))
 }
 
@@ -115,23 +124,35 @@ pub(super) async fn api_put_config(
     }
 
     let path = config_path_for_save(&state);
+    let current_config = match Config::load_allow_missing_api_key(Some(&path)) {
+        Ok(config) => Some(config),
+        Err(ConfigError::ConfigNotFound { .. }) => None,
+        Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string())),
+    };
     update_yaml(&path, |root| {
-        upsert_provider(
-            root,
-            provider,
-            model,
-            request
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            request.api_key.as_deref().map(str::trim),
-        )
-        .map_err(|(_, error)| crate::error::EgoPulseError::Internal(error))?;
-
         if scope == GLOBAL_SCOPE {
+            upsert_provider(
+                root,
+                provider,
+                model,
+                request
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                normalized_api_key_update(request.api_key.as_deref(), request.clear_api_key),
+            )
+            .map_err(|(_, error)| crate::error::EgoPulseError::Internal(error))?;
             set_string(root, "default_provider", provider);
         } else {
+            if current_config
+                .as_ref()
+                .is_none_or(|config| !config.providers.contains_key(provider))
+            {
+                return Err(crate::error::EgoPulseError::Internal(format!(
+                    "unknown provider for scope {scope}: {provider}"
+                )));
+            }
             let channel = ensure_channel_mapping(root, &scope);
             channel.insert(
                 Value::String("provider".to_string()),
@@ -169,6 +190,32 @@ pub(super) async fn api_put_config(
         "ok": true,
         "config": payload_from_config(&display, &path, &scope)?,
     })))
+}
+
+fn default_payload(path: &std::path::Path, scope: &str) -> ConfigPayload {
+    ConfigPayload {
+        scope: scope.to_string(),
+        provider: String::new(),
+        model: String::new(),
+        base_url: String::new(),
+        data_dir: crate::config::default_data_dir()
+            .to_string_lossy()
+            .into_owned(),
+        workspace_dir: crate::config::default_workspace_dir()
+            .to_string_lossy()
+            .into_owned(),
+        web_enabled: false,
+        web_host: "127.0.0.1".to_string(),
+        web_port: 10961,
+        web_auth_enabled: false,
+        has_api_key: false,
+        config_path: path.display().to_string(),
+        scopes: SUPPORTED_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect(),
+        providers: Vec::new(),
+    }
 }
 
 fn config_path_for_save(state: &WebState) -> PathBuf {
@@ -242,7 +289,7 @@ fn upsert_provider(
     provider: &str,
     model: &str,
     base_url: Option<&str>,
-    api_key: Option<&str>,
+    api_key_update: ApiKeyUpdate<'_>,
 ) -> Result<(), (StatusCode, String)> {
     let providers = ensure_mapping(entry_mut(root, "providers"));
     let provider_value = providers
@@ -285,20 +332,36 @@ fn upsert_provider(
         serde_yml::to_value(models).map_err(internal_error)?,
     );
 
-    match api_key {
-        Some(value) if !value.is_empty() => {
+    match api_key_update {
+        ApiKeyUpdate::Replace(value) => {
             provider_mapping.insert(
                 Value::String("api_key".to_string()),
                 Value::String(value.to_string()),
             );
         }
-        Some(_) => {
+        ApiKeyUpdate::Clear => {
             provider_mapping.remove(Value::String("api_key".to_string()));
         }
-        None => {}
+        ApiKeyUpdate::NoChange => {}
     }
 
     Ok(())
+}
+
+enum ApiKeyUpdate<'a> {
+    NoChange,
+    Replace(&'a str),
+    Clear,
+}
+
+fn normalized_api_key_update(api_key: Option<&str>, clear_api_key: bool) -> ApiKeyUpdate<'_> {
+    if clear_api_key {
+        return ApiKeyUpdate::Clear;
+    }
+    match api_key.map(str::trim) {
+        Some(value) if !value.is_empty() => ApiKeyUpdate::Replace(value),
+        _ => ApiKeyUpdate::NoChange,
+    }
 }
 
 fn ensure_channel_mapping<'a>(root: &'a mut Value, channel: &str) -> &'a mut Mapping {
