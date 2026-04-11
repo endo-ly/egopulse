@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
-use secrecy::SecretString;
-use serde::Deserialize;
+use fs2::FileExt;
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::error::ConfigError;
+use crate::error::{ConfigError, EgoPulseError};
+
+static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Per-channel configuration (web, discord, telegram).
 #[derive(Clone, Deserialize, Default)]
@@ -144,6 +149,8 @@ struct FileProviderConfig {
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
+    /// グローバルでのモデル選択（YAMLトップレベル）。未指定時は default_provider の default_model にフォールバック。
+    default_model: Option<String>,
     providers: Option<HashMap<String, FileProviderConfig>>,
     log_level: Option<String>,
     compaction_timeout_secs: Option<u64>,
@@ -157,6 +164,8 @@ struct FileConfig {
 #[derive(Clone)]
 pub struct Config {
     pub default_provider: String,
+    /// Resolved global default model (YAML `default_model` or provider's `default_model`).
+    pub default_model: String,
     pub providers: HashMap<String, ProviderConfig>,
     pub data_dir: String,
     pub log_level: String,
@@ -171,6 +180,7 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("default_provider", &self.default_provider)
+            .field("default_model", &self.default_model)
             .field("providers", &self.providers)
             .field("data_dir", &self.data_dir)
             .field("log_level", &self.log_level)
@@ -210,7 +220,7 @@ impl Config {
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
-            model: provider.default_model.clone(),
+            model: self.default_model.clone(),
         }
     }
 
@@ -236,7 +246,7 @@ impl Config {
             .channels
             .get(&channel_key)
             .and_then(|config| config.model.clone())
-            .unwrap_or_else(|| provider.default_model.clone());
+            .unwrap_or_else(|| self.default_model.clone());
 
         Ok(ResolvedLlmConfig {
             provider: provider_name,
@@ -356,6 +366,22 @@ impl Config {
     /// Workspace directory for agent file operations.
     pub fn workspace_dir(&self) -> PathBuf {
         default_workspace_dir()
+    }
+
+    /// Atomically writes the current config to a YAML file.
+    ///
+    /// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
+    /// file-level lock (`fs2`) for cross-process safety. The write is atomic via
+    /// temp-file + rename.
+    pub fn save_yaml(&self, path: &Path) -> Result<(), EgoPulseError> {
+        let _guard = CONFIG_WRITE_LOCK
+            .lock()
+            .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
+        let _lock_file = acquire_config_lock(path)?;
+
+        let yaml = serde_yml::to_string(&SerializableConfig::from(self))
+            .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+        write_atomically(path, &yaml)
     }
 }
 
@@ -530,6 +556,7 @@ fn build_config(
     };
     let FileConfig {
         default_provider: file_default_provider,
+        default_model: file_default_model,
         providers: file_providers,
         log_level: file_log_level,
         compaction_timeout_secs: file_compaction_timeout_secs,
@@ -550,6 +577,14 @@ fn build_config(
             provider: default_provider,
         });
     }
+
+    let default_model = normalize_string(file_default_model).unwrap_or_else(|| {
+        providers
+            .get(&default_provider)
+            .expect("validated above")
+            .default_model
+            .clone()
+    });
 
     let data_dir = default_data_dir().to_string_lossy().into_owned();
 
@@ -573,6 +608,7 @@ fn build_config(
 
     let config = Config {
         default_provider,
+        default_model,
         providers,
         data_dir,
         log_level,
@@ -732,6 +768,175 @@ fn is_local_url(value: &str) -> bool {
         url.host_str(),
         Some("localhost") | Some("127.0.0.1") | Some("0.0.0.0") | Some("::1")
     )
+}
+
+// --- Serialization helpers for save_yaml ---
+
+#[derive(Serialize)]
+struct SerializableConfig {
+    default_provider: String,
+    default_model: String,
+    providers: HashMap<String, SerializableProvider>,
+    channels: HashMap<String, SerializableChannel>,
+}
+
+#[derive(Serialize)]
+struct SerializableProvider {
+    label: String,
+    base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    default_model: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    models: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SerializableChannel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_origins: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bot_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bot_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_user_ids: Option<Vec<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_channels: Option<Vec<u64>>,
+}
+
+impl From<&Config> for SerializableConfig {
+    fn from(config: &Config) -> Self {
+        let providers = config
+            .providers
+            .iter()
+            .map(|(id, p)| {
+                (
+                    id.clone(),
+                    SerializableProvider {
+                        label: p.label.clone(),
+                        base_url: p.base_url.clone(),
+                        api_key: p
+                            .api_key
+                            .as_ref()
+                            .map(|s| ExposeSecret::expose_secret(s).to_string()),
+                        default_model: p.default_model.clone(),
+                        models: p.models.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let channels = config
+            .channels
+            .iter()
+            .map(|(id, c)| {
+                (
+                    id.clone(),
+                    SerializableChannel {
+                        enabled: c.enabled,
+                        port: c.port,
+                        host: c.host.clone(),
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        auth_token: c.auth_token.clone(),
+                        allowed_origins: c.allowed_origins.clone(),
+                        bot_token: c.bot_token.clone(),
+                        bot_username: c.bot_username.clone(),
+                        allowed_user_ids: c.allowed_user_ids.clone(),
+                        allowed_channels: c.allowed_channels.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            default_provider: config.default_provider.clone(),
+            default_model: config.default_model.clone(),
+            providers,
+            channels,
+        }
+    }
+}
+
+fn acquire_config_lock(path: &Path) -> Result<File, EgoPulseError> {
+    let lock_path = {
+        let parent = path
+            .parent()
+            .ok_or_else(|| EgoPulseError::Internal("config path has no parent".to_string()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("egopulse.config.yaml");
+        parent.join(format!(".{file_name}.lock"))
+    };
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    }
+
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    Ok(lock_file)
+}
+
+fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| EgoPulseError::Internal("config path has no parent".to_string()))?;
+    fs::create_dir_all(parent).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("egopulse.config.yaml"),
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut temp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    temp_file
+        .write_all(content.as_bytes())
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    temp_file
+        .flush()
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    temp_file
+        .sync_all()
+        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    drop(temp_file);
+
+    fs::rename(&temp_path, path).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+
+    if let Ok(dir) = OpenOptions::new().read(true).open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -994,5 +1199,120 @@ channels:
         let config =
             Config::load_allow_missing_api_key(Some(&file_path)).expect("allow missing key");
         assert!(config.web_llm().expect("resolved").api_key.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn default_model_in_yaml_overrides_provider_default() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_model: gpt-5
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        // config.default_model takes the YAML-level value
+        assert_eq!(config.default_model, "gpt-5");
+
+        // resolve_global_llm uses config.default_model
+        let global = config.resolve_global_llm();
+        assert_eq!(global.model, "gpt-5");
+
+        // channel without model override also falls back to config.default_model
+        let web_llm = config.web_llm().expect("web llm");
+        assert_eq!(web_llm.model, "gpt-5");
+    }
+
+    #[test]
+    #[serial]
+    fn default_model_falls_back_to_provider_default() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(config.default_model, "gpt-4o-mini");
+        let global = config.resolve_global_llm();
+        assert_eq!(global.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    #[serial]
+    fn model_resolution_chain_channel_overrides_global() {
+        let env = EnvGuard::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        env.set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_model: gpt-5
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+    model: gpt-4o
+  discord:
+    enabled: false
+    provider: local
+    model: qwen2.5-coder"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        // channel.model > config.default_model
+        let web_llm = config.web_llm().expect("web llm");
+        assert_eq!(web_llm.model, "gpt-4o");
+
+        // channel.model > config.default_model (different provider)
+        let discord_llm = config
+            .resolve_llm_for_channel("discord")
+            .expect("discord llm");
+        assert_eq!(discord_llm.model, "qwen2.5-coder");
+        assert_eq!(discord_llm.provider, "local");
+
+        // channel without model → config.default_model (not provider.default_model)
+        let telegram_llm = config
+            .resolve_llm_for_channel("telegram")
+            .expect("telegram llm");
+        assert_eq!(telegram_llm.model, "gpt-5");
     }
 }

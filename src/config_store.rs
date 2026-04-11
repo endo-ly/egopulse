@@ -1,4 +1,9 @@
 //! 設定 YAML の排他更新と安全な永続化を扱うモジュール。
+//!
+//! このモジュールは旧式の `serde_yml::Value` ベースの操作を提供する。
+//! 新規の保存処理では `Config::save_yaml()` を使用すること。
+
+#![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
