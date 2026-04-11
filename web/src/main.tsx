@@ -53,7 +53,7 @@ type ProviderUpdate = {
   base_url: string;
   default_model: string;
   models: string[];
-  api_key: string;
+  api_key?: string;
 };
 
 type HealthPayload = {
@@ -286,6 +286,18 @@ function App() {
   const selectedProvider = useMemo(() => {
     return config?.providers.find((item) => item.id === config.default_provider) || null;
   }, [config]);
+
+  useEffect(() => {
+    setConfigApiKey("");
+    setConfig((current) =>
+      current
+        ? {
+            ...current,
+            has_api_key: selectedProvider?.has_api_key || false,
+          }
+        : current,
+    );
+  }, [selectedProvider?.id]);
 
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ block: "end" });
@@ -681,14 +693,18 @@ function App() {
         base_url: provider.base_url,
         default_model: provider.default_model,
         models: provider.models,
-        api_key: "",
       };
     }
 
     const activeProviderId = config.default_provider;
     const activeProvider = providersPayload[activeProviderId];
     if (activeProvider) {
-      activeProvider.api_key = configApiKey || "";
+      const apiKey = configApiKey.trim();
+      if (apiKey === "*CLEAR*") {
+        activeProvider.api_key = apiKey;
+      } else if (apiKey) {
+        activeProvider.api_key = apiKey;
+      }
     }
 
     const payload = {
@@ -882,6 +898,7 @@ function App() {
                       ...config,
                       default_provider: providerId,
                       default_model: provider?.default_model || config.default_model,
+                      has_api_key: provider?.has_api_key || false,
                     });
                   }}
                 >
@@ -914,13 +931,13 @@ function App() {
                     type="password"
                     value={configApiKey}
                     placeholder={
-                      selectedProvider?.has_api_key || config.has_api_key
+                      selectedProvider?.has_api_key
                         ? "Configured. Enter to replace."
                         : "Enter API key"
                     }
                     onChange={(event) => setConfigApiKey(event.target.value)}
                   />
-                  {selectedProvider?.has_api_key || config.has_api_key ? (
+                  {selectedProvider?.has_api_key ? (
                     <button
                       type="button"
                       className="secondary-button api-key-clear"
