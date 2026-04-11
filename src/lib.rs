@@ -12,6 +12,7 @@ pub mod error;
 pub mod gateway;
 pub mod llm;
 pub mod logging;
+pub mod mcp;
 pub mod runtime;
 pub mod setup;
 pub mod skills;
