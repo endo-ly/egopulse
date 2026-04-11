@@ -168,7 +168,7 @@ impl ToolRegistry {
         defs
     }
 
-    /// Collect tool definitions asynchronously (preferrred when MCP is present).
+    /// Collect tool definitions asynchronously (preferred when MCP is present).
     pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
         let mut defs: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
