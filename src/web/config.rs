@@ -186,10 +186,7 @@ pub(super) async fn api_put_config(
     })))
 }
 
-fn apply_provider_updates(
-    config: &mut Config,
-    updates: HashMap<String, ProviderUpdatePayload>,
-) {
+fn apply_provider_updates(config: &mut Config, updates: HashMap<String, ProviderUpdatePayload>) {
     for (id, update) in updates {
         let id = id.trim().to_ascii_lowercase();
         if id.is_empty() {
@@ -277,10 +274,7 @@ fn apply_provider_updates(
     }
 }
 
-fn apply_api_key_update(
-    current: &mut Option<SecretString>,
-    raw_update: Option<String>,
-) {
+fn apply_api_key_update(current: &mut Option<SecretString>, raw_update: Option<String>) {
     let Some(value) = raw_update else { return };
     let trimmed = value.trim();
     if trimmed.is_empty() {

@@ -776,6 +776,12 @@ fn is_local_url(value: &str) -> bool {
 struct SerializableConfig {
     default_provider: String,
     default_model: String,
+    data_dir: String,
+    log_level: String,
+    compaction_timeout_secs: u64,
+    max_history_messages: usize,
+    max_session_messages: usize,
+    compact_keep_recent: usize,
     providers: HashMap<String, SerializableProvider>,
     channels: HashMap<String, SerializableChannel>,
 }
@@ -865,6 +871,12 @@ impl From<&Config> for SerializableConfig {
         Self {
             default_provider: config.default_provider.clone(),
             default_model: config.default_model.clone(),
+            data_dir: config.data_dir.clone(),
+            log_level: config.log_level.clone(),
+            compaction_timeout_secs: config.compaction_timeout_secs,
+            max_history_messages: config.max_history_messages,
+            max_session_messages: config.max_session_messages,
+            compact_keep_recent: config.compact_keep_recent,
             providers,
             channels,
         }
@@ -930,7 +942,10 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     drop(temp_file);
 
-    fs::rename(&temp_path, path).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EgoPulseError::Internal(error.to_string()));
+    }
 
     if let Ok(dir) = OpenOptions::new().read(true).open(parent) {
         let _ = dir.sync_all();
