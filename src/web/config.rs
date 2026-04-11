@@ -38,7 +38,8 @@ struct ChannelOverridePayload {
 #[serde(rename_all = "snake_case")]
 struct ConfigPayload {
     default_provider: String,
-    default_model: String,
+    default_model: Option<String>,
+    effective_model: String,
     data_dir: String,
     workspace_dir: String,
     web_enabled: bool,
@@ -79,7 +80,8 @@ struct ChannelOverrideUpdatePayload {
 #[serde(rename_all = "snake_case")]
 pub(super) struct ConfigUpdateRequest {
     default_provider: String,
-    default_model: String,
+    #[serde(default)]
+    default_model: Option<String>,
     #[serde(default)]
     providers: Option<HashMap<String, ProviderUpdatePayload>>,
     web_enabled: bool,
@@ -115,17 +117,10 @@ pub(super) async fn api_put_config(
     Json(request): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let default_provider = request.default_provider.trim();
-    let default_model = request.default_model.trim();
     if default_provider.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "default_provider is required".to_string(),
-        ));
-    }
-    if default_model.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "default_model is required".to_string(),
         ));
     }
     if request.web_host.trim().is_empty() {
@@ -151,20 +146,26 @@ pub(super) async fn api_put_config(
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string())),
     };
 
-    config.default_provider = default_provider.to_string();
-    config.default_model = if default_model.is_empty() {
-        None
-    } else {
-        Some(default_model.to_string())
-    };
-
-    let web_enabled = request.web_enabled;
-    let web_host = request.web_host.trim().to_string();
-    let web_port = request.web_port;
+    config.default_model = request.default_model.as_ref().and_then(|m| {
+        let trimmed = m.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     if let Some(provider_updates) = request.providers {
         apply_provider_updates(&mut config, provider_updates);
     }
+
+    if config.providers.contains_key(default_provider) {
+        config.default_provider = default_provider.to_string();
+    }
+
+    let web_enabled = request.web_enabled;
+    let web_host = request.web_host.trim().to_string();
+    let web_port = request.web_port;
 
     {
         let web = config.channels.entry("web".to_string()).or_default();
@@ -218,6 +219,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                 }
             }
             if let Some(models) = update.models {
+                let final_default = existing.default_model.clone();
                 existing.models = models
                     .into_iter()
                     .filter_map(|m| {
@@ -229,6 +231,9 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                         }
                     })
                     .collect();
+                if !existing.models.contains(&final_default) {
+                    existing.models.push(final_default);
+                }
             }
             apply_api_key_update(&mut existing.api_key, update.api_key);
         } else {
@@ -343,7 +348,8 @@ fn apply_channel_overrides(
 fn default_payload(path: &std::path::Path) -> ConfigPayload {
     ConfigPayload {
         default_provider: String::new(),
-        default_model: String::new(),
+        default_model: None,
+        effective_model: String::new(),
         data_dir: crate::config::default_data_dir()
             .to_string_lossy()
             .into_owned(),
@@ -403,7 +409,8 @@ fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload
 
     ConfigPayload {
         default_provider: resolved.provider,
-        default_model: resolved.model,
+        default_model: config.default_model.clone(),
+        effective_model: resolved.model,
         data_dir: config.data_dir.clone(),
         workspace_dir: crate::config::default_workspace_dir()
             .to_string_lossy()
