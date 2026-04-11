@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -173,7 +174,10 @@ impl OpenAiProvider {
 
         Ok(Self {
             http,
-            api_key: config.api_key.clone(),
+            api_key: config
+                .api_key
+                .as_ref()
+                .map(|key| key.expose_secret().to_string()),
             model: config.model.clone(),
             base_url: config.base_url.clone(),
         })
@@ -1162,7 +1166,8 @@ mod tests {
             provider: "test".to_string(),
             label: "Test".to_string(),
             base_url,
-            api_key: api_key.map(ToString::to_string),
+            api_key: api_key
+                .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             model: model.to_string(),
         }
     }

@@ -6,6 +6,7 @@ use serde_yml::{Mapping, Value};
 
 use crate::agent_loop::SurfaceContext;
 use crate::config::Config;
+use crate::config_store::update_yaml;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
@@ -214,7 +215,7 @@ fn resolved_for_scope(
     scope: &str,
 ) -> Result<crate::config::ResolvedLlmConfig, EgoPulseError> {
     match scope {
-        GLOBAL_SCOPE => Ok(config.resolve_llm_for_channel("cli")?),
+        GLOBAL_SCOPE => Ok(config.resolve_global_llm()),
         channel => Ok(config.resolve_llm_for_channel(channel)?),
     }
 }
@@ -224,26 +225,28 @@ fn save_scope_provider(
     scope: &str,
     provider: Option<&str>,
 ) -> Result<(), EgoPulseError> {
-    let mut root = read_existing_yaml(path)?;
-    if scope == GLOBAL_SCOPE {
-        let provider =
-            provider.ok_or_else(|| EgoPulseError::Internal("provider is required".to_string()))?;
-        set_string(&mut root, "default_provider", provider);
-    } else {
-        let channel = ensure_channel_mapping(&mut root, scope);
-        match provider {
-            Some(provider) => {
-                channel.insert(
-                    Value::String("provider".to_string()),
-                    Value::String(provider.to_string()),
-                );
+    update_yaml(path, |root| {
+        if scope == GLOBAL_SCOPE {
+            let provider = provider
+                .ok_or_else(|| EgoPulseError::Internal("provider is required".to_string()))?;
+            set_string(root, "default_provider", provider);
+        } else {
+            let channel = ensure_channel_mapping(root, scope);
+            match provider {
+                Some(provider) => {
+                    channel.insert(
+                        Value::String("provider".to_string()),
+                        Value::String(provider.to_string()),
+                    );
+                }
+                None => {
+                    channel.remove(Value::String("provider".to_string()));
+                }
             }
-            None => {
-                channel.remove(Value::String("provider".to_string()));
-            }
+            channel.remove(Value::String("model".to_string()));
         }
-    }
-    write_yaml(path, &root)
+        Ok(())
+    })
 }
 
 fn save_scope_model(
@@ -252,68 +255,43 @@ fn save_scope_model(
     model: Option<&str>,
     provider: &str,
 ) -> Result<(), EgoPulseError> {
-    let mut root = read_existing_yaml(path)?;
-    if scope == GLOBAL_SCOPE {
-        let model =
-            model.ok_or_else(|| EgoPulseError::Internal("model is required".to_string()))?;
-        let provider_mapping = ensure_provider_mapping(&mut root, provider);
-        provider_mapping.insert(
-            Value::String("default_model".to_string()),
-            Value::String(model.to_string()),
-        );
-        let mut models = provider_mapping
-            .get(Value::String("models".to_string()))
-            .and_then(value_as_string_vec)
-            .unwrap_or_default();
-        if !models.iter().any(|candidate| candidate == model) {
-            models.push(model.to_string());
-        }
-        provider_mapping.insert(
-            Value::String("models".to_string()),
-            serde_yml::to_value(models)
-                .map_err(|error| EgoPulseError::Internal(error.to_string()))?,
-        );
-    } else {
-        let channel = ensure_channel_mapping(&mut root, scope);
-        match model {
-            Some(model) => {
-                channel.insert(
-                    Value::String("model".to_string()),
-                    Value::String(model.to_string()),
-                );
+    update_yaml(path, |root| {
+        if scope == GLOBAL_SCOPE {
+            let model =
+                model.ok_or_else(|| EgoPulseError::Internal("model is required".to_string()))?;
+            let provider_mapping = ensure_provider_mapping(root, provider);
+            provider_mapping.insert(
+                Value::String("default_model".to_string()),
+                Value::String(model.to_string()),
+            );
+            let mut models = provider_mapping
+                .get(Value::String("models".to_string()))
+                .and_then(value_as_string_vec)
+                .unwrap_or_default();
+            if !models.iter().any(|candidate| candidate == model) {
+                models.push(model.to_string());
             }
-            None => {
-                channel.remove(Value::String("model".to_string()));
+            provider_mapping.insert(
+                Value::String("models".to_string()),
+                serde_yml::to_value(models)
+                    .map_err(|error| EgoPulseError::Internal(error.to_string()))?,
+            );
+        } else {
+            let channel = ensure_channel_mapping(root, scope);
+            match model {
+                Some(model) => {
+                    channel.insert(
+                        Value::String("model".to_string()),
+                        Value::String(model.to_string()),
+                    );
+                }
+                None => {
+                    channel.remove(Value::String("model".to_string()));
+                }
             }
         }
-    }
-    write_yaml(path, &root)
-}
-
-fn read_existing_yaml(path: &Path) -> Result<Value, EgoPulseError> {
-    if !path.exists() {
-        return Ok(Value::Mapping(Mapping::new()));
-    }
-
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    let parsed: Value =
-        serde_yml::from_str(&raw).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    Ok(match parsed {
-        Value::Mapping(_) => parsed,
-        _ => Value::Mapping(Mapping::new()),
+        Ok(())
     })
-}
-
-fn write_yaml(path: &Path, root: &Value) -> Result<(), EgoPulseError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    }
-    let yaml =
-        serde_yml::to_string(root).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    std::fs::write(path, yaml).map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    Ok(())
 }
 
 fn ensure_provider_mapping<'a>(root: &'a mut Value, provider: &str) -> &'a mut Mapping {

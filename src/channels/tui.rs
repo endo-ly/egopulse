@@ -390,18 +390,21 @@ async fn run_loop(
                     }
                     PendingAction::SendMessage(prompt) => {
                         if let View::Chat(chat) = &mut app.view {
-                            if let Some(response) =
-                                llm_profile::handle_command(&app.state, &chat.context, &prompt)
-                                    .await?
+                            match llm_profile::handle_command(&app.state, &chat.context, &prompt)
+                                .await
                             {
-                                chat.messages.push(RenderedMessage {
-                                    role: "assistant".to_string(),
-                                    content: response,
-                                });
-                                chat.status = "Command applied".to_string();
-                                chat.conversation_scroll = 0;
-                            } else {
-                                start_send(app, prompt);
+                                Ok(Some(response)) => {
+                                    chat.messages.push(RenderedMessage {
+                                        role: "assistant".to_string(),
+                                        content: response,
+                                    });
+                                    chat.status = "Command applied".to_string();
+                                    chat.conversation_scroll = 0;
+                                }
+                                Ok(None) => start_send(app, prompt),
+                                Err(error) => {
+                                    chat.status = format!("Command error: {error}");
+                                }
                             }
                         }
                     }

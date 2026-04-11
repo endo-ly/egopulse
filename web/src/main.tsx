@@ -321,9 +321,10 @@ function App() {
     setHealth({ version: payload.version });
   }
 
-  async function refreshConfig() {
+  async function refreshConfig(scope?: string) {
+    const query = scope ? `?scope=${encodeURIComponent(scope)}` : "";
     const payload = await api<{ ok: boolean; config: ConfigPayload }>(
-      "/api/config",
+      `/api/config${query}`,
       authTokenRef.current,
     );
     setConfig(payload.config);
@@ -677,9 +678,10 @@ function App() {
         "/api/config",
         authTokenRef.current,
         {
-        method: "PUT",
-        body: JSON.stringify(payload),
-      });
+          method: "PUT",
+          body: JSON.stringify(payload),
+        },
+      );
       setConfig(response.config);
       setConfigApiKey("");
       setStatus({
@@ -841,9 +843,20 @@ function App() {
                 <span>Apply To</span>
                 <select
                   value={config.scope}
-                  onChange={(event) =>
-                    setConfig({ ...config, scope: event.target.value })
-                  }
+                  onChange={(event) => {
+                    const nextScope = event.target.value;
+                    void withAuthHandling(async () => {
+                      await refreshConfig(nextScope);
+                    }).catch((error) => {
+                      setStatus({
+                        tone: "error",
+                        text:
+                          error instanceof Error
+                            ? error.message
+                            : "Failed to load scoped config",
+                      });
+                    });
+                  }}
                 >
                   {config.scopes.map((scope) => (
                     <option key={scope} value={scope}>

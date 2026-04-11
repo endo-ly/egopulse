@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::Deserialize;
 use url::Url;
 
@@ -93,14 +93,44 @@ impl std::fmt::Debug for ProviderConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ResolvedLlmConfig {
     pub provider: String,
     pub label: String,
     pub base_url: String,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     pub model: String,
 }
+
+impl std::fmt::Debug for ResolvedLlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedLlmConfig")
+            .field("provider", &self.provider)
+            .field("label", &self.label)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+impl PartialEq for ResolvedLlmConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.label == other.label
+            && self.base_url == other.base_url
+            && self.model == other.model
+    }
+}
+
+impl Eq for ResolvedLlmConfig {}
 
 #[derive(Debug, Deserialize, Default)]
 struct FileProviderConfig {
@@ -164,11 +194,24 @@ impl Config {
         build_config(config_path, true)
     }
 
-    /// Returns the global default provider configuration.
+    /// Invariant: `build_config` validates that `default_provider` exists in `providers`.
+    /// This accessor relies on that validated config construction path.
     pub fn global_provider(&self) -> &ProviderConfig {
         self.providers
             .get(&self.default_provider)
             .expect("default_provider must reference an existing provider")
+    }
+
+    /// Resolves the global default provider/model pair used by CLI/TUI.
+    pub fn resolve_global_llm(&self) -> ResolvedLlmConfig {
+        let provider = self.global_provider();
+        ResolvedLlmConfig {
+            provider: self.default_provider.clone(),
+            label: provider.label.clone(),
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: provider.default_model.clone(),
+        }
     }
 
     /// Returns the normalized provider key used for the given channel.
@@ -199,7 +242,7 @@ impl Config {
             provider: provider_name,
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
-            api_key: provider.api_key.as_ref().map(secret_to_string),
+            api_key: provider.api_key.clone(),
             model,
         })
     }
@@ -554,11 +597,9 @@ fn validate_channel_provider_references(
     providers: &HashMap<String, ProviderConfig>,
     channels: &HashMap<String, ChannelConfig>,
 ) -> Result<(), ConfigError> {
-    if !providers.contains_key(default_provider) {
-        return Err(ConfigError::InvalidProviderReference {
-            provider: default_provider.to_string(),
-        });
-    }
+    // `build_config` checks `default_provider` before calling this helper; keep the
+    // parameter to make the relationship explicit for callers and future refactors.
+    let _ = default_provider;
 
     for channel in channels.values() {
         if let Some(provider) = channel.provider.as_ref()
@@ -693,10 +734,6 @@ fn is_local_url(value: &str) -> bool {
     )
 }
 
-fn secret_to_string(secret: &SecretString) -> String {
-    secret.expose_secret().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     //! アプリケーション設定の読み込みと検証。
@@ -708,6 +745,7 @@ mod tests {
     use std::io::Write;
     use std::sync::{LazyLock, Mutex, MutexGuard};
 
+    use secrecy::ExposeSecret;
     use serial_test::serial;
 
     use std::path::PathBuf;
@@ -839,14 +877,17 @@ channels:
         assert_eq!(web_llm.provider, "openai");
         assert_eq!(web_llm.model, "gpt-4o-mini");
         assert_eq!(web_llm.base_url, "https://api.openai.com/v1");
-        assert_eq!(web_llm.api_key.as_deref(), Some("sk-openai"));
+        assert_eq!(
+            web_llm.api_key.as_ref().map(ExposeSecret::expose_secret),
+            Some("sk-openai")
+        );
 
         let discord_llm = config
             .resolve_llm_for_channel("discord")
             .expect("discord llm");
         assert_eq!(discord_llm.provider, "local");
         assert_eq!(discord_llm.model, "qwen2.5-coder");
-        assert_eq!(discord_llm.api_key, None);
+        assert!(discord_llm.api_key.is_none());
     }
 
     #[test]
@@ -871,7 +912,7 @@ channels:
 
         let config = Config::load(Some(&file_path)).expect("load local config");
         let resolved = config.web_llm().expect("resolved llm");
-        assert_eq!(resolved.api_key, None);
+        assert!(resolved.api_key.is_none());
     }
 
     #[test]
@@ -952,6 +993,6 @@ channels:
 
         let config =
             Config::load_allow_missing_api_key(Some(&file_path)).expect("allow missing key");
-        assert_eq!(config.web_llm().expect("resolved").api_key, None);
+        assert!(config.web_llm().expect("resolved").api_key.is_none());
     }
 }

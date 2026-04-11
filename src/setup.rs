@@ -515,9 +515,21 @@ impl SetupApp {
 
         let map = yaml_value.as_mapping_mut().unwrap();
 
-        map.remove(serde_yml::Value::String("model".into()));
-        map.remove(serde_yml::Value::String("api_key".into()));
-        map.remove(serde_yml::Value::String("base_url".into()));
+        let top_level_model = map
+            .get(serde_yml::Value::String("model".into()))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let top_level_api_key = map
+            .get(serde_yml::Value::String("api_key".into()))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let top_level_base_url = map
+            .get(serde_yml::Value::String("base_url".into()))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         map.remove(serde_yml::Value::String("data_dir".into()));
         map.remove(serde_yml::Value::String("workspace_dir".into()));
         map.insert(
@@ -537,29 +549,66 @@ impl SetupApp {
             .entry(serde_yml::Value::String(provider_id.clone()))
             .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
         let provider_map = provider_value.as_mapping_mut().unwrap();
-        provider_map.insert(
-            serde_yml::Value::String("label".into()),
-            serde_yml::Value::String(provider_label.clone()),
-        );
-        provider_map.insert(
-            serde_yml::Value::String("base_url".into()),
-            serde_yml::Value::String(base_url.clone()),
-        );
-        provider_map.insert(
-            serde_yml::Value::String("default_model".into()),
-            serde_yml::Value::String(model.clone()),
-        );
-        provider_map.insert(
-            serde_yml::Value::String("models".into()),
-            serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]),
-        );
-        if !api_key.is_empty() {
-            provider_map.insert(
-                serde_yml::Value::String("api_key".into()),
-                serde_yml::Value::String(api_key.clone()),
-            );
-        } else {
-            provider_map.remove(serde_yml::Value::String("api_key".into()));
+        provider_map
+            .entry(serde_yml::Value::String("label".into()))
+            .or_insert_with(|| serde_yml::Value::String(provider_label.clone()));
+        provider_map
+            .entry(serde_yml::Value::String("base_url".into()))
+            .or_insert_with(|| {
+                serde_yml::Value::String(
+                    top_level_base_url
+                        .clone()
+                        .unwrap_or_else(|| base_url.clone()),
+                )
+            });
+        provider_map
+            .entry(serde_yml::Value::String("default_model".into()))
+            .or_insert_with(|| {
+                serde_yml::Value::String(top_level_model.clone().unwrap_or_else(|| model.clone()))
+            });
+        let models_key = serde_yml::Value::String("models".into());
+        match provider_map.get_mut(&models_key) {
+            Some(serde_yml::Value::Sequence(models)) => {
+                let effective_model = top_level_model.as_ref().unwrap_or(&model);
+                let has_model = models
+                    .iter()
+                    .any(|value| value.as_str() == Some(effective_model));
+                if !has_model {
+                    models.push(serde_yml::Value::String(effective_model.clone()));
+                }
+            }
+            Some(_) => {}
+            None => {
+                provider_map.insert(
+                    models_key,
+                    serde_yml::Value::Sequence(vec![serde_yml::Value::String(
+                        top_level_model.clone().unwrap_or_else(|| model.clone()),
+                    )]),
+                );
+            }
+        }
+        let api_key_key = serde_yml::Value::String("api_key".into());
+        if !provider_map.contains_key(&api_key_key) {
+            let effective_api_key = top_level_api_key
+                .clone()
+                .or_else(|| (!api_key.is_empty()).then_some(api_key.clone()));
+            if let Some(effective_api_key) = effective_api_key {
+                provider_map.insert(api_key_key, serde_yml::Value::String(effective_api_key));
+            }
+        }
+
+        if provider_map.contains_key(serde_yml::Value::String("default_model".into()))
+            && provider_map.contains_key(serde_yml::Value::String("base_url".into()))
+        {
+            if top_level_model.is_some() {
+                map.remove(serde_yml::Value::String("model".into()));
+            }
+            if top_level_api_key.is_some() {
+                map.remove(serde_yml::Value::String("api_key".into()));
+            }
+            if top_level_base_url.is_some() {
+                map.remove(serde_yml::Value::String("base_url".into()));
+            }
         }
 
         let mut channels = serde_yml::Value::Mapping(Default::default());

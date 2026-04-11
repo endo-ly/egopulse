@@ -91,11 +91,18 @@ where
         chat_type: context.chat_type.clone(),
     };
     let system_prompt = build_system_prompt(state, context);
+    let channel_llm = state.llm_for_channel(&context.channel)?;
 
     let user_message = Message::text("user", user_input);
-    let (mut messages, mut session_updated_at) =
-        persist_user_turn_with_compaction(state, context, chat_id, &user_message, user_input)
-            .await?;
+    let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
+        state,
+        context,
+        chat_id,
+        &user_message,
+        user_input,
+        &channel_llm,
+    )
+    .await?;
 
     // LLM → tool execution → tool result feedback を 1 反復として回し、
     // tool_calls が空になるまで続ける。
@@ -109,8 +116,7 @@ where
         emit_event(&on_event, AgentEvent::Iteration { iteration });
         let request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
-        let response = state
-            .llm_for_channel(&context.channel)?
+        let response = channel_llm
             .send_message(
                 &system_prompt,
                 request_messages,
@@ -546,6 +552,7 @@ async fn persist_user_turn_with_compaction(
     chat_id: i64,
     user_message: &Message,
     user_input: &str,
+    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
 ) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, chat_id).await?;
     let stored_message = StoredMessage {
@@ -561,7 +568,7 @@ async fn persist_user_turn_with_compaction(
         let mut candidate_messages = loaded.messages.clone();
         candidate_messages.push(user_message.clone());
         let candidate_messages =
-            maybe_compact_messages(state, context, chat_id, &candidate_messages).await?;
+            maybe_compact_messages(state, context, chat_id, &candidate_messages, llm).await?;
 
         match persist_phase_once(
             state,
@@ -591,6 +598,7 @@ async fn maybe_compact_messages(
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
+    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
 ) -> Result<Vec<Message>, EgoPulseError> {
     if messages.len() <= state.config.max_session_messages {
         return Ok(messages.to_vec());
@@ -621,10 +629,9 @@ async fn maybe_compact_messages(
         format!("{summarize_prompt}\n\n---\n\n{summary_input}"),
     )];
     let timeout_secs = state.config.compaction_timeout_secs;
-    let summary_provider = state.llm_for_channel(&context.channel)?;
     let summary_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        summary_provider.send_message("You are a helpful summarizer.", summarize_messages, None),
+        llm.send_message("You are a helpful summarizer.", summarize_messages, None),
     )
     .await;
 

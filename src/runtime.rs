@@ -70,6 +70,16 @@ impl AppState {
             &config.resolve_llm_for_channel(channel)?,
         )?))
     }
+
+    /// Returns the global default LLM provider for CLI/TUI surfaces.
+    pub fn global_llm(&self) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
+        if let Some(provider) = self.llm_override.clone() {
+            return Ok(provider);
+        }
+
+        let config = self.current_config()?;
+        Ok(Arc::from(create_provider(&config.resolve_global_llm())?))
+    }
 }
 
 /// Builds the application state without recording a config file path.
@@ -122,7 +132,7 @@ pub fn build_app_state_with_path(
 
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
-    let llm = create_provider(&config.resolve_llm_for_channel("cli")?)?;
+    let llm = create_provider(&config.resolve_global_llm())?;
     let messages = vec![Message::text("user", prompt)];
 
     tokio::select! {

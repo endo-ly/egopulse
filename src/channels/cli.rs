@@ -39,15 +39,28 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
             break;
         }
 
-        if let Some(response) = llm_profile::handle_command(state, &context, trimmed).await? {
-            writeln!(stdout, "assistant: {response}")
-                .map_err(crate::error::StorageError::Io)
-                .map_err(EgoPulseError::from)?;
-            stdout
-                .flush()
-                .map_err(crate::error::StorageError::Io)
-                .map_err(EgoPulseError::from)?;
-            continue;
+        match llm_profile::handle_command(state, &context, trimmed).await {
+            Ok(Some(response)) => {
+                writeln!(stdout, "assistant: {response}")
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                stdout
+                    .flush()
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                writeln!(stdout, "assistant: Command error: {error}")
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                stdout
+                    .flush()
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                continue;
+            }
         }
 
         writeln!(stdout, "you: {trimmed}")

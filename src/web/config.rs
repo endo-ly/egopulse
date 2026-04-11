@@ -5,12 +5,13 @@
 use std::path::PathBuf;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_yml::{Mapping, Value};
 
 use crate::config::{Config, default_config_path};
+use crate::config_store::update_yaml;
 
 use super::WebState;
 
@@ -62,17 +63,30 @@ pub(super) struct ConfigUpdateRequest {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ConfigQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
 /// Returns the persisted configuration visible to the web UI.
 pub(super) async fn api_get_config(
     State(state): State<WebState>,
+    Query(query): Query<ConfigQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = config_path_for_save(&state);
     let display = Config::load_allow_missing_api_key(Some(&path))
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let scope = query
+        .scope
+        .as_deref()
+        .map(normalize_scope)
+        .transpose()?
+        .unwrap_or_else(|| GLOBAL_SCOPE.to_string());
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path, GLOBAL_SCOPE)?,
+        "config": payload_from_config(&display, &path, &scope)?,
     })))
 }
 
@@ -101,53 +115,52 @@ pub(super) async fn api_put_config(
     }
 
     let path = config_path_for_save(&state);
-    let mut root = read_existing_yaml(&path)?;
+    update_yaml(&path, |root| {
+        upsert_provider(
+            root,
+            provider,
+            model,
+            request
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            request.api_key.as_deref().map(str::trim),
+        )
+        .map_err(|(_, error)| crate::error::EgoPulseError::Internal(error))?;
 
-    upsert_provider(
-        &mut root,
-        provider,
-        model,
-        request
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-        request.api_key.as_deref().map(str::trim),
-    )?;
+        if scope == GLOBAL_SCOPE {
+            set_string(root, "default_provider", provider);
+        } else {
+            let channel = ensure_channel_mapping(root, &scope);
+            channel.insert(
+                Value::String("provider".to_string()),
+                Value::String(provider.to_string()),
+            );
+            channel.insert(
+                Value::String("model".to_string()),
+                Value::String(model.to_string()),
+            );
+        }
 
-    if scope == GLOBAL_SCOPE {
-        set_string(&mut root, "default_provider", provider);
-    } else {
-        let channel = ensure_channel_mapping(&mut root, &scope);
-        channel.insert(
-            Value::String("provider".to_string()),
-            Value::String(provider.to_string()),
+        let web = ensure_channel_mapping(root, "web");
+        web.insert(
+            Value::String("enabled".to_string()),
+            Value::Bool(request.web_enabled),
         );
-        channel.insert(
-            Value::String("model".to_string()),
-            Value::String(model.to_string()),
+        web.insert(
+            Value::String("host".to_string()),
+            Value::String(request.web_host.trim().to_string()),
         );
-    }
+        web.insert(
+            Value::String("port".to_string()),
+            serde_yml::to_value(request.web_port)
+                .map_err(|error| crate::error::EgoPulseError::Internal(error.to_string()))?,
+        );
 
-    let web = ensure_channel_mapping(&mut root, "web");
-    web.insert(
-        Value::String("enabled".to_string()),
-        Value::Bool(request.web_enabled),
-    );
-    web.insert(
-        Value::String("host".to_string()),
-        Value::String(request.web_host.trim().to_string()),
-    );
-    web.insert(
-        Value::String("port".to_string()),
-        serde_yml::to_value(request.web_port).map_err(internal_error)?,
-    );
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(internal_error)?;
-    }
-    let yaml = serde_yml::to_string(&root).map_err(internal_error)?;
-    std::fs::write(&path, yaml).map_err(internal_error)?;
+        Ok(())
+    })
+    .map_err(internal_error)?;
 
     let display = Config::load_allow_missing_api_key(Some(&path))
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -171,9 +184,7 @@ fn payload_from_config(
     scope: &str,
 ) -> Result<ConfigPayload, (StatusCode, String)> {
     let resolved = match scope {
-        GLOBAL_SCOPE => config
-            .resolve_llm_for_channel("cli")
-            .map_err(internal_error)?,
+        GLOBAL_SCOPE => config.resolve_global_llm(),
         channel => config
             .resolve_llm_for_channel(channel)
             .map_err(internal_error)?,
@@ -205,7 +216,7 @@ fn payload_from_config(
         web_host: config.web_host(),
         web_port: config.web_port(),
         web_auth_enabled: config.web_auth_token().is_some(),
-        has_api_key: config.web_llm().map_err(internal_error)?.api_key.is_some(),
+        has_api_key: resolved.api_key.is_some(),
         config_path: path.display().to_string(),
         scopes: SUPPORTED_SCOPES
             .iter()
@@ -224,19 +235,6 @@ fn normalize_scope(scope: &str) -> Result<String, (StatusCode, String)> {
         return Ok(normalized);
     }
     Err((StatusCode::BAD_REQUEST, "invalid scope".to_string()))
-}
-
-fn read_existing_yaml(path: &std::path::Path) -> Result<Value, (StatusCode, String)> {
-    if !path.exists() {
-        return Ok(Value::Mapping(Mapping::new()));
-    }
-
-    let raw = std::fs::read_to_string(path).map_err(internal_error)?;
-    let parsed: Value = serde_yml::from_str(&raw).map_err(internal_error)?;
-    Ok(match parsed {
-        Value::Mapping(_) => parsed,
-        _ => Value::Mapping(Mapping::new()),
-    })
 }
 
 fn upsert_provider(
@@ -260,10 +258,12 @@ fn upsert_provider(
         "base_url is required when creating a provider".to_string(),
     ))?;
 
-    provider_mapping.insert(
-        Value::String("label".to_string()),
-        Value::String(infer_provider_label(provider).to_string()),
-    );
+    if !provider_mapping.contains_key(Value::String("label".to_string())) {
+        provider_mapping.insert(
+            Value::String("label".to_string()),
+            Value::String(infer_provider_label(provider).to_string()),
+        );
+    }
     provider_mapping.insert(
         Value::String("base_url".to_string()),
         Value::String(effective_base_url.to_string()),
