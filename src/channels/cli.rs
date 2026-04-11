@@ -6,6 +6,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::error::EgoPulseError;
+use crate::llm_profile;
 use crate::runtime::AppState;
 
 /// Runs an interactive CLI chat loop for the given persistent session.
@@ -36,6 +37,17 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         }
         if trimmed == "/exit" {
             break;
+        }
+
+        if let Some(response) = llm_profile::handle_command(state, &context, trimmed).await? {
+            writeln!(stdout, "assistant: {response}")
+                .map_err(crate::error::StorageError::Io)
+                .map_err(EgoPulseError::from)?;
+            stdout
+                .flush()
+                .map_err(crate::error::StorageError::Io)
+                .map_err(EgoPulseError::from)?;
+            continue;
         }
 
         writeln!(stdout, "you: {trimmed}")
