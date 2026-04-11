@@ -31,6 +31,279 @@ use crate::config::{
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
 
+#[derive(Clone, Copy)]
+struct ProviderPreset {
+    id: &'static str,
+    label: &'static str,
+    default_base_url: &'static str,
+    default_model: &'static str,
+    models: &'static [&'static str],
+}
+
+const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "openai",
+        label: "OpenAI",
+        default_base_url: "https://api.openai.com/v1",
+        default_model: "gpt-5.2",
+        models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
+    },
+    ProviderPreset {
+        id: "openrouter",
+        label: "OpenRouter",
+        default_base_url: "https://openrouter.ai/api/v1",
+        default_model: "openrouter/auto",
+        models: &[
+            "openrouter/auto",
+            "openai/gpt-5.2",
+            "anthropic/claude-sonnet-4.5",
+        ],
+    },
+    ProviderPreset {
+        id: "ollama",
+        label: "Ollama (local)",
+        default_base_url: "http://127.0.0.1:11434/v1",
+        default_model: "llama3.2",
+        models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
+    },
+    ProviderPreset {
+        id: "google",
+        label: "Google DeepMind",
+        default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model: "gemini-2.5-pro",
+        models: &[
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+    },
+    ProviderPreset {
+        id: "aliyun-bailian",
+        label: "Alibaba Cloud Bailian",
+        default_base_url: "https://coding.dashscope.aliyuncs.com/v1",
+        default_model: "qwen3.5-plus",
+        models: &["qwen3.5-plus", "qwen3-max", "qwen-plus-latest"],
+    },
+    ProviderPreset {
+        id: "alibaba",
+        label: "Alibaba Cloud (Qwen / DashScope)",
+        default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        default_model: "qwen3-max",
+        models: &["qwen3-max", "qwen3-plus", "qwen-max-latest"],
+    },
+    ProviderPreset {
+        id: "qwen-portal",
+        label: "Qwen Portal (OAuth)",
+        default_base_url: "https://portal.qwen.ai/v1",
+        default_model: "coder-model",
+        models: &["coder-model", "vision-model", "qwen3.5-plus"],
+    },
+    ProviderPreset {
+        id: "deepseek",
+        label: "DeepSeek",
+        default_base_url: "https://api.deepseek.com/v1",
+        default_model: "deepseek-chat",
+        models: &["deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
+    },
+    ProviderPreset {
+        id: "synthetic",
+        label: "Synthetic",
+        default_base_url: "https://api.synthetic.new/openai/v1",
+        default_model: "hf:openai/gpt-oss-120b",
+        models: &["hf:openai/gpt-oss-120b", "hf:deepseek-ai/DeepSeek-V3-0324"],
+    },
+    ProviderPreset {
+        id: "chutes",
+        label: "Chutes",
+        default_base_url: "https://llm.chutes.ai/v1",
+        default_model: "deepseek-ai/DeepSeek-V3-0324",
+        models: &[
+            "deepseek-ai/DeepSeek-V3-0324",
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        ],
+    },
+    ProviderPreset {
+        id: "moonshot",
+        label: "Moonshot AI (Kimi)",
+        default_base_url: "https://api.moonshot.cn/v1",
+        default_model: "kimi-k2.5",
+        models: &["kimi-k2.5", "kimi-k2", "kimi-latest"],
+    },
+    ProviderPreset {
+        id: "mistral",
+        label: "Mistral AI",
+        default_base_url: "https://api.mistral.ai/v1",
+        default_model: "mistral-large-latest",
+        models: &[
+            "mistral-large-latest",
+            "mistral-medium-latest",
+            "ministral-8b-latest",
+        ],
+    },
+    ProviderPreset {
+        id: "azure",
+        label: "Microsoft Azure AI",
+        default_base_url: "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
+        default_model: "gpt-5.2",
+        models: &["gpt-5.2", "gpt-5", "gpt-4.1"],
+    },
+    ProviderPreset {
+        id: "bedrock",
+        label: "Amazon AWS Bedrock",
+        default_base_url: "https://bedrock-runtime.YOUR-REGION.amazonaws.com/openai/v1",
+        default_model: "anthropic.claude-opus-4-6-v1",
+        models: &[
+            "anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-sonnet-4-5-v2",
+            "anthropic.claude-haiku-4-5-v1",
+        ],
+    },
+    ProviderPreset {
+        id: "zhipu",
+        label: "Zhipu AI (GLM / Z.AI)",
+        default_base_url: "https://open.bigmodel.cn/api/paas/v4",
+        default_model: "glm-4.7",
+        models: &["glm-4.7", "glm-4.7-flash", "glm-4.5-air"],
+    },
+    ProviderPreset {
+        id: "zai",
+        label: "Z.AI Coding",
+        default_base_url: "https://api.z.ai/api/coding/paas/v4",
+        default_model: "glm-5.1",
+        models: &["glm-5.1", "glm-5"],
+    },
+    ProviderPreset {
+        id: "minimax",
+        label: "MiniMax",
+        default_base_url: "https://api.minimax.io/v1",
+        default_model: "MiniMax-M2.5",
+        models: &["MiniMax-M2.5", "MiniMax-M2.5-Thinking", "MiniMax-M2.1"],
+    },
+    ProviderPreset {
+        id: "cohere",
+        label: "Cohere",
+        default_base_url: "https://api.cohere.ai/compatibility/v1",
+        default_model: "command-a-03-2025",
+        models: &[
+            "command-a-03-2025",
+            "command-r-plus-08-2024",
+            "command-r-08-2024",
+        ],
+    },
+    ProviderPreset {
+        id: "tencent",
+        label: "Tencent AI Lab",
+        default_base_url: "https://api.hunyuan.cloud.tencent.com/v1",
+        default_model: "hunyuan-t1-latest",
+        models: &[
+            "hunyuan-t1-latest",
+            "hunyuan-turbos-latest",
+            "hunyuan-standard-latest",
+        ],
+    },
+    ProviderPreset {
+        id: "xai",
+        label: "xAI",
+        default_base_url: "https://api.x.ai/v1",
+        default_model: "grok-4",
+        models: &["grok-4", "grok-4-fast", "grok-3"],
+    },
+    ProviderPreset {
+        id: "nvidia",
+        label: "NVIDIA NIM",
+        default_base_url: "https://integrate.api.nvidia.com/v1",
+        default_model: "meta/llama-3.3-70b-instruct",
+        models: &[
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        ],
+    },
+    ProviderPreset {
+        id: "huggingface",
+        label: "Hugging Face",
+        default_base_url: "https://router.huggingface.co/v1",
+        default_model: "Qwen/Qwen3-Coder-Next",
+        models: &[
+            "Qwen/Qwen3-Coder-Next",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "deepseek-ai/DeepSeek-V3",
+        ],
+    },
+    ProviderPreset {
+        id: "together",
+        label: "Together AI",
+        default_base_url: "https://api.together.xyz/v1",
+        default_model: "deepseek-ai/DeepSeek-V3",
+        models: &[
+            "deepseek-ai/DeepSeek-V3",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        ],
+    },
+    ProviderPreset {
+        id: "local",
+        label: "Local OpenAI-compatible",
+        default_base_url: "http://127.0.0.1:1234/v1",
+        default_model: "qwen2.5-coder",
+        models: &["qwen2.5-coder"],
+    },
+    ProviderPreset {
+        id: "custom",
+        label: "Custom OpenAI-compatible",
+        default_base_url: "",
+        default_model: "custom-model",
+        models: &["custom-model"],
+    },
+];
+
+fn find_provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS
+        .iter()
+        .find(|preset| preset.id.eq_ignore_ascii_case(provider))
+}
+
+fn provider_default_base_url(provider: &str) -> Option<&'static str> {
+    find_provider_preset(provider)
+        .map(|preset| preset.default_base_url)
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_default_model(provider: &str) -> Option<&'static str> {
+    find_provider_preset(provider).map(|preset| preset.default_model)
+}
+
+fn provider_label_for(provider: &str) -> String {
+    find_provider_preset(provider)
+        .map(|preset| preset.label.to_string())
+        .unwrap_or_else(|| provider.to_string())
+}
+
+fn provider_choices() -> String {
+    PROVIDER_PRESETS
+        .iter()
+        .map(|preset| {
+            if preset.models.is_empty() {
+                preset.id.to_string()
+            } else {
+                format!("{} (e.g. {})", preset.id, preset.models.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn normalize_provider_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if find_provider_preset(trimmed).is_some() {
+        return trimmed.to_ascii_lowercase();
+    }
+    trimmed.to_string()
+}
+
 #[derive(Clone)]
 struct Field {
     key: String,
@@ -70,29 +343,50 @@ impl SetupApp {
     fn new(config_path: Option<PathBuf>) -> Self {
         let config_path = config_path.unwrap_or_else(default_config_path);
         let (existing, original_yaml) = Self::load_existing_config(&config_path);
+        let provider_id = existing
+            .get("PROVIDER")
+            .cloned()
+            .unwrap_or_else(|| "openai".into());
+        let provider_model = existing
+            .get("MODEL")
+            .cloned()
+            .or_else(|| provider_default_model(&provider_id).map(|value| value.to_string()))
+            .unwrap_or_default();
+        let provider_base_url = existing
+            .get("BASE_URL")
+            .cloned()
+            .or_else(|| provider_default_base_url(&provider_id).map(|value| value.to_string()))
+            .unwrap_or_default();
 
         let mut fields = vec![
             Field {
+                key: "PROVIDER".into(),
+                label: "Provider profile ID".into(),
+                value: provider_id.clone(),
+                required: true,
+                secret: false,
+                help: Some(format!(
+                    "Profile id used as default_provider ({})",
+                    provider_choices()
+                )),
+            },
+            Field {
                 key: "MODEL".into(),
                 label: "LLM model".into(),
-                value: existing
-                    .get("MODEL")
-                    .cloned()
-                    .unwrap_or_else(|| "gpt-4o-mini".into()),
+                value: provider_model,
                 required: false,
                 secret: false,
-                help: Some("Model name for your LLM provider".into()),
+                help: Some("Model name for the selected provider profile".into()),
             },
             Field {
                 key: "BASE_URL".into(),
                 label: "API base URL".into(),
-                value: existing
-                    .get("BASE_URL")
-                    .cloned()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                value: provider_base_url,
                 required: true,
                 secret: false,
-                help: Some("OpenAI-compatible API endpoint".into()),
+                help: Some(
+                    "OpenAI-compatible API endpoint for the selected provider profile".into(),
+                ),
             },
             Field {
                 key: "API_KEY".into(),
@@ -217,10 +511,40 @@ impl SetupApp {
         };
 
         if let Some(map) = parsed.as_mapping() {
-            for (key, value) in map {
-                if let Some(key_str) = key.as_str() {
-                    if let Some(val_str) = value.as_str() {
-                        result.insert(key_str.to_ascii_uppercase(), val_str.to_string());
+            if let Some(default_provider) = map
+                .get(serde_yml::Value::String("default_provider".into()))
+                .and_then(|value| value.as_str())
+            {
+                let provider_id = normalize_provider_id(default_provider);
+                result.insert("PROVIDER".into(), provider_id.clone());
+                if let Some(providers) = map
+                    .get(serde_yml::Value::String("providers".into()))
+                    .and_then(|value| value.as_mapping())
+                    && let Some(provider) = providers
+                        .get(serde_yml::Value::String(default_provider.into()))
+                        .and_then(|value| value.as_mapping())
+                {
+                    if let Some(model) = provider
+                        .get(serde_yml::Value::String("default_model".into()))
+                        .and_then(|value| value.as_str())
+                    {
+                        result.insert("MODEL".into(), model.to_string());
+                    } else if let Some(model) = provider_default_model(&provider_id) {
+                        result.insert("MODEL".into(), model.to_string());
+                    }
+                    if let Some(base_url) = provider
+                        .get(serde_yml::Value::String("base_url".into()))
+                        .and_then(|value| value.as_str())
+                    {
+                        result.insert("BASE_URL".into(), base_url.to_string());
+                    } else if let Some(base_url) = provider_default_base_url(&provider_id) {
+                        result.insert("BASE_URL".into(), base_url.to_string());
+                    }
+                    if let Some(api_key) = provider
+                        .get(serde_yml::Value::String("api_key".into()))
+                        .and_then(|value| value.as_str())
+                    {
+                        result.insert("API_KEY".into(), api_key.to_string());
                     }
                 }
             }
@@ -346,19 +670,53 @@ impl SetupApp {
     }
 
     fn validate(&self) -> Result<(), String> {
+        let provider = self
+            .fields
+            .iter()
+            .find(|f| f.key == "PROVIDER")
+            .map(|f| f.value.trim())
+            .unwrap_or("");
+
+        if provider.is_empty() {
+            return Err("Provider profile ID is required".into());
+        }
+
+        let model = self
+            .fields
+            .iter()
+            .find(|f| f.key == "MODEL")
+            .map(|f| f.value.trim())
+            .unwrap_or("");
+        let effective_model = if model.is_empty() {
+            provider_default_model(provider).unwrap_or("")
+        } else {
+            model
+        };
+
         let base_url = self
             .fields
             .iter()
             .find(|f| f.key == "BASE_URL")
             .map(|f| f.value.trim())
             .unwrap_or("");
+        let effective_base_url = if base_url.is_empty() {
+            provider_default_base_url(provider).unwrap_or("")
+        } else {
+            base_url
+        };
 
-        if base_url.is_empty() {
-            return Err("API base URL is required".into());
+        if effective_base_url.is_empty() {
+            return Err(format!(
+                "API base URL is required for provider '{provider}'"
+            ));
         }
 
-        if Url::parse(base_url).is_err() {
-            return Err(format!("Invalid API base URL: {base_url}"));
+        if Url::parse(effective_base_url).is_err() {
+            return Err(format!("Invalid API base URL: {effective_base_url}"));
+        }
+
+        if effective_model.is_empty() {
+            return Err(format!("LLM model is required for provider '{provider}'"));
         }
 
         let api_key = self
@@ -369,7 +727,7 @@ impl SetupApp {
             .unwrap_or("");
 
         // ローカル推論サーバーだけは API キー未設定を許可する。
-        if !base_url_allows_empty_api_key(base_url) && api_key.is_empty() {
+        if !base_url_allows_empty_api_key(effective_base_url) && api_key.is_empty() {
             return Err(
                 "API key is required for non-local endpoints. Use a local URL (localhost/127.0.0.1) to skip.".into(),
             );
@@ -421,11 +779,22 @@ impl SetupApp {
     fn save(&mut self) -> Result<(), String> {
         self.validate()?;
 
+        let provider_id = normalize_provider_id(
+            self.fields
+                .iter()
+                .find(|f| f.key == "PROVIDER")
+                .map(|f| f.value.trim())
+                .unwrap_or(""),
+        );
+        let provider_label = provider_label_for(&provider_id);
+
         let model = self
             .fields
             .iter()
             .find(|f| f.key == "MODEL")
             .map(|f| f.value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| provider_default_model(&provider_id).map(|value| value.to_string()))
             .unwrap_or_default();
 
         let base_url = self
@@ -433,7 +802,9 @@ impl SetupApp {
             .iter()
             .find(|f| f.key == "BASE_URL")
             .map(|f| f.value.trim().to_string())
-            .unwrap_or_else(|| "https://api.openai.com/v1".into());
+            .filter(|value| !value.is_empty())
+            .or_else(|| provider_default_base_url(&provider_id).map(|value| value.to_string()))
+            .unwrap_or_default();
 
         let api_key = self
             .fields
@@ -441,8 +812,6 @@ impl SetupApp {
             .find(|f| f.key == "API_KEY")
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default();
-        let provider_id = infer_provider_id(&base_url);
-        let provider_label = infer_provider_label(&provider_id);
 
         let existing_token = self
             .original_yaml
@@ -515,23 +884,11 @@ impl SetupApp {
 
         let map = yaml_value.as_mapping_mut().unwrap();
 
-        let top_level_model = map
-            .get(serde_yml::Value::String("model".into()))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let top_level_api_key = map
-            .get(serde_yml::Value::String("api_key".into()))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let top_level_base_url = map
-            .get(serde_yml::Value::String("base_url".into()))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         map.remove(serde_yml::Value::String("data_dir".into()));
         map.remove(serde_yml::Value::String("workspace_dir".into()));
+        map.remove(serde_yml::Value::String("model".into()));
+        map.remove(serde_yml::Value::String("base_url".into()));
+        map.remove(serde_yml::Value::String("api_key".into()));
         map.insert(
             serde_yml::Value::String("default_provider".into()),
             serde_yml::Value::String(provider_id.clone()),
@@ -549,66 +906,41 @@ impl SetupApp {
             .entry(serde_yml::Value::String(provider_id.clone()))
             .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
         let provider_map = provider_value.as_mapping_mut().unwrap();
-        provider_map
-            .entry(serde_yml::Value::String("label".into()))
-            .or_insert_with(|| serde_yml::Value::String(provider_label.clone()));
-        provider_map
-            .entry(serde_yml::Value::String("base_url".into()))
-            .or_insert_with(|| {
-                serde_yml::Value::String(
-                    top_level_base_url
-                        .clone()
-                        .unwrap_or_else(|| base_url.clone()),
-                )
-            });
-        provider_map
-            .entry(serde_yml::Value::String("default_model".into()))
-            .or_insert_with(|| {
-                serde_yml::Value::String(top_level_model.clone().unwrap_or_else(|| model.clone()))
-            });
+        provider_map.insert(
+            serde_yml::Value::String("label".into()),
+            serde_yml::Value::String(provider_label.clone()),
+        );
+        provider_map.insert(
+            serde_yml::Value::String("base_url".into()),
+            serde_yml::Value::String(base_url.clone()),
+        );
+        provider_map.insert(
+            serde_yml::Value::String("default_model".into()),
+            serde_yml::Value::String(model.clone()),
+        );
         let models_key = serde_yml::Value::String("models".into());
         match provider_map.get_mut(&models_key) {
             Some(serde_yml::Value::Sequence(models)) => {
-                let effective_model = top_level_model.as_ref().unwrap_or(&model);
-                let has_model = models
-                    .iter()
-                    .any(|value| value.as_str() == Some(effective_model));
+                let has_model = models.iter().any(|value| value.as_str() == Some(&model));
                 if !has_model {
-                    models.push(serde_yml::Value::String(effective_model.clone()));
+                    models.push(serde_yml::Value::String(model.clone()));
                 }
             }
-            Some(_) => {}
+            Some(other) => {
+                *other = serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]);
+            }
             None => {
                 provider_map.insert(
                     models_key,
-                    serde_yml::Value::Sequence(vec![serde_yml::Value::String(
-                        top_level_model.clone().unwrap_or_else(|| model.clone()),
-                    )]),
+                    serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]),
                 );
             }
         }
         let api_key_key = serde_yml::Value::String("api_key".into());
-        if !provider_map.contains_key(&api_key_key) {
-            let effective_api_key = top_level_api_key
-                .clone()
-                .or_else(|| (!api_key.is_empty()).then_some(api_key.clone()));
-            if let Some(effective_api_key) = effective_api_key {
-                provider_map.insert(api_key_key, serde_yml::Value::String(effective_api_key));
-            }
-        }
-
-        if provider_map.contains_key(serde_yml::Value::String("default_model".into()))
-            && provider_map.contains_key(serde_yml::Value::String("base_url".into()))
-        {
-            if top_level_model.is_some() {
-                map.remove(serde_yml::Value::String("model".into()));
-            }
-            if top_level_api_key.is_some() {
-                map.remove(serde_yml::Value::String("api_key".into()));
-            }
-            if top_level_base_url.is_some() {
-                map.remove(serde_yml::Value::String("base_url".into()));
-            }
+        if api_key.is_empty() {
+            provider_map.remove(&api_key_key);
+        } else {
+            provider_map.insert(api_key_key, serde_yml::Value::String(api_key.clone()));
         }
 
         let mut channels = serde_yml::Value::Mapping(Default::default());
@@ -728,35 +1060,78 @@ fn generate_auth_token() -> String {
     STANDARD.encode(&bytes)
 }
 
-fn infer_provider_id(base_url: &str) -> String {
-    let normalized = base_url.trim().trim_end_matches('/');
-    if normalized == "https://api.openai.com/v1" {
-        "openai".to_string()
-    } else if normalized == "https://openrouter.ai/api/v1" {
-        "openrouter".to_string()
-    } else if base_url_allows_empty_api_key(normalized) {
-        "local".to_string()
-    } else {
-        "custom".to_string()
-    }
-}
-
-fn infer_provider_label(provider_id: &str) -> String {
-    match provider_id {
-        "openai" => "OpenAI".to_string(),
-        "openrouter" => "OpenRouter".to_string(),
-        "local" => "Local OpenAI-compatible".to_string(),
-        "custom" => "Custom OpenAI-compatible".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn mask_secret(value: &str) -> String {
     if value.len() <= 8 {
         return "********".into();
     }
     let visible = &value[..4];
     format!("{visible}********")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetupApp;
+    use std::fs;
+
+    #[test]
+    fn load_existing_config_prefers_new_provider_schema() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        fs::write(
+            &config_path,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      - gpt-4o-mini
+      - gpt-5
+channels:
+  web:
+    enabled: true
+    auth_token: web-token
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert_eq!(existing.get("PROVIDER"), Some(&"openai".to_string()));
+        assert_eq!(existing.get("MODEL"), Some(&"gpt-4o-mini".to_string()));
+        assert_eq!(
+            existing.get("BASE_URL"),
+            Some(&"https://api.openai.com/v1".to_string())
+        );
+        assert_eq!(existing.get("API_KEY"), Some(&"sk-openai".to_string()));
+        assert_eq!(
+            existing.get("WEB_AUTH_TOKEN"),
+            Some(&"web-token".to_string())
+        );
+    }
+
+    #[test]
+    fn load_existing_config_ignores_legacy_top_level_llm_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        fs::write(
+            &config_path,
+            r#"model: gpt-4o-mini
+base_url: https://api.openai.com/v1
+api_key: sk-legacy
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert!(!existing.contains_key("PROVIDER"));
+        assert!(!existing.contains_key("MODEL"));
+        assert!(!existing.contains_key("BASE_URL"));
+        assert!(!existing.contains_key("API_KEY"));
+    }
 }
 
 fn backup_config(path: &Path) -> Result<String, String> {

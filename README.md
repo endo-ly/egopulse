@@ -22,7 +22,9 @@ cargo run -p egopulse
 egopulse setup
 ```
 
-対話型TUIウィザードが `~/.egopulse/egopulse.config.yaml` を作成。LLMプロバイダの選択、API認証情報の入力、チャネルの設定をガイド。
+対話型TUIウィザードが `~/.egopulse/egopulse.config.yaml` を作成。LLMプロファイルIDの選択、対応する base URL / model の入力、チャネルの設定をガイド。
+
+セットアップで選べる主な provider preset は `openai`, `openrouter`, `ollama`, `google`, `aliyun-bailian`, `alibaba`, `qwen-portal`, `deepseek`, `synthetic`, `chutes`, `moonshot`, `mistral`, `azure`, `bedrock`, `zhipu`, `zai`, `minimax`, `cohere`, `tencent`, `xai`, `nvidia`, `huggingface`, `together`, `local`, `custom` です。
 
 ### 3. Run
 
