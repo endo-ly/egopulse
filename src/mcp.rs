@@ -26,8 +26,6 @@ use crate::error::McpError;
 use crate::llm::ToolDefinition;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
-const DEFAULT_MAX_RETRIES: u32 = 2;
-const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 300;
 const TOOL_NAME_MAX_LEN: usize = 64;
 
 type DynClient = RunningService<RoleClient, Box<dyn DynService<RoleClient>>>;
@@ -46,10 +44,6 @@ pub struct McpServerConfig {
     pub protocol_version: Option<String>,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_health_interval_secs")]
-    pub health_interval_secs: u64,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -62,14 +56,6 @@ pub struct McpServerConfig {
 
 fn default_request_timeout_secs() -> u64 {
     DEFAULT_REQUEST_TIMEOUT_SECS
-}
-
-fn default_max_retries() -> u32 {
-    DEFAULT_MAX_RETRIES
-}
-
-fn default_health_interval_secs() -> u64 {
-    DEFAULT_HEALTH_INTERVAL_SECS
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -90,6 +76,12 @@ struct ConnectedServer {
     client: DynClient,
     tool_name_map: HashMap<String, String>,
     cached_tools: Vec<Tool>,
+}
+
+impl ConnectedServer {
+    fn client(&self) -> &DynClient {
+        &self.client
+    }
 }
 
 pub fn mcp_config_paths() -> Vec<PathBuf> {
@@ -257,33 +249,31 @@ impl McpManager {
             .collect()
     }
 
+    /// Execute an MCP tool by name.
+    /// Takes pre-extracted server info to avoid holding RwLock across await.
     pub async fn execute_tool(
         &self,
-        full_name: &str,
+        server_idx: usize,
+        original_tool_name: String,
+        request_timeout_secs: u64,
         input: serde_json::Value,
     ) -> Result<String, McpError> {
         let server = self
             .servers
-            .iter()
-            .find(|s| s.tool_name_map.contains_key(full_name))
+            .get(server_idx)
             .ok_or_else(|| McpError::ToolCallFailed {
                 server: "unknown".to_string(),
-                tool: full_name.to_string(),
-                detail: "no connected server owns this tool".to_string(),
+                tool: original_tool_name.clone(),
+                detail: "server index not found".to_string(),
             })?;
 
-        let original_tool_name = server
-            .tool_name_map
-            .get(full_name)
-            .expect("tool existence verified by server match");
-
-        let request_timeout = Duration::from_secs(server.config.request_timeout_secs);
+        let request_timeout = Duration::from_secs(request_timeout_secs);
         let arguments = match input {
             serde_json::Value::Object(map) => map,
             other => {
                 return Err(McpError::ToolCallFailed {
                     server: server.name.clone(),
-                    tool: full_name.to_string(),
+                    tool: original_tool_name.clone(),
                     detail: format!("expected JSON object for arguments, got {}", other),
                 });
             }
@@ -296,15 +286,15 @@ impl McpManager {
             Ok(Err(error)) => {
                 return Err(McpError::ToolCallFailed {
                     server: server.name.clone(),
-                    tool: full_name.to_string(),
+                    tool: original_tool_name.clone(),
                     detail: error.to_string(),
                 });
             }
             Err(_) => {
                 return Err(McpError::ToolCallFailed {
                     server: server.name.clone(),
-                    tool: full_name.to_string(),
-                    detail: format!("timed out after {}s", server.config.request_timeout_secs),
+                    tool: original_tool_name.clone(),
+                    detail: format!("timed out after {}s", request_timeout_secs),
                 });
             }
         };
@@ -367,10 +357,22 @@ impl McpManager {
         })
     }
 
-    pub fn is_mcp_tool(&self, name: &str) -> bool {
-        self.servers
-            .iter()
-            .any(|s| s.tool_name_map.contains_key(name))
+    pub fn is_mcp_tool(&self, name: &str) -> Option<(usize, String, String, u64)> {
+        for (i, s) in self.servers.iter().enumerate() {
+            if let Some(original_name) = s.tool_name_map.get(name) {
+                return Some((
+                    i,
+                    s.name.clone(),
+                    original_name.clone(),
+                    s.config.request_timeout_secs,
+                ));
+            }
+        }
+        None
+    }
+
+    pub fn get_client_by_index(&self, index: usize) -> Option<&DynClient> {
+        self.servers.get(index).map(|s| s.client())
     }
 }
 
@@ -408,9 +410,14 @@ async fn connect_stdio(
         detail: error.to_string(),
     })?;
 
-    let client =
-        ().into_dyn()
-            .serve(child)
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
+    );
+
+    let client = client_info
+        .into_dyn()
+        .serve(child)
             .await
             .map_err(|error| McpError::ConnectionFailed {
                 server: name.to_string(),
@@ -642,8 +649,7 @@ mod tests {
         let json = r#"{
             "transport": "streamable_http",
             "endpoint": "http://127.0.0.1:8080/mcp",
-            "headers": {"Authorization": "Bearer token123"},
-            "max_retries": 5
+            "headers": {"Authorization": "Bearer token123"}
         }"#;
         let config: McpServerConfig = serde_json::from_str(json).expect("parse");
         assert!(matches!(config.transport, TransportType::StreamableHttp));
@@ -655,7 +661,6 @@ mod tests {
             config.headers.get("Authorization").unwrap(),
             "Bearer token123"
         );
-        assert_eq!(config.max_retries, 5);
     }
 
     #[test]

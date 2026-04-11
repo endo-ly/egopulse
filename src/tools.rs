@@ -194,13 +194,18 @@ impl ToolRegistry {
         }
 
         if let Some(mcp) = &self.mcp_manager {
-            let is_mcp = {
+            let mcp_info = {
                 let guard = mcp.read().await;
                 guard.is_mcp_tool(name)
             };
-            if is_mcp {
-                let guard = mcp.read().await;
-                match guard.execute_tool(name, input).await {
+            if let Some((idx, _, original_tool_name, request_timeout_secs)) = mcp_info {
+                let result = {
+                    let guard = mcp.read().await;
+                    guard
+                        .execute_tool(idx, original_tool_name, request_timeout_secs, input)
+                        .await
+                };
+                match result {
                     Ok(output) => return ToolResult::success(output),
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
