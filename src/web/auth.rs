@@ -173,7 +173,7 @@ mod tests {
     fn config_with_web(auth_token: Option<&str>, allowed_origins: Option<Vec<String>>) -> Config {
         Config {
             default_provider: "local".to_string(),
-            default_model: "gpt-4o-mini".to_string(),
+            default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
                 "local".to_string(),
                 ProviderConfig {

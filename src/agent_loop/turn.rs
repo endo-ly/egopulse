@@ -1139,7 +1139,7 @@ mod tests {
     fn test_config(data_dir: String) -> Config {
         Config {
             default_provider: "openai".to_string(),
-            default_model: "gpt-4o-mini".to_string(),
+            default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
                 "openai".to_string(),
                 ProviderConfig {
