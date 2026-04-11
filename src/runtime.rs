@@ -48,12 +48,12 @@ impl Clone for AppState {
 }
 
 /// Builds the application state without recording a config file path.
-pub fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
-    build_app_state_with_path(config, None)
+pub async fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
+    build_app_state_with_path(config, None).await
 }
 
 /// Builds the application state and keeps the config path for later saves.
-pub fn build_app_state_with_path(
+pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
@@ -62,7 +62,6 @@ pub fn build_app_state_with_path(
     let llm = Arc::from(create_provider(&config)?);
     let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
 
-    // Build channel registry
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
 
@@ -82,7 +81,13 @@ pub fn build_app_state_with_path(
     }
 
     let channels = Arc::new(channels);
-    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&skills)));
+    let mut tools = ToolRegistry::new(&config, Arc::clone(&skills));
+
+    let mcp_manager = crate::mcp::McpManager::new(&config.workspace_dir()).await;
+    let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
+    tools.set_mcp_manager(mcp_arc);
+
+    let tools = Arc::new(tools);
 
     Ok(AppState {
         db,
@@ -109,7 +114,7 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
 
 /// Starts the local TUI channel with a fully built application state.
 pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
-    let state = build_app_state(config)?;
+    let state = build_app_state(config).await?;
     channels::tui::run(state).await
 }
 

@@ -111,6 +111,7 @@ pub trait Tool: Send + Sync {
 /// Owns all tool instances and dispatches execution by tool name.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
 
 impl ToolRegistry {
@@ -135,12 +136,46 @@ impl ToolRegistry {
                 Box::new(LsTool::new(workspace_dir)),
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
+            mcp_manager: None,
         }
+    }
+
+    /// Register a dynamically created tool (e.g. MCP tool wrapper).
+    pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    /// Set the MCP manager for dynamic tool dispatch.
+    pub fn set_mcp_manager(
+        &mut self,
+        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    ) {
+        self.mcp_manager = Some(manager);
     }
 
     /// Collect tool definitions for registration with the LLM provider.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        let mut defs: Vec<ToolDefinition> =
+            self.tools.iter().map(|tool| tool.definition()).collect();
+
+        if let Some(mcp) = &self.mcp_manager {
+            let mcp_defs = mcp.blocking_read().all_tool_definitions();
+            defs.extend(mcp_defs);
+        }
+
+        defs
+    }
+
+    /// Collect tool definitions asynchronously (preferrred when MCP is present).
+    pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
+        let mut defs: Vec<ToolDefinition> =
+            self.tools.iter().map(|tool| tool.definition()).collect();
+
+        if let Some(mcp) = &self.mcp_manager {
+            defs.extend(mcp.read().await.all_tool_definitions());
+        }
+
+        defs
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
@@ -155,6 +190,17 @@ impl ToolRegistry {
                 return tool.execute(input, context).await;
             }
         }
+
+        if let Some(mcp) = &self.mcp_manager {
+            let manager = mcp.read().await;
+            if manager.is_mcp_tool(name) {
+                match manager.execute_tool(name, input).await {
+                    Ok(output) => return ToolResult::success(output),
+                    Err(error) => return ToolResult::error(error.to_string()),
+                }
+            }
+        }
+
         ToolResult::error(format!("Unknown tool: {name}"))
     }
 }
