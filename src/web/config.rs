@@ -1,6 +1,6 @@
 //! Web 設定 API を扱うモジュール。
 //!
-//! ランタイム設定の参照と YAML への保存を HTTP エンドポイントとして公開する。
+//! provider / model / scope を中心とした設定の参照と YAML 保存を HTTP として公開する。
 
 use std::path::PathBuf;
 
@@ -10,13 +10,29 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_yml::{Mapping, Value};
 
-use crate::config::{ChannelConfig, Config, default_config_path};
+use crate::config::{Config, default_config_path};
 
 use super::WebState;
+
+const GLOBAL_SCOPE: &str = "global";
+const SUPPORTED_SCOPES: &[&str] = &[GLOBAL_SCOPE, "web", "discord", "telegram"];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ProviderPayload {
+    id: String,
+    label: String,
+    base_url: String,
+    default_model: String,
+    models: Vec<String>,
+    has_api_key: bool,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct ConfigPayload {
+    scope: String,
+    provider: String,
     model: String,
     base_url: String,
     data_dir: String,
@@ -27,14 +43,18 @@ struct ConfigPayload {
     web_auth_enabled: bool,
     has_api_key: bool,
     config_path: String,
-    requires_restart: bool,
+    scopes: Vec<String>,
+    providers: Vec<ProviderPayload>,
 }
 
 #[derive(Debug, Deserialize)]
-/// Accepts mutable web-related config values from the browser client.
+/// Accepts mutable config values from the browser client.
 pub(super) struct ConfigUpdateRequest {
+    scope: String,
+    provider: String,
     model: String,
-    base_url: String,
+    #[serde(default)]
+    base_url: Option<String>,
     web_enabled: bool,
     web_host: String,
     web_port: u16,
@@ -47,25 +67,28 @@ pub(super) async fn api_get_config(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = config_path_for_save(&state);
-    let display = Config::load(Some(&path)).unwrap_or_else(|_| state.app_state.config.clone());
+    let display = Config::load_allow_missing_api_key(Some(&path))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path),
-        "requires_restart": true,
+        "config": payload_from_config(&display, &path, GLOBAL_SCOPE)?,
     })))
 }
 
-/// Persists a partial config update from the web UI.
+/// Persists a config update from the web UI.
 pub(super) async fn api_put_config(
     State(state): State<WebState>,
     Json(request): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if request.model.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "model is required".to_string()));
+    let scope = normalize_scope(&request.scope)?;
+    let provider = request.provider.trim();
+    let model = request.model.trim();
+    if provider.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "provider is required".to_string()));
     }
-    if request.base_url.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "base_url is required".to_string()));
+    if model.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "model is required".to_string()));
     }
     if request.web_host.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "web_host is required".to_string()));
@@ -80,26 +103,33 @@ pub(super) async fn api_put_config(
     let path = config_path_for_save(&state);
     let mut root = read_existing_yaml(&path)?;
 
-    set_string(&mut root, "model", request.model.trim());
-    set_string(&mut root, "base_url", request.base_url.trim());
-    remove_key(&mut root, "data_dir");
-    remove_key(&mut root, "workspace_dir");
-    remove_key(&mut root, "web_enabled");
-    remove_key(&mut root, "web_host");
-    remove_key(&mut root, "web_port");
+    upsert_provider(
+        &mut root,
+        provider,
+        model,
+        request
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        request.api_key.as_deref().map(str::trim),
+    )?;
 
-    match request.api_key.as_deref().map(str::trim) {
-        Some(value) if !value.is_empty() => set_string(&mut root, "api_key", value),
-        Some(_) => remove_key(&mut root, "api_key"),
-        None => {}
+    if scope == GLOBAL_SCOPE {
+        set_string(&mut root, "default_provider", provider);
+    } else {
+        let channel = ensure_channel_mapping(&mut root, &scope);
+        channel.insert(
+            Value::String("provider".to_string()),
+            Value::String(provider.to_string()),
+        );
+        channel.insert(
+            Value::String("model".to_string()),
+            Value::String(model.to_string()),
+        );
     }
 
-    let channels = ensure_mapping(entry_mut(&mut root, "channels"));
-    let web = ensure_mapping(
-        channels
-            .entry(Value::String("web".to_string()))
-            .or_insert(Value::Mapping(Mapping::new())),
-    );
+    let web = ensure_channel_mapping(&mut root, "web");
     web.insert(
         Value::String("enabled".to_string()),
         Value::Bool(request.web_enabled),
@@ -119,36 +149,12 @@ pub(super) async fn api_put_config(
     let yaml = serde_yml::to_string(&root).map_err(internal_error)?;
     std::fs::write(&path, yaml).map_err(internal_error)?;
 
-    let display = match Config::load_allow_missing_api_key(Some(&path)) {
-        Ok(config) => config,
-        Err(_) => {
-            let mut config = state.app_state.config.clone();
-            config.model = request.model.trim().to_string();
-            config.llm_base_url = request.base_url.trim().to_string();
-            config.data_dir = crate::config::default_data_dir()
-                .to_string_lossy()
-                .into_owned();
-            let web_auth_token = config.web_auth_token().map(str::to_string);
-            let allowed_origins = config.web_allowed_origins();
-            config.channels.insert(
-                "web".to_string(),
-                ChannelConfig {
-                    enabled: Some(request.web_enabled),
-                    host: Some(request.web_host.trim().to_string()),
-                    port: Some(request.web_port),
-                    auth_token: web_auth_token,
-                    allowed_origins: Some(allowed_origins),
-                    ..Default::default()
-                },
-            );
-            config
-        }
-    };
+    let display = Config::load_allow_missing_api_key(Some(&path))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path),
-        "requires_restart": true,
+        "config": payload_from_config(&display, &path, &scope)?,
     })))
 }
 
@@ -159,10 +165,38 @@ fn config_path_for_save(state: &WebState) -> PathBuf {
         .unwrap_or_else(default_config_path)
 }
 
-fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload {
-    ConfigPayload {
-        model: config.model.clone(),
-        base_url: config.llm_base_url.clone(),
+fn payload_from_config(
+    config: &Config,
+    path: &std::path::Path,
+    scope: &str,
+) -> Result<ConfigPayload, (StatusCode, String)> {
+    let resolved = match scope {
+        GLOBAL_SCOPE => config
+            .resolve_llm_for_channel("cli")
+            .map_err(internal_error)?,
+        channel => config
+            .resolve_llm_for_channel(channel)
+            .map_err(internal_error)?,
+    };
+
+    let providers = config
+        .providers
+        .iter()
+        .map(|(id, provider)| ProviderPayload {
+            id: id.clone(),
+            label: provider.label.clone(),
+            base_url: provider.base_url.clone(),
+            default_model: provider.default_model.clone(),
+            models: provider.models.clone(),
+            has_api_key: provider.api_key.is_some(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ConfigPayload {
+        scope: scope.to_string(),
+        provider: resolved.provider,
+        model: resolved.model,
+        base_url: resolved.base_url,
         data_dir: config.data_dir.clone(),
         workspace_dir: crate::config::default_workspace_dir()
             .to_string_lossy()
@@ -171,10 +205,25 @@ fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload
         web_host: config.web_host(),
         web_port: config.web_port(),
         web_auth_enabled: config.web_auth_token().is_some(),
-        has_api_key: config.api_key.is_some(),
+        has_api_key: config.web_llm().map_err(internal_error)?.api_key.is_some(),
         config_path: path.display().to_string(),
-        requires_restart: true,
+        scopes: SUPPORTED_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect(),
+        providers,
+    })
+}
+
+fn normalize_scope(scope: &str) -> Result<String, (StatusCode, String)> {
+    let normalized = scope.trim().to_ascii_lowercase();
+    if SUPPORTED_SCOPES
+        .iter()
+        .any(|candidate| *candidate == normalized)
+    {
+        return Ok(normalized);
     }
+    Err((StatusCode::BAD_REQUEST, "invalid scope".to_string()))
 }
 
 fn read_existing_yaml(path: &std::path::Path) -> Result<Value, (StatusCode, String)> {
@@ -190,17 +239,119 @@ fn read_existing_yaml(path: &std::path::Path) -> Result<Value, (StatusCode, Stri
     })
 }
 
+fn upsert_provider(
+    root: &mut Value,
+    provider: &str,
+    model: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let providers = ensure_mapping(entry_mut(root, "providers"));
+    let provider_value = providers
+        .entry(Value::String(provider.to_string()))
+        .or_insert(Value::Mapping(Mapping::new()));
+    let provider_mapping = ensure_mapping(provider_value);
+
+    let current_base_url = provider_mapping
+        .get(Value::String("base_url".to_string()))
+        .and_then(value_as_trimmed_str);
+    let effective_base_url = base_url.or(current_base_url.as_deref()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "base_url is required when creating a provider".to_string(),
+    ))?;
+
+    provider_mapping.insert(
+        Value::String("label".to_string()),
+        Value::String(infer_provider_label(provider).to_string()),
+    );
+    provider_mapping.insert(
+        Value::String("base_url".to_string()),
+        Value::String(effective_base_url.to_string()),
+    );
+    provider_mapping.insert(
+        Value::String("default_model".to_string()),
+        Value::String(model.to_string()),
+    );
+
+    let mut models = provider_mapping
+        .get(Value::String("models".to_string()))
+        .and_then(value_as_string_vec)
+        .unwrap_or_default();
+    if !models.iter().any(|candidate| candidate == model) {
+        models.push(model.to_string());
+    }
+    provider_mapping.insert(
+        Value::String("models".to_string()),
+        serde_yml::to_value(models).map_err(internal_error)?,
+    );
+
+    match api_key {
+        Some(value) if !value.is_empty() => {
+            provider_mapping.insert(
+                Value::String("api_key".to_string()),
+                Value::String(value.to_string()),
+            );
+        }
+        Some(_) => {
+            provider_mapping.remove(Value::String("api_key".to_string()));
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+fn ensure_channel_mapping<'a>(root: &'a mut Value, channel: &str) -> &'a mut Mapping {
+    let channels = ensure_mapping(entry_mut(root, "channels"));
+    ensure_mapping(
+        channels
+            .entry(Value::String(channel.to_string()))
+            .or_insert(Value::Mapping(Mapping::new())),
+    )
+}
+
+fn infer_provider_label(provider: &str) -> String {
+    match provider {
+        "openai" => "OpenAI".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        "local" => "Local OpenAI-compatible".to_string(),
+        "custom" => "Custom OpenAI-compatible".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn value_as_trimmed_str(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_as_string_vec(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Sequence(values) => Some(
+            values
+                .iter()
+                .filter_map(value_as_trimmed_str)
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    }
+}
+
 fn set_string(root: &mut Value, key: &str, value: &str) {
     let mapping = ensure_mapping(root);
     mapping.insert(
         Value::String(key.to_string()),
         Value::String(value.to_string()),
     );
-}
-
-fn remove_key(root: &mut Value, key: &str) {
-    let mapping = ensure_mapping(root);
-    mapping.remove(Value::String(key.to_string()));
 }
 
 fn entry_mut<'a>(root: &'a mut Value, key: &str) -> &'a mut Value {
