@@ -1068,72 +1068,6 @@ fn mask_secret(value: &str) -> String {
     format!("{visible}********")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SetupApp;
-    use std::fs;
-
-    #[test]
-    fn load_existing_config_prefers_new_provider_schema() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config_path = temp_dir.path().join("egopulse.config.yaml");
-        fs::write(
-            &config_path,
-            r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-    models:
-      - gpt-4o-mini
-      - gpt-5
-channels:
-  web:
-    enabled: true
-    auth_token: web-token
-"#,
-        )
-        .expect("write config");
-
-        let (existing, _) = SetupApp::load_existing_config(&config_path);
-
-        assert_eq!(existing.get("PROVIDER"), Some(&"openai".to_string()));
-        assert_eq!(existing.get("MODEL"), Some(&"gpt-4o-mini".to_string()));
-        assert_eq!(
-            existing.get("BASE_URL"),
-            Some(&"https://api.openai.com/v1".to_string())
-        );
-        assert_eq!(existing.get("API_KEY"), Some(&"sk-openai".to_string()));
-        assert_eq!(
-            existing.get("WEB_AUTH_TOKEN"),
-            Some(&"web-token".to_string())
-        );
-    }
-
-    #[test]
-    fn load_existing_config_ignores_legacy_top_level_llm_fields() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config_path = temp_dir.path().join("egopulse.config.yaml");
-        fs::write(
-            &config_path,
-            r#"model: gpt-4o-mini
-base_url: https://api.openai.com/v1
-api_key: sk-legacy
-"#,
-        )
-        .expect("write config");
-
-        let (existing, _) = SetupApp::load_existing_config(&config_path);
-
-        assert!(!existing.contains_key("PROVIDER"));
-        assert!(!existing.contains_key("MODEL"));
-        assert!(!existing.contains_key("BASE_URL"));
-        assert!(!existing.contains_key("API_KEY"));
-    }
-}
-
 fn backup_config(path: &Path) -> Result<String, String> {
     let backup_dir = path
         .parent()
@@ -1538,5 +1472,71 @@ async fn run_inner(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetupApp;
+    use std::fs;
+
+    #[test]
+    fn load_existing_config_prefers_new_provider_schema() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        fs::write(
+            &config_path,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      - gpt-4o-mini
+      - gpt-5
+channels:
+  web:
+    enabled: true
+    auth_token: web-token
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert_eq!(existing.get("PROVIDER"), Some(&"openai".to_string()));
+        assert_eq!(existing.get("MODEL"), Some(&"gpt-4o-mini".to_string()));
+        assert_eq!(
+            existing.get("BASE_URL"),
+            Some(&"https://api.openai.com/v1".to_string())
+        );
+        assert_eq!(existing.get("API_KEY"), Some(&"sk-openai".to_string()));
+        assert_eq!(
+            existing.get("WEB_AUTH_TOKEN"),
+            Some(&"web-token".to_string())
+        );
+    }
+
+    #[test]
+    fn load_existing_config_ignores_legacy_top_level_llm_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        fs::write(
+            &config_path,
+            r#"model: gpt-4o-mini
+base_url: https://api.openai.com/v1
+api_key: sk-legacy
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert!(!existing.contains_key("PROVIDER"));
+        assert!(!existing.contains_key("MODEL"));
+        assert!(!existing.contains_key("BASE_URL"));
+        assert!(!existing.contains_key("API_KEY"));
     }
 }

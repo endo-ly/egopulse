@@ -42,6 +42,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 rand = "0.9"
 regex = "1"
+rmcp = { version = "1.4", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 similar = "2.7"
 uuid = { version = "1", features = ["v4"] }
 

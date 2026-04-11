@@ -26,7 +26,7 @@ pub async fn ask_in_session(
     session: &str,
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
-    let state = build_app_state(config)?;
+    let state = build_app_state(config).await?;
     let context = SurfaceContext {
         channel: "cli".to_string(),
         surface_user: "local_user".to_string(),
@@ -120,7 +120,7 @@ where
             .send_message(
                 &system_prompt,
                 request_messages,
-                Some(state.tools.definitions()),
+                Some(state.tools.definitions_async().await),
             )
             .await?;
 

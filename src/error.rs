@@ -22,6 +22,8 @@ pub enum EgoPulseError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Channel(#[from] ChannelError),
+    #[error(transparent)]
+    Mcp(#[from] McpError),
     #[error("shutdown_requested")]
     ShutdownRequested,
     #[error("internal_error: {0}")]
@@ -137,4 +139,27 @@ pub enum ChannelError {
     SendFailed(String),
     #[error("channel_cross_chat_not_allowed")]
     CrossChatNotAllowed,
+}
+
+/// MCP (Model Context Protocol) client errors.
+#[derive(Debug, Error)]
+pub enum McpError {
+    #[error("mcp_config_read_failed: {path}: {source}")]
+    ConfigReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("mcp_config_parse_failed: {path}: {detail}")]
+    ConfigParseFailed { path: PathBuf, detail: String },
+    #[error("mcp_connection_failed: server={server} {detail}")]
+    ConnectionFailed { server: String, detail: String },
+    #[error("mcp_tool_call_failed: server={server} tool={tool} {detail}")]
+    ToolCallFailed {
+        server: String,
+        tool: String,
+        detail: String,
+    },
+    #[error("mcp_tool_list_failed: server={server} {detail}")]
+    ToolListFailed { server: String, detail: String },
 }

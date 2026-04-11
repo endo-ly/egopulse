@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod llm;
 pub mod llm_profile;
 pub mod logging;
+pub mod mcp;
 pub mod runtime;
 pub mod setup;
 pub mod skills;
