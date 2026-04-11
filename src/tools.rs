@@ -1970,7 +1970,7 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
 #[cfg(test)]
 mod tests {
     use super::{ToolExecutionContext, ToolRegistry};
-    use crate::config::{ChannelConfig, Config};
+    use crate::config::{ChannelConfig, Config, ProviderConfig};
     use crate::skills::SkillManager;
 
     use serde_json::json;
@@ -2006,9 +2006,17 @@ mod tests {
 
     fn test_config(data_dir: &str) -> Config {
         Config {
-            model: "gpt-4o-mini".to_string(),
-            api_key: None,
-            llm_base_url: "http://127.0.0.1:1234/v1".to_string(),
+            default_provider: "local".to_string(),
+            providers: std::collections::HashMap::from([(
+                "local".to_string(),
+                ProviderConfig {
+                    label: "Local".to_string(),
+                    base_url: "http://127.0.0.1:1234/v1".to_string(),
+                    api_key: None,
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
             data_dir: data_dir.to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
