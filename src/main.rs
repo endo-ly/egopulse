@@ -141,6 +141,6 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
         }
-        None => runtime::run_tui(config).await,
+        None => runtime::run_tui(config, resolved_config_path).await,
     }
 }

@@ -9,7 +9,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{Config, authorization_token};
+use crate::config::ResolvedLlmConfig;
 use crate::error::LlmError;
 
 /// A single tool call requested by the LLM.
@@ -150,8 +150,8 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-/// Create the default LLM provider based on the current configuration.
-pub fn create_provider(config: &Config) -> Result<Box<dyn LlmProvider>, LlmError> {
+/// Create the default LLM provider based on the resolved request-time configuration.
+pub fn create_provider(config: &ResolvedLlmConfig) -> Result<Box<dyn LlmProvider>, LlmError> {
     Ok(Box::new(OpenAiProvider::new(config)?))
 }
 
@@ -165,7 +165,7 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// Build a new provider from the given configuration.
-    pub fn new(config: &Config) -> Result<Self, LlmError> {
+    pub fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
             .build()
@@ -173,9 +173,9 @@ impl OpenAiProvider {
 
         Ok(Self {
             http,
-            api_key: authorization_token(config).map(ToString::to_string),
+            api_key: config.api_key.clone(),
             model: config.model.clone(),
-            base_url: config.llm_base_url.clone(),
+            base_url: config.base_url.clone(),
         })
     }
 
@@ -1146,7 +1146,7 @@ mod tests {
     use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::config::Config;
+    use crate::config::ResolvedLlmConfig;
 
     use super::{
         Message, MessageContent, MessageContentPart, ToolCall, ToolDefinition, create_provider,
@@ -1157,27 +1157,13 @@ mod tests {
         vec![Message::text("user", content)]
     }
 
-    fn config(model: &str, base_url: String, api_key: Option<&str>) -> Config {
-        Config {
+    fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
+        ResolvedLlmConfig {
+            provider: "test".to_string(),
+            label: "Test".to_string(),
+            base_url,
+            api_key: api_key.map(ToString::to_string),
             model: model.to_string(),
-            api_key: api_key
-                .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
-            llm_base_url: base_url,
-            data_dir: ".egopulse-test".to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels: std::collections::HashMap::from([(
-                "web".to_string(),
-                crate::config::ChannelConfig {
-                    enabled: Some(true),
-                    host: Some("127.0.0.1".to_string()),
-                    port: Some(10961),
-                    ..Default::default()
-                },
-            )]),
         }
     }
 

@@ -110,7 +110,7 @@ where
         let request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
         let response = state
-            .llm
+            .llm_for_channel(&context.channel)?
             .send_message(
                 &system_prompt,
                 request_messages,
@@ -561,7 +561,7 @@ async fn persist_user_turn_with_compaction(
         let mut candidate_messages = loaded.messages.clone();
         candidate_messages.push(user_message.clone());
         let candidate_messages =
-            maybe_compact_messages(state, context, chat_id, &candidate_messages).await;
+            maybe_compact_messages(state, context, chat_id, &candidate_messages).await?;
 
         match persist_phase_once(
             state,
@@ -591,16 +591,16 @@ async fn maybe_compact_messages(
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
-) -> Vec<Message> {
+) -> Result<Vec<Message>, EgoPulseError> {
     if messages.len() <= state.config.max_session_messages {
-        return messages.to_vec();
+        return Ok(messages.to_vec());
     }
 
     archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages).await;
 
     let keep_recent = state.config.compact_keep_recent.min(messages.len());
     if keep_recent == messages.len() {
-        return messages.to_vec();
+        return Ok(messages.to_vec());
     }
 
     let split_at = messages.len() - keep_recent;
@@ -621,11 +621,10 @@ async fn maybe_compact_messages(
         format!("{summarize_prompt}\n\n---\n\n{summary_input}"),
     )];
     let timeout_secs = state.config.compaction_timeout_secs;
+    let summary_provider = state.llm_for_channel(&context.channel)?;
     let summary_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        state
-            .llm
-            .send_message("You are a helpful summarizer.", summarize_messages, None),
+        summary_provider.send_message("You are a helpful summarizer.", summarize_messages, None),
     )
     .await;
 
@@ -633,19 +632,19 @@ async fn maybe_compact_messages(
         Ok(Ok(response)) => strip_thinking(&response.content),
         Ok(Err(error)) => {
             warn!("compaction summarization failed: {error}; falling back to recent messages");
-            return recent_messages.to_vec();
+            return Ok(recent_messages.to_vec());
         }
         Err(_) => {
             warn!(
                 "compaction summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
                 context.channel, chat_id
             );
-            return recent_messages.to_vec();
+            return Ok(recent_messages.to_vec());
         }
     };
     if summary.trim().is_empty() {
         warn!("compaction summarization returned empty text; falling back to recent messages");
-        return recent_messages.to_vec();
+        return Ok(recent_messages.to_vec());
     }
 
     let mut compacted = vec![Message::text(
@@ -667,7 +666,7 @@ async fn maybe_compact_messages(
         compacted.pop();
     }
 
-    compacted
+    Ok(compacted)
 }
 
 async fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
@@ -1040,7 +1039,7 @@ mod tests {
         truncate_compaction_summary_input,
     };
     use crate::agent_loop::{SurfaceContext, process_turn};
-    use crate::config::Config;
+    use crate::config::{Config, ProviderConfig};
     use crate::error::{EgoPulseError, LlmError};
     use crate::llm::{
         LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
@@ -1132,9 +1131,17 @@ mod tests {
 
     fn test_config(data_dir: String) -> Config {
         Config {
-            model: "gpt-4o-mini".to_string(),
-            api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
-            llm_base_url: "https://api.openai.com/v1".to_string(),
+            default_provider: "openai".to_string(),
+            providers: std::collections::HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
             data_dir,
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
@@ -1199,7 +1206,7 @@ mod tests {
             db,
             config: config.clone(),
             config_path: None,
-            llm: Arc::from(llm),
+            llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),

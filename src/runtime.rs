@@ -25,7 +25,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
     pub config_path: Option<PathBuf>,
-    pub llm: Arc<dyn crate::llm::LlmProvider>,
+    pub llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub channels: Arc<ChannelRegistry>,
     pub skills: Arc<SkillManager>,
     pub tools: Arc<ToolRegistry>,
@@ -38,12 +38,37 @@ impl Clone for AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
             config_path: self.config_path.clone(),
-            llm: Arc::clone(&self.llm),
+            llm_override: self.llm_override.clone(),
             channels: Arc::clone(&self.channels),
             skills: Arc::clone(&self.skills),
             tools: Arc::clone(&self.tools),
             assets: Arc::clone(&self.assets),
         }
+    }
+}
+
+impl AppState {
+    /// Returns the latest config, reloading from disk when a config path is known.
+    pub fn current_config(&self) -> Result<Config, EgoPulseError> {
+        match self.config_path.as_deref() {
+            Some(path) => Ok(Config::load_allow_missing_api_key(Some(path))?),
+            None => Ok(self.config.clone()),
+        }
+    }
+
+    /// Returns the LLM provider resolved for the given channel.
+    pub fn llm_for_channel(
+        &self,
+        channel: &str,
+    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
+        if let Some(provider) = self.llm_override.clone() {
+            return Ok(provider);
+        }
+
+        let config = self.current_config()?;
+        Ok(Arc::from(create_provider(
+            &config.resolve_llm_for_channel(channel)?,
+        )?))
     }
 }
 
@@ -59,7 +84,6 @@ pub fn build_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let assets = Arc::new(AssetStore::new(&config.data_dir)?);
-    let llm = Arc::from(create_provider(&config)?);
     let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
 
     // Build channel registry
@@ -88,7 +112,7 @@ pub fn build_app_state_with_path(
         db,
         config,
         config_path,
-        llm,
+        llm_override: None,
         channels,
         skills,
         tools,
@@ -98,7 +122,7 @@ pub fn build_app_state_with_path(
 
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
-    let llm = create_provider(&config)?;
+    let llm = create_provider(&config.resolve_llm_for_channel("cli")?)?;
     let messages = vec![Message::text("user", prompt)];
 
     tokio::select! {
@@ -108,8 +132,8 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
 }
 
 /// Starts the local TUI channel with a fully built application state.
-pub async fn run_tui(config: Config) -> Result<(), EgoPulseError> {
-    let state = build_app_state(config)?;
+pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
+    let state = build_app_state_with_path(config, config_path)?;
     channels::tui::run(state).await
 }
 

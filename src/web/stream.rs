@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
 
+use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
 use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
-use super::sessions::parse_chat_id_from_session_key;
 use crate::storage::call_blocking;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,11 +278,15 @@ pub(super) async fn start_stream_run(
             }
         });
 
-        let result =
-            process_turn_with_events(&state_for_task.app_state, &context_for_task, &message, |event| {
+        let result = process_turn_with_events(
+            &state_for_task.app_state,
+            &context_for_task,
+            &message,
+            |event| {
                 let _ = evt_tx.send(event);
-            })
-            .await;
+            },
+        )
+        .await;
 
         if let Err(error) = result {
             let _ = evt_tx.send(super::sse::AgentEvent::Error {
