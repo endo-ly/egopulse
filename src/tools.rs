@@ -153,8 +153,10 @@ impl ToolRegistry {
         self.mcp_manager = Some(manager);
     }
 
-    /// Collect tool definitions for registration with the LLM provider.
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    /// Collect tool definitions synchronously (internal only).
+    /// External callers must use [`definitions_async`] to avoid blocking an async runtime.
+    #[allow(dead_code)]
+    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
 
@@ -192,9 +194,13 @@ impl ToolRegistry {
         }
 
         if let Some(mcp) = &self.mcp_manager {
-            let manager = mcp.read().await;
-            if manager.is_mcp_tool(name) {
-                match manager.execute_tool(name, input).await {
+            let is_mcp = {
+                let guard = mcp.read().await;
+                guard.is_mcp_tool(name)
+            };
+            if is_mcp {
+                let guard = mcp.read().await;
+                match guard.execute_tool(name, input).await {
                     Ok(output) => return ToolResult::success(output),
                     Err(error) => return ToolResult::error(error.to_string()),
                 }

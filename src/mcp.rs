@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, timeout};
@@ -14,7 +16,10 @@ use tracing::warn;
 
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, Tool};
 use rmcp::service::{DynService, RoleClient, RunningService, ServiceExt};
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{
+    StreamableHttpClientTransport, TokioChildProcess,
+    streamable_http_client::StreamableHttpClientTransportConfig,
+};
 
 use crate::config::{default_state_root, default_workspace_dir};
 use crate::error::McpError;
@@ -192,14 +197,21 @@ impl McpManager {
             match connect_server(name, config, workspace_dir).await {
                 Ok((client, tools)) => {
                     let mut tool_name_map = HashMap::new();
-                    let tool_display_names: Vec<String> = tools
-                        .iter()
-                        .map(|t| {
-                            let full = sanitize_tool_name(name, t.name.as_ref());
-                            tool_name_map.insert(full.clone(), t.name.to_string());
-                            full
-                        })
-                        .collect();
+                    let mut tool_display_names = Vec::new();
+                    for t in &tools {
+                        let full = sanitize_tool_name(name, t.name.as_ref());
+                        if tool_name_map.contains_key(&full) {
+                            warn!(
+                                server = name,
+                                original = %t.name,
+                                sanitized = %full,
+                                "skipping MCP tool: sanitized name collides with existing tool"
+                            );
+                            continue;
+                        }
+                        tool_name_map.insert(full.clone(), t.name.to_string());
+                        tool_display_names.push(full);
+                    }
 
                     tracing::info!(
                         server = name,
@@ -297,15 +309,56 @@ impl McpManager {
             }
         };
 
-        let output = result
+        let mut parts: Vec<String> = result
             .content
             .into_iter()
-            .filter_map(|content| match content.raw {
-                rmcp::model::RawContent::Text(text) => Some(text.text.clone()),
-                _ => None,
+            .map(|content| match content.raw {
+                rmcp::model::RawContent::Text(text) => text.text.clone(),
+                rmcp::model::RawContent::Image(img) => {
+                    format!("[image: {} ({} bytes)]", img.mime_type, img.data.len())
+                }
+                rmcp::model::RawContent::Resource(res) => {
+                    let desc = match &res.resource {
+                        rmcp::model::ResourceContents::TextResourceContents {
+                            uri,
+                            mime_type,
+                            ..
+                        } => {
+                            format!(
+                                "resource: {uri} ({})",
+                                mime_type.as_deref().unwrap_or("unknown")
+                            )
+                        }
+                        rmcp::model::ResourceContents::BlobResourceContents {
+                            uri,
+                            mime_type,
+                            ..
+                        } => {
+                            format!(
+                                "blob: {uri} ({})",
+                                mime_type.as_deref().unwrap_or("unknown")
+                            )
+                        }
+                    };
+                    format!("[{desc}]")
+                }
+                rmcp::model::RawContent::Audio(audio) => {
+                    format!("[audio: {} ({} bytes)]", audio.mime_type, audio.data.len())
+                }
+                rmcp::model::RawContent::ResourceLink(link) => {
+                    format!("[resource_link: {} ({})]", link.uri, link.name)
+                }
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+
+        if let Some(structured) = result.structured_content {
+            parts.push(format!(
+                "[structured_content: {}]",
+                serde_json::to_string(&structured).unwrap_or_default()
+            ));
+        }
+
+        let output = parts.join("\n");
 
         Ok(if output.is_empty() {
             "(no output)".to_string()
@@ -387,7 +440,29 @@ async fn connect_http(
             detail: "streamable_http transport requires 'endpoint' field".to_string(),
         })?;
 
-    let transport = StreamableHttpClientTransport::from_uri(endpoint);
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(endpoint).reinit_on_expired_session(true);
+
+    for (key, value) in &config.headers {
+        if key.eq_ignore_ascii_case("authorization") {
+            transport_config = transport_config.auth_header(value);
+        } else if let (Ok(header_name), Ok(header_value)) =
+            (HeaderName::from_str(key), HeaderValue::from_str(value))
+        {
+            let mut map: HashMap<HeaderName, HeaderValue> =
+                std::mem::take(&mut transport_config.custom_headers);
+            map.insert(header_name, header_value);
+            transport_config.custom_headers = map;
+        } else {
+            warn!(
+                server = name,
+                header = %key,
+                "skipping invalid HTTP header in MCP config"
+            );
+        }
+    }
+
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
     let client_info = ClientInfo::new(
         ClientCapabilities::default(),
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
