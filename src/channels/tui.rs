@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::agent_loop;
 use crate::agent_loop::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
+use crate::llm_profile;
 use crate::runtime::AppState;
 use crate::storage::SessionSummary;
 
@@ -388,7 +389,24 @@ async fn run_loop(
                         app.status = app.browser_status();
                     }
                     PendingAction::SendMessage(prompt) => {
-                        start_send(app, prompt);
+                        if let View::Chat(chat) = &mut app.view {
+                            match llm_profile::handle_command(&app.state, &chat.context, &prompt)
+                                .await
+                            {
+                                Ok(Some(response)) => {
+                                    chat.messages.push(RenderedMessage {
+                                        role: "assistant".to_string(),
+                                        content: response,
+                                    });
+                                    chat.status = "Command applied".to_string();
+                                    chat.conversation_scroll = 0;
+                                }
+                                Ok(None) => start_send(app, prompt),
+                                Err(error) => {
+                                    chat.status = format!("Command error: {error}");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -599,6 +617,14 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
         ])
         .split(frame.area());
 
+    let resolved_llm = app
+        .state
+        .config
+        .resolve_llm_for_channel(&chat.context.channel)
+        .ok();
+    let llm_line = resolved_llm
+        .map(|resolved| format!("llm: {} / {}", resolved.provider, resolved.model))
+        .unwrap_or_else(|| "llm: <unavailable>".to_string());
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -614,7 +640,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
             ),
         ]),
         Line::from(format!("status: {}", chat.status)),
-        Line::from(format!("model: {}", app.state.config.model)),
+        Line::from(llm_line),
     ])
     .block(Block::default().title("Chat").borders(Borders::ALL))
     .wrap(Wrap { trim: true });

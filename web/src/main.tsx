@@ -20,6 +20,8 @@ type MessageItem = {
 };
 
 type ConfigPayload = {
+  scope: string;
+  provider: string;
   model: string;
   base_url: string;
   data_dir: string;
@@ -30,7 +32,15 @@ type ConfigPayload = {
   web_auth_enabled: boolean;
   has_api_key: boolean;
   config_path: string;
-  requires_restart: boolean;
+  scopes: string[];
+  providers: Array<{
+    id: string;
+    label: string;
+    base_url: string;
+    default_model: string;
+    models: string[];
+    has_api_key: boolean;
+  }>;
 };
 
 type HealthPayload = {
@@ -260,6 +270,10 @@ function App() {
     );
   }, [selectedSession, sessions]);
 
+  const selectedProvider = useMemo(() => {
+    return config?.providers.find((item) => item.id === config.provider) || null;
+  }, [config]);
+
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages]);
@@ -307,9 +321,10 @@ function App() {
     setHealth({ version: payload.version });
   }
 
-  async function refreshConfig() {
+  async function refreshConfig(scope?: string) {
+    const query = scope ? `?scope=${encodeURIComponent(scope)}` : "";
     const payload = await api<{ ok: boolean; config: ConfigPayload }>(
-      "/api/config",
+      `/api/config${query}`,
       authTokenRef.current,
     );
     setConfig(payload.config);
@@ -648,6 +663,8 @@ function App() {
     if (!config) return;
 
     const payload = {
+      scope: config.scope,
+      provider: config.provider,
       model: config.model,
       base_url: config.base_url,
       web_enabled: config.web_enabled,
@@ -657,21 +674,19 @@ function App() {
     };
 
     try {
-      const response = await api<{
-        ok: boolean;
-        config: ConfigPayload;
-        requires_restart: boolean;
-      }>("/api/config", authTokenRef.current, {
-        method: "PUT",
-        body: JSON.stringify(payload),
-      });
+      const response = await api<{ ok: boolean; config: ConfigPayload }>(
+        "/api/config",
+        authTokenRef.current,
+        {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        },
+      );
       setConfig(response.config);
       setConfigApiKey("");
       setStatus({
         tone: "ok",
-        text: response.requires_restart
-          ? "Config saved. Restart required for runtime changes."
-          : "Config saved.",
+        text: "Config saved. Next turns use the new LLM settings.",
       });
       setShowSettings(false);
     } catch (error) {
@@ -825,13 +840,69 @@ function App() {
 
             <form className="config-form" onSubmit={handleSaveConfig}>
               <label>
+                <span>Apply To</span>
+                <select
+                  value={config.scope}
+                  onChange={(event) => {
+                    const nextScope = event.target.value;
+                    void withAuthHandling(async () => {
+                      await refreshConfig(nextScope);
+                    }).catch((error) => {
+                      setStatus({
+                        tone: "error",
+                        text:
+                          error instanceof Error
+                            ? error.message
+                            : "Failed to load scoped config",
+                      });
+                    });
+                  }}
+                >
+                  {config.scopes.map((scope) => (
+                    <option key={scope} value={scope}>
+                      {scope}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Provider</span>
+                <select
+                  value={config.provider}
+                  onChange={(event) => {
+                    const providerId = event.target.value;
+                    const provider = config.providers.find(
+                      (item) => item.id === providerId,
+                    );
+                    setConfig({
+                      ...config,
+                      provider: providerId,
+                      model: provider?.default_model || config.model,
+                      base_url: provider?.base_url || config.base_url,
+                    });
+                  }}
+                >
+                  {config.providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
                 <span>Model</span>
                 <input
+                  list="provider-models"
                   value={config.model}
                   onChange={(event) =>
                     setConfig({ ...config, model: event.target.value })
                   }
                 />
+                <datalist id="provider-models">
+                  {(selectedProvider?.models || []).map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
               </label>
               <label>
                 <span>Base URL</span>
@@ -848,7 +919,7 @@ function App() {
                   type="password"
                   value={configApiKey}
                   placeholder={
-                    config.has_api_key
+                    selectedProvider?.has_api_key || config.has_api_key
                       ? "Configured. Enter to replace."
                       : "Enter API key"
                   }
@@ -896,9 +967,7 @@ function App() {
               </label>
               <div className="config-footer">
                 <span>
-                  {config.requires_restart
-                    ? "Changes are persisted to disk. Restart EgoPulse to apply runtime changes."
-                    : ""}
+                  Changes are persisted immediately and used on the next turn.
                 </span>
                 <button className="primary-button" type="submit">
                   Save

@@ -362,7 +362,7 @@ mod tests {
     use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::SurfaceContext;
     use crate::assets::AssetStore;
-    use crate::config::Config;
+    use crate::config::{Config, ProviderConfig};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
     use crate::runtime::AppState;
@@ -396,9 +396,17 @@ mod tests {
 
     fn test_config(data_dir: String) -> Config {
         Config {
-            model: "gpt-4o-mini".to_string(),
-            api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
-            llm_base_url: "https://api.openai.com/v1".to_string(),
+            default_provider: "openai".to_string(),
+            providers: std::collections::HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
             data_dir,
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
@@ -434,7 +442,7 @@ mod tests {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: config.clone(),
             config_path: None,
-            llm: Arc::from(llm),
+            llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
