@@ -21,11 +21,12 @@ use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig,
 };
 
-use crate::config::{default_state_root, default_workspace_dir};
+use crate::config::default_state_root;
 use crate::error::McpError;
 use crate::llm::ToolDefinition;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const TOOL_NAME_MAX_LEN: usize = 64;
 
 type DynClient = RunningService<RoleClient, Box<dyn DynService<RoleClient>>>;
@@ -84,19 +85,18 @@ impl ConnectedServer {
     }
 }
 
-pub fn mcp_config_paths() -> Vec<PathBuf> {
+pub fn mcp_config_paths(workspace_dir: &Path) -> Vec<PathBuf> {
     let state_root = default_state_root();
-    let workspace = default_workspace_dir();
     vec![
         state_root.join("mcp.json"),
         state_root.join("mcp.d"),
-        workspace.join("mcp.json"),
-        workspace.join("mcp.d"),
+        workspace_dir.join("mcp.json"),
+        workspace_dir.join("mcp.d"),
     ]
 }
 
-pub fn load_and_merge_mcp_configs() -> HashMap<String, McpServerConfig> {
-    let paths = mcp_config_paths();
+pub fn load_and_merge_mcp_configs(workspace_dir: &Path) -> HashMap<String, McpServerConfig> {
+    let paths = mcp_config_paths(workspace_dir);
     let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
 
     for path in &paths {
@@ -182,13 +182,14 @@ fn sha2_short(input: &str) -> String {
 
 impl McpManager {
     pub async fn new(workspace_dir: &Path) -> Self {
-        let configs = load_and_merge_mcp_configs();
+        let configs = load_and_merge_mcp_configs(workspace_dir);
         let mut servers = Vec::new();
 
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir).await {
                 Ok((client, tools)) => {
                     let mut tool_name_map = HashMap::new();
+                    let mut filtered_tools = Vec::new();
                     let mut tool_display_names = Vec::new();
                     for t in &tools {
                         let full = sanitize_tool_name(name, t.name.as_ref());
@@ -203,6 +204,7 @@ impl McpManager {
                         }
                         tool_name_map.insert(full.clone(), t.name.to_string());
                         tool_display_names.push(full);
+                        filtered_tools.push(t.clone());
                     }
 
                     tracing::info!(
@@ -215,7 +217,7 @@ impl McpManager {
                         config: (*config).clone(),
                         client,
                         tool_name_map,
-                        cached_tools: tools,
+                        cached_tools: filtered_tools,
                     });
                 }
                 Err(error) => {
@@ -415,19 +417,31 @@ async fn connect_stdio(
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
     );
 
-    let client =
-        client_info
-            .into_dyn()
-            .serve(child)
-            .await
-            .map_err(|error| McpError::ConnectionFailed {
-                server: name.to_string(),
-                detail: error.to_string(),
-            })?;
+    let connect_timeout = Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS);
 
-    let tools = client
-        .list_all_tools()
+    let client = timeout(connect_timeout, client_info.into_dyn().serve(child))
         .await
+        .map_err(|_| McpError::ConnectionFailed {
+            server: name.to_string(),
+            detail: format!(
+                "connection timed out after {}s",
+                DEFAULT_CONNECTION_TIMEOUT_SECS
+            ),
+        })?
+        .map_err(|error| McpError::ConnectionFailed {
+            server: name.to_string(),
+            detail: error.to_string(),
+        })?;
+
+    let tools = timeout(connect_timeout, client.list_all_tools())
+        .await
+        .map_err(|_| McpError::ToolListFailed {
+            server: name.to_string(),
+            detail: format!(
+                "tool listing timed out after {}s",
+                DEFAULT_CONNECTION_TIMEOUT_SECS
+            ),
+        })?
         .map_err(|error| McpError::ToolListFailed {
             server: name.to_string(),
             detail: error.to_string(),
@@ -476,18 +490,31 @@ async fn connect_http(
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
     );
 
-    let client = client_info
-        .into_dyn()
-        .serve(transport)
+    let connect_timeout = Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS);
+
+    let client = timeout(connect_timeout, client_info.into_dyn().serve(transport))
         .await
+        .map_err(|_| McpError::ConnectionFailed {
+            server: name.to_string(),
+            detail: format!(
+                "connection timed out after {}s",
+                DEFAULT_CONNECTION_TIMEOUT_SECS
+            ),
+        })?
         .map_err(|error| McpError::ConnectionFailed {
             server: name.to_string(),
             detail: error.to_string(),
         })?;
 
-    let tools = client
-        .list_all_tools()
+    let tools = timeout(connect_timeout, client.list_all_tools())
         .await
+        .map_err(|_| McpError::ToolListFailed {
+            server: name.to_string(),
+            detail: format!(
+                "tool listing timed out after {}s",
+                DEFAULT_CONNECTION_TIMEOUT_SECS
+            ),
+        })?
         .map_err(|error| McpError::ToolListFailed {
             server: name.to_string(),
             detail: error.to_string(),
@@ -503,12 +530,13 @@ mod tests {
 
     #[test]
     fn config_paths_include_global_and_workspace() {
-        let paths = mcp_config_paths();
+        let workspace = Path::new("/tmp/test-workspace");
+        let paths = mcp_config_paths(workspace);
         assert_eq!(paths.len(), 4);
         assert!(paths[0].ends_with("mcp.json"));
         assert!(paths[1].ends_with("mcp.d"));
-        assert!(paths[2].ends_with("workspace/mcp.json"));
-        assert!(paths[3].ends_with("workspace/mcp.d"));
+        assert_eq!(paths[2], workspace.join("mcp.json"));
+        assert_eq!(paths[3], workspace.join("mcp.d"));
     }
 
     #[test]
@@ -553,7 +581,7 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs();
+        let configs = load_and_merge_mcp_configs(&workspace);
         assert_eq!(configs.len(), 2);
         assert!(configs.contains_key("shared"));
         assert!(configs.contains_key("local"));
@@ -578,14 +606,15 @@ mod tests {
     fn load_handles_missing_files_gracefully() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().join(".egopulse");
-        std::fs::create_dir_all(state_root.join("workspace")).expect("workspace");
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
 
         let original_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs();
+        let configs = load_and_merge_mcp_configs(&workspace);
         assert!(configs.is_empty());
 
         match original_home {
@@ -616,7 +645,7 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs();
+        let configs = load_and_merge_mcp_configs(&workspace);
         assert_eq!(configs.len(), 1);
         assert!(configs.contains_key("good"));
 
