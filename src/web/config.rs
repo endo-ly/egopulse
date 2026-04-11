@@ -151,24 +151,12 @@ pub(super) async fn api_put_config(
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string())),
     };
 
-    let selected_provider_default_model = config
-        .providers
-        .get(default_provider)
-        .map(|provider| provider.default_model.clone())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("unknown provider: {default_provider}"),
-            )
-        })?;
-
     config.default_provider = default_provider.to_string();
-    config.default_model =
-        if config.default_model.is_none() && default_model == selected_provider_default_model {
-            None
-        } else {
-            Some(default_model.to_string())
-        };
+    config.default_model = if default_model.is_empty() {
+        None
+    } else {
+        Some(default_model.to_string())
+    };
 
     let web_enabled = request.web_enabled;
     let web_host = request.web_host.trim().to_string();
@@ -186,7 +174,8 @@ pub(super) async fn api_put_config(
     }
 
     if let Some(overrides) = request.channel_overrides {
-        apply_channel_overrides(&mut config, overrides);
+        apply_channel_overrides(&mut config, overrides)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     }
 
     config
@@ -259,7 +248,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                 _ => continue,
             };
 
-            let models = update
+            let mut models = update
                 .models
                 .unwrap_or_default()
                 .into_iter()
@@ -272,6 +261,10 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                     }
                 })
                 .collect::<Vec<_>>();
+
+            if !models.contains(&default_model) {
+                models.push(default_model.clone());
+            }
 
             let mut api_key = None;
             apply_api_key_update(&mut api_key, update.api_key);
@@ -307,24 +300,32 @@ fn apply_api_key_update(current: &mut Option<SecretString>, raw_update: Option<S
 fn apply_channel_overrides(
     config: &mut Config,
     overrides: HashMap<String, ChannelOverrideUpdatePayload>,
-) {
+) -> Result<(), ConfigError> {
     for (channel, update) in overrides {
         let key = channel.trim().to_ascii_lowercase();
         if key.is_empty() || key == "web" {
             continue;
         }
 
-        let entry = config.channels.entry(key).or_default();
+        let entry = config.channels.entry(key.clone()).or_default();
 
-        match update.provider {
-            Some(provider) if !provider.trim().is_empty() => {
-                entry.provider = Some(provider.trim().to_string());
+        let provider_name = match update.provider {
+            Some(provider) => {
+                let trimmed = provider.trim();
+                let channel_name = key.clone();
+                if trimmed.is_empty() {
+                    None
+                } else if config.providers.contains_key(trimmed) {
+                    Some(trimmed.to_string())
+                } else {
+                    return Err(ConfigError::InvalidProviderReference {
+                        provider: format!("{} for channel {}", trimmed, channel_name),
+                    });
+                }
             }
-            Some(_) => {
-                entry.provider = None;
-            }
-            None => {}
-        }
+            None => entry.provider.clone(),
+        };
+        entry.provider = provider_name;
 
         match update.model {
             Some(model) if !model.trim().is_empty() => {
@@ -336,6 +337,7 @@ fn apply_channel_overrides(
             None => {}
         }
     }
+    Ok(())
 }
 
 fn default_payload(path: &std::path::Path) -> ConfigPayload {
