@@ -120,24 +120,26 @@ fn parse_tool_arguments(arguments: &str, name: &str) -> Result<serde_json::Value
     })
 }
 
-fn parse_rescued_tool_arguments(input_json: &str) -> serde_json::Value {
+fn parse_rescued_tool_arguments(input_json: &str) -> Option<serde_json::Value> {
     if input_json.trim().is_empty() {
-        return serde_json::json!({});
+        return Some(serde_json::json!({}));
     }
 
-    serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}))
+    serde_json::from_str(input_json).ok()
 }
 
 fn rescue_raw_tool_calls(content: &str) -> Option<(Vec<ToolCall>, String)> {
     let raw_calls = extract_raw_tool_use_blocks(content)?;
     let tool_calls = raw_calls
         .into_iter()
-        .map(|raw| ToolCall {
-            id: raw.id,
-            name: raw.name,
-            arguments: parse_rescued_tool_arguments(&raw.input_json),
+        .map(|raw| {
+            Some(ToolCall {
+                id: raw.id,
+                name: raw.name,
+                arguments: parse_rescued_tool_arguments(&raw.input_json)?,
+            })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     Some((tool_calls, strip_raw_tool_use_text(content)))
 }
 

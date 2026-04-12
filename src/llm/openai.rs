@@ -15,6 +15,8 @@ impl OpenAiProvider {
     pub fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
             .build()
             .map_err(|error| LlmError::InitFailed(error.to_string()))?;
 
@@ -148,7 +150,9 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, LlmError> {
-        if tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        if should_use_responses_api(&messages)
+            || tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        {
             let response = self.send_message(system, messages, tools).await?;
             if let Some(tx) = text_tx
                 && !response.content.is_empty()
