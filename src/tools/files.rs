@@ -127,7 +127,8 @@ impl Tool for ReadTool {
             }
         };
 
-        let all_lines = content.split('\n').collect::<Vec<_>>();
+        let normalized = normalize_newlines(&content);
+        let all_lines = normalized.split('\n').collect::<Vec<_>>();
         let start_line = input
             .get("offset")
             .and_then(|value| value.as_u64())
@@ -338,6 +339,25 @@ impl Tool for EditTool {
 }
 
 pub(crate) fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, String> {
+    let has_edits_array = input
+        .get("edits")
+        .and_then(|value| value.as_array())
+        .is_some();
+    let has_legacy_fields = input
+        .get("oldText")
+        .and_then(|value| value.as_str())
+        .is_some()
+        || input
+            .get("newText")
+            .and_then(|value| value.as_str())
+            .is_some();
+
+    if has_edits_array && has_legacy_fields {
+        return Err(
+            "Edit tool input is ambiguous: provide either 'edits' array or 'oldText'/'newText' pair, not both.".to_string(),
+        );
+    }
+
     let mut parsed = Vec::new();
     if let Some(edits) = input.get("edits").and_then(|value| value.as_array()) {
         for edit in edits {
@@ -422,7 +442,7 @@ fn build_text_read_result(
         return ToolResult::success_with_details(
             output,
             json!({
-                "truncation": truncation_json(&truncation)
+                "truncation": super::truncation_json(&truncation)
             }),
         );
     }
@@ -471,8 +491,4 @@ fn parse_edit_spec(edit: &serde_json::Value) -> Result<EditSpec, String> {
         old_text: old_text.to_string(),
         new_text: new_text.to_string(),
     })
-}
-
-fn truncation_json(truncation: &super::text::TruncationResult) -> serde_json::Value {
-    super::truncation_json(truncation)
 }

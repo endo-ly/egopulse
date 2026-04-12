@@ -177,7 +177,9 @@ impl Tool for GrepTool {
             command.arg("--glob").arg(file_glob);
         }
         command
+            .arg("-e")
             .arg(pattern)
+            .arg("--")
             .arg(target)
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -328,7 +330,7 @@ impl Tool for FindTool {
         let limit = input
             .get("limit")
             .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
+            .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_FIND_LIMIT);
         let search_dir = if resolved.is_dir() {
             resolved.clone()
@@ -344,6 +346,8 @@ impl Tool for FindTool {
             .arg("--glob")
             .arg("--color=never")
             .arg("--hidden")
+            .arg("--type")
+            .arg("f")
             .arg("--max-results")
             .arg((limit + 1).to_string());
         let ignore_files = tokio::task::spawn_blocking({
@@ -356,6 +360,7 @@ impl Tool for FindTool {
             command.arg("--ignore-file").arg(ignore_file);
         }
         command
+            .arg("--")
             .arg(pattern)
             .arg(search_dir.to_string_lossy().to_string())
             .stdout(Stdio::piped())
@@ -529,7 +534,7 @@ impl Tool for LsTool {
         let limit = input
             .get("limit")
             .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
+            .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_LS_LIMIT);
 
         let mut entries = match tokio::fs::read_dir(&resolved).await {

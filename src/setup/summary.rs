@@ -112,6 +112,7 @@ pub(crate) fn save_config(
     let api_key = field_value(fields, "API_KEY").to_string();
 
     let existing_token = extract_existing_web_auth_token(original_yaml);
+    let has_existing_token = existing_token.is_some();
     let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
     let discord_enabled = field_bool(fields, "DISCORD_ENABLED");
@@ -204,7 +205,11 @@ pub(crate) fn save_config(
         } else {
             format!("API key: {}", mask_secret(&api_key))
         },
-        "Web channel: enabled (auth_token auto-generated)".into(),
+        if has_existing_token {
+            "Web channel: enabled (auth_token reused)".into()
+        } else {
+            "Web channel: enabled (auth_token auto-generated)".into()
+        },
         format!(
             "Discord channel: {}",
             if discord_enabled {
@@ -303,14 +308,20 @@ pub(crate) fn cleanup_old_backups(backup_dir: &Path, file_name: &str) -> Result<
     let mut entries: Vec<_> = fs::read_dir(backup_dir)
         .map_err(|e| format!("Failed to read backup dir: {e}"))?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(file_name))
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix(file_name)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            })
+        })
         .collect();
 
     entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
 
     while entries.len() > MAX_CONFIG_BACKUPS {
         if let Some(oldest) = entries.first() {
-            let _ = fs::remove_file(oldest.path());
+            fs::remove_file(oldest.path())
+                .map_err(|e| format!("Failed to remove old backup: {e}"))?;
             entries.remove(0);
         } else {
             break;
