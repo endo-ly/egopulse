@@ -67,6 +67,13 @@ pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::process_turn;
+    use crate::agent_loop::turn::{
+        FakeProvider, build_state_with_provider, cli_context,
+    };
+    use crate::error::EgoPulseError;
+    use crate::llm::{MessagesResponse, ToolCall};
+    use serial_test::serial;
 
     #[test]
     fn is_declarative_only_reply_detects_patterns() {
@@ -87,5 +94,107 @@ mod tests {
         assert!(!is_declarative_only_reply(
             "Here is the result of the search:"
         ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_reply_guard_retries_once_then_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                    MessagesResponse {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let error = process_turn(&state, &cli_context("empty-guard"), "hello")
+            .await
+            .expect_err("should fail after retry");
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn declarative_only_guard_retries_then_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "Sure, I'll help you with that.".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                    MessagesResponse {
+                        content: "Here is the answer you need.".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let reply = process_turn(&state, &cli_context("declarative-guard"), "help me")
+            .await
+            .expect("should succeed after retry");
+        assert_eq!(reply, "Here is the answer you need.");
+
+        let chat_id = crate::storage::call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:declarative-guard",
+                Some("declarative-guard"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .all(|message| !message.content.as_text_lossy().contains("[runtime_guard]"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_declarative_tool_reply_retries_then_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "了解しました。実行します。".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-malformed".to_string(),
+                            name: String::new(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    MessagesResponse {
+                        content: "実行結果です。".to_string(),
+                        tool_calls: Vec::new(),
+                    },
+                ]),
+            }),
+        );
+
+        let reply = process_turn(&state, &cli_context("malformed-declarative"), "test")
+            .await
+            .expect("should recover after retry");
+        assert_eq!(reply, "実行結果です。");
     }
 }

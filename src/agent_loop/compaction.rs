@@ -212,6 +212,14 @@ pub(crate) fn can_merge_compacted_messages(left: &Message, right: &Message) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::process_turn;
+    use crate::agent_loop::turn::{
+        RecordingProvider, build_state, cli_context, test_config_with_compaction,
+    };
+    use crate::error::LlmError;
+    use crate::llm::{Message, MessagesResponse};
+    use crate::storage::call_blocking;
+    use serial_test::serial;
 
     #[test]
     fn truncate_compaction_summary_input_keeps_exact_character_limit() {
@@ -228,5 +236,202 @@ mod tests {
 
         let expected = format!("{}\n... (truncated)", "a".repeat(19_999) + "あ");
         assert_eq!(truncated, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_summarizes_old_messages_and_persists_summary_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "summary text".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-success");
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-success",
+                Some("compaction-success"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "final answer");
+
+        let seen_systems = provider.seen_systems();
+        assert_eq!(seen_systems.len(), 2);
+        assert_eq!(seen_systems[0], "You are a helpful summarizer.");
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert_eq!(
+            seen_messages[1][0].content.as_text_lossy(),
+            "[Conversation Summary]\nsummary text"
+        );
+        assert_eq!(seen_messages[1][1].role, "assistant");
+        assert_eq!(
+            seen_messages[1][1].content.as_text_lossy(),
+            "old-assistant-2"
+        );
+        assert_eq!(
+            seen_messages[1]
+                .last()
+                .expect("final request")
+                .content
+                .as_text_lossy(),
+            "fresh question"
+        );
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert_eq!(
+            loaded.messages[0].content.as_text_lossy(),
+            "[Conversation Summary]\nsummary text"
+        );
+        assert_eq!(
+            loaded
+                .messages
+                .last()
+                .expect("session last")
+                .content
+                .as_text_lossy(),
+            "final answer"
+        );
+
+        let archive_dir = dir
+            .path()
+            .join("groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        let archives = std::fs::read_dir(&archive_dir)
+            .expect("archive dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("archive entries");
+        assert_eq!(archives.len(), 1);
+        let archive_body = std::fs::read_to_string(archives[0].path()).expect("archive body");
+        assert!(archive_body.contains("old-user-1"));
+        assert!(archive_body.contains("fresh question"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_falls_back_to_recent_messages_when_summary_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(LlmError::InvalidResponse("summary failed".to_string())),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-fallback");
+        let chat_id = call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-fallback",
+                Some("compaction-fallback"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(state.db.clone(), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "final answer");
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert!(seen_messages[1].iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains("[Conversation Summary]")
+        }));
+        assert_eq!(
+            seen_messages[1][0].content.as_text_lossy(),
+            "old-assistant-2"
+        );
+        assert_eq!(
+            seen_messages[1]
+                .last()
+                .expect("final request")
+                .content
+                .as_text_lossy(),
+            "fresh question"
+        );
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("loaded session");
+        assert!(loaded.messages.iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains("[Conversation Summary]")
+        }));
+        assert_eq!(
+            loaded.messages[0].content.as_text_lossy(),
+            "old-assistant-2"
+        );
+        assert_eq!(
+            loaded
+                .messages
+                .last()
+                .expect("session last")
+                .content
+                .as_text_lossy(),
+            "final answer"
+        );
     }
 }
