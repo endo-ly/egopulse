@@ -78,6 +78,12 @@ where
         .map_err(|error| StorageError::TaskJoin(error.to_string()))?
 }
 
+/// 現在のスキーマバージョン。
+///
+/// 新しいマイグレーションを追加する際はこの値をインクリメントし、
+/// `run_migrations` に対応する `if version < N` ブロックを追加する。
+const SCHEMA_VERSION: i64 = 1;
+
 impl Database {
     /// Open (or create) the database at `{data_dir}/egopulse.db` and initialize schema.
     pub fn new(data_dir: &str) -> Result<Self, StorageError> {
@@ -87,6 +93,78 @@ impl Database {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.busy_timeout(Duration::from_secs(5))?;
+
+        run_migrations(&conn)?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// 現在のスキーマバージョンを返す。
+    pub fn schema_version(&self) -> Result<i64, StorageError> {
+        let conn = self.lock_conn()?;
+        schema_version(&conn)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Migration infrastructure
+// ---------------------------------------------------------------------------
+
+/// `db_meta` に格納されたスキーマバージョンを読み取る。
+///
+/// テーブルが存在しない場合は作成し、バージョン未設定なら `0` を返す。
+fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS db_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM db_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
+}
+
+/// スキーマバージョンを更新し、`schema_migrations` に適用履歴を記録する。
+fn set_schema_version(conn: &Connection, version: i64, note: &str) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO db_meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![version.to_string()],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            note TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
+         VALUES(?1, ?2, ?3)",
+        params![version, chrono::Utc::now().to_rfc3339(), note],
+    )?;
+    Ok(())
+}
+
+/// 未適用のマイグレーションを逐次実行する。
+///
+/// 各マイグレーションは `if version < N` でガードされ、
+/// 適用後に `set_schema_version` でバージョンを更新する。
+/// `SCHEMA_VERSION` に到達したら完了。
+fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
+    let mut version = schema_version(conn)?;
+
+    if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -136,12 +214,26 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
                 ON tool_calls(chat_id, message_id);",
         )?;
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        set_schema_version(
+            conn,
+            1,
+            "initial schema: chats, messages, sessions, tool_calls",
+        )?;
+        version = 1;
     }
 
+    // --- v2 以降のマイグレーションはここに追加 ---
+    // if version < 2 {
+    //     conn.execute_batch("...")?;
+    //     set_schema_version(conn, 2, "...")?;
+    //     version = 2;
+    // }
+
+    debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
+    Ok(())
+}
+
+impl Database {
     /// Look up the internal chat_id for a (channel, external_chat_id) pair.
     /// Returns `None` if no matching chat exists.
     pub fn resolve_chat_id(
@@ -799,5 +891,52 @@ mod tests {
             .expect("load tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool_output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn schema_version_is_tracked_on_init() {
+        let (db, _dir) = test_db();
+        let version = db.schema_version().expect("schema version");
+        assert_eq!(version, 1, "新規DBはスキーマバージョン1で初期化される");
+    }
+
+    #[test]
+    fn migration_history_is_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().to_str().expect("path")).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let mut stmt = conn
+            .prepare("SELECT version, note FROM schema_migrations ORDER BY version")
+            .expect("prepare");
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(rows.len(), 1, "v1 マイグレーションが1件記録される");
+        assert_eq!(rows[0].0, 1);
+        assert!(rows[0].1.contains("initial schema"));
+    }
+
+    #[test]
+    fn reopen_db_preserves_schema_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().expect("path").to_string();
+
+        let first_version = {
+            let db = Database::new(&path).expect("db");
+            db.schema_version().expect("version")
+        };
+
+        let db = Database::new(&path).expect("reopen db");
+        let second_version = db.schema_version().expect("version");
+
+        assert_eq!(
+            first_version, second_version,
+            "再起動してもバージョンは変わらない"
+        );
+        assert_eq!(second_version, 1);
     }
 }
