@@ -94,7 +94,7 @@ pub async fn build_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.data_dir)?);
     let assets = Arc::new(AssetStore::new(&config.data_dir)?);
-    let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
+    let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()?));
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
@@ -117,7 +117,8 @@ pub async fn build_app_state_with_path(
     let channels = Arc::new(channels);
     let mut tools = ToolRegistry::new(&config, Arc::clone(&skills));
 
-    let mcp_manager = crate::mcp::McpManager::new(&config.workspace_dir()).await;
+    let workspace_dir = config.workspace_dir()?;
+    let mcp_manager = crate::mcp::McpManager::new(&workspace_dir).await?;
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
     tools.set_mcp_manager(mcp_arc);
 

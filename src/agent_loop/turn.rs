@@ -1209,7 +1209,7 @@ mod tests {
         use crate::channel_adapter::ChannelRegistry;
         let data_dir = config.data_dir.clone();
         let db = Arc::new(Database::new(&data_dir).expect("db"));
-        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
+        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir().expect("skills_dir")));
         AppState {
             db,
             config: config.clone(),
@@ -1252,7 +1252,7 @@ mod tests {
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider.clone()),
         );
-        let workspace = state.config.workspace_dir();
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
         let note_path = workspace.join(&relative_path);
         std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
         std::fs::write(&note_path, "hello from tool").expect("notes");
@@ -1414,7 +1414,7 @@ mod tests {
                 ]),
             }),
         );
-        let workspace = state.config.workspace_dir();
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
         let file_path = workspace.join(&relative_path);
         std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
         std::fs::write(&file_path, "content").expect("a.txt");

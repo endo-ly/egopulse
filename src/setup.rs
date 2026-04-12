@@ -413,8 +413,11 @@ struct SetupApp {
 }
 
 impl SetupApp {
-    fn new(config_path: Option<PathBuf>) -> Self {
-        let config_path = config_path.unwrap_or_else(default_config_path);
+    fn new(config_path: Option<PathBuf>) -> Result<Self, String> {
+        let config_path = match config_path {
+            Some(path) => path,
+            None => default_config_path().map_err(|e| e.to_string())?,
+        };
         let (existing, original_yaml) = Self::load_existing_config(&config_path);
         let provider_id = existing
             .get("PROVIDER")
@@ -529,7 +532,7 @@ impl SetupApp {
         // Hide channel-specific fields when channel is disabled
         Self::update_field_visibility(&mut fields);
 
-        Self {
+        Ok(Self {
             fields,
             selected: 0,
             mode: SetupMode::Navigate,
@@ -539,7 +542,7 @@ impl SetupApp {
             completion_summary: Vec::new(),
             config_path,
             original_yaml,
-        }
+        })
     }
 
     fn update_field_visibility(fields: &mut [Field]) {
@@ -945,9 +948,9 @@ impl SetupApp {
             fs::create_dir_all(config_dir)
                 .map_err(|e| format!("Failed to create config directory: {e}"))?;
         }
-        fs::create_dir_all(default_data_dir())
+        fs::create_dir_all(default_data_dir().map_err(|e| e.to_string())?)
             .map_err(|e| format!("Failed to create data directory: {e}"))?;
-        fs::create_dir_all(default_workspace_dir())
+        fs::create_dir_all(default_workspace_dir().map_err(|e| e.to_string())?)
             .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
 
         if config_path.exists() {
@@ -1031,7 +1034,7 @@ impl SetupApp {
             default_provider: provider_id.clone(),
             default_model: Some(model.clone()),
             providers,
-            data_dir: default_data_dir().to_string_lossy().into_owned(),
+            data_dir: default_data_dir().map_err(|e| e.to_string())?.to_string_lossy().into_owned(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
@@ -1578,7 +1581,7 @@ fn draw_selector_popup(frame: &mut ratatui::Frame<'_>, state: &SelectorState, ar
 
 /// Runs the interactive setup wizard and writes the resulting configuration file.
 pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), String> {
-    let mut app = SetupApp::new(config_path);
+    let mut app = SetupApp::new(config_path)?;
     let terminal = init_terminal()?;
 
     run_loop(terminal, &mut app).await
@@ -1938,7 +1941,7 @@ api_key: sk-legacy
     fn setup_mode_navigate_default() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_path = temp_dir.path().join("egopulse.config.yaml");
-        let app = SetupApp::new(Some(config_path));
+        let app = SetupApp::new(Some(config_path)).expect("setup app");
         assert!(matches!(app.mode, SetupMode::Navigate));
     }
 

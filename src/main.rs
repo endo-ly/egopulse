@@ -103,7 +103,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                     return Ok(());
                 }
                 return Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound {
-                    searched_paths: vec![default_config_path()],
+                    searched_paths: vec![default_config_path()?],
                 }));
             }
             Err(e) => return Err(EgoPulseError::Config(e)),

@@ -22,7 +22,7 @@ use rmcp::transport::{
 };
 
 use crate::config::default_state_root;
-use crate::error::McpError;
+use crate::error::{ConfigError, McpError};
 use crate::llm::ToolDefinition;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -85,18 +85,18 @@ impl ConnectedServer {
     }
 }
 
-pub fn mcp_config_paths(workspace_dir: &Path) -> Vec<PathBuf> {
-    let state_root = default_state_root();
-    vec![
+pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let state_root = default_state_root()?;
+    Ok(vec![
         state_root.join("mcp.json"),
         state_root.join("mcp.d"),
         workspace_dir.join("mcp.json"),
         workspace_dir.join("mcp.d"),
-    ]
+    ])
 }
 
-pub fn load_and_merge_mcp_configs(workspace_dir: &Path) -> HashMap<String, McpServerConfig> {
-    let paths = mcp_config_paths(workspace_dir);
+pub fn load_and_merge_mcp_configs(workspace_dir: &Path) -> Result<HashMap<String, McpServerConfig>, ConfigError> {
+    let paths = mcp_config_paths(workspace_dir)?;
     let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
 
     for path in &paths {
@@ -135,7 +135,7 @@ pub fn load_and_merge_mcp_configs(workspace_dir: &Path) -> HashMap<String, McpSe
         }
     }
 
-    merged
+    Ok(merged)
 }
 
 fn read_mcp_config_file(path: &Path) -> Result<McpConfigFile, McpError> {
@@ -181,8 +181,8 @@ fn sha2_short(input: &str) -> String {
 }
 
 impl McpManager {
-    pub async fn new(workspace_dir: &Path) -> Self {
-        let configs = load_and_merge_mcp_configs(workspace_dir);
+    pub async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
+        let configs = load_and_merge_mcp_configs(workspace_dir)?;
         let mut servers = Vec::new();
 
         for (name, config) in &configs {
@@ -231,7 +231,7 @@ impl McpManager {
             total = configs.len(),
             "MCP initialization complete"
         );
-        Self { servers }
+        Ok(Self { servers })
     }
 
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn config_paths_include_global_and_workspace() {
         let workspace = Path::new("/tmp/test-workspace");
-        let paths = mcp_config_paths(workspace);
+        let paths = mcp_config_paths(workspace).unwrap();
         assert_eq!(paths.len(), 4);
         assert!(paths[0].ends_with("mcp.json"));
         assert!(paths[1].ends_with("mcp.d"));
@@ -581,7 +581,7 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs(&workspace);
+        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert_eq!(configs.len(), 2);
         assert!(configs.contains_key("shared"));
         assert!(configs.contains_key("local"));
@@ -614,7 +614,7 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs(&workspace);
+        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert!(configs.is_empty());
 
         match original_home {
@@ -645,7 +645,7 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
-        let configs = load_and_merge_mcp_configs(&workspace);
+        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert_eq!(configs.len(), 1);
         assert!(configs.contains_key("good"));
 

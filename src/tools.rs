@@ -117,7 +117,16 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// Instantiate all built-in tools scoped to the configured workspace.
     pub fn new(config: &Config, skill_manager: Arc<SkillManager>) -> Self {
-        let workspace_dir = config.workspace_dir();
+        let workspace_dir = match config.workspace_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!("failed to resolve workspace dir: {error}");
+                return Self {
+                    tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
+                    mcp_manager: None,
+                };
+            }
+        };
         if let Err(error) = std::fs::create_dir_all(&workspace_dir) {
             tracing::warn!(
                 workspace_dir = %workspace_dir.display(),
@@ -2046,7 +2055,7 @@ mod tests {
     fn test_registry(config: &Config) -> ToolRegistry {
         ToolRegistry::new(
             config,
-            Arc::new(SkillManager::from_skills_dir(config.skills_dir())),
+            Arc::new(SkillManager::from_skills_dir(config.skills_dir().expect("skills_dir"))),
         )
     }
 
@@ -2056,7 +2065,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("notes.txt"), "hello\nworld").expect("write file");
         let registry = test_registry(&config);
@@ -2074,7 +2083,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(
             workspace.join("pixel.png"),
@@ -2108,7 +2117,7 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        std::fs::create_dir_all(config.workspace_dir().join("src")).expect("create src dir");
+        std::fs::create_dir_all(config.workspace_dir().expect("workspace_dir").join("src")).expect("create src dir");
 
         let result = registry
             .execute(
@@ -2120,7 +2129,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Successfully wrote 11 bytes"));
         assert_eq!(
-            std::fs::read_to_string(config.workspace_dir().join("src/demo.txt")).expect("read"),
+            std::fs::read_to_string(config.workspace_dir().expect("workspace_dir").join("src/demo.txt")).expect("read"),
             "hello world"
         );
     }
@@ -2131,7 +2140,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\ngamma\n").expect("write");
         let registry = test_registry(&config);
@@ -2174,7 +2183,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("nested")).expect("nested");
         std::fs::write(workspace.join("a.txt"), "a").expect("a");
         std::fs::write(workspace.join(".hidden"), "b").expect("hidden");
@@ -2192,7 +2201,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
         std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}").expect("lib");
         let registry = test_registry(&config);
@@ -2210,7 +2219,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
         std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}\n").expect("lib");
         let registry = test_registry(&config);
@@ -2228,7 +2237,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let workspace = config.workspace_dir();
+        let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("notes.txt"), "hello").expect("notes");
         let registry = test_registry(&config);
@@ -2259,7 +2268,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
-        let skills_dir = config.skills_dir();
+        let skills_dir = config.skills_dir().expect("skills_dir");
         std::fs::create_dir_all(skills_dir.join("pdf")).expect("skill dir");
         std::fs::write(
             skills_dir.join("pdf").join("SKILL.md"),

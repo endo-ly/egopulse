@@ -328,7 +328,7 @@ impl Config {
 
     /// Locate the default config file, or fail when absent.
     pub fn resolve_config_path() -> Result<Option<PathBuf>, ConfigError> {
-        let candidate = default_config_path();
+        let candidate = default_config_path()?;
         if candidate.exists() {
             return Ok(Some(candidate));
         }
@@ -370,12 +370,12 @@ impl Config {
     }
 
     /// Directory containing skill definitions.
-    pub fn skills_dir(&self) -> PathBuf {
-        default_workspace_dir().join("skills")
+    pub fn skills_dir(&self) -> Result<PathBuf, ConfigError> {
+        default_workspace_dir().map(|dir| dir.join("skills"))
     }
 
     /// Workspace directory for agent file operations.
-    pub fn workspace_dir(&self) -> PathBuf {
+    pub fn workspace_dir(&self) -> Result<PathBuf, ConfigError> {
         default_workspace_dir()
     }
 
@@ -397,25 +397,25 @@ impl Config {
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.
-pub fn default_config_path() -> PathBuf {
-    default_state_root().join("egopulse.config.yaml")
+pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+    default_state_root().map(|root| root.join("egopulse.config.yaml"))
 }
 
 /// Default state root directory: `~/.egopulse`.
-pub fn default_state_root() -> PathBuf {
+pub fn default_state_root() -> Result<PathBuf, ConfigError> {
     dirs::home_dir()
-        .unwrap_or_else(|| panic!("failed to resolve OS home directory for EgoPulse state root"))
-        .join(".egopulse")
+        .map(|home| home.join(".egopulse"))
+        .ok_or(ConfigError::HomeDirectoryUnresolved)
 }
 
 /// Default data directory: `~/.egopulse/data`.
-pub fn default_data_dir() -> PathBuf {
-    default_state_root().join("data")
+pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
+    default_state_root().map(|root| root.join("data"))
 }
 
 /// Default workspace directory: `~/.egopulse/workspace`.
-pub fn default_workspace_dir() -> PathBuf {
-    default_state_root().join("workspace")
+pub fn default_workspace_dir() -> Result<PathBuf, ConfigError> {
+    default_state_root().map(|root| root.join("workspace"))
 }
 
 fn normalize_channels(
@@ -593,7 +593,7 @@ fn build_config(
 
     let default_model = normalize_string(file_default_model);
 
-    let data_dir = default_data_dir().to_string_lossy().into_owned();
+    let data_dir = default_data_dir()?.to_string_lossy().into_owned();
 
     let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -1095,9 +1095,9 @@ channels:
 
         assert_eq!(config.default_provider, "openai");
         assert_eq!(config.global_provider().label, "OpenAI");
-        assert_eq!(PathBuf::from(&config.data_dir), default_data_dir());
-        assert_eq!(config.workspace_dir(), default_workspace_dir());
-        assert_eq!(config.skills_dir(), default_workspace_dir().join("skills"));
+        assert_eq!(PathBuf::from(&config.data_dir), default_data_dir().unwrap());
+        assert_eq!(config.workspace_dir().unwrap(), default_workspace_dir().unwrap());
+        assert_eq!(config.skills_dir().unwrap(), default_workspace_dir().unwrap().join("skills"));
         assert!(config.web_enabled());
         assert_eq!(config.web_auth_token(), Some("web-secret"));
 

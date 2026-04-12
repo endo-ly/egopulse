@@ -438,7 +438,7 @@ mod tests {
     fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
         use crate::channel_adapter::ChannelRegistry;
         let config = test_config(data_dir.clone());
-        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()));
+        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir().expect("skills_dir")));
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
             config: config.clone(),

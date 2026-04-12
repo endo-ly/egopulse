@@ -95,7 +95,7 @@ pub(super) struct ConfigUpdateRequest {
 pub(super) async fn api_get_config(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = config_path_for_save(&state);
+    let path = config_path_for_save(&state).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let display = match Config::load_allow_missing_api_key(Some(&path)) {
         Ok(config) => Some(config),
         Err(ConfigError::ConfigNotFound { .. }) => None,
@@ -105,8 +105,8 @@ pub(super) async fn api_get_config(
     Ok(Json(serde_json::json!({
         "ok": true,
         "config": match display.as_ref() {
-            Some(display) => payload_from_config(display, &path),
-            None => default_payload(&path),
+            Some(display) => payload_from_config(display, &path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            None => default_payload(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         },
     })))
 }
@@ -133,7 +133,7 @@ pub(super) async fn api_put_config(
         ));
     }
 
-    let path = config_path_for_save(&state);
+    let path = config_path_for_save(&state).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let mut config = match Config::load_allow_missing_api_key(Some(&path)) {
         Ok(config) => config,
@@ -188,7 +188,7 @@ pub(super) async fn api_put_config(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path),
+        "config": payload_from_config(&display, &path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     })))
 }
 
@@ -345,15 +345,15 @@ fn apply_channel_overrides(
     Ok(())
 }
 
-fn default_payload(path: &std::path::Path) -> ConfigPayload {
-    ConfigPayload {
+fn default_payload(path: &std::path::Path) -> Result<ConfigPayload, ConfigError> {
+    Ok(ConfigPayload {
         default_provider: String::new(),
         default_model: None,
         effective_model: String::new(),
-        data_dir: crate::config::default_data_dir()
+        data_dir: crate::config::default_data_dir()?
             .to_string_lossy()
             .into_owned(),
-        workspace_dir: crate::config::default_workspace_dir()
+        workspace_dir: crate::config::default_workspace_dir()?
             .to_string_lossy()
             .into_owned(),
         web_enabled: false,
@@ -364,17 +364,17 @@ fn default_payload(path: &std::path::Path) -> ConfigPayload {
         config_path: path.display().to_string(),
         providers: Vec::new(),
         channel_overrides: HashMap::new(),
+    })
+}
+
+fn config_path_for_save(state: &WebState) -> Result<PathBuf, ConfigError> {
+    match &state.config_path {
+        Some(path) => Ok(path.clone()),
+        None => default_config_path(),
     }
 }
 
-fn config_path_for_save(state: &WebState) -> PathBuf {
-    state
-        .config_path
-        .clone()
-        .unwrap_or_else(default_config_path)
-}
-
-fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload {
+fn payload_from_config(config: &Config, path: &std::path::Path) -> Result<ConfigPayload, ConfigError> {
     let resolved = config.resolve_global_llm();
 
     let providers = config
@@ -407,12 +407,12 @@ fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload
         })
         .collect();
 
-    ConfigPayload {
+    Ok(ConfigPayload {
         default_provider: resolved.provider,
         default_model: config.default_model.clone(),
         effective_model: resolved.model,
         data_dir: config.data_dir.clone(),
-        workspace_dir: crate::config::default_workspace_dir()
+        workspace_dir: crate::config::default_workspace_dir()?
             .to_string_lossy()
             .into_owned(),
         web_enabled: config.web_enabled(),
@@ -423,7 +423,7 @@ fn payload_from_config(config: &Config, path: &std::path::Path) -> ConfigPayload
         config_path: path.display().to_string(),
         providers,
         channel_overrides,
-    }
+    })
 }
 
 fn infer_provider_label(provider: &str) -> String {
