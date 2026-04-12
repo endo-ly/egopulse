@@ -345,7 +345,7 @@ impl Tool for FindTool {
             .arg("--color=never")
             .arg("--hidden")
             .arg("--max-results")
-            .arg(limit.to_string());
+            .arg((limit + 1).to_string());
         let ignore_files = tokio::task::spawn_blocking({
             let search_dir = search_dir.clone();
             move || collect_gitignore_files(&search_dir)
@@ -381,7 +381,7 @@ impl Tool for FindTool {
             });
         }
 
-        let results = stdout
+        let mut results = stdout
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -403,7 +403,10 @@ impl Tool for FindTool {
             return ToolResult::success("No files found matching pattern".to_string());
         }
 
-        let result_limit_reached = results.len() >= limit;
+        let result_limit_reached = results.len() > limit;
+        if result_limit_reached {
+            results.truncate(limit);
+        }
         let raw_output = results.join("\n");
         let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
         let mut text = truncation.content.clone();

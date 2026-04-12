@@ -410,7 +410,7 @@ fn build_text_read_result(
         format!(
             "[Line {start_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {}]",
             format_size(DEFAULT_MAX_BYTES),
-            path,
+            super::text::shell_quote(path),
             DEFAULT_MAX_BYTES
         )
     } else {
