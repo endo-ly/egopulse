@@ -27,8 +27,8 @@ use url::Url;
 use secrecy::SecretString;
 
 use crate::config::{
-    base_url_allows_empty_api_key, default_config_path, default_data_dir, default_workspace_dir,
-    ChannelConfig, Config, ProviderConfig,
+    ChannelConfig, Config, ProviderConfig, base_url_allows_empty_api_key, default_config_path,
+    default_data_dir, default_workspace_dir,
 };
 use crate::error::EgoPulseError;
 
@@ -590,7 +590,12 @@ impl SetupApp {
             {
                 let provider_id = normalize_provider_id(default_provider);
                 result.insert("PROVIDER".into(), provider_id.clone());
-                if let Some(providers) = map
+                if let Some(top_level_model) = map
+                    .get(serde_yml::Value::String("default_model".into()))
+                    .and_then(|v| v.as_str())
+                {
+                    result.insert("MODEL".into(), top_level_model.to_string());
+                } else if let Some(providers) = map
                     .get(serde_yml::Value::String("providers".into()))
                     .and_then(|value| value.as_mapping())
                     && let Some(provider) = providers
@@ -1024,7 +1029,7 @@ impl SetupApp {
 
         let config = Config {
             default_provider: provider_id.clone(),
-            default_model: model.clone(),
+            default_model: Some(model.clone()),
             providers,
             data_dir: default_data_dir().to_string_lossy().into_owned(),
             log_level: "info".to_string(),
@@ -1117,14 +1122,10 @@ impl SetupApp {
                 .unwrap_or_default();
             if let Some(preset) = find_provider_preset(&provider_id) {
                 if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
-                    if model_field.value.is_empty() {
-                        model_field.value = preset.default_model.to_string();
-                    }
+                    model_field.value = preset.default_model.to_string();
                 }
                 if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
-                    if url_field.value.is_empty() && !preset.default_base_url.is_empty() {
-                        url_field.value = preset.default_base_url.to_string();
-                    }
+                    url_field.value = preset.default_base_url.to_string();
                 }
             }
         }
@@ -1640,171 +1641,159 @@ async fn run_inner(
             }
 
             match app.mode {
-                SetupMode::Selector(ref mut state) => {
-                    match key.code {
-                        KeyCode::Esc => {
+                SetupMode::Selector(ref mut state) => match key.code {
+                    KeyCode::Esc => {
+                        if let Some(field) =
+                            app.fields.iter_mut().find(|f| f.key == state.field_key)
+                        {
+                            field.value = state.original_value.clone();
+                        }
+                        app.mode = SetupMode::Navigate;
+                        app.status =
+                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
+                                    .into();
+                    }
+                    KeyCode::Enter => {
+                        let filtered = filtered_items(&state.items, &state.filter);
+                        if filtered.is_empty() {
                             if let Some(field) =
                                 app.fields.iter_mut().find(|f| f.key == state.field_key)
                             {
-                                field.value = state.original_value.clone();
+                                field.value = state.filter.clone();
                             }
-                            app.mode = SetupMode::Navigate;
-                            app.status =
+                        } else {
+                            state.selected = (state.selected).min(filtered.len() - 1);
+                            let selected_value = filtered[state.selected].value.clone();
+                            if let Some(field) =
+                                app.fields.iter_mut().find(|f| f.key == state.field_key)
+                            {
+                                field.value = selected_value;
+                            }
+                        }
+                        let field_key = state.field_key.clone();
+                        app.apply_selector_selection(&field_key);
+                        app.mode = SetupMode::Navigate;
+                        app.status =
                                 "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
                                     .into();
-                        }
-                        KeyCode::Enter => {
-                            let filtered = filtered_items(&state.items, &state.filter);
-                            if filtered.is_empty() {
-                                if let Some(field) =
-                                    app.fields.iter_mut().find(|f| f.key == state.field_key)
-                                {
-                                    field.value = state.filter.clone();
-                                }
-                            } else {
-                                state.selected =
-                                    (state.selected).min(filtered.len() - 1);
-                                let selected_value = filtered[state.selected].value.clone();
-                                if let Some(field) =
-                                    app.fields.iter_mut().find(|f| f.key == state.field_key)
-                                {
-                                    field.value = selected_value;
-                                }
-                            }
-                            let field_key = state.field_key.clone();
-                            app.apply_selector_selection(&field_key);
-                            app.mode = SetupMode::Navigate;
-                            app.status =
-                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
-                                    .into();
-                        }
-                        KeyCode::Up | KeyCode::Char('k')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            let filtered = filtered_items(&state.items, &state.filter);
-                            if !filtered.is_empty() && state.selected > 0 {
-                                state.selected -= 1;
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            let filtered = filtered_items(&state.items, &state.filter);
-                            if !filtered.is_empty() {
-                                state.selected =
-                                    (state.selected + 1).min(filtered.len() - 1);
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            state.filter.pop();
-                            let filtered = filtered_items(&state.items, &state.filter);
-                            if !filtered.is_empty() {
-                                state.selected = state.selected.min(filtered.len() - 1);
-                            } else {
-                                state.selected = 0;
-                            }
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.filter.push(c);
-                            let filtered = filtered_items(&state.items, &state.filter);
-                            if !filtered.is_empty() {
-                                state.selected = state.selected.min(filtered.len() - 1);
-                            } else {
-                                state.selected = 0;
-                            }
-                        }
-                        _ => {}
                     }
-                }
-                SetupMode::Edit => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter => {
-                            if let Some(field) = app.current_field() {
-                                if field.key == "DISCORD_ENABLED"
-                                    || field.key == "TELEGRAM_ENABLED"
-                                {
-                                    SetupApp::update_field_visibility(&mut app.fields);
-                                }
+                    KeyCode::Up | KeyCode::Char('k')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let filtered = filtered_items(&state.items, &state.filter);
+                        if !filtered.is_empty() && state.selected > 0 {
+                            state.selected -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let filtered = filtered_items(&state.items, &state.filter);
+                        if !filtered.is_empty() {
+                            state.selected = (state.selected + 1).min(filtered.len() - 1);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        state.filter.pop();
+                        let filtered = filtered_items(&state.items, &state.filter);
+                        if !filtered.is_empty() {
+                            state.selected = state.selected.min(filtered.len() - 1);
+                        } else {
+                            state.selected = 0;
+                        }
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.filter.push(c);
+                        let filtered = filtered_items(&state.items, &state.filter);
+                        if !filtered.is_empty() {
+                            state.selected = state.selected.min(filtered.len() - 1);
+                        } else {
+                            state.selected = 0;
+                        }
+                    }
+                    _ => {}
+                },
+                SetupMode::Edit => match key.code {
+                    KeyCode::Esc | KeyCode::Enter => {
+                        if let Some(field) = app.current_field() {
+                            if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
+                                SetupApp::update_field_visibility(&mut app.fields);
                             }
-                            app.mode = SetupMode::Navigate;
-                            app.status =
+                        }
+                        app.mode = SetupMode::Navigate;
+                        app.status =
                                 "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
                                     .into();
-                        }
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            match app.save() {
-                                Ok(()) => {
-                                    app.mode = SetupMode::Navigate;
-                                    app.status = "Config saved successfully!".into();
-                                }
-                                Err(e) => {
-                                    app.status = format!("Save failed: {e}");
-                                }
-                            }
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Err("Setup cancelled".into());
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(field) = app.current_field_mut() {
-                                field.value.push(c);
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            if let Some(field) = app.current_field_mut() {
-                                field.value.pop();
-                            }
-                        }
-                        _ => {}
                     }
-                }
-                SetupMode::Navigate => {
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Err("Setup cancelled".into());
-                        }
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            match app.save() {
-                                Ok(()) => {
-                                    app.status = "Config saved successfully!".into();
-                                }
-                                Err(e) => {
-                                    app.status = format!("Save failed: {e}");
-                                }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match app.save() {
+                            Ok(()) => {
+                                app.mode = SetupMode::Navigate;
+                                app.status = "Config saved successfully!".into();
+                            }
+                            Err(e) => {
+                                app.status = format!("Save failed: {e}");
                             }
                         }
-                        KeyCode::Enter => {
-                            if let Some(field) = app.current_field() {
-                                let key_name = field.key.clone();
-                                match key_name.as_str() {
-                                    "PROVIDER" | "MODEL" => {
-                                        app.mode = SetupMode::Selector(
-                                            app.enter_selector(&key_name),
-                                        );
-                                        app.status = "Selector: type to filter, Enter: select, Esc: cancel"
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err("Setup cancelled".into());
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(field) = app.current_field_mut() {
+                            field.value.push(c);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(field) = app.current_field_mut() {
+                            field.value.pop();
+                        }
+                    }
+                    _ => {}
+                },
+                SetupMode::Navigate => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err("Setup cancelled".into());
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match app.save() {
+                            Ok(()) => {
+                                app.status = "Config saved successfully!".into();
+                            }
+                            Err(e) => {
+                                app.status = format!("Save failed: {e}");
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(field) = app.current_field() {
+                            let key_name = field.key.clone();
+                            match key_name.as_str() {
+                                "PROVIDER" | "MODEL" => {
+                                    app.mode = SetupMode::Selector(app.enter_selector(&key_name));
+                                    app.status =
+                                        "Selector: type to filter, Enter: select, Esc: cancel"
                                             .into();
-                                    }
-                                    _ => {
-                                        app.mode = SetupMode::Edit;
-                                        app.status =
-                                            "Editing... (Enter/Esc to finish)".into();
-                                    }
+                                }
+                                _ => {
+                                    app.mode = SetupMode::Edit;
+                                    app.status = "Editing... (Enter/Esc to finish)".into();
                                 }
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.move_selection(-1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.move_selection(1);
-                        }
-                        _ => {}
                     }
-                }
+                    KeyCode::Up | KeyCode::Char('k')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.move_selection(-1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.move_selection(1);
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -1812,8 +1801,8 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetupApp, filtered_items, model_selector_items, provider_selector_items};
     use super::{SelectorItem, SelectorState, SetupMode};
+    use super::{SetupApp, filtered_items, model_selector_items, provider_selector_items};
     use std::fs;
 
     #[test]
