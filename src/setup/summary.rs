@@ -81,6 +81,12 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
         "TELEGRAM_BOT_TOKEN",
         "Telegram bot token is required when Telegram is enabled",
     )?;
+    validate_enabled_token(
+        fields,
+        "TELEGRAM_ENABLED",
+        "TELEGRAM_BOT_USERNAME",
+        "Telegram bot username is required when Telegram is enabled",
+    )?;
 
     Ok(())
 }
@@ -225,10 +231,10 @@ pub(crate) fn save_config(
 }
 
 pub(crate) fn mask_secret(value: &str) -> String {
-    if value.len() <= 8 {
+    if value.chars().count() <= 8 {
         return "********".into();
     }
-    let visible = &value[..4];
+    let visible: String = value.chars().take(4).collect();
     format!("{visible}********")
 }
 
@@ -277,7 +283,7 @@ pub(crate) fn backup_config(path: &Path) -> Result<String, String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos();
 
     let file_name = path
         .file_name()
