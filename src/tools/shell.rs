@@ -38,6 +38,7 @@ impl BashTool {
             .current_dir(&self.workspace_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| format!("Failed to execute bash command: {error}"))
@@ -102,7 +103,7 @@ impl Tool for BashTool {
             Ok(Ok(status)) => Ok(status),
             Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
             Err(_) => {
-                let _ = child.start_kill();
+                kill_process_group(&mut child);
                 let _ = child.wait().await;
                 let output = read_temp_output(&temp_path);
                 return bash_error_result(output, &temp_path, Some(timeout_secs), None);
@@ -163,6 +164,18 @@ pub(crate) fn bash_error_result(
     } else {
         let _ = fs::remove_file(temp_path);
         ToolResult::error(text)
+    }
+}
+
+fn kill_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // 負の PID でプロセスグループ全体に SIGKILL を送信
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if ret != 0 {
+            let _ = child.start_kill();
+        }
+    } else {
+        let _ = child.start_kill();
     }
 }
 

@@ -216,10 +216,10 @@ fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
     tool_calls
         .into_iter()
         .filter(|tc| {
-            if tc.name.trim().is_empty() {
+            if tc.name.trim().is_empty() || tc.id.trim().is_empty() {
                 warn!(
-                    "skipping malformed tool call with empty name (id={})",
-                    tc.id
+                    "skipping malformed tool call (empty name or id): id='{}' name='{}'",
+                    tc.id, tc.name
                 );
                 false
             } else {
@@ -759,6 +759,11 @@ impl RecordingProvider {
         responses: Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>,
         delays_ms: Vec<u64>,
     ) -> Self {
+        assert_eq!(
+            responses.len(),
+            delays_ms.len(),
+            "RecordingProvider::new requires one delay value per response"
+        );
         Self {
             responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
             seen_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
