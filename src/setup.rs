@@ -24,9 +24,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use url::Url;
 
+use secrecy::SecretString;
+
 use crate::config::{
     base_url_allows_empty_api_key, default_config_path, default_data_dir, default_workspace_dir,
+    ChannelConfig, Config, ProviderConfig,
 };
+use crate::error::EgoPulseError;
 
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
@@ -304,6 +308,53 @@ fn normalize_provider_id(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn provider_selector_items() -> Vec<SelectorItem> {
+    PROVIDER_PRESETS
+        .iter()
+        .map(|preset| {
+            let models_str = if preset.models.len() > 2 {
+                format!(
+                    "{}, ... ({} total)",
+                    preset.models[..2].join(", "),
+                    preset.models.len()
+                )
+            } else {
+                preset.models.join(", ")
+            };
+            SelectorItem {
+                display: format!("{} ({})", preset.id, models_str),
+                value: preset.id.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn model_selector_items(provider_id: &str) -> Vec<SelectorItem> {
+    find_provider_preset(provider_id)
+        .map(|preset| {
+            preset
+                .models
+                .iter()
+                .map(|model| SelectorItem {
+                    display: model.to_string(),
+                    value: model.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn filtered_items<'a>(items: &'a [SelectorItem], filter: &str) -> Vec<&'a SelectorItem> {
+    if filter.is_empty() {
+        return items.iter().collect();
+    }
+    let pattern = regex::Regex::new(&format!("(?i){}", regex::escape(filter))).unwrap();
+    items
+        .iter()
+        .filter(|item| pattern.is_match(&item.display) || pattern.is_match(&item.value))
+        .collect()
+}
+
 #[derive(Clone)]
 struct Field {
     key: String,
@@ -312,6 +363,25 @@ struct Field {
     required: bool,
     secret: bool,
     help: Option<String>,
+}
+
+enum SetupMode {
+    Navigate,
+    Edit,
+    Selector(SelectorState),
+}
+
+struct SelectorState {
+    field_key: String,
+    filter: String,
+    items: Vec<SelectorItem>,
+    selected: usize,
+    original_value: String,
+}
+
+struct SelectorItem {
+    display: String,
+    value: String,
 }
 
 impl Field {
@@ -330,7 +400,7 @@ impl Field {
 struct SetupApp {
     fields: Vec<Field>,
     selected: usize,
-    editing: bool,
+    mode: SetupMode,
     status: String,
     completed: bool,
     backup_path: Option<String>,
@@ -459,7 +529,7 @@ impl SetupApp {
         Self {
             fields,
             selected: 0,
-            editing: false,
+            mode: SetupMode::Navigate,
             status: "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel".into(),
             completed: false,
             backup_path: None,
@@ -876,135 +946,95 @@ impl SetupApp {
             self.backup_path = Some(backup_config(config_path)?);
         }
 
-        // 未知の top-level キーは保持しつつ、ウィザード管理対象だけを更新する。
-        let mut yaml_value = self
-            .original_yaml
-            .clone()
-            .unwrap_or(serde_yml::Value::Mapping(Default::default()));
-
-        let map = yaml_value.as_mapping_mut().unwrap();
-
-        map.remove(serde_yml::Value::String("data_dir".into()));
-        map.remove(serde_yml::Value::String("workspace_dir".into()));
-        map.remove(serde_yml::Value::String("model".into()));
-        map.remove(serde_yml::Value::String("base_url".into()));
-        map.remove(serde_yml::Value::String("api_key".into()));
-        map.insert(
-            serde_yml::Value::String("default_provider".into()),
-            serde_yml::Value::String(provider_id.clone()),
-        );
-        map.insert(
-            serde_yml::Value::String("log_level".into()),
-            serde_yml::Value::String("info".into()),
-        );
-
-        let providers_value = map
-            .entry(serde_yml::Value::String("providers".into()))
-            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
-        let providers_map = providers_value.as_mapping_mut().unwrap();
-        let provider_value = providers_map
-            .entry(serde_yml::Value::String(provider_id.clone()))
-            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
-        let provider_map = provider_value.as_mapping_mut().unwrap();
-        provider_map.insert(
-            serde_yml::Value::String("label".into()),
-            serde_yml::Value::String(provider_label.clone()),
-        );
-        provider_map.insert(
-            serde_yml::Value::String("base_url".into()),
-            serde_yml::Value::String(base_url.clone()),
-        );
-        provider_map.insert(
-            serde_yml::Value::String("default_model".into()),
-            serde_yml::Value::String(model.clone()),
-        );
-        let models_key = serde_yml::Value::String("models".into());
-        match provider_map.get_mut(&models_key) {
-            Some(serde_yml::Value::Sequence(models)) => {
-                let has_model = models.iter().any(|value| value.as_str() == Some(&model));
-                if !has_model {
-                    models.push(serde_yml::Value::String(model.clone()));
+        // プリセットの default_model / models は ProviderConfig にそのまま反映する。
+        // ユーザーが選択したモデルは Config.default_model（YAML トップレベル）に置く。
+        let preset = find_provider_preset(&provider_id);
+        let preset_default_model = preset
+            .map(|p| p.default_model.to_string())
+            .unwrap_or_else(|| model.clone());
+        let preset_models: Vec<String> = preset
+            .map(|p| p.models.iter().map(|m| (*m).to_string()).collect())
+            .unwrap_or_else(|| {
+                let mut m = vec![model.clone()];
+                if m[0] != preset_default_model {
+                    m.insert(0, preset_default_model.clone());
                 }
-            }
-            Some(other) => {
-                *other = serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]);
-            }
-            None => {
-                provider_map.insert(
-                    models_key,
-                    serde_yml::Value::Sequence(vec![serde_yml::Value::String(model.clone())]),
-                );
-            }
-        }
-        let api_key_key = serde_yml::Value::String("api_key".into());
-        if api_key.is_empty() {
-            provider_map.remove(&api_key_key);
-        } else {
-            provider_map.insert(api_key_key, serde_yml::Value::String(api_key.clone()));
-        }
+                m
+            });
 
-        let mut channels = serde_yml::Value::Mapping(Default::default());
-        let channels_map = channels.as_mapping_mut().unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            provider_id.clone(),
+            ProviderConfig {
+                label: provider_label.clone(),
+                base_url: base_url.clone(),
+                api_key: if api_key.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::new(api_key.clone().into_boxed_str()))
+                },
+                default_model: preset_default_model,
+                models: preset_models,
+            },
+        );
 
-        let mut web = serde_yml::Value::Mapping(Default::default());
-        let web_map = web.as_mapping_mut().unwrap();
-        web_map.insert(
-            serde_yml::Value::String("enabled".into()),
-            serde_yml::Value::Bool(true),
+        let mut channels = HashMap::new();
+
+        channels.insert(
+            "web".to_string(),
+            ChannelConfig {
+                enabled: Some(true),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(10961),
+                auth_token: Some(auth_token),
+                ..Default::default()
+            },
         );
-        web_map.insert(
-            serde_yml::Value::String("host".into()),
-            serde_yml::Value::String("127.0.0.1".into()),
-        );
-        web_map.insert(
-            serde_yml::Value::String("port".into()),
-            serde_yml::Value::Number(serde_yml::Number::from(10961)),
-        );
-        web_map.insert(
-            serde_yml::Value::String("auth_token".into()),
-            serde_yml::Value::String(auth_token),
-        );
-        channels_map.insert(serde_yml::Value::String("web".into()), web);
 
         if discord_enabled {
-            let mut discord = serde_yml::Value::Mapping(Default::default());
-            let d_map = discord.as_mapping_mut().unwrap();
-            d_map.insert(
-                serde_yml::Value::String("enabled".into()),
-                serde_yml::Value::Bool(true),
+            channels.insert(
+                "discord".to_string(),
+                ChannelConfig {
+                    enabled: Some(true),
+                    bot_token: Some(discord_bot_token),
+                    ..Default::default()
+                },
             );
-            d_map.insert(
-                serde_yml::Value::String("bot_token".into()),
-                serde_yml::Value::String(discord_bot_token),
-            );
-            channels_map.insert(serde_yml::Value::String("discord".into()), discord);
         }
 
         if telegram_enabled {
-            let mut telegram = serde_yml::Value::Mapping(Default::default());
-            let tg_map = telegram.as_mapping_mut().unwrap();
-            tg_map.insert(
-                serde_yml::Value::String("enabled".into()),
-                serde_yml::Value::Bool(true),
+            let bot_username = if telegram_bot_username.is_empty() {
+                None
+            } else {
+                Some(telegram_bot_username)
+            };
+            channels.insert(
+                "telegram".to_string(),
+                ChannelConfig {
+                    enabled: Some(true),
+                    bot_token: Some(telegram_bot_token),
+                    bot_username,
+                    ..Default::default()
+                },
             );
-            tg_map.insert(
-                serde_yml::Value::String("bot_token".into()),
-                serde_yml::Value::String(telegram_bot_token),
-            );
-            if !telegram_bot_username.is_empty() {
-                tg_map.insert(
-                    serde_yml::Value::String("bot_username".into()),
-                    serde_yml::Value::String(telegram_bot_username),
-                );
-            }
-            channels_map.insert(serde_yml::Value::String("telegram".into()), telegram);
         }
 
-        map.insert(serde_yml::Value::String("channels".into()), channels);
+        let config = Config {
+            default_provider: provider_id.clone(),
+            default_model: model.clone(),
+            providers,
+            data_dir: default_data_dir().to_string_lossy().into_owned(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels,
+        };
 
-        let yaml = serde_yml::to_string(&yaml_value)
-            .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        fs::write(config_path, &yaml).map_err(|e| format!("Failed to write config: {e}"))?;
+        config
+            .save_yaml(config_path)
+            .map_err(|e: EgoPulseError| format!("Failed to save config: {e}"))?;
 
         // 保存後の確認を端末上で完結できるよう、反映内容を要約して残す。
         self.completion_summary = vec![
@@ -1043,6 +1073,58 @@ impl SetupApp {
 
         self.completed = true;
         Ok(())
+    }
+
+    fn enter_selector(&self, field_key: &str) -> SelectorState {
+        let items = match field_key {
+            "PROVIDER" => provider_selector_items(),
+            "MODEL" => {
+                let provider = self
+                    .fields
+                    .iter()
+                    .find(|f| f.key == "PROVIDER")
+                    .map(|f| f.value.as_str())
+                    .unwrap_or("");
+                model_selector_items(provider)
+            }
+            _ => Vec::new(),
+        };
+        let original_value = self
+            .fields
+            .iter()
+            .find(|f| f.key == field_key)
+            .map(|f| f.value.clone())
+            .unwrap_or_default();
+        SelectorState {
+            field_key: field_key.to_string(),
+            filter: String::new(),
+            items,
+            selected: 0,
+            original_value,
+        }
+    }
+
+    fn apply_selector_selection(&mut self, field_key: &str) {
+        if field_key == "PROVIDER" {
+            let provider_id = self
+                .fields
+                .iter()
+                .find(|f| f.key == "PROVIDER")
+                .map(|f| f.value.clone())
+                .unwrap_or_default();
+            if let Some(preset) = find_provider_preset(&provider_id) {
+                if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
+                    if model_field.value.is_empty() {
+                        model_field.value = preset.default_model.to_string();
+                    }
+                }
+                if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
+                    if url_field.value.is_empty() && !preset.default_base_url.is_empty() {
+                        url_field.value = preset.default_base_url.to_string();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1148,6 +1230,10 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
             draw_fields(frame, app, chunks[1]);
         }
 
+        if let SetupMode::Selector(ref state) = app.mode {
+            draw_selector_popup(frame, state, area);
+        }
+
         // Footer
         let footer_text = if app.completed {
             vec![Line::from(
@@ -1174,7 +1260,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
         frame.render_widget(footer, chunks[2]);
 
         // 編集中だけカーソルを明示し、非編集時のノイズを避ける。
-        if app.editing && !app.completed {
+        if matches!(app.mode, SetupMode::Edit) && !app.completed {
             if let Some(field) = app.current_field() {
                 let visible = app.visible_fields();
                 let field_pos = visible
@@ -1247,28 +1333,37 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
     let label_width = max_label_width(&app.fields, &visible);
     let window_end = (window_start + content_height).min(visible.len());
 
+    let is_selector_active = matches!(app.mode, SetupMode::Selector(_));
+
     let mut lines = Vec::new();
     for &idx in visible.iter().take(window_end).skip(window_start) {
         let field = &app.fields[idx];
         let is_selected = idx == app.selected;
-        let is_editing = is_selected && app.editing;
+        let is_editing = is_selected && matches!(app.mode, SetupMode::Edit);
 
         let display = field.display_value(is_editing);
         let prefix = if is_selected { "> " } else { "  " };
 
+        let base_style = if is_selector_active {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+
         let mut spans = vec![
-            Span::raw(prefix),
+            Span::styled(prefix, base_style),
             Span::styled(
                 &field.label,
-                Style::default().fg(if is_selected {
-                    Color::Yellow
+                if is_selector_active {
+                    base_style
+                } else if is_selected {
+                    Style::default().fg(Color::Yellow)
                 } else {
-                    Color::White
-                }),
+                    Style::default().fg(Color::White)
+                },
             ),
         ];
 
-        // Separator
         let sep_len = label_width.saturating_sub(field.label.chars().count() as u16);
         if sep_len > 0 {
             spans.push(Span::raw(" ".repeat(sep_len as usize)));
@@ -1276,7 +1371,6 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
 
         spans.push(Span::raw(" "));
 
-        // Value
         if is_editing {
             spans.push(Span::styled(
                 if display.is_empty() {
@@ -1289,18 +1383,36 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
                     .add_modifier(Modifier::UNDERLINED),
             ));
         } else if field.secret && !display.is_empty() {
-            spans.push(Span::styled(display, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                display,
+                if is_selector_active {
+                    base_style
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ));
         } else if display.is_empty() {
             spans.push(Span::styled(
                 "(empty)",
-                Style::default().fg(Color::DarkGray),
+                if is_selector_active {
+                    base_style
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
             ));
         } else {
-            spans.push(Span::raw(display));
+            spans.push(Span::styled(display, base_style));
         }
 
         if field.required && !is_editing {
-            spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+            spans.push(Span::styled(
+                " *",
+                if is_selector_active {
+                    base_style
+                } else {
+                    Style::default().fg(Color::Red)
+                },
+            ));
         }
 
         lines.push(Line::from(spans));
@@ -1337,6 +1449,125 @@ fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area:
         .block(Block::default().title("Summary").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
+}
+
+fn draw_selector_popup(frame: &mut ratatui::Frame<'_>, state: &SelectorState, area: Rect) {
+    let title = match state.field_key.as_str() {
+        "PROVIDER" => "Select Provider",
+        "MODEL" => "Select Model",
+        _ => "Select",
+    };
+
+    let filtered = filtered_items(&state.items, &state.filter);
+
+    let popup_width = (area.width as usize).clamp(40, 70);
+    let popup_height = (7 + filtered.len()).clamp(10, 20) as u16;
+    let max_list_height = (popup_height as usize).saturating_sub(7);
+
+    let popup_x = (area.width as usize).saturating_sub(popup_width) / 2;
+    let popup_y = (area.height as usize).saturating_sub(popup_height as usize) / 2;
+
+    let popup_area = Rect::new(
+        popup_x as u16,
+        popup_y as u16,
+        popup_width as u16,
+        popup_height,
+    );
+
+    let inner_width = popup_width.saturating_sub(2);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    lines.push(Line::from(vec![Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "─".repeat(inner_width),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    let filter_display = format!("Filter: {}", state.filter);
+    lines.push(Line::from(vec![Span::styled(
+        filter_display,
+        Style::default().fg(Color::White),
+    )]));
+
+    lines.push(Line::from(vec![Span::styled(
+        "─".repeat(inner_width),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    if filtered.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "No matches. Enter to use as free input.",
+            Style::default().fg(Color::Yellow),
+        )]));
+    } else {
+        let mut window_start = 0usize;
+        if state.selected >= max_list_height {
+            window_start = state.selected - max_list_height + 1;
+        }
+        let window_end = (window_start + max_list_height).min(filtered.len());
+
+        for (i, item) in filtered
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(window_end - window_start)
+        {
+            let is_selected = i == state.selected;
+            let prefix = if is_selected { "▸ " } else { "  " };
+            let display_text = if item.display.len() > inner_width.saturating_sub(4) {
+                format!(
+                    "{}…",
+                    &item.display[..inner_width.saturating_sub(5)]
+                )
+            } else {
+                item.display.clone()
+            };
+
+            if is_selected {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{display_text}"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+            } else {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{display_text}"),
+                    Style::default().fg(Color::White),
+                )]));
+            }
+        }
+    }
+
+    let remaining = (popup_height as usize).saturating_sub(lines.len() + 3);
+    for _ in 0..remaining {
+        lines.push(Line::from(""));
+    }
+
+    let match_info = format!(
+        "{} matches │ Esc:cancel Enter:select ↑↓:navigate",
+        filtered.len()
+    );
+    lines.push(Line::from(vec![Span::styled(
+        match_info,
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    let popup = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(popup, popup_area);
+
+    let filter_cursor_x = popup_area.x + 1 + 8 + state.filter.chars().count() as u16;
+    let filter_cursor_y = popup_area.y + 3;
+    frame.set_cursor_position(Position::new(filter_cursor_x, filter_cursor_y));
 }
 
 /// Runs the interactive setup wizard and writes the resulting configuration file.
@@ -1403,72 +1634,171 @@ async fn run_inner(
                 continue;
             }
 
-            if app.editing {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => {
-                        app.editing = false;
-                        if let Some(field) = app.current_field() {
-                            // トグル変更は編集終了時にだけ反映し、入力中の項目飛びを防ぐ。
-                            if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
-                                SetupApp::update_field_visibility(&mut app.fields);
+            match app.mode {
+                SetupMode::Selector(ref mut state) => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(field) =
+                                app.fields.iter_mut().find(|f| f.key == state.field_key)
+                            {
+                                field.value = state.original_value.clone();
+                            }
+                            app.mode = SetupMode::Navigate;
+                            app.status =
+                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
+                                    .into();
+                        }
+                        KeyCode::Enter => {
+                            let filtered = filtered_items(&state.items, &state.filter);
+                            if filtered.is_empty() {
+                                if let Some(field) =
+                                    app.fields.iter_mut().find(|f| f.key == state.field_key)
+                                {
+                                    field.value = state.filter.clone();
+                                }
+                            } else {
+                                state.selected =
+                                    (state.selected).min(filtered.len() - 1);
+                                let selected_value = filtered[state.selected].value.clone();
+                                if let Some(field) =
+                                    app.fields.iter_mut().find(|f| f.key == state.field_key)
+                                {
+                                    field.value = selected_value;
+                                }
+                            }
+                            let field_key = state.field_key.clone();
+                            app.apply_selector_selection(&field_key);
+                            app.mode = SetupMode::Navigate;
+                            app.status =
+                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
+                                    .into();
+                        }
+                        KeyCode::Up | KeyCode::Char('k')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let filtered = filtered_items(&state.items, &state.filter);
+                            if !filtered.is_empty() && state.selected > 0 {
+                                state.selected -= 1;
                             }
                         }
-                    }
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match app.save() {
-                            Ok(()) => {
-                                app.editing = false;
-                                app.status = "Config saved successfully!".into();
-                            }
-                            Err(e) => {
-                                app.status = format!("Save failed: {e}");
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let filtered = filtered_items(&state.items, &state.filter);
+                            if !filtered.is_empty() {
+                                state.selected =
+                                    (state.selected + 1).min(filtered.len() - 1);
                             }
                         }
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err("Setup cancelled".into());
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(field) = app.current_field_mut() {
-                            field.value.push(c);
+                        KeyCode::Backspace => {
+                            state.filter.pop();
+                            let filtered = filtered_items(&state.items, &state.filter);
+                            if !filtered.is_empty() {
+                                state.selected = state.selected.min(filtered.len() - 1);
+                            } else {
+                                state.selected = 0;
+                            }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(field) = app.current_field_mut() {
-                            field.value.pop();
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.filter.push(c);
+                            let filtered = filtered_items(&state.items, &state.filter);
+                            if !filtered.is_empty() {
+                                state.selected = state.selected.min(filtered.len() - 1);
+                            } else {
+                                state.selected = 0;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            } else {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err("Setup cancelled".into());
-                    }
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match app.save() {
-                            Ok(()) => {
-                                app.status = "Config saved successfully!".into();
+                SetupMode::Edit => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            if let Some(field) = app.current_field() {
+                                if field.key == "DISCORD_ENABLED"
+                                    || field.key == "TELEGRAM_ENABLED"
+                                {
+                                    SetupApp::update_field_visibility(&mut app.fields);
+                                }
                             }
-                            Err(e) => {
-                                app.status = format!("Save failed: {e}");
+                            app.mode = SetupMode::Navigate;
+                            app.status =
+                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
+                                    .into();
+                        }
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            match app.save() {
+                                Ok(()) => {
+                                    app.mode = SetupMode::Navigate;
+                                    app.status = "Config saved successfully!".into();
+                                }
+                                Err(e) => {
+                                    app.status = format!("Save failed: {e}");
+                                }
                             }
                         }
-                    }
-                    KeyCode::Enter => {
-                        if app.current_field().is_some() {
-                            app.editing = true;
-                            // 画面遷移を増やさず、その場でインライン編集に入る。
-                            app.status = "Editing... (Enter/Esc to finish)".into();
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Err("Setup cancelled".into());
                         }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(field) = app.current_field_mut() {
+                                field.value.push(c);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(field) = app.current_field_mut() {
+                                field.value.pop();
+                            }
+                        }
+                        _ => {}
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.move_selection(-1);
+                }
+                SetupMode::Navigate => {
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Err("Setup cancelled".into());
+                        }
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            match app.save() {
+                                Ok(()) => {
+                                    app.status = "Config saved successfully!".into();
+                                }
+                                Err(e) => {
+                                    app.status = format!("Save failed: {e}");
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(field) = app.current_field() {
+                                let key_name = field.key.clone();
+                                match key_name.as_str() {
+                                    "PROVIDER" | "MODEL" => {
+                                        app.mode = SetupMode::Selector(
+                                            app.enter_selector(&key_name),
+                                        );
+                                        app.status = "Selector: type to filter, Enter: select, Esc: cancel"
+                                            .into();
+                                    }
+                                    _ => {
+                                        app.mode = SetupMode::Edit;
+                                        app.status =
+                                            "Editing... (Enter/Esc to finish)".into();
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            app.move_selection(-1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            app.move_selection(1);
+                        }
+                        _ => {}
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.move_selection(1);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -1477,7 +1807,8 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::SetupApp;
+    use super::{SetupApp, filtered_items, model_selector_items, provider_selector_items};
+    use super::{SelectorItem, SelectorState, SetupMode};
     use std::fs;
 
     #[test]
@@ -1538,5 +1869,95 @@ api_key: sk-legacy
         assert!(!existing.contains_key("MODEL"));
         assert!(!existing.contains_key("BASE_URL"));
         assert!(!existing.contains_key("API_KEY"));
+    }
+
+    #[test]
+    fn filtered_items_returns_all_when_filter_empty() {
+        let items = vec![
+            SelectorItem {
+                display: "openai (gpt-5.2, gpt-5)".into(),
+                value: "openai".into(),
+            },
+            SelectorItem {
+                display: "ollama (llama3.2)".into(),
+                value: "ollama".into(),
+            },
+        ];
+        let result = filtered_items(&items, "");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filtered_items_matches_substring_case_insensitive() {
+        let items = vec![
+            SelectorItem {
+                display: "openai (gpt-5.2, gpt-5)".into(),
+                value: "openai".into(),
+            },
+            SelectorItem {
+                display: "Ollama (local)".into(),
+                value: "ollama".into(),
+            },
+            SelectorItem {
+                display: "OpenRouter".into(),
+                value: "openrouter".into(),
+            },
+        ];
+        let result = filtered_items(&items, "OPEN");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].value, "openai");
+        assert_eq!(result[1].value, "openrouter");
+    }
+
+    #[test]
+    fn filtered_items_returns_none_when_no_match() {
+        let items = vec![SelectorItem {
+            display: "openai".into(),
+            value: "openai".into(),
+        }];
+        let result = filtered_items(&items, "zzzzz");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn provider_selector_items_includes_all_presets() {
+        let items = provider_selector_items();
+        assert_eq!(items.len(), 25);
+        assert!(items.iter().any(|i| i.value == "openai"));
+        assert!(items.iter().any(|i| i.value == "custom"));
+    }
+
+    #[test]
+    fn model_selector_items_returns_models_for_known_provider() {
+        let items = model_selector_items("openai");
+        assert!(!items.is_empty());
+        assert!(items.iter().any(|i| i.value == "gpt-5.2"));
+    }
+
+    #[test]
+    fn model_selector_items_returns_empty_for_unknown_provider() {
+        let items = model_selector_items("nonexistent");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn setup_mode_navigate_default() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let app = SetupApp::new(Some(config_path));
+        assert!(matches!(app.mode, SetupMode::Navigate));
+    }
+
+    #[test]
+    fn selector_state_holds_original_value() {
+        let state = SelectorState {
+            field_key: "PROVIDER".into(),
+            filter: String::new(),
+            items: vec![],
+            selected: 0,
+            original_value: "openai".into(),
+        };
+        assert_eq!(state.field_key, "PROVIDER");
+        assert_eq!(state.original_value, "openai");
     }
 }
