@@ -410,6 +410,118 @@ button {
   font-size: 0.88rem;
 }
 
+.config-form select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(8, 14, 30, 0.86);
+  color: var(--text);
+  padding: 14px 16px;
+}
+
+.config-section-title {
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+  margin-bottom: 14px;
+  margin-top: 6px;
+}
+
+.api-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.api-key-row input {
+  flex: 1;
+}
+
+.api-key-clear {
+  flex-shrink: 0;
+  padding: 10px 12px;
+  font-size: 0.85rem;
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.provider-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: rgba(8, 16, 32, 0.8);
+}
+
+.provider-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.provider-card-header strong {
+  font-size: 0.95rem;
+}
+
+.provider-id {
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: var(--panel-2);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.provider-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.provider-detail {
+  display: flex;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+
+.provider-detail-label {
+  color: var(--muted);
+  min-width: 64px;
+}
+
+.provider-detail-value {
+  color: var(--text);
+  word-break: break-all;
+}
+
+.provider-detail-value.status-ok {
+  color: var(--accent);
+}
+
+.provider-detail-value.status-none {
+  color: var(--danger);
+}
+
+.channel-override-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.channel-override-label {
+  color: var(--accent-2);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 @media (max-width: 960px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -432,9 +544,12 @@ button {
     max-width: 100%;
   }
 
-  .grid-two,
-  .config-footer {
+  .grid-two {
     grid-template-columns: 1fr;
-    display: grid;
+  }
+
+  .config-footer {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
