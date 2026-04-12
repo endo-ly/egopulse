@@ -1,9 +1,7 @@
 //! メッセージの圧縮 (compaction) と会話アーカイブ。
 
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::formatting::{
-    message_to_archive_text, message_to_text, strip_thinking,
-};
+use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::runtime::AppState;
@@ -94,7 +92,12 @@ pub(crate) async fn maybe_compact_messages(
     Ok(compacted)
 }
 
-pub(crate) async fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
+pub(crate) async fn archive_conversation(
+    data_dir: &str,
+    channel: &str,
+    chat_id: i64,
+    messages: &[Message],
+) {
     let data_dir = data_dir.to_string();
     let channel = channel.to_string();
     let messages = messages.to_vec();
@@ -204,4 +207,26 @@ pub(crate) fn can_merge_compacted_messages(left: &Message, right: &Message) -> b
         && right.tool_call_id.is_none()
         && matches!(left.content, crate::llm::MessageContent::Text(_))
         && matches!(right.content, crate::llm::MessageContent::Text(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_compaction_summary_input_keeps_exact_character_limit() {
+        let input = format!("{}{}{}", "a".repeat(19_998), "あ", "い");
+        let truncated = truncate_compaction_summary_input(input.clone());
+
+        assert_eq!(truncated, input);
+    }
+
+    #[test]
+    fn truncate_compaction_summary_input_truncates_by_character_count() {
+        let input = format!("{}{}{}", "a".repeat(19_999), "あ", "い");
+        let truncated = truncate_compaction_summary_input(input);
+
+        let expected = format!("{}\n... (truncated)", "a".repeat(19_999) + "あ");
+        assert_eq!(truncated, expected);
+    }
 }

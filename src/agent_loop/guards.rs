@@ -63,3 +63,29 @@ pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
         || japanese_prefixes.iter().any(|p| trimmed.starts_with(p))
         || japanese_action_markers.iter().any(|p| trimmed.contains(p))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_declarative_only_reply_detects_patterns() {
+        assert!(is_declarative_only_reply("I'll help you with that."));
+        assert!(is_declarative_only_reply("Sure, let me check that."));
+        assert!(is_declarative_only_reply("Of course, I can do that."));
+        assert!(is_declarative_only_reply("Let me look into that."));
+        assert!(is_declarative_only_reply("了解しました。実行します。"));
+        assert!(is_declarative_only_reply("承知しました。確認します。"));
+        assert!(is_declarative_only_reply("今から試してみます。"));
+
+        let long = "I'll help you with that. ".repeat(20);
+        assert!(!is_declarative_only_reply(&long));
+
+        assert!(!is_declarative_only_reply(
+            "The file contains the following:"
+        ));
+        assert!(!is_declarative_only_reply(
+            "Here is the result of the search:"
+        ));
+    }
+}
