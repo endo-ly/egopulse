@@ -308,7 +308,16 @@ async fn run_turn_action<F>(
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
-    match handle_turn_action(action, state, chat_id, messages, session_updated_at, on_event).await? {
+    match handle_turn_action(
+        action,
+        state,
+        chat_id,
+        messages,
+        session_updated_at,
+        on_event,
+    )
+    .await?
+    {
         ControlFlow::Continue(next_retry_messages) => {
             *retry_messages = next_retry_messages;
             Ok(None)
@@ -662,10 +671,7 @@ async fn handle_user_turn_persist_error(
     }
 }
 
-fn persist_phase_conflict_outcome(
-    attempt: usize,
-    error: EgoPulseError,
-) -> PersistConflictOutcome {
+fn persist_phase_conflict_outcome(attempt: usize, error: EgoPulseError) -> PersistConflictOutcome {
     match error {
         EgoPulseError::Storage(StorageError::SessionSnapshotConflict) if attempt == 0 => {
             PersistConflictOutcome::Reload
@@ -690,7 +696,9 @@ pub(crate) struct FailingProvider;
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct RecordingProvider {
-    responses: std::sync::Arc<std::sync::Mutex<Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>>>,
+    responses: std::sync::Arc<
+        std::sync::Mutex<Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>>,
+    >,
     seen_messages: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     seen_systems: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     delays_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
@@ -778,7 +786,9 @@ pub(crate) fn test_config(data_dir: String) -> crate::config::Config {
             crate::config::ProviderConfig {
                 label: "OpenAI".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(secrecy::SecretString::new("sk-test".to_string().into_boxed_str())),
+                api_key: Some(secrecy::SecretString::new(
+                    "sk-test".to_string().into_boxed_str(),
+                )),
                 default_model: "gpt-4o-mini".to_string(),
                 models: vec!["gpt-4o-mini".to_string()],
             },
@@ -879,8 +889,7 @@ pub(crate) fn build_state_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{
-        FakeProvider, FailingProvider, RecordingProvider, build_state_with_provider,
-        cli_context,
+        FailingProvider, FakeProvider, RecordingProvider, build_state_with_provider, cli_context,
     };
     use serial_test::serial;
 
