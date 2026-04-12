@@ -71,6 +71,9 @@ pub enum ConfigError {
     InvalidCompactionConfig(String),
     #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
     NoActiveChannels,
+    /// OS のホームディレクトリが解決できなかった。
+    #[error("home_directory_unresolved: OS home directory could not be resolved")]
+    HomeDirectoryUnresolved,
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

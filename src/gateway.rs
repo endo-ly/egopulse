@@ -55,7 +55,7 @@ pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
 }
 
 fn runtime_default_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".egopulse").join("egopulse.config.yaml"))
+    crate::config::default_config_path().ok()
 }
 
 fn escape_systemd_exec_arg(value: &str) -> String {
