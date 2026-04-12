@@ -363,28 +363,8 @@ pub(crate) fn apply_edits_to_normalized_content(
     edits: &[EditSpec],
     path: &str,
 ) -> Result<AppliedEditsResult, String> {
-    let normalized_edits = edits
-        .iter()
-        .map(|edit| EditSpec {
-            old_text: normalize_newlines(&edit.old_text),
-            new_text: normalize_newlines(&edit.new_text),
-        })
-        .collect::<Vec<_>>();
-
-    for (index, edit) in normalized_edits.iter().enumerate() {
-        if edit.old_text.is_empty() {
-            return Err(get_empty_old_text_error(
-                path,
-                index,
-                normalized_edits.len(),
-            ));
-        }
-    }
-
-    let initial_matches = normalized_edits
-        .iter()
-        .map(|edit| fuzzy_find_text(normalized_content, &edit.old_text))
-        .collect::<Vec<_>>();
+    let normalized_edits = normalize_edits(edits);
+    validate_non_empty_old_texts(&normalized_edits, path)?;
 
     let mut base_content = normalized_content.to_string();
     let mut matched_edits = Vec::with_capacity(normalized_edits.len());
@@ -392,58 +372,132 @@ pub(crate) fn apply_edits_to_normalized_content(
     // バイト長が異なる場合に差分を蓄積し、後続編集の開始位置を調整する。
     let mut cumulative_offset: isize = 0;
 
-    for (index, result) in initial_matches.iter().enumerate() {
-        let Some((fuzzy_pos, fuzzy_len, used_fuzzy)) = result else {
-            return Err(get_not_found_error(path, index, normalized_edits.len()));
-        };
-
-        let (span_start, span_end, match_len) = if *used_fuzzy {
-            let orig_start = fuzzy_byte_pos_to_original_byte_pos(normalized_content, *fuzzy_pos);
-            let fuzzy_old_text = normalize_for_fuzzy_match(&normalized_edits[index].old_text);
-            let char_count = fuzzy_old_text.chars().count();
-            let orig_end = normalized_content[orig_start..]
-                .char_indices()
-                .nth(char_count)
-                .map(|(pos, _)| orig_start + pos)
-                .unwrap_or(normalized_content.len());
-            (orig_start, orig_end, fuzzy_old_text.len())
-        } else {
-            (*fuzzy_pos, *fuzzy_pos + *fuzzy_len, *fuzzy_len)
-        };
-
-        let adjusted_start = (span_start as isize + cumulative_offset) as usize;
-        let adjusted_end = (span_end as isize + cumulative_offset) as usize;
-
-        if *used_fuzzy {
-            let original_span = &base_content[adjusted_start..adjusted_end];
-            let normalized_span = normalize_for_fuzzy_match(original_span);
-            cumulative_offset += normalized_span.len() as isize - (span_end - span_start) as isize;
-            base_content = format!(
-                "{}{}{}",
-                &base_content[..adjusted_start],
-                normalized_span,
-                &base_content[adjusted_end..]
-            );
-        }
-
-        let occurrences = count_occurrences(&base_content, &normalized_edits[index].old_text);
-        if occurrences > 1 {
-            return Err(get_duplicate_error(
-                path,
-                index,
-                normalized_edits.len(),
-                occurrences,
-            ));
-        }
-
-        matched_edits.push(MatchedEdit {
-            edit_index: index,
-            match_index: adjusted_start,
-            match_length: match_len,
-            new_text: normalized_edits[index].new_text.clone(),
-        });
+    for (index, edit) in normalized_edits.iter().enumerate() {
+        let matched = match_normalized_edit(
+            normalized_content,
+            &mut base_content,
+            edit,
+            index,
+            normalized_edits.len(),
+            path,
+            &mut cumulative_offset,
+        )?;
+        matched_edits.push(matched);
     }
 
+    ensure_non_overlapping_matches(&mut matched_edits, path)?;
+    let new_content = apply_matched_edits(&base_content, &matched_edits);
+
+    if new_content == base_content {
+        return Err(get_no_change_error(path, normalized_edits.len()));
+    }
+
+    Ok(AppliedEditsResult {
+        base_content,
+        new_content,
+    })
+}
+
+fn normalize_edits(edits: &[EditSpec]) -> Vec<EditSpec> {
+    edits
+        .iter()
+        .map(|edit| EditSpec {
+            old_text: normalize_newlines(&edit.old_text),
+            new_text: normalize_newlines(&edit.new_text),
+        })
+        .collect()
+}
+
+fn validate_non_empty_old_texts(edits: &[EditSpec], path: &str) -> Result<(), String> {
+    for (index, edit) in edits.iter().enumerate() {
+        if edit.old_text.is_empty() {
+            return Err(get_empty_old_text_error(path, index, edits.len()));
+        }
+    }
+    Ok(())
+}
+
+fn match_normalized_edit(
+    normalized_content: &str,
+    base_content: &mut String,
+    edit: &EditSpec,
+    index: usize,
+    total_edits: usize,
+    path: &str,
+    cumulative_offset: &mut isize,
+) -> Result<MatchedEdit, String> {
+    let Some((fuzzy_pos, fuzzy_len, used_fuzzy)) =
+        fuzzy_find_text(normalized_content, &edit.old_text)
+    else {
+        return Err(get_not_found_error(path, index, total_edits));
+    };
+
+    let (span_start, span_end, match_length) =
+        resolve_match_span(normalized_content, edit, fuzzy_pos, fuzzy_len, used_fuzzy);
+    let adjusted_start = (span_start as isize + *cumulative_offset) as usize;
+    let adjusted_end = (span_end as isize + *cumulative_offset) as usize;
+
+    if used_fuzzy {
+        *cumulative_offset += normalize_matched_span(base_content, adjusted_start, adjusted_end)
+            - (span_end - span_start) as isize;
+    }
+
+    let occurrences = count_occurrences(base_content, &edit.old_text);
+    if occurrences > 1 {
+        return Err(get_duplicate_error(path, index, total_edits, occurrences));
+    }
+
+    Ok(MatchedEdit {
+        edit_index: index,
+        match_index: adjusted_start,
+        match_length,
+        new_text: edit.new_text.clone(),
+    })
+}
+
+fn resolve_match_span(
+    normalized_content: &str,
+    edit: &EditSpec,
+    fuzzy_pos: usize,
+    fuzzy_len: usize,
+    used_fuzzy: bool,
+) -> (usize, usize, usize) {
+    if !used_fuzzy {
+        return (fuzzy_pos, fuzzy_pos + fuzzy_len, fuzzy_len);
+    }
+
+    let orig_start = fuzzy_byte_pos_to_original_byte_pos(normalized_content, fuzzy_pos);
+    let fuzzy_old_text = normalize_for_fuzzy_match(&edit.old_text);
+    let char_count = fuzzy_old_text.chars().count();
+    let orig_end = normalized_content[orig_start..]
+        .char_indices()
+        .nth(char_count)
+        .map(|(pos, _)| orig_start + pos)
+        .unwrap_or(normalized_content.len());
+    (orig_start, orig_end, fuzzy_old_text.len())
+}
+
+fn normalize_matched_span(
+    base_content: &mut String,
+    adjusted_start: usize,
+    adjusted_end: usize,
+) -> isize {
+    let original_span = &base_content[adjusted_start..adjusted_end];
+    let normalized_span = normalize_for_fuzzy_match(original_span);
+    let normalized_len = normalized_span.len() as isize;
+    *base_content = format!(
+        "{}{}{}",
+        &base_content[..adjusted_start],
+        normalized_span,
+        &base_content[adjusted_end..]
+    );
+    normalized_len
+}
+
+fn ensure_non_overlapping_matches(
+    matched_edits: &mut [MatchedEdit],
+    path: &str,
+) -> Result<(), String> {
     matched_edits.sort_by_key(|edit| edit.match_index);
     for pair in matched_edits.windows(2) {
         let previous = &pair[0];
@@ -455,8 +509,11 @@ pub(crate) fn apply_edits_to_normalized_content(
             ));
         }
     }
+    Ok(())
+}
 
-    let mut new_content = base_content.clone();
+fn apply_matched_edits(base_content: &str, matched_edits: &[MatchedEdit]) -> String {
+    let mut new_content = base_content.to_string();
     for edit in matched_edits.iter().rev() {
         new_content = format!(
             "{}{}{}",
@@ -465,15 +522,7 @@ pub(crate) fn apply_edits_to_normalized_content(
             &new_content[edit.match_index + edit.match_length..]
         );
     }
-
-    if new_content == base_content {
-        return Err(get_no_change_error(path, normalized_edits.len()));
-    }
-
-    Ok(AppliedEditsResult {
-        base_content,
-        new_content,
-    })
+    new_content
 }
 
 // ---------------------------------------------------------------------------

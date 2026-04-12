@@ -12,7 +12,10 @@ use tokio::time::{Duration, timeout};
 use crate::llm::ToolDefinition;
 
 use super::text::{format_size, shell_quote, truncate_tail};
-use super::{schema_object, Tool, ToolExecutionContext, ToolResult, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use super::{
+    DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
+    ToolResult, schema_object,
+};
 
 /// Executes bash commands in the workspace with configurable timeout and output capture.
 pub(crate) struct BashTool {
@@ -26,6 +29,18 @@ impl BashTool {
 
     fn temp_dir(&self) -> PathBuf {
         self.workspace_dir.join(".tmp").join("bash")
+    }
+
+    fn spawn_bash_command(&self, wrapped_command: &str) -> Result<tokio::process::Child, String> {
+        Command::new("bash")
+            .arg("-lc")
+            .arg(wrapped_command)
+            .current_dir(&self.workspace_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("Failed to execute bash command: {error}"))
     }
 }
 
@@ -78,19 +93,9 @@ impl Tool for BashTool {
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
         let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
-        let mut child = match Command::new("bash")
-            .arg("-lc")
-            .arg(&wrapped_command)
-            .current_dir(&self.workspace_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
+        let mut child = match self.spawn_bash_command(&wrapped_command) {
             Ok(child) => child,
-            Err(error) => {
-                return ToolResult::error(format!("Failed to execute bash command: {error}"));
-            }
+            Err(error) => return ToolResult::error(error),
         };
 
         let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
@@ -110,52 +115,7 @@ impl Tool for BashTool {
         };
 
         let output = read_temp_output(&temp_path);
-        let truncation = truncate_tail(&output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        let details = if truncation.truncated {
-            Some(json!({
-                "truncation": super::truncation_json(&truncation),
-                "fullOutputPath": temp_path.to_string_lossy()
-            }))
-        } else {
-            None
-        };
-        let mut text = if truncation.content.is_empty() {
-            "(no output)".to_string()
-        } else {
-            truncation.content.clone()
-        };
-
-        if truncation.truncated {
-            let start_line = truncation
-                .total_lines
-                .saturating_sub(truncation.output_lines)
-                + 1;
-            let end_line = truncation.total_lines;
-            if truncation.last_line_partial {
-                let last_line_size =
-                    format_size(output.split('\n').next_back().unwrap_or_default().len());
-                text.push_str(&format!(
-                    "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {}]",
-                    format_size(truncation.output_bytes),
-                    temp_path.to_string_lossy()
-                ));
-            } else if truncation.truncated_by == Some("lines") {
-                text.push_str(&format!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {}]",
-                    truncation.total_lines,
-                    temp_path.to_string_lossy()
-                ));
-            } else {
-                text.push_str(&format!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {}]",
-                    truncation.total_lines,
-                    format_size(DEFAULT_MAX_BYTES),
-                    temp_path.to_string_lossy()
-                ));
-            }
-        } else {
-            let _ = fs::remove_file(&temp_path);
-        }
+        let (mut text, details) = render_bash_output(&output, &temp_path);
 
         if !status.success() {
             if let Some(code) = status.code() {
@@ -210,4 +170,65 @@ pub(crate) fn read_temp_output(path: &Path) -> String {
     fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
         .unwrap_or_default()
+}
+
+fn render_bash_output(output: &str, temp_path: &Path) -> (String, Option<serde_json::Value>) {
+    let truncation = truncate_tail(output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let details = truncation.truncated.then(|| {
+        json!({
+            "truncation": super::truncation_json(&truncation),
+            "fullOutputPath": temp_path.to_string_lossy()
+        })
+    });
+    let mut text = if truncation.content.is_empty() {
+        "(no output)".to_string()
+    } else {
+        truncation.content.clone()
+    };
+
+    if !truncation.truncated {
+        let _ = fs::remove_file(temp_path);
+        return (text, details);
+    }
+
+    append_truncation_summary(&mut text, &truncation, output, temp_path);
+    (text, details)
+}
+
+fn append_truncation_summary(
+    text: &mut String,
+    truncation: &super::text::TruncationResult,
+    output: &str,
+    temp_path: &Path,
+) {
+    let start_line = truncation
+        .total_lines
+        .saturating_sub(truncation.output_lines)
+        + 1;
+    let end_line = truncation.total_lines;
+    if truncation.last_line_partial {
+        let last_line_size = format_size(output.split('\n').next_back().unwrap_or_default().len());
+        text.push_str(&format!(
+            "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {}]",
+            format_size(truncation.output_bytes),
+            temp_path.to_string_lossy()
+        ));
+        return;
+    }
+
+    if truncation.truncated_by == Some("lines") {
+        text.push_str(&format!(
+            "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {}]",
+            truncation.total_lines,
+            temp_path.to_string_lossy()
+        ));
+        return;
+    }
+
+    text.push_str(&format!(
+        "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {}]",
+        truncation.total_lines,
+        format_size(DEFAULT_MAX_BYTES),
+        temp_path.to_string_lossy()
+    ));
 }

@@ -19,7 +19,7 @@ use super::provider::{
 };
 use super::{Field, SetupApp};
 use crate::config::{
-    base_url_allows_empty_api_key, default_data_dir, default_workspace_dir, Config, ProviderConfig,
+    Config, ProviderConfig, base_url_allows_empty_api_key, default_data_dir, default_workspace_dir,
 };
 use crate::error::EgoPulseError;
 
@@ -27,32 +27,20 @@ const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
 
 pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
-    let provider = fields
-        .iter()
-        .find(|f| f.key == "PROVIDER")
-        .map(|f| f.value.trim())
-        .unwrap_or("");
+    let provider = field_value(fields, "PROVIDER");
 
     if provider.is_empty() {
         return Err("Provider profile ID is required".into());
     }
 
-    let model = fields
-        .iter()
-        .find(|f| f.key == "MODEL")
-        .map(|f| f.value.trim())
-        .unwrap_or("");
+    let model = field_value(fields, "MODEL");
     let effective_model = if model.is_empty() {
         provider_default_model(provider).unwrap_or("")
     } else {
         model
     };
 
-    let base_url = fields
-        .iter()
-        .find(|f| f.key == "BASE_URL")
-        .map(|f| f.value.trim())
-        .unwrap_or("");
+    let base_url = field_value(fields, "BASE_URL");
     let effective_base_url = if base_url.is_empty() {
         provider_default_base_url(provider).unwrap_or("")
     } else {
@@ -73,11 +61,7 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
         return Err(format!("LLM model is required for provider '{provider}'"));
     }
 
-    let api_key = fields
-        .iter()
-        .find(|f| f.key == "API_KEY")
-        .map(|f| f.value.trim())
-        .unwrap_or("");
+    let api_key = field_value(fields, "API_KEY");
 
     if !base_url_allows_empty_api_key(effective_base_url) && api_key.is_empty() {
         return Err(
@@ -85,39 +69,18 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
         );
     }
 
-    let discord_enabled = fields
-        .iter()
-        .find(|f| f.key == "DISCORD_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    if discord_enabled {
-        let discord_token = fields
-            .iter()
-            .find(|f| f.key == "DISCORD_BOT_TOKEN")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-        if discord_token.is_empty() {
-            return Err("Discord bot token is required when Discord is enabled".into());
-        }
-    }
-
-    let telegram_enabled = fields
-        .iter()
-        .find(|f| f.key == "TELEGRAM_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    if telegram_enabled {
-        let telegram_token = fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_BOT_TOKEN")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-        if telegram_token.is_empty() {
-            return Err("Telegram bot token is required when Telegram is enabled".into());
-        }
-    }
+    validate_enabled_token(
+        fields,
+        "DISCORD_ENABLED",
+        "DISCORD_BOT_TOKEN",
+        "Discord bot token is required when Discord is enabled",
+    )?;
+    validate_enabled_token(
+        fields,
+        "TELEGRAM_ENABLED",
+        "TELEGRAM_BOT_TOKEN",
+        "Telegram bot token is required when Telegram is enabled",
+    )?;
 
     Ok(())
 }
@@ -129,69 +92,27 @@ pub(crate) fn save_config(
 ) -> Result<(Option<String>, Vec<String>), String> {
     validate_fields(fields)?;
 
-    let provider_id = normalize_provider_id(
-        fields
-            .iter()
-            .find(|f| f.key == "PROVIDER")
-            .map(|f| f.value.trim())
-            .unwrap_or(""),
-    );
+    let provider_id = normalize_provider_id(field_value(fields, "PROVIDER"));
     let provider_label = provider_label_for(&provider_id);
 
-    let model = fields
-        .iter()
-        .find(|f| f.key == "MODEL")
-        .map(|f| f.value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let model = non_empty_owned(field_value(fields, "MODEL"))
         .or_else(|| provider_default_model(&provider_id).map(|value| value.to_string()))
         .unwrap_or_default();
 
-    let base_url = fields
-        .iter()
-        .find(|f| f.key == "BASE_URL")
-        .map(|f| f.value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let base_url = non_empty_owned(field_value(fields, "BASE_URL"))
         .or_else(|| provider_default_base_url(&provider_id).map(|value| value.to_string()))
         .unwrap_or_default();
 
-    let api_key = fields
-        .iter()
-        .find(|f| f.key == "API_KEY")
-        .map(|f| f.value.trim().to_string())
-        .unwrap_or_default();
+    let api_key = field_value(fields, "API_KEY").to_string();
 
     let existing_token = extract_existing_web_auth_token(original_yaml);
     let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
-    let discord_enabled = fields
-        .iter()
-        .find(|f| f.key == "DISCORD_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    let discord_bot_token = fields
-        .iter()
-        .find(|f| f.key == "DISCORD_BOT_TOKEN")
-        .map(|f| f.value.trim().to_string())
-        .unwrap_or_default();
-
-    let telegram_enabled = fields
-        .iter()
-        .find(|f| f.key == "TELEGRAM_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    let telegram_bot_token = fields
-        .iter()
-        .find(|f| f.key == "TELEGRAM_BOT_TOKEN")
-        .map(|f| f.value.trim().to_string())
-        .unwrap_or_default();
-
-    let telegram_bot_username = fields
-        .iter()
-        .find(|f| f.key == "TELEGRAM_BOT_USERNAME")
-        .map(|f| f.value.trim().to_string())
-        .unwrap_or_default();
+    let discord_enabled = field_bool(fields, "DISCORD_ENABLED");
+    let discord_bot_token = field_value(fields, "DISCORD_BOT_TOKEN").to_string();
+    let telegram_enabled = field_bool(fields, "TELEGRAM_ENABLED");
+    let telegram_bot_token = field_value(fields, "TELEGRAM_BOT_TOKEN").to_string();
+    let telegram_bot_username = field_value(fields, "TELEGRAM_BOT_USERNAME").to_string();
 
     if let Some(config_dir) = config_path.parent() {
         fs::create_dir_all(config_dir)
@@ -309,6 +230,41 @@ pub(crate) fn mask_secret(value: &str) -> String {
     }
     let visible = &value[..4];
     format!("{visible}********")
+}
+
+fn field_value<'a>(fields: &'a [Field], key: &str) -> &'a str {
+    fields
+        .iter()
+        .find(|f| f.key == key)
+        .map(|f| f.value.trim())
+        .unwrap_or("")
+}
+
+fn field_bool(fields: &[Field], key: &str) -> bool {
+    fields
+        .iter()
+        .find(|f| f.key == key)
+        .and_then(|f| super::parse_bool(&f.value))
+        .unwrap_or(false)
+}
+
+fn validate_enabled_token(
+    fields: &[Field],
+    enabled_key: &str,
+    token_key: &str,
+    error_message: &str,
+) -> Result<(), String> {
+    if !field_bool(fields, enabled_key) {
+        return Ok(());
+    }
+    if !field_value(fields, token_key).is_empty() {
+        return Ok(());
+    }
+    Err(error_message.into())
+}
+
+fn non_empty_owned(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub(crate) fn backup_config(path: &Path) -> Result<String, String> {

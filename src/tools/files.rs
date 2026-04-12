@@ -9,13 +9,15 @@ use serde_json::json;
 
 use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
 
-use super::text::{
-    apply_edits_to_normalized_content, detect_line_ending, first_changed_line, format_size,
-    generate_diff_string, normalize_newlines, restore_line_endings, strip_bom, truncate_head,
-    EditSpec,
-};
 use super::search::resolve_workspace_path;
-use super::{schema_object, Tool, ToolExecutionContext, ToolResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use super::text::{
+    EditSpec, apply_edits_to_normalized_content, detect_line_ending, first_changed_line,
+    format_size, generate_diff_string, normalize_newlines, restore_line_endings, strip_bom,
+    truncate_head,
+};
+use super::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext, ToolResult, schema_object,
+};
 
 // ---------------------------------------------------------------------------
 // ユーティリティ
@@ -112,29 +114,7 @@ impl Tool for ReadTool {
         };
 
         if let Some(mime_type) = detect_supported_image_mime_type(&bytes, &resolved) {
-            const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
-            if bytes.len() > MAX_IMAGE_SIZE {
-                return ToolResult::error(format!(
-                    "Image file too large ({}). Maximum size is {}.",
-                    format_size(bytes.len()),
-                    format_size(MAX_IMAGE_SIZE)
-                ));
-            }
-            let preview = format!("Read image file [{mime_type}]");
-            let data_url = format!(
-                "data:{mime_type};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(&bytes)
-            );
-            return ToolResult::success_with_llm_content(
-                preview.clone(),
-                MessageContent::parts(vec![
-                    MessageContentPart::InputText { text: preview },
-                    MessageContentPart::InputImage {
-                        image_url: data_url,
-                        detail: Some("auto".to_string()),
-                    },
-                ]),
-            );
+            return image_read_result(&bytes, mime_type);
         }
 
         let content = match String::from_utf8(bytes) {
@@ -175,58 +155,7 @@ impl Tool for ReadTool {
             all_lines[start_line..].join("\n")
         };
 
-        let truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        let start_display = start_line + 1;
-        let total_lines = all_lines.len();
-        let mut output = if truncation.first_line_exceeds_limit {
-            let first_line_size = format_size(
-                all_lines
-                    .get(start_line)
-                    .map(|line| line.len())
-                    .unwrap_or(0),
-            );
-            format!(
-                "[Line {start_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {}]",
-                format_size(DEFAULT_MAX_BYTES),
-                path,
-                DEFAULT_MAX_BYTES
-            )
-        } else {
-            truncation.content.clone()
-        };
-
-        if truncation.truncated && !truncation.first_line_exceeds_limit {
-            let end_display = start_display + truncation.output_lines.saturating_sub(1);
-            let next_offset = end_display + 1;
-            if truncation.truncated_by == Some("lines") {
-                output.push_str(&format!(
-                    "\n\n[Showing lines {start_display}-{end_display} of {total_lines}. Use offset={next_offset} to continue.]"
-                ));
-            } else {
-                output.push_str(&format!(
-                    "\n\n[Showing lines {start_display}-{end_display} of {total_lines} ({} limit). Use offset={next_offset} to continue.]",
-                    format_size(DEFAULT_MAX_BYTES)
-                ));
-            }
-            return ToolResult::success_with_details(
-                output,
-                json!({
-                    "truncation": truncation_json(&truncation)
-                }),
-            );
-        }
-
-        if let Some(limit) = user_limit
-            && start_line + limit < all_lines.len()
-        {
-            let remaining = all_lines.len() - (start_line + limit);
-            let next_offset = start_line + limit + 1;
-            output.push_str(&format!(
-                "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
-            ));
-        }
-
-        ToolResult::success(output)
+        build_text_read_result(path, &all_lines, start_line, user_limit, &selected_content)
     }
 }
 
@@ -412,16 +341,7 @@ pub(crate) fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, St
     let mut parsed = Vec::new();
     if let Some(edits) = input.get("edits").and_then(|value| value.as_array()) {
         for edit in edits {
-            let Some(old_text) = edit.get("oldText").and_then(|value| value.as_str()) else {
-                return Err("Each edit must include oldText".to_string());
-            };
-            let Some(new_text) = edit.get("newText").and_then(|value| value.as_str()) else {
-                return Err("Each edit must include newText".to_string());
-            };
-            parsed.push(EditSpec {
-                old_text: old_text.to_string(),
-                new_text: new_text.to_string(),
-            });
+            parsed.push(parse_edit_spec(edit)?);
         }
     }
 
@@ -441,6 +361,116 @@ pub(crate) fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, St
         );
     }
     Ok(parsed)
+}
+
+fn image_read_result(bytes: &[u8], mime_type: &str) -> ToolResult {
+    const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+    if bytes.len() > MAX_IMAGE_SIZE {
+        return ToolResult::error(format!(
+            "Image file too large ({}). Maximum size is {}.",
+            format_size(bytes.len()),
+            format_size(MAX_IMAGE_SIZE)
+        ));
+    }
+
+    let preview = format!("Read image file [{mime_type}]");
+    let data_url = format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    ToolResult::success_with_llm_content(
+        preview.clone(),
+        MessageContent::parts(vec![
+            MessageContentPart::InputText { text: preview },
+            MessageContentPart::InputImage {
+                image_url: data_url,
+                detail: Some("auto".to_string()),
+            },
+        ]),
+    )
+}
+
+fn build_text_read_result(
+    path: &str,
+    all_lines: &[&str],
+    start_line: usize,
+    user_limit: Option<usize>,
+    selected_content: &str,
+) -> ToolResult {
+    let truncation = truncate_head(selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let start_display = start_line + 1;
+    let total_lines = all_lines.len();
+    let mut output = if truncation.first_line_exceeds_limit {
+        let first_line_size = format_size(
+            all_lines
+                .get(start_line)
+                .map(|line| line.len())
+                .unwrap_or(0),
+        );
+        format!(
+            "[Line {start_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {}]",
+            format_size(DEFAULT_MAX_BYTES),
+            path,
+            DEFAULT_MAX_BYTES
+        )
+    } else {
+        truncation.content.clone()
+    };
+
+    if truncation.truncated && !truncation.first_line_exceeds_limit {
+        append_truncation_notice(&mut output, &truncation, start_display, total_lines);
+        return ToolResult::success_with_details(
+            output,
+            json!({
+                "truncation": truncation_json(&truncation)
+            }),
+        );
+    }
+
+    if let Some(limit) = user_limit.filter(|limit| start_line + limit < all_lines.len()) {
+        let remaining = all_lines.len() - (start_line + limit);
+        let next_offset = start_line + limit + 1;
+        output.push_str(&format!(
+            "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+        ));
+    }
+
+    ToolResult::success(output)
+}
+
+fn append_truncation_notice(
+    output: &mut String,
+    truncation: &super::text::TruncationResult,
+    start_display: usize,
+    total_lines: usize,
+) {
+    let end_display = start_display + truncation.output_lines.saturating_sub(1);
+    let next_offset = end_display + 1;
+    if truncation.truncated_by == Some("lines") {
+        output.push_str(&format!(
+            "\n\n[Showing lines {start_display}-{end_display} of {total_lines}. Use offset={next_offset} to continue.]"
+        ));
+        return;
+    }
+
+    output.push_str(&format!(
+        "\n\n[Showing lines {start_display}-{end_display} of {total_lines} ({} limit). Use offset={next_offset} to continue.]",
+        format_size(DEFAULT_MAX_BYTES)
+    ));
+}
+
+fn parse_edit_spec(edit: &serde_json::Value) -> Result<EditSpec, String> {
+    let Some(old_text) = edit.get("oldText").and_then(|value| value.as_str()) else {
+        return Err("Each edit must include oldText".to_string());
+    };
+    let Some(new_text) = edit.get("newText").and_then(|value| value.as_str()) else {
+        return Err("Each edit must include newText".to_string());
+    };
+
+    Ok(EditSpec {
+        old_text: old_text.to_string(),
+        new_text: new_text.to_string(),
+    })
 }
 
 fn truncation_json(truncation: &super::text::TruncationResult) -> serde_json::Value {

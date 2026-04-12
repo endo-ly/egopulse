@@ -112,8 +112,7 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "azure",
         label: "Microsoft Azure AI",
-        default_base_url:
-            "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
+        default_base_url: "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
         default_model: "gpt-5.2",
         models: &["gpt-5.2", "gpt-5", "gpt-4.1"],
     },
@@ -277,22 +276,23 @@ pub(crate) fn normalize_provider_id(raw: &str) -> String {
 pub(crate) fn provider_selector_items() -> Vec<SelectorItem> {
     PROVIDER_PRESETS
         .iter()
-        .map(|preset| {
-            let models_str = if preset.models.len() > 2 {
-                format!(
-                    "{}, ... ({} total)",
-                    preset.models[..2].join(", "),
-                    preset.models.len()
-                )
-            } else {
-                preset.models.join(", ")
-            };
-            SelectorItem {
-                display: format!("{} ({})", preset.id, models_str),
-                value: preset.id.to_string(),
-            }
+        .map(|preset| SelectorItem {
+            display: format!("{} ({})", preset.id, preset_models_preview(preset)),
+            value: preset.id.to_string(),
         })
         .collect()
+}
+
+fn preset_models_preview(preset: &ProviderPreset) -> String {
+    if preset.models.len() <= 2 {
+        return preset.models.join(", ");
+    }
+
+    format!(
+        "{}, ... ({} total)",
+        preset.models[..2].join(", "),
+        preset.models.len()
+    )
 }
 
 pub(crate) fn model_selector_items(provider_id: &str) -> Vec<SelectorItem> {
@@ -314,15 +314,7 @@ impl SetupApp {
     pub(crate) fn enter_selector(&self, field_key: &str) -> SelectorState {
         let items = match field_key {
             "PROVIDER" => provider_selector_items(),
-            "MODEL" => {
-                let provider = self
-                    .fields
-                    .iter()
-                    .find(|f| f.key == "PROVIDER")
-                    .map(|f| f.value.as_str())
-                    .unwrap_or("");
-                model_selector_items(provider)
-            }
+            "MODEL" => model_selector_items(self.provider_field_value()),
             _ => Vec::new(),
         };
         let original_value = self
@@ -341,22 +333,28 @@ impl SetupApp {
     }
 
     pub(crate) fn apply_selector_selection(&mut self, field_key: &str) {
-        if field_key == "PROVIDER" {
-            let provider_id = self
-                .fields
-                .iter()
-                .find(|f| f.key == "PROVIDER")
-                .map(|f| f.value.clone())
-                .unwrap_or_default();
-            if let Some(preset) = find_provider_preset(&provider_id) {
-                if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
-                    model_field.value = preset.default_model.to_string();
-                }
-                if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
-                    url_field.value = preset.default_base_url.to_string();
-                }
-            }
+        if field_key != "PROVIDER" {
+            return;
         }
+
+        let Some(preset) = find_provider_preset(self.provider_field_value()) else {
+            return;
+        };
+
+        if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
+            model_field.value = preset.default_model.to_string();
+        }
+        if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
+            url_field.value = preset.default_base_url.to_string();
+        }
+    }
+
+    fn provider_field_value(&self) -> &str {
+        self.fields
+            .iter()
+            .find(|f| f.key == "PROVIDER")
+            .map(|f| f.value.as_str())
+            .unwrap_or("")
     }
 }
 

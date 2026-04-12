@@ -110,7 +110,7 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
-        -> ToolResult;
+    -> ToolResult;
 }
 
 /// Owns all tool instances and dispatches execution by tool name.

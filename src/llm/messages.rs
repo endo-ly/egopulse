@@ -23,25 +23,7 @@ pub(crate) fn build_request_body(
     if let Some(stream) = stream {
         body["stream"] = serde_json::Value::Bool(stream);
     }
-    if let Some(tools) = tools
-        && !tools.is_empty()
-    {
-        body["tools"] = serde_json::Value::Array(
-            tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    })
-                })
-                .collect(),
-        );
-    }
+    append_chat_tools(&mut body, tools);
     body
 }
 
@@ -61,23 +43,7 @@ pub(crate) fn build_responses_request_body(
     if !system.trim().is_empty() {
         body["instructions"] = serde_json::Value::String(system.to_string());
     }
-    if let Some(tools) = tools
-        && !tools.is_empty()
-    {
-        body["tools"] = serde_json::Value::Array(
-            tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
-                })
-                .collect(),
-        );
-    }
+    append_responses_tools(&mut body, tools);
     body
 }
 
@@ -116,24 +82,9 @@ pub(crate) fn translate_message_to_openai(message: &Message) -> serde_json::Valu
 pub(crate) fn translate_content_to_chat_completions(content: &MessageContent) -> serde_json::Value {
     match content {
         MessageContent::Text(text) => serde_json::Value::String(text.clone()),
-        MessageContent::Parts(parts) => serde_json::Value::Array(
-            parts
-                .iter()
-                .map(|part| match part {
-                    MessageContentPart::InputText { text } => serde_json::json!({
-                        "type": "text",
-                        "text": text,
-                    }),
-                    MessageContentPart::InputImage { image_url, detail } => serde_json::json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_url,
-                            "detail": detail.clone().unwrap_or_else(|| "auto".to_string()),
-                        }
-                    }),
-                })
-                .collect(),
-        ),
+        MessageContent::Parts(parts) => {
+            serde_json::Value::Array(parts.iter().map(chat_content_part).collect())
+        }
     }
 }
 
@@ -189,20 +140,7 @@ pub(crate) fn translate_content_to_responses_message(
             "type": "input_text",
             "text": text,
         })],
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .map(|part| match part {
-                MessageContentPart::InputText { text } => serde_json::json!({
-                    "type": "input_text",
-                    "text": text,
-                }),
-                MessageContentPart::InputImage { image_url, detail } => serde_json::json!({
-                    "type": "input_image",
-                    "image_url": image_url,
-                    "detail": detail.clone().unwrap_or_else(|| "auto".to_string()),
-                }),
-            })
-            .collect(),
+        MessageContent::Parts(parts) => parts.iter().map(responses_content_part).collect(),
     }
 }
 
@@ -222,4 +160,80 @@ pub(crate) fn synthetic_tool_attachment_parts(content: &MessageContent) -> Vec<s
         }));
     }
     parts
+}
+
+fn append_chat_tools(body: &mut serde_json::Value, tools: Option<&[ToolDefinition]>) {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+        return;
+    };
+
+    body["tools"] = serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect(),
+    );
+}
+
+fn append_responses_tools(body: &mut serde_json::Value, tools: Option<&[ToolDefinition]>) {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+        return;
+    };
+
+    body["tools"] = serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect(),
+    );
+}
+
+fn default_detail(detail: &Option<String>) -> String {
+    detail.clone().unwrap_or_else(|| "auto".to_string())
+}
+
+fn chat_content_part(part: &MessageContentPart) -> serde_json::Value {
+    match part {
+        MessageContentPart::InputText { text } => serde_json::json!({
+            "type": "text",
+            "text": text,
+        }),
+        MessageContentPart::InputImage { image_url, detail } => serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image_url,
+                "detail": default_detail(detail),
+            }
+        }),
+    }
+}
+
+fn responses_content_part(part: &MessageContentPart) -> serde_json::Value {
+    match part {
+        MessageContentPart::InputText { text } => serde_json::json!({
+            "type": "input_text",
+            "text": text,
+        }),
+        MessageContentPart::InputImage { image_url, detail } => serde_json::json!({
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": default_detail(detail),
+        }),
+    }
 }

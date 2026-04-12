@@ -12,8 +12,8 @@ use crate::llm::ToolDefinition;
 
 use super::text::{format_size, truncate_head};
 use super::{
-    schema_object, Tool, ToolExecutionContext, ToolResult, DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT,
-    DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH,
+    DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES,
+    GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
 };
 
 pub(crate) fn resolve_workspace_path(
@@ -445,11 +445,7 @@ fn collect_gitignore_files(root: &Path) -> Vec<PathBuf> {
                 continue;
             };
             if file_type.is_dir() {
-                let name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default();
-                if name == ".git" || name == "node_modules" {
+                if should_skip_gitignore_dir(&path) {
                     continue;
                 }
                 stack.push(path);
@@ -462,6 +458,13 @@ fn collect_gitignore_files(root: &Path) -> Vec<PathBuf> {
     }
     results.sort();
     results
+}
+
+fn should_skip_gitignore_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(".git") | Some("node_modules")
+    )
 }
 
 /// Lists directory entries alphabetically with `/` suffix for subdirectories.
@@ -555,8 +558,7 @@ impl Tool for LsTool {
             entries
         };
         let raw_output = limited.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content.clone();
+        let output_truncated = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES).truncated;
         let mut notices = Vec::new();
         if entry_limit_reached {
             notices.push(format!(
@@ -564,21 +566,39 @@ impl Tool for LsTool {
                 limit * 2
             ));
         }
-        if truncation.truncated {
+        if output_truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
         }
-        if !notices.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-            return ToolResult::success_with_details(
-                text,
-                json!({
-                    "truncation": if truncation.truncated { Some(super::truncation_json(&truncation)) } else { None::<serde_json::Value> },
-                    "entryLimitReached": if entry_limit_reached { Some(limit) } else { None::<usize> }
-                }),
-            );
-        }
-        ToolResult::success(text)
+        finalize_listing_output(
+            raw_output,
+            notices,
+            "entryLimitReached",
+            entry_limit_reached.then_some(limit),
+        )
     }
+}
+
+fn finalize_listing_output(
+    raw_output: String,
+    notices: Vec<String>,
+    limit_key: &str,
+    limit_value: Option<usize>,
+) -> ToolResult {
+    let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+    let mut text = truncation.content.clone();
+
+    if notices.is_empty() {
+        return ToolResult::success(text);
+    }
+
+    text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+    ToolResult::success_with_details(
+        text,
+        json!({
+            "truncation": truncation.truncated.then(|| super::truncation_json(&truncation)),
+            limit_key: limit_value,
+        }),
+    )
 }
 
 pub(crate) fn truncate_grep_line(line: &str) -> (String, bool) {

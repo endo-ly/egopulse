@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use rand::Rng;
 
 use super::Field;
@@ -40,50 +40,24 @@ pub(crate) fn load_channel_fields(
         return;
     };
 
-    if let Some(web) = ch_map.get(serde_yml::Value::String("web".into())) {
-        if let Some(web_map) = web.as_mapping() {
-            if let Some(token) = web_map.get(serde_yml::Value::String("auth_token".into())) {
-                if let Some(token_str) = token.as_str() {
-                    result.insert("WEB_AUTH_TOKEN".into(), token_str.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(discord) = ch_map.get(serde_yml::Value::String("discord".into())) {
-        if let Some(d_map) = discord.as_mapping() {
-            if let Some(enabled) = d_map.get(serde_yml::Value::String("enabled".into())) {
-                if let Some(b) = enabled.as_bool() {
-                    result.insert("DISCORD_ENABLED".into(), b.to_string());
-                }
-            }
-            if let Some(token) = d_map.get(serde_yml::Value::String("bot_token".into())) {
-                if let Some(t) = token.as_str() {
-                    result.insert("DISCORD_BOT_TOKEN".into(), t.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(tg) = ch_map.get(serde_yml::Value::String("telegram".into())) {
-        if let Some(tg_map) = tg.as_mapping() {
-            if let Some(enabled) = tg_map.get(serde_yml::Value::String("enabled".into())) {
-                if let Some(b) = enabled.as_bool() {
-                    result.insert("TELEGRAM_ENABLED".into(), b.to_string());
-                }
-            }
-            if let Some(token) = tg_map.get(serde_yml::Value::String("bot_token".into())) {
-                if let Some(t) = token.as_str() {
-                    result.insert("TELEGRAM_BOT_TOKEN".into(), t.to_string());
-                }
-            }
-            if let Some(username) = tg_map.get(serde_yml::Value::String("bot_username".into())) {
-                if let Some(u) = username.as_str() {
-                    result.insert("TELEGRAM_BOT_USERNAME".into(), u.to_string());
-                }
-            }
-        }
-    }
+    insert_channel_string(ch_map, "web", "auth_token", result, "WEB_AUTH_TOKEN");
+    insert_channel_bool(ch_map, "discord", "enabled", result, "DISCORD_ENABLED");
+    insert_channel_string(ch_map, "discord", "bot_token", result, "DISCORD_BOT_TOKEN");
+    insert_channel_bool(ch_map, "telegram", "enabled", result, "TELEGRAM_ENABLED");
+    insert_channel_string(
+        ch_map,
+        "telegram",
+        "bot_token",
+        result,
+        "TELEGRAM_BOT_TOKEN",
+    );
+    insert_channel_string(
+        ch_map,
+        "telegram",
+        "bot_username",
+        result,
+        "TELEGRAM_BOT_USERNAME",
+    );
 }
 
 pub(crate) fn extract_existing_web_auth_token(
@@ -136,17 +110,12 @@ pub(crate) fn build_channel_configs(
     }
 
     if telegram_enabled {
-        let bot_username = if telegram_bot_username.is_empty() {
-            None
-        } else {
-            Some(telegram_bot_username)
-        };
         channels.insert(
             "telegram".to_string(),
             ChannelConfig {
                 enabled: Some(true),
                 bot_token: Some(telegram_bot_token),
-                bot_username,
+                bot_username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
                 ..Default::default()
             },
         );
@@ -159,4 +128,49 @@ pub(crate) fn generate_auth_token() -> String {
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
     STANDARD.encode(&bytes)
+}
+
+fn yaml_key(value: &str) -> serde_yml::Value {
+    serde_yml::Value::String(value.into())
+}
+
+fn channel_mapping<'a>(
+    channels: &'a serde_yml::Mapping,
+    channel: &str,
+) -> Option<&'a serde_yml::Mapping> {
+    channels.get(yaml_key(channel))?.as_mapping()
+}
+
+fn insert_channel_bool(
+    channels: &serde_yml::Mapping,
+    channel: &str,
+    key: &str,
+    result: &mut HashMap<String, String>,
+    result_key: &str,
+) {
+    let Some(value) = channel_mapping(channels, channel)
+        .and_then(|mapping| mapping.get(yaml_key(key)))
+        .and_then(|value| value.as_bool())
+    else {
+        return;
+    };
+
+    result.insert(result_key.into(), value.to_string());
+}
+
+fn insert_channel_string(
+    channels: &serde_yml::Mapping,
+    channel: &str,
+    key: &str,
+    result: &mut HashMap<String, String>,
+    result_key: &str,
+) {
+    let Some(value) = channel_mapping(channels, channel)
+        .and_then(|mapping| mapping.get(yaml_key(key)))
+        .and_then(|value| value.as_str())
+    else {
+        return;
+    };
+
+    result.insert(result_key.into(), value.to_string());
 }

@@ -1,5 +1,6 @@
-use super::{messages::*, responses::*, sse::*};
 use super::*;
+use super::{messages::*, responses::*, sse::*};
+use reqwest::StatusCode;
 
 /// OpenAI-compatible LLM provider using Chat Completions and Responses APIs.
 pub(crate) struct OpenAiProvider {
@@ -35,18 +36,10 @@ impl OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(api_key) = &self.api_key {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-        }
-
         let response = self
             .http
             .post(url)
-            .headers(headers)
+            .headers(self.build_headers()?)
             .json(&build_responses_request_body(
                 &self.model,
                 system,
@@ -58,15 +51,50 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::ApiError {
+            return Err(Self::api_error(
                 status,
-                body_preview: preview_body(&body),
-            });
+                response.text().await.unwrap_or_default(),
+            ));
         }
 
         let body: ResponsesApiResponse = response.json().await?;
         parse_responses_response(body)
+    }
+
+    fn build_headers(&self) -> Result<HeaderMap, LlmError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let Some(api_key) = &self.api_key else {
+            return Ok(headers);
+        };
+
+        let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+        headers.insert(AUTHORIZATION, auth_value);
+        Ok(headers)
+    }
+
+    fn api_error(status: StatusCode, body: String) -> LlmError {
+        LlmError::ApiError {
+            status,
+            body_preview: preview_body(&body),
+        }
+    }
+
+    fn stream_text_piece(
+        piece: Option<String>,
+        text: &mut String,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) {
+        let Some(piece) = piece.filter(|piece| !piece.is_empty()) else {
+            return;
+        };
+
+        text.push_str(&piece);
+        if let Some(tx) = text_tx {
+            let _ = tx.send(piece);
+        }
     }
 }
 
@@ -85,13 +113,7 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(api_key) = &self.api_key {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-        }
+        let headers = self.build_headers()?;
 
         let response = self
             .http
@@ -109,11 +131,10 @@ impl LlmProvider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::ApiError {
+            return Err(Self::api_error(
                 status,
-                body_preview: preview_body(&body),
-            });
+                response.text().await.unwrap_or_default(),
+            ));
         }
 
         let body: OpenAiResponse = response.json().await?;
@@ -138,13 +159,7 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(api_key) = &self.api_key {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-        }
+        let headers = self.build_headers()?;
 
         let response = self
             .http
@@ -162,11 +177,10 @@ impl LlmProvider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::ApiError {
+            return Err(Self::api_error(
                 status,
-                body_preview: preview_body(&body),
-            });
+                response.text().await.unwrap_or_default(),
+            ));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -184,14 +198,7 @@ impl LlmProvider for OpenAiProvider {
                     done = true;
                     break 'outer;
                 }
-                if let Some(piece) = process_openai_stream_event(&data)
-                    && !piece.is_empty()
-                {
-                    text.push_str(&piece);
-                    if let Some(tx) = text_tx {
-                        let _ = tx.send(piece);
-                    }
-                }
+                Self::stream_text_piece(process_openai_stream_event(&data), &mut text, text_tx);
             }
         }
 
@@ -201,14 +208,7 @@ impl LlmProvider for OpenAiProvider {
                     done = true;
                     break;
                 }
-                if let Some(piece) = process_openai_stream_event(&data)
-                    && !piece.is_empty()
-                {
-                    text.push_str(&piece);
-                    if let Some(tx) = text_tx {
-                        let _ = tx.send(piece);
-                    }
-                }
+                Self::stream_text_piece(process_openai_stream_event(&data), &mut text, text_tx);
             }
         }
 

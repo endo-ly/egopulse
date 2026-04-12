@@ -206,8 +206,7 @@ impl SetupApp {
             fields,
             selected: 0,
             mode: SetupMode::Navigate,
-            status: "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
-                .into(),
+            status: "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel".into(),
             completed: false,
             backup_path: None,
             completion_summary: Vec::new(),
@@ -908,8 +907,7 @@ async fn run_inner(
                             let key_name = field.key.clone();
                             match key_name.as_str() {
                                 "PROVIDER" | "MODEL" => {
-                                    app.mode =
-                                        SetupMode::Selector(app.enter_selector(&key_name));
+                                    app.mode = SetupMode::Selector(app.enter_selector(&key_name));
                                     app.status =
                                         "Selector: type to filter, Enter: select, Esc: cancel"
                                             .into();

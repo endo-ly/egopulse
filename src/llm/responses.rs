@@ -21,22 +21,11 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
             .unwrap_or(OpenAiMessageContent::Text(String::new())),
     );
 
-    if tool_calls.is_empty() {
-        if let Some(raw_calls) = extract_raw_tool_use_blocks(&content) {
-            for raw in raw_calls {
-                let arguments = if raw.input_json.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&raw.input_json).unwrap_or_else(|_| serde_json::json!({}))
-                };
-                tool_calls.push(ToolCall {
-                    id: raw.id,
-                    name: raw.name,
-                    arguments,
-                });
-            }
-            content = strip_raw_tool_use_text(&content);
-        }
+    if tool_calls.is_empty()
+        && let Some((rescued_calls, stripped_content)) = rescue_raw_tool_calls(&content)
+    {
+        tool_calls = rescued_calls;
+        content = stripped_content;
     }
 
     if content.is_empty() && tool_calls.is_empty() {
@@ -60,29 +49,18 @@ pub(crate) fn parse_responses_response(
     for item in body.output {
         match item {
             ResponsesOutputItem::Message { role, content } if role == "assistant" => {
-                for part in content {
-                    match part {
-                        ResponsesOutputPart::OutputText { text } => content_parts.push(text),
-                        ResponsesOutputPart::Refusal { refusal } => content_parts.push(refusal),
-                        ResponsesOutputPart::Ignored => {}
-                    }
-                }
+                content_parts.extend(
+                    content
+                        .into_iter()
+                        .filter_map(extract_response_content_part),
+                );
             }
             ResponsesOutputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
             } => {
-                let arguments = if arguments.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str::<serde_json::Value>(&arguments).map_err(|error| {
-                        LlmError::InvalidResponse(format!(
-                            "invalid tool arguments for '{}': {error}",
-                            name
-                        ))
-                    })?
-                };
+                let arguments = parse_tool_arguments(&arguments, &name)?;
                 tool_calls.push(ToolCall {
                     id: call_id,
                     name,
@@ -95,22 +73,11 @@ pub(crate) fn parse_responses_response(
 
     let mut content = content_parts.join("\n").trim().to_string();
 
-    if tool_calls.is_empty() {
-        if let Some(raw_calls) = extract_raw_tool_use_blocks(&content) {
-            for raw in raw_calls {
-                let arguments = if raw.input_json.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&raw.input_json).unwrap_or_else(|_| serde_json::json!({}))
-                };
-                tool_calls.push(ToolCall {
-                    id: raw.id,
-                    name: raw.name,
-                    arguments,
-                });
-            }
-            content = strip_raw_tool_use_text(&content);
-        }
+    if tool_calls.is_empty()
+        && let Some((rescued_calls, stripped_content)) = rescue_raw_tool_calls(&content)
+    {
+        tool_calls = rescued_calls;
+        content = stripped_content;
     }
 
     if content.is_empty() && tool_calls.is_empty() {
@@ -126,22 +93,52 @@ pub(crate) fn parse_responses_response(
 }
 
 pub(crate) fn parse_tool_call(raw: OaiToolCall) -> Result<ToolCall, LlmError> {
-    let arguments = if raw.function.arguments.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str::<serde_json::Value>(&raw.function.arguments).map_err(|error| {
-            LlmError::InvalidResponse(format!(
-                "invalid tool arguments for '{}': {error}",
-                raw.function.name
-            ))
-        })?
-    };
+    let arguments = parse_tool_arguments(&raw.function.arguments, &raw.function.name)?;
 
     Ok(ToolCall {
         id: raw.id,
         name: raw.function.name,
         arguments,
     })
+}
+
+fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
+    match part {
+        ResponsesOutputPart::OutputText { text } => Some(text),
+        ResponsesOutputPart::Refusal { refusal } => Some(refusal),
+        ResponsesOutputPart::Ignored => None,
+    }
+}
+
+fn parse_tool_arguments(arguments: &str, name: &str) -> Result<serde_json::Value, LlmError> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+
+    serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
+        LlmError::InvalidResponse(format!("invalid tool arguments for '{}': {error}", name))
+    })
+}
+
+fn parse_rescued_tool_arguments(input_json: &str) -> serde_json::Value {
+    if input_json.trim().is_empty() {
+        return serde_json::json!({});
+    }
+
+    serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn rescue_raw_tool_calls(content: &str) -> Option<(Vec<ToolCall>, String)> {
+    let raw_calls = extract_raw_tool_use_blocks(content)?;
+    let tool_calls = raw_calls
+        .into_iter()
+        .map(|raw| ToolCall {
+            id: raw.id,
+            name: raw.name,
+            arguments: parse_rescued_tool_arguments(&raw.input_json),
+        })
+        .collect();
+    Some((tool_calls, strip_raw_tool_use_text(content)))
 }
 
 pub(crate) fn should_use_responses_api(messages: &[Message]) -> bool {
@@ -290,11 +287,7 @@ pub(crate) fn extract_raw_tool_use_blocks(text: &str) -> Option<Vec<RawToolUseBl
         }
     }
 
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+    if calls.is_empty() { None } else { Some(calls) }
 }
 
 /// Removes raw `[tool_use: ...]` blocks from text, returning cleaned text.

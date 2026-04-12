@@ -87,17 +87,15 @@ pub(crate) fn process_openai_stream_event(data: &str) -> Option<String> {
     let content = delta.get("content")?;
     match content {
         serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
-        serde_json::Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| part.get("text")?.as_str())
-                .collect::<String>();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        }
+        serde_json::Value::Array(parts) => collect_stream_text(parts),
         _ => None,
     }
+}
+
+fn collect_stream_text(parts: &[serde_json::Value]) -> Option<String> {
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text")?.as_str())
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
