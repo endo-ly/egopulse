@@ -1,0 +1,65 @@
+//! ランタイムガード: 宣言のみや空応答の検出とリトライメッセージ構築。
+
+use crate::llm::Message;
+
+pub(crate) fn runtime_guard_messages(
+    messages: &[Message],
+    assistant_text: &str,
+    guard_text: &str,
+) -> Vec<Message> {
+    let mut retry_messages = messages.to_vec();
+    retry_messages.push(Message::text("assistant", assistant_text.to_string()));
+    retry_messages.push(Message::text("user", guard_text.to_string()));
+    retry_messages
+}
+
+/// レスポンスが「宣言だけしてツールを実行しない」パターンに一致するか判定する。
+/// microclaw の runtime guard パターンから移植。
+pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let english_patterns = [
+        "i'll ",
+        "i will ",
+        "i'll go ahead and ",
+        "let me ",
+        "sure, ",
+        "of course, ",
+        "i'd be happy to ",
+        "absolutely, ",
+        "i can help with that",
+        "great, i'll",
+        "alright, i'll",
+        "okay, i'll",
+        "sure thing",
+        "i'm on it",
+    ];
+    let japanese_prefixes = [
+        "了解しました",
+        "承知しました",
+        "わかりました",
+        "かしこまりました",
+        "はい、",
+        "では、",
+        "それでは、",
+        "今から",
+    ];
+    let japanese_action_markers = [
+        "実行します",
+        "確認します",
+        "試してみます",
+        "やってみます",
+        "見てみます",
+        "調べます",
+        "作成します",
+        "書き込みます",
+        "進めます",
+    ];
+    // 短いテキスト（≤200文字）だけを対象とする。長い応答は「宣言のみ」ではない。
+    if lower.trim().chars().count() > 200 {
+        return false;
+    }
+    let trimmed = text.trim();
+    english_patterns.iter().any(|p| lower.trim().starts_with(p))
+        || japanese_prefixes.iter().any(|p| trimmed.starts_with(p))
+        || japanese_action_markers.iter().any(|p| trimmed.contains(p))
+}
