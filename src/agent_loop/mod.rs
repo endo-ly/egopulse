@@ -3,8 +3,11 @@
 //! 各チャネルから渡された surface 情報をもとに永続セッションを特定し、
 //! エージェントの 1 ターン処理へ橋渡しする。
 
+pub(crate) mod compaction;
+mod formatting;
+pub(crate) mod guards;
 pub(crate) mod session;
-mod turn;
+pub(crate) mod turn;
 
 pub use session::{list_sessions, load_session_messages};
 pub use turn::{ask_in_session, process_turn, process_turn_with_events, send_turn};

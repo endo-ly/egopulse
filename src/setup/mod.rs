@@ -3,388 +3,59 @@
 //! Ratatui ベースのローカル UI で設定値を収集し、既存 YAML を必要最小限だけ保ちながら
 //! `egopulse.config.yaml` を生成・更新する。
 
+mod channels;
+mod provider;
+mod summary;
+
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
-use url::Url;
 
-use secrecy::SecretString;
+use crate::config::default_config_path;
 
-use crate::config::{
-    ChannelConfig, Config, ProviderConfig, base_url_allows_empty_api_key, default_config_path,
-    default_data_dir, default_workspace_dir,
-};
-use crate::error::EgoPulseError;
-
-const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
-const MAX_CONFIG_BACKUPS: usize = 50;
-
-#[derive(Clone, Copy)]
-struct ProviderPreset {
-    id: &'static str,
-    label: &'static str,
-    default_base_url: &'static str,
-    default_model: &'static str,
-    models: &'static [&'static str],
-}
-
-const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset {
-        id: "openai",
-        label: "OpenAI",
-        default_base_url: "https://api.openai.com/v1",
-        default_model: "gpt-5.2",
-        models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
-    },
-    ProviderPreset {
-        id: "openrouter",
-        label: "OpenRouter",
-        default_base_url: "https://openrouter.ai/api/v1",
-        default_model: "openrouter/auto",
-        models: &[
-            "openrouter/auto",
-            "openai/gpt-5.2",
-            "anthropic/claude-sonnet-4.5",
-        ],
-    },
-    ProviderPreset {
-        id: "ollama",
-        label: "Ollama (local)",
-        default_base_url: "http://127.0.0.1:11434/v1",
-        default_model: "llama3.2",
-        models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
-    },
-    ProviderPreset {
-        id: "google",
-        label: "Google DeepMind",
-        default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
-        default_model: "gemini-2.5-pro",
-        models: &[
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-        ],
-    },
-    ProviderPreset {
-        id: "aliyun-bailian",
-        label: "Alibaba Cloud Bailian",
-        default_base_url: "https://coding.dashscope.aliyuncs.com/v1",
-        default_model: "qwen3.5-plus",
-        models: &["qwen3.5-plus", "qwen3-max", "qwen-plus-latest"],
-    },
-    ProviderPreset {
-        id: "alibaba",
-        label: "Alibaba Cloud (Qwen / DashScope)",
-        default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        default_model: "qwen3-max",
-        models: &["qwen3-max", "qwen3-plus", "qwen-max-latest"],
-    },
-    ProviderPreset {
-        id: "qwen-portal",
-        label: "Qwen Portal (OAuth)",
-        default_base_url: "https://portal.qwen.ai/v1",
-        default_model: "coder-model",
-        models: &["coder-model", "vision-model", "qwen3.5-plus"],
-    },
-    ProviderPreset {
-        id: "deepseek",
-        label: "DeepSeek",
-        default_base_url: "https://api.deepseek.com/v1",
-        default_model: "deepseek-chat",
-        models: &["deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
-    },
-    ProviderPreset {
-        id: "synthetic",
-        label: "Synthetic",
-        default_base_url: "https://api.synthetic.new/openai/v1",
-        default_model: "hf:openai/gpt-oss-120b",
-        models: &["hf:openai/gpt-oss-120b", "hf:deepseek-ai/DeepSeek-V3-0324"],
-    },
-    ProviderPreset {
-        id: "chutes",
-        label: "Chutes",
-        default_base_url: "https://llm.chutes.ai/v1",
-        default_model: "deepseek-ai/DeepSeek-V3-0324",
-        models: &[
-            "deepseek-ai/DeepSeek-V3-0324",
-            "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-        ],
-    },
-    ProviderPreset {
-        id: "moonshot",
-        label: "Moonshot AI (Kimi)",
-        default_base_url: "https://api.moonshot.cn/v1",
-        default_model: "kimi-k2.5",
-        models: &["kimi-k2.5", "kimi-k2", "kimi-latest"],
-    },
-    ProviderPreset {
-        id: "mistral",
-        label: "Mistral AI",
-        default_base_url: "https://api.mistral.ai/v1",
-        default_model: "mistral-large-latest",
-        models: &[
-            "mistral-large-latest",
-            "mistral-medium-latest",
-            "ministral-8b-latest",
-        ],
-    },
-    ProviderPreset {
-        id: "azure",
-        label: "Microsoft Azure AI",
-        default_base_url: "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
-        default_model: "gpt-5.2",
-        models: &["gpt-5.2", "gpt-5", "gpt-4.1"],
-    },
-    ProviderPreset {
-        id: "bedrock",
-        label: "Amazon AWS Bedrock",
-        default_base_url: "https://bedrock-runtime.YOUR-REGION.amazonaws.com/openai/v1",
-        default_model: "anthropic.claude-opus-4-6-v1",
-        models: &[
-            "anthropic.claude-opus-4-6-v1",
-            "anthropic.claude-sonnet-4-5-v2",
-            "anthropic.claude-haiku-4-5-v1",
-        ],
-    },
-    ProviderPreset {
-        id: "zhipu",
-        label: "Zhipu AI (GLM / Z.AI)",
-        default_base_url: "https://open.bigmodel.cn/api/paas/v4",
-        default_model: "glm-4.7",
-        models: &["glm-4.7", "glm-4.7-flash", "glm-4.5-air"],
-    },
-    ProviderPreset {
-        id: "zai",
-        label: "Z.AI Coding",
-        default_base_url: "https://api.z.ai/api/coding/paas/v4",
-        default_model: "glm-5.1",
-        models: &["glm-5.1", "glm-5"],
-    },
-    ProviderPreset {
-        id: "minimax",
-        label: "MiniMax",
-        default_base_url: "https://api.minimax.io/v1",
-        default_model: "MiniMax-M2.5",
-        models: &["MiniMax-M2.5", "MiniMax-M2.5-Thinking", "MiniMax-M2.1"],
-    },
-    ProviderPreset {
-        id: "cohere",
-        label: "Cohere",
-        default_base_url: "https://api.cohere.ai/compatibility/v1",
-        default_model: "command-a-03-2025",
-        models: &[
-            "command-a-03-2025",
-            "command-r-plus-08-2024",
-            "command-r-08-2024",
-        ],
-    },
-    ProviderPreset {
-        id: "tencent",
-        label: "Tencent AI Lab",
-        default_base_url: "https://api.hunyuan.cloud.tencent.com/v1",
-        default_model: "hunyuan-t1-latest",
-        models: &[
-            "hunyuan-t1-latest",
-            "hunyuan-turbos-latest",
-            "hunyuan-standard-latest",
-        ],
-    },
-    ProviderPreset {
-        id: "xai",
-        label: "xAI",
-        default_base_url: "https://api.x.ai/v1",
-        default_model: "grok-4",
-        models: &["grok-4", "grok-4-fast", "grok-3"],
-    },
-    ProviderPreset {
-        id: "nvidia",
-        label: "NVIDIA NIM",
-        default_base_url: "https://integrate.api.nvidia.com/v1",
-        default_model: "meta/llama-3.3-70b-instruct",
-        models: &[
-            "meta/llama-3.3-70b-instruct",
-            "meta/llama-3.1-70b-instruct",
-            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        ],
-    },
-    ProviderPreset {
-        id: "huggingface",
-        label: "Hugging Face",
-        default_base_url: "https://router.huggingface.co/v1",
-        default_model: "Qwen/Qwen3-Coder-Next",
-        models: &[
-            "Qwen/Qwen3-Coder-Next",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "deepseek-ai/DeepSeek-V3",
-        ],
-    },
-    ProviderPreset {
-        id: "together",
-        label: "Together AI",
-        default_base_url: "https://api.together.xyz/v1",
-        default_model: "deepseek-ai/DeepSeek-V3",
-        models: &[
-            "deepseek-ai/DeepSeek-V3",
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-        ],
-    },
-    ProviderPreset {
-        id: "local",
-        label: "Local OpenAI-compatible",
-        default_base_url: "http://127.0.0.1:1234/v1",
-        default_model: "qwen2.5-coder",
-        models: &["qwen2.5-coder"],
-    },
-    ProviderPreset {
-        id: "custom",
-        label: "Custom OpenAI-compatible",
-        default_base_url: "",
-        default_model: "custom-model",
-        models: &["custom-model"],
-    },
-];
-
-fn find_provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
-    PROVIDER_PRESETS
-        .iter()
-        .find(|preset| preset.id.eq_ignore_ascii_case(provider))
-}
-
-fn provider_default_base_url(provider: &str) -> Option<&'static str> {
-    find_provider_preset(provider)
-        .map(|preset| preset.default_base_url)
-        .filter(|value| !value.is_empty())
-}
-
-fn provider_default_model(provider: &str) -> Option<&'static str> {
-    find_provider_preset(provider).map(|preset| preset.default_model)
-}
-
-fn provider_label_for(provider: &str) -> String {
-    find_provider_preset(provider)
-        .map(|preset| preset.label.to_string())
-        .unwrap_or_else(|| provider.to_string())
-}
-
-fn provider_choices() -> String {
-    PROVIDER_PRESETS
-        .iter()
-        .map(|preset| {
-            if preset.models.is_empty() {
-                preset.id.to_string()
-            } else {
-                format!("{} (e.g. {})", preset.id, preset.models.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn normalize_provider_id(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if find_provider_preset(trimmed).is_some() {
-        return trimmed.to_ascii_lowercase();
-    }
-    trimmed.to_string()
-}
-
-fn provider_selector_items() -> Vec<SelectorItem> {
-    PROVIDER_PRESETS
-        .iter()
-        .map(|preset| {
-            let models_str = if preset.models.len() > 2 {
-                format!(
-                    "{}, ... ({} total)",
-                    preset.models[..2].join(", "),
-                    preset.models.len()
-                )
-            } else {
-                preset.models.join(", ")
-            };
-            SelectorItem {
-                display: format!("{} ({})", preset.id, models_str),
-                value: preset.id.to_string(),
-            }
-        })
-        .collect()
-}
-
-fn model_selector_items(provider_id: &str) -> Vec<SelectorItem> {
-    find_provider_preset(provider_id)
-        .map(|preset| {
-            preset
-                .models
-                .iter()
-                .map(|model| SelectorItem {
-                    display: model.to_string(),
-                    value: model.to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn filtered_items<'a>(items: &'a [SelectorItem], filter: &str) -> Vec<&'a SelectorItem> {
-    if filter.is_empty() {
-        return items.iter().collect();
-    }
-    let lower = filter.to_ascii_lowercase();
-    items
-        .iter()
-        .filter(|item| {
-            item.display.to_ascii_lowercase().contains(&lower)
-                || item.value.to_ascii_lowercase().contains(&lower)
-        })
-        .collect()
-}
+pub(crate) use channels::*;
+pub(crate) use provider::*;
+pub(crate) use summary::*;
 
 #[derive(Clone)]
-struct Field {
-    key: String,
-    label: String,
-    value: String,
-    required: bool,
-    secret: bool,
-    help: Option<String>,
+pub(crate) struct Field {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    pub required: bool,
+    pub secret: bool,
+    pub help: Option<String>,
 }
 
-enum SetupMode {
+pub(crate) enum SetupMode {
     Navigate,
     Edit,
     Selector(SelectorState),
 }
 
-struct SelectorState {
-    field_key: String,
-    filter: String,
-    items: Vec<SelectorItem>,
-    selected: usize,
-    original_value: String,
+pub(crate) struct SelectorState {
+    pub field_key: String,
+    pub filter: String,
+    pub items: Vec<SelectorItem>,
+    pub selected: usize,
+    pub original_value: String,
 }
 
-struct SelectorItem {
-    display: String,
-    value: String,
+pub(crate) struct SelectorItem {
+    pub display: String,
+    pub value: String,
 }
 
 impl Field {
@@ -400,16 +71,16 @@ impl Field {
     }
 }
 
-struct SetupApp {
-    fields: Vec<Field>,
-    selected: usize,
-    mode: SetupMode,
-    status: String,
-    completed: bool,
-    backup_path: Option<String>,
-    completion_summary: Vec<String>,
-    config_path: PathBuf,
-    original_yaml: Option<serde_yml::Value>,
+pub(crate) struct SetupApp {
+    pub fields: Vec<Field>,
+    pub selected: usize,
+    pub mode: SetupMode,
+    pub status: String,
+    pub completed: bool,
+    pub backup_path: Option<String>,
+    pub completion_summary: Vec<String>,
+    pub config_path: PathBuf,
+    pub original_yaml: Option<serde_yml::Value>,
 }
 
 impl SetupApp {
@@ -529,8 +200,7 @@ impl SetupApp {
             },
         ];
 
-        // Hide channel-specific fields when channel is disabled
-        Self::update_field_visibility(&mut fields);
+        update_field_visibility(&mut fields);
 
         Ok(Self {
             fields,
@@ -543,32 +213,6 @@ impl SetupApp {
             config_path,
             original_yaml,
         })
-    }
-
-    fn update_field_visibility(fields: &mut [Field]) {
-        let discord_enabled = fields
-            .iter()
-            .find(|f| f.key == "DISCORD_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        let telegram_enabled = fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        for field in fields.iter_mut() {
-            match field.key.as_str() {
-                "DISCORD_BOT_TOKEN" => {
-                    field.required = discord_enabled;
-                }
-                "TELEGRAM_BOT_TOKEN" => {
-                    field.required = telegram_enabled;
-                }
-                _ => {}
-            }
-        }
     }
 
     fn load_existing_config(
@@ -630,68 +274,8 @@ impl SetupApp {
                 }
             }
 
-            // Web の auth_token は既存値を再利用し、ブラウザ側の再ログインを避ける。
             if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
-                if let Some(ch_map) = channels.as_mapping() {
-                    if let Some(web) = ch_map.get(serde_yml::Value::String("web".into())) {
-                        if let Some(web_map) = web.as_mapping() {
-                            if let Some(token) =
-                                web_map.get(serde_yml::Value::String("auth_token".into()))
-                            {
-                                if let Some(token_str) = token.as_str() {
-                                    result.insert("WEB_AUTH_TOKEN".into(), token_str.to_string());
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract discord
-                    if let Some(discord) = ch_map.get(serde_yml::Value::String("discord".into())) {
-                        if let Some(d_map) = discord.as_mapping() {
-                            if let Some(enabled) =
-                                d_map.get(serde_yml::Value::String("enabled".into()))
-                            {
-                                if let Some(b) = enabled.as_bool() {
-                                    result.insert("DISCORD_ENABLED".into(), b.to_string());
-                                }
-                            }
-                            if let Some(token) =
-                                d_map.get(serde_yml::Value::String("bot_token".into()))
-                            {
-                                if let Some(t) = token.as_str() {
-                                    result.insert("DISCORD_BOT_TOKEN".into(), t.to_string());
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract telegram
-                    if let Some(tg) = ch_map.get(serde_yml::Value::String("telegram".into())) {
-                        if let Some(tg_map) = tg.as_mapping() {
-                            if let Some(enabled) =
-                                tg_map.get(serde_yml::Value::String("enabled".into()))
-                            {
-                                if let Some(b) = enabled.as_bool() {
-                                    result.insert("TELEGRAM_ENABLED".into(), b.to_string());
-                                }
-                            }
-                            if let Some(token) =
-                                tg_map.get(serde_yml::Value::String("bot_token".into()))
-                            {
-                                if let Some(t) = token.as_str() {
-                                    result.insert("TELEGRAM_BOT_TOKEN".into(), t.to_string());
-                                }
-                            }
-                            if let Some(username) =
-                                tg_map.get(serde_yml::Value::String("bot_username".into()))
-                            {
-                                if let Some(u) = username.as_str() {
-                                    result.insert("TELEGRAM_BOT_USERNAME".into(), u.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+                load_channel_fields(channels, &mut result);
             }
         }
 
@@ -750,391 +334,13 @@ impl SetupApp {
         self.fields.get_mut(self.selected)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        let provider = self
-            .fields
-            .iter()
-            .find(|f| f.key == "PROVIDER")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-
-        if provider.is_empty() {
-            return Err("Provider profile ID is required".into());
-        }
-
-        let model = self
-            .fields
-            .iter()
-            .find(|f| f.key == "MODEL")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-        let effective_model = if model.is_empty() {
-            provider_default_model(provider).unwrap_or("")
-        } else {
-            model
-        };
-
-        let base_url = self
-            .fields
-            .iter()
-            .find(|f| f.key == "BASE_URL")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-        let effective_base_url = if base_url.is_empty() {
-            provider_default_base_url(provider).unwrap_or("")
-        } else {
-            base_url
-        };
-
-        if effective_base_url.is_empty() {
-            return Err(format!(
-                "API base URL is required for provider '{provider}'"
-            ));
-        }
-
-        if Url::parse(effective_base_url).is_err() {
-            return Err(format!("Invalid API base URL: {effective_base_url}"));
-        }
-
-        if effective_model.is_empty() {
-            return Err(format!("LLM model is required for provider '{provider}'"));
-        }
-
-        let api_key = self
-            .fields
-            .iter()
-            .find(|f| f.key == "API_KEY")
-            .map(|f| f.value.trim())
-            .unwrap_or("");
-
-        // ローカル推論サーバーだけは API キー未設定を許可する。
-        if !base_url_allows_empty_api_key(effective_base_url) && api_key.is_empty() {
-            return Err(
-                "API key is required for non-local endpoints. Use a local URL (localhost/127.0.0.1) to skip.".into(),
-            );
-        }
-
-        let discord_enabled = self
-            .fields
-            .iter()
-            .find(|f| f.key == "DISCORD_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        if discord_enabled {
-            let discord_token = self
-                .fields
-                .iter()
-                .find(|f| f.key == "DISCORD_BOT_TOKEN")
-                .map(|f| f.value.trim())
-                .unwrap_or("");
-            // 有効化したチャネルだけ必須入力にし、未使用チャネルの秘密情報は求めない。
-            if discord_token.is_empty() {
-                return Err("Discord bot token is required when Discord is enabled".into());
-            }
-        }
-
-        let telegram_enabled = self
-            .fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        if telegram_enabled {
-            let telegram_token = self
-                .fields
-                .iter()
-                .find(|f| f.key == "TELEGRAM_BOT_TOKEN")
-                .map(|f| f.value.trim())
-                .unwrap_or("");
-            // 有効化したチャネルだけ必須入力にし、未使用チャネルの秘密情報は求めない。
-            if telegram_token.is_empty() {
-                return Err("Telegram bot token is required when Telegram is enabled".into());
-            }
-        }
-
-        Ok(())
-    }
-
     fn save(&mut self) -> Result<(), String> {
-        self.validate()?;
-
-        let provider_id = normalize_provider_id(
-            self.fields
-                .iter()
-                .find(|f| f.key == "PROVIDER")
-                .map(|f| f.value.trim())
-                .unwrap_or(""),
-        );
-        let provider_label = provider_label_for(&provider_id);
-
-        let model = self
-            .fields
-            .iter()
-            .find(|f| f.key == "MODEL")
-            .map(|f| f.value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| provider_default_model(&provider_id).map(|value| value.to_string()))
-            .unwrap_or_default();
-
-        let base_url = self
-            .fields
-            .iter()
-            .find(|f| f.key == "BASE_URL")
-            .map(|f| f.value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| provider_default_base_url(&provider_id).map(|value| value.to_string()))
-            .unwrap_or_default();
-
-        let api_key = self
-            .fields
-            .iter()
-            .find(|f| f.key == "API_KEY")
-            .map(|f| f.value.trim().to_string())
-            .unwrap_or_default();
-
-        let existing_token = self
-            .original_yaml
-            .as_ref()
-            .and_then(|v| v.as_mapping())
-            .and_then(|m| m.get(serde_yml::Value::String("channels".into())))
-            .and_then(|c| c.as_mapping())
-            .and_then(|m| m.get(serde_yml::Value::String("web".into())))
-            .and_then(|w| w.as_mapping())
-            .and_then(|m| m.get(serde_yml::Value::String("auth_token".into())))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
-        // 既存トークンがあれば維持し、初回作成時のみ新規生成する。
-        let auth_token = existing_token.unwrap_or_else(generate_auth_token);
-
-        let discord_enabled = self
-            .fields
-            .iter()
-            .find(|f| f.key == "DISCORD_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        let discord_bot_token = self
-            .fields
-            .iter()
-            .find(|f| f.key == "DISCORD_BOT_TOKEN")
-            .map(|f| f.value.trim().to_string())
-            .unwrap_or_default();
-
-        let telegram_enabled = self
-            .fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_ENABLED")
-            .map(|f| parse_bool(&f.value).unwrap_or(false))
-            .unwrap_or(false);
-
-        let telegram_bot_token = self
-            .fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_BOT_TOKEN")
-            .map(|f| f.value.trim().to_string())
-            .unwrap_or_default();
-
-        let telegram_bot_username = self
-            .fields
-            .iter()
-            .find(|f| f.key == "TELEGRAM_BOT_USERNAME")
-            .map(|f| f.value.trim().to_string())
-            .unwrap_or_default();
-
-        let config_path = &self.config_path;
-        if let Some(config_dir) = config_path.parent() {
-            fs::create_dir_all(config_dir)
-                .map_err(|e| format!("Failed to create config directory: {e}"))?;
-        }
-        fs::create_dir_all(default_data_dir().map_err(|e| e.to_string())?)
-            .map_err(|e| format!("Failed to create data directory: {e}"))?;
-        fs::create_dir_all(default_workspace_dir().map_err(|e| e.to_string())?)
-            .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
-
-        if config_path.exists() {
-            self.backup_path = Some(backup_config(config_path)?);
-        }
-
-        // プリセットの default_model / models は ProviderConfig にそのまま反映する。
-        // ユーザーが選択したモデルは Config.default_model（YAML トップレベル）に置く。
-        let preset = find_provider_preset(&provider_id);
-        let preset_default_model = preset
-            .map(|p| p.default_model.to_string())
-            .unwrap_or_else(|| model.clone());
-        let preset_models: Vec<String> = preset
-            .map(|p| p.models.iter().map(|m| (*m).to_string()).collect())
-            .unwrap_or_else(|| {
-                let mut m = vec![model.clone()];
-                if m[0] != preset_default_model {
-                    m.insert(0, preset_default_model.clone());
-                }
-                m
-            });
-
-        let mut providers = HashMap::new();
-        providers.insert(
-            provider_id.clone(),
-            ProviderConfig {
-                label: provider_label.clone(),
-                base_url: base_url.clone(),
-                api_key: if api_key.is_empty() {
-                    None
-                } else {
-                    Some(SecretString::new(api_key.clone().into_boxed_str()))
-                },
-                default_model: preset_default_model,
-                models: preset_models,
-            },
-        );
-
-        let mut channels = HashMap::new();
-
-        channels.insert(
-            "web".to_string(),
-            ChannelConfig {
-                enabled: Some(true),
-                host: Some("127.0.0.1".to_string()),
-                port: Some(10961),
-                auth_token: Some(auth_token),
-                ..Default::default()
-            },
-        );
-
-        if discord_enabled {
-            channels.insert(
-                "discord".to_string(),
-                ChannelConfig {
-                    enabled: Some(true),
-                    bot_token: Some(discord_bot_token),
-                    ..Default::default()
-                },
-            );
-        }
-
-        if telegram_enabled {
-            let bot_username = if telegram_bot_username.is_empty() {
-                None
-            } else {
-                Some(telegram_bot_username)
-            };
-            channels.insert(
-                "telegram".to_string(),
-                ChannelConfig {
-                    enabled: Some(true),
-                    bot_token: Some(telegram_bot_token),
-                    bot_username,
-                    ..Default::default()
-                },
-            );
-        }
-
-        let config = Config {
-            default_provider: provider_id.clone(),
-            default_model: Some(model.clone()),
-            providers,
-            data_dir: default_data_dir()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy()
-                .into_owned(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels,
-        };
-
-        config
-            .save_yaml(config_path)
-            .map_err(|e: EgoPulseError| format!("Failed to save config: {e}"))?;
-
-        // 保存後の確認を端末上で完結できるよう、反映内容を要約して残す。
-        self.completion_summary = vec![
-            format!("Config saved to: {}", config_path.display()),
-            format!("Provider: {provider_label} ({provider_id})"),
-            format!("Model: {model}"),
-            format!("Base URL: {base_url}"),
-            if api_key.is_empty() {
-                "API key: (empty - local endpoint)".into()
-            } else {
-                format!("API key: {}", mask_secret(&api_key))
-            },
-            "Web channel: enabled (auth_token auto-generated)".into(),
-            format!(
-                "Discord channel: {}",
-                if discord_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
-            format!(
-                "Telegram channel: {}",
-                if telegram_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
-        ];
-
-        if let Some(ref backup) = self.backup_path {
-            self.completion_summary
-                .push(format!("Previous config backed up to: {backup}"));
-        }
-
+        let (backup_path, completion_summary) =
+            save_config(&self.fields, &self.original_yaml, &self.config_path)?;
+        self.backup_path = backup_path;
+        self.completion_summary = completion_summary;
         self.completed = true;
         Ok(())
-    }
-
-    fn enter_selector(&self, field_key: &str) -> SelectorState {
-        let items = match field_key {
-            "PROVIDER" => provider_selector_items(),
-            "MODEL" => {
-                let provider = self
-                    .fields
-                    .iter()
-                    .find(|f| f.key == "PROVIDER")
-                    .map(|f| f.value.as_str())
-                    .unwrap_or("");
-                model_selector_items(provider)
-            }
-            _ => Vec::new(),
-        };
-        let original_value = self
-            .fields
-            .iter()
-            .find(|f| f.key == field_key)
-            .map(|f| f.value.clone())
-            .unwrap_or_default();
-        SelectorState {
-            field_key: field_key.to_string(),
-            filter: String::new(),
-            items,
-            selected: 0,
-            original_value,
-        }
-    }
-
-    fn apply_selector_selection(&mut self, field_key: &str) {
-        if field_key == "PROVIDER" {
-            let provider_id = self
-                .fields
-                .iter()
-                .find(|f| f.key == "PROVIDER")
-                .map(|f| f.value.clone())
-                .unwrap_or_default();
-            if let Some(preset) = find_provider_preset(&provider_id) {
-                if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
-                    model_field.value = preset.default_model.to_string();
-                }
-                if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
-                    url_field.value = preset.default_base_url.to_string();
-                }
-            }
-        }
     }
 }
 
@@ -1146,66 +352,18 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn generate_auth_token() -> String {
-    let mut rng = rand::rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
-    STANDARD.encode(&bytes)
-}
-
-fn mask_secret(value: &str) -> String {
-    if value.len() <= 8 {
-        return "********".into();
+fn filtered_items<'a>(items: &'a [SelectorItem], filter: &str) -> Vec<&'a SelectorItem> {
+    if filter.is_empty() {
+        return items.iter().collect();
     }
-    let visible = &value[..4];
-    format!("{visible}********")
-}
-
-fn backup_config(path: &Path) -> Result<String, String> {
-    let backup_dir = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(CONFIG_BACKUP_DIR);
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("Failed to create backup dir: {e}"))?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("egopulse.config.yaml");
-    let backup_name = format!("{file_name}.{timestamp}.bak");
-    let backup_path = backup_dir.join(&backup_name);
-
-    fs::copy(path, &backup_path).map_err(|e| format!("Failed to backup config: {e}"))?;
-
-    // バックアップを無制限に増やさないため、古い世代から間引く。
-    cleanup_old_backups(&backup_dir, file_name)?;
-
-    Ok(backup_path.to_string_lossy().to_string())
-}
-
-fn cleanup_old_backups(backup_dir: &Path, file_name: &str) -> Result<(), String> {
-    let mut entries: Vec<_> = fs::read_dir(backup_dir)
-        .map_err(|e| format!("Failed to read backup dir: {e}"))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(file_name))
-        .collect();
-
-    entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
-
-    while entries.len() > MAX_CONFIG_BACKUPS {
-        if let Some(oldest) = entries.first() {
-            let _ = fs::remove_file(oldest.path());
-            entries.remove(0);
-        } else {
-            break;
-        }
-    }
-
-    Ok(())
+    let lower = filter.to_ascii_lowercase();
+    items
+        .iter()
+        .filter(|item| {
+            item.display.to_ascii_lowercase().contains(&lower)
+                || item.value.to_ascii_lowercase().contains(&lower)
+        })
+        .collect()
 }
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
@@ -1220,7 +378,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
             ])
             .split(area);
 
-        // Header
         let header = Paragraph::new(vec![
             Line::from(vec![Span::styled(
                 "EgoPulse Setup Wizard",
@@ -1244,7 +401,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
             draw_selector_popup(frame, state, area);
         }
 
-        // Footer
         let footer_text = if app.completed {
             vec![Line::from(
                 "Setup complete. Run egopulse for the TUI, or egopulse run for channels.",
@@ -1269,7 +425,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &SetupApp) {
             .wrap(Wrap { trim: true });
         frame.render_widget(footer, chunks[2]);
 
-        // 編集中だけカーソルを明示し、非編集時のノイズを避ける。
         if matches!(app.mode, SetupMode::Edit) && !app.completed {
             if let Some(field) = app.current_field() {
                 let visible = app.visible_fields();
@@ -1434,29 +589,6 @@ fn draw_fields(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
                 .title("Configuration Fields")
                 .borders(Borders::ALL),
         )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
-}
-
-fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &SetupApp, area: Rect) {
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "Setup Complete!",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(""));
-
-    for item in &app.completion_summary {
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::raw(item),
-        ]));
-    }
-
-    let body = Paragraph::new(lines)
-        .block(Block::default().title("Summary").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
@@ -1626,7 +758,6 @@ async fn run_inner(
         draw(terminal, app);
 
         if app.completed {
-            // 完了後はサマリーを読めるよう即終了せず、任意キーで閉じる。
             if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                     if key.kind == KeyEventKind::Press {
@@ -1723,7 +854,7 @@ async fn run_inner(
                     KeyCode::Esc | KeyCode::Enter => {
                         if let Some(field) = app.current_field() {
                             if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
-                                SetupApp::update_field_visibility(&mut app.fields);
+                                update_field_visibility(&mut app.fields);
                             }
                         }
                         app.mode = SetupMode::Navigate;
@@ -1808,14 +939,13 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::{SelectorItem, SelectorState, SetupMode};
-    use super::{SetupApp, filtered_items, model_selector_items, provider_selector_items};
-    use std::fs;
+    use super::{SetupApp, filtered_items};
 
     #[test]
     fn load_existing_config_prefers_new_provider_schema() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_path = temp_dir.path().join("egopulse.config.yaml");
-        fs::write(
+        std::fs::write(
             &config_path,
             r#"default_provider: openai
 providers:
@@ -1854,7 +984,7 @@ channels:
     fn load_existing_config_ignores_legacy_top_level_llm_fields() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_path = temp_dir.path().join("egopulse.config.yaml");
-        fs::write(
+        std::fs::write(
             &config_path,
             r#"model: gpt-4o-mini
 base_url: https://api.openai.com/v1
@@ -1917,27 +1047,6 @@ api_key: sk-legacy
         }];
         let result = filtered_items(&items, "zzzzz");
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn provider_selector_items_includes_key_presets() {
-        let items = provider_selector_items();
-        assert!(!items.is_empty());
-        assert!(items.iter().any(|i| i.value == "openai"));
-        assert!(items.iter().any(|i| i.value == "custom"));
-    }
-
-    #[test]
-    fn model_selector_items_returns_models_for_known_provider() {
-        let items = model_selector_items("openai");
-        assert!(!items.is_empty());
-        assert!(items.iter().any(|i| i.value == "gpt-5.2"));
-    }
-
-    #[test]
-    fn model_selector_items_returns_empty_for_unknown_provider() {
-        let items = model_selector_items("nonexistent");
-        assert!(items.is_empty());
     }
 
     #[test]

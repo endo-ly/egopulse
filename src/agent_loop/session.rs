@@ -139,63 +139,81 @@ pub(crate) async fn persist_phase(
     messages: &[Message],
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    let mut retry_snapshot = messages.to_vec();
-    let mut retry_session_updated_at = session_updated_at;
-
-    for attempt in 0..2 {
-        match store_phase_snapshot(
-            state,
-            message.clone(),
-            retry_snapshot.clone(),
-            retry_session_updated_at.clone(),
-        )
-        .await
-        {
-            Ok(persisted) => return Ok(persisted),
-            Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
-                // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
-                // 今回の phase だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
-                let LoadedSession {
-                    messages,
-                    session_updated_at,
-                } = load_messages_for_turn(state, message.chat_id).await?;
-                let mut refreshed_messages = messages;
-                refreshed_messages.push(phase_message.clone());
-                retry_snapshot = refreshed_messages;
-                retry_session_updated_at = session_updated_at;
-            }
-            Err(error) => return Err(EgoPulseError::Storage(error)),
-        }
+    let persisted = store_phase_snapshot(
+        state,
+        message.clone(),
+        messages.to_vec(),
+        session_updated_at.clone(),
+    )
+    .await;
+    if let Some(turn) = persisted_turn_or_retry(persisted)? {
+        return Ok(turn);
     }
 
-    Err(EgoPulseError::Storage(
-        StorageError::SessionSnapshotConflict,
-    ))
+    // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
+    // 今回の phase だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
+    let LoadedSession {
+        messages: mut refreshed_messages,
+        session_updated_at: refreshed_updated_at,
+    } = load_messages_for_turn(state, message.chat_id).await?;
+    refreshed_messages.push(phase_message);
+
+    store_phase_snapshot(state, message, refreshed_messages, refreshed_updated_at)
+        .await
+        .map_err(EgoPulseError::Storage)
+}
+
+fn persisted_turn_or_retry(
+    persisted: Result<PersistedTurn, StorageError>,
+) -> Result<Option<PersistedTurn>, EgoPulseError> {
+    match persisted {
+        Ok(turn) => Ok(Some(turn)),
+        Err(StorageError::SessionSnapshotConflict) => Ok(None),
+        Err(error) => Err(EgoPulseError::Storage(error)),
+    }
 }
 
 async fn snapshot_to_loaded(
     snapshot: SessionSnapshot,
     assets: Arc<AssetStore>,
 ) -> Result<LoadedSession, EgoPulseError> {
-    if let Some(json) = snapshot.messages_json {
+    let Some(json) = snapshot.messages_json.as_ref() else {
+        return Ok(loaded_from_recent(&snapshot));
+    };
+
+    let restored = tokio::task::spawn_blocking({
         let assets = Arc::clone(&assets);
-        let restored =
-            tokio::task::spawn_blocking(move || restore_snapshot_messages(&assets, &json))
-                .await
-                .map_err(|error| {
-                    EgoPulseError::Storage(StorageError::TaskJoin(error.to_string()))
-                })?;
-        if let Ok(restored) = restored
-            && !restored.is_empty()
-        {
-            return Ok(LoadedSession {
-                messages: restored,
-                session_updated_at: snapshot.updated_at,
-            });
-        }
-    }
+        let json = json.clone();
+        move || restore_snapshot_messages(&assets, &json)
+    })
+    .await
+    .map_err(|error| EgoPulseError::Storage(StorageError::TaskJoin(error.to_string())))?;
+
+    let Some(messages) = restored_messages_or_recent(restored) else {
+        return Ok(loaded_from_recent(&snapshot));
+    };
 
     Ok(LoadedSession {
+        messages,
+        session_updated_at: snapshot.updated_at,
+    })
+}
+
+fn restored_messages_or_recent(
+    restored: Result<Vec<Message>, StorageError>,
+) -> Option<Vec<Message>> {
+    let Ok(messages) = restored else {
+        return None;
+    };
+    if messages.is_empty() {
+        return None;
+    }
+
+    Some(messages)
+}
+
+fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
+    LoadedSession {
         messages: snapshot
             .recent_messages
             .iter()
@@ -209,9 +227,9 @@ async fn snapshot_to_loaded(
                     message.content.clone(),
                 )
             })
-            .collect::<Vec<_>>(),
-        session_updated_at: snapshot.updated_at,
-    })
+            .collect(),
+        session_updated_at: snapshot.updated_at.clone(),
+    }
 }
 
 async fn serialize_snapshot(
@@ -316,17 +334,20 @@ fn restore_part(assets: &AssetStore, part: PersistedMessageContentPart) -> Messa
             image_ref,
             mime_type,
             detail,
-        } => match assets.load_image_data_url(&image_ref, &mime_type) {
-            Ok(image_url) => MessageContentPart::InputImage { image_url, detail },
-            Err(StorageError::NotFound(_)) => MessageContentPart::InputText {
-                text: format!(
-                    "Previously attached image could not be restored: missing image_ref {image_ref}"
-                ),
-            },
-            Err(error) => MessageContentPart::InputText {
-                text: format!("Previously attached image could not be restored: {error}"),
-            },
-        },
+        } => assets
+            .load_image_data_url(&image_ref, &mime_type)
+            .map(|image_url| MessageContentPart::InputImage { image_url, detail })
+            .unwrap_or_else(|error| missing_image_text_part(&image_ref, error)),
+    }
+}
+
+fn missing_image_text_part(image_ref: &str, error: StorageError) -> MessageContentPart {
+    let reason = match error {
+        StorageError::NotFound(_) => format!("missing image_ref {image_ref}"),
+        other => other.to_string(),
+    };
+    MessageContentPart::InputText {
+        text: format!("Previously attached image could not be restored: {reason}"),
     }
 }
 
