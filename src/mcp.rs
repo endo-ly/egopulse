@@ -40,6 +40,7 @@ pub enum TransportType {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct McpServerConfig {
+    #[serde(alias = "type")]
     pub transport: TransportType,
     #[serde(default)]
     pub protocol_version: Option<String>,
