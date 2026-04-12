@@ -1034,7 +1034,10 @@ impl SetupApp {
             default_provider: provider_id.clone(),
             default_model: Some(model.clone()),
             providers,
-            data_dir: default_data_dir().map_err(|e| e.to_string())?.to_string_lossy().into_owned(),
+            data_dir: default_data_dir()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,

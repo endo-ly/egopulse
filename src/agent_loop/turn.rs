@@ -1209,7 +1209,9 @@ mod tests {
         use crate::channel_adapter::ChannelRegistry;
         let data_dir = config.data_dir.clone();
         let db = Arc::new(Database::new(&data_dir).expect("db"));
-        let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir().expect("skills_dir")));
+        let skills = Arc::new(SkillManager::from_skills_dir(
+            config.skills_dir().expect("skills_dir"),
+        ));
         AppState {
             db,
             config: config.clone(),

@@ -2055,7 +2055,9 @@ mod tests {
     fn test_registry(config: &Config) -> ToolRegistry {
         ToolRegistry::new(
             config,
-            Arc::new(SkillManager::from_skills_dir(config.skills_dir().expect("skills_dir"))),
+            Arc::new(SkillManager::from_skills_dir(
+                config.skills_dir().expect("skills_dir"),
+            )),
         )
     }
 
@@ -2117,7 +2119,8 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        std::fs::create_dir_all(config.workspace_dir().expect("workspace_dir").join("src")).expect("create src dir");
+        std::fs::create_dir_all(config.workspace_dir().expect("workspace_dir").join("src"))
+            .expect("create src dir");
 
         let result = registry
             .execute(
@@ -2129,7 +2132,13 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Successfully wrote 11 bytes"));
         assert_eq!(
-            std::fs::read_to_string(config.workspace_dir().expect("workspace_dir").join("src/demo.txt")).expect("read"),
+            std::fs::read_to_string(
+                config
+                    .workspace_dir()
+                    .expect("workspace_dir")
+                    .join("src/demo.txt")
+            )
+            .expect("read"),
             "hello world"
         );
     }

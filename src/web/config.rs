@@ -95,7 +95,8 @@ pub(super) struct ConfigUpdateRequest {
 pub(super) async fn api_get_config(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = config_path_for_save(&state).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let path = config_path_for_save(&state)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let display = match Config::load_allow_missing_api_key(Some(&path)) {
         Ok(config) => Some(config),
         Err(ConfigError::ConfigNotFound { .. }) => None,
@@ -133,7 +134,8 @@ pub(super) async fn api_put_config(
         ));
     }
 
-    let path = config_path_for_save(&state).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let path = config_path_for_save(&state)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut config = match Config::load_allow_missing_api_key(Some(&path)) {
         Ok(config) => config,
@@ -374,7 +376,10 @@ fn config_path_for_save(state: &WebState) -> Result<PathBuf, ConfigError> {
     }
 }
 
-fn payload_from_config(config: &Config, path: &std::path::Path) -> Result<ConfigPayload, ConfigError> {
+fn payload_from_config(
+    config: &Config,
+    path: &std::path::Path,
+) -> Result<ConfigPayload, ConfigError> {
     let resolved = config.resolve_global_llm();
 
     let providers = config

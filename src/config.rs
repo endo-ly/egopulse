@@ -1085,6 +1085,14 @@ channels:
 
     #[test]
     #[serial]
+    fn home_directory_unresolved_error_displays_correctly() {
+        let error = ConfigError::HomeDirectoryUnresolved;
+        let message = error.to_string();
+        assert!(message.contains("home_directory_unresolved"));
+    }
+
+    #[test]
+    #[serial]
     fn loads_provider_based_config() {
         let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1096,8 +1104,14 @@ channels:
         assert_eq!(config.default_provider, "openai");
         assert_eq!(config.global_provider().label, "OpenAI");
         assert_eq!(PathBuf::from(&config.data_dir), default_data_dir().unwrap());
-        assert_eq!(config.workspace_dir().unwrap(), default_workspace_dir().unwrap());
-        assert_eq!(config.skills_dir().unwrap(), default_workspace_dir().unwrap().join("skills"));
+        assert_eq!(
+            config.workspace_dir().unwrap(),
+            default_workspace_dir().unwrap()
+        );
+        assert_eq!(
+            config.skills_dir().unwrap(),
+            default_workspace_dir().unwrap().join("skills")
+        );
         assert!(config.web_enabled());
         assert_eq!(config.web_auth_token(), Some("web-secret"));
 

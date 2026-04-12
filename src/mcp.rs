@@ -95,7 +95,9 @@ pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigErro
     ])
 }
 
-pub fn load_and_merge_mcp_configs(workspace_dir: &Path) -> Result<HashMap<String, McpServerConfig>, ConfigError> {
+pub fn load_and_merge_mcp_configs(
+    workspace_dir: &Path,
+) -> Result<HashMap<String, McpServerConfig>, ConfigError> {
     let paths = mcp_config_paths(workspace_dir)?;
     let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
 
