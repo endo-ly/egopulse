@@ -68,7 +68,7 @@ pub(crate) fn resolve_workspace_path(
 ///
 /// ReDoS（Regular Expression Denial of Service）攻撃を防止するため、
 /// パターン長は 1024 文字まで、開き括弧の連続ネスト深さは 10 までに制限する。
-fn validate_grep_pattern(pattern: &str) -> Result<(), String> {
+fn validate_grep_pattern(pattern: &str, literal: bool) -> Result<(), String> {
     const MAX_PATTERN_LEN: usize = 1024;
     const MAX_NESTING_DEPTH: usize = 10;
 
@@ -79,17 +79,19 @@ fn validate_grep_pattern(pattern: &str) -> Result<(), String> {
         ));
     }
 
-    let mut depth = 0usize;
-    for ch in pattern.chars() {
-        if ch == '(' {
-            depth += 1;
-            if depth > MAX_NESTING_DEPTH {
-                return Err(format!(
-                    "Pattern nesting too deep: exceeds {MAX_NESTING_DEPTH} levels. Simplify the pattern or enable literal mode."
-                ));
+    if !literal {
+        let mut depth = 0usize;
+        for ch in pattern.chars() {
+            if ch == '(' {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(format!(
+                        "Pattern nesting too deep: exceeds {MAX_NESTING_DEPTH} levels. Simplify the pattern or enable literal mode."
+                    ));
+                }
+            } else if ch == ')' {
+                depth = depth.saturating_sub(1);
             }
-        } else if ch == ')' {
-            depth = depth.saturating_sub(1);
         }
     }
 
@@ -174,7 +176,11 @@ impl Tool for GrepTool {
         let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) else {
             return ToolResult::error("Missing required parameter: pattern".to_string());
         };
-        if let Err(error) = validate_grep_pattern(pattern) {
+        let literal = input
+            .get("literal")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if let Err(error) = validate_grep_pattern(pattern, literal) {
             return ToolResult::error(error);
         }
         let requested_path = input
@@ -198,10 +204,6 @@ impl Tool for GrepTool {
             .get("ignoreCase")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let literal = input
-            .get("literal")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
         let context_lines = input
             .get("context")
             .and_then(|value| value.as_u64())
@@ -211,6 +213,7 @@ impl Tool for GrepTool {
 
         let (cwd, target) = command_scope_for_path(&resolved);
         let mut command = Command::new("rg");
+        command.kill_on_drop(true);
         command
             .arg("--line-number")
             .arg("--color=never")
