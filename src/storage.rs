@@ -450,6 +450,14 @@ impl Database {
         Ok(())
     }
 
+    /// セッションスナップショットとメッセージ履歴を削除する。
+    pub fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
+        conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        Ok(())
+    }
+
     /// Atomically store a message and update the session snapshot.
     /// Uses optimistic concurrency via `expected_updated_at`; returns
     /// `SessionSnapshotConflict` on stale writes.
@@ -768,6 +776,49 @@ mod tests {
         assert_eq!(loaded_again, json2);
         assert!(second_updated_at >= first_updated_at);
         assert!(db.load_session(200).expect("other chat").is_none());
+    }
+
+    #[test]
+    fn clear_session_deletes_snapshots_and_messages() {
+        let (db, _dir) = test_db();
+        let chat_id = 100;
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+        db.store_message(&StoredMessage {
+            id: "msg-1".to_string(),
+            chat_id,
+            sender_name: "alice".to_string(),
+            content: "hello".to_string(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        })
+        .expect("store first message");
+        db.store_message(&StoredMessage {
+            id: "msg-2".to_string(),
+            chat_id,
+            sender_name: "assistant".to_string(),
+            content: "hi".to_string(),
+            is_from_bot: true,
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+        })
+        .expect("store second message");
+
+        db.clear_session(chat_id).expect("clear session");
+
+        assert!(db.load_session(chat_id).expect("load session").is_none());
+        assert!(
+            db.get_recent_messages(chat_id, 10)
+                .expect("load recent messages")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn clear_session_idempotent_on_empty_chat() {
+        let (db, _dir) = test_db();
+
+        db.clear_session(999).expect("clear missing session");
     }
 
     #[test]
