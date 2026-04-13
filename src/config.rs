@@ -969,9 +969,7 @@ mod tests {
     //! YAML 設定ファイルから provider ベースの設定を構築し、
     //! channel ごとの override を実効 LLM 設定へ解決する。
 
-    use std::collections::HashMap;
     use std::io::Write;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use secrecy::ExposeSecret;
     use serial_test::serial;
@@ -980,76 +978,7 @@ mod tests {
 
     use super::{Config, default_data_dir, default_workspace_dir};
     use crate::error::ConfigError;
-
-    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    const TEST_ENV_KEYS: &[&str] = &[
-        "EGOPULSE_LOG_LEVEL",
-        "EGOPULSE_WEB_ENABLED",
-        "EGOPULSE_WEB_HOST",
-        "EGOPULSE_WEB_PORT",
-        "EGOPULSE_WEB_AUTH_TOKEN",
-        "EGOPULSE_WEB_ALLOWED_ORIGINS",
-        "EGOPULSE_DISCORD_BOT_TOKEN",
-        "EGOPULSE_TELEGRAM_BOT_TOKEN",
-        "HOME",
-    ];
-
-    struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        original: HashMap<&'static str, Option<std::ffi::OsString>>,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            let lock = ENV_MUTEX.lock().expect("lock env mutex");
-            let original = TEST_ENV_KEYS
-                .iter()
-                .copied()
-                .map(|key| (key, std::env::var_os(key)))
-                .collect();
-
-            let guard = Self {
-                _lock: lock,
-                original,
-            };
-            guard.clear();
-            guard
-        }
-
-        fn clear(&self) {
-            for key in TEST_ENV_KEYS {
-                self.remove(key);
-            }
-        }
-
-        fn set<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(&self, key: K, value: V) {
-            unsafe {
-                std::env::set_var(key, value);
-            }
-        }
-
-        fn remove<K: AsRef<std::ffi::OsStr>>(&self, key: K) {
-            unsafe {
-                std::env::remove_var(key);
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.original {
-                match value {
-                    Some(value) => unsafe {
-                        std::env::set_var(key, value);
-                    },
-                    None => unsafe {
-                        std::env::remove_var(key);
-                    },
-                }
-            }
-        }
-    }
+    use crate::test_env::EnvVarGuard;
 
     fn write_config(temp_dir: &tempfile::TempDir, body: &str) -> PathBuf {
         let file_path = temp_dir.path().join("egopulse.config.yaml");
@@ -1094,9 +1023,8 @@ channels:
     #[test]
     #[serial]
     fn loads_provider_based_config() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(&temp_dir, sample_config());
 
         let config = Config::load(Some(&file_path)).expect("load config");
@@ -1135,9 +1063,8 @@ channels:
     #[test]
     #[serial]
     fn allows_missing_api_key_for_local_provider() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: local
@@ -1160,9 +1087,8 @@ channels:
     #[test]
     #[serial]
     fn rejects_missing_remote_api_key() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai
@@ -1187,9 +1113,8 @@ channels:
     #[test]
     #[serial]
     fn rejects_unknown_channel_provider() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai
@@ -1216,9 +1141,8 @@ channels:
     #[test]
     #[serial]
     fn load_allow_missing_api_key_accepts_incomplete_remote_provider() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai
@@ -1241,9 +1165,8 @@ channels:
     #[test]
     #[serial]
     fn default_model_in_yaml_overrides_provider_default() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai
@@ -1277,9 +1200,8 @@ channels:
     #[test]
     #[serial]
     fn default_model_falls_back_to_provider_default() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai
@@ -1305,9 +1227,8 @@ channels:
     #[test]
     #[serial]
     fn model_resolution_chain_channel_overrides_global() {
-        let env = EnvGuard::new();
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        env.set("HOME", temp_dir.path());
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
         let file_path = write_config(
             &temp_dir,
             r#"default_provider: openai

@@ -22,3 +22,6 @@ pub mod storage;
 pub mod text;
 pub mod tools;
 pub mod web;
+
+#[cfg(test)]
+mod test_env;

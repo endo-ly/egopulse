@@ -545,6 +545,7 @@ async fn connect_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvVarGuard;
     use serial_test::serial;
 
     #[test]
@@ -595,10 +596,7 @@ mod tests {
         .expect("write global");
         std::fs::write(workspace.join("mcp.json"), ws_config).expect("write workspace");
 
-        let original_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let _home = EnvVarGuard::set("HOME", dir.path());
 
         let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert_eq!(configs.len(), 2);
@@ -609,15 +607,6 @@ mod tests {
             vec!["-y", "override-server"],
             "workspace config should override global"
         );
-
-        match original_home {
-            Some(home) => unsafe {
-                std::env::set_var("HOME", home);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
     }
 
     #[test]
@@ -628,22 +617,10 @@ mod tests {
         let workspace = state_root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
 
-        let original_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let _home = EnvVarGuard::set("HOME", dir.path());
 
         let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert!(configs.is_empty());
-
-        match original_home {
-            Some(home) => unsafe {
-                std::env::set_var("HOME", home);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
     }
 
     #[test]
@@ -659,23 +636,11 @@ mod tests {
         let valid_config = r#"{"mcpServers":{"good":{"transport":"stdio","command":"node"}}}"#;
         std::fs::write(workspace.join("mcp.json"), valid_config).expect("write good");
 
-        let original_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let _home = EnvVarGuard::set("HOME", dir.path());
 
         let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
         assert_eq!(configs.len(), 1);
         assert!(configs.contains_key("good"));
-
-        match original_home {
-            Some(home) => unsafe {
-                std::env::set_var("HOME", home);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
     }
 
     #[test]
@@ -757,18 +722,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().join(".egopulse");
 
-        let original_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        let _home = EnvVarGuard::set("HOME", dir.path());
 
         let expected_mcp_home = state_root.join("mcp-home").join("test-server");
         assert!(!expected_mcp_home.exists(), "should not exist before");
 
         std::fs::create_dir_all(&expected_mcp_home).expect("create mcp-home");
         assert!(expected_mcp_home.exists(), "should exist after creation");
-
-        match original_home {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 }
