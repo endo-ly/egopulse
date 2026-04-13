@@ -110,6 +110,21 @@ impl SkillManager {
         }
     }
 
+    /// チャット表示用にプレーンテキストでスキル一覧を返す。
+    pub fn list_skills_formatted(&self) -> String {
+        let skills = self.discover_skills();
+        if skills.is_empty() {
+            return "No skills loaded.".to_string();
+        }
+
+        let mut out = String::from("Available skills:\n");
+        for skill in &skills {
+            out.push_str(&format!("- {} ({})\n", skill.name, skill.description));
+        }
+        out.pop();
+        out
+    }
+
     /// Build an XML-formatted skills catalog for injection into the system prompt.
     /// Switches to compact mode (name-only) when skill count exceeds threshold.
     pub fn build_skills_catalog(&self) -> String {
@@ -476,5 +491,31 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "pdf");
+    }
+
+    #[test]
+    fn list_skills_formatted_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("workspace").join("skills");
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let formatted = manager.list_skills_formatted();
+
+        assert_eq!(formatted, "No skills loaded.");
+    }
+
+    #[test]
+    fn list_skills_formatted_multiple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("workspace").join("skills");
+        create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
+        create_skill(&skills_dir, "docx", "Use the DOCX workflow.");
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let formatted = manager.list_skills_formatted();
+
+        assert!(formatted.starts_with("Available skills:\n"));
+        assert!(formatted.contains("- pdf (Description for pdf)"));
+        assert!(formatted.contains("- docx (Description for docx)"));
     }
 }
