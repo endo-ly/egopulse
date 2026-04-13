@@ -3,10 +3,10 @@
 //! 標準入出力を使った永続化チャットセッションを提供し、入力ごとに agent loop を実行する。
 
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::error::EgoPulseError;
-use crate::llm_profile;
 use crate::runtime::AppState;
 
 /// Runs an interactive CLI chat loop for the given persistent session.
@@ -39,20 +39,33 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
             break;
         }
 
-        match llm_profile::handle_command(state, &context, trimmed).await {
-            Ok(Some(response)) => {
+        if crate::slash_commands::is_slash_command(trimmed) {
+            let slash_chat_id = crate::storage::call_blocking(Arc::clone(&state.db), {
+                let channel = context.channel.clone();
+                let thread = context.surface_thread.clone();
+                let chat_type = context.chat_type.clone();
+                move |db| {
+                    db.resolve_or_create_chat_id(
+                        &channel,
+                        &format!("cli:{thread}"),
+                        Some(&thread),
+                        &chat_type,
+                    )
+                }
+            })
+            .await
+            .map_err(EgoPulseError::from)?;
+
+            if let Some(response) = crate::slash_commands::handle_slash_command(
+                state,
+                slash_chat_id,
+                &context.channel,
+                trimmed,
+                None,
+            )
+            .await
+            {
                 writeln!(stdout, "assistant: {response}")
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
-                stdout
-                    .flush()
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                writeln!(stdout, "assistant: Command error: {error}")
                     .map_err(crate::error::StorageError::Io)
                     .map_err(EgoPulseError::from)?;
                 stdout

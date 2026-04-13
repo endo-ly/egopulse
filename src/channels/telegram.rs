@@ -18,6 +18,8 @@ use crate::agent_loop::SurfaceContext;
 use crate::channel_adapter::ChannelAdapter;
 use crate::channel_adapter::ConversationKind;
 use crate::runtime::AppState;
+use crate::slash_commands;
+use crate::storage::call_blocking;
 use crate::text::split_text;
 
 /// Telegram メッセージ長制限 (文字数)。
@@ -207,7 +209,7 @@ async fn handle_message(
         channel: "telegram".to_string(),
         surface_user: sender_name,
         surface_thread: external_chat_id.clone(),
-        chat_type,
+        chat_type: chat_type.clone(),
     };
 
     info!(
@@ -216,6 +218,34 @@ async fn handle_message(
         text_length = text.len(),
         "Telegram message received"
     );
+
+    // --- スラッシュコマンドインターセプト ---
+    // process_turn より先に chat_id を解決し、
+    // スラッシュコマンドであればエージェントループに入らずに即応答する。
+    if slash_commands::is_slash_command(&text) {
+        let resolved_chat_id = call_blocking(std::sync::Arc::clone(&state.db), {
+            let channel = "telegram".to_string();
+            let ext_id = external_chat_id.clone();
+            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
+        })
+        .await
+        .expect("resolve chat_id for slash command");
+
+        let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
+        if let Some(response) = slash_commands::handle_slash_command(
+            &state,
+            resolved_chat_id,
+            "telegram",
+            &text,
+            sender_id.as_deref(),
+        )
+        .await
+        {
+            send_telegram_response(&bot, msg.chat.id, &response).await;
+            return Ok(());
+        }
+    }
+    // --- インターセプトここまで ---
 
     // タイピングインジケーター (バックグラウンドタスクで定期的に送信)
     let typing_bot = bot.clone();
@@ -229,7 +259,6 @@ async fn handle_message(
         }
     });
 
-    // session 解決は process_turn() に一任 (二重解決を避ける)
     match crate::agent_loop::process_turn(&state, &context, &text).await {
         Ok(response) => {
             typing_handle.abort();
@@ -289,6 +318,26 @@ pub async fn start_telegram_bot(
     bot.delete_webhook().await.inspect_err(|e| {
         error!("Telegram: failed to delete webhook: {e}");
     })?;
+
+    // BotFather にコマンド一覧を登録 (メニュー表示用)
+    {
+        use teloxide::types::BotCommand;
+
+        let commands = vec![
+            BotCommand::new("new", "Clear current session"),
+            BotCommand::new("compact", "Force compact session"),
+            BotCommand::new("status", "Show current status"),
+            BotCommand::new("skills", "List available skills"),
+            BotCommand::new("restart", "Restart the bot"),
+            BotCommand::new("providers", "List LLM providers"),
+            BotCommand::new("provider", "Show/switch provider"),
+            BotCommand::new("models", "List models"),
+            BotCommand::new("model", "Show/switch model"),
+        ];
+        if let Err(e) = bot.set_my_commands(commands).await {
+            warn!("Telegram: failed to set bot commands: {e}");
+        }
+    }
 
     info!("Starting Telegram bot...");
 
