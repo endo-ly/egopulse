@@ -315,7 +315,7 @@ async fn write_startup_status(state: &AppState) {
     let web = if state.config.web_enabled() {
         Some(WebChannelStatus {
             enabled: true,
-            host: Some(state.config.web_host()),
+            host: Some(state.config.web_host().to_owned()),
             port: Some(state.config.web_port()),
         })
     } else {
