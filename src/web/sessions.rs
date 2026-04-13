@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::storage::call_blocking;
 
@@ -39,7 +40,7 @@ pub(super) struct SessionItem {
 pub(super) async fn list_sessions(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let db = state.app_state.db.clone();
+    let db = Arc::clone(&state.app_state.db);
     let sessions = match call_blocking(db, |db| db.list_sessions()).await {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -88,13 +89,13 @@ pub(super) async fn get_history(
         .map(|chat_id| format!("chat:{chat_id}"))
         .unwrap_or_else(|| web_session_key(requested_session_key));
     let limit = std::cmp::min(query.limit.unwrap_or(100), MAX_LIMIT);
-    let db = state.app_state.db.clone();
+    let db = Arc::clone(&state.app_state.db);
 
     let chat_id = match parsed_chat_id {
         Some(chat_id) => chat_id,
         None => {
             let external_chat_id = web_external_chat_id(&session_key);
-            match call_blocking(db.clone(), {
+            match call_blocking(Arc::clone(&db), {
                 let channel = "web".to_string();
                 let external_chat_id = external_chat_id.clone();
                 move |db| db.resolve_chat_id(&channel, &external_chat_id)

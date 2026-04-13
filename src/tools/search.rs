@@ -3,17 +3,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::llm::ToolDefinition;
 
 use super::text::{format_size, truncate_head};
 use super::{
-    DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES,
-    GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
+    DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_GREP_TIMEOUT_SECS, DEFAULT_LS_LIMIT,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
 };
 
 pub(crate) fn resolve_workspace_path(
@@ -59,6 +62,66 @@ pub(crate) fn resolve_workspace_path(
     }
 
     Ok(canonical_candidate)
+}
+
+/// grep パターンの長さおよび括弧のネスト深さを検証する。
+///
+/// ReDoS（Regular Expression Denial of Service）攻撃を防止するため、
+/// パターン長は 1024 文字まで、開き括弧の連続ネスト深さは 10 までに制限する。
+fn validate_grep_pattern(pattern: &str, literal: bool) -> Result<(), String> {
+    const MAX_PATTERN_LEN: usize = 1024;
+    const MAX_NESTING_DEPTH: usize = 10;
+
+    let char_count = pattern.chars().count();
+    if char_count > MAX_PATTERN_LEN {
+        return Err(format!(
+            "Pattern too long: {char_count} chars (max {MAX_PATTERN_LEN}). Use a shorter pattern or enable literal mode."
+        ));
+    }
+
+    if !literal {
+        let mut depth = 0usize;
+        let mut in_char_class = false;
+        let mut escaped = false;
+        for ch in pattern.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '[' if !in_char_class => in_char_class = true,
+                ']' if in_char_class => in_char_class = false,
+                '(' if !in_char_class => {
+                    depth += 1;
+                    if depth > MAX_NESTING_DEPTH {
+                        return Err(format!(
+                            "Pattern nesting too deep: exceeds {MAX_NESTING_DEPTH} levels. Simplify the pattern or enable literal mode."
+                        ));
+                    }
+                }
+                ')' if !in_char_class => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// タイムアウト時にプロセスグループへ SIGKILL を送信し、終了を待機する。
+async fn kill_on_timeout(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if ret != 0 {
+            let _ = child.start_kill();
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 /// Searches file contents via ripgrep with regex/literal and context line support.
@@ -126,6 +189,13 @@ impl Tool for GrepTool {
         let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) else {
             return ToolResult::error("Missing required parameter: pattern".to_string());
         };
+        let literal = input
+            .get("literal")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if let Err(error) = validate_grep_pattern(pattern, literal) {
+            return ToolResult::error(error);
+        }
         let requested_path = input
             .get("path")
             .and_then(|value| value.as_str())
@@ -147,10 +217,6 @@ impl Tool for GrepTool {
             .get("ignoreCase")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let literal = input
-            .get("literal")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
         let context_lines = input
             .get("context")
             .and_then(|value| value.as_u64())
@@ -160,6 +226,7 @@ impl Tool for GrepTool {
 
         let (cwd, target) = command_scope_for_path(&resolved);
         let mut command = Command::new("rg");
+        command.process_group(0).kill_on_drop(true);
         command
             .arg("--line-number")
             .arg("--color=never")
@@ -185,8 +252,8 @@ impl Tool for GrepTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = match command.output().await {
-            Ok(output) => output,
+        let mut child = match command.spawn() {
+            Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ToolResult::error(
                     "ripgrep (rg) is not available and could not be downloaded".to_string(),
@@ -195,74 +262,132 @@ impl Tool for GrepTool {
             Err(error) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-        if stdout.trim().is_empty() && output.status.code() == Some(1) {
-            return ToolResult::success("No matches found".to_string());
-        }
-        if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return ToolResult::error(if stderr.is_empty() {
-                format!(
-                    "ripgrep exited with code {}",
-                    output.status.code().unwrap_or(-1)
-                )
-            } else {
-                stderr
-            });
-        }
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
 
-        let mut lines_truncated = false;
-        let lines = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let (truncated, was_truncated) = truncate_grep_line(line);
-                lines_truncated |= was_truncated;
-                truncated
-            })
-            .collect::<Vec<_>>();
-        let result_limit_reached = lines.len() > limit;
-        let limited = if result_limit_reached {
-            lines[..limit].to_vec()
-        } else {
-            lines
-        };
-        let raw_output = limited.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = if truncation.content.is_empty() {
-            "No matches found".to_string()
-        } else {
-            truncation.content.clone()
-        };
+        let read_limit = limit;
+        let stdout_fut = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut line_count = 0usize;
+            let mut exceeded = false;
+            if let Some(ref mut stdout) = stdout_pipe {
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match AsyncReadExt::read(stdout, &mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            line_count += tmp[..n].iter().filter(|&&b| b == b'\n').count();
+                            if line_count > read_limit + 50 || buf.len() > DEFAULT_MAX_BYTES * 2 {
+                                exceeded = true;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            (buf, exceeded)
+        });
+        let stderr_fut = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(ref mut stderr) = stderr_pipe {
+                let _ = AsyncReadExt::read_to_end(stderr, &mut buf).await;
+            }
+            buf
+        });
 
-        let mut notices = Vec::new();
-        if result_limit_reached {
-            notices.push(format!(
-                "{limit} matches limit reached. Use limit={} for more, or refine pattern",
-                limit * 2
-            ));
-        }
-        if truncation.truncated {
-            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        }
-        if lines_truncated {
-            notices.push(format!(
-                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
-            ));
-        }
-        if !notices.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-            return ToolResult::success_with_details(
-                text,
-                json!({
-                    "truncation": if truncation.truncated { Some(super::truncation_json(&truncation)) } else { None::<serde_json::Value> },
-                    "matchLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> },
-                    "linesTruncated": lines_truncated
-                }),
-            );
-        }
+        let wait_result =
+            timeout(Duration::from_secs(DEFAULT_GREP_TIMEOUT_SECS), child.wait()).await;
 
-        ToolResult::success(text)
+        match wait_result {
+            Ok(Ok(status)) => {
+                let (stdout_bytes, stdout_exceeded) = stdout_fut.await.unwrap_or_default();
+                let stderr_bytes = stderr_fut.await.unwrap_or_default();
+                if stdout_exceeded {
+                    let _ = child.start_kill();
+                }
+                let stdout = String::from_utf8_lossy(&stdout_bytes).replace("\r\n", "\n");
+                let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+
+                if stdout.trim().is_empty() && status.code() == Some(1) {
+                    return ToolResult::success("No matches found".to_string());
+                }
+                if !status.success() && status.code() != Some(1) {
+                    return ToolResult::error(if stderr.is_empty() {
+                        format!("ripgrep exited with code {}", status.code().unwrap_or(-1))
+                    } else {
+                        stderr
+                    });
+                }
+
+                let mut lines_truncated = false;
+                let lines = stdout
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| {
+                        let (truncated, was_truncated) = truncate_grep_line(line);
+                        lines_truncated |= was_truncated;
+                        truncated
+                    })
+                    .collect::<Vec<_>>();
+                let result_limit_reached = lines.len() > limit;
+                let limited = if result_limit_reached {
+                    lines[..limit].to_vec()
+                } else {
+                    lines
+                };
+                let raw_output = limited.join("\n");
+                let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+                let mut text = if truncation.content.is_empty() {
+                    "No matches found".to_string()
+                } else {
+                    truncation.content.clone()
+                };
+
+                let mut notices = Vec::new();
+                if result_limit_reached {
+                    notices.push(format!(
+                        "{limit} matches limit reached. Use limit={} for more, or refine pattern",
+                        limit * 2
+                    ));
+                }
+                if truncation.truncated {
+                    notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+                }
+                if lines_truncated {
+                    notices.push(format!(
+                        "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+                    ));
+                }
+                if !notices.is_empty() {
+                    text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+                    return ToolResult::success_with_details(
+                        text,
+                        json!({
+                            "truncation": if truncation.truncated { Some(super::truncation_json(&truncation)) } else { None::<serde_json::Value> },
+                            "matchLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> },
+                            "linesTruncated": lines_truncated
+                        }),
+                    );
+                }
+
+                ToolResult::success(text)
+            }
+            Ok(Err(error)) => {
+                let _ = stdout_fut.await;
+                let _ = stderr_fut.await;
+                ToolResult::error(format!("Failed to run ripgrep: {error}"))
+            }
+            Err(_) => {
+                kill_on_timeout(&mut child).await;
+                let _ = stdout_fut.await;
+                let _ = stderr_fut.await;
+                ToolResult::error(format!(
+                    "Grep timed out after {DEFAULT_GREP_TIMEOUT_SECS}s. Try a simpler pattern or narrow the search path."
+                ))
+            }
+        }
     }
 }
 

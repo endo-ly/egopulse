@@ -26,7 +26,7 @@ pub async fn handle_command(
 
     match command {
         "/providers" => {
-            let config = state.current_config()?;
+            let config = state.try_current_config()?;
             let scope = command_scope(context);
             let effective = resolved_for_scope(&config, &scope)?;
             let lines = config
@@ -46,7 +46,7 @@ pub async fn handle_command(
             .await
             .map(Some),
         "/models" => {
-            let config = state.current_config()?;
+            let config = state.try_current_config()?;
             let scope = parse_scope(&parts[1..], command_scope(context))?;
             let resolved = resolved_for_scope(&config, &scope)?;
             let provider = config
@@ -73,7 +73,7 @@ async fn handle_provider_command(
     context: &SurfaceContext,
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
-    let config = state.current_config()?;
+    let config = state.try_current_config()?;
     let scope = parse_scope(&parts[1..], command_scope(context))?;
 
     if parts.len() == 1 {
@@ -131,7 +131,7 @@ async fn handle_model_command(
     context: &SurfaceContext,
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
-    let config = state.current_config()?;
+    let config = state.try_current_config()?;
     let scope = parse_scope(&parts[1..], command_scope(context))?;
     let resolved = resolved_for_scope(&config, &scope)?;
 

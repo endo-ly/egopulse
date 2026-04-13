@@ -72,6 +72,7 @@ mod tests {
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use serial_test::serial;
+    use std::sync::Arc;
 
     #[test]
     fn is_declarative_only_reply_detects_patterns() {
@@ -145,7 +146,7 @@ mod tests {
             .expect("should succeed after retry");
         assert_eq!(reply, "Here is the answer you need.");
 
-        let chat_id = crate::storage::call_blocking(state.db.clone(), move |db| {
+        let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:declarative-guard",

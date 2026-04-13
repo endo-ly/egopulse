@@ -367,7 +367,7 @@ mod tests {
         let items = provider_selector_items();
         assert!(!items.is_empty());
         assert!(items.iter().any(|i| i.value == "openai"));
-        assert!(items.iter().any(|i| i.value == "custom"));
+        assert!(items.iter().any(|i| i.value == "lmstudio"));
     }
 
     #[test]

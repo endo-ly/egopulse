@@ -52,11 +52,16 @@ impl Clone for AppState {
 }
 
 impl AppState {
-    /// Returns the latest config, reloading from disk when a config path is known.
-    pub fn current_config(&self) -> Result<Config, EgoPulseError> {
+    /// 現在の設定スナップショットを返す。
+    pub fn current_config(&self) -> Arc<Config> {
+        Arc::new(self.config.clone())
+    }
+
+    /// 設定ファイルパスがある場合はディスクから再読込した最新設定を返す。
+    pub fn try_current_config(&self) -> Result<Arc<Config>, EgoPulseError> {
         match self.config_path.as_deref() {
-            Some(path) => Ok(Config::load_allow_missing_api_key(Some(path))?),
-            None => Ok(self.config.clone()),
+            Some(path) => Ok(Arc::new(Config::load_allow_missing_api_key(Some(path))?)),
+            None => Ok(self.current_config()),
         }
     }
 
@@ -69,7 +74,7 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.current_config()?;
+        let config = self.try_current_config()?;
         Ok(Arc::from(create_provider(
             &config.resolve_llm_for_channel(channel)?,
         )?))
@@ -81,7 +86,7 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.current_config()?;
+        let config = self.try_current_config()?;
         Ok(Arc::from(create_provider(&config.resolve_global_llm())?))
     }
 }
@@ -175,7 +180,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     if state.config.web_enabled() {
         has_active_channels = true;
         let web_state = state.clone();
-        let host = state.config.web_host();
+        let host = state.config.web_host().to_owned();
         let port = state.config.web_port();
         info!("Starting Web UI server on {host}:{port}");
         let handle =
@@ -315,7 +320,7 @@ async fn write_startup_status(state: &AppState) {
     let web = if state.config.web_enabled() {
         Some(WebChannelStatus {
             enabled: true,
-            host: Some(state.config.web_host()),
+            host: Some(state.config.web_host().to_owned()),
             port: Some(state.config.web_port()),
         })
     } else {
