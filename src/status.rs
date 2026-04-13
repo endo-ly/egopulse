@@ -196,6 +196,18 @@ fn format_channels(channels: &ChannelsStatus, lines: &mut Vec<String>) {
     }
 }
 
+/// `status.json` からスナップショットを読み取り、表示する。
+pub fn run_status(json_output: bool) -> Result<(), String> {
+    let state_root = crate::config::default_state_root().map_err(|e| e.to_string())?;
+    let snapshot = read_status(&state_root).ok_or("EgoPulse has not been started yet")?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&snapshot).unwrap());
+    } else {
+        print!("{}", format_snapshot(&snapshot));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -167,6 +167,13 @@ impl ToolRegistry {
         self.mcp_manager = Some(manager);
     }
 
+    /// Returns a reference to the MCP manager, if configured.
+    pub fn mcp_manager(
+        &self,
+    ) -> Option<&std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>> {
+        self.mcp_manager.as_ref()
+    }
+
     /// Collect tool definitions synchronously (internal only).
     /// External callers must use [`definitions_async`] to avoid blocking an async runtime.
     #[allow(dead_code)]

@@ -14,6 +14,7 @@ use egopulse::gateway::{self, GatewayAction};
 use egopulse::logging::init_logging;
 use egopulse::runtime;
 use egopulse::setup;
+use egopulse::status;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -49,6 +50,12 @@ enum Command {
         action: Option<GatewayAction>,
     },
     Update,
+    /// Show last startup status (MCP, channels, provider).
+    Status {
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parses the CLI, runs the requested command, and exits with status 1 on failure.
@@ -68,6 +75,11 @@ async fn run() -> Result<(), EgoPulseError> {
         return setup::run_setup_wizard(cli.config.clone())
             .await
             .map_err(EgoPulseError::Internal);
+    }
+
+    // status は設定ファイル不要で即座に実行する。
+    if let Some(Command::Status { json }) = cli.command {
+        return status::run_status(json).map_err(EgoPulseError::Internal);
     }
 
     match cli.command {
@@ -139,7 +151,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
-        Some(Command::Gateway { .. }) | Some(Command::Update) => {
+        Some(Command::Gateway { .. }) | Some(Command::Update) | Some(Command::Status { .. }) => {
             unreachable!("handled without config")
         }
         None => runtime::run_tui(config, resolved_config_path).await,

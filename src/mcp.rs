@@ -292,10 +292,7 @@ impl McpManager {
         connected.sort_by(|a, b| a.name.cmp(&b.name));
         failed.sort_by(|a, b| a.name.cmp(&b.name));
 
-        crate::status::McpStatus {
-            connected,
-            failed,
-        }
+        crate::status::McpStatus { connected, failed }
     }
 
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
