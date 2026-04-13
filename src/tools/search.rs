@@ -3,17 +3,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::llm::ToolDefinition;
 
 use super::text::{format_size, truncate_head};
 use super::{
-    DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES,
-    GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
+    DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_GREP_TIMEOUT_SECS, DEFAULT_LS_LIMIT,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
 };
 
 pub(crate) fn resolve_workspace_path(
@@ -59,6 +62,51 @@ pub(crate) fn resolve_workspace_path(
     }
 
     Ok(canonical_candidate)
+}
+
+/// grep パターンの長さおよび括弧のネスト深さを検証する。
+///
+/// ReDoS（Regular Expression Denial of Service）攻撃を防止するため、
+/// パターン長は 1024 文字まで、開き括弧の連続ネスト深さは 10 までに制限する。
+fn validate_grep_pattern(pattern: &str) -> Result<(), String> {
+    const MAX_PATTERN_LEN: usize = 1024;
+    const MAX_NESTING_DEPTH: usize = 10;
+
+    if pattern.len() > MAX_PATTERN_LEN {
+        return Err(format!(
+            "Pattern too long: {} chars (max {MAX_PATTERN_LEN}). Use a shorter pattern or enable literal mode.",
+            pattern.len()
+        ));
+    }
+
+    let mut depth = 0usize;
+    for ch in pattern.chars() {
+        if ch == '(' {
+            depth += 1;
+            if depth > MAX_NESTING_DEPTH {
+                return Err(format!(
+                    "Pattern nesting too deep: exceeds {MAX_NESTING_DEPTH} levels. Simplify the pattern or enable literal mode."
+                ));
+            }
+        } else if ch == ')' {
+            depth = depth.saturating_sub(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// タイムアウト時にプロセスグループへ SIGKILL を送信し、終了を待機する。
+async fn kill_on_timeout(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if ret != 0 {
+            let _ = child.start_kill();
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 /// Searches file contents via ripgrep with regex/literal and context line support.
@@ -126,6 +174,9 @@ impl Tool for GrepTool {
         let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) else {
             return ToolResult::error("Missing required parameter: pattern".to_string());
         };
+        if let Err(error) = validate_grep_pattern(pattern) {
+            return ToolResult::error(error);
+        }
         let requested_path = input
             .get("path")
             .and_then(|value| value.as_str())
@@ -185,14 +236,54 @@ impl Tool for GrepTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = match command.output().await {
-            Ok(output) => output,
+        let mut child = match command.spawn() {
+            Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ToolResult::error(
                     "ripgrep (rg) is not available and could not be downloaded".to_string(),
                 );
             }
             Err(error) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
+        };
+
+        let status = match timeout(
+            Duration::from_secs(DEFAULT_GREP_TIMEOUT_SECS),
+            child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
+            Err(_) => {
+                kill_on_timeout(&mut child).await;
+                return ToolResult::error(
+                    "Grep timed out after 30s. Try a simpler pattern or narrow the search path."
+                        .to_string(),
+                );
+            }
+        };
+
+        let stdout = match child.stdout {
+            Some(ref mut stdout) => {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).replace("\r\n", "\n")
+            }
+            None => String::new(),
+        };
+        let stderr = match child.stderr {
+            Some(ref mut stderr) => {
+                let mut buf = Vec::new();
+                let _ = stderr.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).trim().to_string()
+            }
+            None => String::new(),
+        };
+
+        let output = std::process::Output {
+            status,
+            stdout: stdout.into_bytes(),
+            stderr: stderr.into_bytes(),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");

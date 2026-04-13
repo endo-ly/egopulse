@@ -30,6 +30,7 @@ const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,37 +317,11 @@ mod tests {
     use super::{ToolExecutionContext, ToolRegistry};
     use crate::config::{ChannelConfig, Config, ProviderConfig};
     use crate::skills::SkillManager;
+    use crate::test_env::EnvVarGuard;
 
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
-
-    struct HomeGuard {
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let original = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", path);
-            }
-            Self { original }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe {
-                    std::env::set_var("HOME", value);
-                },
-                None => unsafe {
-                    std::env::remove_var("HOME");
-                },
-            }
-        }
-    }
 
     fn test_config(data_dir: &str) -> Config {
         Config {
@@ -400,7 +375,7 @@ mod tests {
     #[serial]
     async fn read_respects_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -418,7 +393,7 @@ mod tests {
     #[serial]
     async fn read_reports_supported_images() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -450,7 +425,7 @@ mod tests {
     #[serial]
     async fn write_creates_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
@@ -482,7 +457,7 @@ mod tests {
     #[serial]
     async fn edit_replaces_exact_match_and_returns_diff() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -525,7 +500,7 @@ mod tests {
     #[serial]
     async fn ls_lists_directory_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("nested")).expect("nested");
@@ -543,7 +518,7 @@ mod tests {
     #[serial]
     async fn find_discovers_matching_files() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
@@ -561,7 +536,7 @@ mod tests {
     #[serial]
     async fn grep_finds_matching_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
@@ -579,7 +554,7 @@ mod tests {
     #[serial]
     async fn bash_runs_in_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -610,7 +585,7 @@ mod tests {
     #[serial]
     async fn activate_skill_loads_skill_instructions() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let skills_dir = config.skills_dir().expect("skills_dir");
         std::fs::create_dir_all(skills_dir.join("pdf")).expect("skill dir");
