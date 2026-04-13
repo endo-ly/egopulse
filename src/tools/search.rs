@@ -72,10 +72,10 @@ fn validate_grep_pattern(pattern: &str, literal: bool) -> Result<(), String> {
     const MAX_PATTERN_LEN: usize = 1024;
     const MAX_NESTING_DEPTH: usize = 10;
 
-    if pattern.len() > MAX_PATTERN_LEN {
+    let char_count = pattern.chars().count();
+    if char_count > MAX_PATTERN_LEN {
         return Err(format!(
-            "Pattern too long: {} chars (max {MAX_PATTERN_LEN}). Use a shorter pattern or enable literal mode.",
-            pattern.len()
+            "Pattern too long: {char_count} chars (max {MAX_PATTERN_LEN}). Use a shorter pattern or enable literal mode."
         ));
     }
 
@@ -265,12 +265,29 @@ impl Tool for GrepTool {
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
 
+        let read_limit = limit;
         let stdout_fut = tokio::spawn(async move {
             let mut buf = Vec::new();
+            let mut line_count = 0usize;
+            let mut exceeded = false;
             if let Some(ref mut stdout) = stdout_pipe {
-                let _ = AsyncReadExt::read_to_end(stdout, &mut buf).await;
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match AsyncReadExt::read(stdout, &mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            line_count += tmp[..n].iter().filter(|&&b| b == b'\n').count();
+                            if line_count > read_limit + 50 || buf.len() > DEFAULT_MAX_BYTES * 2 {
+                                exceeded = true;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
-            buf
+            (buf, exceeded)
         });
         let stderr_fut = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -285,8 +302,11 @@ impl Tool for GrepTool {
 
         match wait_result {
             Ok(Ok(status)) => {
-                let stdout_bytes = stdout_fut.await.unwrap_or_default();
+                let (stdout_bytes, stdout_exceeded) = stdout_fut.await.unwrap_or_default();
                 let stderr_bytes = stderr_fut.await.unwrap_or_default();
+                if stdout_exceeded {
+                    let _ = child.start_kill();
+                }
                 let stdout = String::from_utf8_lossy(&stdout_bytes).replace("\r\n", "\n");
                 let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
 
