@@ -467,7 +467,7 @@ mod tests {
         ));
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
-            config: Arc::new(config.clone()),
+            config: config.clone(),
             config_path: None,
             llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),

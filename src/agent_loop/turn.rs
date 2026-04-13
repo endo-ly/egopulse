@@ -874,7 +874,7 @@ pub(crate) fn build_state(
     ));
     AppState {
         db,
-        config: std::sync::Arc::new(config.clone()),
+        config: config.clone(),
         config_path: None,
         llm_override: Some(std::sync::Arc::from(llm)),
         channels: std::sync::Arc::new(ChannelRegistry::new()),

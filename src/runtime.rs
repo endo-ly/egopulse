@@ -27,7 +27,7 @@ use crate::web::WebAdapter;
 /// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
     pub db: Arc<Database>,
-    pub config: Arc<Config>,
+    pub config: Config,
     pub config_path: Option<PathBuf>,
     pub llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub channels: Arc<ChannelRegistry>,
@@ -40,7 +40,7 @@ impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
-            config: Arc::clone(&self.config),
+            config: self.config.clone(),
             config_path: self.config_path.clone(),
             llm_override: self.llm_override.clone(),
             channels: Arc::clone(&self.channels),
@@ -52,11 +52,16 @@ impl Clone for AppState {
 }
 
 impl AppState {
-    /// Returns the latest config, reloading from disk when a config path is known.
-    pub fn current_config(&self) -> Result<Arc<Config>, EgoPulseError> {
+    /// 現在の設定スナップショットを返す。
+    pub fn current_config(&self) -> Arc<Config> {
+        Arc::new(self.config.clone())
+    }
+
+    /// 設定ファイルパスがある場合はディスクから再読込した最新設定を返す。
+    pub fn try_current_config(&self) -> Result<Arc<Config>, EgoPulseError> {
         match self.config_path.as_deref() {
             Some(path) => Ok(Arc::new(Config::load_allow_missing_api_key(Some(path))?)),
-            None => Ok(Arc::clone(&self.config)),
+            None => Ok(self.current_config()),
         }
     }
 
@@ -69,7 +74,7 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.current_config()?;
+        let config = self.try_current_config()?;
         Ok(Arc::from(create_provider(
             &config.resolve_llm_for_channel(channel)?,
         )?))
@@ -81,7 +86,7 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.current_config()?;
+        let config = self.try_current_config()?;
         Ok(Arc::from(create_provider(&config.resolve_global_llm())?))
     }
 }
@@ -130,7 +135,7 @@ pub async fn build_app_state_with_path(
 
     Ok(AppState {
         db,
-        config: Arc::new(config),
+        config,
         config_path,
         llm_override: None,
         channels,
