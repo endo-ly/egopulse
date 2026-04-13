@@ -162,7 +162,7 @@ fn format_channels(channels: &ChannelsStatus, lines: &mut Vec<String>) {
         let addr = match (&web.host, web.port) {
             (Some(host), Some(port)) => format!(" ({}:{})", host, port),
             (Some(host), None) => format!(" ({})", host),
-            (None, Some(port)) => format!(" (:{}))", port),
+            (None, Some(port)) => format!(" (:{})", port),
             (None, None) => String::new(),
         };
         lines.push(format!(

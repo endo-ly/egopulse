@@ -166,7 +166,7 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
 /// Starts all enabled channels and supervises them until shutdown or failure.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
-    write_startup_status(&state);
+    write_startup_status(&state).await;
 
     let mut has_active_channels = false;
     let mut handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
@@ -303,12 +303,12 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
     )))
 }
 
-fn write_startup_status(state: &AppState) {
-    let mcp = state
-        .tools
-        .mcp_manager()
-        .map(|m| m.blocking_read().status_snapshot())
-        .unwrap_or_default();
+async fn write_startup_status(state: &AppState) {
+    let mcp = if let Some(m) = state.tools.mcp_manager() {
+        m.read().await.status_snapshot()
+    } else {
+        Default::default()
+    };
 
     let resolved_llm = state.config.resolve_global_llm();
 
@@ -353,10 +353,14 @@ fn write_startup_status(state: &AppState) {
         },
     };
 
-    let state_root = std::path::Path::new(&state.config.data_dir)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if let Err(error) = status::write_status(state_root, &snapshot) {
+    let state_root = match crate::config::default_state_root() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!("failed to resolve state root for startup status: {error}");
+            return;
+        }
+    };
+    if let Err(error) = status::write_status(&state_root, &snapshot) {
         tracing::warn!("failed to write startup status: {error}");
     }
 }
