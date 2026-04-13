@@ -169,7 +169,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     if state.config.web_enabled() {
         has_active_channels = true;
         let web_state = state.clone();
-        let host = state.config.web_host().to_string();
+        let host = state.config.web_host().to_owned();
         let port = state.config.web_port();
         info!("Starting Web UI server on {host}:{port}");
         let handle =
