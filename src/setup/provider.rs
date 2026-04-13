@@ -139,7 +139,7 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         label: "Z.AI Coding",
         default_base_url: "https://api.z.ai/api/coding/paas/v4",
         default_model: "glm-5.1",
-        models: &["glm-5.1", "glm-5"],
+        models: &["glm-5.1", "glm-5", "glm-4.7"],
     },
     ProviderPreset {
         id: "minimax",
@@ -218,11 +218,11 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["qwen2.5-coder"],
     },
     ProviderPreset {
-        id: "custom",
-        label: "Custom OpenAI-compatible",
+        id: "lmstudio",
+        label: "LM Studio (local)",
         default_base_url: "",
         default_model: "custom-model",
-        models: &["custom-model"],
+        models: &["google/gemma-4-e4b"],
     },
 ];
 
@@ -367,7 +367,7 @@ mod tests {
         let items = provider_selector_items();
         assert!(!items.is_empty());
         assert!(items.iter().any(|i| i.value == "openai"));
-        assert!(items.iter().any(|i| i.value == "custom"));
+        assert!(items.iter().any(|i| i.value == "lmstudio"));
     }
 
     #[test]
