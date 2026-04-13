@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod runtime;
 pub mod setup;
 pub mod skills;
+pub mod slash_commands;
 pub mod status;
 pub mod storage;
 pub mod text;
