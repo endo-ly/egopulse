@@ -68,8 +68,16 @@ pub struct McpConfigFile {
     pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
+struct FailedServer {
+    name: String,
+    #[expect(dead_code, reason = "将来のリトライや再接続で設定を利用するため保持")]
+    config: McpServerConfig,
+    error: String,
+}
+
 pub struct McpManager {
     servers: Vec<ConnectedServer>,
+    failed_servers: Vec<FailedServer>,
 }
 
 struct ConnectedServer {
@@ -183,10 +191,18 @@ fn sha2_short(input: &str) -> String {
     result[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn convert_transport(tt: &TransportType) -> crate::status::TransportType {
+    match tt {
+        TransportType::Stdio => crate::status::TransportType::Stdio,
+        TransportType::StreamableHttp => crate::status::TransportType::StreamableHttp,
+    }
+}
+
 impl McpManager {
     pub async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
         let configs = load_and_merge_mcp_configs(workspace_dir)?;
         let mut servers = Vec::new();
+        let mut failed_servers = Vec::new();
 
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir).await {
@@ -225,6 +241,11 @@ impl McpManager {
                 }
                 Err(error) => {
                     warn!(server = name, "MCP server connection failed: {error}");
+                    failed_servers.push(FailedServer {
+                        name: name.clone(),
+                        config: (*config).clone(),
+                        error: error.to_string(),
+                    });
                 }
             }
         }
@@ -234,7 +255,44 @@ impl McpManager {
             total = configs.len(),
             "MCP initialization complete"
         );
-        Ok(Self { servers })
+        Ok(Self {
+            servers,
+            failed_servers,
+        })
+    }
+
+    /// 現在の接続状態をスナップショットとして返す。
+    pub fn status_snapshot(&self) -> crate::status::McpStatus {
+        let mut connected: Vec<crate::status::ConnectedMcpServer> = self
+            .servers
+            .iter()
+            .map(|server| {
+                let tools: Vec<String> = server
+                    .cached_tools
+                    .iter()
+                    .map(|t| t.name.as_ref().to_string())
+                    .collect();
+                crate::status::ConnectedMcpServer {
+                    name: server.name.clone(),
+                    transport: convert_transport(&server.config.transport),
+                    tools,
+                }
+            })
+            .collect();
+
+        let mut failed: Vec<crate::status::FailedMcpServer> = self
+            .failed_servers
+            .iter()
+            .map(|server| crate::status::FailedMcpServer {
+                name: server.name.clone(),
+                error: server.error.clone(),
+            })
+            .collect();
+
+        connected.sort_by(|a, b| a.name.cmp(&b.name));
+        failed.sort_by(|a, b| a.name.cmp(&b.name));
+
+        crate::status::McpStatus { connected, failed }
     }
 
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
