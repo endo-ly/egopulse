@@ -421,7 +421,7 @@ fn payload_from_config(
             .to_string_lossy()
             .into_owned(),
         web_enabled: config.web_enabled(),
-        web_host: config.web_host(),
+        web_host: config.web_host().to_string(),
         web_port: config.web_port(),
         web_auth_enabled: config.web_auth_token().is_some(),
         has_api_key: resolved.api_key.is_some(),

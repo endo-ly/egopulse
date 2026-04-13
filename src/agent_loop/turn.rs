@@ -20,6 +20,7 @@ use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
@@ -581,7 +582,7 @@ async fn store_pending_tool_call(
         tool_output: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    call_blocking(state.db.clone(), move |db| db.store_tool_call(&record))
+    call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
         .await
         .map_err(EgoPulseError::from)
 }
@@ -593,7 +594,7 @@ async fn update_tool_call_output(
 ) -> Result<(), EgoPulseError> {
     let tool_call_id = tool_call_id.to_string();
     let output = output.to_string();
-    call_blocking(state.db.clone(), move |db| {
+    call_blocking(Arc::clone(&state.db), move |db| {
         db.update_tool_call_output(&tool_call_id, &output)
     })
     .await
@@ -873,7 +874,7 @@ pub(crate) fn build_state(
     ));
     AppState {
         db,
-        config: config.clone(),
+        config: std::sync::Arc::new(config.clone()),
         config_path: None,
         llm_override: Some(std::sync::Arc::from(llm)),
         channels: std::sync::Arc::new(ChannelRegistry::new()),
@@ -897,6 +898,7 @@ mod tests {
         FailingProvider, FakeProvider, RecordingProvider, build_state_with_provider, cli_context,
     };
     use serial_test::serial;
+    use std::sync::Arc;
 
     use crate::agent_loop::process_turn;
     use crate::error::EgoPulseError;
@@ -939,12 +941,12 @@ mod tests {
             .expect("process turn");
         assert_eq!(reply, "All set");
 
-        let chat_id = call_blocking(state.db.clone(), move |db| {
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id("cli", "cli:tool-flow", Some("tool-flow"), "cli")
         })
         .await
         .expect("chat id");
-        let tool_calls = call_blocking(state.db.clone(), move |db| {
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
             db.get_tool_calls_for_chat(chat_id)
         })
         .await

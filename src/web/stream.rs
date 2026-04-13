@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
@@ -140,7 +141,7 @@ pub(super) async fn start_stream_run(
     let parsed_chat_id = parse_chat_id_from_session_key(raw_session_key);
 
     let (session_key, context) = if let Some(chat_id) = parsed_chat_id {
-        let db = state.app_state.db.clone();
+        let db = Arc::clone(&state.app_state.db);
         let chat_info = call_blocking(db, move |db| db.get_chat_by_id(chat_id))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

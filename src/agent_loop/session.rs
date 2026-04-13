@@ -64,7 +64,7 @@ pub(crate) async fn resolve_chat_id(
     state: &AppState,
     context: &SurfaceContext,
 ) -> Result<i64, EgoPulseError> {
-    call_blocking(state.db.clone(), {
+    call_blocking(Arc::clone(&state.db), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
         let surface_thread = context.surface_thread.clone();
@@ -79,7 +79,7 @@ pub(crate) async fn resolve_chat_id(
 
 /// Lists all persisted sessions available in the local database.
 pub async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary>, EgoPulseError> {
-    call_blocking(state.db.clone(), move |db| db.list_sessions())
+    call_blocking(Arc::clone(&state.db), move |db| db.list_sessions())
         .await
         .map_err(EgoPulseError::from)
 }
@@ -90,7 +90,10 @@ pub async fn load_session_messages(
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let chat_id = resolve_chat_id(state, context).await?;
-    let history = call_blocking(state.db.clone(), move |db| db.get_all_messages(chat_id)).await?;
+    let history = call_blocking(Arc::clone(&state.db), move |db| {
+        db.get_all_messages(chat_id)
+    })
+    .await?;
     Ok(history
         .into_iter()
         .map(|message| {
@@ -112,7 +115,7 @@ pub(crate) async fn load_messages_for_turn(
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
     let max_history_messages = state.config.max_history_messages;
-    let snapshot = call_blocking(state.db.clone(), move |db| {
+    let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
         db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
@@ -363,7 +366,7 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
-    let updated_at = call_blocking(state.db.clone(), move |db| {
+    let updated_at = call_blocking(Arc::clone(&state.db), move |db| {
         db.store_message_with_session(&message, &session_json, session_updated_at.as_deref())
     })
     .await?;
@@ -464,7 +467,7 @@ mod tests {
         ));
         AppState {
             db: Arc::new(Database::new(&data_dir).expect("db")),
-            config: config.clone(),
+            config: Arc::new(config.clone()),
             config_path: None,
             llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),
@@ -485,7 +488,7 @@ mod tests {
         );
         let context = cli_context("conflict");
 
-        let chat_id = call_blocking(state.db.clone(), {
+        let chat_id = call_blocking(Arc::clone(&state.db), {
             let channel = context.channel.clone();
             let session_key = context.session_key();
             let surface_thread = context.surface_thread.clone();
@@ -510,7 +513,7 @@ mod tests {
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
         };
-        call_blocking(state.db.clone(), {
+        call_blocking(Arc::clone(&state.db), {
             let message = seed_message.clone();
             move |db| {
                 db.store_message_with_session(
@@ -524,7 +527,7 @@ mod tests {
         .await
         .expect("seed session");
 
-        let stale_session_updated_at = call_blocking(state.db.clone(), move |db| {
+        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session(chat_id)
                 .map(|session| session.expect("session").1)
         })
@@ -539,7 +542,7 @@ mod tests {
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:01Z".to_string(),
         };
-        call_blocking(state.db.clone(), {
+        call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
             let expected_updated_at = stale_session_updated_at.clone();
             move |db| {
@@ -623,7 +626,7 @@ mod tests {
         .await
         .expect("persist image turn");
 
-        let (session_json, _) = call_blocking(state.db.clone(), move |db| {
+        let (session_json, _) = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session(chat_id)
                 .map(|session| session.expect("session row"))
         })
@@ -660,7 +663,7 @@ mod tests {
             .await
             .expect("chat id");
 
-        call_blocking(state.db.clone(), move |db| {
+        call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(
                 chat_id,
                 r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"missing-ref","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
@@ -707,7 +710,7 @@ mod tests {
             .collect::<Vec<_>>();
         let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
 
-        call_blocking(state.db.clone(), move |db| {
+        call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(chat_id, &snapshot_json)
         })
         .await
@@ -744,14 +747,14 @@ mod tests {
             .collect::<Vec<_>>();
         let seed_json = serde_json::to_string(&seed_messages).expect("seed json");
 
-        call_blocking(state.db.clone(), {
+        call_blocking(Arc::clone(&state.db), {
             let seed_json = seed_json.clone();
             move |db| db.save_session(chat_id, &seed_json)
         })
         .await
         .expect("save seed snapshot");
 
-        let stale_session_updated_at = call_blocking(state.db.clone(), move |db| {
+        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session(chat_id)
                 .map(|session| session.expect("session").1)
         })
@@ -770,7 +773,7 @@ mod tests {
         latest_messages.push(Message::text("assistant", "concurrent"));
         let latest_json = serde_json::to_string(&latest_messages).expect("latest json");
 
-        call_blocking(state.db.clone(), {
+        call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
             let latest_json = latest_json.clone();
             let expected_updated_at = stale_session_updated_at.clone();

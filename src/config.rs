@@ -282,11 +282,11 @@ impl Config {
     }
 
     /// Returns the web channel host, defaulting to `127.0.0.1`.
-    pub fn web_host(&self) -> String {
+    pub fn web_host(&self) -> &str {
         self.channels
             .get("web")
-            .and_then(|c| c.host.clone())
-            .unwrap_or_else(|| default_web_host().to_string())
+            .and_then(|c| c.host.as_deref())
+            .unwrap_or(default_web_host())
     }
 
     /// Returns the web channel port, defaulting to `10961`.
@@ -363,10 +363,10 @@ impl Config {
     }
 
     /// Telegram bot username for group mention detection.
-    pub fn telegram_bot_username(&self) -> Option<String> {
+    pub fn telegram_bot_username(&self) -> Option<&str> {
         self.channels
             .get("telegram")
-            .and_then(|c| c.bot_username.clone())
+            .and_then(|c| c.bot_username.as_deref())
     }
 
     /// Directory containing skill definitions.

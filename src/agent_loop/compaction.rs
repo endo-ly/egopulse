@@ -220,6 +220,7 @@ mod tests {
     use crate::llm::{Message, MessagesResponse};
     use crate::storage::call_blocking;
     use serial_test::serial;
+    use std::sync::Arc;
 
     #[test]
     fn truncate_compaction_summary_input_keeps_exact_character_limit() {
@@ -259,7 +260,7 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-success");
-        let chat_id = call_blocking(state.db.clone(), move |db| {
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-success",
@@ -276,7 +277,7 @@ mod tests {
             Message::text("assistant", "old-assistant-2"),
         ];
         let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
-        call_blocking(state.db.clone(), move |db| {
+        call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(chat_id, &seeded_json)
         })
         .await
@@ -362,7 +363,7 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-fallback");
-        let chat_id = call_blocking(state.db.clone(), move |db| {
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-fallback",
@@ -379,7 +380,7 @@ mod tests {
             Message::text("assistant", "old-assistant-2"),
         ];
         let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
-        call_blocking(state.db.clone(), move |db| {
+        call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(chat_id, &seeded_json)
         })
         .await

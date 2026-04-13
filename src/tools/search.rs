@@ -246,11 +246,8 @@ impl Tool for GrepTool {
             Err(error) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
         };
 
-        let status = match timeout(
-            Duration::from_secs(DEFAULT_GREP_TIMEOUT_SECS),
-            child.wait(),
-        )
-        .await
+        let status = match timeout(Duration::from_secs(DEFAULT_GREP_TIMEOUT_SECS), child.wait())
+            .await
         {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),

@@ -23,7 +23,7 @@ use crate::web::WebAdapter;
 /// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
     pub db: Arc<Database>,
-    pub config: Config,
+    pub config: Arc<Config>,
     pub config_path: Option<PathBuf>,
     pub llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub channels: Arc<ChannelRegistry>,
@@ -36,7 +36,7 @@ impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
-            config: self.config.clone(),
+            config: Arc::clone(&self.config),
             config_path: self.config_path.clone(),
             llm_override: self.llm_override.clone(),
             channels: Arc::clone(&self.channels),
@@ -49,10 +49,10 @@ impl Clone for AppState {
 
 impl AppState {
     /// Returns the latest config, reloading from disk when a config path is known.
-    pub fn current_config(&self) -> Result<Config, EgoPulseError> {
+    pub fn current_config(&self) -> Result<Arc<Config>, EgoPulseError> {
         match self.config_path.as_deref() {
-            Some(path) => Ok(Config::load_allow_missing_api_key(Some(path))?),
-            None => Ok(self.config.clone()),
+            Some(path) => Ok(Arc::new(Config::load_allow_missing_api_key(Some(path))?)),
+            None => Ok(Arc::clone(&self.config)),
         }
     }
 
@@ -126,7 +126,7 @@ pub async fn build_app_state_with_path(
 
     Ok(AppState {
         db,
-        config,
+        config: Arc::new(config),
         config_path,
         llm_override: None,
         channels,
@@ -169,7 +169,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     if state.config.web_enabled() {
         has_active_channels = true;
         let web_state = state.clone();
-        let host = state.config.web_host();
+        let host = state.config.web_host().to_string();
         let port = state.config.web_port();
         info!("Starting Web UI server on {host}:{port}");
         let handle =
