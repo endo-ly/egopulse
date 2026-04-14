@@ -56,7 +56,7 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
             .await
             .map_err(EgoPulseError::from)?;
 
-            if let Some(response) = crate::slash_commands::handle_slash_command(
+            let response = crate::slash_commands::handle_slash_command(
                 state,
                 slash_chat_id,
                 &context.channel,
@@ -64,16 +64,15 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
                 None,
             )
             .await
-            {
-                writeln!(stdout, "assistant: {response}")
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
-                stdout
-                    .flush()
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
-                continue;
-            }
+            .unwrap_or_else(crate::slash_commands::unknown_command_response);
+            writeln!(stdout, "assistant: {response}")
+                .map_err(crate::error::StorageError::Io)
+                .map_err(EgoPulseError::from)?;
+            stdout
+                .flush()
+                .map_err(crate::error::StorageError::Io)
+                .map_err(EgoPulseError::from)?;
+            continue;
         }
 
         writeln!(stdout, "you: {trimmed}")

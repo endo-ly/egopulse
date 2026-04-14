@@ -432,7 +432,8 @@ async fn run_loop(
                                             chat.status = "Command applied".to_string();
                                             chat.conversation_scroll = 0;
                                         } else {
-                                            chat.status = "Unknown command".to_string();
+                                            chat.status =
+                                                crate::slash_commands::unknown_command_response();
                                         }
                                     }
                                     Err(e) => {

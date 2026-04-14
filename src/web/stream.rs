@@ -230,7 +230,7 @@ pub(super) async fn start_stream_run(
             Some(actor),
         )
         .await
-        .unwrap_or_else(|| "Unknown command.".to_string());
+        .unwrap_or_else(crate::slash_commands::unknown_command_response);
 
         state
             .run_hub
