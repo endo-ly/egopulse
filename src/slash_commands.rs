@@ -19,17 +19,12 @@ use crate::storage::call_blocking;
 
 /// 入力テキストがスラッシュコマンドかどうかを判定する。
 ///
-/// 先頭のメンション (`@botname `, `<@U123456> `, `@bot/command`) を除去した後、
-/// 残りのテキストが `/` で始まる場合に `true` を返す。
-/// `//` (二重スラッシュ) や単独の `/` はコマンドとは見なさない。
+/// 先頭のメンションをループで除去した後、残りのテキストが `/` で始まる場合に
+/// `true` を返す。`//` (二重スラッシュ) や単独の `/` はコマンドとは見なさない。
 pub fn is_slash_command(text: &str) -> bool {
-    let normalized = strip_mentions(text.trim());
-    if normalized.is_empty() {
+    let Some(normalized) = normalized_slash_command(text) else {
         return false;
-    }
-    if !normalized.starts_with('/') {
-        return false;
-    }
+    };
     // `//` を除外
     if normalized.starts_with("//") {
         return false;
@@ -39,8 +34,7 @@ pub fn is_slash_command(text: &str) -> bool {
         return false;
     }
     // `/ ` のようにスペースのみ続く場合も除外
-    let trimmed = normalized.trim();
-    if trimmed.len() == 1 {
+    if normalized.trim().len() == 1 {
         return false;
     }
     true
@@ -56,10 +50,7 @@ pub async fn handle_slash_command(
     command_text: &str,
     sender_id: Option<&str>,
 ) -> Option<String> {
-    let normalized = strip_mentions(command_text.trim());
-    if normalized.is_empty() {
-        return None;
-    }
+    let normalized = normalized_slash_command(command_text)?;
 
     let parts: Vec<&str> = normalized.splitn(2, char::is_whitespace).collect();
     let raw_command = parts.first().copied().unwrap_or("");
@@ -84,51 +75,44 @@ pub async fn handle_slash_command(
 }
 
 // ---------------------------------------------------------------------------
-// Mention stripping
+// 正規化
 // ---------------------------------------------------------------------------
 
-/// 先頭のメンションプレフィクスを除去する。
+/// 先頭のメンションをループで除去し、スラッシュコマンド部分を返す。
 ///
-/// パターン:
-/// - `@botname ` (Telegram スタイル)
-/// - `<@U123456> ` (Discord スタイル)
-/// - `@botname/command` (メンションとスラッシュの間にスペースなし)
-fn strip_mentions(text: &str) -> &str {
-    let mut rest = text;
-
-    // Discord スタイル: `<@...> `
-    if let Some(end) = rest.find('>') {
-        let prefix = &rest[..=end];
-        if prefix.starts_with("<@")
-            && prefix
-                .chars()
-                .all(|c| c == '<' || c == '@' || c == '!' || c == '>' || c.is_ascii_alphanumeric())
-        {
-            rest = rest[end + 1..].trim_start();
+/// 対応パターン:
+/// - `<@U123456>` (Discord スタイル) — 複数回出現してもループで全て除去
+/// - `@botname` (Telegram スタイル) — 複数回出現してもループで全て除去
+fn normalized_slash_command(text: &str) -> Option<&str> {
+    let mut s = text.trim_start();
+    loop {
+        if s.starts_with('/') {
+            return Some(s);
         }
-    }
-
-    // Telegram スタイル: `@botname ` または `@botname/command`
-    if rest.starts_with('@') {
-        // 次のスペースまたは `/` までをメンションとして扱う
-        let mention_end = rest.find([' ', '/']).unwrap_or(rest.len());
-        if mention_end > 1 {
-            // `@` の後に少なくとも1文字ある
-            let after_mention = &rest[mention_end..];
-            if after_mention.starts_with('/') {
-                // `@bot/command` パターン: メンション部分だけ除去
-                rest = after_mention;
-            } else if after_mention.starts_with(' ') {
-                rest = after_mention.trim_start();
-            } else {
-                // `@bot` のみ → メンションはコマンドではない
-                // (テキスト全体が `@bot` のような場合)
-                rest = after_mention.trim_start();
+        if s.starts_with("<@") {
+            let end = s.find('>')?;
+            s = s[end + 1..].trim_start();
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix('@') {
+            if rest.is_empty() {
+                return None;
             }
+            let end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() || *c == '/')
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            s = rest[end..].trim_start();
+            continue;
         }
+        return None;
     }
+}
 
-    rest
+/// 未知コマンド時の応答メッセージを返す。
+pub fn unknown_command_response() -> String {
+    "Unknown command.".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +306,11 @@ mod tests {
     #[test]
     fn is_slash_case_insensitive() {
         assert!(is_slash_command("/STATUS"));
+    }
+
+    #[test]
+    fn is_slash_multiple_mentions() {
+        assert!(is_slash_command("<@U123>   @bot   /status"));
     }
 
     // -- Test helper: no-op LLM provider -----------------------------------------
