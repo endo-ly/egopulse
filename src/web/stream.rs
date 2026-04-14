@@ -192,6 +192,60 @@ pub(super) async fn start_stream_run(
     let run_id = Uuid::new_v4().to_string();
     state.run_hub.create(&run_id, actor.to_string()).await;
 
+    if crate::slash_commands::is_slash_command(&message) {
+        let slash_chat_id = match call_blocking(std::sync::Arc::clone(&state.app_state.db), {
+            let channel = context.channel.clone();
+            let ext_id = context.surface_thread.clone();
+            let chat_type = context.chat_type.clone();
+            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
+        })
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                state
+                    .run_hub
+                    .publish(
+                        &run_id,
+                        "error",
+                        json!({"error": e.to_string()}).to_string(),
+                    )
+                    .await;
+                state
+                    .run_hub
+                    .remove_later(run_id.clone(), RUN_TTL_SECONDS)
+                    .await;
+                return Ok(StartedRun {
+                    run_id,
+                    session_key,
+                });
+            }
+        };
+
+        let response = crate::slash_commands::handle_slash_command(
+            &state.app_state,
+            slash_chat_id,
+            &context.channel,
+            &message,
+            None,
+        )
+        .await
+        .unwrap_or_else(|| "Unknown command.".to_string());
+
+        state
+            .run_hub
+            .publish(&run_id, "done", json!({"response": response}).to_string())
+            .await;
+        state
+            .run_hub
+            .remove_later(run_id.clone(), RUN_TTL_SECONDS)
+            .await;
+        return Ok(StartedRun {
+            run_id,
+            session_key,
+        });
+    }
+
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
     let context_for_task = context;

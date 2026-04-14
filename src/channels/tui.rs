@@ -24,7 +24,6 @@ use uuid::Uuid;
 use crate::agent_loop;
 use crate::agent_loop::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
-use crate::llm_profile;
 use crate::runtime::AppState;
 use crate::storage::SessionSummary;
 
@@ -390,21 +389,53 @@ async fn run_loop(
                     }
                     PendingAction::SendMessage(prompt) => {
                         if let View::Chat(chat) = &mut app.view {
-                            match llm_profile::handle_command(&app.state, &chat.context, &prompt)
-                                .await
-                            {
-                                Ok(Some(response)) => {
-                                    chat.messages.push(RenderedMessage {
-                                        role: "assistant".to_string(),
-                                        content: response,
-                                    });
-                                    chat.status = "Command applied".to_string();
-                                    chat.conversation_scroll = 0;
+                            if crate::slash_commands::is_slash_command(&prompt) {
+                                let slash_chat_id = crate::storage::call_blocking(
+                                    std::sync::Arc::clone(&app.state.db),
+                                    {
+                                        let channel = chat.context.channel.clone();
+                                        let thread = chat.context.surface_thread.clone();
+                                        let chat_type = chat.context.chat_type.clone();
+                                        move |db| {
+                                            db.resolve_or_create_chat_id(
+                                                &channel,
+                                                &format!("tui:{thread}"),
+                                                Some(&thread),
+                                                &chat_type,
+                                            )
+                                        }
+                                    },
+                                )
+                                .await;
+
+                                match slash_chat_id {
+                                    Ok(chat_id) => {
+                                        if let Some(response) =
+                                            crate::slash_commands::handle_slash_command(
+                                                &app.state,
+                                                chat_id,
+                                                &chat.context.channel,
+                                                &prompt,
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            chat.messages.push(RenderedMessage {
+                                                role: "assistant".to_string(),
+                                                content: response,
+                                            });
+                                            chat.status = "Command applied".to_string();
+                                            chat.conversation_scroll = 0;
+                                        } else {
+                                            chat.status = "Unknown command".to_string();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        chat.status = format!("Command error: {e}");
+                                    }
                                 }
-                                Ok(None) => start_send(app, prompt),
-                                Err(error) => {
-                                    chat.status = format!("Command error: {error}");
-                                }
+                            } else {
+                                start_send(app, prompt);
                             }
                         }
                     }
