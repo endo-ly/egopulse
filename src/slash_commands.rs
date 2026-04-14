@@ -62,7 +62,12 @@ pub async fn handle_slash_command(
     }
 
     let parts: Vec<&str> = normalized.splitn(2, char::is_whitespace).collect();
-    let command = parts.first().unwrap_or(&"").to_ascii_lowercase();
+    let raw_command = parts.first().copied().unwrap_or("");
+    let bare_command = raw_command
+        .split_once('@')
+        .map(|(cmd, _)| cmd)
+        .unwrap_or(raw_command);
+    let command = bare_command.to_ascii_lowercase();
     let _args = parts.get(1).copied().unwrap_or("");
 
     match command.as_str() {
@@ -141,7 +146,10 @@ async fn handle_new(state: &AppState, chat_id: i64) -> Option<String> {
 }
 
 async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) -> Option<String> {
-    let loaded = load_messages_for_turn(state, chat_id).await.ok()?;
+    let loaded = match load_messages_for_turn(state, chat_id).await {
+        Ok(loaded) => loaded,
+        Err(e) => return Some(format!("Failed to load session: {e}")),
+    };
     if loaded.messages.is_empty() {
         return Some("Session is empty.".to_string());
     }
@@ -153,7 +161,10 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
         surface_thread: String::new(),
         chat_type: String::new(),
     };
-    let llm = state.global_llm().ok()?;
+    let llm = match state.global_llm() {
+        Ok(llm) => llm,
+        Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
+    };
 
     match force_compact(state, &context, chat_id, &loaded.messages, &llm).await {
         Ok(compacted) => {
@@ -178,8 +189,14 @@ async fn handle_status(
     caller_channel: &str,
     sender_id: Option<&str>,
 ) -> Option<String> {
-    let config = state.try_current_config().ok()?;
-    let resolved = config.resolve_llm_for_channel(caller_channel).ok()?;
+    let config = match state.try_current_config() {
+        Ok(config) => config,
+        Err(e) => return Some(format!("Failed to load config: {e}")),
+    };
+    let resolved = match config.resolve_llm_for_channel(caller_channel) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("Failed to resolve LLM: {e}")),
+    };
 
     let messages = call_blocking(Arc::clone(&state.db), move |db| {
         db.get_recent_messages(chat_id, 99999)
@@ -214,11 +231,7 @@ fn handle_skills(state: &AppState) -> String {
 }
 
 fn handle_restart() -> String {
-    if std::path::Path::new("/etc/systemd/system/egopulse.service").exists() {
-        "Restarting via systemctl...".to_string()
-    } else {
-        "Restarting...".to_string()
-    }
+    "Not implemented yet.".to_string()
 }
 
 async fn handle_llm_profile(state: &AppState, caller_channel: &str, input: &str) -> Option<String> {
@@ -481,7 +494,7 @@ mod tests {
 
         // Assert
         let response = result.expect("response");
-        assert!(response.contains("Restarting"), "response: {response}");
+        assert!(response.contains("Not implemented"), "response: {response}");
     }
 
     #[tokio::test]

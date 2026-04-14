@@ -20,83 +20,9 @@ pub(crate) async fn maybe_compact_messages(
         return Ok(messages.to_vec());
     }
 
-    archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages).await;
-
-    let keep_recent = state.config.compact_keep_recent.min(messages.len());
-    if keep_recent == messages.len() {
-        return Ok(messages.to_vec());
-    }
-
-    let split_at = messages.len() - keep_recent;
-    let old_messages = &messages[..split_at];
-    let recent_messages = &messages[split_at..];
-
-    let mut summary_input = String::new();
-    for message in old_messages {
-        let role = &message.role;
-        let text = message_to_text(message);
-        summary_input.push_str(&format!("[{role}]: {text}\n\n"));
-    }
-    summary_input = truncate_compaction_summary_input(summary_input);
-
-    let summarize_prompt = "Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.";
-    let summarize_messages = vec![Message::text(
-        "user",
-        format!("{summarize_prompt}\n\n---\n\n{summary_input}"),
-    )];
-    let timeout_secs = state.config.compaction_timeout_secs;
-    let summary_result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        llm.send_message("You are a helpful summarizer.", summarize_messages, None),
-    )
-    .await;
-
-    let summary = match summary_result {
-        Ok(Ok(response)) => strip_thinking(&response.content),
-        Ok(Err(error)) => {
-            warn!("compaction summarization failed: {error}; falling back to recent messages");
-            return Ok(recent_messages.to_vec());
-        }
-        Err(_) => {
-            warn!(
-                "compaction summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
-                context.channel, chat_id
-            );
-            return Ok(recent_messages.to_vec());
-        }
-    };
-    if summary.trim().is_empty() {
-        warn!("compaction summarization returned empty text; falling back to recent messages");
-        return Ok(recent_messages.to_vec());
-    }
-
-    let mut compacted = vec![Message::text(
-        "user",
-        format!("[Conversation Summary]\n{summary}"),
-    )];
-    if !matches!(recent_messages.first(), Some(message) if message.role == "assistant") {
-        compacted.push(Message::text(
-            "assistant",
-            "Understood, I have the conversation context. How can I help?",
-        ));
-    }
-
-    for message in recent_messages {
-        append_compacted_message(&mut compacted, message);
-    }
-
-    if matches!(compacted.last(), Some(last) if last.role == "assistant") {
-        compacted.pop();
-    }
-
-    Ok(compacted)
+    summarize_and_compact(state, context, chat_id, messages, llm, "compaction").await
 }
 
-/// メッセージ数に関わらず必ず圧縮を実行する。
-///
-/// `maybe_compact_messages` と同一の要約・圧縮ロジックだが、閾値判定をスキップする。
-/// 空セッションの場合は空ベクタを返し、メッセージ数が `compact_keep_recent` 以下の場合は
-/// アーカイブだけ行ってメッセージをそのまま返す。
 pub async fn force_compact(
     state: &AppState,
     context: &SurfaceContext,
@@ -108,6 +34,17 @@ pub async fn force_compact(
         return Ok(Vec::new());
     }
 
+    summarize_and_compact(state, context, chat_id, messages, llm, "force_compact").await
+}
+
+async fn summarize_and_compact(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    messages: &[Message],
+    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    label: &str,
+) -> Result<Vec<Message>, EgoPulseError> {
     archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages).await;
 
     let keep_recent = state.config.compact_keep_recent.min(messages.len());
@@ -142,19 +79,19 @@ pub async fn force_compact(
     let summary = match summary_result {
         Ok(Ok(response)) => strip_thinking(&response.content),
         Ok(Err(error)) => {
-            warn!("force_compact summarization failed: {error}; falling back to recent messages");
+            warn!("{label} summarization failed: {error}; falling back to recent messages");
             return Ok(recent_messages.to_vec());
         }
         Err(_) => {
             warn!(
-                "force_compact summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
+                "{label} summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
                 context.channel, chat_id
             );
             return Ok(recent_messages.to_vec());
         }
     };
     if summary.trim().is_empty() {
-        warn!("force_compact summarization returned empty text; falling back to recent messages");
+        warn!("{label} summarization returned empty text; falling back to recent messages");
         return Ok(recent_messages.to_vec());
     }
 

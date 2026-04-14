@@ -168,38 +168,47 @@ async fn handle_message(
     // グループ/スーパーグループでは message entity の Mention で正確に判定
     let is_group = chat_type != "telegram_private";
     if is_group {
-        let bot_username = state.config.telegram_bot_username();
-        let mentioned = match &bot_username {
-            Some(username) => msg
-                .parse_entities()
-                .into_iter()
-                .flatten()
-                .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
-                .any(|e| {
-                    e.text()
-                        .strip_prefix('@')
-                        .is_some_and(|m| m.eq_ignore_ascii_case(username))
-                }),
-            None => {
-                if BOT_USERNAME_WARN_EMITTED
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    warn!(
-                        chat_id = raw_chat_id,
-                        "telegram_bot_username not set; group messages will be ignored"
-                    );
-                }
-                false
-            }
-        };
+        let is_bot_command = msg
+            .entities()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| matches!(e.kind, MessageEntityKind::BotCommand));
 
-        if !mentioned {
-            debug!(
-                chat_id = raw_chat_id,
-                "Telegram: skipping non-mentioned group message"
-            );
-            return Ok(());
+        if is_bot_command {
+        } else {
+            let bot_username = state.config.telegram_bot_username();
+            let mentioned = match &bot_username {
+                Some(username) => msg
+                    .parse_entities()
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
+                    .any(|e| {
+                        e.text()
+                            .strip_prefix('@')
+                            .is_some_and(|m| m.eq_ignore_ascii_case(username))
+                    }),
+                None => {
+                    if BOT_USERNAME_WARN_EMITTED
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        warn!(
+                            chat_id = raw_chat_id,
+                            "telegram_bot_username not set; group messages will be ignored"
+                        );
+                    }
+                    false
+                }
+            };
+
+            if !mentioned {
+                debug!(
+                    chat_id = raw_chat_id,
+                    "Telegram: skipping non-mentioned group message"
+                );
+                return Ok(());
+            }
         }
     }
 
