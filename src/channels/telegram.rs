@@ -168,13 +168,26 @@ async fn handle_message(
     // グループ/スーパーグループでは message entity の Mention で正確に判定
     let is_group = chat_type != "telegram_private";
     if is_group {
-        let is_bot_command = msg
+        let bot_username = state.config.telegram_bot_username();
+        let msg_text = text.as_str();
+        let is_own_command = msg
             .entities()
             .unwrap_or_default()
             .iter()
-            .any(|e| matches!(e.kind, MessageEntityKind::BotCommand));
+            .filter(|e| matches!(e.kind, MessageEntityKind::BotCommand))
+            .any(|e| {
+                let start = e.offset;
+                let end = start + e.length;
+                let cmd_text = msg_text.get(start..end).unwrap_or("");
+                if let Some(at_pos) = cmd_text.find('@') {
+                    let mention = &cmd_text[at_pos + 1..];
+                    bot_username.is_some_and(|u| mention.eq_ignore_ascii_case(u))
+                } else {
+                    true
+                }
+            });
 
-        if is_bot_command {
+        if is_own_command {
         } else {
             let bot_username = state.config.telegram_bot_username();
             let mentioned = match &bot_username {

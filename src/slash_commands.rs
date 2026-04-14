@@ -102,7 +102,7 @@ fn strip_mentions(text: &str) -> &str {
         if prefix.starts_with("<@")
             && prefix
                 .chars()
-                .all(|c| c == '<' || c == '@' || c == '>' || c.is_ascii_alphanumeric())
+                .all(|c| c == '<' || c == '@' || c == '!' || c == '>' || c.is_ascii_alphanumeric())
         {
             rest = rest[end + 1..].trim_start();
         }
@@ -168,11 +168,15 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
 
     match force_compact(state, &context, chat_id, &loaded.messages, &llm).await {
         Ok(compacted) => {
-            let json = serde_json::to_string(&compacted).ok()?;
+            let json = match serde_json::to_string(&compacted) {
+                Ok(j) => j,
+                Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
+            };
             call_blocking(Arc::clone(&state.db), move |db| {
                 db.save_session(chat_id, &json)
             })
             .await
+            .map_err(|e| format!("Failed to save compacted session: {e}"))
             .ok()?;
             Some(format!(
                 "Compacted {count} messages to {}.",
