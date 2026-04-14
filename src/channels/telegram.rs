@@ -165,9 +165,14 @@ async fn handle_message(
         }
     }
 
-    // グループ/スーパーグループでは message entity の Mention で正確に判定
     let is_group = chat_type != "telegram_private";
-    if is_group {
+    let external_chat_id = raw_chat_id.to_string();
+
+    // グループメンション判定 (スラッシュコマンドと通常メッセージで共用)。
+    // BotCommand エンティティの @botname またはテキストメンションのいずれかで true。
+    let is_mentioned_in_group = if !is_group {
+        true
+    } else {
         let bot_username = state.config.telegram_bot_username();
         let msg_text = text.as_str();
         let is_own_command = msg
@@ -187,8 +192,10 @@ async fn handle_message(
                 }
             });
 
-        if !is_own_command {
-            let mentioned = match &bot_username {
+        if is_own_command {
+            true
+        } else {
+            match &bot_username {
                 Some(username) => msg
                     .parse_entities()
                     .into_iter()
@@ -211,38 +218,23 @@ async fn handle_message(
                     }
                     false
                 }
-            };
-
-            if !mentioned {
-                debug!(
-                    chat_id = raw_chat_id,
-                    "Telegram: skipping non-mentioned group message"
-                );
-                return Ok(());
             }
         }
-    }
-
-    let external_chat_id = raw_chat_id.to_string();
-
-    let context = SurfaceContext {
-        channel: "telegram".to_string(),
-        surface_user: sender_name,
-        surface_thread: external_chat_id.clone(),
-        chat_type: chat_type.clone(),
     };
-
-    info!(
-        chat_id = raw_chat_id,
-        sender = %context.surface_user,
-        text_length = text.len(),
-        "Telegram message received"
-    );
 
     // --- スラッシュコマンドインターセプト ---
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
     if slash_commands::is_slash_command(&text) {
+        // グループではメンション必須
+        if !is_mentioned_in_group {
+            debug!(
+                chat_id = raw_chat_id,
+                "Telegram: skipping non-mentioned slash command in group"
+            );
+            return Ok(());
+        }
+
         let resolved_chat_id = match call_blocking(std::sync::Arc::clone(&state.db), {
             let channel = "telegram".to_string();
             let ext_id = external_chat_id.clone();
@@ -274,10 +266,40 @@ async fn handle_message(
         .await
         {
             send_telegram_response(&bot, msg.chat.id, &response).await;
-            return Ok(());
+        } else {
+            send_telegram_response(
+                &bot,
+                msg.chat.id,
+                &slash_commands::unknown_command_response(),
+            )
+            .await;
         }
+        return Ok(());
     }
     // --- インターセプトここまで ---
+
+    // グループ/スーパーグループではメンション必須 (通常メッセージ向け)
+    if !is_mentioned_in_group {
+        debug!(
+            chat_id = raw_chat_id,
+            "Telegram: skipping non-mentioned group message"
+        );
+        return Ok(());
+    }
+
+    let context = SurfaceContext {
+        channel: "telegram".to_string(),
+        surface_user: sender_name,
+        surface_thread: external_chat_id.clone(),
+        chat_type: chat_type.clone(),
+    };
+
+    info!(
+        chat_id = raw_chat_id,
+        sender = %context.surface_user,
+        text_length = text.len(),
+        "Telegram message received"
+    );
 
     // タイピングインジケーター (バックグラウンドタスクで定期的に送信)
     let typing_bot = bot.clone();

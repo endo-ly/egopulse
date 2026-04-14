@@ -161,19 +161,18 @@ impl EventHandler for Handler {
             true
         };
 
-        if !should_respond {
-            return;
-        }
-
-        if text.is_empty() {
-            return;
-        }
-
         // microclaw パターン: chat_type を "discord" に統一
         let external_chat_id = external_channel_id.to_string();
 
         // --- スラッシュコマンドインターセプト ---
+        // process_turn より先に chat_id を解決し、
+        // スラッシュコマンドであればエージェントループに入らずに即応答する。
         if crate::slash_commands::is_slash_command(&text) {
+            // guild ではメンション必須
+            if msg.guild_id.is_some() && !should_respond {
+                return;
+            }
+
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
@@ -196,8 +195,15 @@ impl EventHandler for Handler {
                     .await
                     {
                         send_discord_response(&ctx, msg.channel_id, &response).await;
-                        return;
+                    } else {
+                        send_discord_response(
+                            &ctx,
+                            msg.channel_id,
+                            &crate::slash_commands::unknown_command_response(),
+                        )
+                        .await;
                     }
+                    return;
                 }
                 Err(e) => {
                     error!("failed to resolve chat_id for slash command: {e}");
@@ -212,6 +218,14 @@ impl EventHandler for Handler {
             }
         }
         // --- インターセプトここまで ---
+
+        if !should_respond {
+            return;
+        }
+
+        if text.is_empty() {
+            return;
+        }
 
         let sender_name = msg.author.name.clone();
 
