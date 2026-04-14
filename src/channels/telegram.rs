@@ -223,13 +223,25 @@ async fn handle_message(
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
     if slash_commands::is_slash_command(&text) {
-        let resolved_chat_id = call_blocking(std::sync::Arc::clone(&state.db), {
+        let resolved_chat_id = match call_blocking(std::sync::Arc::clone(&state.db), {
             let channel = "telegram".to_string();
             let ext_id = external_chat_id.clone();
             move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
         })
         .await
-        .expect("resolve chat_id for slash command");
+        {
+            Ok(id) => id,
+            Err(e) => {
+                error!("failed to resolve chat_id for slash command: {e}");
+                send_telegram_response(
+                    &bot,
+                    msg.chat.id,
+                    "An error occurred processing the command.",
+                )
+                .await;
+                return Ok(());
+            }
+        };
 
         let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
         if let Some(response) = slash_commands::handle_slash_command(

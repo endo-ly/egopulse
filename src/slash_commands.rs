@@ -131,10 +131,13 @@ fn strip_mentions(text: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 async fn handle_new(state: &AppState, chat_id: i64) -> Option<String> {
-    call_blocking(Arc::clone(&state.db), move |db| db.clear_session(chat_id))
-        .await
-        .ok();
-    Some("Session cleared.".to_string())
+    match call_blocking(Arc::clone(&state.db), move |db| db.clear_session(chat_id)).await {
+        Ok(_) => Some("Session cleared.".to_string()),
+        Err(e) => {
+            tracing::warn!("failed to clear session: {e}");
+            Some(format!("Failed to clear session: {e}"))
+        }
+    }
 }
 
 async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) -> Option<String> {
@@ -153,7 +156,18 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
     let llm = state.global_llm().ok()?;
 
     match force_compact(state, &context, chat_id, &loaded.messages, &llm).await {
-        Ok(_) => Some(format!("Compacted {count} messages.")),
+        Ok(compacted) => {
+            let json = serde_json::to_string(&compacted).ok()?;
+            call_blocking(Arc::clone(&state.db), move |db| {
+                db.save_session(chat_id, &json)
+            })
+            .await
+            .ok()?;
+            Some(format!(
+                "Compacted {count} messages to {}.",
+                compacted.len()
+            ))
+        }
         Err(error) => Some(format!("Compaction failed: {error}")),
     }
 }

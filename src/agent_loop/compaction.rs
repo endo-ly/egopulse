@@ -591,7 +591,6 @@ mod tests {
         let text: Vec<String> = result.iter().map(|m| m.content.as_text_lossy()).collect();
         assert!(text.iter().any(|t| t.contains("kept-b")));
         assert!(text.iter().any(|t| t.contains("kept-c")));
-        assert!(text.iter().any(|t| t.contains("kept-c")));
     }
 
     #[tokio::test]

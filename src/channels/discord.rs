@@ -183,18 +183,30 @@ impl EventHandler for Handler {
                 })
                 .await;
 
-            if let Ok(chat_id) = slash_chat_id {
-                let sender_id = msg.author.id.get().to_string();
-                if let Some(response) = crate::slash_commands::handle_slash_command(
-                    &self.app_state,
-                    chat_id,
-                    "discord",
-                    &text,
-                    Some(&sender_id),
-                )
-                .await
-                {
-                    send_discord_response(&ctx, msg.channel_id, &response).await;
+            match slash_chat_id {
+                Ok(chat_id) => {
+                    let sender_id = msg.author.id.get().to_string();
+                    if let Some(response) = crate::slash_commands::handle_slash_command(
+                        &self.app_state,
+                        chat_id,
+                        "discord",
+                        &text,
+                        Some(&sender_id),
+                    )
+                    .await
+                    {
+                        send_discord_response(&ctx, msg.channel_id, &response).await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("failed to resolve chat_id for slash command: {e}");
+                    send_discord_response(
+                        &ctx,
+                        msg.channel_id,
+                        "An error occurred processing the command.",
+                    )
+                    .await;
                     return;
                 }
             }
