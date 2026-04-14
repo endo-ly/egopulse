@@ -172,16 +172,19 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
                 Ok(j) => j,
                 Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
             };
-            call_blocking(Arc::clone(&state.db), move |db| {
+            match call_blocking(Arc::clone(&state.db), move |db| {
                 db.save_session(chat_id, &json)
             })
             .await
-            .map_err(|e| format!("Failed to save compacted session: {e}"))
-            .ok()?;
-            Some(format!(
-                "Compacted {count} messages to {}.",
-                compacted.len()
-            ))
+            {
+                Ok(_) => Some(format!(
+                    "Compacted {count} messages to {}.",
+                    compacted.len()
+                )),
+                Err(e) => Some(format!(
+                    "Compacted {count} messages but failed to save session: {e}"
+                )),
+            }
         }
         Err(error) => Some(format!("Compaction failed: {error}")),
     }
@@ -245,9 +248,10 @@ async fn handle_llm_profile(state: &AppState, caller_channel: &str, input: &str)
         surface_thread: String::new(),
         chat_type: caller_channel.to_string(),
     };
-    llm_profile::handle_command(state, &context, input)
-        .await
-        .ok()?
+    match llm_profile::handle_command(state, &context, input).await {
+        Ok(result) => result,
+        Err(e) => Some(format!("LLM profile error: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

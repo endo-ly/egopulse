@@ -183,13 +183,11 @@ async fn handle_message(
                     let mention = &cmd_text[at_pos + 1..];
                     bot_username.is_some_and(|u| mention.eq_ignore_ascii_case(u))
                 } else {
-                    true
+                    bot_username.is_some()
                 }
             });
 
-        if is_own_command {
-        } else {
-            let bot_username = state.config.telegram_bot_username();
+        if !is_own_command {
             let mentioned = match &bot_username {
                 Some(username) => msg
                     .parse_entities()

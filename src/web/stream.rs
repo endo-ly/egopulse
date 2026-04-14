@@ -227,7 +227,7 @@ pub(super) async fn start_stream_run(
             slash_chat_id,
             &context.channel,
             &message,
-            None,
+            Some(actor),
         )
         .await
         .unwrap_or_else(|| "Unknown command.".to_string());

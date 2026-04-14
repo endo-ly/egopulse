@@ -390,6 +390,11 @@ async fn run_loop(
                     PendingAction::SendMessage(prompt) => {
                         if let View::Chat(chat) = &mut app.view {
                             if crate::slash_commands::is_slash_command(&prompt) {
+                                chat.messages.push(RenderedMessage {
+                                    role: "user".to_string(),
+                                    content: prompt.clone(),
+                                });
+                                chat.conversation_scroll = 0;
                                 let slash_chat_id = crate::storage::call_blocking(
                                     std::sync::Arc::clone(&app.state.db),
                                     {
