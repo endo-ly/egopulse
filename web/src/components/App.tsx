@@ -121,13 +121,20 @@ export function App() {
         version={health.version ?? ""}
         sessions={sessions.sessions}
         selectedSession={sessions.selectedSession}
-        onNewSession={sessions.handleNewSession}
+        onNewSession={() => {
+          sessions.handleNewSession();
+          setIsSidebarOpen(false);
+        }}
         onSelectSession={(key) => {
           sessions.selectedSessionRef.current = key;
           sessions.setSelectedSession(key);
           void sessions.loadHistory(key);
+          setIsSidebarOpen(false);
         }}
-        onOpenSettings={() => setShowSettings(true)}
+        onOpenSettings={() => {
+          setShowSettings(true);
+          setIsSidebarOpen(false);
+        }}
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen(false)}
       />
