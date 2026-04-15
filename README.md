@@ -342,6 +342,22 @@ cargo run -p egopulse -- ask "hello"     # 単発
 cargo run -p egopulse -- run             # 全チャネル
 ```
 
+### systemd運用中の再ビルド・差し替え
+
+WebUI等を変更した場合、バイナリに資産が埋め込まれているためリビルド→差し替え→再起動が必要。`build.rs`が`web/src`のmtimeを監視し、変更があれば自動で`npm run build`も実行する。
+
+実行中バイナリは上書きできないため **stop → cp → start** の順が必要。
+
+```bash
+# 手動の場合
+cargo build --release -p egopulse
+sudo systemctl stop egopulse
+sudo cp target/release/egopulse /usr/local/bin/egopulse
+sudo systemctl start egopulse
+```
+
+リリースバイナリへ戻す場合は `egopulse update` で再ダウンロード → 自動再起動。
+
 ### Install script options
 
 ```bash
