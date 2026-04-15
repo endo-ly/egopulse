@@ -235,9 +235,9 @@
   border-radius: 16px;
   background: rgba(8, 14, 30, 0.86);
   color: var(--color-text);
-  padding: 14px 16px;
+  padding: 10px 16px;
   resize: none;
-  min-height: 72px;
+  min-height: 36px;
 }
 
 .composer textarea:focus {
