@@ -15,6 +15,7 @@ use super::text::{
     format_size, generate_diff_string, normalize_newlines, restore_line_endings, strip_bom,
     truncate_head,
 };
+use super::path_guard;
 use super::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext, ToolResult, schema_object,
 };
@@ -104,6 +105,9 @@ impl Tool for ReadTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(path) {
+            return ToolResult::error(reason);
+        }
 
         let bytes = match tokio::fs::read(&resolved).await {
             Ok(bytes) => bytes,
@@ -212,6 +216,9 @@ impl Tool for WriteTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(path) {
+            return ToolResult::error(reason);
+        }
         if let Some(parent) = resolved.parent()
             && let Err(error) = tokio::fs::create_dir_all(parent).await
         {
@@ -295,6 +302,9 @@ impl Tool for EditTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(path) {
+            return ToolResult::error(reason);
+        }
 
         let raw_content = match tokio::fs::read_to_string(&resolved).await {
             Ok(content) => content,

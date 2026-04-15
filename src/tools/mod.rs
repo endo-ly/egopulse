@@ -4,12 +4,18 @@
 //! 7 種のファイル操作ツールと、スキル遅延読み込み用の activate_skill を提供する。
 //! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
 
+mod command_guard;
 mod files;
+mod path_guard;
 mod search;
 mod shell;
 mod text;
 
+#[allow(unused_imports)] // re-export for future use from other modules
+pub(crate) use command_guard::*;
 pub(crate) use files::*;
+#[allow(unused_imports)] // re-export for future use from other modules
+pub(crate) use path_guard::*;
 pub(crate) use search::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
@@ -31,6 +37,39 @@ const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
+
+/// シークレット値の最小長。この長さ未満の値はリダクション対象外。
+const REDACT_MIN_VALUE_LEN: usize = 8;
+
+/// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。
+const SECRET_PATTERNS: &[&str] = &[
+    // OpenAI
+    "sk-",
+    // OpenRouter
+    "sk-or-",
+    // Anthropic
+    "sk-ant-",
+    // Slack
+    "xoxb-",
+    "xapp-",
+    // GitHub
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    // GitLab
+    "glpat-",
+    // AWS Access Key ID
+    "AKIA",
+    "ASIA",
+    // Google API Key / OAuth
+    "AIza",
+    // Stripe
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+];
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +157,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    config_secrets: Vec<(String, String)>,
 }
 
 impl ToolRegistry {
@@ -130,6 +170,7 @@ impl ToolRegistry {
                 return Self {
                     tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
                     mcp_manager: None,
+                    config_secrets: collect_config_secrets(config),
                 };
             }
         };
@@ -152,10 +193,10 @@ impl ToolRegistry {
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
             mcp_manager: None,
+            config_secrets: collect_config_secrets(config),
         }
     }
 
-    /// Register a dynamically created tool (e.g. MCP tool wrapper).
     pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -209,9 +250,18 @@ impl ToolRegistry {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
+        if let Some(denied) = require_approval(name, &context.channel, &input) {
+            return denied;
+        }
+
         for tool in &self.tools {
             if tool.name() == name {
-                return tool.execute(input, context).await;
+                let mut result = tool.execute(input, context).await;
+                if !result.is_error {
+                    result.content = redact_secrets(&result.content, &self.config_secrets);
+                    result.content = redact_known_secret_patterns(&result.content);
+                }
+                return result;
             }
         }
 
@@ -228,7 +278,11 @@ impl ToolRegistry {
                         .await
                 };
                 match result {
-                    Ok(output) => return ToolResult::success(output),
+                    Ok(output) => {
+                        let redacted = redact_secrets(&output, &self.config_secrets);
+                        let redacted = redact_known_secret_patterns(&redacted);
+                        return ToolResult::success(redacted);
+                    }
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
             }
@@ -309,6 +363,107 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
         "maxLines": truncation.max_lines,
         "maxBytes": truncation.max_bytes
     })
+}
+
+/// ツールのリスクレベル。高リスクツールは承認なしに実行できない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolRisk {
+    High,
+    Medium,
+    Low,
+}
+
+pub(crate) fn tool_risk(name: &str) -> ToolRisk {
+    match name {
+        "bash" => ToolRisk::High,
+        "write" | "edit" => ToolRisk::Medium,
+        _ => ToolRisk::Low,
+    }
+}
+
+/// ツール実行前にリスクベースの承認チェックを行う。
+/// Web UI からの High リスクツール実行は `__approved: true` マーカーを要求する。
+pub(crate) fn require_approval(name: &str, channel: &str, input: &serde_json::Value) -> Option<ToolResult> {
+    if tool_risk(name) != ToolRisk::High || channel != "web" {
+        return None;
+    }
+    let approved = input
+        .get("__approved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if approved {
+        None
+    } else {
+        Some(ToolResult::error(format!(
+            "Approval required for high-risk tool '{name}'. Add `__approved: true` after explicit operator approval."
+        )))
+    }
+}
+
+/// Config から収集したシークレット値で出力をリダクションする。
+pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
+    if secrets.is_empty() {
+        return output.to_string();
+    }
+    let mut sorted: Vec<_> = secrets
+        .iter()
+        .filter(|(_, v)| v.len() >= REDACT_MIN_VALUE_LEN)
+        .collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let mut redacted = output.to_string();
+    for (key, value) in &sorted {
+        redacted = redacted.replace(value, &format!("[REDACTED:{key}]"));
+    }
+    redacted
+}
+
+/// Well-known secret プレフィックスに基づくパターンリダクション。
+pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
+    let mut result = output.to_string();
+    for prefix in SECRET_PATTERNS {
+        let mut start = 0usize;
+        while let Some(offset) = result[start..].find(prefix) {
+            let abs_offset = start + offset;
+            let prefix_end = abs_offset + prefix.len();
+            let secret_end = result[prefix_end..]
+                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '\n' || c == ';')
+                .map(|i| prefix_end + i)
+                .unwrap_or(result.len());
+            if secret_end > prefix_end {
+                result = format!(
+                    "{}[REDACTED:secret]{}",
+                    &result[..abs_offset],
+                    &result[secret_end..]
+                );
+            }
+            start = abs_offset + "[REDACTED:secret]".len();
+            if start >= result.len() {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Config から抽出したシークレット値のリストを構築する。
+pub(crate) fn collect_config_secrets(config: &crate::config::Config) -> Vec<(String, String)> {
+    let mut secrets = Vec::new();
+    use secrecy::ExposeSecret;
+    for (name, provider) in &config.providers {
+        if let Some(key) = &provider.api_key {
+            let value = ExposeSecret::expose_secret(key).to_string();
+            secrets.push((format!("provider.{name}.api_key"), value));
+        }
+    }
+    for (name, channel) in &config.channels {
+        if let Some(token) = &channel.auth_token {
+            secrets.push((format!("channel.{name}.auth_token"), token.clone()));
+        }
+        if let Some(token) = &channel.bot_token {
+            secrets.push((format!("channel.{name}.bot_token"), token.clone()));
+        }
+    }
+    secrets
 }
 
 fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {

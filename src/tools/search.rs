@@ -14,6 +14,7 @@ use tokio::time::timeout;
 use crate::llm::ToolDefinition;
 
 use super::text::{format_size, truncate_head};
+use super::path_guard;
 use super::{
     DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_GREP_TIMEOUT_SECS, DEFAULT_LS_LIMIT,
     DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
@@ -204,6 +205,9 @@ impl Tool for GrepTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(requested_path) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
@@ -448,6 +452,9 @@ impl Tool for FindTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(requested_path) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
@@ -650,6 +657,9 @@ impl Tool for LsTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = path_guard::check_path(requested_path) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
