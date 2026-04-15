@@ -53,6 +53,8 @@ export function useWebSocket({
         try {
           data = JSON.parse(String(event.data)) as WsRes | WsEvent;
         } catch {
+          socket.close();
+          socketRef.current = null;
           connectReject.current?.(new Error("invalid JSON from server"));
           connectPromise.current = null;
           connectResolve.current = null;
@@ -100,6 +102,8 @@ export function useWebSocket({
           connectPromise.current = null;
           connectResolve.current = null;
           connectReject.current = null;
+          socket.close();
+          socketRef.current = null;
           setWsState("closed");
           onStatusChange({ tone: "error", text: "Gateway connection failed" });
         }

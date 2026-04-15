@@ -23,7 +23,10 @@ export function Modal({ children, onClose, labelledBy }: ModalProps) {
         aria-labelledby={labelledBy}
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
-          if (event.key === "Escape") onClose();
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            onClose();
+          }
         }}
       >
         {children}

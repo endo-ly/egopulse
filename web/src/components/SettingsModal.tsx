@@ -139,11 +139,9 @@ export function SettingsModal({
               value={config.web_port}
               onChange={(event) => {
                 const parsed = Number(event.target.value);
-                const clamped =
-                  Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535
-                    ? Math.round(parsed)
-                    : 0;
-                setConfig({ ...config, web_port: clamped });
+                if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535) {
+                  setConfig({ ...config, web_port: Math.round(parsed) });
+                }
               }}
             />
           </label>

@@ -40,8 +40,10 @@ export function useAuth(): UseAuthResult {
   }
 
   async function saveAuth(onSuccess: () => Promise<void>) {
-    persistAuthToken(authDraft);
-    setAuthToken(authDraft.trim());
+    const trimmed = authDraft.trim();
+    persistAuthToken(trimmed);
+    authTokenRef.current = trimmed;
+    setAuthToken(trimmed);
     setShowAuth(false);
     await onSuccess();
   }

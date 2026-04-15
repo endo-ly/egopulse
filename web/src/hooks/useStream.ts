@@ -194,6 +194,9 @@ export function useStream({
         }
       }
     } catch (error) {
+      if (abortController.signal.aborted) {
+        return;
+      }
       if (error instanceof AuthRequiredError) {
         onAuthRequired();
       }

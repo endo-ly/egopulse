@@ -31,7 +31,12 @@ export function ChatPanel({
   return (
     <main className="main-panel">
       <header className="chat-header">
-        <button className="hamburger-button" onClick={onToggleSidebar}>
+        <button
+          className="hamburger-button"
+          type="button"
+          aria-label="Open session list"
+          onClick={onToggleSidebar}
+        >
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
             <line x1="3" y1="5" x2="17" y2="5" />
             <line x1="3" y1="10" x2="17" y2="10" />

@@ -1,7 +1,7 @@
 type AuthModalProps = {
   authDraft: string;
   setAuthDraft: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (event: React.FormEvent) => void;
 };
 
 export function AuthModal({ authDraft, setAuthDraft, onSubmit }: AuthModalProps) {

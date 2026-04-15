@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
 
 import { api } from "../api";
 import type { HealthPayload } from "../types";
@@ -88,7 +89,8 @@ export function App() {
     });
   }, []);
 
-  async function handleSaveAuth() {
+  async function handleSaveAuth(event: FormEvent) {
+    event.preventDefault();
     await saveAuth(async () => {
       await refreshHealth();
       await refreshConfig();
@@ -101,7 +103,8 @@ export function App() {
     try {
       await saveConfig();
       setShowSettings(false);
-    } catch {
+    } catch (error) {
+      console.error("Failed to save config:", error);
     }
   }
 
