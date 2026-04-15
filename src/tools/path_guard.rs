@@ -119,7 +119,7 @@ pub(crate) fn is_blocked(path: &Path) -> bool {
         }
     }
 
-    if is_proc_path(&resolved_str) {
+    if is_proc_path(&original_str) || is_proc_path(&resolved_str) {
         return true;
     }
 

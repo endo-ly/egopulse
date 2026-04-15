@@ -250,10 +250,6 @@ impl ToolRegistry {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
-        if let Some(denied) = require_approval(name, &context.channel, &input) {
-            return denied;
-        }
-
         for tool in &self.tools {
             if tool.name() == name {
                 let mut result = tool.execute(input, context).await;
@@ -363,41 +359,6 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
         "maxLines": truncation.max_lines,
         "maxBytes": truncation.max_bytes
     })
-}
-
-/// ツールのリスクレベル。高リスクツールは承認なしに実行できない。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolRisk {
-    High,
-    Medium,
-    Low,
-}
-
-pub(crate) fn tool_risk(name: &str) -> ToolRisk {
-    match name {
-        "bash" => ToolRisk::High,
-        "write" | "edit" => ToolRisk::Medium,
-        _ => ToolRisk::Low,
-    }
-}
-
-/// ツール実行前にリスクベースの承認チェックを行う。
-/// Web UI からの High リスクツール実行は `__approved: true` マーカーを要求する。
-pub(crate) fn require_approval(name: &str, channel: &str, input: &serde_json::Value) -> Option<ToolResult> {
-    if tool_risk(name) != ToolRisk::High || channel != "web" {
-        return None;
-    }
-    let approved = input
-        .get("__approved")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if approved {
-        None
-    } else {
-        Some(ToolResult::error(format!(
-            "Approval required for high-risk tool '{name}'. Add `__approved: true` after explicit operator approval."
-        )))
-    }
 }
 
 /// Config から収集したシークレット値で出力をリダクションする。
