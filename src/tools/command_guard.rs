@@ -38,10 +38,13 @@ fn check_blocked_patterns(command: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// シェル経由でブロック対象コマンドを実行するパターンを検出する。
+const SHELL_EXEC_PREFIXES: &[&str] = &["bash -c", "sh -c", "dash -c", "zsh -c", "ksh -c", "eval "];
+
 /// `env`・`printenv` の実行をブロックする。
 ///
-/// パイプやセミコロンで繋がれた場合も検知するため、
-/// コマンド文字列内のすべてのトークンを検査する。
+/// 直接実行に加え、`bash -c 'env'` や `eval 'printenv'` 等
+/// シェル経由のバイパスも検出する。
 fn check_blocked_commands(command: &str) -> Result<(), String> {
     for segment in split_command_segments(command) {
         let trimmed = segment.trim();
@@ -57,6 +60,16 @@ fn check_blocked_commands(command: &str) -> Result<(), String> {
                     "Access denied: '{blocked}' is blocked to prevent environment variable leakage. \
                      Use 'echo $VAR_NAME' to read a specific variable."
                 ));
+            }
+        }
+        if SHELL_EXEC_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            let lowered = trimmed.to_ascii_lowercase();
+            for blocked in BLOCKED_COMMANDS {
+                if lowered.contains(blocked) {
+                    return Err(format!(
+                        "Access denied: '{blocked}' detected in shell execution context."
+                    ));
+                }
             }
         }
     }
@@ -125,40 +138,38 @@ fn tokenize(command: &str) -> Vec<String> {
 fn split_command_segments(command: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0usize;
-    let chars: Vec<char> = command.chars().collect();
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut i = 0usize;
 
     while i < chars.len() {
-        let ch = chars[i];
+        let (byte_pos, ch) = chars[i];
         if ch == '\'' && !in_double_quote {
             in_single_quote = !in_single_quote;
         } else if ch == '"' && !in_single_quote {
             in_double_quote = !in_double_quote;
         } else if !in_single_quote && !in_double_quote {
             if ch == ';' {
-                if i > start {
-                    segments.push(&command[start..i]);
+                if byte_pos > start {
+                    segments.push(&command[start..byte_pos]);
                 }
-                start = i + 1;
-            }
-            // | はパイプ区切り（|| も処理）
-            else if ch == '|' {
-                if i > start {
-                    segments.push(&command[start..i]);
+                start = byte_pos + 1;
+            } else if ch == '|' {
+                if byte_pos > start {
+                    segments.push(&command[start..byte_pos]);
                 }
-                start = i + 1;
-                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                start = byte_pos + 1;
+                if i + 1 < chars.len() && chars[i + 1].1 == '|' {
                     i += 1;
-                    start = i + 1;
+                    start = chars[i].0 + 1;
                 }
-            } else if ch == '&' && i + 1 < chars.len() && chars[i + 1] == '&' {
-                if i > start {
-                    segments.push(&command[start..i]);
+            } else if ch == '&' && i + 1 < chars.len() && chars[i + 1].1 == '&' {
+                if byte_pos > start {
+                    segments.push(&command[start..byte_pos]);
                 }
                 i += 1;
-                start = i + 1;
+                start = chars[i].0 + 1;
             }
         }
         i += 1;

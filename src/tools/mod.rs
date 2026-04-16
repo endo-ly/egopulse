@@ -385,6 +385,15 @@ pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
         let mut start = 0usize;
         while let Some(offset) = result[start..].find(prefix) {
             let abs_offset = start + offset;
+            let preceded_by_boundary = abs_offset == 0
+                || result[..abs_offset]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+            if !preceded_by_boundary {
+                start = abs_offset + 1;
+                continue;
+            }
             let prefix_end = abs_offset + prefix.len();
             let secret_end = result[prefix_end..]
                 .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '\n' || c == ';')
