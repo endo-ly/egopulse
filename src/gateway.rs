@@ -11,7 +11,19 @@ use crate::error::EgoPulseError;
 use clap::Subcommand;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const UNIT_PATH: &str = "/etc/systemd/system/egopulse.service";
+
+const SERVICE_NAME: &str = "egopulse.service";
+
+/// systemd ユーザーサービスのユニットファイルパスを返す。
+fn unit_path() -> Result<PathBuf, EgoPulseError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| EgoPulseError::Internal("HOME directory could not be resolved".into()))?;
+    Ok(home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(SERVICE_NAME))
+}
 
 /// Supported systemd service management actions for `egopulse gateway`.
 #[derive(Debug, Subcommand)]
@@ -54,40 +66,9 @@ pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
-fn runtime_default_config_path() -> Option<PathBuf> {
-    crate::config::default_config_path().ok()
-}
-
-fn escape_systemd_exec_arg(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn escape_systemd_path(value: &str) -> String {
-    value.replace('\\', "\\\\").replace(' ', "\\s")
-}
-
 fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String {
-    let uses_runtime_default_config = runtime_default_config_path().as_deref() == Some(config_path);
-    let default_config_arg = "%h/.egopulse/egopulse.config.yaml";
-    let config_arg = if uses_runtime_default_config {
-        default_config_arg.to_string()
-    } else {
-        config_path.to_string_lossy().to_string()
-    };
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/etc/egopulse".into());
-    let state_root = "%h/.egopulse";
-    let read_write_paths = if uses_runtime_default_config {
-        format!("{state_root} {state_root}/data {state_root}/workspace")
-    } else {
-        format!(
-            "{} {state_root} {state_root}/data {state_root}/workspace",
-            escape_systemd_path(&config_dir)
-        )
-    };
-    let config_arg = escape_systemd_exec_arg(&config_arg);
+    let config_arg = config_path.to_string_lossy();
+    let escaped_config = config_arg.replace('\\', "\\\\").replace('"', "\\\"");
 
     format!(
         "[Unit]
@@ -97,28 +78,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exe_path} --config \"{config_arg}\" run
+ExecStart={exe_path} --config \"{escaped_config}\" run
 Restart=always
 RestartSec=10
-Environment=HOME=%h
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths={read_write_paths}
-ProtectHome=read-only
+KillMode=process
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 "
     )
 }
 
 fn systemctl_cmd(args: &[&str]) -> Result<std::process::Output, EgoPulseError> {
     ProcessCommand::new("systemctl")
+        .arg("--user")
         .args(args)
         .output()
-        .map_err(|e| EgoPulseError::Internal(format!("failed to run systemctl: {e}")))
+        .map_err(|e| EgoPulseError::Internal(format!("failed to run systemctl --user: {e}")))
 }
 
 fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoPulseError> {
@@ -133,12 +109,13 @@ fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoP
 }
 
 fn restart_service() -> Result<(), EgoPulseError> {
-    if !std::path::Path::new(UNIT_PATH).exists() {
+    let unit = unit_path()?;
+    if !unit.exists() {
         println!("Service not installed, skipping restart");
         return Ok(());
     }
 
-    let output = systemctl_cmd(&["restart", "egopulse"])?;
+    let output = systemctl_cmd(&["restart", SERVICE_NAME])?;
     if output.status.success() {
         println!("egopulse service restarted");
         Ok(())
@@ -187,50 +164,53 @@ ACTIONS:
                 )));
             }
 
-            let already_installed = std::path::Path::new(UNIT_PATH).exists();
-            let unit_content = render_systemd_unit(&exe_path.to_string_lossy(), &config_path);
-            std::fs::write(UNIT_PATH, &unit_content).map_err(|e| {
-                let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!(
-                        "failed to write unit file: permission denied. \
-                         Run as root or with sudo, or grant write access to {UNIT_PATH}"
-                    )
-                } else {
-                    format!("failed to write unit file: {e}")
-                };
-                EgoPulseError::Internal(msg)
+            let unit = unit_path()?;
+            let unit_dir = unit
+                .parent()
+                .ok_or_else(|| EgoPulseError::Internal("invalid unit file path".into()))?;
+            std::fs::create_dir_all(unit_dir).map_err(|e| {
+                EgoPulseError::Internal(format!("failed to create unit directory: {e}"))
             })?;
+
+            let already_installed = unit.exists();
+            let unit_content = render_systemd_unit(&exe_path.to_string_lossy(), &config_path);
+            std::fs::write(&unit, &unit_content)
+                .map_err(|e| EgoPulseError::Internal(format!("failed to write unit file: {e}")))?;
 
             ensure_success(systemctl_cmd(&["daemon-reload"])?, "daemon-reload")?;
 
             if already_installed {
-                ensure_success(systemctl_cmd(&["restart", "egopulse"])?, "restart service")?;
-                println!("Updated and restarted egopulse service: {UNIT_PATH}");
+                ensure_success(
+                    systemctl_cmd(&["restart", SERVICE_NAME])?,
+                    "restart service",
+                )?;
+                println!("Updated and restarted egopulse service: {}", unit.display());
             } else {
                 ensure_success(
-                    systemctl_cmd(&["enable", "--now", "egopulse"])?,
+                    systemctl_cmd(&["enable", "--now", SERVICE_NAME])?,
                     "enable service",
                 )?;
-                println!("Installed and started egopulse service: {UNIT_PATH}");
+                println!("Installed and started egopulse service: {}", unit.display());
             }
             Ok(())
         }
         GatewayAction::Start => {
-            ensure_success(systemctl_cmd(&["start", "egopulse"])?, "start service")?;
+            ensure_success(systemctl_cmd(&["start", SERVICE_NAME])?, "start service")?;
             println!("egopulse service started");
             Ok(())
         }
         GatewayAction::Stop => {
-            ensure_success(systemctl_cmd(&["stop", "egopulse"])?, "stop service")?;
+            ensure_success(systemctl_cmd(&["stop", SERVICE_NAME])?, "stop service")?;
             println!("egopulse service stopped");
             Ok(())
         }
         GatewayAction::Uninstall => {
-            let _ = systemctl_cmd(&["disable", "--now", "egopulse"]);
+            let _ = systemctl_cmd(&["disable", "--now", SERVICE_NAME]);
             let _ = systemctl_cmd(&["daemon-reload"]);
 
-            if std::path::Path::new(UNIT_PATH).exists() {
-                std::fs::remove_file(UNIT_PATH).map_err(|e| {
+            let unit = unit_path()?;
+            if unit.exists() {
+                std::fs::remove_file(&unit).map_err(|e| {
                     EgoPulseError::Internal(format!("failed to remove unit file: {e}"))
                 })?;
             }
@@ -240,7 +220,7 @@ ACTIONS:
             Ok(())
         }
         GatewayAction::Status => {
-            let output = systemctl_cmd(&["status", "egopulse", "--no-pager"])?;
+            let output = systemctl_cmd(&["status", SERVICE_NAME, "--no-pager"])?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             print!("{stdout}{stderr}");
@@ -254,7 +234,7 @@ ACTIONS:
             }
         }
         GatewayAction::Restart => {
-            let output = systemctl_cmd(&["restart", "egopulse"])?;
+            let output = systemctl_cmd(&["restart", SERVICE_NAME])?;
             if output.status.success() {
                 println!("egopulse service restarted");
                 Ok(())
@@ -297,37 +277,36 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_systemd_unit, runtime_default_config_path};
-    use serial_test::serial;
+    use super::render_systemd_unit;
     use std::path::PathBuf;
 
     #[test]
-    #[serial]
-    fn render_systemd_unit_uses_runtime_home_placeholder_for_default_config() {
-        let default_config_path =
-            runtime_default_config_path().expect("home directory should resolve in tests");
-
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &default_config_path);
-
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/egopulse --config \"%h/.egopulse/egopulse.config.yaml\" run"
-        ));
-        assert!(
-            unit.contains("ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace")
-        );
-    }
-
-    #[test]
-    fn render_systemd_unit_quotes_exec_path_and_escapes_read_write_paths() {
-        let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
+    fn render_systemd_unit_contains_expected_directives() {
+        let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
 
         let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/egopulse --config \"/tmp/ego pulse/config dir/egopulse.config.yaml\" run"
+            "ExecStart=/usr/local/bin/egopulse --config \"/home/user/.egopulse/egopulse.config.yaml\" run"
         ));
-        assert!(unit.contains(
-            "ReadWritePaths=/tmp/ego\\spulse/config\\sdir %h/.egopulse %h/.egopulse/data %h/.egopulse/workspace"
-        ));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("RestartSec=10"));
+        assert!(unit.contains("KillMode=process"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(!unit.contains("NoNewPrivileges"));
+        assert!(!unit.contains("ProtectSystem"));
+        assert!(!unit.contains("ReadWritePaths"));
+        assert!(!unit.contains("ProtectHome"));
+        assert!(!unit.contains("Environment=HOME"));
+    }
+
+    #[test]
+    fn render_systemd_unit_escapes_config_path_with_special_chars() {
+        let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
+
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
+
+        assert!(unit.contains("/tmp/ego pulse/config dir/egopulse.config.yaml"));
+        assert!(unit.contains("WantedBy=default.target"));
     }
 }

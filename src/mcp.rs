@@ -468,22 +468,6 @@ async fn connect_stdio(
     cmd.current_dir(workspace_dir);
     cmd.envs(&config.env);
 
-    // systemd (ProtectHome=read-only) 下でパッケージマネージャが $HOME へ
-    // キャッシュを書けず起動に失敗する問題を回避するため writable HOME を注入。
-    // ユーザーが mcp.json の env で HOME を明示した場合はそちらを優先。
-    let state_root = default_state_root().map_err(|e| McpError::ConnectionFailed {
-        server: name.to_string(),
-        detail: format!("failed to resolve state root: {e}"),
-    })?;
-    let mcp_home = state_root.join("mcp-home").join(name);
-    std::fs::create_dir_all(&mcp_home).map_err(|e| McpError::ConnectionFailed {
-        server: name.to_string(),
-        detail: format!("failed to create MCP home: {e}"),
-    })?;
-    if !config.env.contains_key("HOME") {
-        cmd.env("HOME", &mcp_home);
-    }
-
     let child = TokioChildProcess::new(cmd).map_err(|error| McpError::ConnectionFailed {
         server: name.to_string(),
         detail: error.to_string(),
@@ -772,20 +756,5 @@ mod tests {
         let server = &config.mcp_servers["context7"];
         assert!(matches!(server.transport, TransportType::Stdio));
         assert_eq!(server.command.as_deref(), Some("npx"));
-    }
-
-    #[test]
-    #[serial]
-    fn mcp_home_dir_is_created_under_state_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_root = dir.path().join(".egopulse");
-
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let expected_mcp_home = state_root.join("mcp-home").join("test-server");
-        assert!(!expected_mcp_home.exists(), "should not exist before");
-
-        std::fs::create_dir_all(&expected_mcp_home).expect("create mcp-home");
-        assert!(expected_mcp_home.exists(), "should exist after creation");
     }
 }
