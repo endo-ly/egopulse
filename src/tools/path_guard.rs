@@ -9,11 +9,7 @@ const BLOCKED_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube"];
 
 const BLOCKED_SUBPATHS: &[&[&str]] = &[&[".config", "gcloud"]];
 
-const BLOCKED_FILES: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.development",
+const BLOCKED_FILE_NAMES: &[&str] = &[
     "credentials",
     "credentials.json",
     "token.json",
@@ -45,14 +41,17 @@ const BLOCKED_ABSOLUTE: &[&str] = &[
 
 pub(crate) fn blocked_ripgrep_exclude_globs() -> Vec<String> {
     let mut globs = Vec::with_capacity(
-        BLOCKED_DIRS.len() * 2 + BLOCKED_FILES.len() * 2 + BLOCKED_SUBPATHS.len() * 2,
+        BLOCKED_DIRS.len() * 2 + BLOCKED_FILE_NAMES.len() * 2 + BLOCKED_SUBPATHS.len() * 2 + 2,
     );
 
     for dir in BLOCKED_DIRS {
         globs.push(format!("!{dir}/**"));
         globs.push(format!("!**/{dir}/**"));
     }
-    for file in BLOCKED_FILES {
+    globs.push("!.env*".to_string());
+    globs.push("!**/.env*".to_string());
+
+    for file in BLOCKED_FILE_NAMES {
         globs.push(format!("!{file}"));
         globs.push(format!("!**/{file}"));
     }
@@ -67,7 +66,7 @@ pub(crate) fn blocked_ripgrep_exclude_globs() -> Vec<String> {
 
 pub(crate) fn blocked_fd_exclude_patterns() -> Vec<String> {
     let mut patterns = Vec::with_capacity(
-        BLOCKED_DIRS.len() * 4 + BLOCKED_FILES.len() * 2 + BLOCKED_SUBPATHS.len() * 4,
+        BLOCKED_DIRS.len() * 4 + BLOCKED_FILE_NAMES.len() * 2 + BLOCKED_SUBPATHS.len() * 4 + 2,
     );
 
     for dir in BLOCKED_DIRS {
@@ -76,7 +75,10 @@ pub(crate) fn blocked_fd_exclude_patterns() -> Vec<String> {
         patterns.push(format!("{dir}/**"));
         patterns.push(format!("**/{dir}/**"));
     }
-    for file in BLOCKED_FILES {
+    patterns.push(".env*".to_string());
+    patterns.push("**/.env*".to_string());
+
+    for file in BLOCKED_FILE_NAMES {
         patterns.push((*file).to_string());
         patterns.push(format!("**/{file}"));
     }
@@ -106,40 +108,32 @@ pub(crate) fn check_path(path: &str) -> Result<(), String> {
 /// コマンド文字列内に含まれるパス参照がブロック対象か検査する。
 /// `cat /home/user/.ssh/id_rsa` や `cat .env` などを検知する。
 pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
-    let lower = command.to_ascii_lowercase();
+    let normalized_command = normalize_command_path_like(command);
     for blocked in BLOCKED_ABSOLUTE {
-        if contains_path_reference(&lower, blocked) {
+        if contains_path_reference(&normalized_command, blocked) {
             return Err(format!(
                 "Access denied: command references blocked path '{blocked}'."
             ));
         }
     }
-    check_proc_access(&lower)?;
-    check_blocked_files_in_command(&lower)?;
-    check_blocked_dirs_in_command(&lower)?;
-    check_blocked_subpaths_in_command(&lower)?;
+    check_proc_access(&normalized_command)?;
+    check_blocked_files_in_command(&normalized_command)?;
+    check_blocked_dirs_in_command(&normalized_command)?;
+    check_blocked_subpaths_in_command(&normalized_command)?;
     Ok(())
 }
 
-fn check_blocked_files_in_command(lower: &str) -> Result<(), String> {
-    for blocked in BLOCKED_FILES {
-        let mut start = 0usize;
-        while let Some(offset) = lower[start..].find(blocked) {
-            let abs = start + offset;
-            let preceded_by_boundary =
-                abs == 0 || is_path_prefix_boundary(lower.as_bytes()[abs - 1]);
-            let blocked_end = abs + blocked.len();
-            let followed_by_boundary = blocked_end >= lower.len()
-                || is_path_suffix_boundary(lower.as_bytes()[blocked_end]);
-            if preceded_by_boundary && followed_by_boundary {
+fn check_blocked_files_in_command(command: &str) -> Result<(), String> {
+    for token in command_word_tokens(command) {
+        for component in token.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            if is_blocked_filename(component) {
                 return Err(format!(
-                    "Access denied: command references blocked file '{blocked}'. \
+                    "Access denied: command references blocked file '{component}'. \
                      Sensitive files cannot be accessed through shell commands."
                 ));
-            }
-            start = abs + 1;
-            if start >= lower.len() {
-                break;
             }
         }
     }
@@ -265,6 +259,52 @@ fn check_proc_access(lower: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_command_path_like(command: &str) -> String {
+    let mut normalized = String::with_capacity(command.len());
+    let mut prev_slash = false;
+
+    for ch in command.chars() {
+        let mapped = match ch {
+            '\\' => '/',
+            _ => ch.to_ascii_lowercase(),
+        };
+
+        if mapped == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+
+        normalized.push(mapped);
+    }
+
+    normalized
+}
+
+fn command_word_tokens(command: &str) -> Vec<&str> {
+    command
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '|' | '&' | '(' | ')' | '\'' | '"' | '`' | ',' | '=' | ':'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn is_blocked_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    BLOCKED_FILE_NAMES.contains(&lower.as_str())
+}
+
 pub(crate) fn is_blocked(path: &Path) -> bool {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| {
         let abs = if path.is_relative() {
@@ -301,7 +341,7 @@ pub(crate) fn is_blocked(path: &Path) -> bool {
         if BLOCKED_DIRS.contains(&component.as_str()) {
             return true;
         }
-        if BLOCKED_FILES.contains(&component.as_str()) {
+        if is_blocked_filename(component) {
             return true;
         }
     }
@@ -428,6 +468,8 @@ mod tests {
         assert!(is_blocked(Path::new("/project/.env.local")));
         assert!(is_blocked(Path::new("/project/.env.production")));
         assert!(is_blocked(Path::new("/project/.env.development")));
+        assert!(is_blocked(Path::new("/project/.env.test")));
+        assert!(is_blocked(Path::new("/project/.env.staging")));
     }
 
     #[test]
@@ -519,6 +561,18 @@ mod tests {
     }
 
     #[test]
+    fn check_command_paths_blocks_env_family_variants() {
+        assert!(check_command_paths("cat .env.test").is_err());
+        assert!(check_command_paths("cat ./config/.env.staging").is_err());
+    }
+
+    #[test]
+    fn check_command_paths_normalizes_redundant_separators() {
+        assert!(check_command_paths("cat /etc//shadow").is_err());
+        assert!(check_command_paths("cat /proc//self/environ").is_err());
+    }
+
+    #[test]
     fn check_command_paths_avoids_suffix_false_positive() {
         assert!(check_command_paths("cat /etc/shadow.bak").is_ok());
     }
@@ -532,7 +586,7 @@ mod tests {
     fn ripgrep_exclude_globs_include_sensitive_targets() {
         let globs = blocked_ripgrep_exclude_globs();
         assert!(globs.iter().any(|g| g == "!**/.ssh/**"));
-        assert!(globs.iter().any(|g| g == "!**/.env"));
+        assert!(globs.iter().any(|g| g == "!**/.env*"));
         assert!(globs.iter().any(|g| g == "!**/.config/gcloud/**"));
     }
 
@@ -540,7 +594,7 @@ mod tests {
     fn fd_exclude_patterns_include_sensitive_targets() {
         let patterns = blocked_fd_exclude_patterns();
         assert!(patterns.iter().any(|p| p == ".ssh"));
-        assert!(patterns.iter().any(|p| p == "**/.env"));
+        assert!(patterns.iter().any(|p| p == "**/.env*"));
         assert!(patterns.iter().any(|p| p == "**/.config/gcloud/**"));
     }
 }

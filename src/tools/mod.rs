@@ -38,9 +38,6 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
-/// シークレット値の最小長。この長さ未満の値はリダクション対象外。
-const REDACT_MIN_VALUE_LEN: usize = 8;
-
 /// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。
 const SECRET_PATTERNS: &[&str] = &[
     // OpenAI
@@ -371,10 +368,7 @@ pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> Stri
     if secrets.is_empty() {
         return output.to_string();
     }
-    let mut sorted: Vec<_> = secrets
-        .iter()
-        .filter(|(_, v)| v.len() >= REDACT_MIN_VALUE_LEN)
-        .collect();
+    let mut sorted: Vec<_> = secrets.iter().collect();
     sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     let mut redacted = output.to_string();
     for (key, value) in &sorted {
@@ -886,6 +880,38 @@ mod tests {
             MessageContent::Text(text) => assert!(!text.contains("sk-secret-token-123")),
             other => panic!("expected text llm content, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redacts_short_configured_secret_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                auth_token: Some("xyz".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "leaky_short_secret",
+            result: ToolResult::success("short secret xyz leaked".to_string()),
+        }));
+
+        let result = registry
+            .execute("leaky_short_secret", json!({}), &test_context())
+            .await;
+
+        assert!(!result.is_error);
+        assert!(!result.content.contains(" xyz "));
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:channel.discord.auth_token]")
+        );
     }
 
     #[tokio::test]
