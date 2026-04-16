@@ -269,18 +269,21 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("Discord bot connected as {}", ready.user.name);
 
-        let commands: Vec<serenity::builder::CreateCommand> =
-            crate::slash_commands::all_commands()
-                .iter()
-                .map(|c| serenity::builder::CreateCommand::new(c.name).description(c.description))
-                .collect();
+        let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
+            .iter()
+            .map(|c| serenity::builder::CreateCommand::new(c.name).description(c.description))
+            .collect();
 
         if let Err(e) = Command::set_global_commands(&ctx.http, commands).await {
             tracing::warn!("Discord: failed to register slash commands: {e}");
         }
     }
 
-    async fn interaction_create(&self, ctx: Context, interaction: serenity::model::application::Interaction) {
+    async fn interaction_create(
+        &self,
+        ctx: Context,
+        interaction: serenity::model::application::Interaction,
+    ) {
         let Some(cmd) = interaction.clone().command() else {
             return;
         };
@@ -311,7 +314,7 @@ impl EventHandler for Handler {
                     Some(&sender_id),
                 )
                 .await
-                .unwrap_or_else(|| crate::slash_commands::unknown_command_response())
+                .unwrap_or_else(crate::slash_commands::unknown_command_response)
             }
             Err(e) => {
                 tracing::error!("failed to resolve chat_id for interaction: {e}");
@@ -319,10 +322,13 @@ impl EventHandler for Handler {
             }
         };
 
-        let message = serenity::builder::CreateInteractionResponseMessage::new()
-            .content(response_text);
+        let message =
+            serenity::builder::CreateInteractionResponseMessage::new().content(response_text);
         if let Err(e) = cmd
-            .create_response(&ctx.http, serenity::builder::CreateInteractionResponse::Message(message))
+            .create_response(
+                &ctx.http,
+                serenity::builder::CreateInteractionResponse::Message(message),
+            )
             .await
         {
             tracing::warn!("Discord: failed to respond to interaction: {e}");
