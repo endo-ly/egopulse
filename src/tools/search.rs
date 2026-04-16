@@ -20,49 +20,20 @@ use super::{
     DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
 };
 
+/// 相対パスを working_dir 基準に解決し、絶対パスはそのまま通す。
+///
+/// 機密パスのブロックは `path_guard::check_path` で別途行う。
 pub(crate) fn resolve_workspace_path(
     workspace_dir: &Path,
     requested_path: &str,
 ) -> Result<PathBuf, String> {
-    let requested = PathBuf::from(requested_path);
-    let candidate = if requested.is_absolute() {
-        requested
+    let candidate = PathBuf::from(requested_path);
+    let resolved = if candidate.is_absolute() {
+        candidate
     } else {
-        workspace_dir.join(requested)
+        workspace_dir.join(candidate)
     };
-
-    let canonical_workspace = std::fs::canonicalize(workspace_dir)
-        .map_err(|e| format!("Failed to resolve workspace path: {e}"))?;
-
-    let canonical_candidate = match std::fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(_) => {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| format!("Invalid path (no parent): {}", candidate.display()))?;
-            let canonical_parent = std::fs::canonicalize(parent)
-                .map_err(|_| format!("Parent directory does not exist: {}", parent.display()))?;
-            if !canonical_parent.starts_with(&canonical_workspace) {
-                return Err(format!(
-                    "Refusing to access path outside workspace: {}",
-                    candidate.display()
-                ));
-            }
-            let file_name = candidate
-                .file_name()
-                .ok_or_else(|| format!("Invalid path (no file name): {}", candidate.display()))?;
-            return Ok(canonical_parent.join(file_name));
-        }
-    };
-
-    if !canonical_candidate.starts_with(&canonical_workspace) {
-        return Err(format!(
-            "Refusing to access path outside workspace: {}",
-            canonical_candidate.display()
-        ));
-    }
-
-    Ok(canonical_candidate)
+    Ok(resolved)
 }
 
 /// grep パターンの長さおよび括弧のネスト深さを検証する。
