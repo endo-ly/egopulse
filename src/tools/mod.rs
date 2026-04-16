@@ -368,7 +368,10 @@ pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> Stri
     if secrets.is_empty() {
         return output.to_string();
     }
-    let mut sorted: Vec<_> = secrets.iter().collect();
+    let mut sorted: Vec<_> = secrets
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
     sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     let mut redacted = output.to_string();
     for (key, value) in &sorted {
@@ -912,6 +915,32 @@ mod tests {
                 .content
                 .contains("[REDACTED:channel.discord.auth_token]")
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ignores_empty_configured_secret_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                auth_token: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "empty_secret",
+            result: ToolResult::success("hello".to_string()),
+        }));
+
+        let result = registry
+            .execute("empty_secret", json!({}), &test_context())
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "hello");
     }
 
     #[tokio::test]

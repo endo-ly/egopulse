@@ -245,7 +245,8 @@ fn check_proc_access(lower: &str) -> Result<(), String> {
         let abs = start + offset;
         let after = &lower[abs + "/proc/".len()..];
         let segment = after.split('/').next().unwrap_or("");
-        if segment == "self" || segment.chars().all(|c| c.is_ascii_digit()) {
+        if segment == "self" || (!segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+        {
             return Err(
                 "Access denied: command references /proc/*/..., which exposes process internals."
                     .to_string(),
@@ -299,7 +300,7 @@ fn command_word_tokens(command: &str) -> Vec<&str> {
 
 fn is_blocked_filename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") {
+    if lower.starts_with(".env") {
         return true;
     }
     BLOCKED_FILE_NAMES.contains(&lower.as_str())
@@ -366,7 +367,7 @@ pub(crate) fn is_blocked(path: &Path) -> bool {
 fn is_proc_path(path: &str) -> bool {
     if let Some(after) = path.strip_prefix("/proc/") {
         let segment = after.split('/').next().unwrap_or("");
-        segment == "self" || segment.chars().all(|c| c.is_ascii_digit())
+        segment == "self" || (!segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
     } else {
         false
     }
@@ -470,6 +471,7 @@ mod tests {
         assert!(is_blocked(Path::new("/project/.env.development")));
         assert!(is_blocked(Path::new("/project/.env.test")));
         assert!(is_blocked(Path::new("/project/.env.staging")));
+        assert!(is_blocked(Path::new("/project/.envrc")));
     }
 
     #[test]
@@ -510,6 +512,7 @@ mod tests {
         // /proc/cpuinfo 等の数値以外はプロセス情報ではないため許可
         assert!(!is_blocked(Path::new("/proc/cpuinfo")));
         assert!(!is_blocked(Path::new("/proc/meminfo")));
+        assert!(!is_blocked(Path::new("/proc/")));
     }
 
     #[test]
@@ -564,12 +567,14 @@ mod tests {
     fn check_command_paths_blocks_env_family_variants() {
         assert!(check_command_paths("cat .env.test").is_err());
         assert!(check_command_paths("cat ./config/.env.staging").is_err());
+        assert!(check_command_paths("cat .envrc").is_err());
     }
 
     #[test]
     fn check_command_paths_normalizes_redundant_separators() {
         assert!(check_command_paths("cat /etc//shadow").is_err());
         assert!(check_command_paths("cat /proc//self/environ").is_err());
+        assert!(check_command_paths("cat /proc/").is_ok());
     }
 
     #[test]
