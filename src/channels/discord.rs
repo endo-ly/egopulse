@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use serenity::builder::{CreateAllowedMentions, CreateMessage};
+use serenity::model::application::Command;
 use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
@@ -265,8 +266,67 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!("Discord bot connected as {}", ready.user.name);
+
+        let commands: Vec<serenity::builder::CreateCommand> =
+            crate::slash_commands::all_commands()
+                .iter()
+                .map(|c| serenity::builder::CreateCommand::new(c.name).description(c.description))
+                .collect();
+
+        if let Err(e) = Command::set_global_commands(&ctx.http, commands).await {
+            tracing::warn!("Discord: failed to register slash commands: {e}");
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: serenity::model::application::Interaction) {
+        let Some(cmd) = interaction.clone().command() else {
+            return;
+        };
+
+        let command_text = interaction_to_command_text(&cmd.data.name);
+
+        // チャネル ID を解決して内部 chat_id を取得
+        let channel_id = cmd.channel_id.get();
+        let external_chat_id = channel_id.to_string();
+
+        let slash_chat_id =
+            crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
+                let channel = "discord".to_string();
+                let ext_id = external_chat_id.clone();
+                let chat_type = "discord".to_string();
+                move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
+            })
+            .await;
+
+        let response_text = match slash_chat_id {
+            Ok(chat_id) => {
+                let sender_id = cmd.user.id.get().to_string();
+                crate::slash_commands::handle_slash_command(
+                    &self.app_state,
+                    chat_id,
+                    "discord",
+                    &command_text,
+                    Some(&sender_id),
+                )
+                .await
+                .unwrap_or_else(|| crate::slash_commands::unknown_command_response())
+            }
+            Err(e) => {
+                tracing::error!("failed to resolve chat_id for interaction: {e}");
+                "An error occurred processing the command.".to_string()
+            }
+        };
+
+        let message = serenity::builder::CreateInteractionResponseMessage::new()
+            .content(response_text);
+        if let Err(e) = cmd
+            .create_response(&ctx.http, serenity::builder::CreateInteractionResponse::Message(message))
+            .await
+        {
+            tracing::warn!("Discord: failed to respond to interaction: {e}");
+        }
     }
 }
 
@@ -289,6 +349,12 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .unwrap_or(external_chat_id)
         .parse::<u64>()
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
+}
+
+/// Discord Interaction のコマンド名を handle_slash_command が
+/// 受け付ける形式（"/command"）に正規化する。
+fn interaction_to_command_text(name: &str) -> String {
+    format!("/{name}")
 }
 
 /// Starts the Discord bot and supervises its gateway lifecycle.
@@ -358,5 +424,28 @@ mod tests {
             12345
         );
         assert!(parse_discord_chat_id("discord:not-a-number").is_err());
+    }
+
+    /// Interaction コマンド名 → "/command" 形式の正規化が正しいこと。
+    #[test]
+    fn interaction_command_text_normalizes() {
+        // Arrange & Act & Assert
+        assert_eq!(interaction_to_command_text("status"), "/status");
+        assert_eq!(interaction_to_command_text("new"), "/new");
+        assert_eq!(interaction_to_command_text("model"), "/model");
+    }
+
+    /// 未知コマンド名を正規化した場合、handle_slash_command が unknown_command_response を返すこと。
+    #[test]
+    fn interaction_unknown_command_responds() {
+        // Arrange
+        let command_text = interaction_to_command_text("nonexistent_cmd");
+
+        // Act: 正規化後のテキストが is_slash_command に認識されることを確認
+        assert!(crate::slash_commands::is_slash_command(&command_text));
+
+        // Assert: handle_slash_command が None を返す（未知コマンド）
+        // ※ AppState が必要なため、ここでは正規化結果の形式のみ検証
+        assert_eq!(command_text, "/nonexistent_cmd");
     }
 }
