@@ -360,10 +360,8 @@ async fn run_loop(
                             next_action = Some(PendingAction::SendMessage(raw_input));
                         }
                     }
-                    KeyCode::Char(c) => {
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            insert_input_char(chat, c);
-                        }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        insert_input_char(chat, c);
                     }
                     _ => {}
                 },
