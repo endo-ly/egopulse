@@ -69,6 +69,12 @@ pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
 fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String {
     let config_arg = config_path.to_string_lossy();
     let escaped_config = config_arg.replace('\\', "\\\\").replace('"', "\\\"");
+    let working_dir = config_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| dirs::home_dir()
+            .map(|h| h.join(".egopulse").to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string()));
 
     format!(
         "[Unit]
@@ -78,6 +84,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory={working_dir}
 ExecStart={exe_path} --config \"{escaped_config}\" run
 Restart=always
 RestartSec=10
