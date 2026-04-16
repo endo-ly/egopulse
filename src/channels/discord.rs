@@ -271,7 +271,23 @@ impl EventHandler for Handler {
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
             .iter()
-            .map(|c| serenity::builder::CreateCommand::new(c.name).description(c.description))
+            .map(|c| {
+                let builder =
+                    serenity::builder::CreateCommand::new(c.name).description(c.description);
+                // 引数を持つコマンドには String option を追加
+                if c.usage.contains('[') {
+                    builder.add_option(
+                        serenity::builder::CreateCommandOption::new(
+                            serenity::model::application::CommandOptionType::String,
+                            "name",
+                            c.description,
+                        )
+                        .required(false),
+                    )
+                } else {
+                    builder
+                }
+            })
             .collect();
 
         if let Err(e) = Command::set_global_commands(&ctx.http, commands).await {
@@ -288,7 +304,21 @@ impl EventHandler for Handler {
             return;
         };
 
-        let command_text = interaction_to_command_text(&cmd.data.name);
+        // Discord 3秒ルール対応: 即座に defer して "thinking..." を表示
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                serenity::builder::CreateInteractionResponse::Defer(
+                    serenity::builder::CreateInteractionResponseMessage::new(),
+                ),
+            )
+            .await
+        {
+            tracing::warn!("Discord: failed to defer interaction: {e}");
+            return;
+        }
+
+        let command_text = interaction_to_command_text(&cmd.data.name, &cmd.data.options);
 
         // チャネル ID を解決して内部 chat_id を取得
         let channel_id = cmd.channel_id.get();
@@ -322,16 +352,15 @@ impl EventHandler for Handler {
             }
         };
 
-        let message =
-            serenity::builder::CreateInteractionResponseMessage::new().content(response_text);
+        // defer 後の編集で最終応答を送信
         if let Err(e) = cmd
-            .create_response(
+            .edit_response(
                 &ctx.http,
-                serenity::builder::CreateInteractionResponse::Message(message),
+                serenity::builder::EditInteractionResponse::new().content(response_text),
             )
             .await
         {
-            tracing::warn!("Discord: failed to respond to interaction: {e}");
+            tracing::warn!("Discord: failed to edit interaction response: {e}");
         }
     }
 }
@@ -357,10 +386,20 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
 }
 
-/// Discord Interaction のコマンド名を handle_slash_command が
-/// 受け付ける形式（"/command"）に正規化する。
-fn interaction_to_command_text(name: &str) -> String {
-    format!("/{name}")
+/// Discord Interaction のコマンド名と引数を handle_slash_command が
+/// 受け付ける形式（"/command [args]"）に正規化する。
+fn interaction_to_command_text(
+    name: &str,
+    options: &[serenity::model::application::CommandDataOption],
+) -> String {
+    let mut text = format!("/{name}");
+    for opt in options {
+        if let serenity::model::application::CommandDataOptionValue::String(value) = &opt.value {
+            text.push(' ');
+            text.push_str(value);
+        }
+    }
+    text
 }
 
 /// Starts the Discord bot and supervises its gateway lifecycle.
@@ -435,17 +474,17 @@ mod tests {
     /// Interaction コマンド名 → "/command" 形式の正規化が正しいこと。
     #[test]
     fn interaction_command_text_normalizes() {
-        // Arrange & Act & Assert
-        assert_eq!(interaction_to_command_text("status"), "/status");
-        assert_eq!(interaction_to_command_text("new"), "/new");
-        assert_eq!(interaction_to_command_text("model"), "/model");
+        // Arrange & Act & Assert: 引数なし
+        assert_eq!(interaction_to_command_text("status", &[]), "/status");
+        assert_eq!(interaction_to_command_text("new", &[]), "/new");
+        assert_eq!(interaction_to_command_text("model", &[]), "/model");
     }
 
     /// 未知コマンド名を正規化した場合、handle_slash_command が unknown_command_response を返すこと。
     #[test]
     fn interaction_unknown_command_responds() {
         // Arrange
-        let command_text = interaction_to_command_text("nonexistent_cmd");
+        let command_text = interaction_to_command_text("nonexistent_cmd", &[]);
 
         // Act: 正規化後のテキストが is_slash_command に認識されることを確認
         assert!(crate::slash_commands::is_slash_command(&command_text));
