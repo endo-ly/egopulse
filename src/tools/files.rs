@@ -9,13 +9,13 @@ use serde_json::json;
 
 use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
 
+use super::path_guard;
 use super::search::resolve_workspace_path;
 use super::text::{
     EditSpec, apply_edits_to_normalized_content, detect_line_ending, first_changed_line,
     format_size, generate_diff_string, normalize_newlines, restore_line_endings, strip_bom,
     truncate_head,
 };
-use super::path_guard;
 use super::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext, ToolResult, schema_object,
 };

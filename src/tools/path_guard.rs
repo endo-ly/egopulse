@@ -67,12 +67,40 @@ pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
         }
     }
     check_proc_access(&lower)?;
+    check_blocked_files_in_command(&lower)?;
+    Ok(())
+}
+
+fn check_blocked_files_in_command(lower: &str) -> Result<(), String> {
     for blocked in BLOCKED_FILES {
-        if lower.contains(blocked) {
-            return Err(format!(
-                "Access denied: command references blocked file '{blocked}'. \
-                 Sensitive files cannot be accessed through shell commands."
-            ));
+        let mut start = 0usize;
+        while let Some(offset) = lower[start..].find(blocked) {
+            let abs = start + offset;
+            let preceded_by_boundary = abs == 0
+                || lower.as_bytes().get(abs - 1).is_some_and(|&b| {
+                    b == b'/' || b == b'\\' || b == b' ' || b == b'\'' || b == b'"'
+                });
+            let blocked_end = abs + blocked.len();
+            let followed_by_boundary = blocked_end >= lower.len()
+                || lower.as_bytes().get(blocked_end).is_some_and(|&b| {
+                    b == b'/'
+                        || b == b'\\'
+                        || b == b' '
+                        || b == b'\''
+                        || b == b'"'
+                        || b == b'\n'
+                        || b == b';'
+                });
+            if preceded_by_boundary && followed_by_boundary {
+                return Err(format!(
+                    "Access denied: command references blocked file '{blocked}'. \
+                     Sensitive files cannot be accessed through shell commands."
+                ));
+            }
+            start = abs + 1;
+            if start >= lower.len() {
+                break;
+            }
         }
     }
     Ok(())

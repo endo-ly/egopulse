@@ -420,8 +420,14 @@ pub(crate) fn collect_config_secrets(config: &crate::config::Config) -> Vec<(Str
         if let Some(token) = &channel.auth_token {
             secrets.push((format!("channel.{name}.auth_token"), token.clone()));
         }
+        if let Some(token) = &channel.file_auth_token {
+            secrets.push((format!("channel.{name}.file_auth_token"), token.clone()));
+        }
         if let Some(token) = &channel.bot_token {
             secrets.push((format!("channel.{name}.bot_token"), token.clone()));
+        }
+        if let Some(token) = &channel.file_bot_token {
+            secrets.push((format!("channel.{name}.file_bot_token"), token.clone()));
         }
     }
     secrets

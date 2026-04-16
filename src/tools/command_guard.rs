@@ -1,7 +1,7 @@
 //! シェルコマンドのセキュリティガード。
 //!
 //! AI エージェントによる環境変数ダンプやシークレット窃取を防止するため、
-//！実行前にコマンド文字列を検証し、危険なパターンをブロックする。
+//! 実行前にコマンド文字列を検証し、危険なパターンをブロックする。
 
 /// ブロック対象のコマンド名（単語境界で照合）。
 const BLOCKED_COMMANDS: &[&str] = &["env", "printenv"];
@@ -77,19 +77,20 @@ pub(crate) fn check_command(command: &str) -> Result<(), String> {
 fn check_set_without_options(command: &str) -> Result<(), String> {
     for segment in split_command_segments(command) {
         let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
         let words: Vec<&str> = trimmed.split_whitespace().collect();
-        for (i, word) in words.iter().enumerate() {
-            if *word != "set" {
-                continue;
-            }
-            let next_is_option = words.get(i + 1).is_some_and(|w| w.starts_with('-'));
-            if !next_is_option {
-                return Err(
-                    "Access denied: bare 'set' is blocked to prevent shell variable leakage. \
-                     Use 'set -e', 'set -o pipefail', etc. for option configuration."
-                        .to_string(),
-                );
-            }
+        if words.first() != Some(&"set") {
+            continue;
+        }
+        let next_is_option = words.get(1).is_some_and(|w| w.starts_with('-'));
+        if !next_is_option {
+            return Err(
+                "Access denied: bare 'set' is blocked to prevent shell variable leakage. \
+                 Use 'set -e', 'set -o pipefail', etc. for option configuration."
+                    .to_string(),
+            );
         }
     }
     Ok(())

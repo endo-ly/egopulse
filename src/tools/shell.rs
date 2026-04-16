@@ -13,9 +13,8 @@ use crate::llm::ToolDefinition;
 
 use super::text::{format_size, shell_quote, truncate_tail};
 use super::{
-    command_guard, path_guard,
     DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
-    ToolResult, schema_object, redact_known_secret_patterns,
+    ToolResult, command_guard, path_guard, redact_known_secret_patterns, schema_object,
 };
 
 /// Executes bash commands in the workspace with configurable timeout and output capture.
@@ -41,7 +40,8 @@ impl BashTool {
             .stderr(Stdio::null())
             .process_group(0)
             .kill_on_drop(true);
-        cmd.spawn().map_err(|error| format!("Failed to execute bash command: {error}"))
+        cmd.spawn()
+            .map_err(|error| format!("Failed to execute bash command: {error}"))
     }
 }
 
