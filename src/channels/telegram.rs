@@ -377,17 +377,10 @@ pub async fn start_telegram_bot(
     {
         use teloxide::types::BotCommand;
 
-        let commands = vec![
-            BotCommand::new("new", "Clear current session"),
-            BotCommand::new("compact", "Force compact session"),
-            BotCommand::new("status", "Show current status"),
-            BotCommand::new("skills", "List available skills"),
-            BotCommand::new("restart", "Restart the bot"),
-            BotCommand::new("providers", "List LLM providers"),
-            BotCommand::new("provider", "Show/switch provider"),
-            BotCommand::new("models", "List models"),
-            BotCommand::new("model", "Show/switch model"),
-        ];
+        let commands: Vec<BotCommand> = slash_commands::all_commands()
+            .iter()
+            .map(|c| BotCommand::new(c.name, c.description))
+            .collect();
         if let Err(e) = bot.set_my_commands(commands).await {
             warn!("Telegram: failed to set bot commands: {e}");
         }
@@ -461,5 +454,26 @@ mod tests {
             12345
         );
         assert!(parse_telegram_chat_id("telegram:not-a-number").is_err());
+    }
+
+    /// Telegram BotCommand リストが all_commands() レジストリと整合することを確認。
+    #[test]
+    fn telegram_commands_match_registry() {
+        use teloxide::types::BotCommand;
+
+        let registry = crate::slash_commands::all_commands();
+        let bot_commands: Vec<BotCommand> = registry
+            .iter()
+            .map(|c| BotCommand::new(c.name, c.description))
+            .collect();
+
+        // 同数であること
+        assert_eq!(bot_commands.len(), registry.len());
+
+        // 名前と説明が順序含めて一致すること
+        for (bot_cmd, reg) in bot_commands.iter().zip(registry.iter()) {
+            assert_eq!(bot_cmd.command, reg.name);
+            assert_eq!(bot_cmd.description, reg.description);
+        }
     }
 }
