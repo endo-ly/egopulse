@@ -65,6 +65,32 @@ pub(crate) fn blocked_ripgrep_exclude_globs() -> Vec<String> {
     globs
 }
 
+pub(crate) fn blocked_fd_exclude_patterns() -> Vec<String> {
+    let mut patterns = Vec::with_capacity(
+        BLOCKED_DIRS.len() * 4 + BLOCKED_FILES.len() * 2 + BLOCKED_SUBPATHS.len() * 4,
+    );
+
+    for dir in BLOCKED_DIRS {
+        patterns.push((*dir).to_string());
+        patterns.push(format!("**/{dir}"));
+        patterns.push(format!("{dir}/**"));
+        patterns.push(format!("**/{dir}/**"));
+    }
+    for file in BLOCKED_FILES {
+        patterns.push((*file).to_string());
+        patterns.push(format!("**/{file}"));
+    }
+    for subpath in BLOCKED_SUBPATHS {
+        let joined = subpath.join("/");
+        patterns.push(joined.clone());
+        patterns.push(format!("**/{joined}"));
+        patterns.push(format!("{joined}/**"));
+        patterns.push(format!("**/{joined}/**"));
+    }
+
+    patterns
+}
+
 /// パスがセキュリティポリシーでブロックされるか検査する。
 pub(crate) fn check_path(path: &str) -> Result<(), String> {
     let candidate = Path::new(path);
@@ -508,5 +534,13 @@ mod tests {
         assert!(globs.iter().any(|g| g == "!**/.ssh/**"));
         assert!(globs.iter().any(|g| g == "!**/.env"));
         assert!(globs.iter().any(|g| g == "!**/.config/gcloud/**"));
+    }
+
+    #[test]
+    fn fd_exclude_patterns_include_sensitive_targets() {
+        let patterns = blocked_fd_exclude_patterns();
+        assert!(patterns.iter().any(|p| p == ".ssh"));
+        assert!(patterns.iter().any(|p| p == "**/.env"));
+        assert!(patterns.iter().any(|p| p == "**/.config/gcloud/**"));
     }
 }
