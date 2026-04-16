@@ -247,6 +247,9 @@ impl Tool for GrepTool {
         if let Some(file_glob) = file_glob {
             command.arg("--glob").arg(file_glob);
         }
+        for blocked_glob in path_guard::blocked_ripgrep_exclude_globs() {
+            command.arg("--glob").arg(blocked_glob);
+        }
         command
             .arg("-e")
             .arg(pattern)

@@ -43,6 +43,28 @@ const BLOCKED_ABSOLUTE: &[&str] = &[
     "/proc/self/mountinfo",
 ];
 
+pub(crate) fn blocked_ripgrep_exclude_globs() -> Vec<String> {
+    let mut globs = Vec::with_capacity(
+        BLOCKED_DIRS.len() * 2 + BLOCKED_FILES.len() * 2 + BLOCKED_SUBPATHS.len() * 2,
+    );
+
+    for dir in BLOCKED_DIRS {
+        globs.push(format!("!{dir}/**"));
+        globs.push(format!("!**/{dir}/**"));
+    }
+    for file in BLOCKED_FILES {
+        globs.push(format!("!{file}"));
+        globs.push(format!("!**/{file}"));
+    }
+    for subpath in BLOCKED_SUBPATHS {
+        let joined = subpath.join("/");
+        globs.push(format!("!{joined}/**"));
+        globs.push(format!("!**/{joined}/**"));
+    }
+
+    globs
+}
+
 /// パスがセキュリティポリシーでブロックされるか検査する。
 pub(crate) fn check_path(path: &str) -> Result<(), String> {
     let candidate = Path::new(path);
@@ -60,7 +82,7 @@ pub(crate) fn check_path(path: &str) -> Result<(), String> {
 pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
     let lower = command.to_ascii_lowercase();
     for blocked in BLOCKED_ABSOLUTE {
-        if lower.contains(blocked) {
+        if contains_path_reference(&lower, blocked) {
             return Err(format!(
                 "Access denied: command references blocked path '{blocked}'."
             ));
@@ -68,6 +90,8 @@ pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
     }
     check_proc_access(&lower)?;
     check_blocked_files_in_command(&lower)?;
+    check_blocked_dirs_in_command(&lower)?;
+    check_blocked_subpaths_in_command(&lower)?;
     Ok(())
 }
 
@@ -76,21 +100,11 @@ fn check_blocked_files_in_command(lower: &str) -> Result<(), String> {
         let mut start = 0usize;
         while let Some(offset) = lower[start..].find(blocked) {
             let abs = start + offset;
-            let preceded_by_boundary = abs == 0
-                || lower.as_bytes().get(abs - 1).is_some_and(|&b| {
-                    b == b'/' || b == b'\\' || b == b' ' || b == b'\'' || b == b'"'
-                });
+            let preceded_by_boundary =
+                abs == 0 || is_path_prefix_boundary(lower.as_bytes()[abs - 1]);
             let blocked_end = abs + blocked.len();
             let followed_by_boundary = blocked_end >= lower.len()
-                || lower.as_bytes().get(blocked_end).is_some_and(|&b| {
-                    b == b'/'
-                        || b == b'\\'
-                        || b == b' '
-                        || b == b'\''
-                        || b == b'"'
-                        || b == b'\n'
-                        || b == b';'
-                });
+                || is_path_suffix_boundary(lower.as_bytes()[blocked_end]);
             if preceded_by_boundary && followed_by_boundary {
                 return Err(format!(
                     "Access denied: command references blocked file '{blocked}'. \
@@ -104,6 +118,104 @@ fn check_blocked_files_in_command(lower: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_blocked_dirs_in_command(lower: &str) -> Result<(), String> {
+    for blocked in BLOCKED_DIRS {
+        if contains_path_component(lower, blocked) {
+            return Err(format!(
+                "Access denied: command references blocked directory '{blocked}'."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_blocked_subpaths_in_command(lower: &str) -> Result<(), String> {
+    for blocked in BLOCKED_SUBPATHS {
+        let subpath = blocked.join("/");
+        if contains_path_reference(lower, &subpath) {
+            return Err(format!(
+                "Access denied: command references blocked path segment '{subpath}'."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_path_component(lower: &str, component: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut start = 0usize;
+    while let Some(offset) = lower[start..].find(component) {
+        let abs = start + offset;
+        let end = abs + component.len();
+        let preceded = if abs == 0 {
+            true
+        } else {
+            is_path_prefix_boundary(bytes[abs - 1])
+        };
+        let followed = end >= bytes.len() || is_path_suffix_boundary(bytes[end]);
+        if preceded && followed {
+            return true;
+        }
+        start = abs + 1;
+        if start >= lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn contains_path_reference(lower: &str, needle: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut start = 0usize;
+    while let Some(offset) = lower[start..].find(needle) {
+        let abs = start + offset;
+        let end = abs + needle.len();
+        let preceded = abs == 0 || is_path_prefix_boundary(bytes[abs - 1]);
+        let followed = end >= bytes.len() || is_path_suffix_boundary(bytes[end]);
+        if preceded && followed {
+            return true;
+        }
+        start = abs + 1;
+        if start >= lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn is_path_prefix_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'/' | b'\\'
+            | b' '
+            | b'\t'
+            | b'\n'
+            | b'\''
+            | b'"'
+            | b'`'
+            | b';'
+            | b'|'
+            | b'&'
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'='
+            | b':'
+            | b','
+    )
+}
+
+fn is_path_suffix_boundary(byte: u8) -> bool {
+    if is_path_prefix_boundary(byte) {
+        return true;
+    }
+    !matches!(
+        byte,
+        b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/'
+    )
 }
 
 /// `/proc/self/*` `/proc/<pid>/*` へのアクセスを包括的にブロックする。
@@ -366,5 +478,35 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0], "src/main.rs");
         assert_eq!(filtered[1], "README.md");
+    }
+
+    #[test]
+    fn check_command_paths_blocks_directory_references() {
+        assert!(check_command_paths("find ~/.ssh -type f -exec cat {} +").is_err());
+        assert!(check_command_paths("tar czf - /home/user/.aws").is_err());
+    }
+
+    #[test]
+    fn check_command_paths_blocks_subpath_references() {
+        assert!(check_command_paths("tar czf - ~/.config/gcloud").is_err());
+        assert!(check_command_paths("cat /home/user/.config/gcloud/credentials.db").is_err());
+    }
+
+    #[test]
+    fn check_command_paths_avoids_suffix_false_positive() {
+        assert!(check_command_paths("cat /etc/shadow.bak").is_ok());
+    }
+
+    #[test]
+    fn check_command_paths_avoids_word_false_positive() {
+        assert!(check_command_paths("echo credentials-json").is_ok());
+    }
+
+    #[test]
+    fn ripgrep_exclude_globs_include_sensitive_targets() {
+        let globs = blocked_ripgrep_exclude_globs();
+        assert!(globs.iter().any(|g| g == "!**/.ssh/**"));
+        assert!(globs.iter().any(|g| g == "!**/.env"));
+        assert!(globs.iter().any(|g| g == "!**/.config/gcloud/**"));
     }
 }

@@ -63,9 +63,8 @@ fn check_blocked_commands(command: &str) -> Result<(), String> {
             }
         }
         if SHELL_EXEC_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
-            let lowered = trimmed.to_ascii_lowercase();
             for blocked in BLOCKED_COMMANDS {
-                if lowered.contains(blocked) {
+                if contains_blocked_command_token(trimmed, blocked) {
                     return Err(format!(
                         "Access denied: '{blocked}' detected in shell execution context."
                     ));
@@ -97,7 +96,9 @@ fn check_set_without_options(command: &str) -> Result<(), String> {
         if words.first() != Some(&"set") {
             continue;
         }
-        let next_is_option = words.get(1).is_some_and(|w| w.starts_with('-'));
+        let next_is_option = words
+            .get(1)
+            .is_some_and(|w| w.starts_with('-') || w.starts_with('+'));
         if !next_is_option {
             return Err(
                 "Access denied: bare 'set' is blocked to prevent shell variable leakage. \
@@ -150,7 +151,7 @@ fn split_command_segments(command: &str) -> Vec<&str> {
         } else if ch == '"' && !in_single_quote {
             in_double_quote = !in_double_quote;
         } else if !in_single_quote && !in_double_quote {
-            if ch == ';' {
+            if ch == ';' || ch == '\n' {
                 if byte_pos > start {
                     segments.push(&command[start..byte_pos]);
                 }
@@ -182,6 +183,27 @@ fn split_command_segments(command: &str) -> Vec<&str> {
     segments
 }
 
+fn contains_blocked_command_token(segment: &str, blocked: &str) -> bool {
+    segment
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '|' | '&' | '(' | ')' | '\'' | '"' | '`' | '<' | '>'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let normalized =
+                token.trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`' | ',' | ';'));
+            if normalized.is_empty() {
+                return false;
+            }
+            let base = normalized.rsplit('/').next().unwrap_or(normalized);
+            base == blocked
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +224,7 @@ mod tests {
         assert!(check_command("echo hello; env").is_err());
         assert!(check_command("echo hello && env").is_err());
         assert!(check_command("echo hello || env").is_err());
+        assert!(check_command("echo ok\nenv").is_err());
     }
 
     #[test]
@@ -244,12 +267,31 @@ mod tests {
         assert!(check_command("set -e").is_ok());
         assert!(check_command("set -o pipefail").is_ok());
         assert!(check_command("set -euxo pipefail").is_ok());
+        assert!(check_command("set +x").is_ok());
     }
 
     #[test]
     fn allows_env_in_quotes() {
         assert!(check_command("echo 'environment'").is_ok());
         assert!(check_command("echo \"the env variable\"").is_ok());
+    }
+
+    #[test]
+    fn blocks_bare_set_after_newline() {
+        assert!(check_command("echo ok\nset").is_err());
+    }
+
+    #[test]
+    fn allows_shell_exec_words_containing_env() {
+        assert!(check_command("bash -c 'echo event'").is_ok());
+        assert!(check_command("bash -c 'echo printenvy'").is_ok());
+    }
+
+    #[test]
+    fn blocks_shell_exec_env_tokens_with_boundaries() {
+        assert!(check_command("bash -c 'env'").is_err());
+        assert!(check_command("bash -c '/usr/bin/env | sort'").is_err());
+        assert!(check_command("eval \"printenv\"").is_err());
     }
 
     #[test]
