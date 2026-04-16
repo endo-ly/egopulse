@@ -72,9 +72,11 @@ fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String 
     let working_dir = config_path
         .parent()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| dirs::home_dir()
-            .map(|h| h.join(".egopulse").to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string()));
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".egopulse").to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        });
 
     format!(
         "[Unit]

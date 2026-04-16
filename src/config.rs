@@ -171,7 +171,7 @@ pub struct Config {
     /// Optional global model override (YAML `default_model`).
     pub default_model: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
-    pub data_dir: String,
+    pub state_root: String,
     pub log_level: String,
     pub compaction_timeout_secs: u64,
     pub max_history_messages: usize,
@@ -186,7 +186,7 @@ impl std::fmt::Debug for Config {
             .field("default_provider", &self.default_provider)
             .field("default_model", &self.default_model)
             .field("providers", &self.providers)
-            .field("data_dir", &self.data_dir)
+            .field("state_root", &self.state_root)
             .field("log_level", &self.log_level)
             .field("compaction_timeout_secs", &self.compaction_timeout_secs)
             .field("max_history_messages", &self.max_history_messages)
@@ -369,14 +369,44 @@ impl Config {
             .and_then(|c| c.bot_username.as_deref())
     }
 
-    /// Directory containing skill definitions.
+    /// 組み込みスキルディレクトリ: `state_root/skills`。
     pub fn skills_dir(&self) -> Result<PathBuf, ConfigError> {
+        default_state_root().map(|root| root.join("skills"))
+    }
+
+    /// ユーザースキルディレクトリ: `state_root/workspace/skills`。
+    pub fn user_skills_dir(&self) -> Result<PathBuf, ConfigError> {
         default_workspace_dir().map(|dir| dir.join("skills"))
     }
 
     /// Workspace directory for agent file operations.
     pub fn workspace_dir(&self) -> Result<PathBuf, ConfigError> {
         default_workspace_dir()
+    }
+
+    /// ランタイムデータディレクトリ: `state_root/runtime`。
+    pub fn runtime_dir(&self) -> PathBuf {
+        Path::new(&self.state_root).join("runtime")
+    }
+
+    /// データベースファイルパス: `state_root/runtime/egopulse.db`。
+    pub fn db_path(&self) -> PathBuf {
+        self.runtime_dir().join("egopulse.db")
+    }
+
+    /// アセットディレクトリ: `state_root/runtime/assets`。
+    pub fn assets_dir(&self) -> PathBuf {
+        self.runtime_dir().join("assets")
+    }
+
+    /// アーカイブディレクトリ: `state_root/runtime/groups`。
+    pub fn groups_dir(&self) -> PathBuf {
+        self.runtime_dir().join("groups")
+    }
+
+    /// ステータスファイルパス: `state_root/runtime/status.json`。
+    pub fn status_json_path(&self) -> PathBuf {
+        self.runtime_dir().join("status.json")
     }
 
     /// Atomically writes the current config to a YAML file.
@@ -406,11 +436,6 @@ pub fn default_state_root() -> Result<PathBuf, ConfigError> {
     dirs::home_dir()
         .map(|home| home.join(".egopulse"))
         .ok_or(ConfigError::HomeDirectoryUnresolved)
-}
-
-/// Default data directory: `~/.egopulse/data`.
-pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
-    default_state_root().map(|root| root.join("data"))
 }
 
 /// Default workspace directory: `~/.egopulse/workspace`.
@@ -593,7 +618,7 @@ fn build_config(
 
     let default_model = normalize_string(file_default_model);
 
-    let data_dir = default_data_dir()?.to_string_lossy().into_owned();
+    let state_root = default_state_root()?.to_string_lossy().into_owned();
 
     let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -617,7 +642,7 @@ fn build_config(
         default_provider,
         default_model,
         providers,
-        data_dir,
+        state_root,
         log_level,
         compaction_timeout_secs,
         max_history_messages,
@@ -784,7 +809,7 @@ struct SerializableConfig {
     default_provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
-    data_dir: String,
+    state_root: String,
     log_level: String,
     compaction_timeout_secs: u64,
     max_history_messages: usize,
@@ -879,7 +904,7 @@ impl From<&Config> for SerializableConfig {
         Self {
             default_provider: config.default_provider.clone(),
             default_model: config.default_model.clone(),
-            data_dir: config.data_dir.clone(),
+            state_root: config.state_root.clone(),
             log_level: config.log_level.clone(),
             compaction_timeout_secs: config.compaction_timeout_secs,
             max_history_messages: config.max_history_messages,
@@ -976,7 +1001,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Config, default_data_dir, default_workspace_dir};
+    use super::{Config, default_state_root, default_workspace_dir};
     use crate::error::ConfigError;
     use crate::test_env::EnvVarGuard;
 
@@ -1031,14 +1056,17 @@ channels:
 
         assert_eq!(config.default_provider, "openai");
         assert_eq!(config.global_provider().label, "OpenAI");
-        assert_eq!(PathBuf::from(&config.data_dir), default_data_dir().unwrap());
+        assert_eq!(
+            PathBuf::from(&config.state_root),
+            default_state_root().unwrap()
+        );
         assert_eq!(
             config.workspace_dir().unwrap(),
             default_workspace_dir().unwrap()
         );
         assert_eq!(
             config.skills_dir().unwrap(),
-            default_workspace_dir().unwrap().join("skills")
+            default_state_root().unwrap().join("skills")
         );
         assert!(config.web_enabled());
         assert_eq!(config.web_auth_token(), Some("web-secret"));

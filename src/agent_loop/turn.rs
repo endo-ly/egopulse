@@ -783,7 +783,7 @@ impl RecordingProvider {
 }
 
 #[cfg(test)]
-pub(crate) fn test_config(data_dir: String) -> crate::config::Config {
+pub(crate) fn test_config(state_root: String) -> crate::config::Config {
     crate::config::Config {
         default_provider: "openai".to_string(),
         default_model: Some("gpt-4o-mini".to_string()),
@@ -799,7 +799,7 @@ pub(crate) fn test_config(data_dir: String) -> crate::config::Config {
                 models: vec!["gpt-4o-mini".to_string()],
             },
         )]),
-        data_dir,
+        state_root,
         log_level: "info".to_string(),
         compaction_timeout_secs: 180,
         max_history_messages: 50,
@@ -819,11 +819,11 @@ pub(crate) fn test_config(data_dir: String) -> crate::config::Config {
 
 #[cfg(test)]
 pub(crate) fn test_config_with_compaction(
-    data_dir: String,
+    state_root: String,
     max_session_messages: usize,
     compact_keep_recent: usize,
 ) -> crate::config::Config {
-    let mut config = test_config(data_dir);
+    let mut config = test_config(state_root);
     config.max_session_messages = max_session_messages;
     config.compact_keep_recent = compact_keep_recent;
     config
@@ -867,9 +867,10 @@ pub(crate) fn build_state(
     use crate::storage::Database;
     use crate::tools::ToolRegistry;
 
-    let data_dir = config.data_dir.clone();
-    let db = std::sync::Arc::new(Database::new(&data_dir).expect("db"));
-    let skills = std::sync::Arc::new(SkillManager::from_skills_dir(
+    let state_root = config.state_root.clone();
+    let db = std::sync::Arc::new(Database::new(&state_root).expect("db"));
+    let skills = std::sync::Arc::new(SkillManager::from_dirs(
+        config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
     ));
     AppState {
@@ -880,16 +881,16 @@ pub(crate) fn build_state(
         channels: std::sync::Arc::new(ChannelRegistry::new()),
         skills: std::sync::Arc::clone(&skills),
         tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
-        assets: std::sync::Arc::new(AssetStore::new(&data_dir).expect("assets")),
+        assets: std::sync::Arc::new(AssetStore::new(&state_root).expect("assets")),
     }
 }
 
 #[cfg(test)]
 pub(crate) fn build_state_with_provider(
-    data_dir: String,
+    state_root: String,
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
-    build_state(test_config(data_dir), llm)
+    build_state(test_config(state_root), llm)
 }
 
 #[cfg(test)]

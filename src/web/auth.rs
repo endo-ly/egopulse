@@ -184,7 +184,7 @@ mod tests {
                     models: vec!["gpt-4o-mini".to_string()],
                 },
             )]),
-            data_dir: ".egopulse".to_string(),
+            state_root: ".egopulse".to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,

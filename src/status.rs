@@ -100,7 +100,9 @@ pub struct ProviderStatus {
 
 /// `status.json` にスナップショットを書き出す。
 pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Result<()> {
-    let path = state_root.join(STATUS_FILE);
+    let runtime_dir = state_root.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)?;
+    let path = runtime_dir.join(STATUS_FILE);
     let json = serde_json::to_string_pretty(snapshot)?;
     fs::write(path, json)
 }
@@ -109,7 +111,7 @@ pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Re
 ///
 /// ファイルが存在しない、またはパースに失敗した場合は `None` を返す。
 pub fn read_status(state_root: &Path) -> Option<StatusSnapshot> {
-    let path = state_root.join(STATUS_FILE);
+    let path = state_root.join("runtime").join(STATUS_FILE);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -275,7 +277,9 @@ mod tests {
     fn read_invalid_json_returns_none() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(STATUS_FILE);
+        let runtime_dir = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let path = runtime_dir.join(STATUS_FILE);
         fs::write(&path, "not json").unwrap();
 
         // Act

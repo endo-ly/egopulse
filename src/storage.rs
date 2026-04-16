@@ -85,10 +85,11 @@ where
 const SCHEMA_VERSION: i64 = 1;
 
 impl Database {
-    /// Open (or create) the database at `{data_dir}/egopulse.db` and initialize schema.
-    pub fn new(data_dir: &str) -> Result<Self, StorageError> {
-        let db_path = Path::new(data_dir).join("egopulse.db");
-        std::fs::create_dir_all(data_dir)?;
+    /// Open (or create) the database at `{state_root}/runtime/egopulse.db` and initialize schema.
+    pub fn new(state_root: &str) -> Result<Self, StorageError> {
+        let runtime_dir = Path::new(state_root).join("runtime");
+        let db_path = runtime_dir.join("egopulse.db");
+        std::fs::create_dir_all(&runtime_dir)?;
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;

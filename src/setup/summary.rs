@@ -19,7 +19,8 @@ use super::provider::{
 };
 use super::{Field, SetupApp};
 use crate::config::{
-    Config, ProviderConfig, base_url_allows_empty_api_key, default_data_dir, default_workspace_dir,
+    Config, ProviderConfig, base_url_allows_empty_api_key, default_state_root,
+    default_workspace_dir,
 };
 use crate::error::EgoPulseError;
 
@@ -125,8 +126,8 @@ pub(crate) fn save_config(
         fs::create_dir_all(config_dir)
             .map_err(|e| format!("Failed to create config directory: {e}"))?;
     }
-    fs::create_dir_all(default_data_dir().map_err(|e| e.to_string())?)
-        .map_err(|e| format!("Failed to create data directory: {e}"))?;
+    fs::create_dir_all(default_state_root().map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Failed to create state root directory: {e}"))?;
     fs::create_dir_all(default_workspace_dir().map_err(|e| e.to_string())?)
         .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
 
@@ -179,7 +180,7 @@ pub(crate) fn save_config(
         default_provider: provider_id.clone(),
         default_model: Some(model.clone()),
         providers,
-        data_dir: default_data_dir()
+        state_root: default_state_root()
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .into_owned(),

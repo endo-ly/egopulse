@@ -418,7 +418,7 @@ mod tests {
         }
     }
 
-    fn test_config(data_dir: String) -> Config {
+    fn test_config(state_root: String) -> Config {
         Config {
             default_provider: "openai".to_string(),
             default_model: Some("gpt-4o-mini".to_string()),
@@ -432,7 +432,7 @@ mod tests {
                     models: vec!["gpt-4o-mini".to_string()],
                 },
             )]),
-            data_dir,
+            state_root,
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
@@ -459,21 +459,22 @@ mod tests {
         }
     }
 
-    fn build_state_with_provider(data_dir: String, llm: Box<dyn LlmProvider>) -> AppState {
+    fn build_state_with_provider(state_root: String, llm: Box<dyn LlmProvider>) -> AppState {
         use crate::channel_adapter::ChannelRegistry;
-        let config = test_config(data_dir.clone());
-        let skills = Arc::new(SkillManager::from_skills_dir(
+        let config = test_config(state_root.clone());
+        let skills = Arc::new(SkillManager::from_dirs(
+            config.user_skills_dir().expect("user_skills_dir"),
             config.skills_dir().expect("skills_dir"),
         ));
         AppState {
-            db: Arc::new(Database::new(&data_dir).expect("db")),
+            db: Arc::new(Database::new(&state_root).expect("db")),
             config: config.clone(),
             config_path: None,
             llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
-            assets: Arc::new(AssetStore::new(&data_dir).expect("assets")),
+            assets: Arc::new(AssetStore::new(&state_root).expect("assets")),
         }
     }
 

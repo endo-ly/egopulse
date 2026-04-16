@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
 
-/// Content-addressable file store for image assets under `{data_dir}/assets/images/`.
+/// Content-addressable file store for image assets under `{state_root}/runtime/assets/images/`.
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
@@ -32,8 +32,8 @@ struct ImageAssetMetadata {
 
 impl AssetStore {
     /// Create the asset store, ensuring the `assets/images/` directory tree exists.
-    pub fn new(data_dir: &str) -> Result<Self, StorageError> {
-        let root = Path::new(data_dir).join("assets");
+    pub fn new(state_root: &str) -> Result<Self, StorageError> {
+        let root = Path::new(state_root).join("runtime").join("assets");
         std::fs::create_dir_all(root.join("images"))?;
         Ok(Self { root })
     }

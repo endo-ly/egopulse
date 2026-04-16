@@ -101,9 +101,12 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
-    let db = Arc::new(Database::new(&config.data_dir)?);
-    let assets = Arc::new(AssetStore::new(&config.data_dir)?);
-    let skills = Arc::new(SkillManager::from_skills_dir(config.skills_dir()?));
+    let db = Arc::new(Database::new(&config.state_root)?);
+    let assets = Arc::new(AssetStore::new(&config.state_root)?);
+    let skills = Arc::new(SkillManager::from_dirs(
+        config.user_skills_dir()?,
+        config.skills_dir()?,
+    ));
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
@@ -358,13 +361,7 @@ async fn write_startup_status(state: &AppState) {
         },
     };
 
-    let state_root = match crate::config::default_state_root() {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!("failed to resolve state root for startup status: {error}");
-            return;
-        }
-    };
+    let state_root = PathBuf::from(&state.config.state_root);
     if let Err(error) = status::write_status(&state_root, &snapshot) {
         tracing::warn!("failed to write startup status: {error}");
     }

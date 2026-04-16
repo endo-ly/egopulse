@@ -40,7 +40,7 @@ struct ConfigPayload {
     default_provider: String,
     default_model: Option<String>,
     effective_model: String,
-    data_dir: String,
+    state_root: String,
     workspace_dir: String,
     web_enabled: bool,
     web_host: String,
@@ -352,7 +352,7 @@ fn default_payload(path: &std::path::Path) -> Result<ConfigPayload, ConfigError>
         default_provider: String::new(),
         default_model: None,
         effective_model: String::new(),
-        data_dir: crate::config::default_data_dir()?
+        state_root: crate::config::default_state_root()?
             .to_string_lossy()
             .into_owned(),
         workspace_dir: crate::config::default_workspace_dir()?
@@ -416,7 +416,7 @@ fn payload_from_config(
         default_provider: resolved.provider,
         default_model: config.default_model.clone(),
         effective_model: resolved.model,
-        data_dir: config.data_dir.clone(),
+        state_root: config.state_root.clone(),
         workspace_dir: crate::config::default_workspace_dir()?
             .to_string_lossy()
             .into_owned(),
