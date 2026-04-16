@@ -14,7 +14,7 @@ use crate::llm::ToolDefinition;
 use super::text::{format_size, shell_quote, truncate_tail};
 use super::{
     DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
-    ToolResult, schema_object,
+    ToolResult, command_guard, path_guard, redact_known_secret_patterns, schema_object,
 };
 
 /// Executes bash commands in the workspace with configurable timeout and output capture.
@@ -32,15 +32,15 @@ impl BashTool {
     }
 
     fn spawn_bash_command(&self, wrapped_command: &str) -> Result<tokio::process::Child, String> {
-        Command::new("bash")
-            .arg("-lc")
+        let mut cmd = Command::new("bash");
+        cmd.arg("-lc")
             .arg(wrapped_command)
             .current_dir(&self.workspace_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        cmd.spawn()
             .map_err(|error| format!("Failed to execute bash command: {error}"))
     }
 }
@@ -79,6 +79,12 @@ impl Tool for BashTool {
         let Some(command) = input.get("command").and_then(|value| value.as_str()) else {
             return ToolResult::error("Missing required parameter: command".to_string());
         };
+        if let Err(reason) = command_guard::check_command(command) {
+            return ToolResult::error(reason);
+        }
+        if let Err(reason) = path_guard::check_command_paths(command) {
+            return ToolResult::error(reason);
+        }
         let timeout_secs = input
             .get("timeout")
             .and_then(|value| value.as_u64())
@@ -116,6 +122,7 @@ impl Tool for BashTool {
         };
 
         let output = read_temp_output(&temp_path);
+        let output = redact_known_secret_patterns(&output);
         let (mut text, details) = render_bash_output(&output, &temp_path);
 
         if !status.success() {

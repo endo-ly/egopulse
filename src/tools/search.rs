@@ -13,6 +13,7 @@ use tokio::time::timeout;
 
 use crate::llm::ToolDefinition;
 
+use super::path_guard;
 use super::text::{format_size, truncate_head};
 use super::{
     DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_GREP_TIMEOUT_SECS, DEFAULT_LS_LIMIT,
@@ -204,6 +205,9 @@ impl Tool for GrepTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = check_resolved_path(&resolved) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
@@ -242,6 +246,9 @@ impl Tool for GrepTool {
         }
         if let Some(file_glob) = file_glob {
             command.arg("--glob").arg(file_glob);
+        }
+        for blocked_glob in path_guard::blocked_ripgrep_exclude_globs() {
+            command.arg("--glob").arg(blocked_glob);
         }
         command
             .arg("-e")
@@ -448,6 +455,9 @@ impl Tool for FindTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = check_resolved_path(&resolved) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
@@ -484,6 +494,9 @@ impl Tool for FindTool {
         for ignore_file in ignore_files {
             command.arg("--ignore-file").arg(ignore_file);
         }
+        for excluded in path_guard::blocked_fd_exclude_patterns() {
+            command.arg("--exclude").arg(excluded);
+        }
         command
             .arg("--")
             .arg(pattern)
@@ -515,17 +528,25 @@ impl Tool for FindTool {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(|line| {
+            .filter_map(|line| {
                 let path = Path::new(line);
+                let resolved_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    search_dir.join(path)
+                };
+                if check_resolved_path(&resolved_path).is_err() {
+                    return None;
+                }
                 let relative = path
                     .strip_prefix(&search_dir)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
                 if line.ends_with('/') || line.ends_with('\\') {
-                    format!("{relative}/")
+                    Some(format!("{relative}/"))
                 } else {
-                    relative
+                    Some(relative)
                 }
             })
             .collect::<Vec<_>>();
@@ -650,6 +671,9 @@ impl Tool for LsTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if let Err(reason) = check_resolved_path(&resolved) {
+            return ToolResult::error(reason);
+        }
         if !resolved.exists() {
             return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
@@ -666,6 +690,10 @@ impl Tool for LsTool {
             Ok(mut dir) => {
                 let mut names = Vec::new();
                 while let Some(entry) = dir.next_entry().await.ok().flatten() {
+                    let entry_path = entry.path();
+                    if check_resolved_path(&entry_path).is_err() {
+                        continue;
+                    }
                     let mut name = entry.file_name().to_string_lossy().to_string();
                     if let Ok(file_type) = entry.file_type().await {
                         if file_type.is_dir() {
@@ -758,4 +786,8 @@ pub(crate) fn command_scope_for_path(path: &Path) -> (&Path, &str) {
                 .unwrap_or("."),
         )
     }
+}
+
+fn check_resolved_path(path: &Path) -> Result<(), String> {
+    path_guard::check_path(path.to_string_lossy().as_ref())
 }

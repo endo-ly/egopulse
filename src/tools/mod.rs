@@ -4,12 +4,18 @@
 //! 7 種のファイル操作ツールと、スキル遅延読み込み用の activate_skill を提供する。
 //! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
 
+mod command_guard;
 mod files;
+mod path_guard;
 mod search;
 mod shell;
 mod text;
 
+#[allow(unused_imports)] // re-export for future use from other modules
+pub(crate) use command_guard::*;
 pub(crate) use files::*;
+#[allow(unused_imports)] // re-export for future use from other modules
+pub(crate) use path_guard::*;
 pub(crate) use search::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
@@ -31,6 +37,36 @@ const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
+
+/// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。
+const SECRET_PATTERNS: &[&str] = &[
+    // OpenAI
+    "sk-",
+    // OpenRouter
+    "sk-or-",
+    // Anthropic
+    "sk-ant-",
+    // Slack
+    "xoxb-",
+    "xapp-",
+    // GitHub
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    // GitLab
+    "glpat-",
+    // AWS Access Key ID
+    "AKIA",
+    "ASIA",
+    // Google API Key / OAuth
+    "AIza",
+    // Stripe
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+];
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +154,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    config_secrets: Vec<(String, String)>,
 }
 
 impl ToolRegistry {
@@ -130,6 +167,7 @@ impl ToolRegistry {
                 return Self {
                     tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
                     mcp_manager: None,
+                    config_secrets: collect_config_secrets(config),
                 };
             }
         };
@@ -152,10 +190,10 @@ impl ToolRegistry {
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
             mcp_manager: None,
+            config_secrets: collect_config_secrets(config),
         }
     }
 
-    /// Register a dynamically created tool (e.g. MCP tool wrapper).
     pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -211,7 +249,8 @@ impl ToolRegistry {
     ) -> ToolResult {
         for tool in &self.tools {
             if tool.name() == name {
-                return tool.execute(input, context).await;
+                let result = tool.execute(input, context).await;
+                return sanitize_tool_result(result, &self.config_secrets);
             }
         }
 
@@ -228,13 +267,26 @@ impl ToolRegistry {
                         .await
                 };
                 match result {
-                    Ok(output) => return ToolResult::success(output),
-                    Err(error) => return ToolResult::error(error.to_string()),
+                    Ok(output) => {
+                        return sanitize_tool_result(
+                            ToolResult::success(output),
+                            &self.config_secrets,
+                        );
+                    }
+                    Err(error) => {
+                        return sanitize_tool_result(
+                            ToolResult::error(error.to_string()),
+                            &self.config_secrets,
+                        );
+                    }
                 }
             }
         }
 
-        ToolResult::error(format!("Unknown tool: {name}"))
+        sanitize_tool_result(
+            ToolResult::error(format!("Unknown tool: {name}")),
+            &self.config_secrets,
+        )
     }
 }
 
@@ -311,6 +363,152 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
     })
 }
 
+/// Config から収集したシークレット値で出力をリダクションする。
+pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
+    if secrets.is_empty() {
+        return output.to_string();
+    }
+    let mut sorted: Vec<_> = secrets
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let mut redacted = output.to_string();
+    for (key, value) in &sorted {
+        redacted = redacted.replace(value, &format!("[REDACTED:{key}]"));
+    }
+    redacted
+}
+
+/// Well-known secret プレフィックスに基づくパターンリダクション。
+pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
+    let mut result = output.to_string();
+    for prefix in SECRET_PATTERNS {
+        let mut start = 0usize;
+        while let Some(offset) = result[start..].find(prefix) {
+            let abs_offset = start + offset;
+            let preceded_by_boundary = abs_offset == 0
+                || result[..abs_offset]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+            if !preceded_by_boundary {
+                start = abs_offset + 1;
+                continue;
+            }
+            let prefix_end = abs_offset + prefix.len();
+            let secret_end = result[prefix_end..]
+                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '\n' || c == ';')
+                .map(|i| prefix_end + i)
+                .unwrap_or(result.len());
+            if secret_end > prefix_end {
+                result = format!(
+                    "{}[REDACTED:secret]{}",
+                    &result[..abs_offset],
+                    &result[secret_end..]
+                );
+            }
+            start = abs_offset + "[REDACTED:secret]".len();
+            if start >= result.len() {
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn sanitize_output_string(output: &str, secrets: &[(String, String)]) -> String {
+    let redacted = redact_secrets(output, secrets);
+    redact_known_secret_patterns(&redacted)
+}
+
+fn sanitize_message_content(
+    content: crate::llm::MessageContent,
+    secrets: &[(String, String)],
+) -> crate::llm::MessageContent {
+    use crate::llm::{MessageContent, MessageContentPart};
+
+    match content {
+        MessageContent::Text(text) => MessageContent::Text(sanitize_output_string(&text, secrets)),
+        MessageContent::Parts(parts) => MessageContent::Parts(
+            parts
+                .into_iter()
+                .map(|part| match part {
+                    MessageContentPart::InputText { text } => MessageContentPart::InputText {
+                        text: sanitize_output_string(&text, secrets),
+                    },
+                    MessageContentPart::InputImage { image_url, detail } => {
+                        MessageContentPart::InputImage {
+                            image_url: sanitize_output_string(&image_url, secrets),
+                            detail: detail.map(|value| sanitize_output_string(&value, secrets)),
+                        }
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn sanitize_json_value(
+    value: serde_json::Value,
+    secrets: &[(String, String)],
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(sanitize_output_string(&text, secrets))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|item| sanitize_json_value(item, secrets))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, sanitize_json_value(value, secrets)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn sanitize_tool_result(mut result: ToolResult, secrets: &[(String, String)]) -> ToolResult {
+    result.content = sanitize_output_string(&result.content, secrets);
+    result.llm_content = sanitize_message_content(result.llm_content, secrets);
+    result.details = result
+        .details
+        .take()
+        .map(|details| sanitize_json_value(details, secrets));
+    result
+}
+
+/// Config から抽出したシークレット値のリストを構築する。
+pub(crate) fn collect_config_secrets(config: &crate::config::Config) -> Vec<(String, String)> {
+    let mut secrets = Vec::new();
+    use secrecy::ExposeSecret;
+    for (name, provider) in &config.providers {
+        if let Some(key) = &provider.api_key {
+            let value = ExposeSecret::expose_secret(key).to_string();
+            secrets.push((format!("provider.{name}.api_key"), value));
+        }
+    }
+    for (name, channel) in &config.channels {
+        if let Some(token) = &channel.auth_token {
+            secrets.push((format!("channel.{name}.auth_token"), token.clone()));
+        }
+        if let Some(token) = &channel.file_auth_token {
+            secrets.push((format!("channel.{name}.file_auth_token"), token.clone()));
+        }
+        if let Some(token) = &channel.bot_token {
+            secrets.push((format!("channel.{name}.bot_token"), token.clone()));
+        }
+        if let Some(token) = &channel.file_bot_token {
+            secrets.push((format!("channel.{name}.file_bot_token"), token.clone()));
+        }
+    }
+    secrets
+}
+
 fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
@@ -321,14 +519,43 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolExecutionContext, ToolRegistry};
+    use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
     use crate::config::{ChannelConfig, Config, ProviderConfig};
+    use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
     use crate::test_env::EnvVarGuard;
 
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+
+    struct StaticTool {
+        name: &'static str,
+        result: ToolResult,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StaticTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.to_string(),
+                description: "test tool".to_string(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &ToolExecutionContext,
+        ) -> ToolResult {
+            self.result.clone()
+        }
+    }
 
     fn test_config(data_dir: &str) -> Config {
         Config {
@@ -613,5 +840,196 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("# Skill: pdf"));
         assert!(result.content.contains("Use the PDF flow."));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redacts_error_result_fields_before_returning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                file_bot_token: Some("sk-secret-token-123".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "leaky_error",
+            result: ToolResult::error_with_details(
+                "error exposes sk-secret-token-123".to_string(),
+                json!({"trace":"sk-secret-token-123"}),
+            ),
+        }));
+
+        let result = registry
+            .execute("leaky_error", json!({}), &test_context())
+            .await;
+
+        assert!(result.is_error);
+        assert!(!result.content.contains("sk-secret-token-123"));
+        assert!(result.content.contains("[REDACTED:"));
+        assert!(
+            result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("trace"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| !text.contains("sk-secret-token-123"))
+        );
+        match &result.llm_content {
+            MessageContent::Text(text) => assert!(!text.contains("sk-secret-token-123")),
+            other => panic!("expected text llm content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redacts_short_configured_secret_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                auth_token: Some("xyz".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "leaky_short_secret",
+            result: ToolResult::success("short secret xyz leaked".to_string()),
+        }));
+
+        let result = registry
+            .execute("leaky_short_secret", json!({}), &test_context())
+            .await;
+
+        assert!(!result.is_error);
+        assert!(!result.content.contains(" xyz "));
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:channel.discord.auth_token]")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ignores_empty_configured_secret_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                auth_token: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "empty_secret",
+            result: ToolResult::success("hello".to_string()),
+        }));
+
+        let result = registry
+            .execute("empty_secret", json!({}), &test_context())
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "hello");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redacts_multimodal_llm_content_before_returning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.channels.insert(
+            "discord".to_string(),
+            ChannelConfig {
+                file_auth_token: Some("sk-multimodal-secret".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "leaky_multimodal",
+            result: ToolResult::success_with_llm_content(
+                "ok".to_string(),
+                MessageContent::parts(vec![
+                    MessageContentPart::InputText {
+                        text: "payload sk-multimodal-secret".to_string(),
+                    },
+                    MessageContentPart::InputImage {
+                        image_url: "https://example.com/image?token=sk-multimodal-secret"
+                            .to_string(),
+                        detail: Some("sk-multimodal-secret".to_string()),
+                    },
+                ]),
+            ),
+        }));
+
+        let result = registry
+            .execute("leaky_multimodal", json!({}), &test_context())
+            .await;
+
+        assert!(!result.is_error);
+        match &result.llm_content {
+            MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    MessageContentPart::InputText { text } => {
+                        assert!(!text.contains("sk-multimodal-secret"));
+                    }
+                    _ => panic!("expected InputText"),
+                }
+                match &parts[1] {
+                    MessageContentPart::InputImage { image_url, detail } => {
+                        assert!(!image_url.contains("sk-multimodal-secret"));
+                        assert!(
+                            detail
+                                .as_deref()
+                                .is_some_and(|value| !value.contains("sk-multimodal-secret"))
+                        );
+                    }
+                    _ => panic!("expected InputImage"),
+                }
+            }
+            other => panic!("expected parts llm content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn find_and_ls_filter_sensitive_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let workspace = config.workspace_dir().expect("workspace_dir");
+        std::fs::create_dir_all(workspace.join("src")).expect("src");
+        std::fs::create_dir_all(workspace.join(".ssh")).expect(".ssh");
+        std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}").expect("lib");
+        std::fs::write(workspace.join(".env"), "SECRET=1").expect(".env");
+        std::fs::write(workspace.join(".ssh/id_rsa"), "private").expect("id_rsa");
+        let registry = test_registry(&config);
+
+        let ls_result = registry.execute("ls", json!({}), &test_context()).await;
+        assert!(!ls_result.is_error, "{}", ls_result.content);
+        assert!(ls_result.content.contains("src/"));
+        assert!(!ls_result.content.contains(".env"));
+        assert!(!ls_result.content.contains(".ssh/"));
+
+        let find_result = registry
+            .execute("find", json!({"pattern": "*"}), &test_context())
+            .await;
+        assert!(!find_result.is_error, "{}", find_result.content);
+        assert!(find_result.content.contains("src/lib.rs"));
+        assert!(!find_result.content.contains(".env"));
+        assert!(!find_result.content.contains(".ssh/id_rsa"));
     }
 }
