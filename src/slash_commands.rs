@@ -239,6 +239,79 @@ async fn handle_llm_profile(state: &AppState, caller_channel: &str, input: &str)
 }
 
 // ---------------------------------------------------------------------------
+// Command Metadata Registry
+// ---------------------------------------------------------------------------
+
+/// スラッシュコマンド定義のメタデータ。
+///
+/// 各チャネル (Telegram, Discord, WebUI) はこのレジストリを通じて
+/// コマンド名・説明・使用法を参照する。
+pub struct CommandDef {
+    /// コマンド名（`/` なし）。
+    pub name: &'static str,
+    /// コマンドの短い説明。
+    pub description: &'static str,
+    /// 使用例（`/` で始まる）。
+    pub usage: &'static str,
+}
+
+/// 登録済みコマンド一覧を返す。
+pub const fn all_commands() -> &'static [CommandDef] {
+    &[
+        CommandDef {
+            name: "new",
+            description: "Clear current session",
+            usage: "/new",
+        },
+        CommandDef {
+            name: "compact",
+            description: "Force compact session",
+            usage: "/compact",
+        },
+        CommandDef {
+            name: "status",
+            description: "Show current status",
+            usage: "/status",
+        },
+        CommandDef {
+            name: "skills",
+            description: "List available skills",
+            usage: "/skills",
+        },
+        CommandDef {
+            name: "restart",
+            description: "Restart the bot",
+            usage: "/restart",
+        },
+        CommandDef {
+            name: "providers",
+            description: "List LLM providers",
+            usage: "/providers",
+        },
+        CommandDef {
+            name: "provider",
+            description: "Show/switch provider",
+            usage: "/provider [name]",
+        },
+        CommandDef {
+            name: "models",
+            description: "List models",
+            usage: "/models",
+        },
+        CommandDef {
+            name: "model",
+            description: "Show/switch model",
+            usage: "/model [name]",
+        },
+    ]
+}
+
+/// 名前から CommandDef を検索する。
+pub fn find_command(name: &str) -> Option<&'static CommandDef> {
+    all_commands().iter().find(|c| c.name == name)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -254,7 +327,7 @@ mod tests {
     use crate::runtime::AppState;
     use crate::storage::{StoredMessage, call_blocking};
 
-    use super::{handle_slash_command, is_slash_command};
+    use super::{all_commands, find_command, handle_slash_command, is_slash_command};
 
     // -- is_slash_command tests ---------------------------------------------------
 
@@ -525,5 +598,84 @@ mod tests {
             response.contains("Session is empty"),
             "response: {response}"
         );
+    }
+
+    // -- CommandDef registry tests -----------------------------------------------
+
+    #[test]
+    fn all_commands_returns_all() {
+        // Arrange & Act
+        let commands = all_commands();
+
+        // Assert: 9 コマンドが返る
+        assert_eq!(commands.len(), 9);
+        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"new"));
+        assert!(names.contains(&"compact"));
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"skills"));
+        assert!(names.contains(&"restart"));
+        assert!(names.contains(&"providers"));
+        assert!(names.contains(&"provider"));
+        assert!(names.contains(&"models"));
+        assert!(names.contains(&"model"));
+    }
+
+    #[test]
+    fn all_commands_has_valid_metadata() {
+        // Arrange & Act
+        let commands = all_commands();
+
+        // Assert: 各 CommandDef のメタデータが有効
+        for cmd in commands {
+            assert!(!cmd.name.is_empty(), "name must not be empty");
+            assert!(
+                !cmd.description.is_empty(),
+                "description for '{}' must not be empty",
+                cmd.name
+            );
+            assert!(
+                !cmd.usage.is_empty(),
+                "usage for '{}' must not be empty",
+                cmd.name
+            );
+            assert!(
+                cmd.usage.starts_with('/'),
+                "usage for '{}' must start with '/': got '{}'",
+                cmd.name,
+                cmd.usage
+            );
+        }
+    }
+
+    #[test]
+    fn all_commands_names_are_unique() {
+        // Arrange & Act
+        let commands = all_commands();
+
+        // Assert: name が重複しない
+        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len());
+    }
+
+    #[test]
+    fn find_command_by_name_known() {
+        // Arrange & Act
+        let found = find_command("status");
+
+        // Assert
+        let cmd = found.expect("status command should exist");
+        assert_eq!(cmd.name, "status");
+        assert_eq!(cmd.usage, "/status");
+    }
+
+    #[test]
+    fn find_command_by_name_unknown() {
+        // Arrange & Act
+        let found = find_command("nonexistent");
+
+        // Assert
+        assert!(found.is_none());
     }
 }

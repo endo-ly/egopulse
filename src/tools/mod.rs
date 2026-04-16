@@ -372,7 +372,7 @@ pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> Stri
         .iter()
         .filter(|(_, value)| !value.is_empty())
         .collect();
-    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     let mut redacted = output.to_string();
     for (key, value) in &sorted {
         redacted = redacted.replace(value, &format!("[REDACTED:{key}]"));
