@@ -33,6 +33,7 @@ pub struct AppState {
     pub channels: Arc<ChannelRegistry>,
     pub skills: Arc<SkillManager>,
     pub tools: Arc<ToolRegistry>,
+    pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     pub assets: Arc<AssetStore>,
 }
 
@@ -46,6 +47,7 @@ impl Clone for AppState {
             channels: Arc::clone(&self.channels),
             skills: Arc::clone(&self.skills),
             tools: Arc::clone(&self.tools),
+            mcp_manager: self.mcp_manager.clone(),
             assets: Arc::clone(&self.assets),
         }
     }
@@ -132,7 +134,12 @@ pub async fn build_app_state_with_path(
     let workspace_dir = config.workspace_dir()?;
     let mcp_manager = crate::mcp::McpManager::new(&workspace_dir).await?;
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
-    tools.set_mcp_manager(mcp_arc);
+
+    // Register MCP tools as adapters
+    let adapters = crate::mcp::McpManager::create_tool_adapters(&mcp_arc).await;
+    for adapter in adapters {
+        tools.register_tool(adapter);
+    }
 
     let tools = Arc::new(tools);
 
@@ -144,6 +151,7 @@ pub async fn build_app_state_with_path(
         channels,
         skills,
         tools,
+        mcp_manager: Some(mcp_arc),
         assets,
     })
 }
@@ -312,7 +320,7 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
 }
 
 async fn write_startup_status(state: &AppState) {
-    let mcp = if let Some(m) = state.tools.mcp_manager() {
+    let mcp = if let Some(m) = &state.mcp_manager {
         m.read().await.status_snapshot()
     } else {
         Default::default()

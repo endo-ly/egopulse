@@ -880,6 +880,7 @@ pub(crate) fn build_state(
         channels: std::sync::Arc::new(ChannelRegistry::new()),
         skills: std::sync::Arc::clone(&skills),
         tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
+        mcp_manager: None,
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
     }
 }
