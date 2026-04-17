@@ -424,7 +424,10 @@ impl Config {
 
     /// チャット別 AGENTS.md: `state_root/runtime/groups/{channel}/{thread}/AGENTS.md`。
     pub fn chat_agents_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir().join(channel).join(thread).join("AGENTS.md")
+        self.groups_dir()
+            .join(channel)
+            .join(thread)
+            .join("AGENTS.md")
     }
 
     /// チャット別 SOUL.md: `state_root/runtime/groups/{channel}/{thread}/SOUL.md`。
