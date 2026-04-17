@@ -3,7 +3,10 @@
 //! Microclaw の load_soul_content() / build_system_prompt() を踏襲し、
 //! 3層フォールバックチェーンによる SOUL 選択機構を提供する。
 
+use std::io;
 use std::path::{Path, PathBuf};
+
+const DEFAULT_SOUL_MD: &str = include_str!("default_soul.md");
 
 /// SOUL.md / AGENTS.md の読み込みと system prompt セクション構築。
 /// Microclaw の load_soul_content() / build_system_prompt() を踏襲。
@@ -145,6 +148,17 @@ impl SoulAgentsLoader {
 
     fn chat_soul_path(&self, channel: &str, thread: &str) -> PathBuf {
         self.groups_dir.join(channel).join(thread).join("SOUL.md")
+    }
+
+    pub fn provision_default_soul(&self) -> io::Result<bool> {
+        if self.soul_path.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = self.soul_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.soul_path, DEFAULT_SOUL_MD)?;
+        Ok(true)
     }
 }
 
@@ -424,5 +438,40 @@ mod tests {
         assert!(section.contains("<chat-agents>"));
         assert!(section.contains("Chat agents content"));
         assert!(section.contains("</chat-agents>"));
+    }
+
+    // --- provision_default_soul tests ---
+
+    #[test]
+    fn default_soul_content_is_non_empty_and_contains_key_phrases() {
+        assert!(!DEFAULT_SOUL_MD.trim().is_empty());
+        assert!(DEFAULT_SOUL_MD.contains("EgoPulse"));
+        assert!(DEFAULT_SOUL_MD.contains("local-first"));
+    }
+
+    #[test]
+    fn provision_default_soul_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        let created = loader.provision_default_soul().unwrap();
+        assert!(created);
+
+        let content = std::fs::read_to_string(dir.path().join("SOUL.md")).unwrap();
+        assert_eq!(content, DEFAULT_SOUL_MD);
+    }
+
+    #[test]
+    fn provision_default_soul_does_not_overwrite_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        write_file(&dir.path().join("SOUL.md"), "Existing personality");
+
+        let created = loader.provision_default_soul().unwrap();
+        assert!(!created);
+
+        let content = std::fs::read_to_string(dir.path().join("SOUL.md")).unwrap();
+        assert_eq!(content, "Existing personality");
     }
 }

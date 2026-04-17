@@ -140,6 +140,9 @@ pub async fn build_app_state_with_path(
     let tools = Arc::new(tools);
 
     let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
+    if let Err(error) = soul_agents.provision_default_soul() {
+        tracing::warn!("failed to provision default SOUL.md: {error}");
+    }
 
     Ok(AppState {
         db,
