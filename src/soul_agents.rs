@@ -462,8 +462,8 @@ mod tests {
     #[test]
     fn default_soul_content_is_non_empty_and_contains_key_phrases() {
         assert!(!DEFAULT_SOUL_MD.trim().is_empty());
-        assert!(DEFAULT_SOUL_MD.contains("EgoPulse"));
-        assert!(DEFAULT_SOUL_MD.contains("local-first"));
+        assert!(DEFAULT_SOUL_MD.contains("action-oriented"));
+        assert!(DEFAULT_SOUL_MD.contains("Reliability over impressiveness"));
     }
 
     #[test]
