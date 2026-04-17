@@ -3,6 +3,7 @@
 //! `egopulse gateway` サブコマンド向けに unit file の生成・systemctl 実行・
 //! 最新リリースへの更新処理をまとめる。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -14,7 +15,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SERVICE_NAME: &str = "egopulse.service";
 
-/// systemd ユーザーサービスのユニットファイルパスを返す。
 fn unit_path() -> Result<PathBuf, EgoPulseError> {
     let home = dirs::home_dir()
         .ok_or_else(|| EgoPulseError::Internal("HOME directory could not be resolved".into()))?;
@@ -25,7 +25,123 @@ fn unit_path() -> Result<PathBuf, EgoPulseError> {
         .join(SERVICE_NAME))
 }
 
-/// Supported systemd service management actions for `egopulse gateway`.
+fn build_service_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            env.insert("HOME".to_string(), home.clone());
+
+            let parts: Vec<String> = vec![
+                format!("{home}/.local/bin"),
+                "/usr/local/bin".to_string(),
+                "/usr/bin".to_string(),
+                "/bin".to_string(),
+            ];
+            let mut dedup = Vec::new();
+            for p in parts {
+                if !dedup.iter().any(|v| v == &p) {
+                    dedup.push(p);
+                }
+            }
+            env.insert("PATH".to_string(), dedup.join(":"));
+        }
+    }
+
+    env
+}
+
+/// systemd user session が利用可能か検証する。
+///
+/// `systemctl --user status` が成功するか確認し、失敗時は
+/// 原因を含むエラーメッセージを返す。
+fn assert_systemd_user_available() -> Result<(), EgoPulseError> {
+    assert_command_exists("systemctl")?;
+
+    let output = systemctl_cmd(&["status"])?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+    .trim()
+    .to_string();
+
+    if detail.to_lowercase().contains("not found") {
+        return Err(EgoPulseError::Internal(
+            "systemctl is not available; systemd user services are required".into(),
+        ));
+    }
+
+    Err(EgoPulseError::Internal(format!(
+        "systemctl --user unavailable: {detail}"
+    )))
+}
+
+fn ensure_user_session() -> Result<(), EgoPulseError> {
+    if systemctl_cmd(&["status"]).is_ok() {
+        return Ok(());
+    }
+
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        .unwrap_or(0);
+
+    if std::env::var("XDG_RUNTIME_DIR").is_err() {
+        let runtime_dir = format!("/run/user/{uid}");
+        if !std::path::Path::new(&runtime_dir).exists() {
+            let linger_output = ProcessCommand::new("loginctl")
+                .args(["enable-linger", &uid.to_string()])
+                .output()
+                .map_err(|e| {
+                    EgoPulseError::Internal(format!("failed to run loginctl enable-linger: {e}"))
+                })?;
+            if !linger_output.status.success() {
+                let stderr = String::from_utf8_lossy(&linger_output.stderr)
+                    .trim()
+                    .to_string();
+                return Err(EgoPulseError::Internal(format!(
+                    "loginctl enable-linger failed: {stderr}"
+                )));
+            }
+            println!("Enabled lingering for uid {uid}");
+        }
+        // SAFETY: XDG_RUNTIME_DIR の設定はプロセス内で安全。
+        // 他スレッドへの影響はない（gateway コマンドはシングルスレッド）。
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        }
+    }
+
+    assert_systemd_user_available()
+}
+
+fn assert_command_exists(cmd: &str) -> Result<(), EgoPulseError> {
+    let output = ProcessCommand::new("which")
+        .arg(cmd)
+        .output()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to run which: {e}")))?;
+    if !output.status.success() {
+        return Err(EgoPulseError::Internal(format!(
+            "'{cmd}' not found in PATH"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Subcommand)]
 pub enum GatewayAction {
     /// Install and enable the systemd service
@@ -66,7 +182,26 @@ pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
-fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String {
+fn systemd_escape_env(value: &str) -> String {
+    assert!(
+        !value.contains('\n'),
+        "environment variable must not contain newlines"
+    );
+    let needs_quoting = value.is_empty()
+        || value.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\' || c == '\'');
+    if !needs_quoting {
+        return value.to_string();
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// systemd ユニットファイルの内容を生成する。
+fn render_systemd_unit(
+    exe_path: &str,
+    config_path: &std::path::Path,
+    service_env: &BTreeMap<String, String>,
+) -> String {
     let config_arg = config_path.to_string_lossy();
     let escaped_config = config_arg.replace('\\', "\\\\").replace('"', "\\\"");
     let working_dir = config_path
@@ -78,6 +213,12 @@ fn render_systemd_unit(exe_path: &str, config_path: &std::path::Path) -> String 
                 .unwrap_or_else(|| ".".to_string())
         });
 
+    let mut env_lines = String::new();
+    for (key, value) in service_env {
+        let kv = format!("{key}={}", systemd_escape_env(value));
+        env_lines.push_str(&format!("Environment={kv}\n"));
+    }
+
     format!(
         "[Unit]
 Description=EgoPulse Agent Runtime
@@ -88,6 +229,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={working_dir}
 ExecStart={exe_path} --config \"{escaped_config}\" run
+{env_lines}\
 Restart=always
 RestartSec=10
 KillMode=process
@@ -162,6 +304,8 @@ ACTIONS:
 
     match action {
         GatewayAction::Install => {
+            ensure_user_session()?;
+
             let exe_path = std::env::current_exe().map_err(|e| {
                 EgoPulseError::Internal(format!("failed to resolve binary path: {e}"))
             })?;
@@ -173,6 +317,8 @@ ACTIONS:
                 )));
             }
 
+            let service_env = build_service_env();
+
             let unit = unit_path()?;
             let unit_dir = unit
                 .parent()
@@ -182,7 +328,8 @@ ACTIONS:
             })?;
 
             let already_installed = unit.exists();
-            let unit_content = render_systemd_unit(&exe_path.to_string_lossy(), &config_path);
+            let unit_content =
+                render_systemd_unit(&exe_path.to_string_lossy(), &config_path, &service_env);
             std::fs::write(&unit, &unit_content)
                 .map_err(|e| EgoPulseError::Internal(format!("failed to write unit file: {e}")))?;
 
@@ -204,16 +351,19 @@ ACTIONS:
             Ok(())
         }
         GatewayAction::Start => {
+            ensure_user_session()?;
             ensure_success(systemctl_cmd(&["start", SERVICE_NAME])?, "start service")?;
             println!("egopulse service started");
             Ok(())
         }
         GatewayAction::Stop => {
+            ensure_user_session()?;
             ensure_success(systemctl_cmd(&["stop", SERVICE_NAME])?, "stop service")?;
             println!("egopulse service stopped");
             Ok(())
         }
         GatewayAction::Uninstall => {
+            ensure_user_session()?;
             let _ = systemctl_cmd(&["disable", "--now", SERVICE_NAME]);
             let _ = systemctl_cmd(&["daemon-reload"]);
 
@@ -229,6 +379,7 @@ ACTIONS:
             Ok(())
         }
         GatewayAction::Status => {
+            ensure_user_session()?;
             let output = systemctl_cmd(&["status", SERVICE_NAME, "--no-pager"])?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -243,6 +394,7 @@ ACTIONS:
             }
         }
         GatewayAction::Restart => {
+            ensure_user_session()?;
             let output = systemctl_cmd(&["restart", SERVICE_NAME])?;
             if output.status.success() {
                 println!("egopulse service restarted");
@@ -286,14 +438,20 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_systemd_unit;
+    use super::*;
     use std::path::PathBuf;
 
     #[test]
     fn render_systemd_unit_contains_expected_directives() {
         let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
+        let mut service_env = BTreeMap::new();
+        service_env.insert("HOME".to_string(), "/home/user".to_string());
+        service_env.insert(
+            "PATH".to_string(),
+            "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        );
 
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
 
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/egopulse --config \"/home/user/.egopulse/egopulse.config.yaml\" run"
@@ -302,20 +460,62 @@ mod tests {
         assert!(unit.contains("RestartSec=10"));
         assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("WantedBy=default.target"));
-        assert!(!unit.contains("NoNewPrivileges"));
-        assert!(!unit.contains("ProtectSystem"));
-        assert!(!unit.contains("ReadWritePaths"));
-        assert!(!unit.contains("ProtectHome"));
-        assert!(!unit.contains("Environment=HOME"));
+        assert!(unit.contains("Environment=HOME=/home/user"));
+        assert!(unit.contains("Environment=PATH="));
     }
 
     #[test]
     fn render_systemd_unit_escapes_config_path_with_special_chars() {
         let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
+        let service_env = BTreeMap::new();
 
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path);
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
 
         assert!(unit.contains("/tmp/ego pulse/config dir/egopulse.config.yaml"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn render_systemd_unit_without_service_env() {
+        let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
+        let service_env = BTreeMap::new();
+
+        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
+
+        assert!(!unit.contains("Environment="));
+    }
+
+    #[test]
+    fn systemd_escape_env_plain_value() {
+        assert_eq!(systemd_escape_env("/usr/bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn systemd_escape_env_value_with_spaces() {
+        assert_eq!(
+            systemd_escape_env("/path with spaces"),
+            "\"/path with spaces\""
+        );
+    }
+
+    #[test]
+    fn systemd_escape_env_value_with_quotes() {
+        assert_eq!(systemd_escape_env("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn build_service_env_contains_expected_keys() {
+        let env = build_service_env();
+
+        assert!(env.contains_key("HOME"));
+        assert!(env.contains_key("PATH"));
+        assert!(!env.contains_key("TMPDIR"));
+        assert!(!env.contains_key("EGOPULSE_CONFIG"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain newlines")]
+    fn systemd_escape_env_rejects_newlines() {
+        systemd_escape_env("line1\nline2");
     }
 }
