@@ -87,12 +87,6 @@ struct ConnectedServer {
     cached_tools: Vec<Tool>,
 }
 
-impl ConnectedServer {
-    fn client(&self) -> &DynClient {
-        &self.client
-    }
-}
-
 pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let state_root = default_state_root()?;
     Ok(vec![
@@ -417,10 +411,6 @@ impl McpManager {
         })
     }
 
-    pub fn get_client_by_index(&self, index: usize) -> Option<&DynClient> {
-        self.servers.get(index).map(|s| s.client())
-    }
-
     /// 接続済み全サーバーの全ツールについて McpToolAdapter を生成する。
     ///
     /// 名前衝突したツールはスキップする（初期化時の warn ログと同じ方針）。
@@ -437,6 +427,12 @@ impl McpManager {
             for tool in &server.cached_tools {
                 let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
                 if !seen_names.insert(full_name.clone()) {
+                    warn!(
+                        server = %server.name,
+                        original = %tool.name,
+                        sanitized = %full_name,
+                        "skipping MCP tool adapter: sanitized name collides across servers"
+                    );
                     continue;
                 }
                 let definition = ToolDefinition {

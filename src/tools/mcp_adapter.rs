@@ -96,9 +96,11 @@ mod tests {
     use crate::tools::Tool;
 
     use serde_json::json;
+    use serial_test::serial;
 
     /// name() がサニタイズ済み mcp_{server}_{tool} 形式の名前を返すことを検証する。
     #[test]
+    #[serial]
     fn test_adapter_name_matches_sanitized() {
         // Arrange
         let adapter = create_test_adapter(
@@ -115,6 +117,7 @@ mod tests {
 
     /// definition() が正しい ToolDefinition を返すことを検証する。
     #[test]
+    #[serial]
     fn test_adapter_definition_converts_schema() {
         // Arrange
         let definition = ToolDefinition {
@@ -152,6 +155,7 @@ mod tests {
     /// このテストは adapter の構築と trait メソッドの呼び出し可能性を検証する。
     /// 実際の MCP 呼び出しの成功パスは integration test でカバーする。
     #[test]
+    #[serial]
     fn test_adapter_holds_correct_fields_for_success_path() {
         // Arrange
         let adapter = create_test_adapter(
@@ -169,6 +173,7 @@ mod tests {
 
     /// 複数サーバー・複数ツールの adapter が独立して名前を保持することを検証する。
     #[test]
+    #[serial]
     fn test_adapter_distinguishes_multiple_servers() {
         // Arrange
         let adapter_a = create_test_adapter("mcp_serverA_tool1".to_string(), "tool1".to_string());
@@ -182,6 +187,7 @@ mod tests {
 
     /// definition() を複数回呼び出しても同じ内容が返ることを検証する。
     #[test]
+    #[serial]
     fn test_adapter_definition_is_idempotent() {
         // Arrange
         let adapter = create_test_adapter("mcp_db_query".to_string(), "query".to_string());
@@ -198,6 +204,7 @@ mod tests {
 
     /// Tool trait オブジェクトとして扱えることを検証する。
     #[test]
+    #[serial]
     fn test_adapter_is_dyn_tool_compatible() {
         // Arrange
         let adapter = create_test_adapter(

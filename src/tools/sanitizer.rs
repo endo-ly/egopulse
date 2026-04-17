@@ -80,8 +80,10 @@ pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
                     &result[..abs_offset],
                     &result[secret_end..]
                 );
+                start = abs_offset + "[REDACTED:secret]".len();
+            } else {
+                start = prefix_end;
             }
-            start = abs_offset + "[REDACTED:secret]".len();
             if start >= result.len() {
                 break;
             }
