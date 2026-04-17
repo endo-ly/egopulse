@@ -101,8 +101,8 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
-    let db = Arc::new(Database::new(&config.state_root)?);
-    let assets = Arc::new(AssetStore::new(&config.state_root)?);
+    let db = Arc::new(Database::new(&config.db_path())?);
+    let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir()?,
         config.skills_dir()?,

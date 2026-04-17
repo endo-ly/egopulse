@@ -867,8 +867,7 @@ pub(crate) fn build_state(
     use crate::storage::Database;
     use crate::tools::ToolRegistry;
 
-    let state_root = config.state_root.clone();
-    let db = std::sync::Arc::new(Database::new(&state_root).expect("db"));
+    let db = std::sync::Arc::new(Database::new(&config.db_path()).expect("db"));
     let skills = std::sync::Arc::new(SkillManager::from_dirs(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
@@ -881,7 +880,7 @@ pub(crate) fn build_state(
         channels: std::sync::Arc::new(ChannelRegistry::new()),
         skills: std::sync::Arc::clone(&skills),
         tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
-        assets: std::sync::Arc::new(AssetStore::new(&state_root).expect("assets")),
+        assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
     }
 }
 

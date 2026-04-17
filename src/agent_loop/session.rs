@@ -467,14 +467,14 @@ mod tests {
             config.skills_dir().expect("skills_dir"),
         ));
         AppState {
-            db: Arc::new(Database::new(&state_root).expect("db")),
+            db: Arc::new(Database::new(&config.db_path()).expect("db")),
             config: config.clone(),
             config_path: None,
             llm_override: Some(Arc::from(llm)),
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
-            assets: Arc::new(AssetStore::new(&state_root).expect("assets")),
+            assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         }
     }
 

@@ -31,11 +31,12 @@ struct ImageAssetMetadata {
 }
 
 impl AssetStore {
-    /// Create the asset store, ensuring the `assets/images/` directory tree exists.
-    pub fn new(state_root: &str) -> Result<Self, StorageError> {
-        let root = Path::new(state_root).join("runtime").join("assets");
-        std::fs::create_dir_all(root.join("images"))?;
-        Ok(Self { root })
+    /// Create the asset store, ensuring the `images/` directory tree exists.
+    pub fn new(assets_dir: &Path) -> Result<Self, StorageError> {
+        std::fs::create_dir_all(assets_dir.join("images"))?;
+        Ok(Self {
+            root: assets_dir.to_path_buf(),
+        })
     }
 
     /// Parse a `data:<mime>;base64,...` URL, write the decoded bytes to disk (deduplicated by SHA-256).
@@ -170,7 +171,7 @@ mod tests {
     #[test]
     fn persists_and_hydrates_images_by_reference() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = AssetStore::new(dir.path().to_str().expect("utf8")).expect("store");
+        let store = AssetStore::new(dir.path()).expect("store");
         let data_url = "data:image/png;base64,AAAA";
 
         let stored = store
@@ -187,7 +188,7 @@ mod tests {
     #[test]
     fn deduplicates_identical_images_and_sweeps_unreferenced() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = AssetStore::new(dir.path().to_str().expect("utf8")).expect("store");
+        let store = AssetStore::new(dir.path()).expect("store");
         let data_url = "data:image/png;base64,AAAA";
 
         let first = store

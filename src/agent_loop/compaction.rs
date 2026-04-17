@@ -46,7 +46,7 @@ async fn summarize_and_compact(
     label: &str,
 ) -> Result<Vec<Message>, EgoPulseError> {
     archive_conversation(
-        &state.config.state_root,
+        &state.config.groups_dir(),
         &context.channel,
         chat_id,
         messages,
@@ -124,17 +124,17 @@ async fn summarize_and_compact(
 }
 
 pub(crate) async fn archive_conversation(
-    state_root: &str,
+    groups_dir: &std::path::Path,
     channel: &str,
     chat_id: i64,
     messages: &[Message],
 ) {
-    let state_root = state_root.to_string();
+    let groups_dir = groups_dir.to_path_buf();
     let channel = channel.to_string();
     let messages = messages.to_vec();
     let join_channel = channel.clone();
     let join_result = tokio::task::spawn_blocking(move || {
-        archive_conversation_blocking(&state_root, &channel, chat_id, &messages);
+        archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages);
     })
     .await;
 
@@ -147,7 +147,7 @@ pub(crate) async fn archive_conversation(
 }
 
 pub(crate) fn archive_conversation_blocking(
-    state_root: &str,
+    groups_dir: &std::path::Path,
     channel: &str,
     chat_id: i64,
     messages: &[Message],
@@ -159,9 +159,7 @@ pub(crate) fn archive_conversation_blocking(
     } else {
         channel.trim()
     };
-    let dir = std::path::PathBuf::from(state_root)
-        .join("runtime")
-        .join("groups")
+    let dir = groups_dir
         .join(channel_dir)
         .join(chat_id.to_string())
         .join("conversations");
