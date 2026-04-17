@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -200,7 +200,9 @@ fn format_channels(channels: &ChannelsStatus, lines: &mut Vec<String>) {
 
 /// `status.json` からスナップショットを読み取り、表示する。
 pub fn run_status(json_output: bool) -> Result<(), String> {
-    let state_root = crate::config::default_state_root().map_err(|e| e.to_string())?;
+    let config_path = crate::config::default_config_path().map_err(|e| e.to_string())?;
+    let config = crate::config::Config::load(Some(&config_path)).map_err(|e| e.to_string())?;
+    let state_root = PathBuf::from(&config.state_root);
     let snapshot = read_status(&state_root).ok_or("EgoPulse has not been started yet")?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&snapshot).unwrap());

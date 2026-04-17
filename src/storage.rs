@@ -89,6 +89,19 @@ impl Database {
     pub fn new(state_root: &str) -> Result<Self, StorageError> {
         let runtime_dir = Path::new(state_root).join("runtime");
         let db_path = runtime_dir.join("egopulse.db");
+
+        let legacy_db = Path::new(state_root).join("data").join("egopulse.db");
+        if legacy_db.exists() && !db_path.exists() {
+            return Err(StorageError::InitFailed(format!(
+                "legacy_db_pending_migration: found {}, but {} does not exist. \
+                 run 'mv {} {}' to migrate.",
+                legacy_db.display(),
+                db_path.display(),
+                legacy_db.display(),
+                db_path.display(),
+            )));
+        }
+
         std::fs::create_dir_all(&runtime_dir)?;
 
         let conn = Connection::open(db_path)?;

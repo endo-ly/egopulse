@@ -371,17 +371,17 @@ impl Config {
 
     /// 組み込みスキルディレクトリ: `state_root/skills`。
     pub fn skills_dir(&self) -> Result<PathBuf, ConfigError> {
-        default_state_root().map(|root| root.join("skills"))
+        Ok(Path::new(&self.state_root).join("skills"))
     }
 
     /// ユーザースキルディレクトリ: `state_root/workspace/skills`。
     pub fn user_skills_dir(&self) -> Result<PathBuf, ConfigError> {
-        default_workspace_dir().map(|dir| dir.join("skills"))
+        Ok(self.workspace_dir()?.join("skills"))
     }
 
-    /// Workspace directory for agent file operations.
+    /// エージェント作業ディレクトリ: `state_root/workspace`。
     pub fn workspace_dir(&self) -> Result<PathBuf, ConfigError> {
-        default_workspace_dir()
+        Ok(Path::new(&self.state_root).join("workspace"))
     }
 
     /// ランタイムデータディレクトリ: `state_root/runtime`。

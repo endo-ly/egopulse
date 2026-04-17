@@ -417,9 +417,7 @@ fn payload_from_config(
         default_model: config.default_model.clone(),
         effective_model: resolved.model,
         state_root: config.state_root.clone(),
-        workspace_dir: crate::config::default_workspace_dir()?
-            .to_string_lossy()
-            .into_owned(),
+        workspace_dir: config.workspace_dir()?.to_string_lossy().into_owned(),
         web_enabled: config.web_enabled(),
         web_host: config.web_host().to_string(),
         web_port: config.web_port(),
