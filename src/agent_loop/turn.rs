@@ -872,6 +872,7 @@ pub(crate) fn build_state(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
     ));
+    let soul_agents = std::sync::Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config));
     AppState {
         db,
         config: config.clone(),
@@ -881,6 +882,7 @@ pub(crate) fn build_state(
         skills: std::sync::Arc::clone(&skills),
         tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
+        soul_agents,
     }
 }
 

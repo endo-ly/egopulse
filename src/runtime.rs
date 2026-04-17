@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
 use crate::skills::SkillManager;
+use crate::soul_agents::SoulAgentsLoader;
 use crate::status::{
     self, ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
 };
@@ -34,6 +35,7 @@ pub struct AppState {
     pub skills: Arc<SkillManager>,
     pub tools: Arc<ToolRegistry>,
     pub assets: Arc<AssetStore>,
+    pub soul_agents: Arc<SoulAgentsLoader>,
 }
 
 impl Clone for AppState {
@@ -47,6 +49,7 @@ impl Clone for AppState {
             skills: Arc::clone(&self.skills),
             tools: Arc::clone(&self.tools),
             assets: Arc::clone(&self.assets),
+            soul_agents: Arc::clone(&self.soul_agents),
         }
     }
 }
@@ -136,6 +139,8 @@ pub async fn build_app_state_with_path(
 
     let tools = Arc::new(tools);
 
+    let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
+
     Ok(AppState {
         db,
         config,
@@ -145,6 +150,7 @@ pub async fn build_app_state_with_path(
         skills,
         tools,
         assets,
+        soul_agents,
     })
 }
 
@@ -364,5 +370,64 @@ async fn write_startup_status(state: &AppState) {
     let state_root = PathBuf::from(&state.config.state_root);
     if let Err(error) = status::write_status(&state_root, &snapshot) {
         tracing::warn!("failed to write startup status: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::soul_agents::SoulAgentsLoader;
+
+    fn test_config_for_runtime(state_root: String) -> crate::config::Config {
+        crate::config::Config {
+            default_provider: "openai".to_string(),
+            default_model: Some("gpt-4o-mini".to_string()),
+            providers: std::collections::HashMap::from([(
+                "openai".to_string(),
+                crate::config::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(secrecy::SecretString::new(
+                        "sk-test".to_string().into_boxed_str(),
+                    )),
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
+            state_root,
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_app_state_contains_soul_agents_loader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        // soul_agents が初期化されてアクセス可能であることを検証
+        let _ = &*state.soul_agents;
+    }
+
+    #[tokio::test]
+    async fn soul_agents_loader_loads_agents_from_config_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+        let config = test_config_for_runtime(state_root);
+        let loader = SoulAgentsLoader::new(&config);
+
+        // ファイルが存在しない場合は None
+        assert!(loader.load_global_agents().is_none());
+
+        // AGENTS.md を書き込むと読み取れる
+        std::fs::write(dir.path().join("AGENTS.md"), "test agents content").expect("write");
+        assert_eq!(
+            loader.load_global_agents(),
+            Some("test agents content".to_string())
+        );
     }
 }

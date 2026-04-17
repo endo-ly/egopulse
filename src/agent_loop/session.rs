@@ -475,6 +475,7 @@ mod tests {
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
             assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
+            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
         }
     }
 
