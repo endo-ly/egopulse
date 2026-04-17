@@ -42,11 +42,12 @@ impl SoulAgentsLoader {
         account_id: Option<&str>,
     ) -> Option<String> {
         let base_soul = self.load_base_soul(channel_soul_path, account_id);
-        let chat_soul_path = self.chat_soul_path(channel, thread);
 
         // チャット別 SOUL.md があればグローバルを完全上書き
-        if let Some(chat_soul) = read_trimmed(&chat_soul_path) {
-            return Some(chat_soul);
+        if let Some(path) = self.chat_soul_path(channel, thread) {
+            if let Some(chat_soul) = read_trimmed(&path) {
+                return Some(chat_soul);
+            }
         }
 
         base_soul
@@ -110,7 +111,7 @@ impl SoulAgentsLoader {
 
     /// チャット別 AGENTS.md を読み込む
     pub fn load_chat_agents(&self, channel: &str, thread: &str) -> Option<String> {
-        let path = self.chat_agents_path(channel, thread);
+        let path = self.chat_agents_path(channel, thread)?;
         read_trimmed(&path)
     }
 
@@ -142,12 +143,14 @@ impl SoulAgentsLoader {
         Some(section)
     }
 
-    fn chat_agents_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir.join(channel).join(thread).join("AGENTS.md")
+    fn chat_agents_path(&self, channel: &str, thread: &str) -> Option<PathBuf> {
+        safe_path_components(channel, thread)?;
+        Some(self.groups_dir.join(channel).join(thread).join("AGENTS.md"))
     }
 
-    fn chat_soul_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir.join(channel).join(thread).join("SOUL.md")
+    fn chat_soul_path(&self, channel: &str, thread: &str) -> Option<PathBuf> {
+        safe_path_components(channel, thread)?;
+        Some(self.groups_dir.join(channel).join(thread).join("SOUL.md"))
     }
 
     pub fn provision_default_soul(&self) -> io::Result<bool> {
@@ -162,7 +165,17 @@ impl SoulAgentsLoader {
     }
 }
 
-/// ファイルを読み込み、trim して空白のみなら None を返す
+/// `Path::components()` がすべて `Normal` であることを検証し、
+/// `../` や `./` を含むパストラバーサルを弾く。
+fn safe_path_components(channel: &str, thread: &str) -> Option<()> {
+    let ok = |s: &str| {
+        Path::new(s)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    };
+    if ok(channel) && ok(thread) { Some(()) } else { None }
+}
+
 fn read_trimmed(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim();
@@ -473,5 +486,28 @@ mod tests {
 
         let content = std::fs::read_to_string(dir.path().join("SOUL.md")).unwrap();
         assert_eq!(content, "Existing personality");
+    }
+
+    // --- path traversal guards ---
+
+    #[test]
+    fn load_chat_agents_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        assert!(loader.load_chat_agents("web", "../../../etc").is_none());
+    }
+
+    #[test]
+    fn load_chat_agents_rejects_cur_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        assert!(loader.load_chat_agents("web", "./thread").is_none());
+    }
+
+    #[test]
+    fn load_soul_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        assert!(loader.load_soul("../../../etc", "thread", None, None).is_none());
     }
 }

@@ -508,10 +508,11 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
     let channel = &context.channel;
     let thread = &context.surface_thread;
 
+    let channel_key = channel.trim().to_ascii_lowercase();
     let channel_soul_path = state
         .config
         .channels
-        .get(channel)
+        .get(&channel_key)
         .and_then(|c| c.soul_path.as_deref());
     let soul_content = state
         .soul_agents
