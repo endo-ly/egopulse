@@ -173,7 +173,11 @@ fn safe_path_components(channel: &str, thread: &str) -> Option<()> {
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
     };
-    if ok(channel) && ok(thread) { Some(()) } else { None }
+    if ok(channel) && ok(thread) {
+        Some(())
+    } else {
+        None
+    }
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -508,6 +512,10 @@ mod tests {
     fn load_soul_rejects_parent_dir_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
-        assert!(loader.load_soul("../../../etc", "thread", None, None).is_none());
+        assert!(
+            loader
+                .load_soul("../../../etc", "thread", None, None)
+                .is_none()
+        );
     }
 }
