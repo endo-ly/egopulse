@@ -437,6 +437,44 @@ impl McpManager {
     pub fn get_client_by_index(&self, index: usize) -> Option<&DynClient> {
         self.servers.get(index).map(|s| s.client())
     }
+
+    /// 接続済み全サーバーの全ツールについて McpToolAdapter を生成する。
+    ///
+    /// 名前衝突したツールはスキップする（初期化時の warn ログと同じ方針）。
+    pub async fn create_tool_adapters(
+        manager: &std::sync::Arc<tokio::sync::RwLock<Self>>,
+    ) -> Vec<Box<dyn crate::tools::Tool>> {
+        use crate::tools::McpToolAdapter;
+
+        let guard = manager.read().await;
+        let mut adapters: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for (idx, server) in guard.servers.iter().enumerate() {
+            for tool in &server.cached_tools {
+                let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
+                if !seen_names.insert(full_name.clone()) {
+                    continue;
+                }
+                let definition = ToolDefinition {
+                    name: full_name.clone(),
+                    description: tool.description.clone().unwrap_or_default().to_string(),
+                    parameters: serde_json::to_value(&tool.input_schema)
+                        .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
+                };
+                adapters.push(Box::new(McpToolAdapter::new(
+                    full_name,
+                    tool.name.to_string(),
+                    idx,
+                    server.config.request_timeout_secs,
+                    definition,
+                    std::sync::Arc::clone(manager),
+                )));
+            }
+        }
+
+        adapters
+    }
 }
 
 async fn connect_server(
