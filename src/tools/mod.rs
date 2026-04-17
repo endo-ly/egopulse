@@ -128,7 +128,6 @@ pub trait Tool: Send + Sync {
 /// Owns all tool instances and dispatches execution by tool name.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
-    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     config_secrets: Vec<(String, String)>,
 }
 
@@ -141,7 +140,6 @@ impl ToolRegistry {
                 tracing::warn!("failed to resolve workspace dir: {error}");
                 return Self {
                     tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
-                    mcp_manager: None,
                     config_secrets: collect_config_secrets(config),
                 };
             }
@@ -164,7 +162,6 @@ impl ToolRegistry {
                 Box::new(LsTool::new(workspace_dir)),
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
-            mcp_manager: None,
             config_secrets: collect_config_secrets(config),
         }
     }
@@ -173,46 +170,9 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
-    /// Set the MCP manager for dynamic tool dispatch.
-    pub fn set_mcp_manager(
-        &mut self,
-        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
-    ) {
-        self.mcp_manager = Some(manager);
-    }
-
-    /// Returns a reference to the MCP manager, if configured.
-    pub fn mcp_manager(
-        &self,
-    ) -> Option<&std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>> {
-        self.mcp_manager.as_ref()
-    }
-
-    /// Collect tool definitions synchronously (internal only).
-    /// External callers must use [`definitions_async`] to avoid blocking an async runtime.
-    #[allow(dead_code)]
-    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<ToolDefinition> =
-            self.tools.iter().map(|tool| tool.definition()).collect();
-
-        if let Some(mcp) = &self.mcp_manager {
-            let mcp_defs = mcp.blocking_read().all_tool_definitions();
-            defs.extend(mcp_defs);
-        }
-
-        defs
-    }
-
-    /// Collect tool definitions asynchronously (preferred when MCP is present).
+    /// Collect tool definitions asynchronously.
     pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<ToolDefinition> =
-            self.tools.iter().map(|tool| tool.definition()).collect();
-
-        if let Some(mcp) = &self.mcp_manager {
-            defs.extend(mcp.read().await.all_tool_definitions());
-        }
-
-        defs
+        self.tools.iter().map(|tool| tool.definition()).collect()
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
@@ -228,36 +188,6 @@ impl ToolRegistry {
                 return sanitize_tool_result(result, &self.config_secrets);
             }
         }
-
-        if let Some(mcp) = &self.mcp_manager {
-            let mcp_info = {
-                let guard = mcp.read().await;
-                guard.is_mcp_tool(name)
-            };
-            if let Some((idx, _, original_tool_name, request_timeout_secs)) = mcp_info {
-                let result = {
-                    let guard = mcp.read().await;
-                    guard
-                        .execute_tool(idx, original_tool_name, request_timeout_secs, input)
-                        .await
-                };
-                match result {
-                    Ok(output) => {
-                        return sanitize_tool_result(
-                            ToolResult::success(output),
-                            &self.config_secrets,
-                        );
-                    }
-                    Err(error) => {
-                        return sanitize_tool_result(
-                            ToolResult::error(error.to_string()),
-                            &self.config_secrets,
-                        );
-                    }
-                }
-            }
-        }
-
         sanitize_tool_result(
             ToolResult::error(format!("Unknown tool: {name}")),
             &self.config_secrets,

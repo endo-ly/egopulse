@@ -84,7 +84,6 @@ struct ConnectedServer {
     name: String,
     config: McpServerConfig,
     client: DynClient,
-    tool_name_map: HashMap<String, String>,
     cached_tools: Vec<Tool>,
 }
 
@@ -207,12 +206,12 @@ impl McpManager {
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir).await {
                 Ok((client, tools)) => {
-                    let mut tool_name_map = HashMap::new();
+                    let mut seen_names = std::collections::HashSet::new();
                     let mut filtered_tools = Vec::new();
                     let mut tool_display_names = Vec::new();
                     for t in &tools {
                         let full = sanitize_tool_name(name, t.name.as_ref());
-                        if tool_name_map.contains_key(&full) {
+                        if !seen_names.insert(full.clone()) {
                             warn!(
                                 server = name,
                                 original = %t.name,
@@ -221,7 +220,6 @@ impl McpManager {
                             );
                             continue;
                         }
-                        tool_name_map.insert(full.clone(), t.name.to_string());
                         tool_display_names.push(full);
                         filtered_tools.push(t.clone());
                     }
@@ -235,7 +233,6 @@ impl McpManager {
                         name: name.clone(),
                         config: (*config).clone(),
                         client,
-                        tool_name_map,
                         cached_tools: filtered_tools,
                     });
                 }
@@ -418,20 +415,6 @@ impl McpManager {
         } else {
             output
         })
-    }
-
-    pub fn is_mcp_tool(&self, name: &str) -> Option<(usize, String, String, u64)> {
-        for (i, s) in self.servers.iter().enumerate() {
-            if let Some(original_name) = s.tool_name_map.get(name) {
-                return Some((
-                    i,
-                    s.name.clone(),
-                    original_name.clone(),
-                    s.config.request_timeout_secs,
-                ));
-            }
-        }
-        None
     }
 
     pub fn get_client_by_index(&self, index: usize) -> Option<&DynClient> {
