@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -100,7 +100,9 @@ pub struct ProviderStatus {
 
 /// `status.json` にスナップショットを書き出す。
 pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Result<()> {
-    let path = state_root.join(STATUS_FILE);
+    let runtime_dir = state_root.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)?;
+    let path = runtime_dir.join(STATUS_FILE);
     let json = serde_json::to_string_pretty(snapshot)?;
     fs::write(path, json)
 }
@@ -109,7 +111,7 @@ pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Re
 ///
 /// ファイルが存在しない、またはパースに失敗した場合は `None` を返す。
 pub fn read_status(state_root: &Path) -> Option<StatusSnapshot> {
-    let path = state_root.join(STATUS_FILE);
+    let path = state_root.join("runtime").join(STATUS_FILE);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -198,7 +200,9 @@ fn format_channels(channels: &ChannelsStatus, lines: &mut Vec<String>) {
 
 /// `status.json` からスナップショットを読み取り、表示する。
 pub fn run_status(json_output: bool) -> Result<(), String> {
-    let state_root = crate::config::default_state_root().map_err(|e| e.to_string())?;
+    let config_path = crate::config::default_config_path().map_err(|e| e.to_string())?;
+    let config = crate::config::Config::load(Some(&config_path)).map_err(|e| e.to_string())?;
+    let state_root = PathBuf::from(&config.state_root);
     let snapshot = read_status(&state_root).ok_or("EgoPulse has not been started yet")?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&snapshot).unwrap());
@@ -275,7 +279,9 @@ mod tests {
     fn read_invalid_json_returns_none() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(STATUS_FILE);
+        let runtime_dir = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let path = runtime_dir.join(STATUS_FILE);
         fs::write(&path, "not json").unwrap();
 
         // Act

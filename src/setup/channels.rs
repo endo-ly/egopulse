@@ -75,6 +75,17 @@ pub(crate) fn extract_existing_web_auth_token(
         .map(|s| s.to_string())
 }
 
+pub(crate) fn extract_existing_state_root(
+    original_yaml: &Option<serde_yml::Value>,
+) -> Option<String> {
+    original_yaml
+        .as_ref()
+        .and_then(|v| v.as_mapping())
+        .and_then(|m| m.get(serde_yml::Value::String("state_root".into())))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 pub(crate) fn build_channel_configs(
     auth_token: String,
     discord_enabled: bool,

@@ -39,7 +39,8 @@ pub struct LoadedSkill {
 /// Discovers, validates, and loads skills from the workspace skill directories.
 #[derive(Debug, Clone)]
 pub struct SkillManager {
-    skills_dir: PathBuf,
+    user_skills_dir: PathBuf,
+    builtin_skills_dir: PathBuf,
 }
 
 const MAX_SKILLS_CATALOG_ITEMS: usize = 40;
@@ -47,15 +48,33 @@ const MAX_SKILL_DESCRIPTION_CHARS: usize = 120;
 const COMPACT_SKILLS_MODE_THRESHOLD: usize = 20;
 
 impl SkillManager {
-    /// Create a manager rooted at the given skills directory.
-    pub fn from_skills_dir(skills_dir: impl Into<PathBuf>) -> Self {
+    /// Create a manager scanning both user and built-in skill directories.
+    pub fn from_dirs(
+        user_skills_dir: impl Into<PathBuf>,
+        builtin_skills_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            skills_dir: skills_dir.into(),
+            user_skills_dir: user_skills_dir.into(),
+            builtin_skills_dir: builtin_skills_dir.into(),
+        }
+    }
+
+    /// Backward-compatible constructor using a single skills directory.
+    pub fn from_skills_dir(skills_dir: impl Into<PathBuf>) -> Self {
+        let dir = skills_dir.into();
+        let builtin = dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("skills"))
+            .unwrap_or_else(|| dir.clone());
+        Self {
+            user_skills_dir: dir.clone(),
+            builtin_skills_dir: builtin,
         }
     }
 
     pub fn skills_dir(&self) -> &Path {
-        &self.skills_dir
+        &self.user_skills_dir
     }
 
     /// Scan the workspace for available skills, filtering by platform and dependency availability.
@@ -174,19 +193,25 @@ impl SkillManager {
     fn discover_skill_dirs(&self) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
-        // Highest priority: ~/.egopulse/workspace/skills/*
-        collect_skill_dirs_direct_children(&self.skills_dir, &mut candidates);
+        // Highest priority: user skills (workspace/skills/*)
+        collect_skill_dirs_direct_children(&self.user_skills_dir, &mut candidates);
 
-        // Then recursively scan the rest of workspace for SKILL.md files.
-        let Some(workspace_root) = self.skills_dir.parent() else {
+        // Then recursively scan workspace for SKILL.md files.
+        let Some(workspace_root) = self.user_skills_dir.parent() else {
             return candidates;
         };
-        let Ok(skills_dir_canonical) = std::fs::canonicalize(&self.skills_dir) else {
-            collect_skill_dirs_recursive(workspace_root, &self.skills_dir, &mut candidates);
+        let Ok(user_skills_dir_canonical) = std::fs::canonicalize(&self.user_skills_dir) else {
+            collect_skill_dirs_recursive(workspace_root, &self.user_skills_dir, &mut candidates);
             return candidates;
         };
 
-        collect_skill_dirs_recursive(workspace_root, &skills_dir_canonical, &mut candidates);
+        collect_skill_dirs_recursive(workspace_root, &user_skills_dir_canonical, &mut candidates);
+
+        // Built-in skills: state_root/skills/*
+        if self.builtin_skills_dir != self.user_skills_dir {
+            collect_skill_dirs_direct_children(&self.builtin_skills_dir, &mut candidates);
+        }
+
         candidates
     }
 }

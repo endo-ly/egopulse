@@ -85,10 +85,27 @@ where
 const SCHEMA_VERSION: i64 = 1;
 
 impl Database {
-    /// Open (or create) the database at `{data_dir}/egopulse.db` and initialize schema.
-    pub fn new(data_dir: &str) -> Result<Self, StorageError> {
-        let db_path = Path::new(data_dir).join("egopulse.db");
-        std::fs::create_dir_all(data_dir)?;
+    /// Open (or create) the database at `db_path` and initialize schema.
+    pub fn new(db_path: &Path) -> Result<Self, StorageError> {
+        let legacy_db = db_path
+            .parent()
+            .and_then(|runtime| runtime.parent())
+            .map(|root| root.join("data").join("egopulse.db"))
+            .unwrap_or_else(|| Path::new("data").join("egopulse.db"));
+        if legacy_db.exists() && !db_path.exists() {
+            return Err(StorageError::InitFailed(format!(
+                "legacy_db_pending_migration: found {}, but {} does not exist. \
+                 run 'mv {} {}' to migrate.",
+                legacy_db.display(),
+                db_path.display(),
+                legacy_db.display(),
+                db_path.display(),
+            )));
+        }
+
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -703,7 +720,8 @@ mod tests {
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Database::new(dir.path().to_str().expect("path")).expect("db");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = Database::new(&db_path).expect("db");
         (db, dir)
     }
 
@@ -954,7 +972,7 @@ mod tests {
     #[test]
     fn migration_history_is_recorded() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Database::new(dir.path().to_str().expect("path")).expect("db");
+        let db = Database::new(&dir.path().join("runtime").join("egopulse.db")).expect("db");
 
         let conn = db.conn.lock().expect("lock");
         let mut stmt = conn
@@ -974,14 +992,14 @@ mod tests {
     #[test]
     fn reopen_db_preserves_schema_version() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().to_str().expect("path").to_string();
+        let db_path = dir.path().join("runtime").join("egopulse.db");
 
         let first_version = {
-            let db = Database::new(&path).expect("db");
+            let db = Database::new(&db_path).expect("db");
             db.schema_version().expect("version")
         };
 
-        let db = Database::new(&path).expect("reopen db");
+        let db = Database::new(&db_path).expect("reopen db");
         let second_version = db.schema_version().expect("version");
 
         assert_eq!(

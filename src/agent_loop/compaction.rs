@@ -45,7 +45,13 @@ async fn summarize_and_compact(
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     label: &str,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    archive_conversation(&state.config.data_dir, &context.channel, chat_id, messages).await;
+    archive_conversation(
+        &state.config.groups_dir(),
+        &context.channel,
+        chat_id,
+        messages,
+    )
+    .await;
 
     let keep_recent = state.config.compact_keep_recent.min(messages.len());
     if keep_recent == messages.len() {
@@ -118,17 +124,17 @@ async fn summarize_and_compact(
 }
 
 pub(crate) async fn archive_conversation(
-    data_dir: &str,
+    groups_dir: &std::path::Path,
     channel: &str,
     chat_id: i64,
     messages: &[Message],
 ) {
-    let data_dir = data_dir.to_string();
+    let groups_dir = groups_dir.to_path_buf();
     let channel = channel.to_string();
     let messages = messages.to_vec();
     let join_channel = channel.clone();
     let join_result = tokio::task::spawn_blocking(move || {
-        archive_conversation_blocking(&data_dir, &channel, chat_id, &messages);
+        archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages);
     })
     .await;
 
@@ -141,7 +147,7 @@ pub(crate) async fn archive_conversation(
 }
 
 pub(crate) fn archive_conversation_blocking(
-    data_dir: &str,
+    groups_dir: &std::path::Path,
     channel: &str,
     chat_id: i64,
     messages: &[Message],
@@ -153,8 +159,7 @@ pub(crate) fn archive_conversation_blocking(
     } else {
         channel.trim()
     };
-    let dir = std::path::PathBuf::from(data_dir)
-        .join("groups")
+    let dir = groups_dir
         .join(channel_dir)
         .join(chat_id.to_string())
         .join("conversations");
@@ -356,6 +361,7 @@ mod tests {
 
         let archive_dir = dir
             .path()
+            .join("runtime")
             .join("groups")
             .join("cli")
             .join(chat_id.to_string())
@@ -534,7 +540,7 @@ mod tests {
     #[serial]
     async fn force_compact_produces_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let data_dir = dir.path().to_str().expect("utf8").to_string();
+        let state_root = dir.path().to_str().expect("utf8").to_string();
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
@@ -542,7 +548,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(data_dir.clone(), 40, 1);
+        let config = test_config_with_compaction(state_root.clone(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
         let llm = state.global_llm().expect("llm");
@@ -558,6 +564,7 @@ mod tests {
 
         let archive_dir = dir
             .path()
+            .join("runtime")
             .join("groups")
             .join("cli")
             .join(chat_id.to_string())

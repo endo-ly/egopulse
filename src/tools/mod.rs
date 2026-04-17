@@ -557,7 +557,7 @@ mod tests {
         }
     }
 
-    fn test_config(data_dir: &str) -> Config {
+    fn test_config(state_root: &str) -> Config {
         Config {
             default_provider: "local".to_string(),
             default_model: Some("gpt-4o-mini".to_string()),
@@ -571,7 +571,7 @@ mod tests {
                     models: vec!["gpt-4o-mini".to_string()],
                 },
             )]),
-            data_dir: data_dir.to_string(),
+            state_root: state_root.to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
