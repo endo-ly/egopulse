@@ -84,14 +84,7 @@ struct ConnectedServer {
     name: String,
     config: McpServerConfig,
     client: DynClient,
-    tool_name_map: HashMap<String, String>,
     cached_tools: Vec<Tool>,
-}
-
-impl ConnectedServer {
-    fn client(&self) -> &DynClient {
-        &self.client
-    }
 }
 
 pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
@@ -207,12 +200,12 @@ impl McpManager {
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir).await {
                 Ok((client, tools)) => {
-                    let mut tool_name_map = HashMap::new();
+                    let mut seen_names = std::collections::HashSet::new();
                     let mut filtered_tools = Vec::new();
                     let mut tool_display_names = Vec::new();
                     for t in &tools {
                         let full = sanitize_tool_name(name, t.name.as_ref());
-                        if tool_name_map.contains_key(&full) {
+                        if !seen_names.insert(full.clone()) {
                             warn!(
                                 server = name,
                                 original = %t.name,
@@ -221,7 +214,6 @@ impl McpManager {
                             );
                             continue;
                         }
-                        tool_name_map.insert(full.clone(), t.name.to_string());
                         tool_display_names.push(full);
                         filtered_tools.push(t.clone());
                     }
@@ -235,7 +227,6 @@ impl McpManager {
                         name: name.clone(),
                         config: (*config).clone(),
                         client,
-                        tool_name_map,
                         cached_tools: filtered_tools,
                     });
                 }
@@ -420,22 +411,48 @@ impl McpManager {
         })
     }
 
-    pub fn is_mcp_tool(&self, name: &str) -> Option<(usize, String, String, u64)> {
-        for (i, s) in self.servers.iter().enumerate() {
-            if let Some(original_name) = s.tool_name_map.get(name) {
-                return Some((
-                    i,
-                    s.name.clone(),
-                    original_name.clone(),
-                    s.config.request_timeout_secs,
-                ));
+    /// 接続済み全サーバーの全ツールについて McpToolAdapter を生成する。
+    ///
+    /// 名前衝突したツールはスキップする（初期化時の warn ログと同じ方針）。
+    pub async fn create_tool_adapters(
+        manager: &std::sync::Arc<tokio::sync::RwLock<Self>>,
+    ) -> Vec<Box<dyn crate::tools::Tool>> {
+        use crate::tools::McpToolAdapter;
+
+        let guard = manager.read().await;
+        let mut adapters: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for (idx, server) in guard.servers.iter().enumerate() {
+            for tool in &server.cached_tools {
+                let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
+                if !seen_names.insert(full_name.clone()) {
+                    warn!(
+                        server = %server.name,
+                        original = %tool.name,
+                        sanitized = %full_name,
+                        "skipping MCP tool adapter: sanitized name collides across servers"
+                    );
+                    continue;
+                }
+                let definition = ToolDefinition {
+                    name: full_name.clone(),
+                    description: tool.description.clone().unwrap_or_default().to_string(),
+                    parameters: serde_json::to_value(&tool.input_schema)
+                        .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
+                };
+                adapters.push(Box::new(McpToolAdapter::new(
+                    full_name,
+                    tool.name.to_string(),
+                    idx,
+                    server.config.request_timeout_secs,
+                    definition,
+                    std::sync::Arc::clone(manager),
+                )));
             }
         }
-        None
-    }
 
-    pub fn get_client_by_index(&self, index: usize) -> Option<&DynClient> {
-        self.servers.get(index).map(|s| s.client())
+        adapters
     }
 }
 

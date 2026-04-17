@@ -474,6 +474,7 @@ mod tests {
             channels: Arc::new(ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
+            mcp_manager: None,
             assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         }
     }

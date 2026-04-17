@@ -6,7 +6,9 @@
 
 mod command_guard;
 mod files;
+mod mcp_adapter;
 mod path_guard;
+mod sanitizer;
 mod search;
 mod shell;
 mod text;
@@ -15,7 +17,10 @@ mod text;
 pub(crate) use command_guard::*;
 pub(crate) use files::*;
 #[allow(unused_imports)] // re-export for future use from other modules
+pub(crate) use mcp_adapter::*;
+#[allow(unused_imports)] // re-export for future use from other modules
 pub(crate) use path_guard::*;
+pub(crate) use sanitizer::*;
 pub(crate) use search::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
@@ -37,36 +42,6 @@ const DEFAULT_LS_LIMIT: usize = 500;
 const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
-
-/// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。
-const SECRET_PATTERNS: &[&str] = &[
-    // OpenAI
-    "sk-",
-    // OpenRouter
-    "sk-or-",
-    // Anthropic
-    "sk-ant-",
-    // Slack
-    "xoxb-",
-    "xapp-",
-    // GitHub
-    "ghp_",
-    "gho_",
-    "ghu_",
-    "ghs_",
-    "github_pat_",
-    // GitLab
-    "glpat-",
-    // AWS Access Key ID
-    "AKIA",
-    "ASIA",
-    // Google API Key / OAuth
-    "AIza",
-    // Stripe
-    "sk_live_",
-    "sk_test_",
-    "rk_live_",
-];
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +128,6 @@ pub trait Tool: Send + Sync {
 /// Owns all tool instances and dispatches execution by tool name.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
-    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     config_secrets: Vec<(String, String)>,
 }
 
@@ -166,7 +140,6 @@ impl ToolRegistry {
                 tracing::warn!("failed to resolve workspace dir: {error}");
                 return Self {
                     tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
-                    mcp_manager: None,
                     config_secrets: collect_config_secrets(config),
                 };
             }
@@ -189,7 +162,6 @@ impl ToolRegistry {
                 Box::new(LsTool::new(workspace_dir)),
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
-            mcp_manager: None,
             config_secrets: collect_config_secrets(config),
         }
     }
@@ -198,46 +170,9 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
-    /// Set the MCP manager for dynamic tool dispatch.
-    pub fn set_mcp_manager(
-        &mut self,
-        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
-    ) {
-        self.mcp_manager = Some(manager);
-    }
-
-    /// Returns a reference to the MCP manager, if configured.
-    pub fn mcp_manager(
-        &self,
-    ) -> Option<&std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>> {
-        self.mcp_manager.as_ref()
-    }
-
-    /// Collect tool definitions synchronously (internal only).
-    /// External callers must use [`definitions_async`] to avoid blocking an async runtime.
-    #[allow(dead_code)]
-    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<ToolDefinition> =
-            self.tools.iter().map(|tool| tool.definition()).collect();
-
-        if let Some(mcp) = &self.mcp_manager {
-            let mcp_defs = mcp.blocking_read().all_tool_definitions();
-            defs.extend(mcp_defs);
-        }
-
-        defs
-    }
-
-    /// Collect tool definitions asynchronously (preferred when MCP is present).
+    /// Collect tool definitions asynchronously.
     pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<ToolDefinition> =
-            self.tools.iter().map(|tool| tool.definition()).collect();
-
-        if let Some(mcp) = &self.mcp_manager {
-            defs.extend(mcp.read().await.all_tool_definitions());
-        }
-
-        defs
+        self.tools.iter().map(|tool| tool.definition()).collect()
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
@@ -253,36 +188,6 @@ impl ToolRegistry {
                 return sanitize_tool_result(result, &self.config_secrets);
             }
         }
-
-        if let Some(mcp) = &self.mcp_manager {
-            let mcp_info = {
-                let guard = mcp.read().await;
-                guard.is_mcp_tool(name)
-            };
-            if let Some((idx, _, original_tool_name, request_timeout_secs)) = mcp_info {
-                let result = {
-                    let guard = mcp.read().await;
-                    guard
-                        .execute_tool(idx, original_tool_name, request_timeout_secs, input)
-                        .await
-                };
-                match result {
-                    Ok(output) => {
-                        return sanitize_tool_result(
-                            ToolResult::success(output),
-                            &self.config_secrets,
-                        );
-                    }
-                    Err(error) => {
-                        return sanitize_tool_result(
-                            ToolResult::error(error.to_string()),
-                            &self.config_secrets,
-                        );
-                    }
-                }
-            }
-        }
-
         sanitize_tool_result(
             ToolResult::error(format!("Unknown tool: {name}")),
             &self.config_secrets,
@@ -361,152 +266,6 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
         "maxLines": truncation.max_lines,
         "maxBytes": truncation.max_bytes
     })
-}
-
-/// Config から収集したシークレット値で出力をリダクションする。
-pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
-    if secrets.is_empty() {
-        return output.to_string();
-    }
-    let mut sorted: Vec<_> = secrets
-        .iter()
-        .filter(|(_, value)| !value.is_empty())
-        .collect();
-    sorted.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-    let mut redacted = output.to_string();
-    for (key, value) in &sorted {
-        redacted = redacted.replace(value, &format!("[REDACTED:{key}]"));
-    }
-    redacted
-}
-
-/// Well-known secret プレフィックスに基づくパターンリダクション。
-pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
-    let mut result = output.to_string();
-    for prefix in SECRET_PATTERNS {
-        let mut start = 0usize;
-        while let Some(offset) = result[start..].find(prefix) {
-            let abs_offset = start + offset;
-            let preceded_by_boundary = abs_offset == 0
-                || result[..abs_offset]
-                    .chars()
-                    .last()
-                    .is_some_and(|c| !c.is_alphanumeric() && c != '_');
-            if !preceded_by_boundary {
-                start = abs_offset + 1;
-                continue;
-            }
-            let prefix_end = abs_offset + prefix.len();
-            let secret_end = result[prefix_end..]
-                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '\n' || c == ';')
-                .map(|i| prefix_end + i)
-                .unwrap_or(result.len());
-            if secret_end > prefix_end {
-                result = format!(
-                    "{}[REDACTED:secret]{}",
-                    &result[..abs_offset],
-                    &result[secret_end..]
-                );
-            }
-            start = abs_offset + "[REDACTED:secret]".len();
-            if start >= result.len() {
-                break;
-            }
-        }
-    }
-    result
-}
-
-fn sanitize_output_string(output: &str, secrets: &[(String, String)]) -> String {
-    let redacted = redact_secrets(output, secrets);
-    redact_known_secret_patterns(&redacted)
-}
-
-fn sanitize_message_content(
-    content: crate::llm::MessageContent,
-    secrets: &[(String, String)],
-) -> crate::llm::MessageContent {
-    use crate::llm::{MessageContent, MessageContentPart};
-
-    match content {
-        MessageContent::Text(text) => MessageContent::Text(sanitize_output_string(&text, secrets)),
-        MessageContent::Parts(parts) => MessageContent::Parts(
-            parts
-                .into_iter()
-                .map(|part| match part {
-                    MessageContentPart::InputText { text } => MessageContentPart::InputText {
-                        text: sanitize_output_string(&text, secrets),
-                    },
-                    MessageContentPart::InputImage { image_url, detail } => {
-                        MessageContentPart::InputImage {
-                            image_url: sanitize_output_string(&image_url, secrets),
-                            detail: detail.map(|value| sanitize_output_string(&value, secrets)),
-                        }
-                    }
-                })
-                .collect(),
-        ),
-    }
-}
-
-fn sanitize_json_value(
-    value: serde_json::Value,
-    secrets: &[(String, String)],
-) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(sanitize_output_string(&text, secrets))
-        }
-        serde_json::Value::Array(values) => serde_json::Value::Array(
-            values
-                .into_iter()
-                .map(|item| sanitize_json_value(item, secrets))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (key, sanitize_json_value(value, secrets)))
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-fn sanitize_tool_result(mut result: ToolResult, secrets: &[(String, String)]) -> ToolResult {
-    result.content = sanitize_output_string(&result.content, secrets);
-    result.llm_content = sanitize_message_content(result.llm_content, secrets);
-    result.details = result
-        .details
-        .take()
-        .map(|details| sanitize_json_value(details, secrets));
-    result
-}
-
-/// Config から抽出したシークレット値のリストを構築する。
-pub(crate) fn collect_config_secrets(config: &crate::config::Config) -> Vec<(String, String)> {
-    let mut secrets = Vec::new();
-    use secrecy::ExposeSecret;
-    for (name, provider) in &config.providers {
-        if let Some(key) = &provider.api_key {
-            let value = ExposeSecret::expose_secret(key).to_string();
-            secrets.push((format!("provider.{name}.api_key"), value));
-        }
-    }
-    for (name, channel) in &config.channels {
-        if let Some(token) = &channel.auth_token {
-            secrets.push((format!("channel.{name}.auth_token"), token.clone()));
-        }
-        if let Some(token) = &channel.file_auth_token {
-            secrets.push((format!("channel.{name}.file_auth_token"), token.clone()));
-        }
-        if let Some(token) = &channel.bot_token {
-            secrets.push((format!("channel.{name}.bot_token"), token.clone()));
-        }
-        if let Some(token) = &channel.file_bot_token {
-            secrets.push((format!("channel.{name}.file_bot_token"), token.clone()));
-        }
-    }
-    secrets
 }
 
 fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
