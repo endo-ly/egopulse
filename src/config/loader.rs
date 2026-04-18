@@ -392,6 +392,11 @@ pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
     is_local_url(base_url)
 }
 
+/// URL として有効か検証する。setup wizard からも使用。
+pub fn is_valid_base_url(url: &str) -> bool {
+    Url::parse(url).is_ok()
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),

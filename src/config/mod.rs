@@ -9,7 +9,7 @@ pub mod loader;
 pub mod persist;
 pub mod resolve;
 
-pub use loader::base_url_allows_empty_api_key;
+pub use loader::{base_url_allows_empty_api_key, is_valid_base_url};
 pub use resolve::{default_config_path, default_state_root, default_workspace_dir};
 
 /// 小文字正規化済みのプロバイダー識別子。

@@ -8,7 +8,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use secrecy::SecretString;
-use url::Url;
 
 use super::channels::{
     build_channel_configs, extract_existing_state_root, extract_existing_web_auth_token,
@@ -21,7 +20,7 @@ use super::provider::{
 use super::{Field, SetupApp};
 use crate::config::{
     Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
-    default_workspace_dir,
+    default_workspace_dir, is_valid_base_url,
 };
 use crate::error::EgoPulseError;
 
@@ -55,7 +54,7 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
         ));
     }
 
-    if Url::parse(effective_base_url).is_err() {
+    if !is_valid_base_url(effective_base_url) {
         return Err(format!("Invalid API base URL: {effective_base_url}"));
     }
 
