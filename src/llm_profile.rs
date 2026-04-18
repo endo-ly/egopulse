@@ -33,7 +33,11 @@ pub async fn handle_command(
                 .providers
                 .iter()
                 .map(|(id, provider)| {
-                    let marker = if id.as_str() == effective.provider { "*" } else { "-" };
+                    let marker = if id.as_str() == effective.provider {
+                        "*"
+                    } else {
+                        "-"
+                    };
                     format!(
                         "{marker} {id} ({}) default_model={}",
                         provider.label, provider.default_model
@@ -113,7 +117,10 @@ async fn handle_provider_command(
         config.default_provider = crate::config::ProviderId::new(value);
         config.default_model = None;
     } else {
-        let channel = config.channels.entry(crate::config::ChannelName::new(&scope)).or_default();
+        let channel = config
+            .channels
+            .entry(crate::config::ChannelName::new(&scope))
+            .or_default();
         channel.provider = Some(value.to_string());
         channel.model = None;
     }
@@ -174,7 +181,10 @@ async fn handle_model_command(
             }
         }
     } else {
-        let channel = config.channels.entry(crate::config::ChannelName::new(&scope)).or_default();
+        let channel = config
+            .channels
+            .entry(crate::config::ChannelName::new(&scope))
+            .or_default();
         channel.model = Some(value.to_string());
     }
     config.save_yaml(path)?;

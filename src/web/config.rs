@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ProviderConfig, ProviderId, ChannelName, default_config_path};
+use crate::config::{ChannelName, Config, ProviderConfig, ProviderId, default_config_path};
 use crate::error::ConfigError;
 
 use super::WebState;

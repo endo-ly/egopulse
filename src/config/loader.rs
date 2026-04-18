@@ -105,18 +105,21 @@ pub(super) fn build_config(
 
     let default_model = normalize_string(file_default_model);
 
-    let state_root = super::resolve::default_state_root()?.to_string_lossy().into_owned();
+    let state_root = super::resolve::default_state_root()?
+        .to_string_lossy()
+        .into_owned();
 
     let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
 
-    let compaction_timeout_secs =
-        file_compaction_timeout_secs.unwrap_or_else(super::resolve::default_compaction_timeout_secs);
+    let compaction_timeout_secs = file_compaction_timeout_secs
+        .unwrap_or_else(super::resolve::default_compaction_timeout_secs);
     let max_history_messages =
         file_max_history_messages.unwrap_or_else(super::resolve::default_max_history_messages);
     let max_session_messages =
         file_max_session_messages.unwrap_or_else(super::resolve::default_max_session_messages);
-    let compact_keep_recent = file_compact_keep_recent.unwrap_or_else(super::resolve::default_compact_keep_recent);
+    let compact_keep_recent =
+        file_compact_keep_recent.unwrap_or_else(super::resolve::default_compact_keep_recent);
 
     let mut channels = normalize_channels(file_channels.unwrap_or_default());
     apply_web_channel_env_overrides(&mut channels);
@@ -202,7 +205,8 @@ fn normalize_provider_map(
     let mut normalized = HashMap::new();
 
     for (name, file_provider) in providers {
-        let key = ProviderId::new(&normalize_string(Some(name)).ok_or(ConfigError::MissingProvider)?);
+        let key =
+            ProviderId::new(&normalize_string(Some(name)).ok_or(ConfigError::MissingProvider)?);
         let label = normalize_string(file_provider.label).unwrap_or_else(|| key.to_string());
         let base_url = normalize_string(file_provider.base_url).ok_or_else(|| {
             ConfigError::MissingProviderBaseUrl {
