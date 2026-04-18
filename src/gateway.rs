@@ -253,7 +253,10 @@ fn build_systemctl_command(args: &[&str], runtime_dir: Option<&str>) -> ProcessC
     let mut command = ProcessCommand::new("systemctl");
     command.arg("--user").args(args);
     if let Some(runtime_dir) = runtime_dir {
-        command.env("XDG_RUNTIME_DIR", runtime_dir);
+        command.env("XDG_RUNTIME_DIR", runtime_dir).env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={runtime_dir}/bus"),
+        );
     }
     command
 }
