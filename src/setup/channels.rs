@@ -93,13 +93,13 @@ pub(crate) fn build_channel_configs(
     telegram_enabled: bool,
     telegram_bot_token: String,
     telegram_bot_username: String,
-) -> HashMap<String, crate::config::ChannelConfig> {
-    use crate::config::ChannelConfig;
+) -> HashMap<crate::config::ChannelName, crate::config::ChannelConfig> {
+    use crate::config::{ChannelConfig, ChannelName};
 
     let mut channels = HashMap::new();
 
     channels.insert(
-        "web".to_string(),
+        ChannelName::new("web"),
         ChannelConfig {
             enabled: Some(true),
             host: Some("127.0.0.1".to_string()),
@@ -111,7 +111,7 @@ pub(crate) fn build_channel_configs(
 
     if discord_enabled {
         channels.insert(
-            "discord".to_string(),
+            ChannelName::new("discord"),
             ChannelConfig {
                 enabled: Some(true),
                 bot_token: Some(discord_bot_token),
@@ -122,7 +122,7 @@ pub(crate) fn build_channel_configs(
 
     if telegram_enabled {
         channels.insert(
-            "telegram".to_string(),
+            ChannelName::new("telegram"),
             ChannelConfig {
                 enabled: Some(true),
                 bot_token: Some(telegram_bot_token),

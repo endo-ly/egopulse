@@ -389,11 +389,12 @@ mod tests {
     use crate::soul_agents::SoulAgentsLoader;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
+        use crate::config::ProviderId;
         crate::config::Config {
-            default_provider: "openai".to_string(),
+            default_provider: ProviderId::new("openai"),
             default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
-                "openai".to_string(),
+                ProviderId::new("openai"),
                 crate::config::ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),

@@ -74,7 +74,7 @@ impl From<&Config> for SerializableConfig {
             .iter()
             .map(|(id, p)| {
                 (
-                    id.clone(),
+                    id.to_string(),
                     SerializableProvider {
                         label: p.label.clone(),
                         base_url: p.base_url.clone(),
@@ -94,7 +94,7 @@ impl From<&Config> for SerializableConfig {
             .iter()
             .map(|(id, c)| {
                 (
-                    id.clone(),
+                    id.to_string(),
                     SerializableChannel {
                         enabled: c.enabled,
                         port: c.port,
@@ -114,7 +114,7 @@ impl From<&Config> for SerializableConfig {
             .collect();
 
         Self {
-            default_provider: config.default_provider.clone(),
+            default_provider: config.default_provider.to_string(),
             default_model: config.default_model.clone(),
             state_root: config.state_root.clone(),
             log_level: config.log_level.clone(),

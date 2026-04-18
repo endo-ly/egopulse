@@ -419,11 +419,12 @@ mod tests {
     }
 
     fn test_config(state_root: String) -> Config {
+        use crate::config::{ChannelName, ProviderId};
         Config {
-            default_provider: "openai".to_string(),
+            default_provider: ProviderId::new("openai"),
             default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
-                "openai".to_string(),
+                ProviderId::new("openai"),
                 ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
@@ -439,7 +440,7 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
-                "web".to_string(),
+                ChannelName::new("web"),
                 crate::config::ChannelConfig {
                     enabled: Some(true),
                     host: Some("127.0.0.1".to_string()),

@@ -190,7 +190,7 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ChannelConfig, Config, ProviderConfig};
+    use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
     use crate::llm::{MessageContent, MessageContentPart};
     use crate::test_env::EnvVarGuard;
     use secrecy::SecretString;
@@ -425,10 +425,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = Config {
-            default_provider: "openai".to_string(),
+            default_provider: ProviderId::new("openai"),
             default_model: None,
             providers: std::collections::HashMap::from([(
-                "openai".to_string(),
+                ProviderId::new("openai"),
                 ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
@@ -464,7 +464,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = Config {
-            default_provider: "local".to_string(),
+            default_provider: ProviderId::new("local"),
             default_model: None,
             providers: std::collections::HashMap::new(),
             state_root: dir.path().to_str().expect("path").to_string(),
@@ -474,7 +474,7 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
-                "discord".to_string(),
+                ChannelName::new("discord"),
                 ChannelConfig {
                     enabled: Some(true),
                     auth_token: Some("auth-token-value".to_string()),

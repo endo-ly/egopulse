@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{Config, ProviderConfig, ResolvedLlmConfig};
+use super::{ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
 use crate::error::ConfigError;
 
 impl Config {
@@ -17,7 +17,7 @@ impl Config {
     pub fn resolve_global_llm(&self) -> ResolvedLlmConfig {
         let provider = self.global_provider();
         ResolvedLlmConfig {
-            provider: self.default_provider.clone(),
+            provider: self.default_provider.to_string(),
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
@@ -29,18 +29,21 @@ impl Config {
     }
 
     /// Returns the normalized provider key used for the given channel.
-    pub fn effective_provider_name<'a>(&'a self, channel: &str) -> &'a str {
+    pub fn effective_provider_name(&self, channel: &str) -> String {
+        let channel_key = ChannelName::new(channel);
         self.channels
-            .get(&channel.trim().to_ascii_lowercase())
+            .get(&channel_key)
             .and_then(|config| config.provider.as_deref())
-            .unwrap_or(&self.default_provider)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| self.default_provider.to_string())
     }
 
     /// Resolves the provider/model pair used for a request from the given channel.
     pub fn resolve_llm_for_channel(&self, channel: &str) -> Result<ResolvedLlmConfig, ConfigError> {
-        let channel_key = channel.trim().to_ascii_lowercase();
-        let provider_name = self.effective_provider_name(&channel_key).to_string();
-        let provider = self.providers.get(&provider_name).ok_or_else(|| {
+        let channel_key = ChannelName::new(channel);
+        let provider_name = self.effective_provider_name(channel_key.as_str());
+        let provider_id = ProviderId::new(&provider_name);
+        let provider = self.providers.get(&provider_id).ok_or_else(|| {
             ConfigError::InvalidProviderReference {
                 provider: provider_name.clone(),
             }
@@ -116,7 +119,7 @@ impl Config {
 
     /// Returns `true` if the named channel is enabled.
     pub fn channel_enabled(&self, channel: &str) -> bool {
-        let needle = channel.trim().to_ascii_lowercase();
+        let needle = ChannelName::new(channel);
         self.channels
             .get(&needle)
             .and_then(|c| c.enabled)

@@ -33,7 +33,7 @@ pub async fn handle_command(
                 .providers
                 .iter()
                 .map(|(id, provider)| {
-                    let marker = if id == &effective.provider { "*" } else { "-" };
+                    let marker = if id.as_str() == effective.provider { "*" } else { "-" };
                     format!(
                         "{marker} {id} ({}) default_model={}",
                         provider.label, provider.default_model
@@ -51,7 +51,7 @@ pub async fn handle_command(
             let resolved = resolved_for_scope(&config, &scope)?;
             let provider = config
                 .providers
-                .get(&resolved.provider)
+                .get(resolved.provider.as_str())
                 .ok_or_else(|| EgoPulseError::Internal("provider not found".to_string()))?;
             let lines = provider
                 .models
@@ -91,7 +91,7 @@ async fn handle_provider_command(
         }
         let path = config_path(state)?;
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
-        if let Some(channel) = config.channels.get_mut(&scope) {
+        if let Some(channel) = config.channels.get_mut(scope.as_str()) {
             channel.provider = None;
             channel.model = None;
         }
@@ -110,10 +110,10 @@ async fn handle_provider_command(
     let path = config_path(state)?;
     let mut config = Config::load_allow_missing_api_key(Some(path))?;
     if scope == GLOBAL_SCOPE {
-        config.default_provider = value.to_string();
+        config.default_provider = crate::config::ProviderId::new(value);
         config.default_model = None;
     } else {
-        let channel = config.channels.entry(scope.clone()).or_default();
+        let channel = config.channels.entry(crate::config::ChannelName::new(&scope)).or_default();
         channel.provider = Some(value.to_string());
         channel.model = None;
     }
@@ -155,7 +155,7 @@ async fn handle_model_command(
         }
         let path = config_path(state)?;
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
-        if let Some(channel) = config.channels.get_mut(&scope) {
+        if let Some(channel) = config.channels.get_mut(scope.as_str()) {
             channel.model = None;
         }
         config.save_yaml(path)?;
@@ -174,7 +174,7 @@ async fn handle_model_command(
             }
         }
     } else {
-        let channel = config.channels.entry(scope.clone()).or_default();
+        let channel = config.channels.entry(crate::config::ChannelName::new(&scope)).or_default();
         channel.model = Some(value.to_string());
     }
     config.save_yaml(path)?;

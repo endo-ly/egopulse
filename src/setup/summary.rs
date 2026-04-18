@@ -20,7 +20,7 @@ use super::provider::{
 };
 use super::{Field, SetupApp};
 use crate::config::{
-    Config, ProviderConfig, base_url_allows_empty_api_key, default_state_root,
+    Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
     default_workspace_dir,
 };
 use crate::error::EgoPulseError;
@@ -156,7 +156,7 @@ pub(crate) fn save_config(
 
     let mut providers = HashMap::new();
     providers.insert(
-        provider_id.clone(),
+        ProviderId::new(&provider_id),
         ProviderConfig {
             label: provider_label.clone(),
             base_url: base_url.clone(),
@@ -180,7 +180,7 @@ pub(crate) fn save_config(
     );
 
     let config = Config {
-        default_provider: provider_id.clone(),
+        default_provider: ProviderId::new(&provider_id),
         default_model: Some(model.clone()),
         providers,
         state_root: existing_state_root.unwrap_or_else(|| {

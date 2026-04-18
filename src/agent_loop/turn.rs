@@ -511,7 +511,7 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
     let channel_soul_path = state
         .config
         .channels
-        .get(&channel_key)
+        .get(channel_key.as_str())
         .and_then(|c| c.soul_path.as_deref());
     let soul_content = state
         .soul_agents
@@ -808,11 +808,12 @@ impl RecordingProvider {
 
 #[cfg(test)]
 pub(crate) fn test_config(state_root: String) -> crate::config::Config {
+    use crate::config::{ChannelName, ProviderId};
     crate::config::Config {
-        default_provider: "openai".to_string(),
+        default_provider: ProviderId::new("openai"),
         default_model: Some("gpt-4o-mini".to_string()),
         providers: std::collections::HashMap::from([(
-            "openai".to_string(),
+            ProviderId::new("openai"),
             crate::config::ProviderConfig {
                 label: "OpenAI".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
@@ -830,7 +831,7 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
         max_session_messages: 40,
         compact_keep_recent: 20,
         channels: std::collections::HashMap::from([(
-            "web".to_string(),
+            ChannelName::new("web"),
             crate::config::ChannelConfig {
                 enabled: Some(true),
                 host: Some("127.0.0.1".to_string()),
@@ -1263,7 +1264,7 @@ mod tests {
         write_file(&dir.path().join("souls/work.md"), "Work soul content");
         let mut config = test_config(dir.path().to_str().expect("utf8").to_string());
         config.channels.insert(
-            "web".to_string(),
+            crate::config::ChannelName::new("web"),
             crate::config::ChannelConfig {
                 enabled: Some(true),
                 soul_path: Some("work".to_string()),

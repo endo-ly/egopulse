@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ProviderConfig, default_config_path};
+use crate::config::{Config, ProviderConfig, ProviderId, ChannelName, default_config_path};
 use crate::error::ConfigError;
 
 use super::WebState;
@@ -162,7 +162,7 @@ pub(super) async fn api_put_config(
     }
 
     if config.providers.contains_key(default_provider) {
-        config.default_provider = default_provider.to_string();
+        config.default_provider = ProviderId::new(default_provider);
     }
 
     let web_enabled = request.web_enabled;
@@ -170,7 +170,7 @@ pub(super) async fn api_put_config(
     let web_port = request.web_port;
 
     {
-        let web = config.channels.entry("web".to_string()).or_default();
+        let web = config.channels.entry(ChannelName::new("web")).or_default();
         web.enabled = Some(web_enabled);
         web.host = Some(web_host);
         web.port = Some(web_port);
@@ -201,7 +201,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
             continue;
         }
 
-        if let Some(existing) = config.providers.get_mut(&id) {
+        if let Some(existing) = config.providers.get_mut(id.as_str()) {
             if let Some(label) = update.label {
                 let trimmed = label.trim();
                 if !trimmed.is_empty() {
@@ -277,7 +277,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
             apply_api_key_update(&mut api_key, update.api_key);
 
             config.providers.insert(
-                id,
+                ProviderId::new(&id),
                 ProviderConfig {
                     label,
                     base_url,
@@ -314,7 +314,7 @@ fn apply_channel_overrides(
             continue;
         }
 
-        let entry = config.channels.entry(key.clone()).or_default();
+        let entry = config.channels.entry(ChannelName::new(&key)).or_default();
 
         let provider_name = match update.provider {
             Some(provider) => {
@@ -386,7 +386,7 @@ fn payload_from_config(
         .providers
         .iter()
         .map(|(id, provider)| ProviderPayload {
-            id: id.clone(),
+            id: id.to_string(),
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
             default_model: provider.default_model.clone(),
@@ -399,11 +399,11 @@ fn payload_from_config(
         .channels
         .iter()
         .filter_map(|(id, channel)| {
-            if id == "web" {
+            if id.as_str() == "web" {
                 return None;
             }
             Some((
-                id.clone(),
+                id.to_string(),
                 ChannelOverridePayload {
                     provider: channel.provider.clone(),
                     model: channel.model.clone(),

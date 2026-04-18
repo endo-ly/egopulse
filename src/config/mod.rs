@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use secrecy::SecretString;
-use serde::Deserialize;
 
 use crate::error::ConfigError;
 
@@ -13,8 +12,70 @@ pub mod resolve;
 pub use loader::base_url_allows_empty_api_key;
 pub use resolve::{default_config_path, default_state_root, default_workspace_dir};
 
+/// 小文字正規化済みのプロバイダー識別子。
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    pub fn new(s: &str) -> Self {
+        Self(s.trim().to_ascii_lowercase())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for ProviderId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ProviderId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+/// トリム + 小文字正規化済みのチャネル名。
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ChannelName(String);
+
+impl ChannelName {
+    pub fn new(s: &str) -> Self {
+        Self(s.trim().to_ascii_lowercase())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ChannelName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for ChannelName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ChannelName {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
 /// Per-channel configuration (web, discord, telegram).
-#[derive(Clone, Deserialize, Default)]
+#[derive(Clone, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
@@ -25,13 +86,11 @@ pub struct ChannelConfig {
     pub model: Option<String>,
     /// Web: browser/client authentication token.
     pub auth_token: Option<String>,
-    #[serde(skip)]
     pub file_auth_token: Option<String>,
     /// Web: allowed Origin values for WebSocket connections.
     pub allowed_origins: Option<Vec<String>>,
     /// Discord / Telegram 共通: bot token
     pub bot_token: Option<String>,
-    #[serde(skip)]
     pub file_bot_token: Option<String>,
     /// Telegram: bot username (group メンション検知用)
     pub bot_username: Option<String>,
@@ -146,17 +205,17 @@ impl Eq for ResolvedLlmConfig {}
 /// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
-    pub default_provider: String,
+    pub default_provider: ProviderId,
     /// Optional global model override (YAML `default_model`).
     pub default_model: Option<String>,
-    pub providers: HashMap<String, ProviderConfig>,
+    pub providers: HashMap<ProviderId, ProviderConfig>,
     pub state_root: String,
     pub log_level: String,
     pub compaction_timeout_secs: u64,
     pub max_history_messages: usize,
     pub max_session_messages: usize,
     pub compact_keep_recent: usize,
-    pub channels: HashMap<String, ChannelConfig>,
+    pub channels: HashMap<ChannelName, ChannelConfig>,
 }
 
 impl std::fmt::Debug for Config {
@@ -255,7 +314,7 @@ channels:
 
         let config = Config::load(Some(&file_path)).expect("load config");
 
-        assert_eq!(config.default_provider, "openai");
+        assert_eq!(config.default_provider.as_str(), "openai");
         assert_eq!(config.global_provider().label, "OpenAI");
         assert_eq!(
             PathBuf::from(&config.state_root),
@@ -619,5 +678,17 @@ channels:
             .resolve_llm_for_channel("telegram")
             .expect("telegram llm");
         assert_eq!(telegram_llm.model, "gpt-5");
+    }
+
+    #[test]
+    fn provider_id_normalizes_case() {
+        let id = super::ProviderId::new("OpenAI");
+        assert_eq!(id.as_str(), "openai");
+    }
+
+    #[test]
+    fn channel_name_trims_whitespace() {
+        let name = super::ChannelName::new(" Web ");
+        assert_eq!(name.as_str(), "web");
     }
 }
