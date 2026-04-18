@@ -8,7 +8,6 @@ pub mod assets;
 pub mod channel_adapter;
 pub mod channels;
 pub mod config;
-pub mod config_store;
 pub mod error;
 pub mod gateway;
 pub mod llm;
