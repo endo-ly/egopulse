@@ -279,7 +279,7 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
 #[cfg(test)]
 mod tests {
     use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
-    use crate::config::{ChannelConfig, Config, ProviderConfig};
+    use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
     use crate::test_env::EnvVarGuard;
@@ -318,10 +318,10 @@ mod tests {
 
     fn test_config(state_root: &str) -> Config {
         Config {
-            default_provider: "local".to_string(),
+            default_provider: ProviderId::new("local"),
             default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
-                "local".to_string(),
+                ProviderId::new("local"),
                 ProviderConfig {
                     label: "Local".to_string(),
                     base_url: "http://127.0.0.1:1234/v1".to_string(),
@@ -337,7 +337,7 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
-                "web".to_string(),
+                ChannelName::new("web"),
                 ChannelConfig {
                     enabled: Some(true),
                     ..Default::default()
@@ -608,7 +608,7 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut config = test_config(dir.path().to_str().expect("utf8"));
         config.channels.insert(
-            "discord".to_string(),
+            ChannelName::new("discord"),
             ChannelConfig {
                 file_bot_token: Some("sk-secret-token-123".to_string()),
                 ..Default::default()
@@ -651,7 +651,7 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut config = test_config(dir.path().to_str().expect("utf8"));
         config.channels.insert(
-            "discord".to_string(),
+            ChannelName::new("discord"),
             ChannelConfig {
                 auth_token: Some("xyz".to_string()),
                 ..Default::default()
@@ -683,7 +683,7 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut config = test_config(dir.path().to_str().expect("utf8"));
         config.channels.insert(
-            "discord".to_string(),
+            ChannelName::new("discord"),
             ChannelConfig {
                 auth_token: Some(String::new()),
                 ..Default::default()
@@ -709,7 +709,7 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut config = test_config(dir.path().to_str().expect("utf8"));
         config.channels.insert(
-            "discord".to_string(),
+            ChannelName::new("discord"),
             ChannelConfig {
                 file_auth_token: Some("sk-multimodal-secret".to_string()),
                 ..Default::default()

@@ -163,7 +163,7 @@ impl OriginParts {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use crate::config::{ChannelConfig, Config, ProviderConfig};
+    use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
 
     use super::{
         OriginParts, constant_time_eq, is_authorized_bearer, is_valid_ws_token,
@@ -172,10 +172,10 @@ mod tests {
 
     fn config_with_web(auth_token: Option<&str>, allowed_origins: Option<Vec<String>>) -> Config {
         Config {
-            default_provider: "local".to_string(),
+            default_provider: ProviderId::new("local"),
             default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
-                "local".to_string(),
+                ProviderId::new("local"),
                 ProviderConfig {
                     label: "Local".to_string(),
                     base_url: "http://127.0.0.1:1234/v1".to_string(),
@@ -191,7 +191,7 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::from([(
-                "web".to_string(),
+                ChannelName::new("web"),
                 ChannelConfig {
                     enabled: Some(true),
                     host: Some("127.0.0.1".to_string()),
