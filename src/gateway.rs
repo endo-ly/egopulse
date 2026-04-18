@@ -32,12 +32,17 @@ fn build_service_env() -> BTreeMap<String, String> {
         if !home.trim().is_empty() {
             env.insert("HOME".to_string(), home.clone());
 
-            let parts: Vec<String> = vec![
-                format!("{home}/.local/bin"),
+            let mut parts = vec![format!("{home}/.local/bin")];
+            if let Some(current_path) = std::env::var_os("PATH") {
+                parts.extend(
+                    std::env::split_paths(&current_path).map(|p| p.to_string_lossy().into_owned()),
+                );
+            }
+            parts.extend([
                 "/usr/local/bin".to_string(),
                 "/usr/bin".to_string(),
                 "/bin".to_string(),
-            ];
+            ]);
             let mut dedup = Vec::new();
             for p in parts {
                 if !dedup.iter().any(|v| v == &p) {
@@ -83,21 +88,28 @@ fn assert_systemd_user_available() -> Result<(), EgoPulseError> {
 }
 
 fn ensure_user_session() -> Result<(), EgoPulseError> {
-    if systemctl_cmd(&["status"]).is_ok() {
-        return Ok(());
+    if let Ok(output) = systemctl_cmd(&["status"]) {
+        if output.status.success() {
+            return Ok(());
+        }
     }
 
-    let uid = std::process::Command::new("id")
+    let uid_output = std::process::Command::new("id")
         .arg("-u")
         .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
-        })
-        .unwrap_or(0);
+        .map_err(|e| EgoPulseError::Internal(format!("failed to run id -u: {e}")))?;
+    if !uid_output.status.success() {
+        let stderr = String::from_utf8_lossy(&uid_output.stderr)
+            .trim()
+            .to_string();
+        return Err(EgoPulseError::Internal(format!(
+            "failed to resolve uid: {stderr}"
+        )));
+    }
+    let uid = String::from_utf8_lossy(&uid_output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to parse uid: {e}")))?;
 
     if std::env::var("XDG_RUNTIME_DIR").is_err() {
         let runtime_dir = format!("/run/user/{uid}");
