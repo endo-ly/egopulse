@@ -1,8 +1,7 @@
 //! スラッシュコマンドの検出・ディスパッチ。
 //!
-//! Microclaw 準拠の公開 API を提供し、各チャネルから渡されたコマンドテキストを
-//! 対応するハンドラに振り分ける。`is_slash_command` で判定し、
-//! `handle_slash_command` で実行結果のメッセージを返す。
+//! 公開 API を提供し、各チャネルから渡されたコマンドテキストを対応するハンドラに振り分ける。
+//! `is_slash_command` で判定し、`handle_slash_command` で実行結果のメッセージを返す。
 
 use std::sync::Arc;
 

@@ -182,10 +182,9 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
     channels::tui::run(state).await
 }
 
-/// 全有効チャネルを一括起動 (microclaw 互換)。
+/// 全有効チャネルを一括起動
 ///
 /// `egopulse run` から呼び出される。
-/// microclaw `src/runtime.rs::run()` と同じパターン:
 /// 設定ベースでチャネルを構築 → spawn → ctrl_c 待機。
 ///
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。

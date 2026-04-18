@@ -1,7 +1,6 @@
 //! SOUL.md / AGENTS.md の読み込みと system prompt セクション構築。
 //!
-//! Microclaw の load_soul_content() / build_system_prompt() を踏襲し、
-//! 3層フォールバックチェーンによる SOUL 選択機構を提供する。
+//! 3層フォールバックチェーンによる SOUL 選択機構を提供。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +8,6 @@ use std::path::{Path, PathBuf};
 const DEFAULT_SOUL_MD: &str = include_str!("default_soul.md");
 
 /// SOUL.md / AGENTS.md の読み込みと system prompt セクション構築。
-/// Microclaw の load_soul_content() / build_system_prompt() を踏襲。
 pub struct SoulAgentsLoader {
     state_root: PathBuf,
     soul_path: PathBuf,
@@ -87,7 +85,7 @@ impl SoulAgentsLoader {
         read_trimmed(&path)
     }
 
-    /// 相対パスを解決する。Microclaw の configured_soul_candidate_paths() と同じロジック:
+    /// 相対パスを解決する。
     /// - まず souls/ から探す
     /// - 次に state_root から探す
     fn resolve_soul_path(&self, path: &str) -> Vec<PathBuf> {
@@ -116,7 +114,7 @@ impl SoulAgentsLoader {
     }
 
     /// System prompt 用の `<soul>` セクションを構築。
-    /// Microclaw 準拠: `<soul>{content}</soul>` + identity line
+    /// `<soul>{content}</soul>` + identity line
     pub fn build_soul_section(&self, content: &str, channel: &str) -> String {
         format!("<soul>\n{content}\n</soul>\n\nYour name is EgoPulse. Current channel: {channel}.")
     }

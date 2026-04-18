@@ -1,7 +1,6 @@
 //! ファイルパスのセキュリティガード。
 //!
 //! 機密情報を含むパス（.ssh, .aws, .env など）へのアクセスをブロックする。
-//! MicroClaw の path_guard.rs をベースに EgoPulse 向けに調整。
 
 use std::path::{Component, Path, PathBuf};
 

@@ -268,7 +268,6 @@ pub(crate) fn truncate_summary_text(text: &str, max_chars: usize) -> String {
 
 /// `<think`>`...`</think`>` や `<thought`>`...`</thought`>` などの
 /// thinking タグブロックをモデル出力から除去する。
-/// microclaw agent_engine.rs から移植。
 pub(crate) fn strip_thinking(text: &str) -> String {
     fn strip_tag_blocks(input: &str, open: &str, close: &str) -> String {
         let mut result = String::with_capacity(input.len());

@@ -14,7 +14,6 @@ pub(crate) fn runtime_guard_messages(
 }
 
 /// レスポンスが「宣言だけしてツールを実行しない」パターンに一致するか判定する。
-/// microclaw の runtime guard パターンから移植。
 pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
     let lower = text.to_lowercase();
     let english_patterns = [

@@ -116,7 +116,6 @@ where
 
     // LLM → tool execution → tool result feedback を 1 反復として回し、
     // tool_calls が空になるまで続ける。
-    // microclaw 由来の runtime guard / recovery を組み込み、
     // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
     let mut empty_reply_retry_attempted = false;
     let mut declarative_retry_attempted = false;

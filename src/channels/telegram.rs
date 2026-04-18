@@ -2,8 +2,6 @@
 //!
 //! teloxide 0.17 を用いて Telegram Bot API (long polling) からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Telegram に返信する。
-//!
-//! Based on: microclaw `src/channels/telegram.rs`
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +50,6 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
-        // microclaw パターン: concrete な chat_type を全て登録
         vec![
             ("telegram_private", ConversationKind::Private),
             ("private", ConversationKind::Private),
@@ -100,8 +97,6 @@ impl ChannelAdapter for TelegramAdapter {
 }
 
 /// Telegram メッセージハンドラ。
-///
-/// microclaw `src/channels/telegram.rs::handle_message` と同じパターン。
 async fn handle_message(
     bot: Bot,
     msg: teloxide::types::Message,
@@ -125,7 +120,7 @@ async fn handle_message(
         .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // チャット種別判定 — microclaw パターンに準拠
+    // チャット種別判定
     let chat_type = match &msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => "telegram_private".to_string(),
         teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
@@ -361,7 +356,6 @@ fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
 /// Telegram bot を起動。
 ///
 /// Long polling モードでメッセージの受信を開始する。
-/// microclaw `src/channels/telegram.rs::start_telegram_bot` と同じパターン。
 pub async fn start_telegram_bot(
     state: Arc<AppState>,
     token: String,

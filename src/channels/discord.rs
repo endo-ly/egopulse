@@ -2,8 +2,6 @@
 //!
 //! serenity 0.12 を用いて Discord Gateway からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Discord に返信する。
-//!
-//! Based on: microclaw `src/channels/discord.rs`
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,7 +160,6 @@ impl EventHandler for Handler {
             true
         };
 
-        // microclaw パターン: chat_type を "discord" に統一
         let external_chat_id = external_channel_id.to_string();
 
         // --- スラッシュコマンドインターセプト ---

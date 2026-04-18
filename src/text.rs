@@ -6,7 +6,6 @@
 /// UTF-8安全なインデックスクランプ。
 ///
 /// 指定インデックスが文字境界でない場合、前の文字境界まで下げる。
-/// microclaw `crates/microclaw-core/src/text.rs` から移植。
 pub fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     let len = s.len();
     if index >= len {
