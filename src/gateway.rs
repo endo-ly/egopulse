@@ -60,10 +60,10 @@ fn build_service_env() -> BTreeMap<String, String> {
 ///
 /// `systemctl --user status` が成功するか確認し、失敗時は
 /// 原因を含むエラーメッセージを返す。
-fn assert_systemd_user_available() -> Result<(), EgoPulseError> {
+fn assert_systemd_user_available(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
     assert_command_exists("systemctl")?;
 
-    let output = systemctl_cmd(&["status"])?;
+    let output = systemctl_cmd(&["status"], runtime_dir)?;
     if output.status.success() {
         return Ok(());
     }
@@ -87,10 +87,10 @@ fn assert_systemd_user_available() -> Result<(), EgoPulseError> {
     )))
 }
 
-fn ensure_user_session() -> Result<(), EgoPulseError> {
-    if let Ok(output) = systemctl_cmd(&["status"]) {
+fn ensure_user_session() -> Result<Option<String>, EgoPulseError> {
+    if let Ok(output) = systemctl_cmd(&["status"], None) {
         if output.status.success() {
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -130,15 +130,12 @@ fn ensure_user_session() -> Result<(), EgoPulseError> {
             }
             println!("Enabled lingering for uid {uid}");
         }
-        // SAFETY: XDG_RUNTIME_DIR の設定はプロセス内で安全。
-        // 他スレッドへの影響はない（gateway コマンドはシングルスレッド）。
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-        }
+        assert_systemd_user_available(Some(&runtime_dir))?;
+        return Ok(Some(runtime_dir));
     }
 
-    assert_systemd_user_available()
+    assert_systemd_user_available(None)?;
+    Ok(None)
 }
 
 fn assert_command_exists(cmd: &str) -> Result<(), EgoPulseError> {
@@ -252,10 +249,20 @@ WantedBy=default.target
     )
 }
 
-fn systemctl_cmd(args: &[&str]) -> Result<std::process::Output, EgoPulseError> {
-    ProcessCommand::new("systemctl")
-        .arg("--user")
-        .args(args)
+fn build_systemctl_command(args: &[&str], runtime_dir: Option<&str>) -> ProcessCommand {
+    let mut command = ProcessCommand::new("systemctl");
+    command.arg("--user").args(args);
+    if let Some(runtime_dir) = runtime_dir {
+        command.env("XDG_RUNTIME_DIR", runtime_dir);
+    }
+    command
+}
+
+fn systemctl_cmd(
+    args: &[&str],
+    runtime_dir: Option<&str>,
+) -> Result<std::process::Output, EgoPulseError> {
+    build_systemctl_command(args, runtime_dir)
         .output()
         .map_err(|e| EgoPulseError::Internal(format!("failed to run systemctl --user: {e}")))
 }
@@ -278,7 +285,8 @@ fn restart_service() -> Result<(), EgoPulseError> {
         return Ok(());
     }
 
-    let output = systemctl_cmd(&["restart", SERVICE_NAME])?;
+    let runtime_dir = ensure_user_session()?;
+    let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
     if output.status.success() {
         println!("egopulse service restarted");
         Ok(())
@@ -316,7 +324,7 @@ ACTIONS:
 
     match action {
         GatewayAction::Install => {
-            ensure_user_session()?;
+            let runtime_dir = ensure_user_session()?;
 
             let exe_path = std::env::current_exe().map_err(|e| {
                 EgoPulseError::Internal(format!("failed to resolve binary path: {e}"))
@@ -345,17 +353,20 @@ ACTIONS:
             std::fs::write(&unit, &unit_content)
                 .map_err(|e| EgoPulseError::Internal(format!("failed to write unit file: {e}")))?;
 
-            ensure_success(systemctl_cmd(&["daemon-reload"])?, "daemon-reload")?;
+            ensure_success(
+                systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref())?,
+                "daemon-reload",
+            )?;
 
             if already_installed {
                 ensure_success(
-                    systemctl_cmd(&["restart", SERVICE_NAME])?,
+                    systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?,
                     "restart service",
                 )?;
                 println!("Updated and restarted egopulse service: {}", unit.display());
             } else {
                 ensure_success(
-                    systemctl_cmd(&["enable", "--now", SERVICE_NAME])?,
+                    systemctl_cmd(&["enable", "--now", SERVICE_NAME], runtime_dir.as_deref())?,
                     "enable service",
                 )?;
                 println!("Installed and started egopulse service: {}", unit.display());
@@ -363,21 +374,27 @@ ACTIONS:
             Ok(())
         }
         GatewayAction::Start => {
-            ensure_user_session()?;
-            ensure_success(systemctl_cmd(&["start", SERVICE_NAME])?, "start service")?;
+            let runtime_dir = ensure_user_session()?;
+            ensure_success(
+                systemctl_cmd(&["start", SERVICE_NAME], runtime_dir.as_deref())?,
+                "start service",
+            )?;
             println!("egopulse service started");
             Ok(())
         }
         GatewayAction::Stop => {
-            ensure_user_session()?;
-            ensure_success(systemctl_cmd(&["stop", SERVICE_NAME])?, "stop service")?;
+            let runtime_dir = ensure_user_session()?;
+            ensure_success(
+                systemctl_cmd(&["stop", SERVICE_NAME], runtime_dir.as_deref())?,
+                "stop service",
+            )?;
             println!("egopulse service stopped");
             Ok(())
         }
         GatewayAction::Uninstall => {
-            ensure_user_session()?;
-            let _ = systemctl_cmd(&["disable", "--now", SERVICE_NAME]);
-            let _ = systemctl_cmd(&["daemon-reload"]);
+            let runtime_dir = ensure_user_session()?;
+            let _ = systemctl_cmd(&["disable", "--now", SERVICE_NAME], runtime_dir.as_deref());
+            let _ = systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref());
 
             let unit = unit_path()?;
             if unit.exists() {
@@ -385,14 +402,20 @@ ACTIONS:
                     EgoPulseError::Internal(format!("failed to remove unit file: {e}"))
                 })?;
             }
-            ensure_success(systemctl_cmd(&["daemon-reload"])?, "daemon-reload")?;
+            ensure_success(
+                systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref())?,
+                "daemon-reload",
+            )?;
 
             println!("Uninstalled egopulse service");
             Ok(())
         }
         GatewayAction::Status => {
-            ensure_user_session()?;
-            let output = systemctl_cmd(&["status", SERVICE_NAME, "--no-pager"])?;
+            let runtime_dir = ensure_user_session()?;
+            let output = systemctl_cmd(
+                &["status", SERVICE_NAME, "--no-pager"],
+                runtime_dir.as_deref(),
+            )?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             print!("{stdout}{stderr}");
@@ -406,8 +429,8 @@ ACTIONS:
             }
         }
         GatewayAction::Restart => {
-            ensure_user_session()?;
-            let output = systemctl_cmd(&["restart", SERVICE_NAME])?;
+            let runtime_dir = ensure_user_session()?;
+            let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
             if output.status.success() {
                 println!("egopulse service restarted");
                 Ok(())
@@ -451,6 +474,7 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
 
     #[test]
@@ -523,6 +547,28 @@ mod tests {
         assert!(env.contains_key("PATH"));
         assert!(!env.contains_key("TMPDIR"));
         assert!(!env.contains_key("EGOPULSE_CONFIG"));
+    }
+
+    #[test]
+    fn build_systemctl_command_sets_runtime_dir_only_when_present() {
+        let command = build_systemctl_command(&["status"], Some("/run/user/1000"));
+        let envs: Vec<_> = command.get_envs().collect();
+
+        assert!(envs.iter().any(|(key, value)| {
+            *key == OsStr::new("XDG_RUNTIME_DIR") && *value == Some(OsStr::new("/run/user/1000"))
+        }));
+    }
+
+    #[test]
+    fn build_systemctl_command_omits_runtime_dir_when_absent() {
+        let command = build_systemctl_command(&["status"], None);
+        let envs: Vec<_> = command.get_envs().collect();
+
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, _)| *key == OsStr::new("XDG_RUNTIME_DIR"))
+        );
     }
 
     #[test]
