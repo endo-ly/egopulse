@@ -187,9 +187,14 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
         uuid::Uuid::new_v4()
     ));
 
-    let mut temp_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut temp_file = opts
         .open(&temp_path)
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     temp_file

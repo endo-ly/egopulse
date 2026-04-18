@@ -290,12 +290,13 @@ fn validate_channel_provider_references(
     channels: &HashMap<ChannelName, ChannelConfig>,
 ) -> Result<(), ConfigError> {
     for channel in channels.values() {
-        if let Some(provider) = channel.provider.as_ref()
-            && !providers.contains_key(provider.as_str())
-        {
-            return Err(ConfigError::InvalidProviderReference {
-                provider: provider.clone(),
-            });
+        if let Some(provider) = channel.provider.as_ref() {
+            let provider_id = ProviderId::new(provider);
+            if !providers.contains_key(&provider_id) {
+                return Err(ConfigError::InvalidProviderReference {
+                    provider: provider.clone(),
+                });
+            }
         }
     }
 
