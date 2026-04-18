@@ -504,8 +504,28 @@ where
     })
 }
 
-fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
-    let mut prompt = format!(
+pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
+    let channel = &context.channel;
+    let thread = &context.surface_thread;
+
+    let channel_key = channel.trim().to_ascii_lowercase();
+    let channel_soul_path = state
+        .config
+        .channels
+        .get(&channel_key)
+        .and_then(|c| c.soul_path.as_deref());
+    let soul_content = state
+        .soul_agents
+        .load_soul(channel, thread, channel_soul_path, None);
+
+    let mut prompt = String::new();
+
+    if let Some(content) = &soul_content {
+        prompt.push_str(&state.soul_agents.build_soul_section(content, channel));
+        prompt.push_str("\n\n");
+    }
+
+    prompt.push_str(&format!(
         r#"You are EgoPulse, a local-first AI assistant running on the '{channel}' channel. You can execute tools to help users with tasks.
 
 Identity rules (highest priority unless unsafe):
@@ -555,7 +575,12 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         channel = context.channel,
         session = context.surface_thread,
         chat_type = context.chat_type,
-    );
+    ));
+
+    if let Some(memories) = state.soul_agents.build_agents_section(channel, thread) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&memories);
+    }
 
     let skills_catalog = state.skills.build_skills_catalog();
     if !skills_catalog.is_empty() {
@@ -872,6 +897,7 @@ pub(crate) fn build_state(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
     ));
+    let soul_agents = std::sync::Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config));
     AppState {
         db,
         config: config.clone(),
@@ -882,6 +908,7 @@ pub(crate) fn build_state(
         tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
+        soul_agents,
     }
 }
 
@@ -896,7 +923,8 @@ pub(crate) fn build_state_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{
-        FailingProvider, FakeProvider, RecordingProvider, build_state_with_provider, cli_context,
+        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext, build_state,
+        build_state_with_provider, build_system_prompt, cli_context, test_config,
     };
     use serial_test::serial;
     use std::sync::Arc;
@@ -1058,5 +1086,235 @@ mod tests {
             .await
             .expect_err("should fail with malformed tool calls");
         assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    fn web_context(session: &str) -> SurfaceContext {
+        SurfaceContext {
+            channel: "web".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: session.to_string(),
+            chat_type: "web".to_string(),
+        }
+    }
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir");
+        std::fs::write(path, content).expect("write");
+    }
+
+    #[test]
+    fn system_prompt_contains_soul_section_when_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "I am a wise assistant.");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(prompt.contains("<soul>"), "should contain <soul> tag");
+        assert!(prompt.contains("</soul>"), "should contain </soul> tag");
+        assert!(
+            prompt.contains("I am a wise assistant."),
+            "should contain SOUL.md content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_uses_default_identity_when_no_soul() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("<soul>"),
+            "should not contain <soul> tag when no SOUL.md"
+        );
+        assert!(
+            prompt.contains(r#"Your public name is "EgoPulse"."#),
+            "should contain hardcoded identity text"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_agents_section_when_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path().join("AGENTS.md"),
+            "Use Rust for all code tasks.",
+        );
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(prompt.contains("# Memories"), "should contain # Memories");
+        assert!(prompt.contains("<agents>"), "should contain <agents>");
+        assert!(
+            prompt.contains("Use Rust for all code tasks."),
+            "should contain AGENTS.md content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_no_agents_section_when_no_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("# Memories"),
+            "should not contain # Memories when no AGENTS.md"
+        );
+        assert!(
+            !prompt.contains("<agents>"),
+            "should not contain <agents> when no AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn system_prompt_order_soul_before_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "Soul content here");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        let soul_pos = prompt.find("<soul>").expect("should find <soul>");
+        let identity_pos = prompt
+            .find("Identity rules")
+            .expect("should find Identity rules");
+        assert!(
+            soul_pos < identity_pos,
+            "<soul> should appear before Identity rules"
+        );
+    }
+
+    #[test]
+    fn system_prompt_order_agents_before_skills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("AGENTS.md"), "Agents content");
+        std::fs::create_dir_all(dir.path().join("workspace/skills")).expect("workspace/skills");
+        let skill_dir = dir.path().join("skills/test-skill");
+        write_file(
+            &skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: A test skill\n---\nInstructions",
+        );
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        let memories_pos = prompt.find("# Memories").expect("should find # Memories");
+        let skills_pos = prompt
+            .find("# Agent Skills")
+            .expect("should find # Agent Skills");
+        assert!(
+            memories_pos < skills_pos,
+            "# Memories should appear before # Agent Skills"
+        );
+    }
+
+    #[test]
+    fn system_prompt_chat_agents_included() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("AGENTS.md"), "Global agents content");
+        let chat_agents = dir.path().join("runtime/groups/web/thread1/AGENTS.md");
+        write_file(&chat_agents, "Chat-specific agents content");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("thread1"));
+
+        assert!(prompt.contains("<agents>"), "should contain <agents>");
+        assert!(
+            prompt.contains("Global agents content"),
+            "should contain global AGENTS.md content"
+        );
+        assert!(
+            prompt.contains("<chat-agents>"),
+            "should contain <chat-agents>"
+        );
+        assert!(
+            prompt.contains("Chat-specific agents content"),
+            "should contain chat AGENTS.md content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_chat_soul_overrides_global() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "global soul content");
+        let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
+        write_file(&chat_soul, "chat soul content");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("thread1"));
+
+        assert!(
+            prompt.contains("chat soul content"),
+            "should contain chat SOUL content"
+        );
+        assert!(
+            !prompt.contains("global soul content"),
+            "should not contain global SOUL content when overridden"
+        );
+    }
+
+    #[test]
+    fn system_prompt_channel_soul_from_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("souls/work.md"), "Work soul content");
+        let mut config = test_config(dir.path().to_str().expect("utf8").to_string());
+        config.channels.insert(
+            "web".to_string(),
+            crate::config::ChannelConfig {
+                enabled: Some(true),
+                soul_path: Some("work".to_string()),
+                ..Default::default()
+            },
+        );
+        let state = build_state(config, no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            prompt.contains("Work soul content"),
+            "should contain channel soul_path content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_channel_soul_fallback_to_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "Default soul content");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            prompt.contains("Default soul content"),
+            "should contain default SOUL.md content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_account_soul_does_not_break_when_not_implemented() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "Default soul");
+        let state =
+            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            prompt.contains("Default soul"),
+            "account_id=None should not break soul loading"
+        );
+        assert!(
+            prompt.contains("Identity rules"),
+            "should still contain identity section"
+        );
+    }
+
+    fn no_tools() -> Box<dyn crate::llm::LlmProvider> {
+        Box::new(FakeProvider {
+            responses: std::sync::Mutex::new(vec![]),
+        })
     }
 }

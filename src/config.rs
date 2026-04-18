@@ -40,6 +40,8 @@ pub struct ChannelConfig {
     pub allowed_user_ids: Option<Vec<i64>>,
     /// Discord: 許可チャンネル ID (空 = 全チャンネル許可)
     pub allowed_channels: Option<Vec<u64>>,
+    /// Soul file path for this channel. Relative path resolves from souls/ directory.
+    pub soul_path: Option<String>,
 }
 
 impl std::fmt::Debug for ChannelConfig {
@@ -70,6 +72,7 @@ impl std::fmt::Debug for ChannelConfig {
             .field("bot_username", &self.bot_username)
             .field("allowed_user_ids", &self.allowed_user_ids)
             .field("allowed_channels", &self.allowed_channels)
+            .field("soul_path", &self.soul_path)
             .finish()
     }
 }
@@ -402,6 +405,34 @@ impl Config {
     /// アーカイブディレクトリ: `state_root/runtime/groups`。
     pub fn groups_dir(&self) -> PathBuf {
         self.runtime_dir().join("groups")
+    }
+
+    /// デフォルト SOUL.md パス: `state_root/SOUL.md`。
+    pub fn soul_path(&self) -> PathBuf {
+        Path::new(&self.state_root).join("SOUL.md")
+    }
+
+    /// デフォルト AGENTS.md パス: `state_root/AGENTS.md`。
+    pub fn agents_path(&self) -> PathBuf {
+        Path::new(&self.state_root).join("AGENTS.md")
+    }
+
+    /// マルチソウル用ディレクトリ: `state_root/souls`。
+    pub fn souls_dir(&self) -> PathBuf {
+        Path::new(&self.state_root).join("souls")
+    }
+
+    /// チャット別 AGENTS.md: `state_root/runtime/groups/{channel}/{thread}/AGENTS.md`。
+    pub fn chat_agents_path(&self, channel: &str, thread: &str) -> PathBuf {
+        self.groups_dir()
+            .join(channel)
+            .join(thread)
+            .join("AGENTS.md")
+    }
+
+    /// チャット別 SOUL.md: `state_root/runtime/groups/{channel}/{thread}/SOUL.md`。
+    pub fn chat_soul_path(&self, channel: &str, thread: &str) -> PathBuf {
+        self.groups_dir().join(channel).join(thread).join("SOUL.md")
     }
 
     /// ステータスファイルパス: `state_root/runtime/status.json`。
@@ -854,6 +885,8 @@ struct SerializableChannel {
     allowed_user_ids: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_channels: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soul_path: Option<String>,
 }
 
 impl From<&Config> for SerializableConfig {
@@ -896,6 +929,7 @@ impl From<&Config> for SerializableConfig {
                         bot_username: c.bot_username.clone(),
                         allowed_user_ids: c.allowed_user_ids.clone(),
                         allowed_channels: c.allowed_channels.clone(),
+                        soul_path: c.soul_path.clone(),
                     },
                 )
             })
@@ -1250,6 +1284,124 @@ channels:
         assert_eq!(config.default_model, None);
         let global = config.resolve_global_llm();
         assert_eq!(global.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    #[serial]
+    fn soul_path_returns_state_root_soul_md() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.soul_path(),
+            PathBuf::from(&config.state_root).join("SOUL.md")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agents_path_returns_state_root_agents_md() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.agents_path(),
+            PathBuf::from(&config.state_root).join("AGENTS.md")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn chat_agents_path_returns_groups_channel_chatid() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.chat_agents_path("web", "thread-1"),
+            PathBuf::from(&config.state_root)
+                .join("runtime")
+                .join("groups")
+                .join("web")
+                .join("thread-1")
+                .join("AGENTS.md")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn souls_dir_returns_state_root_souls() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.souls_dir(),
+            PathBuf::from(&config.state_root).join("souls")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn chat_soul_path_returns_groups_channel_chatid() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.chat_soul_path("discord", "thread-42"),
+            PathBuf::from(&config.state_root)
+                .join("runtime")
+                .join("groups")
+                .join("discord")
+                .join("thread-42")
+                .join("SOUL.md")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn channel_soul_path_reads_from_config() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+    soul_path: work"#,
+        );
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let web = config.channels.get("web").expect("web channel");
+        assert_eq!(web.soul_path.as_deref(), Some("work"));
+    }
+
+    #[test]
+    #[serial]
+    fn channel_soul_path_none_when_unset() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, sample_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let web = config.channels.get("web").expect("web channel");
+        assert!(web.soul_path.is_none());
     }
 
     #[test]

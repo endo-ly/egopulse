@@ -476,6 +476,7 @@ mod tests {
             tools: Arc::new(ToolRegistry::new(&config, skills)),
             mcp_manager: None,
             assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
+            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
         }
     }
 
