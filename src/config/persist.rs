@@ -60,8 +60,6 @@ struct SerializableChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
     bot_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_user_ids: Option<Vec<i64>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     allowed_channels: Option<Vec<u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_chat_ids: Option<Vec<i64>>,
@@ -107,7 +105,6 @@ impl From<&Config> for SerializableConfig {
                         allowed_origins: c.allowed_origins.clone(),
                         bot_token: c.file_bot_token.clone(),
                         bot_username: c.bot_username.clone(),
-                        allowed_user_ids: c.allowed_user_ids.clone(),
                         allowed_channels: c.allowed_channels.clone(),
                         allowed_chat_ids: c.allowed_chat_ids.clone(),
                         soul_path: c.soul_path.clone(),

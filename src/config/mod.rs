@@ -94,12 +94,10 @@ pub struct ChannelConfig {
     pub file_bot_token: Option<String>,
     /// Telegram: bot username (group メンション検知用)
     pub bot_username: Option<String>,
-    /// Telegram: DM 許可ユーザー ID (空 = 全員許可)
-    pub allowed_user_ids: Option<Vec<i64>>,
     /// Discord: 許可チャンネル ID。空 = ギルドメッセージ全拒否（DM は常に許可）。
     /// 許可されたチャンネルでは @mention なしで即応答する。
     pub allowed_channels: Option<Vec<u64>>,
-    /// Telegram: 許可グループ/スーパーグループの chat ID。空 = グループメッセージ全拒否（DM は allowed_user_ids で制御）。
+    /// Telegram: 許可グループ/スーパーグループの chat ID。空 = グループメッセージ全拒否（DM は常に許可）。
     /// 許可されたチャットでは @mention なしで即応答する。
     pub allowed_chat_ids: Option<Vec<i64>>,
     /// Soul file path for this channel. Relative path resolves from souls/ directory.
@@ -132,7 +130,6 @@ impl std::fmt::Debug for ChannelConfig {
                     .unwrap_or("<none>"),
             )
             .field("bot_username", &self.bot_username)
-            .field("allowed_user_ids", &self.allowed_user_ids)
             .field("allowed_channels", &self.allowed_channels)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("soul_path", &self.soul_path)
