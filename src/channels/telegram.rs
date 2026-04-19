@@ -186,7 +186,7 @@ async fn handle_message(
     // グループメンション判定 (スラッシュコマンドと通常メッセージで共用)。
     // BotCommand エンティティの @botname またはテキストメンションのいずれかで true。
     // 許可済みチャットではメンション不要。DM は上流で既に処理済み。
-    let is_mentioned = if is_in_allowed_chat {
+    let is_mentioned = if !is_group || is_in_allowed_chat {
         true
     } else {
         let bot_username = state.config.telegram_bot_username();
