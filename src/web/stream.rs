@@ -13,6 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::agent_loop::{SurfaceContext, process_turn_with_events};
+use tracing::error;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
@@ -344,8 +345,15 @@ pub(super) async fn start_stream_run(
         .await;
 
         if let Err(error) = result {
+            error!(
+                session = %context_for_task.surface_thread,
+                error_kind = error.error_kind(),
+                error = %error,
+                error_debug = ?error,
+                "Web: error processing message"
+            );
             let _ = evt_tx.send(super::sse::AgentEvent::Error {
-                message: error.to_string(),
+                message: error.user_message(),
             });
         }
 

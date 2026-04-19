@@ -46,35 +46,16 @@ impl EgoPulseError {
         }
     }
 
-    /// ユーザー向けエラーメッセージ。内部詳細は含まず、ログ側で完全な情報を記録する前提。
+    /// Microclaw と同じ方針: エラー全文をそのままユーザーに返す。
     pub fn user_message(&self) -> String {
-        match self {
-            Self::Llm(e) => match e {
-                LlmError::RequestFailed(_) => {
-                    "⚠️ LLM API request failed. The provider may be unreachable.".to_string()
-                }
-                LlmError::ApiError { status, .. } => {
-                    format!("⚠️ LLM API returned HTTP {status}. Check your provider configuration.")
-                }
-                LlmError::InvalidResponse(_) => {
-                    "⚠️ LLM returned an invalid response.".to_string()
-                }
-                LlmError::InitFailed(_) => {
-                    "⚠️ Failed to initialize LLM client.".to_string()
-                }
-                LlmError::RequestConstructionFailed(_) => {
-                    "⚠️ Failed to construct LLM request.".to_string()
-                }
-            },
-            Self::Storage(_) => "⚠️ A database error occurred.".to_string(),
-            Self::Config(e) => format!("⚠️ Configuration error: {e}"),
-            Self::Mcp(e) => format!("⚠️ MCP error: {e}"),
-            Self::Channel(e) => format!("⚠️ Channel error: {e}"),
-            Self::ShutdownRequested => "Shutdown requested.".to_string(),
-            Self::Logging(_) | Self::Tui(_) | Self::Internal(_) => {
-                "⚠️ An internal error occurred.".to_string()
-            }
-        }
+        format!("Error: {self}")
+    }
+
+    /// ネットワーク到達不能など、ユーザー通知を抑制すべきノイズエラーなら true。
+    /// Microclaw の `should_suppress_user_error()` と同じ判定。
+    pub fn should_suppress_user_error(&self) -> bool {
+        let text = self.to_string().to_ascii_lowercase();
+        text.contains("error sending request for url")
     }
 }
 

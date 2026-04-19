@@ -261,7 +261,9 @@ impl EventHandler for Handler {
                     error_debug = ?e,
                     "Discord: error processing message"
                 );
-                send_discord_response(&ctx, msg.channel_id, &e.user_message()).await;
+                if !e.should_suppress_user_error() {
+                    send_discord_response(&ctx, msg.channel_id, &e.user_message()).await;
+                }
             }
         }
     }

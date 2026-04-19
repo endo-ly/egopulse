@@ -319,13 +319,16 @@ async fn handle_message(
             typing_handle.abort();
             error!(
                 chat_id = raw_chat_id,
+                error_kind = e.error_kind(),
                 error = %e,
                 error_debug = ?e,
                 "Telegram: error processing message"
             );
-            let _ = bot
-                .send_message(msg.chat.id, "Sorry, an error occurred.")
-                .await;
+            if !e.should_suppress_user_error() {
+                let _ = bot
+                    .send_message(msg.chat.id, e.user_message())
+                    .await;
+            }
         }
     }
 
