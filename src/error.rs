@@ -46,13 +46,12 @@ impl EgoPulseError {
         }
     }
 
-    /// Microclaw と同じ方針: エラー全文をそのままユーザーに返す。
+    /// エラー全文をそのままユーザーに返す。
     pub fn user_message(&self) -> String {
         format!("Error: {self}")
     }
 
     /// ネットワーク到達不能など、ユーザー通知を抑制すべきノイズエラーなら true。
-    /// Microclaw の `should_suppress_user_error()` と同じ判定。
     pub fn should_suppress_user_error(&self) -> bool {
         let text = self.to_string().to_ascii_lowercase();
         text.contains("error sending request for url")
