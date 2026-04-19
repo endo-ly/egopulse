@@ -145,8 +145,7 @@ impl EventHandler for Handler {
             .and_then(|c| c.allowed_channels.clone())
             .unwrap_or_default();
         if msg.guild_id.is_some()
-            && (allowed_channels.is_empty()
-                || !allowed_channels.contains(&external_channel_id))
+            && (allowed_channels.is_empty() || !allowed_channels.contains(&external_channel_id))
         {
             return;
         }
