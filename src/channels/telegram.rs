@@ -163,9 +163,30 @@ async fn handle_message(
     let is_group = chat_type != "telegram_private";
     let external_chat_id = raw_chat_id.to_string();
 
+    // グループアクセス制御: allowed_chat_ids に含まれるチャットのみ応答する。
+    let allowed_chat_ids = state
+        .config
+        .channels
+        .get("telegram")
+        .and_then(|c| c.allowed_chat_ids.clone())
+        .unwrap_or_default();
+    let is_in_allowed_chat = if is_group {
+        if allowed_chat_ids.is_empty() || !allowed_chat_ids.contains(&raw_chat_id) {
+            debug!(
+                chat_id = raw_chat_id,
+                "Telegram: rejecting message from unauthorized group"
+            );
+            return Ok(());
+        }
+        true
+    } else {
+        false
+    };
+
     // グループメンション判定 (スラッシュコマンドと通常メッセージで共用)。
     // BotCommand エンティティの @botname またはテキストメンションのいずれかで true。
-    let is_mentioned_in_group = if !is_group {
+    // 許可済みチャットではメンション不要。DM は上流で既に処理済み。
+    let is_mentioned = if is_in_allowed_chat {
         true
     } else {
         let bot_username = state.config.telegram_bot_username();
@@ -221,8 +242,7 @@ async fn handle_message(
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
     if slash_commands::is_slash_command(&text) {
-        // グループではメンション必須
-        if !is_mentioned_in_group {
+        if !is_mentioned {
             debug!(
                 chat_id = raw_chat_id,
                 "Telegram: skipping non-mentioned slash command in group"
@@ -274,7 +294,7 @@ async fn handle_message(
     // --- インターセプトここまで ---
 
     // グループ/スーパーグループではメンション必須 (通常メッセージ向け)
-    if !is_mentioned_in_group {
+    if !is_mentioned {
         debug!(
             chat_id = raw_chat_id,
             "Telegram: skipping non-mentioned group message"

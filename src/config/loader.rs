@@ -32,6 +32,7 @@ struct FileChannelConfig {
     bot_username: Option<String>,
     allowed_user_ids: Option<Vec<i64>>,
     allowed_channels: Option<Vec<u64>>,
+    allowed_chat_ids: Option<Vec<i64>>,
     soul_path: Option<String>,
 }
 
@@ -51,6 +52,7 @@ impl From<FileChannelConfig> for ChannelConfig {
             bot_username: fc.bot_username,
             allowed_user_ids: fc.allowed_user_ids,
             allowed_channels: fc.allowed_channels,
+            allowed_chat_ids: fc.allowed_chat_ids,
             soul_path: fc.soul_path,
         }
     }

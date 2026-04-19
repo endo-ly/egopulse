@@ -135,7 +135,8 @@ impl EventHandler for Handler {
         let text = msg.content.clone();
         let external_channel_id = msg.channel_id.get();
 
-        // allowed_channels は guild 向け制御だけに使い、DM は個人チャネルとして常に通す。
+        // ギルドメッセージは allowed_channels に含まれるチャンネルのみ応答する。
+        // DM は個人チャネルとして常に通す。
         let allowed_channels = self
             .app_state
             .config
@@ -144,21 +145,11 @@ impl EventHandler for Handler {
             .and_then(|c| c.allowed_channels.clone())
             .unwrap_or_default();
         if msg.guild_id.is_some()
-            && !allowed_channels.is_empty()
-            && !allowed_channels.contains(&external_channel_id)
+            && (allowed_channels.is_empty()
+                || !allowed_channels.contains(&external_channel_id))
         {
             return;
         }
-
-        // guild では bot への明示メンション時のみ応答し、雑談チャンネルへの常時反応を避ける。
-        let should_respond = if msg.guild_id.is_some() {
-            let cache = &ctx.cache;
-            let bot_id = cache.current_user().id;
-            msg.mentions.iter().any(|u| u.id == bot_id)
-        } else {
-            // DM は bot 宛て会話しか流れてこないため常時応答でよい。
-            true
-        };
 
         let external_chat_id = external_channel_id.to_string();
 
@@ -166,11 +157,6 @@ impl EventHandler for Handler {
         // process_turn より先に chat_id を解決し、
         // スラッシュコマンドであればエージェントループに入らずに即応答する。
         if crate::slash_commands::is_slash_command(&text) {
-            // guild ではメンション必須
-            if msg.guild_id.is_some() && !should_respond {
-                return;
-            }
-
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
@@ -216,10 +202,6 @@ impl EventHandler for Handler {
             }
         }
         // --- インターセプトここまで ---
-
-        if !should_respond {
-            return;
-        }
 
         if text.is_empty() {
             return;
