@@ -93,7 +93,17 @@ async fn process_turn_inner<F>(
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
-    let chat_id = resolve_chat_id(state, context).await?;
+    let chat_id = resolve_chat_id(state, context)
+        .await
+        .inspect_err(|e| {
+            warn!(
+                error_kind = e.error_kind(),
+                error = %e,
+                channel = context.channel,
+                surface_thread = context.surface_thread,
+                "resolve_chat_id failed"
+            );
+        })?;
     let tool_context = ToolExecutionContext {
         chat_id,
         channel: context.channel.clone(),
@@ -101,7 +111,14 @@ where
         chat_type: context.chat_type.clone(),
     };
     let system_prompt = build_system_prompt(state, context);
-    let channel_llm = state.llm_for_channel(&context.channel)?;
+    let channel_llm = state.llm_for_channel(&context.channel).inspect_err(|e| {
+        warn!(
+            error_kind = e.error_kind(),
+            error = %e,
+            channel = context.channel,
+            "llm_for_channel failed"
+        );
+    })?;
 
     let user_message = Message::text("user", user_input);
     let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
@@ -131,7 +148,10 @@ where
                 request_messages,
                 Some(state.tools.definitions_async().await),
             )
-            .await?;
+            .await
+            .inspect_err(|e| {
+                warn!(error = %e, iteration, "LLM send_message failed");
+            })?;
 
         if response.tool_calls.is_empty() {
             if let Some(final_content) = run_turn_action(

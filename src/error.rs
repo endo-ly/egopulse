@@ -30,6 +30,54 @@ pub enum EgoPulseError {
     Internal(String),
 }
 
+impl EgoPulseError {
+    /// 構造化ログの `error_kind` フィールドやユーザー向けメッセージの振り分けに使用する分類タグ。
+    pub fn error_kind(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::Llm(_) => "llm",
+            Self::Logging(_) => "logging",
+            Self::Tui(_) => "tui",
+            Self::Storage(_) => "storage",
+            Self::Channel(_) => "channel",
+            Self::Mcp(_) => "mcp",
+            Self::ShutdownRequested => "shutdown",
+            Self::Internal(_) => "internal",
+        }
+    }
+
+    /// ユーザー向けエラーメッセージ。内部詳細は含まず、ログ側で完全な情報を記録する前提。
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::Llm(e) => match e {
+                LlmError::RequestFailed(_) => {
+                    "⚠️ LLM API request failed. The provider may be unreachable.".to_string()
+                }
+                LlmError::ApiError { status, .. } => {
+                    format!("⚠️ LLM API returned HTTP {status}. Check your provider configuration.")
+                }
+                LlmError::InvalidResponse(_) => {
+                    "⚠️ LLM returned an invalid response.".to_string()
+                }
+                LlmError::InitFailed(_) => {
+                    "⚠️ Failed to initialize LLM client.".to_string()
+                }
+                LlmError::RequestConstructionFailed(_) => {
+                    "⚠️ Failed to construct LLM request.".to_string()
+                }
+            },
+            Self::Storage(_) => "⚠️ A database error occurred.".to_string(),
+            Self::Config(e) => format!("⚠️ Configuration error: {e}"),
+            Self::Mcp(e) => format!("⚠️ MCP error: {e}"),
+            Self::Channel(e) => format!("⚠️ Channel error: {e}"),
+            Self::ShutdownRequested => "Shutdown requested.".to_string(),
+            Self::Logging(_) | Self::Tui(_) | Self::Internal(_) => {
+                "⚠️ An internal error occurred.".to_string()
+            }
+        }
+    }
+}
+
 /// Configuration loading and validation errors.
 #[derive(Debug, Error)]
 pub enum ConfigError {

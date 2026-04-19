@@ -256,9 +256,12 @@ impl EventHandler for Handler {
                 drop(typing);
                 error!(
                     channel_id = external_chat_id,
-                    "Discord: error processing message: {e}"
+                    error_kind = e.error_kind(),
+                    error = %e,
+                    error_debug = ?e,
+                    "Discord: error processing message"
                 );
-                send_discord_response(&ctx, msg.channel_id, "Sorry, an error occurred.").await;
+                send_discord_response(&ctx, msg.channel_id, &e.user_message()).await;
             }
         }
     }
