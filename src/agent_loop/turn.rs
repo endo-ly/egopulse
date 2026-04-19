@@ -93,17 +93,15 @@ async fn process_turn_inner<F>(
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
-    let chat_id = resolve_chat_id(state, context)
-        .await
-        .inspect_err(|e| {
-            warn!(
-                error_kind = e.error_kind(),
-                error = %e,
-                channel = context.channel,
-                surface_thread = context.surface_thread,
-                "resolve_chat_id failed"
-            );
-        })?;
+    let chat_id = resolve_chat_id(state, context).await.inspect_err(|e| {
+        warn!(
+            error_kind = e.error_kind(),
+            error = %e,
+            channel = context.channel,
+            surface_thread = context.surface_thread,
+            "resolve_chat_id failed"
+        );
+    })?;
     let tool_context = ToolExecutionContext {
         chat_id,
         channel: context.channel.clone(),

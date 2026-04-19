@@ -325,9 +325,7 @@ async fn handle_message(
                 "Telegram: error processing message"
             );
             if !e.should_suppress_user_error() {
-                let _ = bot
-                    .send_message(msg.chat.id, e.user_message())
-                    .await;
+                let _ = bot.send_message(msg.chat.id, e.user_message()).await;
             }
         }
     }
