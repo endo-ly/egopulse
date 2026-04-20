@@ -140,7 +140,7 @@ impl Config {
 
     /// Discord bot token (env override or config file).
     pub fn discord_bot_token(&self) -> Option<String> {
-        env::var("EGOPULSE_DISCORD_BOT_TOKEN")
+        env::var("DISCORD_BOT_TOKEN")
             .ok()
             .and_then(|v| super::loader::normalize_string(Some(v)))
             .or_else(|| {
@@ -152,7 +152,7 @@ impl Config {
 
     /// Telegram bot token (env override or config file).
     pub fn telegram_bot_token(&self) -> Option<String> {
-        env::var("EGOPULSE_TELEGRAM_BOT_TOKEN")
+        env::var("TELEGRAM_BOT_TOKEN")
             .ok()
             .and_then(|v| super::loader::normalize_string(Some(v)))
             .or_else(|| {

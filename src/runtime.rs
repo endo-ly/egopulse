@@ -227,9 +227,9 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         } else {
             tracing::warn!(
                 "Discord channel is enabled but no bot_token is configured. \
-                  Set channels.discord.bot_token in egopulse.config.yaml, \
-                  set EGOPULSE_DISCORD_BOT_TOKEN environment variable, \
-                  or add EGOPULSE_DISCORD_BOT_TOKEN to ~/.egopulse/.env."
+                 Set channels.discord.bot_token in egopulse.config.yaml, \
+                  set DISCORD_BOT_TOKEN environment variable, \
+                  or add DISCORD_BOT_TOKEN to ~/.egopulse/.env."
             );
         }
     }
@@ -255,9 +255,9 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         } else {
             tracing::warn!(
                 "Telegram channel is enabled but no bot_token is configured. \
-                  Set channels.telegram.bot_token in egopulse.config.yaml, \
-                  set EGOPULSE_TELEGRAM_BOT_TOKEN environment variable, \
-                  or add EGOPULSE_TELEGRAM_BOT_TOKEN to ~/.egopulse/.env."
+                 Set channels.telegram.bot_token in egopulse.config.yaml, \
+                  set TELEGRAM_BOT_TOKEN environment variable, \
+                  or add TELEGRAM_BOT_TOKEN to ~/.egopulse/.env."
             );
         }
     }

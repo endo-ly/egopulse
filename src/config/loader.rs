@@ -94,7 +94,7 @@ pub(super) fn build_config(
         .to_string_lossy()
         .into_owned();
 
-    let log_level = first_non_empty([env_var("EGOPULSE_LOG_LEVEL"), file_log_level])
+    let log_level = first_non_empty([env_var("LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
 
     let compaction_timeout_secs = file_compaction_timeout_secs
@@ -332,11 +332,11 @@ fn validate_channel_provider_references(
 }
 
 fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelConfig>) {
-    let web_host = env_var("EGOPULSE_WEB_HOST");
-    let web_port = env_var("EGOPULSE_WEB_PORT").and_then(|value| value.parse::<u16>().ok());
-    let web_enabled = env_var("EGOPULSE_WEB_ENABLED").and_then(|value| parse_bool(&value));
+    let web_host = env_var("WEB_HOST");
+    let web_port = env_var("WEB_PORT").and_then(|value| value.parse::<u16>().ok());
+    let web_enabled = env_var("WEB_ENABLED").and_then(|value| parse_bool(&value));
     let web_auth_token = env_var(WEB_AUTH_TOKEN_ENV_NAME);
-    let web_allowed_origins = env_var("EGOPULSE_WEB_ALLOWED_ORIGINS").map(|value| {
+    let web_allowed_origins = env_var("WEB_ALLOWED_ORIGINS").map(|value| {
         value
             .split(',')
             .filter_map(|origin| normalize_string(Some(origin.to_string())))

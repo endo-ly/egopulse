@@ -132,9 +132,9 @@ pub(crate) fn provider_api_key_env_name(provider_id: &str) -> String {
     format!("{normalized}_API_KEY")
 }
 
-pub(crate) const WEB_AUTH_TOKEN_ENV_NAME: &str = "EGOPULSE_WEB_AUTH_TOKEN";
-pub(crate) const DISCORD_BOT_TOKEN_ENV_NAME: &str = "EGOPULSE_DISCORD_BOT_TOKEN";
-pub(crate) const TELEGRAM_BOT_TOKEN_ENV_NAME: &str = "EGOPULSE_TELEGRAM_BOT_TOKEN";
+pub(crate) const WEB_AUTH_TOKEN_ENV_NAME: &str = "WEB_AUTH_TOKEN";
+pub(crate) const DISCORD_BOT_TOKEN_ENV_NAME: &str = "DISCORD_BOT_TOKEN";
+pub(crate) const TELEGRAM_BOT_TOKEN_ENV_NAME: &str = "TELEGRAM_BOT_TOKEN";
 
 pub(crate) fn resolve_string_or_ref(
     value: Option<StringOrRef>,

@@ -203,18 +203,18 @@ mod tests {
         let web_file = serde_yml::to_string(web.file_auth_token.as_ref().expect("web file"))
             .expect("serialize web file");
         assert!(web_file.contains("source: env"));
-        assert!(web_file.contains("id: EGOPULSE_WEB_AUTH_TOKEN"));
+        assert!(web_file.contains("id: WEB_AUTH_TOKEN"));
 
         let discord = channels.get("discord").expect("discord");
         let discord_file =
             serde_yml::to_string(discord.file_bot_token.as_ref().expect("discord file"))
                 .expect("serialize discord file");
-        assert!(discord_file.contains("id: EGOPULSE_DISCORD_BOT_TOKEN"));
+        assert!(discord_file.contains("id: DISCORD_BOT_TOKEN"));
 
         let telegram = channels.get("telegram").expect("telegram");
         let telegram_file =
             serde_yml::to_string(telegram.file_bot_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");
-        assert!(telegram_file.contains("id: EGOPULSE_TELEGRAM_BOT_TOKEN"));
+        assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
     }
 }
