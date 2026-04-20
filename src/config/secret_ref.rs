@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -104,6 +106,36 @@ impl ResolvedValue {
     }
 }
 
+pub(crate) fn env_resolved_value(id: impl Into<String>, value: impl Into<String>) -> ResolvedValue {
+    ResolvedValue::EnvRef {
+        id: id.into(),
+        value: value.into(),
+    }
+}
+
+pub(crate) fn env_yaml_value(id: impl Into<String>) -> serde_yml::Value {
+    env_resolved_value(id, String::new()).to_yaml_value()
+}
+
+pub(crate) fn provider_api_key_env_name(provider_id: &str) -> String {
+    let normalized = provider_id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{normalized}_API_KEY")
+}
+
+pub(crate) const WEB_AUTH_TOKEN_ENV_NAME: &str = "EGOPULSE_WEB_AUTH_TOKEN";
+pub(crate) const DISCORD_BOT_TOKEN_ENV_NAME: &str = "EGOPULSE_DISCORD_BOT_TOKEN";
+pub(crate) const TELEGRAM_BOT_TOKEN_ENV_NAME: &str = "EGOPULSE_TELEGRAM_BOT_TOKEN";
+
 pub(crate) fn resolve_string_or_ref(
     value: Option<StringOrRef>,
     dotenv: &HashMap<String, String>,
@@ -175,48 +207,77 @@ fn resolve_secret_ref(
 const EXEC_TIMEOUT_SECS: u64 = 10;
 
 fn run_exec_command(command: &str) -> Result<ResolvedValue, ConfigError> {
-    let command_owned = command.to_string();
-    let handle =
-        std::thread::spawn(move || Command::new("sh").arg("-c").arg(&command_owned).output());
-
-    match handle.join() {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(ConfigError::SecretRefExecFailed {
-                    command: command.to_string(),
-                    detail: format!("exit {}: {stderr}", output.status),
-                });
-            }
-
-            let value = String::from_utf8(output.stdout)
-                .map_err(|e| ConfigError::SecretRefExecFailed {
-                    command: command.to_string(),
-                    detail: e.to_string(),
-                })?
-                .trim()
-                .to_string();
-
-            if value.is_empty() {
-                return Err(ConfigError::SecretRefExecFailed {
-                    command: command.to_string(),
-                    detail: "command produced empty output".into(),
-                });
-            }
-
-            Ok(ResolvedValue::ExecRef {
-                value,
-                command: command.to_string(),
-            })
-        }
-        Ok(Err(e)) => Err(ConfigError::SecretRefExecFailed {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ConfigError::SecretRefExecFailed {
             command: command.to_string(),
             detail: e.to_string(),
-        }),
-        Err(_) => Err(ConfigError::SecretRefExecFailed {
-            command: command.to_string(),
-            detail: format!("timed out after {EXEC_TIMEOUT_SECS} seconds"),
-        }),
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(EXEC_TIMEOUT_SECS);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output =
+                    child
+                        .wait_with_output()
+                        .map_err(|e| ConfigError::SecretRefExecFailed {
+                            command: command.to_string(),
+                            detail: e.to_string(),
+                        })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(ConfigError::SecretRefExecFailed {
+                        command: command.to_string(),
+                        detail: format!("exit {}: {stderr}", output.status),
+                    });
+                }
+
+                let value = String::from_utf8(output.stdout)
+                    .map_err(|e| ConfigError::SecretRefExecFailed {
+                        command: command.to_string(),
+                        detail: e.to_string(),
+                    })?
+                    .trim()
+                    .to_string();
+
+                if value.is_empty() {
+                    return Err(ConfigError::SecretRefExecFailed {
+                        command: command.to_string(),
+                        detail: "command produced empty output".into(),
+                    });
+                }
+
+                return Ok(ResolvedValue::ExecRef {
+                    value,
+                    command: command.to_string(),
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ConfigError::SecretRefExecFailed {
+                    command: command.to_string(),
+                    detail: format!("timed out after {EXEC_TIMEOUT_SECS} seconds"),
+                });
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ConfigError::SecretRefExecFailed {
+                    command: command.to_string(),
+                    detail: e.to_string(),
+                });
+            }
+        }
     }
 }
 
@@ -399,6 +460,20 @@ mod tests {
 
     #[test]
     #[serial]
+    fn secret_ref_exec_times_out() {
+        let dotenv = HashMap::new();
+        let source = SecretSource::Exec {
+            command: Some("sleep 11".into()),
+        };
+        let err = resolve_secret_ref(source, &dotenv).expect_err("should timeout");
+        assert!(
+            matches!(err, ConfigError::SecretRefExecFailed { ref detail, .. } if detail.contains("timed out after 10 seconds")),
+            "expected timeout error, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn secret_ref_literal_value_unchanged() {
         let dotenv = HashMap::new();
         let result =
@@ -491,5 +566,14 @@ mod tests {
             let mode = meta.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn provider_api_key_env_name_normalizes_provider_id() {
+        assert_eq!(provider_api_key_env_name("openai"), "OPENAI_API_KEY");
+        assert_eq!(
+            provider_api_key_env_name("open-router custom"),
+            "OPEN_ROUTER_CUSTOM_API_KEY"
+        );
     }
 }

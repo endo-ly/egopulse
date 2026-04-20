@@ -280,3 +280,154 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::secret_ref::{
+        DISCORD_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value,
+    };
+    use crate::config::{ChannelConfig, ChannelName, ProviderConfig, ProviderId};
+    use serial_test::serial;
+
+    fn sample_config() -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            ProviderId::new("openai"),
+            ProviderConfig {
+                label: "OpenAI".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                default_model: "gpt-5".to_string(),
+                models: vec!["gpt-5".to_string()],
+            },
+        );
+
+        let mut channels = HashMap::new();
+        channels.insert(
+            ChannelName::new("web"),
+            ChannelConfig {
+                enabled: Some(true),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(10961),
+                auth_token: Some(env_resolved_value(WEB_AUTH_TOKEN_ENV_NAME, "web-token")),
+                file_auth_token: Some(env_yaml_value(WEB_AUTH_TOKEN_ENV_NAME)),
+                ..Default::default()
+            },
+        );
+        channels.insert(
+            ChannelName::new("discord"),
+            ChannelConfig {
+                enabled: Some(true),
+                bot_token: Some(env_resolved_value(
+                    DISCORD_BOT_TOKEN_ENV_NAME,
+                    "discord-token",
+                )),
+                file_bot_token: Some(env_yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
+                ..Default::default()
+            },
+        );
+
+        Config {
+            default_provider: ProviderId::new("openai"),
+            default_model: None,
+            providers,
+            state_root: "/tmp/egopulse".to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels,
+        }
+    }
+
+    #[test]
+    fn save_config_with_secrets_writes_dotenv_and_secret_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+
+        save_config_with_secrets(&sample_config(), &path).expect("save config");
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("source: env"));
+        assert!(yaml.contains("id: OPENAI_API_KEY"));
+        assert!(yaml.contains(&format!("id: {WEB_AUTH_TOKEN_ENV_NAME}")));
+        assert!(yaml.contains(&format!("id: {DISCORD_BOT_TOKEN_ENV_NAME}")));
+        assert!(!yaml.contains("sk-test"));
+        assert!(!yaml.contains("web-token"));
+        assert!(!yaml.contains("discord-token"));
+
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert!(dotenv.contains("OPENAI_API_KEY=sk-test"));
+        assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
+        assert!(dotenv.contains(&format!("{DISCORD_BOT_TOKEN_ENV_NAME}=discord-token")));
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_with_secrets_preserves_yaml_secret_refs_during_runtime_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let initial_yaml = format!(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key:
+      source: env
+      id: OPENAI_API_KEY
+    default_model: gpt-5
+channels:
+  web:
+    enabled: true
+    auth_token:
+      source: env
+      id: {WEB_AUTH_TOKEN_ENV_NAME}
+  discord:
+    enabled: true
+    bot_token:
+      source: env
+      id: {DISCORD_BOT_TOKEN_ENV_NAME}
+"#
+        );
+        fs::write(&path, initial_yaml).expect("write yaml");
+        fs::write(
+            dir.path().join(".env"),
+            format!(
+                "OPENAI_API_KEY=sk-test\n{WEB_AUTH_TOKEN_ENV_NAME}=web-file\n{DISCORD_BOT_TOKEN_ENV_NAME}=discord-file\n"
+            ),
+        )
+        .expect("write dotenv");
+
+        let previous_web = std::env::var_os(WEB_AUTH_TOKEN_ENV_NAME);
+        let previous_discord = std::env::var_os(DISCORD_BOT_TOKEN_ENV_NAME);
+        // SAFETY: this serial test mutates process environment in isolation and restores it below.
+        unsafe {
+            std::env::set_var(WEB_AUTH_TOKEN_ENV_NAME, "web-override");
+            std::env::set_var(DISCORD_BOT_TOKEN_ENV_NAME, "discord-override");
+        }
+
+        let config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        // SAFETY: restore original process environment values before assertions can unwind.
+        unsafe {
+            match previous_web {
+                Some(value) => std::env::set_var(WEB_AUTH_TOKEN_ENV_NAME, value),
+                None => std::env::remove_var(WEB_AUTH_TOKEN_ENV_NAME),
+            }
+            match previous_discord {
+                Some(value) => std::env::set_var(DISCORD_BOT_TOKEN_ENV_NAME, value),
+                None => std::env::remove_var(DISCORD_BOT_TOKEN_ENV_NAME),
+            }
+        }
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains(&format!("id: {WEB_AUTH_TOKEN_ENV_NAME}")));
+        assert!(yaml.contains(&format!("id: {DISCORD_BOT_TOKEN_ENV_NAME}")));
+        assert!(!yaml.contains("web-override"));
+        assert!(!yaml.contains("discord-override"));
+    }
+}

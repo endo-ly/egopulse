@@ -7,7 +7,8 @@ use serde::Deserialize;
 use url::Url;
 
 use super::secret_ref::{
-    ResolvedValue, StringOrRef, dotenv_path, read_dotenv, resolve_string_or_ref,
+    DISCORD_BOT_TOKEN_ENV_NAME, ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME,
+    WEB_AUTH_TOKEN_ENV_NAME, dotenv_path, read_dotenv, resolve_string_or_ref,
 };
 use super::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
 use crate::error::ConfigError;
@@ -107,8 +108,8 @@ pub(super) fn build_config(
 
     let mut channels = normalize_channels(file_channels.unwrap_or_default(), &dotenv)?;
     apply_web_channel_env_overrides(&mut channels);
-    apply_channel_bot_token_env_override(&mut channels, "discord", "EGOPULSE_DISCORD_BOT_TOKEN");
-    apply_channel_bot_token_env_override(&mut channels, "telegram", "EGOPULSE_TELEGRAM_BOT_TOKEN");
+    apply_channel_bot_token_env_override(&mut channels, "discord", DISCORD_BOT_TOKEN_ENV_NAME);
+    apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
 
     validate_channel_provider_references(&providers, &channels)?;
 
@@ -334,7 +335,7 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelCo
     let web_host = env_var("EGOPULSE_WEB_HOST");
     let web_port = env_var("EGOPULSE_WEB_PORT").and_then(|value| value.parse::<u16>().ok());
     let web_enabled = env_var("EGOPULSE_WEB_ENABLED").and_then(|value| parse_bool(&value));
-    let web_auth_token = env_var("EGOPULSE_WEB_AUTH_TOKEN");
+    let web_auth_token = env_var(WEB_AUTH_TOKEN_ENV_NAME);
     let web_allowed_origins = env_var("EGOPULSE_WEB_ALLOWED_ORIGINS").map(|value| {
         value
             .split(',')
@@ -362,8 +363,7 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelCo
         web.port = Some(port);
     }
     if let Some(token) = web_auth_token {
-        web.auth_token = Some(ResolvedValue::Literal(token.clone()));
-        web.file_auth_token = Some(serde_yml::Value::String(token));
+        web.auth_token = Some(ResolvedValue::Literal(token));
     }
     if let Some(origins) = web_allowed_origins {
         web.allowed_origins = Some(origins);
@@ -385,7 +385,6 @@ fn apply_channel_bot_token_env_override(
     if let Some(token) = env_var(env_key) {
         let channel = channels.entry(ChannelName::new(channel_name)).or_default();
         channel.bot_token = Some(ResolvedValue::Literal(token));
-        channel.file_bot_token = None;
     }
 }
 
