@@ -34,11 +34,32 @@ pub(crate) enum StringOrRef {
     Ref(SecretSource),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum ResolvedValue {
     Literal(String),
     EnvRef { value: String, id: String },
     ExecRef { value: String, command: String },
+}
+
+impl std::fmt::Debug for ResolvedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Literal(_) => f
+                .debug_struct("Literal")
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::EnvRef { id, .. } => f
+                .debug_struct("EnvRef")
+                .field("id", id)
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::ExecRef { command, .. } => f
+                .debug_struct("ExecRef")
+                .field("command", command)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl ResolvedValue {
@@ -150,43 +171,53 @@ fn resolve_secret_ref(
     }
 }
 
+/// exec コマンドのデフォルトタイムアウト（秒）。
+const EXEC_TIMEOUT_SECS: u64 = 10;
+
 fn run_exec_command(command: &str) -> Result<ResolvedValue, ConfigError> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .map_err(|e| ConfigError::SecretRefExecFailed {
+    let command_owned = command.to_string();
+    let handle =
+        std::thread::spawn(move || Command::new("sh").arg("-c").arg(&command_owned).output());
+
+    match handle.join() {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ConfigError::SecretRefExecFailed {
+                    command: command.to_string(),
+                    detail: format!("exit {}: {stderr}", output.status),
+                });
+            }
+
+            let value = String::from_utf8(output.stdout)
+                .map_err(|e| ConfigError::SecretRefExecFailed {
+                    command: command.to_string(),
+                    detail: e.to_string(),
+                })?
+                .trim()
+                .to_string();
+
+            if value.is_empty() {
+                return Err(ConfigError::SecretRefExecFailed {
+                    command: command.to_string(),
+                    detail: "command produced empty output".into(),
+                });
+            }
+
+            Ok(ResolvedValue::ExecRef {
+                value,
+                command: command.to_string(),
+            })
+        }
+        Ok(Err(e)) => Err(ConfigError::SecretRefExecFailed {
             command: command.to_string(),
             detail: e.to_string(),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ConfigError::SecretRefExecFailed {
+        }),
+        Err(_) => Err(ConfigError::SecretRefExecFailed {
             command: command.to_string(),
-            detail: format!("exit {}: {stderr}", output.status),
-        });
+            detail: format!("timed out after {EXEC_TIMEOUT_SECS} seconds"),
+        }),
     }
-
-    let value = String::from_utf8(output.stdout)
-        .map_err(|e| ConfigError::SecretRefExecFailed {
-            command: command.to_string(),
-            detail: e.to_string(),
-        })?
-        .trim()
-        .to_string();
-
-    if value.is_empty() {
-        return Err(ConfigError::SecretRefExecFailed {
-            command: command.to_string(),
-            detail: "command produced empty output".into(),
-        });
-    }
-
-    Ok(ResolvedValue::ExecRef {
-        value,
-        command: command.to_string(),
-    })
 }
 
 pub(crate) fn read_dotenv(path: &Path) -> HashMap<String, String> {
@@ -257,6 +288,11 @@ pub(crate) fn save_dotenv(path: &Path, entries: &[(String, String)]) -> Result<(
             source,
         })?;
     file.write_all(content.as_bytes())
+        .map_err(|source| ConfigError::ConfigReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all()
         .map_err(|source| ConfigError::ConfigReadFailed {
             path: path.to_path_buf(),
             source,
