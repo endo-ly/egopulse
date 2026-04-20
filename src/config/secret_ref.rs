@@ -316,6 +316,7 @@ pub(crate) fn save_dotenv(path: &Path, entries: &[(String, String)]) -> Result<(
     let mut existing = read_dotenv(path);
 
     for (key, value) in entries {
+        validate_dotenv_value(key, value)?;
         existing.insert(key.clone(), value.clone());
     }
 
@@ -335,29 +336,72 @@ pub(crate) fn save_dotenv(path: &Path, entries: &[(String, String)]) -> Result<(
 
     let content = format!("{}\n", lines.join("\n"));
 
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("env"),
+        std::process::id()
+    ));
+
     let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
+    opts.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut file = opts
-        .open(path)
+        .open(&temp_path)
         .map_err(|source| ConfigError::ConfigReadFailed {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             source,
         })?;
     file.write_all(content.as_bytes())
         .map_err(|source| ConfigError::ConfigReadFailed {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             source,
         })?;
     file.sync_all()
         .map_err(|source| ConfigError::ConfigReadFailed {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             source,
         })?;
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|source| ConfigError::ConfigReadFailed {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            ConfigError::ConfigReadFailed {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
+    if let Ok(dir) = fs::File::open(parent) {
+        dir.sync_all()
+            .map_err(|source| ConfigError::ConfigReadFailed {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn validate_dotenv_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(ConfigError::SecretRefUnresolved {
+            reference: format!("dotenv:{key}: values must not contain newlines"),
+        });
+    }
 
     Ok(())
 }
@@ -564,6 +608,39 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let meta = fs::metadata(&path).expect("metadata");
             let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn save_dotenv_rejects_values_with_newlines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".env");
+
+        let error =
+            save_dotenv(&path, &[("TEST_KEY".into(), "line1\nline2".into())]).expect_err("save");
+
+        assert!(matches!(error, ConfigError::SecretRefUnresolved { .. }));
+    }
+
+    #[test]
+    fn save_dotenv_corrects_existing_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".env");
+        fs::write(&path, "TEST_KEY=old-value\n").expect("write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        }
+
+        save_dotenv(&path, &[("TEST_KEY".into(), "new-value".into())]).expect("save");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
         }
     }
