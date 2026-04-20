@@ -3,10 +3,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use secrecy::SecretString;
 use serde::Deserialize;
 use url::Url;
 
+use super::secret_ref::{
+    ResolvedValue, StringOrRef, dotenv_path, read_dotenv, resolve_string_or_ref,
+};
 use super::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
 use crate::error::ConfigError;
 
@@ -14,7 +16,7 @@ use crate::error::ConfigError;
 struct FileProviderConfig {
     label: Option<String>,
     base_url: Option<String>,
-    api_key: Option<String>,
+    api_key: Option<StringOrRef>,
     default_model: Option<String>,
     models: Option<Vec<String>>,
 }
@@ -26,40 +28,18 @@ struct FileChannelConfig {
     host: Option<String>,
     provider: Option<String>,
     model: Option<String>,
-    auth_token: Option<String>,
+    auth_token: Option<StringOrRef>,
     allowed_origins: Option<Vec<String>>,
-    bot_token: Option<String>,
+    bot_token: Option<StringOrRef>,
     bot_username: Option<String>,
     allowed_channels: Option<Vec<u64>>,
     allowed_chat_ids: Option<Vec<i64>>,
     soul_path: Option<String>,
 }
 
-impl From<FileChannelConfig> for ChannelConfig {
-    fn from(fc: FileChannelConfig) -> Self {
-        Self {
-            enabled: fc.enabled,
-            port: fc.port,
-            host: fc.host,
-            provider: normalize_string(fc.provider),
-            model: normalize_string(fc.model),
-            auth_token: fc.auth_token,
-            file_auth_token: None,
-            allowed_origins: fc.allowed_origins,
-            bot_token: fc.bot_token,
-            file_bot_token: None,
-            bot_username: fc.bot_username,
-            allowed_channels: fc.allowed_channels,
-            allowed_chat_ids: fc.allowed_chat_ids,
-            soul_path: fc.soul_path,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
-    /// グローバルでのモデル選択（YAMLトップレベル）。未指定時は default_provider の default_model にフォールバック。
     default_model: Option<String>,
     providers: Option<HashMap<String, FileProviderConfig>>,
     log_level: Option<String>,
@@ -78,6 +58,9 @@ pub(super) fn build_config(
         Some(path) => Some(PathBuf::from(path)),
         None => Config::resolve_config_path()?,
     };
+
+    let dotenv = load_dotenv(resolved_config_path.as_deref());
+
     let FileConfig {
         default_provider: file_default_provider,
         default_model: file_default_model,
@@ -95,6 +78,7 @@ pub(super) fn build_config(
     let default_provider = ProviderId::new(&default_provider);
     let providers = normalize_provider_map(
         file_providers.ok_or(ConfigError::MissingProviders)?,
+        &dotenv,
         allow_missing_api_key,
     )?;
     if !providers.contains_key(&default_provider) {
@@ -121,7 +105,7 @@ pub(super) fn build_config(
     let compact_keep_recent =
         file_compact_keep_recent.unwrap_or_else(super::resolve::default_compact_keep_recent);
 
-    let mut channels = normalize_channels(file_channels.unwrap_or_default());
+    let mut channels = normalize_channels(file_channels.unwrap_or_default(), &dotenv)?;
     apply_web_channel_env_overrides(&mut channels);
     apply_channel_bot_token_env_override(&mut channels, "discord", "EGOPULSE_DISCORD_BOT_TOKEN");
     apply_channel_bot_token_env_override(&mut channels, "telegram", "EGOPULSE_TELEGRAM_BOT_TOKEN");
@@ -150,6 +134,16 @@ pub(super) fn build_config(
     Ok(config)
 }
 
+fn load_dotenv(config_path: Option<&Path>) -> HashMap<String, String> {
+    let Some(path) = config_path else {
+        return HashMap::new();
+    };
+    let Some(parent) = path.parent() else {
+        return HashMap::new();
+    };
+    read_dotenv(&dotenv_path(parent))
+}
+
 fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
     let Some(path) = path else {
         return Ok(FileConfig::default());
@@ -173,16 +167,49 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
 
 fn normalize_channels(
     channels: HashMap<String, FileChannelConfig>,
-) -> HashMap<ChannelName, ChannelConfig> {
+    dotenv: &HashMap<String, String>,
+) -> Result<HashMap<ChannelName, ChannelConfig>, ConfigError> {
     let mut normalized = HashMap::new();
     for (name, fc) in channels {
         let key = ChannelName::new(&name);
         if key.as_str().is_empty() {
             continue;
         }
-        let mut config = ChannelConfig::from(fc);
-        config.file_auth_token = normalize_string(config.auth_token.clone());
-        config.file_bot_token = normalize_string(config.bot_token.clone());
+
+        let resolved_auth = resolve_string_or_ref(fc.auth_token, dotenv)?;
+        let resolved_bot = resolve_string_or_ref(fc.bot_token, dotenv)?;
+
+        let file_auth_token = resolved_auth.as_ref().map(|rv| {
+            if matches!(rv, ResolvedValue::Literal(_)) {
+                serde_yml::Value::String(rv.value().to_string())
+            } else {
+                rv.to_yaml_value()
+            }
+        });
+        let file_bot_token = resolved_bot.as_ref().map(|rv| {
+            if matches!(rv, ResolvedValue::Literal(_)) {
+                serde_yml::Value::String(rv.value().to_string())
+            } else {
+                rv.to_yaml_value()
+            }
+        });
+
+        let config = ChannelConfig {
+            enabled: fc.enabled,
+            port: fc.port,
+            host: fc.host,
+            provider: normalize_string(fc.provider),
+            model: normalize_string(fc.model),
+            auth_token: resolved_auth,
+            file_auth_token,
+            allowed_origins: fc.allowed_origins,
+            bot_token: resolved_bot,
+            file_bot_token,
+            bot_username: fc.bot_username,
+            allowed_channels: fc.allowed_channels,
+            allowed_chat_ids: fc.allowed_chat_ids,
+            soul_path: fc.soul_path,
+        };
         normalized.insert(key, config);
     }
 
@@ -195,11 +222,12 @@ fn normalize_channels(
         }
     }
 
-    normalized
+    Ok(normalized)
 }
 
 fn normalize_provider_map(
     providers: HashMap<String, FileProviderConfig>,
+    dotenv: &HashMap<String, String>,
     allow_missing_api_key: bool,
 ) -> Result<HashMap<ProviderId, ProviderConfig>, ConfigError> {
     let mut normalized = HashMap::new();
@@ -231,8 +259,7 @@ fn normalize_provider_map(
             models.insert(0, default_model.clone());
         }
 
-        let api_key = normalize_string(file_provider.api_key)
-            .map(|value| SecretString::new(value.into_boxed_str()));
+        let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
         if !allow_missing_api_key && api_key.is_none() && !base_url_allows_empty_api_key(&base_url)
         {
             return Err(ConfigError::MissingProviderApiKey {
@@ -335,7 +362,8 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelCo
         web.port = Some(port);
     }
     if let Some(token) = web_auth_token {
-        web.auth_token = Some(token);
+        web.auth_token = Some(ResolvedValue::Literal(token.clone()));
+        web.file_auth_token = Some(serde_yml::Value::String(token));
     }
     if let Some(origins) = web_allowed_origins {
         web.allowed_origins = Some(origins);
@@ -356,7 +384,8 @@ fn apply_channel_bot_token_env_override(
 ) {
     if let Some(token) = env_var(env_key) {
         let channel = channels.entry(ChannelName::new(channel_name)).or_default();
-        channel.bot_token = Some(token);
+        channel.bot_token = Some(ResolvedValue::Literal(token));
+        channel.file_bot_token = None;
     }
 }
 

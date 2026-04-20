@@ -94,6 +94,7 @@ pub(crate) fn build_channel_configs(
     telegram_bot_token: String,
     telegram_bot_username: String,
 ) -> HashMap<crate::config::ChannelName, crate::config::ChannelConfig> {
+    use crate::config::secret_ref::ResolvedValue;
     use crate::config::{ChannelConfig, ChannelName};
 
     let mut channels = HashMap::new();
@@ -104,7 +105,8 @@ pub(crate) fn build_channel_configs(
             enabled: Some(true),
             host: Some("127.0.0.1".to_string()),
             port: Some(10961),
-            auth_token: Some(auth_token),
+            auth_token: Some(ResolvedValue::Literal(auth_token)),
+            file_auth_token: None,
             ..Default::default()
         },
     );
@@ -114,7 +116,8 @@ pub(crate) fn build_channel_configs(
             ChannelName::new("discord"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(discord_bot_token),
+                bot_token: Some(ResolvedValue::Literal(discord_bot_token)),
+                file_bot_token: None,
                 ..Default::default()
             },
         );
@@ -125,7 +128,8 @@ pub(crate) fn build_channel_configs(
             ChannelName::new("telegram"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(telegram_bot_token),
+                bot_token: Some(ResolvedValue::Literal(telegram_bot_token)),
+                file_bot_token: None,
                 bot_username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
                 ..Default::default()
             },

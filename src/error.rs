@@ -102,6 +102,12 @@ pub enum ConfigError {
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,
+    /// SecretRef の解決に失敗した（環境変数が見つからない等）。
+    #[error("secret_ref_unresolved: {reference}")]
+    SecretRefUnresolved { reference: String },
+    /// SecretRef の exec コマンド実行に失敗した。
+    #[error("secret_ref_exec_failed: {command}: {detail}")]
+    SecretRefExecFailed { command: String, detail: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

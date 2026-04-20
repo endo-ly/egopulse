@@ -835,8 +835,8 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
             crate::config::ProviderConfig {
                 label: "OpenAI".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(secrecy::SecretString::new(
-                    "sk-test".to_string().into_boxed_str(),
+                api_key: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                    "sk-test".to_string(),
                 )),
                 default_model: "gpt-4o-mini".to_string(),
                 models: vec!["gpt-4o-mini".to_string()],

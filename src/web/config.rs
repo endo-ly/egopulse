@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
+use crate::config::secret_ref::ResolvedValue;
 use crate::config::{ChannelName, Config, ProviderConfig, ProviderId, default_config_path};
 use crate::error::ConfigError;
 
@@ -290,17 +290,16 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
     }
 }
 
-fn apply_api_key_update(current: &mut Option<SecretString>, raw_update: Option<String>) {
+fn apply_api_key_update(current: &mut Option<ResolvedValue>, raw_update: Option<String>) {
     let Some(value) = raw_update else { return };
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        // empty string → keep existing
         return;
     }
     if trimmed == "*CLEAR*" {
         *current = None;
     } else {
-        *current = Some(SecretString::new(trimmed.to_string().into_boxed_str()));
+        *current = Some(ResolvedValue::Literal(trimmed.to_string()));
     }
 }
 

@@ -5,10 +5,10 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use fs2::FileExt;
-use secrecy::ExposeSecret;
 use serde::Serialize;
 
 use super::Config;
+use super::secret_ref::{ResolvedValue, dotenv_path, save_dotenv};
 use crate::error::EgoPulseError;
 
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -32,8 +32,11 @@ struct SerializableConfig {
 struct SerializableProvider {
     label: String,
     base_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_key: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    api_key: Option<serde_yml::Value>,
     default_model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     models: Vec<String>,
@@ -51,12 +54,18 @@ struct SerializableChannel {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_token: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    auth_token: Option<serde_yml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_origins: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bot_token: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    bot_token: Option<serde_yml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bot_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,21 +76,32 @@ struct SerializableChannel {
     soul_path: Option<String>,
 }
 
+fn serialize_optional_yaml_value<S>(
+    value: &Option<serde_yml::Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(v) => serde_yml::Value::serialize(v, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 impl From<&Config> for SerializableConfig {
     fn from(config: &Config) -> Self {
         let providers = config
             .providers
             .iter()
             .map(|(id, p)| {
+                let api_key_value = p.api_key.as_ref().map(|rv| rv.to_yaml_value());
                 (
                     id.to_string(),
                     SerializableProvider {
                         label: p.label.clone(),
                         base_url: p.base_url.clone(),
-                        api_key: p
-                            .api_key
-                            .as_ref()
-                            .map(|s| ExposeSecret::expose_secret(s).to_string()),
+                        api_key: api_key_value,
                         default_model: p.default_model.clone(),
                         models: p.models.clone(),
                     },
@@ -142,6 +162,47 @@ pub fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
     let yaml = serde_yml::to_string(&SerializableConfig::from(config))
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     write_atomically(path, &yaml)
+}
+
+/// Saves config with SecretRef-aware YAML and .env file.
+///
+/// Writes the YAML with SecretRef objects for secrets, and writes actual values
+/// for env-mode secrets to the .env file.
+pub fn save_config_with_secrets(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
+    save_yaml(config, yaml_path)?;
+
+    let dotenv_entries = collect_dotenv_entries(config);
+    if !dotenv_entries.is_empty() {
+        if let Some(config_dir) = yaml_path.parent() {
+            let env_path = dotenv_path(config_dir);
+            save_dotenv(&env_path, &dotenv_entries).map_err(EgoPulseError::Config)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+
+    for (id, provider) in &config.providers {
+        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &provider.api_key {
+            entries.push((env_id.clone(), value.clone()));
+        }
+        let _ = id;
+    }
+
+    for (name, channel) in &config.channels {
+        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.auth_token {
+            entries.push((env_id.clone(), value.clone()));
+        }
+        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.bot_token {
+            entries.push((env_id.clone(), value.clone()));
+        }
+        let _ = name;
+    }
+
+    entries
 }
 
 fn acquire_config_lock(path: &Path) -> Result<File, EgoPulseError> {

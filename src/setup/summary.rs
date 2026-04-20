@@ -7,7 +7,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use secrecy::SecretString;
 
 use super::channels::{
     build_channel_configs, extract_existing_state_root, extract_existing_web_auth_token,
@@ -18,6 +17,7 @@ use super::provider::{
     provider_label_for,
 };
 use super::{Field, SetupApp};
+use crate::config::secret_ref::ResolvedValue;
 use crate::config::{
     Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
     default_workspace_dir, is_valid_base_url,
@@ -162,7 +162,7 @@ pub(crate) fn save_config(
             api_key: if api_key.is_empty() {
                 None
             } else {
-                Some(SecretString::new(api_key.clone().into_boxed_str()))
+                Some(ResolvedValue::Literal(api_key.clone()))
             },
             default_model: preset_default_model,
             models: preset_models,

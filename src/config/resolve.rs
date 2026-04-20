@@ -20,7 +20,7 @@ impl Config {
             provider: self.default_provider.to_string(),
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
-            api_key: provider.api_key.clone(),
+            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model: self
                 .default_model
                 .clone()
@@ -63,7 +63,7 @@ impl Config {
             provider: provider_name,
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
-            api_key: provider.api_key.clone(),
+            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
         })
     }
@@ -101,7 +101,7 @@ impl Config {
     pub fn web_auth_token(&self) -> Option<&str> {
         self.channels
             .get("web")
-            .and_then(|c| c.auth_token.as_deref())
+            .and_then(|c| c.auth_token.as_ref().map(|rv| rv.value()))
             .map(str::trim)
             .filter(|token| !token.is_empty())
     }
@@ -146,7 +146,7 @@ impl Config {
             .or_else(|| {
                 self.channels
                     .get("discord")
-                    .and_then(|c| c.bot_token.clone())
+                    .and_then(|c| c.bot_token.as_ref().map(|rv| rv.value().to_string()))
             })
     }
 
@@ -158,7 +158,7 @@ impl Config {
             .or_else(|| {
                 self.channels
                     .get("telegram")
-                    .and_then(|c| c.bot_token.clone())
+                    .and_then(|c| c.bot_token.as_ref().map(|rv| rv.value().to_string()))
             })
     }
 
@@ -244,6 +244,14 @@ impl Config {
     /// temp-file + rename.
     pub fn save_yaml(&self, path: &Path) -> Result<(), crate::error::EgoPulseError> {
         super::persist::save_yaml(self, path)
+    }
+
+    /// Saves config with SecretRef-aware YAML and .env file.
+    pub fn save_config_with_secrets(
+        &self,
+        yaml_path: &Path,
+    ) -> Result<(), crate::error::EgoPulseError> {
+        super::persist::save_config_with_secrets(self, yaml_path)
     }
 }
 
