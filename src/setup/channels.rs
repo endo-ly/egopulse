@@ -60,21 +60,6 @@ pub(crate) fn load_channel_fields(
     );
 }
 
-pub(crate) fn extract_existing_web_auth_token(
-    original_yaml: &Option<serde_yml::Value>,
-) -> Option<String> {
-    original_yaml
-        .as_ref()
-        .and_then(|v| v.as_mapping())
-        .and_then(|m| m.get(serde_yml::Value::String("channels".into())))
-        .and_then(|c| c.as_mapping())
-        .and_then(|m| m.get(serde_yml::Value::String("web".into())))
-        .and_then(|w| w.as_mapping())
-        .and_then(|m| m.get(serde_yml::Value::String("auth_token".into())))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-}
-
 pub(crate) fn extract_existing_state_root(
     original_yaml: &Option<serde_yml::Value>,
 ) -> Option<String> {
@@ -94,6 +79,10 @@ pub(crate) fn build_channel_configs(
     telegram_bot_token: String,
     telegram_bot_username: String,
 ) -> HashMap<crate::config::ChannelName, crate::config::ChannelConfig> {
+    use crate::config::secret_ref::{
+        DISCORD_BOT_TOKEN_ENV_NAME, TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME,
+        env_resolved_value, env_yaml_value,
+    };
     use crate::config::{ChannelConfig, ChannelName};
 
     let mut channels = HashMap::new();
@@ -104,7 +93,8 @@ pub(crate) fn build_channel_configs(
             enabled: Some(true),
             host: Some("127.0.0.1".to_string()),
             port: Some(10961),
-            auth_token: Some(auth_token),
+            auth_token: Some(env_resolved_value(WEB_AUTH_TOKEN_ENV_NAME, auth_token)),
+            file_auth_token: Some(env_yaml_value(WEB_AUTH_TOKEN_ENV_NAME)),
             ..Default::default()
         },
     );
@@ -114,7 +104,11 @@ pub(crate) fn build_channel_configs(
             ChannelName::new("discord"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(discord_bot_token),
+                bot_token: Some(env_resolved_value(
+                    DISCORD_BOT_TOKEN_ENV_NAME,
+                    discord_bot_token,
+                )),
+                file_bot_token: Some(env_yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
                 ..Default::default()
             },
         );
@@ -125,7 +119,11 @@ pub(crate) fn build_channel_configs(
             ChannelName::new("telegram"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(telegram_bot_token),
+                bot_token: Some(env_resolved_value(
+                    TELEGRAM_BOT_TOKEN_ENV_NAME,
+                    telegram_bot_token,
+                )),
+                file_bot_token: Some(env_yaml_value(TELEGRAM_BOT_TOKEN_ENV_NAME)),
                 bot_username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
                 ..Default::default()
             },
@@ -184,4 +182,39 @@ fn insert_channel_string(
     };
 
     result.insert(result_key.into(), value.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_channel_configs;
+
+    #[test]
+    fn build_channel_configs_stores_channel_secrets_as_env_refs() {
+        let channels = build_channel_configs(
+            "web-token".to_string(),
+            true,
+            "discord-token".to_string(),
+            true,
+            "telegram-token".to_string(),
+            "botname".to_string(),
+        );
+
+        let web = channels.get("web").expect("web");
+        let web_file = serde_yml::to_string(web.file_auth_token.as_ref().expect("web file"))
+            .expect("serialize web file");
+        assert!(web_file.contains("source: env"));
+        assert!(web_file.contains("id: WEB_AUTH_TOKEN"));
+
+        let discord = channels.get("discord").expect("discord");
+        let discord_file =
+            serde_yml::to_string(discord.file_bot_token.as_ref().expect("discord file"))
+                .expect("serialize discord file");
+        assert!(discord_file.contains("id: DISCORD_BOT_TOKEN"));
+
+        let telegram = channels.get("telegram").expect("telegram");
+        let telegram_file =
+            serde_yml::to_string(telegram.file_bot_token.as_ref().expect("telegram file"))
+                .expect("serialize telegram file");
+        assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
+    }
 }

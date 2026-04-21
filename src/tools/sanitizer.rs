@@ -163,25 +163,17 @@ pub(crate) fn sanitize_tool_result(
 /// Config から抽出したシークレット値のリストを構築する。
 pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
     let mut secrets = Vec::new();
-    use secrecy::ExposeSecret;
     for (name, provider) in &config.providers {
-        if let Some(key) = &provider.api_key {
-            let value = ExposeSecret::expose_secret(key).to_string();
-            secrets.push((format!("provider.{name}.api_key"), value));
+        if let Some(rv) = &provider.api_key {
+            secrets.push((format!("provider.{name}.api_key"), rv.value().to_string()));
         }
     }
     for (name, channel) in &config.channels {
-        if let Some(token) = &channel.auth_token {
-            secrets.push((format!("channel.{name}.auth_token"), token.clone()));
+        if let Some(rv) = &channel.auth_token {
+            secrets.push((format!("channel.{name}.auth_token"), rv.value().to_string()));
         }
-        if let Some(token) = &channel.file_auth_token {
-            secrets.push((format!("channel.{name}.file_auth_token"), token.clone()));
-        }
-        if let Some(token) = &channel.bot_token {
-            secrets.push((format!("channel.{name}.bot_token"), token.clone()));
-        }
-        if let Some(token) = &channel.file_bot_token {
-            secrets.push((format!("channel.{name}.file_bot_token"), token.clone()));
+        if let Some(rv) = &channel.bot_token {
+            secrets.push((format!("channel.{name}.bot_token"), rv.value().to_string()));
         }
     }
     secrets
@@ -190,10 +182,10 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::secret_ref::ResolvedValue;
     use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
     use crate::llm::{MessageContent, MessageContentPart};
     use crate::test_env::EnvVarGuard;
-    use secrecy::SecretString;
     use serde_json::json;
 
     /// redact_secrets: Config 由来のシークレット値を [REDACTED:key] に置換する。
@@ -432,9 +424,7 @@ mod tests {
                 ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(SecretString::new(
-                        "sk-test-key-123".to_string().into_boxed_str(),
-                    )),
+                    api_key: Some(ResolvedValue::Literal("sk-test-key-123".to_string())),
                     default_model: "gpt-4o".to_string(),
                     models: vec!["gpt-4o".to_string()],
                 },
@@ -477,10 +467,10 @@ mod tests {
                 ChannelName::new("discord"),
                 ChannelConfig {
                     enabled: Some(true),
-                    auth_token: Some("auth-token-value".to_string()),
-                    file_auth_token: Some("file-auth-token-value".to_string()),
-                    bot_token: Some("bot-token-value".to_string()),
-                    file_bot_token: Some("file-bot-token-value".to_string()),
+                    auth_token: Some(ResolvedValue::Literal("auth-token-value".to_string())),
+                    file_auth_token: None,
+                    bot_token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
+                    file_bot_token: None,
                     ..Default::default()
                 },
             )]),
@@ -492,9 +482,7 @@ mod tests {
         // Assert
         let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"channel.discord.auth_token"));
-        assert!(keys.contains(&"channel.discord.file_auth_token"));
         assert!(keys.contains(&"channel.discord.bot_token"));
-        assert!(keys.contains(&"channel.discord.file_bot_token"));
-        assert_eq!(secrets.len(), 4);
+        assert_eq!(secrets.len(), 2);
     }
 }

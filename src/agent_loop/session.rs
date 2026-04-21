@@ -381,11 +381,11 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use secrecy::SecretString;
 
     use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::SurfaceContext;
     use crate::assets::AssetStore;
+    use crate::config::secret_ref::ResolvedValue;
     use crate::config::{Config, ProviderConfig};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
@@ -428,7 +428,7 @@ mod tests {
                 ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(SecretString::new("sk-test".to_string().into_boxed_str())),
+                    api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
                     default_model: "gpt-4o-mini".to_string(),
                     models: vec!["gpt-4o-mini".to_string()],
                 },

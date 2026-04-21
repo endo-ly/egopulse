@@ -99,7 +99,7 @@ async fn handle_provider_command(
             channel.provider = None;
             channel.model = None;
         }
-        config.save_yaml(path)?;
+        config.save_config_with_secrets(path)?;
         let updated = Config::load_allow_missing_api_key(Some(path))?;
         let resolved = resolved_for_scope(&updated, &scope)?;
         return Ok(format!(
@@ -124,7 +124,7 @@ async fn handle_provider_command(
         channel.provider = Some(value.to_string());
         channel.model = None;
     }
-    config.save_yaml(path)?;
+    config.save_config_with_secrets(path)?;
     let updated = Config::load_allow_missing_api_key(Some(path))?;
     let resolved = resolved_for_scope(&updated, &scope)?;
     Ok(format!(
@@ -154,7 +154,7 @@ async fn handle_model_command(
         if scope == GLOBAL_SCOPE {
             let mut config = Config::load_allow_missing_api_key(Some(config_path(state)?))?;
             config.default_model = None;
-            config.save_yaml(config_path(state)?)?;
+            config.save_config_with_secrets(config_path(state)?)?;
             return Ok(format!(
                 "scope={scope} model reset -> {}",
                 config.global_provider().default_model
@@ -165,7 +165,7 @@ async fn handle_model_command(
         if let Some(channel) = config.channels.get_mut(scope.as_str()) {
             channel.model = None;
         }
-        config.save_yaml(path)?;
+        config.save_config_with_secrets(path)?;
         let updated = Config::load_allow_missing_api_key(Some(path))?;
         let effective = resolved_for_scope(&updated, &scope)?;
         return Ok(format!("scope={scope} model reset -> {}", effective.model));
@@ -187,7 +187,7 @@ async fn handle_model_command(
             .or_default();
         channel.model = Some(value.to_string());
     }
-    config.save_yaml(path)?;
+    config.save_config_with_secrets(path)?;
     let updated = Config::load_allow_missing_api_key(Some(path))?;
     let effective = resolved_for_scope(&updated, &scope)?;
     Ok(format!(

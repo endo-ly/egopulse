@@ -196,7 +196,8 @@ mod tests {
                     enabled: Some(true),
                     host: Some("127.0.0.1".to_string()),
                     port: Some(10961),
-                    auth_token: auth_token.map(str::to_string),
+                    auth_token: auth_token
+                        .map(|t| crate::config::secret_ref::ResolvedValue::Literal(t.to_string())),
                     allowed_origins,
                     ..Default::default()
                 },

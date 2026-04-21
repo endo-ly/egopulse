@@ -610,7 +610,7 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                file_bot_token: Some("sk-secret-token-123".to_string()),
+                file_bot_token: Some(serde_yml::Value::String("sk-secret-token-123".to_string())),
                 ..Default::default()
             },
         );
@@ -653,7 +653,9 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                auth_token: Some("xyz".to_string()),
+                auth_token: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                    "xyz".to_string(),
+                )),
                 ..Default::default()
             },
         );
@@ -685,7 +687,9 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                auth_token: Some(String::new()),
+                auth_token: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                    String::new(),
+                )),
                 ..Default::default()
             },
         );
@@ -711,7 +715,7 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                file_auth_token: Some("sk-multimodal-secret".to_string()),
+                file_auth_token: Some(serde_yml::Value::String("sk-multimodal-secret".to_string())),
                 ..Default::default()
             },
         );

@@ -7,17 +7,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use secrecy::SecretString;
 
-use super::channels::{
-    build_channel_configs, extract_existing_state_root, extract_existing_web_auth_token,
-    generate_auth_token,
-};
+use super::channels::{build_channel_configs, extract_existing_state_root, generate_auth_token};
 use super::provider::{
     find_provider_preset, normalize_provider_id, provider_default_base_url, provider_default_model,
     provider_label_for,
 };
 use super::{Field, SetupApp};
+use crate::config::secret_ref::{env_resolved_value, provider_api_key_env_name};
 use crate::config::{
     Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
     default_workspace_dir, is_valid_base_url,
@@ -112,7 +109,9 @@ pub(crate) fn save_config(
 
     let api_key = field_value(fields, "API_KEY").to_string();
 
-    let existing_token = extract_existing_web_auth_token(original_yaml);
+    let existing_token = Config::load_allow_missing_api_key(Some(config_path))
+        .ok()
+        .and_then(|config| config.web_auth_token().map(str::to_string));
     let has_existing_token = existing_token.is_some();
     let auth_token = existing_token.unwrap_or_else(generate_auth_token);
 
@@ -162,7 +161,10 @@ pub(crate) fn save_config(
             api_key: if api_key.is_empty() {
                 None
             } else {
-                Some(SecretString::new(api_key.clone().into_boxed_str()))
+                Some(env_resolved_value(
+                    provider_api_key_env_name(&provider_id),
+                    api_key.clone(),
+                ))
             },
             default_model: preset_default_model,
             models: preset_models,
@@ -198,7 +200,7 @@ pub(crate) fn save_config(
     };
 
     config
-        .save_yaml(config_path)
+        .save_config_with_secrets(config_path)
         .map_err(|e: EgoPulseError| format!("Failed to save config: {e}"))?;
 
     let mut completion_summary = vec![

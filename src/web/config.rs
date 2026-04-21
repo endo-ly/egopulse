@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
+use crate::config::secret_ref::{ResolvedValue, env_resolved_value, provider_api_key_env_name};
 use crate::config::{ChannelName, Config, ProviderConfig, ProviderId, default_config_path};
 use crate::error::ConfigError;
 
@@ -182,7 +182,7 @@ pub(super) async fn api_put_config(
     }
 
     config
-        .save_yaml(&path)
+        .save_config_with_secrets(&path)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     let display = Config::load_allow_missing_api_key(Some(&path))
@@ -237,7 +237,8 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                     existing.models.push(final_default);
                 }
             }
-            apply_api_key_update(&mut existing.api_key, update.api_key);
+            let env_name = provider_api_key_env_name(&id);
+            apply_api_key_update(&mut existing.api_key, update.api_key, &env_name);
         } else {
             let label = update
                 .label
@@ -274,7 +275,8 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
             }
 
             let mut api_key = None;
-            apply_api_key_update(&mut api_key, update.api_key);
+            let env_name = provider_api_key_env_name(&id);
+            apply_api_key_update(&mut api_key, update.api_key, &env_name);
 
             config.providers.insert(
                 ProviderId::new(&id),
@@ -290,17 +292,23 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
     }
 }
 
-fn apply_api_key_update(current: &mut Option<SecretString>, raw_update: Option<String>) {
+fn apply_api_key_update(
+    current: &mut Option<ResolvedValue>,
+    raw_update: Option<String>,
+    env_name: &str,
+) {
     let Some(value) = raw_update else { return };
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        // empty string → keep existing
         return;
     }
     if trimmed == "*CLEAR*" {
         *current = None;
     } else {
-        *current = Some(SecretString::new(trimmed.to_string().into_boxed_str()));
+        *current = Some(env_resolved_value(
+            env_name.to_string(),
+            trimmed.to_string(),
+        ));
     }
 }
 
@@ -436,5 +444,24 @@ fn infer_provider_label(provider: &str) -> String {
         "local" => "Local OpenAI-compatible".to_string(),
         "custom" => "Custom OpenAI-compatible".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_api_key_update;
+    use crate::config::secret_ref::ResolvedValue;
+
+    #[test]
+    fn apply_api_key_update_stores_env_ref() {
+        let mut current = None;
+
+        apply_api_key_update(&mut current, Some("sk-test".to_string()), "OPENAI_API_KEY");
+
+        assert!(matches!(
+            current,
+            Some(ResolvedValue::EnvRef { ref id, ref value })
+                if id == "OPENAI_API_KEY" && value == "sk-test"
+        ));
     }
 }

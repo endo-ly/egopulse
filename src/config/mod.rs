@@ -8,9 +8,12 @@ use crate::error::ConfigError;
 pub mod loader;
 pub mod persist;
 pub mod resolve;
+pub(crate) mod secret_ref;
 
 pub use loader::{base_url_allows_empty_api_key, is_valid_base_url};
 pub use resolve::{default_config_path, default_state_root, default_workspace_dir};
+
+use self::secret_ref::ResolvedValue;
 
 /// 小文字正規化済みのプロバイダー識別子。
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -74,7 +77,6 @@ impl From<&str> for ChannelName {
     }
 }
 
-/// Per-channel configuration (web, discord, telegram).
 #[derive(Clone, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
@@ -85,13 +87,15 @@ pub struct ChannelConfig {
     /// LLM model override for this channel.
     pub model: Option<String>,
     /// Web: browser/client authentication token.
-    pub auth_token: Option<String>,
-    pub file_auth_token: Option<String>,
+    pub auth_token: Option<ResolvedValue>,
+    /// YAML 保存用に auth_token の SecretRef 構造を保持する。
+    pub file_auth_token: Option<serde_yml::Value>,
     /// Web: allowed Origin values for WebSocket connections.
     pub allowed_origins: Option<Vec<String>>,
     /// Discord / Telegram 共通: bot token
-    pub bot_token: Option<String>,
-    pub file_bot_token: Option<String>,
+    pub bot_token: Option<ResolvedValue>,
+    /// YAML 保存用に bot_token の SecretRef 構造を保持する。
+    pub file_bot_token: Option<serde_yml::Value>,
     /// Telegram: bot username (group メンション検知用)
     pub bot_username: Option<String>,
     /// Discord: 許可チャンネル ID。空 = ギルドメッセージ全拒否（DM は常に許可）。
@@ -141,7 +145,7 @@ impl std::fmt::Debug for ChannelConfig {
 pub struct ProviderConfig {
     pub label: String,
     pub base_url: String,
-    pub api_key: Option<SecretString>,
+    pub api_key: Option<ResolvedValue>,
     pub default_model: String,
     pub models: Vec<String>,
 }

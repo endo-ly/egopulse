@@ -227,8 +227,9 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         } else {
             tracing::warn!(
                 "Discord channel is enabled but no bot_token is configured. \
-                 Set channels.discord.bot_token in egopulse.config.yaml \
-                 or set EGOPULSE_DISCORD_BOT_TOKEN environment variable."
+                 Set channels.discord.bot_token in egopulse.config.yaml, \
+                  set DISCORD_BOT_TOKEN environment variable, \
+                  or add DISCORD_BOT_TOKEN to ~/.egopulse/.env."
             );
         }
     }
@@ -254,8 +255,9 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         } else {
             tracing::warn!(
                 "Telegram channel is enabled but no bot_token is configured. \
-                 Set channels.telegram.bot_token in egopulse.config.yaml \
-                 or set EGOPULSE_TELEGRAM_BOT_TOKEN environment variable."
+                 Set channels.telegram.bot_token in egopulse.config.yaml, \
+                  set TELEGRAM_BOT_TOKEN environment variable, \
+                  or add TELEGRAM_BOT_TOKEN to ~/.egopulse/.env."
             );
         }
     }
@@ -398,8 +400,8 @@ mod tests {
                 crate::config::ProviderConfig {
                     label: "OpenAI".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(secrecy::SecretString::new(
-                        "sk-test".to_string().into_boxed_str(),
+                    api_key: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                        "sk-test".to_string(),
                     )),
                     default_model: "gpt-4o-mini".to_string(),
                     models: vec!["gpt-4o-mini".to_string()],
