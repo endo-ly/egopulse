@@ -400,6 +400,14 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for FakeProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+
         async fn send_message(
             &self,
             _system: &str,
@@ -414,6 +422,7 @@ mod tests {
             Ok(MessagesResponse {
                 content: format!("{} [{prompt}]", self.response),
                 tool_calls: Vec::new(),
+                usage: None,
             })
         }
     }

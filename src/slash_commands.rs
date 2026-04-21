@@ -391,6 +391,14 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for NoOpProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+
         async fn send_message(
             &self,
             _system: &str,
@@ -400,6 +408,7 @@ mod tests {
             Ok(MessagesResponse {
                 content: "summary".to_string(),
                 tool_calls: Vec::new(),
+                usage: None,
             })
         }
     }

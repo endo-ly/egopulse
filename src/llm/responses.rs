@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
+    let usage = body.usage;
     let choice = body
         .choices
         .into_iter()
@@ -37,12 +38,21 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
     Ok(MessagesResponse {
         content,
         tool_calls,
+        usage: usage.and_then(|u| {
+            u.prompt_tokens
+                .zip(u.completion_tokens)
+                .map(|(pt, ct)| LlmUsage {
+                    input_tokens: pt,
+                    output_tokens: ct,
+                })
+        }),
     })
 }
 
 pub(crate) fn parse_responses_response(
     body: ResponsesApiResponse,
 ) -> Result<MessagesResponse, LlmError> {
+    let usage = body.usage;
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -89,6 +99,14 @@ pub(crate) fn parse_responses_response(
     Ok(MessagesResponse {
         content,
         tool_calls,
+        usage: usage.and_then(|u| {
+            u.input_tokens
+                .zip(u.output_tokens)
+                .map(|(it, ot)| LlmUsage {
+                    input_tokens: it,
+                    output_tokens: ot,
+                })
+        }),
     })
 }
 
@@ -365,11 +383,31 @@ pub(crate) fn find_raw_tool_use_end(text: &str) -> Option<usize> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiResponse {
     pub(crate) choices: Vec<Choice>,
+    #[serde(default)]
+    pub(crate) usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiUsage {
+    #[serde(default)]
+    pub(crate) prompt_tokens: Option<i64>,
+    #[serde(default)]
+    pub(crate) completion_tokens: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiResponse {
     pub(crate) output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    pub(crate) usage: Option<ResponsesApiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesApiUsage {
+    #[serde(default)]
+    pub(crate) input_tokens: Option<i64>,
+    #[serde(default)]
+    pub(crate) output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

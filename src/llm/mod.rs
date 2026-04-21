@@ -130,16 +130,27 @@ impl Message {
     }
 }
 
+/// LLM API レスポンスに含まれるトークン使用量。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
 /// Parsed response from the LLM containing text and/or tool calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessagesResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<LlmUsage>,
 }
 
 /// Trait for LLM providers supporting non-streaming and streaming message sending.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    fn provider_name(&self) -> &str;
+    fn model_name(&self) -> &str;
+
     async fn send_message(
         &self,
         system: &str,
@@ -494,5 +505,138 @@ mod tests {
         let blocks = extract_raw_tool_use_blocks(text).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].name, "bash");
+    }
+
+    #[test]
+    fn parse_openai_response_extracts_usage() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "tool_calls": null
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20
+            }
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+        assert_eq!(
+            response.usage,
+            Some(super::LlmUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_openai_response_handles_missing_usage() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "tool_calls": null
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn parse_responses_api_extracts_usage() {
+        let body: super::ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "usage": {
+                "input_tokens": 15,
+                "output_tokens": 25
+            }
+        }))
+        .unwrap();
+
+        let response = super::parse_responses_response(body).unwrap();
+        assert_eq!(
+            response.usage,
+            Some(super::LlmUsage {
+                input_tokens: 15,
+                output_tokens: 25,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_responses_api_handles_missing_usage() {
+        let body: super::ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }]
+        }))
+        .unwrap();
+
+        let response = super::parse_responses_response(body).unwrap();
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn parse_openai_response_handles_partial_usage() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "tool_calls": null
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10
+            }
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn parse_responses_api_handles_partial_usage() {
+        let body: super::ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "usage": {
+                "input_tokens": 15
+            }
+        }))
+        .unwrap();
+
+        let response = super::parse_responses_response(body).unwrap();
+        assert_eq!(response.usage, None);
+    }
+
+    #[tokio::test]
+    async fn llm_provider_metadata_returns_config() {
+        let server = wiremock::MockServer::start().await;
+        let provider = create_provider(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        assert_eq!(provider.provider_name(), "test");
+        assert_eq!(provider.model_name(), "gpt-4o-mini");
     }
 }

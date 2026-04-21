@@ -151,6 +151,30 @@ where
                 warn!(error = %e, iteration, "LLM send_message failed");
             })?;
 
+        if let Some(usage) = &response.usage {
+            let db = Arc::clone(&state.db);
+            let channel = context.channel.clone();
+            let provider = channel_llm.provider_name().to_string();
+            let model = channel_llm.model_name().to_string();
+            let input_tokens = usage.input_tokens;
+            let output_tokens = usage.output_tokens;
+            tokio::spawn(async move {
+                let _ = call_blocking(db, move |db| {
+                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                        chat_id,
+                        caller_channel: &channel,
+                        provider: &provider,
+                        model: &model,
+                        input_tokens,
+                        output_tokens,
+                        request_kind: "agent_loop",
+                    })
+                })
+                .await
+                .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
+            });
+        }
+
         if response.tool_calls.is_empty() {
             if let Some(final_content) = run_turn_action(
                 evaluate_end_turn(
@@ -759,6 +783,14 @@ impl crate::llm::LlmProvider for FakeProvider {
         let mut locked = self.responses.lock().expect("responses");
         Ok(locked.remove(0))
     }
+
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+
+    fn model_name(&self) -> &str {
+        "test-model"
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +803,14 @@ impl crate::llm::LlmProvider for FailingProvider {
         _tools: Option<Vec<crate::llm::ToolDefinition>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         Err(crate::error::LlmError::InvalidResponse("boom".to_string()))
+    }
+
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+
+    fn model_name(&self) -> &str {
+        "test-model"
     }
 }
 
@@ -793,6 +833,14 @@ impl crate::llm::LlmProvider for RecordingProvider {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         self.responses.lock().expect("responses").remove(0)
+    }
+
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+
+    fn model_name(&self) -> &str {
+        "test-model"
     }
 }
 
@@ -966,10 +1014,12 @@ mod tests {
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
                     }],
+                    usage: None,
                 }),
                 Ok(MessagesResponse {
                     content: "All set".to_string(),
                     tool_calls: Vec::new(),
+                    usage: None,
                 }),
             ],
             vec![0, 0],
@@ -1058,10 +1108,12 @@ mod tests {
                             name: "read".to_string(),
                             arguments: serde_json::json!({"path": relative_path}),
                         }],
+                        usage: None,
                     },
                     MessagesResponse {
                         content: "Done reading. Final answer.".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                 ]),
             }),
@@ -1096,6 +1148,7 @@ mod tests {
                         name: String::new(),
                         arguments: serde_json::json!({}),
                     }],
+                    usage: None,
                 }]),
             }),
         );
@@ -1334,5 +1387,172 @@ mod tests {
         Box::new(FakeProvider {
             responses: std::sync::Mutex::new(vec![]),
         })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_logs_llm_usage_on_agent_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello world".to_string(),
+                tool_calls: vec![],
+                usage: Some(crate::llm::LlmUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                }),
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "hello world");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:usage-log-single",
+                Some("usage-log-single"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        // Wait for the spawned logging task to complete
+        for _ in 0..20 {
+            let summary = call_blocking(Arc::clone(&state.db), move |db| {
+                db.get_llm_usage_summary(Some(chat_id), None, None)
+            })
+            .await
+            .expect("summary");
+            if summary.requests > 0 {
+                assert_eq!(summary.requests, 1);
+                assert_eq!(summary.input_tokens, 10);
+                assert_eq!(summary.output_tokens, 20);
+                assert_eq!(summary.total_tokens, 30);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage log was not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_logs_each_iteration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/data.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "checking".to_string(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-iter-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 15,
+                        output_tokens: 25,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "done".to_string(),
+                    tool_calls: vec![],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 30,
+                        output_tokens: 40,
+                    }),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let file_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&file_path, "data").expect("file");
+
+        let reply = process_turn(&state, &cli_context("usage-log-multi"), "read the file")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "done");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:usage-log-multi",
+                Some("usage-log-multi"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        for _ in 0..20 {
+            let summary = call_blocking(Arc::clone(&state.db), move |db| {
+                db.get_llm_usage_summary(Some(chat_id), None, None)
+            })
+            .await
+            .expect("summary");
+            if summary.requests >= 2 {
+                assert_eq!(
+                    summary.requests, 2,
+                    "should have 2 usage records (one per iteration)"
+                );
+                assert_eq!(summary.input_tokens, 45);
+                assert_eq!(summary.output_tokens, 65);
+                assert_eq!(summary.total_tokens, 110);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage logs were not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn usage_not_logged_when_response_has_no_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "no usage info".to_string(),
+                tool_calls: vec![],
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let reply = process_turn(&state, &cli_context("no-usage"), "hi")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "no usage info");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let summary = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_llm_usage_summary(None, None, None)
+        })
+        .await
+        .expect("summary");
+
+        assert_eq!(
+            summary.requests, 0,
+            "no usage records should exist when response has no usage"
+        );
     }
 }

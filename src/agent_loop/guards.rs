@@ -105,10 +105,12 @@ mod tests {
                     MessagesResponse {
                         content: String::new(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                     MessagesResponse {
                         content: String::new(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                 ]),
             }),
@@ -131,10 +133,12 @@ mod tests {
                     MessagesResponse {
                         content: "Sure, I'll help you with that.".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                     MessagesResponse {
                         content: "Here is the answer you need.".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                 ]),
             }),
@@ -181,10 +185,12 @@ mod tests {
                             name: String::new(),
                             arguments: serde_json::json!({}),
                         }],
+                        usage: None,
                     },
                     MessagesResponse {
                         content: "実行結果です。".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     },
                 ]),
             }),

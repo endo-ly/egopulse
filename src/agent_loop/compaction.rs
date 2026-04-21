@@ -83,7 +83,32 @@ async fn summarize_and_compact(
     .await;
 
     let summary = match summary_result {
-        Ok(Ok(response)) => strip_thinking(&response.content),
+        Ok(Ok(response)) => {
+            if let Some(usage) = &response.usage {
+                let db = std::sync::Arc::clone(&state.db);
+                let channel = context.channel.clone();
+                let provider = llm.provider_name().to_string();
+                let model = llm.model_name().to_string();
+                let input_tokens = usage.input_tokens;
+                let output_tokens = usage.output_tokens;
+                tokio::spawn(async move {
+                    let _ = crate::storage::call_blocking(db, move |db| {
+                        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                            chat_id,
+                            caller_channel: &channel,
+                            provider: &provider,
+                            model: &model,
+                            input_tokens,
+                            output_tokens,
+                            request_kind: "summarize",
+                        })
+                    })
+                    .await
+                    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
+                });
+            }
+            strip_thinking(&response.content)
+        }
         Ok(Err(error)) => {
             warn!("{label} summarization failed: {error}; falling back to recent messages");
             return Ok(recent_messages.to_vec());
@@ -278,10 +303,12 @@ mod tests {
                 Ok(MessagesResponse {
                     content: "summary text".to_string(),
                     tool_calls: Vec::new(),
+                    usage: None,
                 }),
                 Ok(MessagesResponse {
                     content: "final answer".to_string(),
                     tool_calls: Vec::new(),
+                    usage: None,
                 }),
             ],
             vec![0, 0],
@@ -386,6 +413,7 @@ mod tests {
                 Ok(MessagesResponse {
                     content: "final answer".to_string(),
                     tool_calls: Vec::new(),
+                    usage: None,
                 }),
             ],
             vec![0, 0],
@@ -475,6 +503,7 @@ mod tests {
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
                 tool_calls: Vec::new(),
+                usage: None,
             })],
             vec![0],
         );
@@ -509,6 +538,7 @@ mod tests {
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
                 tool_calls: Vec::new(),
+                usage: None,
             })],
             vec![0],
         );
@@ -545,6 +575,7 @@ mod tests {
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
                 tool_calls: Vec::new(),
+                usage: None,
             })],
             vec![0],
         );
@@ -576,5 +607,80 @@ mod tests {
         assert_eq!(archives.len(), 1);
         let body = std::fs::read_to_string(archives[0].path()).expect("archive body");
         assert!(body.contains("msg-1"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_logs_llm_usage_as_summarize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "summary text".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 100,
+                        output_tokens: 200,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider));
+        let context = cli_context("compaction-usage");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-usage",
+                Some("compaction-usage"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "final answer");
+
+        for _ in 0..20 {
+            let summary = call_blocking(Arc::clone(&state.db), move |db| {
+                db.get_llm_usage_summary(Some(chat_id), None, None)
+            })
+            .await
+            .expect("summary");
+            if summary.requests > 0 {
+                assert_eq!(
+                    summary.requests, 1,
+                    "compaction LLM call should be logged once"
+                );
+                assert_eq!(summary.input_tokens, 100);
+                assert_eq!(summary.output_tokens, 200);
+                assert_eq!(summary.total_tokens, 300);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("compaction usage log was not written within the polling timeout");
     }
 }

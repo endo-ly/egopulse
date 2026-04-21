@@ -67,6 +67,37 @@ pub struct ToolCall {
     pub timestamp: String,
 }
 
+/// LLM使用量ログの記録用データ。
+pub struct LlmUsageLogEntry<'a> {
+    pub chat_id: i64,
+    pub caller_channel: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub request_kind: &'a str,
+}
+
+/// LLM使用量の集計サマリ。
+#[derive(Debug, PartialEq)]
+pub struct LlmUsageSummary {
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub last_request_at: Option<String>,
+}
+
+/// モデル別のLLM使用量サマリ。
+#[derive(Debug, PartialEq)]
+pub struct LlmModelUsageSummary {
+    pub model: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
 /// Run a blocking database operation on a tokio blocking thread.
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
@@ -82,7 +113,7 @@ where
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 impl Database {
     /// Open (or create) the database at `db_path` and initialize schema.
@@ -239,12 +270,30 @@ fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 1;
     }
 
-    // --- v2 以降のマイグレーションはここに追加 ---
-    // if version < 2 {
-    //     conn.execute_batch("...")?;
-    //     set_schema_version(conn, 2, "...")?;
-    //     version = 2;
-    // }
+    if version < 2 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                caller_channel TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
+                ON llm_usage_logs(chat_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+                ON llm_usage_logs(created_at);",
+        )?;
+        set_schema_version(conn, 2, "add llm_usage_logs table for LLM usage tracking")?;
+        version = 2;
+    }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
@@ -689,6 +738,151 @@ impl Database {
 
         Ok(calls)
     }
+
+    /// LLM使用量ログを記録し、挿入された行IDを返す。
+    pub fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
+        let conn = self.lock_conn()?;
+        let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO llm_usage_logs
+                (chat_id, caller_channel, provider, model, input_tokens, output_tokens, total_tokens, request_kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                entry.chat_id,
+                entry.caller_channel,
+                entry.provider,
+                entry.model,
+                entry.input_tokens,
+                entry.output_tokens,
+                total_tokens,
+                entry.request_kind,
+                created_at,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// LLM使用量の集計サマリを取得する。
+    ///
+    /// `chat_id`, `since`, `request_kind` でフィルタリング可能。
+    pub fn get_llm_usage_summary(
+        &self,
+        chat_id: Option<i64>,
+        since: Option<&str>,
+        request_kind: Option<&str>,
+    ) -> Result<LlmUsageSummary, StorageError> {
+        let conn = self.lock_conn()?;
+
+        let mut sql = String::from(
+            "SELECT COUNT(*) as requests,
+                    COALESCE(SUM(input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    MAX(created_at) as last_request_at
+             FROM llm_usage_logs WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(cid) = chat_id {
+            sql.push_str(" AND chat_id = ?");
+            param_values.push(Box::new(cid));
+        }
+        if let Some(s) = since {
+            let normalized = chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+                .unwrap_or_else(|_| s.to_string());
+            sql.push_str(" AND created_at >= ?");
+            param_values.push(Box::new(normalized));
+        }
+        if let Some(kind) = request_kind {
+            sql.push_str(" AND request_kind = ?");
+            param_values.push(Box::new(kind.to_string()));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let result = conn.query_row(&sql, params_refs.as_slice(), |row| {
+            Ok(LlmUsageSummary {
+                requests: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                total_tokens: row.get(3)?,
+                last_request_at: row.get(4)?,
+            })
+        });
+
+        match result {
+            Ok(summary) => Ok(summary),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(LlmUsageSummary {
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                last_request_at: None,
+            }),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// モデル別のLLM使用量サマリを取得する。
+    ///
+    /// `total_tokens` の降順で返す。`chat_id`, `since`, `request_kind` でフィルタリング可能。
+    pub fn get_llm_usage_by_model(
+        &self,
+        chat_id: Option<i64>,
+        since: Option<&str>,
+        request_kind: Option<&str>,
+    ) -> Result<Vec<LlmModelUsageSummary>, StorageError> {
+        let conn = self.lock_conn()?;
+
+        let mut sql = String::from(
+            "SELECT model,
+                    COUNT(*) as requests,
+                    COALESCE(SUM(input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens
+             FROM llm_usage_logs WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(cid) = chat_id {
+            sql.push_str(" AND chat_id = ?");
+            param_values.push(Box::new(cid));
+        }
+        if let Some(s) = since {
+            let normalized = chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+                .unwrap_or_else(|_| s.to_string());
+            sql.push_str(" AND created_at >= ?");
+            param_values.push(Box::new(normalized));
+        }
+        if let Some(kind) = request_kind {
+            sql.push_str(" AND request_kind = ?");
+            param_values.push(Box::new(kind.to_string()));
+        }
+
+        sql.push_str(" GROUP BY model ORDER BY total_tokens DESC");
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(LlmModelUsageSummary {
+                    model: row.get(0)?,
+                    requests: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
 }
 
 // セッション一覧の表示名: chat_title → external_chat_id のチャネルプレフィクス除去 → そのまま
@@ -716,7 +910,8 @@ fn logical_session_thread(
 mod tests {
     use crate::error::StorageError;
 
-    use super::{Database, StoredMessage, ToolCall};
+    use super::{Database, LlmUsageLogEntry, StoredMessage, ToolCall};
+    use rusqlite::Connection;
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -966,7 +1161,7 @@ mod tests {
     fn schema_version_is_tracked_on_init() {
         let (db, _dir) = test_db();
         let version = db.schema_version().expect("schema version");
-        assert_eq!(version, 1, "新規DBはスキーマバージョン1で初期化される");
+        assert_eq!(version, 2, "新規DBはスキーマバージョン2で初期化される");
     }
 
     #[test]
@@ -984,9 +1179,11 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 1, "v1 マイグレーションが1件記録される");
+        assert_eq!(rows.len(), 2, "v1・v2 マイグレーションが2件記録される");
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
+        assert_eq!(rows[1].0, 2);
+        assert!(rows[1].1.contains("llm_usage_logs"));
     }
 
     #[test]
@@ -1006,6 +1203,388 @@ mod tests {
             first_version, second_version,
             "再起動してもバージョンは変わらない"
         );
-        assert_eq!(second_version, 1);
+        assert_eq!(second_version, 2);
+    }
+
+    #[test]
+    fn log_llm_usage_inserts_record() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log usage");
+
+        let conn = db.conn.lock().expect("lock");
+        let (total_tokens, created_at): (i64, String) = conn
+            .query_row(
+                "SELECT total_tokens, created_at FROM llm_usage_logs WHERE chat_id = 100",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+
+        assert_eq!(total_tokens, 150);
+        assert!(created_at.contains('T'), "RFC3339形式であること");
+    }
+
+    #[test]
+    fn log_llm_usage_returns_row_id() {
+        let (db, _dir) = test_db();
+
+        let row_id = db
+            .log_llm_usage(&LlmUsageLogEntry {
+                chat_id: 100,
+                caller_channel: "tui",
+                provider: "openai",
+                model: "gpt-4",
+                input_tokens: 100,
+                output_tokens: 50,
+                request_kind: "agent_loop",
+            })
+            .expect("log usage");
+
+        assert!(row_id > 0);
+    }
+
+    #[test]
+    fn get_llm_usage_summary_returns_zeros_when_empty() {
+        let (db, _dir) = test_db();
+
+        let summary = db.get_llm_usage_summary(None, None, None).expect("summary");
+
+        assert_eq!(summary.requests, 0);
+        assert_eq!(summary.input_tokens, 0);
+        assert_eq!(summary.output_tokens, 0);
+        assert_eq!(summary.total_tokens, 0);
+        assert!(summary.last_request_at.is_none());
+    }
+
+    #[test]
+    fn get_llm_usage_summary_aggregates_all() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 200,
+            output_tokens: 100,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 200,
+            caller_channel: "web",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 300,
+            output_tokens: 150,
+            request_kind: "agent_loop",
+        })
+        .expect("log 3");
+
+        let summary = db.get_llm_usage_summary(None, None, None).expect("summary");
+
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.input_tokens, 600);
+        assert_eq!(summary.output_tokens, 300);
+        assert_eq!(summary.total_tokens, 900);
+        assert!(summary.last_request_at.is_some());
+    }
+
+    #[test]
+    fn get_llm_usage_summary_filters_by_chat_id() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 200,
+            caller_channel: "web",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 200,
+            output_tokens: 100,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+
+        let summary = db
+            .get_llm_usage_summary(Some(100), None, None)
+            .expect("summary");
+
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.input_tokens, 100);
+        assert_eq!(summary.output_tokens, 50);
+    }
+
+    #[test]
+    fn get_llm_usage_summary_filters_by_since() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let cutoff = chrono::Utc::now().to_rfc3339();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 200,
+            output_tokens: 100,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+
+        let summary = db
+            .get_llm_usage_summary(None, Some(&cutoff), None)
+            .expect("summary");
+
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.input_tokens, 200);
+    }
+
+    #[test]
+    fn get_llm_usage_summary_filters_by_chat_id_and_since() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let cutoff = chrono::Utc::now().to_rfc3339();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 200,
+            caller_channel: "web",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 200,
+            output_tokens: 100,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 300,
+            output_tokens: 150,
+            request_kind: "agent_loop",
+        })
+        .expect("log 3");
+
+        let summary = db
+            .get_llm_usage_summary(Some(100), Some(&cutoff), None)
+            .expect("summary");
+
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.input_tokens, 300);
+    }
+
+    #[test]
+    fn get_llm_usage_by_model_groups_correctly() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 200,
+            output_tokens: 100,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "claude-3",
+            input_tokens: 300,
+            output_tokens: 150,
+            request_kind: "agent_loop",
+        })
+        .expect("log 3");
+
+        let models = db.get_llm_usage_by_model(None, None, None).expect("models");
+
+        assert_eq!(models.len(), 2);
+        let gpt4 = models.iter().find(|m| m.model == "gpt-4").expect("gpt-4");
+        assert_eq!(gpt4.requests, 2);
+        assert_eq!(gpt4.input_tokens, 300);
+        assert_eq!(gpt4.output_tokens, 150);
+
+        let claude = models
+            .iter()
+            .find(|m| m.model == "claude-3")
+            .expect("claude-3");
+        assert_eq!(claude.requests, 1);
+        assert_eq!(claude.input_tokens, 300);
+    }
+
+    #[test]
+    fn get_llm_usage_by_model_orders_by_total_tokens_desc() {
+        let (db, _dir) = test_db();
+
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            request_kind: "agent_loop",
+        })
+        .expect("log 1");
+        db.log_llm_usage(&LlmUsageLogEntry {
+            chat_id: 100,
+            caller_channel: "tui",
+            provider: "openai",
+            model: "claude-3",
+            input_tokens: 300,
+            output_tokens: 150,
+            request_kind: "agent_loop",
+        })
+        .expect("log 2");
+
+        let models = db.get_llm_usage_by_model(None, None, None).expect("models");
+
+        assert_eq!(models.len(), 2);
+        assert!(
+            models[0].total_tokens >= models[1].total_tokens,
+            "total_tokens降順であること"
+        );
+        assert_eq!(models[0].model, "claude-3");
+    }
+
+    #[test]
+    fn migration_v2_creates_llm_usage_logs_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+
+        assert!(table_exists, "llm_usage_logsテーブルが存在すること");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_llm_usage_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check indexes");
+
+        assert_eq!(index_count, 2, "2つのインデックスが作成されること");
+    }
+
+    #[test]
+    fn migration_v2_applied_on_existing_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // 生のConnectionでv1スキーマを手動構築（db_meta + schema_migrations + v1テーブル）
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '1');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (1, '2025-01-01T00:00:00Z', 'test v1');
+                 CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS messages (id TEXT NOT NULL, chat_id INTEGER NOT NULL, PRIMARY KEY (id, chat_id));
+                 CREATE TABLE IF NOT EXISTS sessions (chat_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS tool_calls (id TEXT PRIMARY KEY);",
+            )
+            .expect("create v1 schema");
+        }
+
+        let db = Database::new(&db_path).expect("reopen");
+        let version = db.schema_version().expect("version");
+        assert_eq!(version, 2);
+
+        let conn = db.conn.lock().expect("lock");
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn schema_version_increments_to_2() {
+        let (db, _dir) = test_db();
+        let version = db.schema_version().expect("version");
+        assert_eq!(
+            version, 2,
+            "スキーマバージョンが2にインクリメントされていること"
+        );
     }
 }
