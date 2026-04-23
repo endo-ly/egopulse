@@ -1,0 +1,54 @@
+name: Test EgoPulse
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "egopulse/**"
+      - ".github/workflows/ci-egopulse.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "egopulse/**"
+      - ".github/workflows/ci-egopulse.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run format check
+        run: cargo fmt --check
+
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          sudo ln -sf $(which fdfind) /usr/local/bin/fd
+
+      - name: Run tests
+        run: cargo test

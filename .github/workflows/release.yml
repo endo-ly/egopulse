@@ -1,0 +1,168 @@
+name: Release EgoPulse
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "egopulse/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-egopulse.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-tag:
+    name: Create Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+      release_version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' egopulse/Cargo.toml | sed 's/version = "//;s/"//')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE=$(date +%Y%m%d)
+          RUN=${{ github.run_number }}
+          RELEASE_TAG="egopulse-v${VERSION}-${DATE}.${RUN}"
+
+          # Avoid duplicate tags
+          if git tag -l "${RELEASE_TAG}" | grep -q .; then
+            echo "Tag ${RELEASE_TAG} already exists, appending commit SHA suffix"
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            RELEASE_TAG="${RELEASE_TAG}-${SHORT_SHA}"
+          fi
+
+          git tag "${RELEASE_TAG}"
+          git push origin "${RELEASE_TAG}"
+
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Created tag: ${RELEASE_TAG}"
+
+  build-assets:
+    name: Build ${{ matrix.target.label }}
+    runs-on: ${{ matrix.target.os }}
+    needs: create-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            bin: egopulse
+            target_triple: x86_64-unknown-linux-gnu
+            asset_triple: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            bin: egopulse
+            target_triple: aarch64-unknown-linux-gnu
+            asset_triple: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - label: macos-x86_64
+            os: macos-15-intel
+            bin: egopulse
+            target_triple: x86_64-apple-darwin
+            asset_triple: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - label: macos-arm64
+            os: macos-14
+            bin: egopulse
+            target_triple: aarch64-apple-darwin
+            asset_triple: aarch64-apple-darwin
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: egopulse/web/package-lock.json
+
+      - name: Build embedded web assets
+        run: |
+          npm --prefix egopulse/web ci
+          npm --prefix egopulse/web run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p egopulse
+
+      - name: Package archive
+        shell: bash
+        run: |
+          RELEASE_VERSION="${{ needs.create-tag.outputs.release_version }}"
+          ASSET_NAME="egopulse-${RELEASE_VERSION}-${{ matrix.target.asset_triple }}.tar.gz"
+          tar -czf "$ASSET_NAME" -C target/release "${{ matrix.target.bin }}"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.label }}
+          path: ${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [create-tag, build-assets]
+    env:
+      RELEASE_TAG: ${{ needs.create-tag.outputs.release_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ./* > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.create-tag.outputs.release_version }}"
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            -t "EgoPulse v${VERSION}" \
+            --generate-notes \
+            --target "${{ github.sha }}" \
+            dist/*
