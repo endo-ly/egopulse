@@ -1,14 +1,9 @@
-name: Release EgoPulse
+name: Release
 
 on:
   push:
     branches:
       - main
-    paths:
-      - "egopulse/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/release-egopulse.yml"
   workflow_dispatch:
 
 permissions:
@@ -33,7 +28,7 @@ jobs:
       - name: Read version from Cargo.toml
         id: version
         run: |
-          VERSION=$(grep -m1 '^version' egopulse/Cargo.toml | sed 's/version = "//;s/"//')
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "//;s/"//')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Create release tag
@@ -44,7 +39,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           DATE=$(date +%Y%m%d)
           RUN=${{ github.run_number }}
-          RELEASE_TAG="egopulse-v${VERSION}-${DATE}.${RUN}"
+          RELEASE_TAG="v${VERSION}-${DATE}.${RUN}"
 
           # Avoid duplicate tags
           if git tag -l "${RELEASE_TAG}" | grep -q .; then
@@ -101,19 +96,19 @@ jobs:
         with:
           node-version: '20'
           cache: npm
-          cache-dependency-path: egopulse/web/package-lock.json
+          cache-dependency-path: web/package-lock.json
 
       - name: Build embedded web assets
         run: |
-          npm --prefix egopulse/web ci
-          npm --prefix egopulse/web run build
+          npm --prefix web ci
+          npm --prefix web run build
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release -p egopulse
+        run: cargo build --release
 
       - name: Package archive
         shell: bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="endo-ava/ego-graph"
+REPO="endo-ly/egopulse"
 BIN_NAME="egopulse"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 SKIP_RUN="${EGOPULSE_INSTALL_SKIP_RUN:-0}"
@@ -213,7 +213,7 @@ main() {
   if [ -z "$asset_url" ]; then
     err "No prebuilt binary found for ${os}/${arch} in the latest GitHub release."
     err "Use a separate install method instead:"
-    err "  Build from source: cd ego-graph && cargo build --release -p egopulse"
+    err "  Build from source: cd egopulse && cargo build --release"
     err "  Then install it: sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse"
     err "  Releases: https://github.com/${REPO}/releases"
     exit 1

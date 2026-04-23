@@ -7,7 +7,7 @@ TUI / Web UI / Discord / Telegram を単一バイナリで提供。Rust (Tokio) 
 
 ```bash
 # インストール（リリースバイナリ）
-curl -fsSL https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh | bash
+curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
 
 # 初期セットアップ（対話型TUIウィザード → ~/.egopulse/egopulse.config.yaml を生成）
 egopulse setup
@@ -38,11 +38,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test -p egopulse
 
 # WebUI ビルド（build.rs が web/src の mtime を監視し変更時自動ビルドするが、手動も可能）
-npm install --prefix egopulse/web
-npm run build --prefix egopulse/web
+npm install --prefix web
+npm run build --prefix web
 
 # 開発時・WebUIのみ確認
-cd egopulse/web && npm run dev
+cd web && npm run dev
 ```
 
 ## バイナリ配置
@@ -72,10 +72,10 @@ sudo systemctl start egopulse
 
 | トピック | ドキュメント |
 |---|---|
-| コマンド仕様 | [commands.md](../docs/30.egopulse/commands.md) |
-| 設定仕様 | [config.md](../docs/30.egopulse/config.md) |
-| セッションライフサイクル | [session-lifecycle.md](../docs/30.egopulse/session-lifecycle.md) |
-| MCP 統合 | [mcp.md](../docs/30.egopulse/mcp.md) |
-| Built-in Tools | [tools.md](../docs/30.egopulse/tools.md) |
-| DB Schema | [db.md](../docs/30.egopulse/db.md) |
-| デプロイ手順 | [docs/50.deploy/](../docs/50.deploy/) |
+| コマンド仕様 | [commands.md](./docs/commands.md) |
+| 設定仕様 | [config.md](./docs/config.md) |
+| セッションライフサイクル | [session-lifecycle.md](./docs/session-lifecycle.md) |
+| MCP 統合 | [mcp.md](./docs/mcp.md) |
+| Built-in Tools | [tools.md](./docs/tools.md) |
+| DB Schema | [db.md](./docs/db.md) |
+| デプロイ手順 | [deploy.md](./docs/deploy.md) |

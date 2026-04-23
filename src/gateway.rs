@@ -453,7 +453,7 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     println!("Updating EgoPulse from latest release...");
 
     let script_url =
-        "https://raw.githubusercontent.com/endo-ava/ego-graph/main/scripts/install-egopulse.sh";
+        "https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh";
     let cmd = format!(
         "(curl -fsSL '{url}' || wget -qO- '{url}') | bash -s -- --skip-run",
         url = script_url

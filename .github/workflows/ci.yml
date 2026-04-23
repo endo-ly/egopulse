@@ -1,21 +1,11 @@
-name: Test EgoPulse
+name: CI
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "egopulse/**"
-      - ".github/workflows/ci-egopulse.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "egopulse/**"
-      - ".github/workflows/ci-egopulse.yml"
 
 permissions:
   contents: read

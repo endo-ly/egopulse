@@ -42,7 +42,7 @@ curl -s http://127.0.0.1:8000/v1/chat/tools | jq '.tools[].name'
 fuser -k 8000/tcp 2>/dev/null || true
 
 # tmuxセッションでBE起動
-cd /root/workspace/ego-graph
+cd /root/workspace/egopulse
 tmux new-session -d -s "egograph-backend" "uv run python -m backend.main"
 ```
 
