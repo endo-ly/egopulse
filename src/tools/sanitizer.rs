@@ -176,6 +176,14 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
             secrets.push((format!("channel.{name}.bot_token"), rv.value().to_string()));
         }
     }
+    for (id, agent) in &config.agents {
+        if let Some(rv) = &agent.discord.bot_token {
+            secrets.push((
+                format!("agents.{id}.discord.bot_token"),
+                rv.value().to_string(),
+            ));
+        }
+    }
     secrets
 }
 
@@ -436,6 +444,8 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::new(),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
         };
 
         // Act
@@ -474,6 +484,8 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
         };
 
         // Act

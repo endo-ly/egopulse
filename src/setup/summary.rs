@@ -197,6 +197,14 @@ pub(crate) fn save_config(
         max_session_messages: 40,
         compact_keep_recent: 20,
         channels,
+        default_agent: crate::config::AgentId::new("default"),
+        agents: std::collections::HashMap::from([(
+            crate::config::AgentId::new("default"),
+            crate::config::AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        )]),
     };
 
     config

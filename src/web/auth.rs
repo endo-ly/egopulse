@@ -202,6 +202,8 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
         }
     }
 

@@ -77,6 +77,37 @@ impl From<&str> for ChannelName {
     }
 }
 
+/// Trimmed + lowercased agent identifier.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct AgentId(String);
+
+impl AgentId {
+    pub fn new(s: &str) -> Self {
+        Self(s.trim().to_ascii_lowercase())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for AgentId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for AgentId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
@@ -208,6 +239,48 @@ impl PartialEq for ResolvedLlmConfig {
 
 impl Eq for ResolvedLlmConfig {}
 
+#[derive(Clone, Default)]
+pub struct AgentDiscordConfig {
+    pub bot_token: Option<ResolvedValue>,
+    pub file_bot_token: Option<serde_yml::Value>,
+    pub allowed_channels: Option<Vec<u64>>,
+}
+
+impl std::fmt::Debug for AgentDiscordConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentDiscordConfig")
+            .field(
+                "bot_token",
+                &self
+                    .bot_token
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
+            .field("allowed_channels", &self.allowed_channels)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct AgentConfig {
+    pub label: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub discord: AgentDiscordConfig,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("label", &self.label)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("discord", &self.discord)
+            .finish()
+    }
+}
+
 /// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
@@ -222,6 +295,8 @@ pub struct Config {
     pub max_session_messages: usize,
     pub compact_keep_recent: usize,
     pub channels: HashMap<ChannelName, ChannelConfig>,
+    pub default_agent: AgentId,
+    pub agents: HashMap<AgentId, AgentConfig>,
 }
 
 impl std::fmt::Debug for Config {
@@ -237,6 +312,8 @@ impl std::fmt::Debug for Config {
             .field("max_session_messages", &self.max_session_messages)
             .field("compact_keep_recent", &self.compact_keep_recent)
             .field("channels", &self.channels)
+            .field("default_agent", &self.default_agent)
+            .field("agents", &self.agents)
             .finish()
     }
 }
@@ -696,5 +773,199 @@ channels:
     fn channel_name_trims_whitespace() {
         let name = super::ChannelName::new(" Web ");
         assert_eq!(name.as_str(), "web");
+    }
+
+    #[test]
+    #[serial]
+    fn loads_agents_with_default_agent() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: alice
+agents:
+  alice:
+    label: Alice"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(config.default_agent.as_str(), "alice");
+        let alice = config.agents.get("alice").expect("alice agent");
+        assert_eq!(alice.label, "Alice");
+    }
+
+    #[test]
+    #[serial]
+    fn default_agent_falls_back_to_default_when_missing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(config.default_agent.as_str(), "default");
+        assert!(config.agents.contains_key("default"));
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_default_agent_not_in_agents() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: missing
+agents:
+  alice:
+    label: Alice"#,
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
+        assert!(matches!(
+            error,
+            ConfigError::DefaultAgentNotFound { agent_id } if agent_id == "missing"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_agent_id_path_traversal() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+
+        for bad_id in ["../etc", "/etc", ""] {
+            let yaml = format!(
+                r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: alice
+agents:
+  "{bad_id}":
+    label: Bad
+  alice:
+    label: Alice"#
+            );
+            let file_path = write_config(&temp_dir, &yaml);
+            let error = Config::load(Some(&file_path)).expect_err("should reject bad agent id");
+            assert!(
+                matches!(error, ConfigError::InvalidAgentId { .. }),
+                "expected InvalidAgentId for '{bad_id}', got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn persists_agents_without_leaking_secret_values() {
+        use crate::config::persist::save_config_with_secrets;
+        use crate::config::secret_ref::{env_resolved_value, env_yaml_value};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let path = temp_dir.path().join("egopulse.config.yaml");
+
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            super::AgentId::new("alice"),
+            super::AgentConfig {
+                label: "Alice".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(env_resolved_value(
+                        "DISCORD_BOT_TOKEN_ALICE",
+                        "discord-token-alice",
+                    )),
+                    file_bot_token: Some(env_yaml_value("DISCORD_BOT_TOKEN_ALICE")),
+                    allowed_channels: Some(vec![123456]),
+                },
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            super::AgentId::new("default"),
+            super::AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config = Config {
+            default_provider: super::ProviderId::new("openai"),
+            default_model: None,
+            providers: std::collections::HashMap::from([(
+                super::ProviderId::new("openai"),
+                super::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                    default_model: "gpt-5".to_string(),
+                    models: vec!["gpt-5".to_string()],
+                },
+            )]),
+            state_root: temp_dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: std::collections::HashMap::new(),
+            default_agent: super::AgentId::new("alice"),
+            agents,
+        };
+
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        let yaml = std::fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("default_agent: alice"));
+        assert!(yaml.contains("label: Alice"));
+        assert!(yaml.contains("id: DISCORD_BOT_TOKEN_ALICE"));
+        assert!(yaml.contains("source: env"));
+        assert!(!yaml.contains("discord-token-alice"));
+
+        let dotenv = std::fs::read_to_string(temp_dir.path().join(".env")).expect(".env");
+        assert!(dotenv.contains("DISCORD_BOT_TOKEN_ALICE=discord-token-alice"));
     }
 }

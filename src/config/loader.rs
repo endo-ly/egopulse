@@ -10,7 +10,10 @@ use super::secret_ref::{
     DISCORD_BOT_TOKEN_ENV_NAME, ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME,
     WEB_AUTH_TOKEN_ENV_NAME, dotenv_path, read_dotenv, resolve_string_or_ref,
 };
-use super::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
+use super::{
+    AgentConfig, AgentDiscordConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig,
+    ProviderId,
+};
 use crate::error::ConfigError;
 
 #[derive(Debug, Deserialize, Default)]
@@ -39,6 +42,20 @@ struct FileChannelConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FileAgentDiscordConfig {
+    bot_token: Option<StringOrRef>,
+    allowed_channels: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileAgentConfig {
+    label: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    discord: Option<FileAgentDiscordConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
     default_model: Option<String>,
@@ -49,6 +66,8 @@ struct FileConfig {
     max_session_messages: Option<usize>,
     compact_keep_recent: Option<usize>,
     channels: Option<HashMap<String, FileChannelConfig>>,
+    default_agent: Option<String>,
+    agents: Option<HashMap<String, FileAgentConfig>>,
 }
 
 pub(super) fn build_config(
@@ -72,6 +91,8 @@ pub(super) fn build_config(
         max_session_messages: file_max_session_messages,
         compact_keep_recent: file_compact_keep_recent,
         channels: file_channels,
+        default_agent: file_default_agent,
+        agents: file_agents,
     } = read_file_config(resolved_config_path.as_deref())?;
 
     let default_provider =
@@ -113,6 +134,17 @@ pub(super) fn build_config(
 
     validate_channel_provider_references(&providers, &channels)?;
 
+    let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
+    let default_agent =
+        normalize_string(file_default_agent).unwrap_or_else(|| "default".to_string());
+    let default_agent = AgentId::new(&default_agent);
+    validate_agent_id(&default_agent)?;
+    if !agents.contains_key(&default_agent) {
+        return Err(ConfigError::DefaultAgentNotFound {
+            agent_id: default_agent.to_string(),
+        });
+    }
+
     let config = Config {
         default_provider,
         default_model,
@@ -124,6 +156,8 @@ pub(super) fn build_config(
         max_session_messages,
         compact_keep_recent,
         channels,
+        default_agent,
+        agents,
     };
 
     validate_compaction_config(&config)?;
@@ -221,6 +255,67 @@ fn normalize_channels(
         if web.port.is_none() {
             web.port = Some(super::resolve::default_web_port());
         }
+    }
+
+    Ok(normalized)
+}
+
+fn validate_agent_id(id: &AgentId) -> Result<(), ConfigError> {
+    let s = id.as_str();
+    if s.is_empty() || s.trim().is_empty() {
+        return Err(ConfigError::InvalidAgentId { id: id.to_string() });
+    }
+    if s.contains("..") || s.contains('/') || s.contains('\\') {
+        return Err(ConfigError::InvalidAgentId { id: id.to_string() });
+    }
+    Ok(())
+}
+
+fn normalize_agents(
+    agents: HashMap<String, FileAgentConfig>,
+    dotenv: &HashMap<String, String>,
+) -> Result<HashMap<AgentId, AgentConfig>, ConfigError> {
+    let mut normalized = HashMap::new();
+    for (name, fa) in agents {
+        let key = AgentId::new(&name);
+        validate_agent_id(&key)?;
+
+        let discord = match fa.discord {
+            Some(fd) => {
+                let resolved_bot = resolve_string_or_ref(fd.bot_token, dotenv)?;
+                let file_bot_token = resolved_bot.as_ref().map(|rv| {
+                    if matches!(rv, ResolvedValue::Literal(_)) {
+                        serde_yml::Value::String(rv.value().to_string())
+                    } else {
+                        rv.to_yaml_value()
+                    }
+                });
+                AgentDiscordConfig {
+                    bot_token: resolved_bot,
+                    file_bot_token,
+                    allowed_channels: fd.allowed_channels,
+                }
+            }
+            None => AgentDiscordConfig::default(),
+        };
+
+        let config = AgentConfig {
+            label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
+            provider: normalize_string(fa.provider),
+            model: normalize_string(fa.model),
+            discord,
+        };
+        normalized.insert(key, config);
+    }
+
+    if normalized.is_empty() {
+        normalized.insert(
+            AgentId::new("default"),
+            AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        );
     }
 
     Ok(normalized)

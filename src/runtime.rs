@@ -391,7 +391,7 @@ mod tests {
     use crate::soul_agents::SoulAgentsLoader;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
-        use crate::config::ProviderId;
+        use crate::config::{AgentConfig, AgentId, ProviderId};
         crate::config::Config {
             default_provider: ProviderId::new("openai"),
             default_model: Some("gpt-4o-mini".to_string()),
@@ -414,6 +414,14 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels: std::collections::HashMap::new(),
+            default_agent: AgentId::new("default"),
+            agents: std::collections::HashMap::from([(
+                AgentId::new("default"),
+                AgentConfig {
+                    label: "Default Agent".to_string(),
+                    ..Default::default()
+                },
+            )]),
         }
     }
 

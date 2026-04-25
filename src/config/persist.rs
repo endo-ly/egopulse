@@ -14,6 +14,28 @@ use crate::error::EgoPulseError;
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Serialize)]
+struct SerializableAgentDiscord {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    bot_token: Option<serde_yml::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_channels: Option<Vec<u64>>,
+}
+
+#[derive(Serialize)]
+struct SerializableAgent {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discord: Option<SerializableAgentDiscord>,
+}
+
+#[derive(Serialize)]
 struct SerializableConfig {
     default_provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +48,10 @@ struct SerializableConfig {
     compact_keep_recent: usize,
     providers: HashMap<String, SerializableProvider>,
     channels: HashMap<String, SerializableChannel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_agent: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    agents: HashMap<String, SerializableAgent>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +159,31 @@ impl From<&Config> for SerializableConfig {
             })
             .collect();
 
+        let agents = config
+            .agents
+            .iter()
+            .map(|(id, a)| {
+                let discord =
+                    if a.discord.bot_token.is_some() || a.discord.allowed_channels.is_some() {
+                        Some(SerializableAgentDiscord {
+                            bot_token: a.discord.file_bot_token.clone(),
+                            allowed_channels: a.discord.allowed_channels.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                (
+                    id.to_string(),
+                    SerializableAgent {
+                        label: a.label.clone(),
+                        provider: a.provider.clone(),
+                        model: a.model.clone(),
+                        discord,
+                    },
+                )
+            })
+            .collect();
+
         Self {
             default_provider: config.default_provider.to_string(),
             default_model: config.default_model.clone(),
@@ -144,6 +195,8 @@ impl From<&Config> for SerializableConfig {
             compact_keep_recent: config.compact_keep_recent,
             providers,
             channels,
+            default_agent: Some(config.default_agent.to_string()),
+            agents,
         }
     }
 }
@@ -200,6 +253,13 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
             entries.push((env_id.clone(), value.clone()));
         }
         let _ = name;
+    }
+
+    for (agent_id, agent) in &config.agents {
+        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &agent.discord.bot_token {
+            entries.push((env_id.clone(), value.clone()));
+        }
+        let _ = agent_id;
     }
 
     entries
@@ -291,6 +351,7 @@ mod tests {
     use serial_test::serial;
 
     fn sample_config() -> Config {
+        use super::super::{AgentConfig, AgentId};
         let mut providers = HashMap::new();
         providers.insert(
             ProviderId::new("openai"),
@@ -328,6 +389,15 @@ mod tests {
             },
         );
 
+        let mut agents = HashMap::new();
+        agents.insert(
+            AgentId::new("default"),
+            AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        );
+
         Config {
             default_provider: ProviderId::new("openai"),
             default_model: None,
@@ -339,6 +409,8 @@ mod tests {
             max_session_messages: 40,
             compact_keep_recent: 20,
             channels,
+            default_agent: AgentId::new("default"),
+            agents,
         }
     }
 

@@ -99,6 +99,10 @@ pub enum ConfigError {
     InvalidCompactionConfig(String),
     #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
     NoActiveChannels,
+    #[error("invalid_agent_id: {id}")]
+    InvalidAgentId { id: String },
+    #[error("default_agent_not_found: {agent_id}")]
+    DefaultAgentNotFound { agent_id: String },
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,

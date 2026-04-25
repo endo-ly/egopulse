@@ -428,7 +428,7 @@ mod tests {
     }
 
     fn test_config(state_root: String) -> Config {
-        use crate::config::{ChannelName, ProviderId};
+        use crate::config::{AgentConfig, AgentId, ChannelName, ProviderId};
         Config {
             default_provider: ProviderId::new("openai"),
             default_model: Some("gpt-4o-mini".to_string()),
@@ -454,6 +454,14 @@ mod tests {
                     enabled: Some(true),
                     host: Some("127.0.0.1".to_string()),
                     port: Some(10961),
+                    ..Default::default()
+                },
+            )]),
+            default_agent: AgentId::new("default"),
+            agents: std::collections::HashMap::from([(
+                AgentId::new("default"),
+                AgentConfig {
+                    label: "Default Agent".to_string(),
                     ..Default::default()
                 },
             )]),
