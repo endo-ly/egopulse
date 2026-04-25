@@ -19,6 +19,7 @@ pub struct SurfaceContext {
     pub surface_user: String,
     pub surface_thread: String,
     pub chat_type: String,
+    pub agent_id: String,
 }
 
 impl SurfaceContext {

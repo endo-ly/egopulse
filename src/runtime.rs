@@ -94,6 +94,22 @@ impl AppState {
         let config = self.try_current_config()?;
         Ok(Arc::from(create_provider(&config.resolve_global_llm())?))
     }
+
+    /// Returns the LLM provider resolved for the agent and channel in the given context.
+    pub fn llm_for_context(
+        &self,
+        context: &crate::agent_loop::SurfaceContext,
+    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
+        if let Some(provider) = self.llm_override.clone() {
+            return Ok(provider);
+        }
+
+        let config = self.try_current_config()?;
+        let agent_id = crate::config::AgentId::new(&context.agent_id);
+        Ok(Arc::from(create_provider(
+            &config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?,
+        )?))
+    }
 }
 
 /// Builds the application state without recording a config file path.

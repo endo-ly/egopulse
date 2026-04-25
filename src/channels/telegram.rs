@@ -229,10 +229,11 @@ async fn handle_message(
             return Ok(());
         }
 
+        let slash_chat_type = chat_type.clone();
         let resolved_chat_id = match call_blocking(std::sync::Arc::clone(&state.db), {
             let channel = "telegram".to_string();
             let ext_id = external_chat_id.clone();
-            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
+            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &slash_chat_type)
         })
         .await
         {
@@ -250,10 +251,17 @@ async fn handle_message(
         };
 
         let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
+        let slash_context = SurfaceContext {
+            channel: "telegram".to_string(),
+            surface_user: sender_name.clone(),
+            surface_thread: external_chat_id.clone(),
+            chat_type: chat_type.clone(),
+            agent_id: state.config.default_agent.to_string(),
+        };
         if let Some(response) = slash_commands::handle_slash_command(
             &state,
             resolved_chat_id,
-            "telegram",
+            &slash_context,
             &text,
             sender_id.as_deref(),
         )
@@ -286,6 +294,7 @@ async fn handle_message(
         surface_user: sender_name,
         surface_thread: external_chat_id.clone(),
         chat_type: chat_type.clone(),
+        agent_id: state.config.default_agent.to_string(),
     };
 
     info!(

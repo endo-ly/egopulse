@@ -42,6 +42,7 @@ pub async fn ask_in_session(
         surface_user: "local_user".to_string(),
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
+        agent_id: state.config.default_agent.to_string(),
     };
 
     tokio::select! {
@@ -109,12 +110,12 @@ where
         chat_type: context.chat_type.clone(),
     };
     let system_prompt = build_system_prompt(state, context);
-    let channel_llm = state.llm_for_channel(&context.channel).inspect_err(|e| {
+    let channel_llm = state.llm_for_context(context).inspect_err(|e| {
         warn!(
             error_kind = e.error_kind(),
             error = %e,
             channel = context.channel,
-            "llm_for_channel failed"
+            "llm_for_context failed"
         );
     })?;
 
@@ -935,6 +936,7 @@ pub(crate) fn cli_context(session: &str) -> SurfaceContext {
         surface_user: "local_user".to_string(),
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
+        agent_id: "default".to_string(),
     }
 }
 
@@ -1173,6 +1175,7 @@ mod tests {
             surface_user: "user".to_string(),
             surface_thread: session.to_string(),
             chat_type: "web".to_string(),
+            agent_id: "default".to_string(),
         }
     }
 
@@ -1562,5 +1565,34 @@ mod tests {
             summary.requests, 0,
             "no usage records should exist when response has no usage"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_uses_agent_llm_resolution() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "agent reply".to_string(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+
+        // Act
+        let result = process_turn(&state, &cli_context("agent-llm-test"), "hello")
+            .await
+            .expect("turn");
+
+        // Assert
+        assert_eq!(result, "agent reply");
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 1, "should have exactly one LLM call");
     }
 }

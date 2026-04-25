@@ -168,10 +168,17 @@ impl EventHandler for Handler {
             match slash_chat_id {
                 Ok(chat_id) => {
                     let sender_id = msg.author.id.get().to_string();
+                    let slash_context = SurfaceContext {
+                        channel: "discord".to_string(),
+                        surface_user: msg.author.name.clone(),
+                        surface_thread: external_chat_id.clone(),
+                        chat_type: "discord".to_string(),
+                        agent_id: self.app_state.config.default_agent.to_string(),
+                    };
                     if let Some(response) = crate::slash_commands::handle_slash_command(
                         &self.app_state,
                         chat_id,
-                        "discord",
+                        &slash_context,
                         &text,
                         Some(&sender_id),
                     )
@@ -213,6 +220,7 @@ impl EventHandler for Handler {
             surface_user: sender_name,
             surface_thread: external_chat_id.clone(),
             chat_type: "discord".to_string(),
+            agent_id: self.app_state.config.default_agent.to_string(),
         };
 
         info!(
@@ -319,10 +327,17 @@ impl EventHandler for Handler {
         let response_text = match slash_chat_id {
             Ok(chat_id) => {
                 let sender_id = cmd.user.id.get().to_string();
+                let slash_context = SurfaceContext {
+                    channel: "discord".to_string(),
+                    surface_user: cmd.user.name.clone(),
+                    surface_thread: external_chat_id.clone(),
+                    chat_type: "discord".to_string(),
+                    agent_id: self.app_state.config.default_agent.to_string(),
+                };
                 crate::slash_commands::handle_slash_command(
                     &self.app_state,
                     chat_id,
-                    "discord",
+                    &slash_context,
                     &command_text,
                     Some(&sender_id),
                 )

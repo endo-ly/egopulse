@@ -178,6 +178,7 @@ impl TuiApp {
             surface_user: "local_user".to_string(),
             surface_thread: session_id,
             chat_type: "tui".to_string(),
+            agent_id: self.state.config.default_agent.to_string(),
         };
         let messages = agent_loop::load_session_messages(&self.state, &context).await?;
         self.view = View::Chat(Box::new(ChatState {
@@ -207,6 +208,7 @@ impl TuiApp {
             surface_user: "local_user".to_string(),
             surface_thread: summary.surface_thread.clone(),
             chat_type: summary.channel,
+            agent_id: self.state.config.default_agent.to_string(),
         };
         let messages = agent_loop::load_session_messages(&self.state, &context).await?;
         self.view = View::Chat(Box::new(ChatState {
@@ -417,7 +419,7 @@ async fn run_loop(
                                             crate::slash_commands::handle_slash_command(
                                                 &app.state,
                                                 chat_id,
-                                                &chat.context.channel,
+                                                &chat.context,
                                                 &prompt,
                                                 None,
                                             )

@@ -968,4 +968,202 @@ agents:
         let dotenv = std::fs::read_to_string(temp_dir.path().join(".env")).expect(".env");
         assert!(dotenv.contains("DISCORD_BOT_TOKEN_ALICE=discord-token-alice"));
     }
+
+    // --- Step 2: Agent LLM Resolution tests ---
+
+    fn agent_config() -> &'static str {
+        r#"default_provider: openai
+default_model: gpt-5
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  discord:
+    enabled: true
+    provider: local
+    model: qwen2.5-coder
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob
+    provider: openai
+    model: gpt-5-mini
+  carol:
+    label: Carol
+    model: custom-model"#
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_uses_channel_provider_when_agent_has_none() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let resolved = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "discord")
+            .expect("resolve");
+
+        assert_eq!(resolved.provider, "local");
+        assert_eq!(resolved.model, "qwen2.5-coder");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_agent_provider_overrides_channel() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let resolved = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("bob"), "discord")
+            .expect("resolve");
+
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.model, "gpt-5-mini");
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_agent_model_overrides_channel_model() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let resolved = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("carol"), "discord")
+            .expect("resolve");
+
+        assert_eq!(resolved.provider, "local");
+        assert_eq!(resolved.model, "custom-model");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_falls_back_to_defaults() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let resolved = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
+            .expect("resolve");
+
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.model, "gpt-5");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_rejects_unknown_agent() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let error = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("unknown"), "discord")
+            .expect_err("should fail");
+
+        assert!(
+            matches!(error, ConfigError::AgentNotFound { ref agent_id } if agent_id == "unknown"),
+            "expected AgentNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_agent_channel_rejects_unknown_provider() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+    provider: nonexistent"#,
+        );
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let error = config
+            .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
+            .expect_err("should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidProviderReference { provider } if provider == "nonexistent"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_llm_for_channel_delegates_to_default_agent() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let via_channel = config.resolve_llm_for_channel("web").expect("via channel");
+        let via_agent = config
+            .resolve_llm_for_agent_channel(&config.default_agent, "web")
+            .expect("via agent");
+
+        assert_eq!(via_channel, via_agent);
+    }
+
+    #[test]
+    #[serial]
+    fn agent_soul_path_returns_agents_dir_soul() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.agent_soul_path(&super::AgentId::new("alice")),
+            PathBuf::from(&config.state_root)
+                .join("agents")
+                .join("alice")
+                .join("SOUL.md")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_agents_path_returns_agents_dir_agents() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, agent_config());
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        assert_eq!(
+            config.agent_agents_path(&super::AgentId::new("bob")),
+            PathBuf::from(&config.state_root)
+                .join("agents")
+                .join("bob")
+                .join("AGENTS.md")
+        );
+    }
 }

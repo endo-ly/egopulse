@@ -103,6 +103,8 @@ pub enum ConfigError {
     InvalidAgentId { id: String },
     #[error("default_agent_not_found: {agent_id}")]
     DefaultAgentNotFound { agent_id: String },
+    #[error("agent_not_found: {agent_id}")]
+    AgentNotFound { agent_id: String },
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,

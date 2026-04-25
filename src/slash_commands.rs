@@ -45,7 +45,7 @@ pub fn is_slash_command(text: &str) -> bool {
 pub async fn handle_slash_command(
     state: &AppState,
     chat_id: i64,
-    caller_channel: &str,
+    context: &SurfaceContext,
     command_text: &str,
     sender_id: Option<&str>,
 ) -> Option<String> {
@@ -62,12 +62,12 @@ pub async fn handle_slash_command(
 
     match command.as_str() {
         "/new" => handle_new(state, chat_id).await,
-        "/compact" => handle_compact(state, chat_id, caller_channel).await,
-        "/status" => handle_status(state, chat_id, caller_channel, sender_id).await,
+        "/compact" => handle_compact(state, chat_id, context).await,
+        "/status" => handle_status(state, chat_id, context, sender_id).await,
         "/skills" => Some(handle_skills(state)),
         "/restart" => Some(handle_restart()),
         "/providers" | "/provider" | "/models" | "/model" => {
-            handle_llm_profile(state, caller_channel, normalized).await
+            handle_llm_profile(state, context, normalized).await
         }
         _ => None,
     }
@@ -128,7 +128,7 @@ async fn handle_new(state: &AppState, chat_id: i64) -> Option<String> {
     }
 }
 
-async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) -> Option<String> {
+async fn handle_compact(state: &AppState, chat_id: i64, context: &SurfaceContext) -> Option<String> {
     let loaded = match load_messages_for_turn(state, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
@@ -138,18 +138,12 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
     }
 
     let count = loaded.messages.len();
-    let context = SurfaceContext {
-        channel: caller_channel.to_string(),
-        surface_user: String::new(),
-        surface_thread: String::new(),
-        chat_type: String::new(),
-    };
-    let llm = match state.global_llm() {
+    let llm = match state.llm_for_context(context) {
         Ok(llm) => llm,
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
-    match force_compact(state, &context, chat_id, &loaded.messages, &llm).await {
+    match force_compact(state, context, chat_id, &loaded.messages, &llm).await {
         Ok(compacted) => {
             let json = match serde_json::to_string(&compacted) {
                 Ok(j) => j,
@@ -176,14 +170,15 @@ async fn handle_compact(state: &AppState, chat_id: i64, caller_channel: &str) ->
 async fn handle_status(
     state: &AppState,
     chat_id: i64,
-    caller_channel: &str,
+    context: &SurfaceContext,
     sender_id: Option<&str>,
 ) -> Option<String> {
     let config = match state.try_current_config() {
         Ok(config) => config,
         Err(e) => return Some(format!("Failed to load config: {e}")),
     };
-    let resolved = match config.resolve_llm_for_channel(caller_channel) {
+    let agent_id = crate::config::AgentId::new(&context.agent_id);
+    let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
         Ok(r) => r,
         Err(e) => return Some(format!("Failed to resolve LLM: {e}")),
     };
@@ -202,11 +197,11 @@ async fn handle_status(
 
     let mut status = format!(
         "Status\n\
-         Channel: {caller_channel}\n\
+         Channel: {}\n\
          Provider: {}\n\
          Model: {}\n\
          {session_line}",
-        resolved.provider, resolved.model,
+        context.channel, resolved.provider, resolved.model,
     );
 
     if let Some(id) = sender_id {
@@ -224,14 +219,8 @@ fn handle_restart() -> String {
     "Not implemented yet.".to_string()
 }
 
-async fn handle_llm_profile(state: &AppState, caller_channel: &str, input: &str) -> Option<String> {
-    let context = SurfaceContext {
-        channel: caller_channel.to_string(),
-        surface_user: String::new(),
-        surface_thread: String::new(),
-        chat_type: caller_channel.to_string(),
-    };
-    match llm_profile::handle_command(state, &context, input).await {
+async fn handle_llm_profile(state: &AppState, context: &SurfaceContext, input: &str) -> Option<String> {
+    match llm_profile::handle_command(state, context, input).await {
         Ok(result) => result,
         Err(e) => Some(format!("LLM profile error: {e}")),
     }
@@ -321,6 +310,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::agent_loop::turn::{build_state, test_config};
+    use crate::agent_loop::SurfaceContext;
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
@@ -420,6 +410,16 @@ mod tests {
         (state, dir)
     }
 
+    fn test_context() -> SurfaceContext {
+        SurfaceContext {
+            channel: "cli".to_string(),
+            surface_user: "local_user".to_string(),
+            surface_thread: "test".to_string(),
+            chat_type: "cli".to_string(),
+            agent_id: "default".to_string(),
+        }
+    }
+
     // -- handle_slash_command tests -----------------------------------------------
 
     #[tokio::test]
@@ -448,7 +448,7 @@ mod tests {
         .expect("store message");
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/new", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/new", None).await;
 
         // Assert
         assert_eq!(result, Some("Session cleared.".to_string()));
@@ -482,7 +482,7 @@ mod tests {
         .expect("save session");
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/compact", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -502,7 +502,7 @@ mod tests {
 
         // Act
         let result =
-            handle_slash_command(&state, chat_id, "cli", "/status", Some("user-123")).await;
+            handle_slash_command(&state, chat_id, &test_context(), "/status", Some("user-123")).await;
 
         // Assert
         let response = result.expect("response");
@@ -523,7 +523,7 @@ mod tests {
         let chat_id = 1;
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/skills", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/skills", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -540,7 +540,7 @@ mod tests {
         let chat_id = 1;
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/providers", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/providers", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -556,7 +556,7 @@ mod tests {
         let (state, _dir) = build_test_state();
 
         // Act
-        let result = handle_slash_command(&state, 1, "cli", "/foo", None).await;
+        let result = handle_slash_command(&state, 1, &test_context(), "/foo", None).await;
 
         // Assert
         assert!(result.is_none());
@@ -568,7 +568,7 @@ mod tests {
         let (state, _dir) = build_test_state();
 
         // Act
-        let result = handle_slash_command(&state, 1, "cli", "/restart", None).await;
+        let result = handle_slash_command(&state, 1, &test_context(), "/restart", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -582,7 +582,7 @@ mod tests {
         let chat_id = 999;
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/status", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/status", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -596,7 +596,7 @@ mod tests {
         let chat_id = 998;
 
         // Act
-        let result = handle_slash_command(&state, chat_id, "cli", "/compact", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
 
         // Assert
         // load_messages_for_turn は chat_id を直接受け取るため、
@@ -606,6 +606,63 @@ mod tests {
             response.contains("Session is empty"),
             "response: {response}"
         );
+    }
+
+    // -- Step 2: Agent LLM Resolution tests -----------------------------------------
+
+    #[tokio::test]
+    async fn status_uses_agent_llm_resolution() {
+        // Arrange
+        let (state, _dir) = build_test_state();
+        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
+            db.resolve_or_create_chat_id("cli", "cli:test-status-agent", Some("test-status-agent"), "cli")
+        })
+        .await
+        .expect("chat_id");
+
+        // Act
+        let result =
+            handle_slash_command(&state, chat_id, &test_context(), "/status", None).await;
+
+        // Assert
+        let response = result.expect("response");
+        assert!(
+            response.contains("Provider: openai"),
+            "expected agent-resolved provider, got: {response}"
+        );
+        assert!(
+            response.contains("Model: gpt-4o-mini"),
+            "expected agent-resolved model, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_uses_agent_llm_resolution() {
+        // Arrange
+        let (state, _dir) = build_test_state();
+        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
+            db.resolve_or_create_chat_id("cli", "cli:test-compact-agent", Some("test-compact-agent"), "cli")
+        })
+        .await
+        .expect("chat_id");
+
+        let messages = vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "hi"),
+        ];
+        let json = serde_json::to_string(&messages).expect("json");
+        call_blocking(Arc::clone(&state.db), {
+            move |db| db.save_session(chat_id, &json)
+        })
+        .await
+        .expect("save session");
+
+        // Act
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
+
+        // Assert
+        let response = result.expect("response");
+        assert!(response.contains("Compacted"), "response: {response}");
     }
 
     // -- CommandDef registry tests -----------------------------------------------

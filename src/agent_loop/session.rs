@@ -474,6 +474,7 @@ mod tests {
             surface_user: "local_user".to_string(),
             surface_thread: session.to_string(),
             chat_type: "cli".to_string(),
+            agent_id: "default".to_string(),
         }
     }
 

@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
+use super::{AgentId, ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
 use crate::error::ConfigError;
 
 impl Config {
@@ -38,10 +38,38 @@ impl Config {
             .unwrap_or_else(|| self.default_provider.to_string())
     }
 
-    /// Resolves the provider/model pair used for a request from the given channel.
-    pub fn resolve_llm_for_channel(&self, channel: &str) -> Result<ResolvedLlmConfig, ConfigError> {
+    /// Resolves the provider/model pair for a specific agent on a given channel.
+    ///
+    /// Resolution chain (highest priority first):
+    /// 1. `agent.provider` / `agent.model`
+    /// 2. `channel.provider` / `channel.model`
+    /// 3. `config.default_provider` / `config.default_model`
+    /// 4. `provider.default_model`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::AgentNotFound`] if `agent_id` is not in `self.agents`.
+    /// Returns [`ConfigError::InvalidProviderReference`] if the resolved provider name
+    /// does not reference an existing provider.
+    pub fn resolve_llm_for_agent_channel(
+        &self,
+        agent_id: &AgentId,
+        channel: &str,
+    ) -> Result<ResolvedLlmConfig, ConfigError> {
+        let agent = self.agents.get(agent_id).ok_or_else(|| {
+            ConfigError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            }
+        })?;
+
         let channel_key = ChannelName::new(channel);
-        let provider_name = self.effective_provider_name(channel_key.as_str());
+
+        let provider_name = agent
+            .provider
+            .as_deref()
+            .map(|p| p.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| self.effective_provider_name(channel_key.as_str()));
+
         let provider_id = ProviderId::new(&provider_name);
         let provider = self.providers.get(&provider_id).ok_or_else(|| {
             ConfigError::InvalidProviderReference {
@@ -49,10 +77,15 @@ impl Config {
             }
         })?;
 
-        let model = self
-            .channels
-            .get(&channel_key)
-            .and_then(|config| config.model.clone())
+        let model = agent
+            .model
+            .as_deref()
+            .map(String::from)
+            .or_else(|| {
+                self.channels
+                    .get(&channel_key)
+                    .and_then(|config| config.model.clone())
+            })
             .unwrap_or_else(|| {
                 self.default_model
                     .clone()
@@ -66,6 +99,16 @@ impl Config {
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
         })
+    }
+
+    /// Resolves the provider/model pair used for a request from the given channel
+    /// using the default agent.
+    ///
+    /// # Errors
+    ///
+    /// See [`resolve_llm_for_agent_channel`].
+    pub fn resolve_llm_for_channel(&self, channel: &str) -> Result<ResolvedLlmConfig, ConfigError> {
+        self.resolve_llm_for_agent_channel(&self.default_agent, channel)
     }
 
     /// Returns the web channel's resolved LLM settings.
@@ -212,6 +255,32 @@ impl Config {
     /// デフォルト AGENTS.md パス: `state_root/AGENTS.md`。
     pub fn agents_path(&self) -> PathBuf {
         Path::new(&self.state_root).join("AGENTS.md")
+    }
+
+    /// Agent-specific SOUL.md: `state_root/agents/{agent_id}/SOUL.md`.
+    pub fn agent_soul_path(&self, agent_id: &AgentId) -> PathBuf {
+        Path::new(&self.state_root)
+            .join("agents")
+            .join(agent_id.as_str())
+            .join("SOUL.md")
+    }
+
+    /// Agent-specific AGENTS.md: `state_root/agents/{agent_id}/AGENTS.md`.
+    pub fn agent_agents_path(&self, agent_id: &AgentId) -> PathBuf {
+        Path::new(&self.state_root)
+            .join("agents")
+            .join(agent_id.as_str())
+            .join("AGENTS.md")
+    }
+
+    /// Discord session thread for a multi-agent Discord bot:
+    /// `{channel_id}:agent:{agent_id}`.
+    pub fn discord_agent_surface_thread(
+        &self,
+        channel_id: &str,
+        agent_id: &AgentId,
+    ) -> String {
+        format!("{channel_id}:agent:{agent_id}")
     }
 
     /// マルチソウル用ディレクトリ: `state_root/souls`。

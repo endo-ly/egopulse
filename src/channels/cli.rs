@@ -18,6 +18,7 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         surface_user: "local_user".to_string(),
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
+        agent_id: state.config.default_agent.to_string(),
     };
 
     writeln!(stdout, "session: {}", session)
@@ -59,7 +60,7 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
             let response = crate::slash_commands::handle_slash_command(
                 state,
                 slash_chat_id,
-                &context.channel,
+                &context,
                 trimmed,
                 None,
             )

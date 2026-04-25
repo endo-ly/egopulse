@@ -161,6 +161,7 @@ pub(super) async fn start_stream_run(
                         surface_user: actor.to_string(),
                         surface_thread,
                         chat_type: info.chat_type,
+                        agent_id: state.app_state.config.default_agent.to_string(),
                     },
                 )
             }
@@ -173,6 +174,7 @@ pub(super) async fn start_stream_run(
                         surface_user: actor.to_string(),
                         surface_thread: key,
                         chat_type: "web".to_string(),
+                        agent_id: state.app_state.config.default_agent.to_string(),
                     },
                 )
             }
@@ -186,6 +188,7 @@ pub(super) async fn start_stream_run(
                 surface_user: actor.to_string(),
                 surface_thread: key,
                 chat_type: "web".to_string(),
+                agent_id: state.app_state.config.default_agent.to_string(),
             },
         )
     };
@@ -226,7 +229,7 @@ pub(super) async fn start_stream_run(
         let response = crate::slash_commands::handle_slash_command(
             &state.app_state,
             slash_chat_id,
-            &context.channel,
+            &context,
             &message,
             Some(actor),
         )
