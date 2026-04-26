@@ -133,10 +133,12 @@ pub async fn build_app_state_with_path(
     channels.register(Arc::new(WebAdapter));
 
     #[cfg(feature = "channel-discord")]
-    if let Some(token) = config.discord_bot_token() {
-        channels.register(Arc::new(crate::channels::discord::DiscordAdapter::new(
-            token,
-        )));
+    if !config.discord_agent_bots().is_empty() {
+        channels.register(Arc::new(
+            crate::channels::discord::DiscordAdapter::new_for_agents(
+                &config,
+            ),
+        ));
     }
 
     #[cfg(feature = "channel-telegram")]
@@ -209,7 +211,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     write_startup_status(&state).await;
 
     let mut has_active_channels = false;
-    let mut handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
+    let mut handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
 
     // Web サーバー起動
     if state.config.web_enabled() {
@@ -220,32 +222,48 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         info!("Starting Web UI server on {host}:{port}");
         let handle =
             tokio::spawn(async move { crate::web::run_server(web_state, &host, port).await });
-        handles.push(("web", handle));
+        handles.push(("web".to_string(), handle));
     }
 
-    // Discord bot 起動
+    // Discord bot 起動 — Agent ごとに 1 つの Discord client を起動する。
     #[cfg(feature = "channel-discord")]
-    if state.config.channel_enabled("discord") {
-        if let Some(token) = state.config.discord_bot_token() {
+    {
+        let agent_bots: Vec<_> = state
+            .config
+            .discord_agent_bots()
+            .into_iter()
+            .map(|b| (b.agent_id.clone(), b.token.to_string(), b.allowed_channels.to_vec(), b.label.to_string()))
+            .collect();
+
+        if !agent_bots.is_empty() {
             has_active_channels = true;
-            let discord_state = Arc::new(state.clone());
-            info!("Starting Discord bot...");
-            let handle = tokio::spawn(async move {
-                crate::channels::discord::start_discord_bot(discord_state, token)
+            for (agent_id, token, allowed_channels, label) in agent_bots {
+                let discord_state = Arc::new(state.clone());
+                let handle_name = format!("discord[{agent_id}]");
+                info!(
+                    "Starting Discord bot for agent '{agent_id}' ({label})...",
+                );
+                let aid = agent_id.clone();
+                let handle = tokio::spawn(async move {
+                    crate::channels::discord::start_discord_bot_for_agent(
+                        discord_state,
+                        &token,
+                        &aid,
+                        &allowed_channels,
+                    )
                     .await
                     .map_err(|error| {
                         EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                            "discord bot failed: {error}"
+                            "discord bot (agent {aid}) failed: {error}",
                         )))
                     })
-            });
-            handles.push(("discord", handle));
+                });
+                handles.push((handle_name, handle));
+            }
         } else {
             tracing::warn!(
-                "Discord channel is enabled but no bot_token is configured. \
-                 Set channels.discord.bot_token in egopulse.config.yaml, \
-                  set DISCORD_BOT_TOKEN environment variable, \
-                  or add DISCORD_BOT_TOKEN to ~/.egopulse/.env."
+                "Discord channel is enabled but no agents have a discord.bot_token configured. \
+                 Set agents.<id>.discord.bot_token in egopulse.config.yaml."
             );
         }
     }
@@ -267,7 +285,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                         )))
                     })
             });
-            handles.push(("telegram", handle));
+            handles.push(("telegram".to_string(), handle));
         } else {
             tracing::warn!(
                 "Telegram channel is enabled but no bot_token is configured. \
@@ -297,7 +315,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                     "channel '{name}' exited unexpectedly"
                 )))),
                 Ok(Err(error)) => Err(error),
-                Err(error) => Err(channel_join_error(name, error)),
+                Err(error) => Err(channel_join_error(&name, error)),
             };
         }
 
@@ -312,7 +330,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 }
 
 async fn shutdown_channel_tasks(
-    handles: Vec<(&'static str, JoinHandle<Result<(), EgoPulseError>>)>,
+    handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)>,
 ) {
     for (name, mut handle) in handles {
         let shutdown_result = tokio::time::timeout(Duration::from_secs(10), &mut handle).await;
@@ -364,15 +382,25 @@ async fn write_startup_status(state: &AppState) {
         None
     };
 
-    let discord = state
-        .config
-        .channel_enabled("discord")
-        .then_some(ChannelEntry { enabled: true });
+    let discord_agent_count = state.config.discord_agent_bots().len();
+    let discord = if discord_agent_count > 0 {
+        Some(ChannelEntry {
+            enabled: true,
+            agent_count: Some(discord_agent_count),
+        })
+    } else if state.config.channel_enabled("discord") {
+        Some(ChannelEntry {
+            enabled: true,
+            agent_count: Some(0),
+        })
+    } else {
+        None
+    };
 
     let telegram = state
         .config
         .channel_enabled("telegram")
-        .then_some(ChannelEntry { enabled: true });
+        .then_some(ChannelEntry { enabled: true, agent_count: None });
 
     let snapshot = StatusSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),

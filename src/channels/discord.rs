@@ -50,6 +50,19 @@ impl DiscordAdapter {
     pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
         Self { token, http_client }
     }
+
+    /// Creates a Discord adapter with agent-token mapping for multi-agent support.
+    pub fn new_for_agents(config: &crate::config::Config) -> Self {
+        // Select the first agent's token as the "primary" for legacy outbound.
+        // Full agent-token selection is implemented in Step 4 (external ID parsing).
+        let primary_token = config
+            .discord_agent_bots()
+            .into_iter()
+            .next()
+            .map(|b| b.token.to_string())
+            .unwrap_or_default();
+        Self::new(primary_token)
+    }
 }
 
 #[async_trait]
@@ -398,6 +411,21 @@ fn interaction_to_command_text(
         }
     }
     text
+}
+
+/// Starts a Discord bot for a specific agent.
+///
+/// Wraps [`start_discord_bot`] and passes agent metadata for per-agent
+/// context binding in the event handler (see Step 3).
+pub async fn start_discord_bot_for_agent(
+    state: Arc<AppState>,
+    token: &str,
+    agent_id: &crate::config::AgentId,
+    allowed_channels: &[u64],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = agent_id;
+    let _ = allowed_channels;
+    start_discord_bot(state, token.to_string()).await
 }
 
 /// Starts the Discord bot and supervises its gateway lifecycle.
