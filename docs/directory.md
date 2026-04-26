@@ -25,6 +25,13 @@
 │
 ├── AGENTS.md
 │
+├── agents/
+│   ├── default/
+│   │   └── SOUL.md
+│   └── alice/
+│       ├── SOUL.md
+│       └── AGENTS.md
+│
 ├── skills/
 │   └── pdf/SKILL.md
 │
@@ -37,11 +44,9 @@
 │   ├── groups/
 │   │   ├── telegram/
 │   │   │   └── {chat_id}/
-│   │   │       ├── AGENTS.md
 │   │   │       └── conversations/
 │   │   └── discord/
 │   │       └── {chat_id}/
-│   │           ├── AGENTS.md
 │   │           └── conversations/
 │   └── status.json
 │
@@ -56,7 +61,7 @@
 | レイヤー | 配置 | 内容 |
 |---|---|---|
 | 設定 | 直下 | config.yaml, config.backups/ |
-| 人格 | 直下 | SOUL.md, souls/ |
+| 人格 | 直下 | SOUL.md, souls/, agents/ |
 | ルール | 直下 | AGENTS.md (グローバル) |
 | 組み込みスキル | skills/ | EgoPulse に同梱されるスキル |
 | MCP | 直下 | mcp.json, mcp.d/ |
@@ -76,6 +81,7 @@
 | `SOUL.md` | デフォルト人格定義。system prompt の先頭に注入される |
 | `souls/` | 複数人格定義。チャネルやチャットに人格を紐付ける場合に使用 |
 | `AGENTS.md` | グローバルルール。全チャットで共有 |
+| `agents/` | エージェント別設定。各 `agents/{agent_id}/` 配下に SOUL.md / AGENTS.md を配置 |
 | `mcp.json` | MCP サーバー定義 |
 | `mcp.d/` | MCP 追加設定ファイル群 |
 
@@ -97,26 +103,21 @@ skills/
 | `status.json` | ランタイムステータス（起動時刻、接続状態等） |
 | `groups/` | チャット別永続データのルート |
 
-### 2.4 runtime/groups/ — チャット別ルールとアーカイブ
+### 2.4 runtime/groups/ — チャット別アーカイブ
 
-チャット毎に独立したディレクトリを持ち、チャット別ルール(AGENTS.md)と会話アーカイブを配置する。
+チャット毎に独立したディレクトリを持ち、会話アーカイブを配置する。
 
-```
+```text
 groups/
-├── telegram/{chat_id}/AGENTS.md        ← チャット別ルール
 ├── telegram/{chat_id}/conversations/   ← compaction アーカイブ
-├── discord/{chat_id}/AGENTS.md
-└── discord/{chat_id}/conversations/
+├── discord/{chat_id}/conversations/
 ```
 
 | パス | 責務 |
 |---|---|
-| `{channel}/{chat_id}/AGENTS.md` | チャット別ルール。そのチャット固有の行動ルール・制約 |
 | `{channel}/{chat_id}/conversations/` | compaction によって生成される過去会話のアーカイブファイル |
 
-ルールは2層構造:
-- **グローバル**: `~/.egopulse/AGENTS.md`（直下）。全チャットで共有される行動ルール
-- **チャット毎**: `runtime/groups/{channel}/{chat_id}/AGENTS.md`。そのチャット固有のルール
+> **注**: チャット別 `AGENTS.md`（`runtime/groups/{channel}/{chat_id}/AGENTS.md`）はアーカイブ目的で残存する可能性があるが、system prompt 構築時には読み込まれない。ルールはグローバル `AGENTS.md` + エージェント別 `agents/{agent_id}/AGENTS.md` の2層累積構造に移行済み。
 
 ### 2.5 workspace/ — エージェント作業領域
 

@@ -33,6 +33,14 @@ session は `(channel, surface_thread)` から安定的に決まる。
 
 この surface identity から `chat_id` を解決し、以後の履歴保存・復元は `chat_id` 単位で扱う。
 
+### 2.1 エージェント対応セッションアイデンティティ
+
+`SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
+
+- `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
+- **Discord マルチボット**: `discord_agent_surface_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する。これにより同一チャンネル内でエージェントごとに独立したセッションが確保される
+- **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
+
 ## 3. 保存モデル
 
 会話永続化は SQLite ベースで、役割は次の 4 つに分かれる。

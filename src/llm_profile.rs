@@ -3,12 +3,31 @@
 use std::path::Path;
 
 use crate::agent_loop::SurfaceContext;
-use crate::config::Config;
+use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
 const GLOBAL_SCOPE: &str = "global";
-const AVAILABLE_SCOPES: &[&str] = &[GLOBAL_SCOPE, "web", "discord", "telegram"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProfileScope {
+    Global,
+    Channel(ChannelName),
+    Agent {
+        agent_id: AgentId,
+        channel: ChannelName,
+    },
+}
+
+impl std::fmt::Display for ProfileScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => f.write_str(GLOBAL_SCOPE),
+            Self::Channel(channel) => write!(f, "{channel}"),
+            Self::Agent { agent_id, .. } => write!(f, "agent:{agent_id}"),
+        }
+    }
+}
 
 pub async fn handle_command(
     state: &AppState,
@@ -51,7 +70,7 @@ pub async fn handle_command(
             .map(Some),
         "/models" => {
             let config = state.try_current_config()?;
-            let scope = parse_scope(&parts[1..], command_scope(context))?;
+            let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
             let resolved = resolved_for_scope(&config, &scope)?;
             let provider = config
                 .providers
@@ -78,7 +97,7 @@ async fn handle_provider_command(
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
     let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context))?;
+    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
 
     if parts.len() == 1 {
         let resolved = resolved_for_scope(&config, &scope)?;
@@ -90,14 +109,28 @@ async fn handle_provider_command(
 
     let value = first_non_scope_arg(&parts[1..]).unwrap_or_default();
     if value == "reset" {
-        if scope == GLOBAL_SCOPE {
+        if scope == ProfileScope::Global {
             return Ok("global scope uses default_provider and cannot reset".to_string());
         }
         let path = config_path(state)?;
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
-        if let Some(channel) = config.channels.get_mut(scope.as_str()) {
-            channel.provider = None;
-            channel.model = None;
+        match &scope {
+            ProfileScope::Global => unreachable!("global reset is returned above"),
+            ProfileScope::Channel(channel_name) => {
+                if let Some(channel) = config.channels.get_mut(channel_name.as_str()) {
+                    channel.provider = None;
+                    channel.model = None;
+                }
+            }
+            ProfileScope::Agent { agent_id, .. } => {
+                let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
+                    crate::error::ConfigError::AgentNotFound {
+                        agent_id: agent_id.to_string(),
+                    }
+                })?;
+                agent.provider = None;
+                agent.model = None;
+            }
         }
         config.save_config_with_secrets(path)?;
         let updated = Config::load_allow_missing_api_key(Some(path))?;
@@ -108,21 +141,31 @@ async fn handle_provider_command(
         ));
     }
 
-    if !config.providers.contains_key(value) {
+    let provider_id = ProviderId::new(value);
+    if !config.providers.contains_key(&provider_id) {
         return Ok(format!("unknown provider: {value}"));
     }
     let path = config_path(state)?;
     let mut config = Config::load_allow_missing_api_key(Some(path))?;
-    if scope == GLOBAL_SCOPE {
-        config.default_provider = crate::config::ProviderId::new(value);
-        config.default_model = None;
-    } else {
-        let channel = config
-            .channels
-            .entry(crate::config::ChannelName::new(&scope))
-            .or_default();
-        channel.provider = Some(value.to_string());
-        channel.model = None;
+    match &scope {
+        ProfileScope::Global => {
+            config.default_provider = provider_id;
+            config.default_model = None;
+        }
+        ProfileScope::Channel(channel_name) => {
+            let channel = config.channels.entry(channel_name.clone()).or_default();
+            channel.provider = Some(value.to_string());
+            channel.model = None;
+        }
+        ProfileScope::Agent { agent_id, .. } => {
+            let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
+                crate::error::ConfigError::AgentNotFound {
+                    agent_id: agent_id.to_string(),
+                }
+            })?;
+            agent.provider = Some(value.to_string());
+            agent.model = None;
+        }
     }
     config.save_config_with_secrets(path)?;
     let updated = Config::load_allow_missing_api_key(Some(path))?;
@@ -139,7 +182,7 @@ async fn handle_model_command(
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
     let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context))?;
+    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
     let resolved = resolved_for_scope(&config, &scope)?;
 
     if parts.len() == 1 {
@@ -151,7 +194,7 @@ async fn handle_model_command(
 
     let value = first_non_scope_arg(&parts[1..]).unwrap_or_default();
     if value == "reset" {
-        if scope == GLOBAL_SCOPE {
+        if scope == ProfileScope::Global {
             let mut config = Config::load_allow_missing_api_key(Some(config_path(state)?))?;
             config.default_model = None;
             config.save_config_with_secrets(config_path(state)?)?;
@@ -162,8 +205,21 @@ async fn handle_model_command(
         }
         let path = config_path(state)?;
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
-        if let Some(channel) = config.channels.get_mut(scope.as_str()) {
-            channel.model = None;
+        match &scope {
+            ProfileScope::Global => unreachable!("global reset is returned above"),
+            ProfileScope::Channel(channel_name) => {
+                if let Some(channel) = config.channels.get_mut(channel_name.as_str()) {
+                    channel.model = None;
+                }
+            }
+            ProfileScope::Agent { agent_id, .. } => {
+                let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
+                    crate::error::ConfigError::AgentNotFound {
+                        agent_id: agent_id.to_string(),
+                    }
+                })?;
+                agent.model = None;
+            }
         }
         config.save_config_with_secrets(path)?;
         let updated = Config::load_allow_missing_api_key(Some(path))?;
@@ -173,19 +229,36 @@ async fn handle_model_command(
 
     let path = config_path(state)?;
     let mut config = Config::load_allow_missing_api_key(Some(path))?;
-    if scope == GLOBAL_SCOPE {
-        config.default_model = Some(value.to_string());
-        if let Some(provider) = config.providers.get_mut(&config.default_provider) {
-            if !provider.models.iter().any(|m| m == value) {
+    match &scope {
+        ProfileScope::Global => {
+            config.default_model = Some(value.to_string());
+            let default_provider = config.default_provider.clone();
+            if let Some(provider) = config.providers.get_mut(&default_provider)
+                && !provider.models.iter().any(|m| m == value)
+            {
                 provider.models.push(value.to_string());
             }
         }
-    } else {
-        let channel = config
-            .channels
-            .entry(crate::config::ChannelName::new(&scope))
-            .or_default();
-        channel.model = Some(value.to_string());
+        ProfileScope::Channel(channel_name) => {
+            let channel = config.channels.entry(channel_name.clone()).or_default();
+            channel.model = Some(value.to_string());
+        }
+        ProfileScope::Agent { agent_id, channel } => {
+            let provider_name = config
+                .resolve_llm_for_agent_channel(agent_id, channel.as_str())?
+                .provider;
+            let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
+                crate::error::ConfigError::AgentNotFound {
+                    agent_id: agent_id.to_string(),
+                }
+            })?;
+            agent.model = Some(value.to_string());
+            if let Some(provider) = config.providers.get_mut(provider_name.as_str())
+                && !provider.models.iter().any(|m| m == value)
+            {
+                provider.models.push(value.to_string());
+            }
+        }
     }
     config.save_config_with_secrets(path)?;
     let updated = Config::load_allow_missing_api_key(Some(path))?;
@@ -203,21 +276,25 @@ fn config_path(state: &AppState) -> Result<&Path, EgoPulseError> {
         .ok_or_else(|| EgoPulseError::Internal("config path is unavailable".to_string()))
 }
 
-fn command_scope(context: &SurfaceContext) -> String {
-    match context.channel.as_str() {
-        "web" | "discord" | "telegram" => context.channel.clone(),
-        _ => GLOBAL_SCOPE.to_string(),
+fn command_scope(context: &SurfaceContext) -> ProfileScope {
+    ProfileScope::Agent {
+        agent_id: AgentId::new(&context.agent_id),
+        channel: ChannelName::new(&context.channel),
     }
 }
 
-fn parse_scope(args: &[&str], fallback: String) -> Result<String, EgoPulseError> {
+fn parse_scope(
+    args: &[&str],
+    fallback: ProfileScope,
+    config: &Config,
+) -> Result<ProfileScope, EgoPulseError> {
     let mut iter = args.iter().copied();
     while let Some(arg) = iter.next() {
         if arg == "--scope" {
             let value = iter
                 .next()
                 .ok_or_else(|| EgoPulseError::Internal("missing scope value".to_string()))?;
-            return normalize_scope(value);
+            return normalize_scope(value, fallback, config);
         }
     }
     Ok(fallback)
@@ -239,24 +316,45 @@ fn first_non_scope_arg<'a>(args: &'a [&str]) -> Option<&'a str> {
     None
 }
 
-fn normalize_scope(scope: &str) -> Result<String, EgoPulseError> {
+fn normalize_scope(
+    scope: &str,
+    fallback: ProfileScope,
+    config: &Config,
+) -> Result<ProfileScope, EgoPulseError> {
     let normalized = scope.trim().to_ascii_lowercase();
-    if AVAILABLE_SCOPES
-        .iter()
-        .any(|candidate| *candidate == normalized)
-    {
-        Ok(normalized)
-    } else {
-        Err(EgoPulseError::Internal(format!("invalid scope: {scope}")))
+    if normalized == GLOBAL_SCOPE {
+        return Ok(ProfileScope::Global);
     }
+    if config.channels.contains_key(&ChannelName::new(&normalized)) {
+        return Ok(ProfileScope::Channel(ChannelName::new(&normalized)));
+    }
+    if let Some(agent_id) = normalized.strip_prefix("agent:") {
+        let channel = match fallback {
+            ProfileScope::Agent { channel, .. } | ProfileScope::Channel(channel) => channel,
+            ProfileScope::Global => config
+                .channels
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| ChannelName::new("web")),
+        };
+        return Ok(ProfileScope::Agent {
+            agent_id: AgentId::new(agent_id),
+            channel,
+        });
+    }
+    Err(EgoPulseError::Internal(format!("invalid scope: {scope}")))
 }
 
 fn resolved_for_scope(
     config: &Config,
-    scope: &str,
+    scope: &ProfileScope,
 ) -> Result<crate::config::ResolvedLlmConfig, EgoPulseError> {
     match scope {
-        GLOBAL_SCOPE => Ok(config.resolve_global_llm()),
-        channel => Ok(config.resolve_llm_for_channel(channel)?),
+        ProfileScope::Global => Ok(config.resolve_global_llm()),
+        ProfileScope::Channel(channel) => Ok(config.resolve_llm_for_channel(channel.as_str())?),
+        ProfileScope::Agent { agent_id, channel } => {
+            Ok(config.resolve_llm_for_agent_channel(agent_id, channel.as_str())?)
+        }
     }
 }

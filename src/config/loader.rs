@@ -135,6 +135,7 @@ pub(super) fn build_config(
     validate_channel_provider_references(&providers, &channels)?;
 
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
+    validate_agent_provider_references(&providers, &agents)?;
     let default_agent =
         normalize_string(file_default_agent).unwrap_or_else(|| "default".to_string());
     let default_agent = AgentId::new(&default_agent);
@@ -265,7 +266,7 @@ fn validate_agent_id(id: &AgentId) -> Result<(), ConfigError> {
     if s.is_empty() || s.trim().is_empty() {
         return Err(ConfigError::InvalidAgentId { id: id.to_string() });
     }
-    if s.contains("..") || s.contains('/') || s.contains('\\') {
+    if s.contains("..") || s.contains('/') || s.contains('\\') || s.contains(':') {
         return Err(ConfigError::InvalidAgentId { id: id.to_string() });
     }
     Ok(())
@@ -408,22 +409,33 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_provider_references<'a>(
+    providers: &HashMap<ProviderId, ProviderConfig>,
+    references: impl IntoIterator<Item = Option<&'a String>>,
+) -> Result<(), ConfigError> {
+    for provider in references.into_iter().flatten() {
+        let provider_id = ProviderId::new(provider);
+        if !providers.contains_key(&provider_id) {
+            return Err(ConfigError::InvalidProviderReference {
+                provider: provider.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_channel_provider_references(
     providers: &HashMap<ProviderId, ProviderConfig>,
     channels: &HashMap<ChannelName, ChannelConfig>,
 ) -> Result<(), ConfigError> {
-    for channel in channels.values() {
-        if let Some(provider) = channel.provider.as_ref() {
-            let provider_id = ProviderId::new(provider);
-            if !providers.contains_key(&provider_id) {
-                return Err(ConfigError::InvalidProviderReference {
-                    provider: provider.clone(),
-                });
-            }
-        }
-    }
+    validate_provider_references(providers, channels.values().map(|c| c.provider.as_ref()))
+}
 
-    Ok(())
+fn validate_agent_provider_references(
+    providers: &HashMap<ProviderId, ProviderConfig>,
+    agents: &HashMap<AgentId, AgentConfig>,
+) -> Result<(), ConfigError> {
+    validate_provider_references(providers, agents.values().map(|a| a.provider.as_ref()))
 }
 
 fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelConfig>) {

@@ -128,7 +128,11 @@ async fn handle_new(state: &AppState, chat_id: i64) -> Option<String> {
     }
 }
 
-async fn handle_compact(state: &AppState, chat_id: i64, context: &SurfaceContext) -> Option<String> {
+async fn handle_compact(
+    state: &AppState,
+    chat_id: i64,
+    context: &SurfaceContext,
+) -> Option<String> {
     let loaded = match load_messages_for_turn(state, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
@@ -219,7 +223,11 @@ fn handle_restart() -> String {
     "Not implemented yet.".to_string()
 }
 
-async fn handle_llm_profile(state: &AppState, context: &SurfaceContext, input: &str) -> Option<String> {
+async fn handle_llm_profile(
+    state: &AppState,
+    context: &SurfaceContext,
+    input: &str,
+) -> Option<String> {
     match llm_profile::handle_command(state, context, input).await {
         Ok(result) => result,
         Err(e) => Some(format!("LLM profile error: {e}")),
@@ -309,8 +317,9 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::agent_loop::turn::{build_state, test_config};
     use crate::agent_loop::SurfaceContext;
+    use crate::agent_loop::turn::{build_state, test_config};
+    use crate::config::{AgentId, Config};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
@@ -410,6 +419,16 @@ mod tests {
         (state, dir)
     }
 
+    async fn create_test_chat(state: &AppState, key: &str) -> i64 {
+        let session_key = format!("cli:{key}");
+        let key = key.to_string();
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id("cli", &session_key, Some(&key), "cli")
+        })
+        .await
+        .expect("chat_id")
+    }
+
     fn test_context() -> SurfaceContext {
         SurfaceContext {
             channel: "cli".to_string(),
@@ -426,11 +445,7 @@ mod tests {
     async fn handle_new_clears_session() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-new", Some("test-new"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-new").await;
 
         call_blocking(Arc::clone(&state.db), {
             move |db| {
@@ -464,11 +479,7 @@ mod tests {
     async fn handle_compact_returns_count() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-compact", Some("test-compact"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-compact").await;
 
         let messages = vec![
             Message::text("user", "hello"),
@@ -494,15 +505,17 @@ mod tests {
     async fn handle_status_shows_info() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-status", Some("test-status"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-status").await;
 
         // Act
-        let result =
-            handle_slash_command(&state, chat_id, &test_context(), "/status", Some("user-123")).await;
+        let result = handle_slash_command(
+            &state,
+            chat_id,
+            &test_context(),
+            "/status",
+            Some("user-123"),
+        )
+        .await;
 
         // Assert
         let response = result.expect("response");
@@ -540,7 +553,8 @@ mod tests {
         let chat_id = 1;
 
         // Act
-        let result = handle_slash_command(&state, chat_id, &test_context(), "/providers", None).await;
+        let result =
+            handle_slash_command(&state, chat_id, &test_context(), "/providers", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -614,15 +628,10 @@ mod tests {
     async fn status_uses_agent_llm_resolution() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-status-agent", Some("test-status-agent"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-status-agent").await;
 
         // Act
-        let result =
-            handle_slash_command(&state, chat_id, &test_context(), "/status", None).await;
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/status", None).await;
 
         // Assert
         let response = result.expect("response");
@@ -640,11 +649,7 @@ mod tests {
     async fn compact_uses_agent_llm_resolution() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-compact-agent", Some("test-compact-agent"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-compact-agent").await;
 
         let messages = vec![
             Message::text("user", "hello"),
@@ -742,5 +747,212 @@ mod tests {
 
         // Assert
         assert!(found.is_none());
+    }
+
+    // -- Step 4: SurfaceContext agent_id propagation tests --------------------------
+
+    #[tokio::test]
+    async fn handle_status_receives_surface_context() {
+        let (state, _dir) = build_test_state();
+        let chat_id = create_test_chat(&state, "test-status-surface").await;
+
+        let context = SurfaceContext {
+            channel: "cli".to_string(),
+            surface_user: "local_user".to_string(),
+            surface_thread: "test".to_string(),
+            chat_type: "cli".to_string(),
+            agent_id: "default".to_string(),
+        };
+
+        let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
+        let response = result.expect("response");
+        assert!(
+            response.contains("Provider: openai"),
+            "expected provider resolved via context agent_id: {response}"
+        );
+        assert!(
+            response.contains("Model: gpt-4o-mini"),
+            "expected model resolved via context agent_id: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_receives_surface_context() {
+        let (state, _dir) = build_test_state();
+        let chat_id = create_test_chat(&state, "test-compact-surface").await;
+
+        let messages = vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "hi"),
+        ];
+        let json = serde_json::to_string(&messages).expect("json");
+        call_blocking(Arc::clone(&state.db), {
+            move |db| db.save_session(chat_id, &json)
+        })
+        .await
+        .expect("save session");
+
+        let context = SurfaceContext {
+            channel: "cli".to_string(),
+            surface_user: "local_user".to_string(),
+            surface_thread: "test".to_string(),
+            chat_type: "cli".to_string(),
+            agent_id: "default".to_string(),
+        };
+
+        let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
+        let response = result.expect("response");
+        assert!(
+            response.contains("Compacted"),
+            "LLM should be resolved via context agent_id: {response}"
+        );
+    }
+
+    #[test]
+    fn slash_command_callers_pass_default_agent_context() {
+        let (state, _dir) = build_test_state();
+        assert_eq!(
+            state.config.default_agent.to_string(),
+            "default",
+            "test config must use default agent"
+        );
+
+        let ctx = test_context();
+        assert_eq!(
+            ctx.agent_id, "default",
+            "test_context must carry the default agent_id (matches channel caller pattern)"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_profile_resolved_for_scope_keeps_channel_scope() {
+        let (state, _dir) = build_test_state();
+        let ctx = test_context();
+
+        let result = handle_slash_command(&state, 1, &ctx, "/providers", None).await;
+        let response = result.expect("response");
+        assert!(
+            response.contains("openai"),
+            "providers listing should contain openai: {response}"
+        );
+
+        let result = handle_slash_command(&state, 1, &ctx, "/model", None).await;
+        let response = result.expect("response");
+        assert!(
+            response.contains("gpt-4o-mini"),
+            "/model should show current model for the current agent: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_command_updates_current_agent_by_default() {
+        let (state, _dir, path) = build_state_from_yaml(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  discord:
+    provider: openai
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob"#,
+        );
+        let context = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "thread".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "bob".to_string(),
+        };
+
+        let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
+        let response = result.expect("response");
+        assert!(response.contains("scope=agent:bob"), "response: {response}");
+
+        let updated = Config::load_allow_missing_api_key(Some(&path)).expect("reload");
+        assert_eq!(
+            updated
+                .agents
+                .get(&AgentId::new("bob"))
+                .and_then(|agent| agent.provider.as_deref()),
+            Some("local")
+        );
+        assert_eq!(
+            updated
+                .channels
+                .get("discord")
+                .and_then(|channel| channel.provider.as_deref()),
+            Some("openai")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_command_updates_current_agent_by_default() {
+        let (state, _dir, path) = build_state_from_yaml(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  discord:
+    model: channel-model
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob"#,
+        );
+        let context = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "thread".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "bob".to_string(),
+        };
+
+        let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
+        let response = result.expect("response");
+        assert!(response.contains("scope=agent:bob"), "response: {response}");
+
+        let updated = Config::load_allow_missing_api_key(Some(&path)).expect("reload");
+        assert_eq!(
+            updated
+                .agents
+                .get(&AgentId::new("bob"))
+                .and_then(|agent| agent.model.as_deref()),
+            Some("agent-model")
+        );
+        assert_eq!(
+            updated
+                .channels
+                .get("discord")
+                .and_then(|channel| channel.model.as_deref()),
+            Some("channel-model")
+        );
+    }
+
+    fn build_state_from_yaml(yaml: &str) -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        std::fs::write(&path, yaml).expect("write config");
+        let config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        let mut state = build_state(config, Box::new(NoOpProvider));
+        state.config_path = Some(path.clone());
+        (state, dir, path)
     }
 }

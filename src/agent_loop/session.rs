@@ -831,4 +831,144 @@ mod tests {
         assert_eq!(persisted.messages[51].content.as_text_lossy(), "concurrent");
         assert_eq!(persisted.messages[52].content.as_text_lossy(), "next");
     }
+
+    #[test]
+    fn surface_context_defaults_to_default_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8").to_string());
+
+        let context = SurfaceContext {
+            channel: "cli".to_string(),
+            surface_user: "local_user".to_string(),
+            surface_thread: "s1".to_string(),
+            chat_type: "cli".to_string(),
+            agent_id: config.default_agent.to_string(),
+        };
+
+        assert_eq!(context.agent_id, "default");
+    }
+
+    #[test]
+    fn discord_agent_scoped_thread_includes_agent_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8").to_string());
+
+        let thread =
+            config.discord_agent_surface_thread("ch123", &crate::config::AgentId::new("alice"));
+
+        assert_eq!(thread, "ch123:agent:alice");
+    }
+
+    #[tokio::test]
+    async fn same_discord_thread_different_agents_create_different_chats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+
+        let ctx_a = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: state
+                .config
+                .discord_agent_surface_thread("ch999", &crate::config::AgentId::new("agent_a")),
+            chat_type: "discord".to_string(),
+            agent_id: "agent_a".to_string(),
+        };
+        let ctx_b = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: state
+                .config
+                .discord_agent_surface_thread("ch999", &crate::config::AgentId::new("agent_b")),
+            chat_type: "discord".to_string(),
+            agent_id: "agent_b".to_string(),
+        };
+
+        let chat_a = super::resolve_chat_id(&state, &ctx_a)
+            .await
+            .expect("chat_a");
+        let chat_b = super::resolve_chat_id(&state, &ctx_b)
+            .await
+            .expect("chat_b");
+
+        assert_ne!(
+            chat_a, chat_b,
+            "different agents must produce different chat ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_discord_thread_same_agent_reuses_chat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+
+        let ctx = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: state
+                .config
+                .discord_agent_surface_thread("ch555", &crate::config::AgentId::new("agent_a")),
+            chat_type: "discord".to_string(),
+            agent_id: "agent_a".to_string(),
+        };
+
+        let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
+        let chat_second = super::resolve_chat_id(&state, &ctx).await.expect("second");
+
+        assert_eq!(chat_first, chat_second, "same agent must reuse chat id");
+    }
+
+    #[test]
+    fn web_and_telegram_keep_existing_identity_with_default_agent() {
+        let web_ctx = SurfaceContext {
+            channel: "web".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "s1".to_string(),
+            chat_type: "web".to_string(),
+            agent_id: "default".to_string(),
+        };
+        let telegram_ctx = SurfaceContext {
+            channel: "telegram".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "s2".to_string(),
+            chat_type: "telegram".to_string(),
+            agent_id: "default".to_string(),
+        };
+
+        assert_eq!(web_ctx.session_key(), "web:s1");
+        assert_eq!(telegram_ctx.session_key(), "telegram:s2");
+    }
+
+    #[tokio::test]
+    async fn web_chat_id_reentry_preserves_existing_external_chat_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+
+        let ctx = SurfaceContext {
+            channel: "web".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "chat:abc123".to_string(),
+            chat_type: "web".to_string(),
+            agent_id: "default".to_string(),
+        };
+
+        let first = super::resolve_chat_id(&state, &ctx).await.expect("first");
+        let second = super::resolve_chat_id(&state, &ctx).await.expect("second");
+
+        assert_eq!(first, second, "reentry must preserve existing chat id");
+    }
 }
