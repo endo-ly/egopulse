@@ -246,8 +246,14 @@ mod tests {
                     host: Some("127.0.0.1".to_string()),
                     port: Some(10961),
                 }),
-                discord: Some(ChannelEntry { enabled: true, agent_count: None }),
-                telegram: Some(ChannelEntry { enabled: true, agent_count: None }),
+                discord: Some(ChannelEntry {
+                    enabled: true,
+                    agent_count: None,
+                }),
+                telegram: Some(ChannelEntry {
+                    enabled: true,
+                    agent_count: None,
+                }),
             },
             provider: ProviderStatus {
                 default: "openrouter".to_string(),
@@ -436,7 +442,10 @@ mod tests {
             host: None,
             port: None,
         });
-        snapshot.channels.discord = Some(ChannelEntry { enabled: false, agent_count: None });
+        snapshot.channels.discord = Some(ChannelEntry {
+            enabled: false,
+            agent_count: None,
+        });
 
         // Act
         let output = format_snapshot(&snapshot);

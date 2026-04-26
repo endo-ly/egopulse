@@ -1167,7 +1167,10 @@ agents:
 
     use crate::config::secret_ref::{env_resolved_value as lit_val, env_yaml_value as lit_yaml};
 
-    fn test_config(agents: HashMap<super::AgentId, super::AgentConfig>, discord_enabled: bool) -> super::Config {
+    fn test_config(
+        agents: HashMap<super::AgentId, super::AgentConfig>,
+        discord_enabled: bool,
+    ) -> super::Config {
         super::Config {
             default_provider: super::ProviderId::new("openai"),
             default_model: Some("gpt-4o-mini".to_string()),

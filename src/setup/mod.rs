@@ -275,7 +275,7 @@ impl SetupApp {
             }
 
             if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
-                load_channel_fields(channels, &mut result);
+                load_channel_fields(channels, &parsed, &mut result);
             }
         }
 

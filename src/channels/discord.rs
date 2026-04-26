@@ -75,12 +75,24 @@ impl DiscordAdapter {
         }
     }
 
-    fn select_token(&self, external_chat_id: &str) -> &str {
+    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
         match parse_discord_agent_id(external_chat_id) {
-            Some(agent_id) => self.agent_token_map.get(agent_id).map(String::as_str),
-            None => None,
+            Some(agent_id) => self
+                .agent_token_map
+                .get(agent_id)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    format!("no Discord bot token found for agent '{agent_id}' in external_chat_id '{external_chat_id}'")
+                }),
+            None => {
+                if self.legacy_token.is_empty() {
+                    return Err(format!(
+                        "no agent suffix in external_chat_id '{external_chat_id}' and no legacy Discord token configured"
+                    ));
+                }
+                Ok(&self.legacy_token)
+            }
         }
-        .unwrap_or(&self.legacy_token)
     }
 }
 
@@ -96,7 +108,7 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
-        let token = self.select_token(external_chat_id);
+        let token = self.select_token(external_chat_id)?;
 
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
@@ -112,10 +124,7 @@ impl ChannelAdapter for DiscordAdapter {
                     .http_client
                     .post(&url)
                     .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
-                    .header(
-                        reqwest::header::AUTHORIZATION,
-                        format!("Bot {token}"),
-                    )
+                    .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .json(&body)
                     .send()
@@ -195,7 +204,7 @@ impl EventHandler for Handler {
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
-                    let ext_id = thread.clone();
+                    let ext_id = format!("{thread}:agent:{}", self.agent_id);
                     let chat_type = "discord".to_string();
                     move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
                 })
@@ -405,7 +414,11 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
 fn parse_discord_agent_id(external_chat_id: &str) -> Option<&str> {
     let pos = external_chat_id.find(":agent:")?;
     let agent_id = &external_chat_id[pos + ":agent:".len()..];
-    if agent_id.is_empty() { None } else { Some(agent_id) }
+    if agent_id.is_empty() {
+        None
+    } else {
+        Some(agent_id)
+    }
 }
 
 /// Discord Interaction のコマンド名と引数を handle_slash_command が

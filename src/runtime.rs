@@ -135,9 +135,7 @@ pub async fn build_app_state_with_path(
     #[cfg(feature = "channel-discord")]
     if !config.discord_agent_bots().is_empty() {
         channels.register(Arc::new(
-            crate::channels::discord::DiscordAdapter::new_for_agents(
-                &config,
-            ),
+            crate::channels::discord::DiscordAdapter::new_for_agents(&config),
         ));
     }
 
@@ -232,7 +230,14 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             .config
             .discord_agent_bots()
             .into_iter()
-            .map(|b| (b.agent_id.clone(), b.token.to_string(), b.allowed_channels.to_vec(), b.label.to_string()))
+            .map(|b| {
+                (
+                    b.agent_id.clone(),
+                    b.token.to_string(),
+                    b.allowed_channels.to_vec(),
+                    b.label.to_string(),
+                )
+            })
             .collect();
 
         if !agent_bots.is_empty() {
@@ -240,9 +245,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             for (agent_id, token, allowed_channels, label) in agent_bots {
                 let discord_state = Arc::new(state.clone());
                 let handle_name = format!("discord[{agent_id}]");
-                info!(
-                    "Starting Discord bot for agent '{agent_id}' ({label})...",
-                );
+                info!("Starting Discord bot for agent '{agent_id}' ({label})...",);
                 let aid = agent_id.clone();
                 let handle = tokio::spawn(async move {
                     crate::channels::discord::start_discord_bot_for_agent(
@@ -329,9 +332,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     }
 }
 
-async fn shutdown_channel_tasks(
-    handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)>,
-) {
+async fn shutdown_channel_tasks(handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)>) {
     for (name, mut handle) in handles {
         let shutdown_result = tokio::time::timeout(Duration::from_secs(10), &mut handle).await;
         match shutdown_result {
@@ -400,7 +401,10 @@ async fn write_startup_status(state: &AppState) {
     let telegram = state
         .config
         .channel_enabled("telegram")
-        .then_some(ChannelEntry { enabled: true, agent_count: None });
+        .then_some(ChannelEntry {
+            enabled: true,
+            agent_count: None,
+        });
 
     let snapshot = StatusSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),

@@ -265,6 +265,25 @@ pub(crate) fn save_config(
         completion_summary.push(format!("Previous config backed up to: {backup}"));
     }
 
+    let existing_non_default = original_yaml
+        .as_ref()
+        .and_then(|yaml| yaml.as_mapping())
+        .and_then(|m| m.get(serde_yml::Value::String("agents".into())))
+        .and_then(|a| a.as_mapping())
+        .map(|m| {
+            m.keys()
+                .filter_map(|k| k.as_str())
+                .filter(|id| *id != "default")
+                .count()
+        })
+        .unwrap_or(0);
+    if existing_non_default > 0 {
+        completion_summary.push(format!(
+            "⚠ Existing {existing_non_default} custom agent(s) preserved in backup; \
+             re-add them to agents in config YAML if needed"
+        ));
+    }
+
     Ok((backup_path, completion_summary))
 }
 

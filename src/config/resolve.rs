@@ -332,7 +332,8 @@ impl Config {
             return vec![];
         }
 
-        self.agents
+        let mut bots: Vec<_> = self
+            .agents
             .iter()
             .filter_map(|(agent_id, agent)| {
                 let token = agent.discord.bot_token.as_ref()?;
@@ -347,17 +348,30 @@ impl Config {
                         .unwrap_or_default(),
                 })
             })
-            .collect()
+            .collect();
+        bots.sort_by_key(|b| b.agent_id.as_str());
+        bots
     }
 }
 
 /// Information about an agent with its own Discord bot token.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DiscordAgentBot<'a> {
     pub agent_id: &'a AgentId,
     pub label: &'a str,
     pub token: &'a str,
     pub allowed_channels: &'a [u64],
+}
+
+impl std::fmt::Debug for DiscordAgentBot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordAgentBot")
+            .field("agent_id", &self.agent_id)
+            .field("label", &self.label)
+            .field("token", &"<redacted>")
+            .field("allowed_channels", &self.allowed_channels)
+            .finish()
+    }
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.

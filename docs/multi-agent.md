@@ -62,9 +62,9 @@ agents:
 - DM は常に許可される
 - 各 Bot のメッセージは Agent ID でタグ付けされたセッションに記録される
 
-### Legacy 互換
+### `channels.discord.bot_token` について
 
-`channels.discord.bot_token` は単一 Bot 運用向けのレガシー設定。マルチ Bot 環境では `agents.<id>.discord.bot_token` を使用する。
+`channels.discord.bot_token` は読み込まれない。Discord Bot を起動するには、各 Agent に `agents.<id>.discord.bot_token` を設定する必要がある。`channels.discord` には `enabled: true` のみを指定する。
 
 ## 内部セッション管理
 
@@ -73,4 +73,3 @@ agents:
 ## 関連ドキュメント
 
 - 設定仕様: [config.md](./config.md)（`agents` セクション）
-- デプロイ手順: [deploy.md](./deploy.md)（Discord Multi-Bot 運用）

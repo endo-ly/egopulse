@@ -34,6 +34,7 @@ pub(crate) fn update_field_visibility(fields: &mut [Field]) {
 
 pub(crate) fn load_channel_fields(
     channels: &serde_yml::Value,
+    root: &serde_yml::Value,
     result: &mut HashMap<String, String>,
 ) {
     let Some(ch_map) = channels.as_mapping() else {
@@ -58,6 +59,24 @@ pub(crate) fn load_channel_fields(
         result,
         "TELEGRAM_BOT_USERNAME",
     );
+
+    // Fallback: if DISCORD_BOT_TOKEN is not set from channels.discord.bot_token,
+    // check agents.default.discord.bot_token (the new config location).
+    if !result.contains_key("DISCORD_BOT_TOKEN") || result["DISCORD_BOT_TOKEN"].is_empty() {
+        if let Some(token) = root
+            .as_mapping()
+            .and_then(|m| m.get(yaml_key("agents")))
+            .and_then(|a| a.as_mapping())
+            .and_then(|m| m.get(yaml_key("default")))
+            .and_then(|a| a.as_mapping())
+            .and_then(|m| m.get(yaml_key("discord")))
+            .and_then(|d| d.as_mapping())
+            .and_then(|m| m.get(yaml_key("bot_token")))
+            .and_then(|v| v.as_str())
+        {
+            result.insert("DISCORD_BOT_TOKEN".into(), token.to_string());
+        }
+    }
 }
 
 pub(crate) fn extract_existing_state_root(
