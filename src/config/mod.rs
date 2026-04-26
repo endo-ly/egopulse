@@ -1105,11 +1105,7 @@ agents:
     label: Alice
     provider: nonexistent"#,
         );
-        let config = Config::load(Some(&file_path)).expect("load config");
-
-        let error = config
-            .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
-            .expect_err("should fail");
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
 
         assert!(matches!(
             error,

@@ -319,6 +319,7 @@ mod tests {
 
     use crate::agent_loop::SurfaceContext;
     use crate::agent_loop::turn::{build_state, test_config};
+    use crate::config::{AgentId, Config};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
@@ -839,7 +840,119 @@ mod tests {
         let response = result.expect("response");
         assert!(
             response.contains("gpt-4o-mini"),
-            "/model should show current model for the channel: {response}"
+            "/model should show current model for the current agent: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_command_updates_current_agent_by_default() {
+        let (state, _dir, path) = build_state_from_yaml(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  discord:
+    provider: openai
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob"#,
+        );
+        let context = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "thread".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "bob".to_string(),
+        };
+
+        let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
+        let response = result.expect("response");
+        assert!(response.contains("scope=agent:bob"), "response: {response}");
+
+        let updated = Config::load_allow_missing_api_key(Some(&path)).expect("reload");
+        assert_eq!(
+            updated
+                .agents
+                .get(&AgentId::new("bob"))
+                .and_then(|agent| agent.provider.as_deref()),
+            Some("local")
+        );
+        assert_eq!(
+            updated
+                .channels
+                .get("discord")
+                .and_then(|channel| channel.provider.as_deref()),
+            Some("openai")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_command_updates_current_agent_by_default() {
+        let (state, _dir, path) = build_state_from_yaml(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  discord:
+    model: channel-model
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob"#,
+        );
+        let context = SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: "user".to_string(),
+            surface_thread: "thread".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "bob".to_string(),
+        };
+
+        let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
+        let response = result.expect("response");
+        assert!(response.contains("scope=agent:bob"), "response: {response}");
+
+        let updated = Config::load_allow_missing_api_key(Some(&path)).expect("reload");
+        assert_eq!(
+            updated
+                .agents
+                .get(&AgentId::new("bob"))
+                .and_then(|agent| agent.model.as_deref()),
+            Some("agent-model")
+        );
+        assert_eq!(
+            updated
+                .channels
+                .get("discord")
+                .and_then(|channel| channel.model.as_deref()),
+            Some("channel-model")
+        );
+    }
+
+    fn build_state_from_yaml(yaml: &str) -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        std::fs::write(&path, yaml).expect("write config");
+        let config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        let mut state = build_state(config, Box::new(NoOpProvider));
+        state.config_path = Some(path.clone());
+        (state, dir, path)
     }
 }

@@ -135,6 +135,7 @@ pub(super) fn build_config(
     validate_channel_provider_references(&providers, &channels)?;
 
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
+    validate_agent_provider_references(&providers, &agents)?;
     let default_agent =
         normalize_string(file_default_agent).unwrap_or_else(|| "default".to_string());
     let default_agent = AgentId::new(&default_agent);
@@ -414,6 +415,24 @@ fn validate_channel_provider_references(
 ) -> Result<(), ConfigError> {
     for channel in channels.values() {
         if let Some(provider) = channel.provider.as_ref() {
+            let provider_id = ProviderId::new(provider);
+            if !providers.contains_key(&provider_id) {
+                return Err(ConfigError::InvalidProviderReference {
+                    provider: provider.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_agent_provider_references(
+    providers: &HashMap<ProviderId, ProviderConfig>,
+    agents: &HashMap<AgentId, AgentConfig>,
+) -> Result<(), ConfigError> {
+    for agent in agents.values() {
+        if let Some(provider) = agent.provider.as_ref() {
             let provider_id = ProviderId::new(provider);
             if !providers.contains_key(&provider_id) {
                 return Err(ConfigError::InvalidProviderReference {
