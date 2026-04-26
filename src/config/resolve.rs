@@ -319,6 +319,45 @@ impl Config {
     ) -> Result<(), crate::error::EgoPulseError> {
         super::persist::save_config_with_secrets(self, yaml_path)
     }
+
+    /// Returns the list of agents that have their own Discord bot token configured.
+    ///
+    /// Each returned entry contains the agent's id, label, resolved token string,
+    /// and allowed channel slice for this bot.
+    ///
+    /// Agents without a `discord.bot_token` are excluded. When `channels.discord`
+    /// is disabled no agents are returned.
+    pub fn discord_agent_bots(&self) -> Vec<DiscordAgentBot<'_>> {
+        if !self.channel_enabled("discord") {
+            return vec![];
+        }
+
+        self.agents
+            .iter()
+            .filter_map(|(agent_id, agent)| {
+                let token = agent.discord.bot_token.as_ref()?;
+                Some(DiscordAgentBot {
+                    agent_id,
+                    label: agent.label.as_str(),
+                    token: token.value(),
+                    allowed_channels: agent
+                        .discord
+                        .allowed_channels
+                        .as_deref()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Information about an agent with its own Discord bot token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscordAgentBot<'a> {
+    pub agent_id: &'a AgentId,
+    pub label: &'a str,
+    pub token: &'a str,
+    pub allowed_channels: &'a [u64],
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.

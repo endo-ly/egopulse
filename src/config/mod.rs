@@ -337,12 +337,12 @@ mod tests {
     //! YAML 設定ファイルから provider ベースの設定を構築し、
     //! channel ごとの override を実効 LLM 設定へ解決する。
 
+    use std::collections::HashMap;
     use std::io::Write;
+    use std::path::PathBuf;
 
     use secrecy::ExposeSecret;
     use serial_test::serial;
-
-    use std::path::PathBuf;
 
     use super::{Config, default_state_root, default_workspace_dir};
     use crate::error::ConfigError;
@@ -1161,5 +1161,190 @@ agents:
                 .join("bob")
                 .join("AGENTS.md")
         );
+    }
+
+    // --- Step 1: Discord Agent Bot Config Helper tests ---
+
+    use crate::config::secret_ref::{env_resolved_value as lit_val, env_yaml_value as lit_yaml};
+
+    fn test_config(agents: HashMap<super::AgentId, super::AgentConfig>, discord_enabled: bool) -> super::Config {
+        super::Config {
+            default_provider: super::ProviderId::new("openai"),
+            default_model: Some("gpt-4o-mini".to_string()),
+            providers: HashMap::from([(
+                super::ProviderId::new("openai"),
+                super::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(lit_val("OPENAI_API_KEY", "sk-test")),
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                },
+            )]),
+            state_root: "/tmp/egopulse-test".to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: HashMap::from([(
+                super::ChannelName::new("discord"),
+                super::ChannelConfig {
+                    enabled: Some(discord_enabled),
+                    ..Default::default()
+                },
+            )]),
+            default_agent: super::AgentId::new("default"),
+            agents,
+        }
+    }
+
+    #[test]
+    fn discord_agents_returns_only_agents_with_token() {
+        // Arrange
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("alice"),
+            super::AgentConfig {
+                label: "Alice".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(lit_val("ALICE_TOKEN", "token-a")),
+                    file_bot_token: Some(lit_yaml("ALICE_TOKEN")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            super::AgentId::new("bob"),
+            super::AgentConfig {
+                label: "Bob".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(lit_val("BOB_TOKEN", "token-b")),
+                    file_bot_token: Some(lit_yaml("BOB_TOKEN")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            super::AgentId::new("carol"),
+            super::AgentConfig {
+                label: "Carol".to_string(),
+                ..Default::default()
+            },
+        );
+        let config = test_config(agents, true);
+
+        // Act
+        let bots = config.discord_agent_bots();
+
+        // Assert
+        assert_eq!(bots.len(), 2, "only alice and bob should have tokens");
+        let ids: Vec<&str> = bots.iter().map(|b| b.agent_id.as_str()).collect();
+        assert!(ids.contains(&"alice"));
+        assert!(ids.contains(&"bob"));
+        assert!(!ids.contains(&"carol"));
+    }
+
+    #[test]
+    fn discord_agents_preserve_agent_id_and_label() {
+        // Arrange
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("developer"),
+            super::AgentConfig {
+                label: "Dev Bot".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(lit_val("DEV_TOKEN", "dev-secret")),
+                    file_bot_token: Some(lit_yaml("DEV_TOKEN")),
+                    allowed_channels: Some(vec![42, 99]),
+                },
+                ..Default::default()
+            },
+        );
+        let config = test_config(agents, true);
+
+        // Act
+        let bots = config.discord_agent_bots();
+
+        // Assert
+        assert_eq!(bots.len(), 1);
+        let bot = &bots[0];
+        assert_eq!(bot.agent_id.as_str(), "developer");
+        assert_eq!(bot.label, "Dev Bot");
+        assert_eq!(bot.token, "dev-secret");
+        assert_eq!(bot.allowed_channels, &[42, 99]);
+    }
+
+    #[test]
+    fn discord_agents_allow_empty_allowed_channels_as_guild_reject() {
+        // Arrange
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("bouncer"),
+            super::AgentConfig {
+                label: "Bouncer".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(lit_val("BOUNCER_TOKEN", "t")),
+                    file_bot_token: Some(lit_yaml("BOUNCER_TOKEN")),
+                    allowed_channels: None,
+                },
+                ..Default::default()
+            },
+        );
+        let config = test_config(agents, true);
+
+        // Act
+        let bots = config.discord_agent_bots();
+
+        // Assert
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].allowed_channels, &[] as &[u64]);
+    }
+
+    #[test]
+    fn discord_disabled_returns_no_agents() {
+        // Arrange
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("alice"),
+            super::AgentConfig {
+                label: "Alice".to_string(),
+                discord: super::AgentDiscordConfig {
+                    bot_token: Some(lit_val("ALICE_TOKEN", "token-a")),
+                    file_bot_token: Some(lit_yaml("ALICE_TOKEN")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let config = test_config(agents, false);
+
+        // Act
+        let bots = config.discord_agent_bots();
+
+        // Assert
+        assert!(bots.is_empty());
+    }
+
+    #[test]
+    fn discord_agents_returns_empty_when_no_agents_have_token() {
+        // Arrange
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("default"),
+            super::AgentConfig {
+                label: "Default".to_string(),
+                ..Default::default()
+            },
+        );
+        let config = test_config(agents, true);
+
+        // Act
+        let bots = config.discord_agent_bots();
+
+        // Assert
+        assert!(bots.is_empty());
     }
 }
