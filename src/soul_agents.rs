@@ -33,18 +33,20 @@ impl SoulAgentsLoader {
         self.load_base_soul(channel_soul_path, agent_id)
     }
 
+    fn read_agent_file(&self, agent_id: &str, file_name: &str) -> Option<String> {
+        if !safe_agent_id(agent_id) {
+            return None;
+        }
+        read_trimmed(&self.agents_dir.join(agent_id).join(file_name))
+    }
+
     fn load_base_soul(
         &self,
         channel_soul_path: Option<&str>,
         agent_id: Option<&str>,
     ) -> Option<String> {
-        if let Some(id) = agent_id {
-            if safe_agent_id(id) {
-                let path = self.agents_dir.join(id).join("SOUL.md");
-                if let Some(content) = read_trimmed(&path) {
-                    return Some(content);
-                }
-            }
+        if let Some(content) = agent_id.and_then(|id| self.read_agent_file(id, "SOUL.md")) {
+            return Some(content);
         }
 
         if let Some(soul_path) = channel_soul_path {
@@ -100,13 +102,7 @@ impl SoulAgentsLoader {
         agent_id: Option<&str>,
     ) -> Option<String> {
         let global = self.load_global_agents();
-        let agent_agents = agent_id.and_then(|id| {
-            if safe_agent_id(id) {
-                read_trimmed(&self.agents_dir.join(id).join("AGENTS.md"))
-            } else {
-                None
-            }
-        });
+        let agent_agents = agent_id.and_then(|id| self.read_agent_file(id, "AGENTS.md"));
 
         if global.is_none() && agent_agents.is_none() {
             return None;
@@ -134,13 +130,12 @@ impl SoulAgentsLoader {
     }
 }
 
-/// `Path::components()` がすべて `Normal` であることを検証し、
-/// `../` や `./` を含むパストラバーサルを弾く。
 fn safe_agent_id(id: &str) -> bool {
     !id.is_empty()
-        && Path::new(id)
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains(':')
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -535,5 +530,10 @@ mod tests {
                 .is_none()
         );
         assert!(loader.load_soul("web", "t1", None, Some("")).is_none());
+        assert!(
+            loader
+                .load_soul("web", "t1", None, Some("alice/bob"))
+                .is_none()
+        );
     }
 }

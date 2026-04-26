@@ -44,11 +44,9 @@
 │   ├── groups/
 │   │   ├── telegram/
 │   │   │   └── {chat_id}/
-│   │   │       ├── AGENTS.md
 │   │   │       └── conversations/
 │   │   └── discord/
 │   │       └── {chat_id}/
-│   │           ├── AGENTS.md
 │   │           └── conversations/
 │   └── status.json
 │

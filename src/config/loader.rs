@@ -265,7 +265,7 @@ fn validate_agent_id(id: &AgentId) -> Result<(), ConfigError> {
     if s.is_empty() || s.trim().is_empty() {
         return Err(ConfigError::InvalidAgentId { id: id.to_string() });
     }
-    if s.contains("..") || s.contains('/') || s.contains('\\') {
+    if s.contains("..") || s.contains('/') || s.contains('\\') || s.contains(':') {
         return Err(ConfigError::InvalidAgentId { id: id.to_string() });
     }
     Ok(())

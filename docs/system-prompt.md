@@ -78,7 +78,7 @@ Your name is EgoPulse. Current channel: {channel}.
 
 ### 2.3 Memories セクション
 
-グローバル AGENTS.md またはチャット別 AGENTS.md が存在する場合、Identity セクションの直後（Skills の直前）に配置される。
+グローバル AGENTS.md またはエージェント別 AGENTS.md が存在する場合、Identity セクションの直後（Skills の直前）に配置される。
 
 ```
 # Memories

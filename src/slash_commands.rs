@@ -418,6 +418,16 @@ mod tests {
         (state, dir)
     }
 
+    async fn create_test_chat(state: &AppState, key: &str) -> i64 {
+        let session_key = format!("cli:{key}");
+        let key = key.to_string();
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id("cli", &session_key, Some(&key), "cli")
+        })
+        .await
+        .expect("chat_id")
+    }
+
     fn test_context() -> SurfaceContext {
         SurfaceContext {
             channel: "cli".to_string(),
@@ -434,11 +444,7 @@ mod tests {
     async fn handle_new_clears_session() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-new", Some("test-new"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-new").await;
 
         call_blocking(Arc::clone(&state.db), {
             move |db| {
@@ -472,11 +478,7 @@ mod tests {
     async fn handle_compact_returns_count() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-compact", Some("test-compact"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-compact").await;
 
         let messages = vec![
             Message::text("user", "hello"),
@@ -502,11 +504,7 @@ mod tests {
     async fn handle_status_shows_info() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "cli:test-status", Some("test-status"), "cli")
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-status").await;
 
         // Act
         let result = handle_slash_command(
@@ -629,16 +627,7 @@ mod tests {
     async fn status_uses_agent_llm_resolution() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:test-status-agent",
-                Some("test-status-agent"),
-                "cli",
-            )
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-status-agent").await;
 
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/status", None).await;
@@ -659,16 +648,7 @@ mod tests {
     async fn compact_uses_agent_llm_resolution() {
         // Arrange
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:test-compact-agent",
-                Some("test-compact-agent"),
-                "cli",
-            )
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-compact-agent").await;
 
         let messages = vec![
             Message::text("user", "hello"),
@@ -773,16 +753,7 @@ mod tests {
     #[tokio::test]
     async fn handle_status_receives_surface_context() {
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:test-status-surface",
-                Some("test-status-surface"),
-                "cli",
-            )
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-status-surface").await;
 
         let context = SurfaceContext {
             channel: "cli".to_string(),
@@ -807,16 +778,7 @@ mod tests {
     #[tokio::test]
     async fn handle_compact_receives_surface_context() {
         let (state, _dir) = build_test_state();
-        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:test-compact-surface",
-                Some("test-compact-surface"),
-                "cli",
-            )
-        })
-        .await
-        .expect("chat_id");
+        let chat_id = create_test_chat(&state, "test-compact-surface").await;
 
         let messages = vec![
             Message::text("user", "hello"),
