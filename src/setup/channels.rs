@@ -74,14 +74,12 @@ pub(crate) fn extract_existing_state_root(
 pub(crate) fn build_channel_configs(
     auth_token: String,
     discord_enabled: bool,
-    discord_bot_token: String,
     telegram_enabled: bool,
     telegram_bot_token: String,
     telegram_bot_username: String,
 ) -> HashMap<crate::config::ChannelName, crate::config::ChannelConfig> {
     use crate::config::secret_ref::{
-        DISCORD_BOT_TOKEN_ENV_NAME, TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME,
-        env_resolved_value, env_yaml_value,
+        TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value,
     };
     use crate::config::{ChannelConfig, ChannelName};
 
@@ -104,11 +102,6 @@ pub(crate) fn build_channel_configs(
             ChannelName::new("discord"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(env_resolved_value(
-                    DISCORD_BOT_TOKEN_ENV_NAME,
-                    discord_bot_token,
-                )),
-                file_bot_token: Some(env_yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
                 ..Default::default()
             },
         );
@@ -193,7 +186,6 @@ mod tests {
         let channels = build_channel_configs(
             "web-token".to_string(),
             true,
-            "discord-token".to_string(),
             true,
             "telegram-token".to_string(),
             "botname".to_string(),
@@ -206,10 +198,8 @@ mod tests {
         assert!(web_file.contains("id: WEB_AUTH_TOKEN"));
 
         let discord = channels.get("discord").expect("discord");
-        let discord_file =
-            serde_yml::to_string(discord.file_bot_token.as_ref().expect("discord file"))
-                .expect("serialize discord file");
-        assert!(discord_file.contains("id: DISCORD_BOT_TOKEN"));
+        assert!(discord.bot_token.is_none());
+        assert!(discord.file_bot_token.is_none());
 
         let telegram = channels.get("telegram").expect("telegram");
         let telegram_file =
