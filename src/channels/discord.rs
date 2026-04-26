@@ -135,44 +135,48 @@ impl ChannelAdapter for DiscordAdapter {
 /// serenity EventHandler。インバウンドメッセージを処理する。
 struct Handler {
     app_state: Arc<AppState>,
+    agent_id: String,
+    agent_label: String,
+    allowed_channels: Vec<u64>,
+}
+
+impl Handler {
+    fn make_context(&self, user: &str, thread: &str) -> SurfaceContext {
+        SurfaceContext {
+            channel: "discord".to_string(),
+            surface_user: user.to_string(),
+            surface_thread: format!("{thread}:agent:{}", self.agent_id),
+            chat_type: "discord".to_string(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+
+    fn guild_allowed(&self, channel_id: u64) -> bool {
+        self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id)
+    }
 }
 
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: DiscordMessage) {
-        // bot 自身のメッセージは無視
         if msg.author.bot {
             return;
         }
 
         let text = msg.content.clone();
-        let external_channel_id = msg.channel_id.get();
+        let channel_id = msg.channel_id.get();
 
-        // ギルドメッセージは allowed_channels に含まれるチャンネルのみ応答する。
-        // DM は個人チャネルとして常に通す。
-        let allowed_channels = self
-            .app_state
-            .config
-            .channels
-            .get("discord")
-            .and_then(|c| c.allowed_channels.clone())
-            .unwrap_or_default();
-        if msg.guild_id.is_some()
-            && (allowed_channels.is_empty() || !allowed_channels.contains(&external_channel_id))
-        {
+        if msg.guild_id.is_some() && !self.guild_allowed(channel_id) {
             return;
         }
 
-        let external_chat_id = external_channel_id.to_string();
+        let thread = channel_id.to_string();
 
-        // --- スラッシュコマンドインターセプト ---
-        // process_turn より先に chat_id を解決し、
-        // スラッシュコマンドであればエージェントループに入らずに即応答する。
         if crate::slash_commands::is_slash_command(&text) {
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
-                    let ext_id = external_chat_id.clone();
+                    let ext_id = thread.clone();
                     let chat_type = "discord".to_string();
                     move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
                 })
@@ -181,13 +185,7 @@ impl EventHandler for Handler {
             match slash_chat_id {
                 Ok(chat_id) => {
                     let sender_id = msg.author.id.get().to_string();
-                    let slash_context = SurfaceContext {
-                        channel: "discord".to_string(),
-                        surface_user: msg.author.name.clone(),
-                        surface_thread: external_chat_id.clone(),
-                        chat_type: "discord".to_string(),
-                        agent_id: self.app_state.config.default_agent.to_string(),
-                    };
+                    let slash_context = self.make_context(&msg.author.name, &thread);
                     if let Some(response) = crate::slash_commands::handle_slash_command(
                         &self.app_state,
                         chat_id,
@@ -220,33 +218,23 @@ impl EventHandler for Handler {
                 }
             }
         }
-        // --- インターセプトここまで ---
 
         if text.is_empty() {
             return;
         }
 
-        let sender_name = msg.author.name.clone();
-
-        let context = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: sender_name,
-            surface_thread: external_chat_id.clone(),
-            chat_type: "discord".to_string(),
-            agent_id: self.app_state.config.default_agent.to_string(),
-        };
+        let context = self.make_context(&msg.author.name, &thread);
 
         info!(
-            channel_id = external_chat_id,
+            channel_id = channel_id,
+            agent = %self.agent_id,
             sender = %context.surface_user,
             text_length = text.len(),
             "Discord message received"
         );
 
-        // タイピングインジケーター開始
         let typing = msg.channel_id.start_typing(&ctx.http);
 
-        // session 解決は process_turn() に一任 (二重解決を避ける)
         match crate::agent_loop::process_turn(&self.app_state, &context, &text).await {
             Ok(response) => {
                 drop(typing);
@@ -257,7 +245,8 @@ impl EventHandler for Handler {
             Err(e) => {
                 drop(typing);
                 error!(
-                    channel_id = external_chat_id,
+                    channel_id = channel_id,
+                    agent = %self.agent_id,
                     error_kind = e.error_kind(),
                     error = %e,
                     error_debug = ?e,
@@ -271,14 +260,16 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("Discord bot connected as {}", ready.user.name);
+        info!(
+            "Discord bot ({}) connected as {}",
+            self.agent_label, ready.user.name
+        );
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
             .iter()
             .map(|c| {
                 let builder =
                     serenity::builder::CreateCommand::new(c.name).description(c.description);
-                // 引数を持つコマンドには String option を追加
                 if c.usage.contains('[') {
                     builder.add_option(
                         serenity::builder::CreateCommandOption::new(
@@ -308,7 +299,6 @@ impl EventHandler for Handler {
             return;
         };
 
-        // Discord 3秒ルール対応: 即座に defer して "thinking..." を表示
         if let Err(e) = cmd
             .create_response(
                 &ctx.http,
@@ -323,15 +313,13 @@ impl EventHandler for Handler {
         }
 
         let command_text = interaction_to_command_text(&cmd.data.name, &cmd.data.options);
-
-        // チャネル ID を解決して内部 chat_id を取得
         let channel_id = cmd.channel_id.get();
-        let external_chat_id = channel_id.to_string();
+        let thread = channel_id.to_string();
 
         let slash_chat_id =
             crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                 let channel = "discord".to_string();
-                let ext_id = external_chat_id.clone();
+                let ext_id = thread.clone();
                 let chat_type = "discord".to_string();
                 move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
             })
@@ -340,13 +328,7 @@ impl EventHandler for Handler {
         let response_text = match slash_chat_id {
             Ok(chat_id) => {
                 let sender_id = cmd.user.id.get().to_string();
-                let slash_context = SurfaceContext {
-                    channel: "discord".to_string(),
-                    surface_user: cmd.user.name.clone(),
-                    surface_thread: external_chat_id.clone(),
-                    chat_type: "discord".to_string(),
-                    agent_id: self.app_state.config.default_agent.to_string(),
-                };
+                let slash_context = self.make_context(&cmd.user.name, &thread);
                 crate::slash_commands::handle_slash_command(
                     &self.app_state,
                     chat_id,
@@ -363,7 +345,6 @@ impl EventHandler for Handler {
             }
         };
 
-        // defer 後の編集で最終応答を送信
         if let Err(e) = cmd
             .edit_response(
                 &ctx.http,
@@ -423,9 +404,55 @@ pub async fn start_discord_bot_for_agent(
     agent_id: &crate::config::AgentId,
     allowed_channels: &[u64],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = agent_id;
-    let _ = allowed_channels;
-    start_discord_bot(state, token.to_string()).await
+    let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT;
+
+    let agent_label = state
+        .config
+        .agents
+        .get(agent_id)
+        .map(|a| a.label.as_str())
+        .unwrap_or(agent_id.as_str())
+        .to_string();
+
+    info!(
+        "Starting Discord bot for agent '{}' ({agent_label}) ...",
+        agent_id.as_str(),
+    );
+
+    let handler = Handler {
+        app_state: state,
+        agent_id: agent_id.to_string(),
+        agent_label,
+        allowed_channels: allowed_channels.to_vec(),
+    };
+
+    let mut client = Client::builder(token, intents)
+        .event_handler(handler)
+        .await
+        .map_err(|e| {
+            error!("Discord bot failed to start: {e}");
+            e
+        })?;
+
+    let shard_manager = client.shard_manager.clone();
+    let shutdown_task = tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Discord bot failed to listen for Ctrl-C: {e}");
+            return;
+        }
+        shard_manager.shutdown_all().await;
+    });
+
+    client.start().await.map_err(|e| {
+        error!("Discord bot error: {e}");
+        e
+    })?;
+
+    shutdown_task.abort();
+
+    Ok(())
 }
 
 /// Starts the Discord bot and supervises its gateway lifecycle.
@@ -433,13 +460,34 @@ pub async fn start_discord_bot(
     state: Arc<AppState>,
     token: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // legacy path: use default agent. Prefer start_discord_bot_for_agent instead.
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
+    let default_agent = state.config.default_agent.to_string();
+    let agent_label = state
+        .config
+        .agents
+        .get(&state.config.default_agent)
+        .map(|a| a.label.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let allowed_channels = state
+        .config
+        .channels
+        .get("discord")
+        .and_then(|c| c.allowed_channels.clone())
+        .unwrap_or_default();
+
     info!("Starting Discord bot (requesting MESSAGE_CONTENT intent)...");
 
-    let handler = Handler { app_state: state };
+    let handler = Handler {
+        app_state: state,
+        agent_id: default_agent,
+        agent_label,
+        allowed_channels,
+    };
 
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
