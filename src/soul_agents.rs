@@ -1,19 +1,14 @@
-//! SOUL.md / AGENTS.md の読み込みと system prompt セクション構築。
-//!
-//! 3層フォールバックチェーンによる SOUL 選択機構を提供。
-
 use std::io;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SOUL_MD: &str = include_str!("default_soul.md");
 
-/// SOUL.md / AGENTS.md の読み込みと system prompt セクション構築。
 pub struct SoulAgentsLoader {
     state_root: PathBuf,
     soul_path: PathBuf,
     agents_path: PathBuf,
+    agents_dir: PathBuf,
     souls_dir: PathBuf,
-    groups_dir: PathBuf,
 }
 
 impl SoulAgentsLoader {
@@ -22,48 +17,36 @@ impl SoulAgentsLoader {
             state_root: PathBuf::from(&config.state_root),
             soul_path: config.soul_path(),
             agents_path: config.agents_path(),
+            agents_dir: PathBuf::from(&config.state_root).join("agents"),
             souls_dir: config.souls_dir(),
-            groups_dir: config.groups_dir(),
         }
     }
 
-    /// 3層フォールバックチェーンで SOUL を読み込む:
-    /// 1. account_id soul_path (将来用, 現状は None → skip)
-    /// 2. channel_soul_path (ChannelConfig.soul_path → 相対パスは souls/ から解決)
-    /// 3. state_root/SOUL.md (デフォルト)
-    /// 4. チャット別 SOUL.md (あればグローバルを完全上書き)
+    /// Agent SOUL → channel soul_path → global SOUL.md
     pub fn load_soul(
         &self,
-        channel: &str,
-        thread: &str,
+        _channel: &str,
+        _thread: &str,
         channel_soul_path: Option<&str>,
-        account_id: Option<&str>,
+        agent_id: Option<&str>,
     ) -> Option<String> {
-        let base_soul = self.load_base_soul(channel_soul_path, account_id);
-
-        // チャット別 SOUL.md があればグローバルを完全上書き
-        if let Some(path) = self.chat_soul_path(channel, thread) {
-            if let Some(chat_soul) = read_trimmed(&path) {
-                return Some(chat_soul);
-            }
-        }
-
-        base_soul
+        self.load_base_soul(channel_soul_path, agent_id)
     }
 
-    /// ベース SOUL を読み込む（アカウント → チャネル → デフォルト）
     fn load_base_soul(
         &self,
         channel_soul_path: Option<&str>,
-        account_id: Option<&str>,
+        agent_id: Option<&str>,
     ) -> Option<String> {
-        // 1. アカウント別 (将来用)
-        if let Some(_account_id) = account_id {
-            // 将来の multi-account 実装時に有効化
-            // 現状はスキップ
+        if let Some(id) = agent_id {
+            if safe_agent_id(id) {
+                let path = self.agents_dir.join(id).join("SOUL.md");
+                if let Some(content) = read_trimmed(&path) {
+                    return Some(content);
+                }
+            }
         }
 
-        // 2. チャネル別 soul_path
         if let Some(soul_path) = channel_soul_path {
             let candidates = self.resolve_soul_path(soul_path);
             for candidate in candidates {
@@ -73,7 +56,6 @@ impl SoulAgentsLoader {
             }
         }
 
-        // 3. デフォルト SOUL.md
         read_trimmed(&self.soul_path)
     }
 
@@ -107,48 +89,37 @@ impl SoulAgentsLoader {
         read_trimmed(&self.agents_path)
     }
 
-    /// チャット別 AGENTS.md を読み込む
-    pub fn load_chat_agents(&self, channel: &str, thread: &str) -> Option<String> {
-        let path = self.chat_agents_path(channel, thread)?;
-        read_trimmed(&path)
-    }
-
-    /// System prompt 用の `<soul>` セクションを構築。
-    /// `<soul>{content}</soul>` + identity line
     pub fn build_soul_section(&self, content: &str, channel: &str) -> String {
         format!("<soul>\n{content}\n</soul>\n\nYour name is EgoPulse. Current channel: {channel}.")
     }
 
-    /// System prompt 用の `# Memories` セクションを構築。
-    /// global_agents + chat_agents を結合。どちらもなければ None を返す。
-    pub fn build_agents_section(&self, channel: &str, thread: &str) -> Option<String> {
+    pub fn build_agents_section(
+        &self,
+        _channel: &str,
+        _thread: &str,
+        agent_id: Option<&str>,
+    ) -> Option<String> {
         let global = self.load_global_agents();
-        let chat = self.load_chat_agents(channel, thread);
+        let agent_agents = agent_id.and_then(|id| {
+            if safe_agent_id(id) {
+                read_trimmed(&self.agents_dir.join(id).join("AGENTS.md"))
+            } else {
+                None
+            }
+        });
 
-        if global.is_none() && chat.is_none() {
+        if global.is_none() && agent_agents.is_none() {
             return None;
         }
 
         let mut section = String::from("# Memories\n");
-        if let Some(global_content) = global {
-            section.push_str(&format!("\n<agents>\n{global_content}\n</agents>\n"));
+        if let Some(content) = global {
+            section.push_str(&format!("\n<agents>\n{content}\n</agents>\n"));
         }
-        if let Some(chat_content) = chat {
-            section.push_str(&format!(
-                "\n<chat-agents>\n{chat_content}\n</chat-agents>\n"
-            ));
+        if let Some(content) = agent_agents {
+            section.push_str(&format!("\n<agents>\n{content}\n</agents>\n"));
         }
         Some(section)
-    }
-
-    fn chat_agents_path(&self, channel: &str, thread: &str) -> Option<PathBuf> {
-        safe_path_components(channel, thread)?;
-        Some(self.groups_dir.join(channel).join(thread).join("AGENTS.md"))
-    }
-
-    fn chat_soul_path(&self, channel: &str, thread: &str) -> Option<PathBuf> {
-        safe_path_components(channel, thread)?;
-        Some(self.groups_dir.join(channel).join(thread).join("SOUL.md"))
     }
 
     pub fn provision_default_soul(&self) -> io::Result<bool> {
@@ -165,17 +136,11 @@ impl SoulAgentsLoader {
 
 /// `Path::components()` がすべて `Normal` であることを検証し、
 /// `../` や `./` を含むパストラバーサルを弾く。
-fn safe_path_components(channel: &str, thread: &str) -> Option<()> {
-    let ok = |s: &str| {
-        Path::new(s)
+fn safe_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && Path::new(id)
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
-    };
-    if ok(channel) && ok(thread) {
-        Some(())
-    } else {
-        None
-    }
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -198,8 +163,8 @@ mod tests {
             state_root: dir.to_path_buf(),
             soul_path: dir.join("SOUL.md"),
             agents_path: dir.join("AGENTS.md"),
+            agents_dir: dir.join("agents"),
             souls_dir: dir.join("souls"),
-            groups_dir: dir.join("runtime").join("groups"),
         }
     }
 
@@ -260,32 +225,10 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // --- load_chat_agents tests ---
+    // --- load_chat_agents tests (removed: chat-specific loading removed) ---
 
     #[test]
-    fn load_chat_agents_reads_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        let chat_agents = dir.path().join("runtime/groups/web/thread1/AGENTS.md");
-        write_file(&chat_agents, "This chat is about Rust.");
-
-        let result = loader.load_chat_agents("web", "thread1");
-        assert_eq!(result, Some("This chat is about Rust.".to_string()));
-    }
-
-    #[test]
-    fn load_chat_agents_returns_none_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.load_chat_agents("web", "thread1");
-        assert_eq!(result, None);
-    }
-
-    // --- chat SOUL override tests ---
-
-    #[test]
-    fn load_chat_soul_reads_existing_file() {
+    fn load_chat_agents_removed_no_longer_reads_chat_file() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "Global soul");
@@ -293,11 +236,11 @@ mod tests {
         write_file(&chat_soul, "Chat-specific soul");
 
         let result = loader.load_soul("web", "thread1", None, None);
-        assert_eq!(result, Some("Chat-specific soul".to_string()));
+        assert_eq!(result, Some("Global soul".to_string()));
     }
 
     #[test]
-    fn load_chat_soul_returns_none_when_missing() {
+    fn load_chat_agents_removed_returns_none_without_global_soul() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
@@ -388,21 +331,20 @@ mod tests {
         assert_eq!(result, Some("Default soul".to_string()));
     }
 
-    // --- account_id tests (future: not yet implemented) ---
+    // --- agent_id tests ---
 
     #[test]
-    fn load_soul_account_path_overrides_channel() {
+    fn load_soul_agent_id_falls_through_when_no_agent_soul() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "Default soul");
 
-        // account_id は未実装なので、フォールスルーして default が返る
         let result = loader.load_soul("web", "t1", None, Some("user1"));
         assert_eq!(result, Some("Default soul".to_string()));
     }
 
     #[test]
-    fn load_soul_account_path_falls_back_to_channel() {
+    fn load_soul_agent_id_falls_through_to_channel() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("souls/custom.md"), "Custom soul");
@@ -439,20 +381,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("AGENTS.md"), "Global agents content");
-        write_file(
-            &dir.path().join("runtime/groups/web/thread1/AGENTS.md"),
-            "Chat agents content",
-        );
 
-        let result = loader.build_agents_section("web", "thread1");
+        let result = loader.build_agents_section("web", "thread1", None);
         let section = result.expect("should return Some");
         assert!(section.contains("# Memories"));
         assert!(section.contains("<agents>"));
         assert!(section.contains("Global agents content"));
         assert!(section.contains("</agents>"));
-        assert!(section.contains("<chat-agents>"));
-        assert!(section.contains("Chat agents content"));
-        assert!(section.contains("</chat-agents>"));
     }
 
     // --- provision_default_soul tests ---
@@ -493,17 +428,12 @@ mod tests {
     // --- path traversal guards ---
 
     #[test]
-    fn load_chat_agents_rejects_parent_dir_traversal() {
+    fn load_soul_agent_id_rejects_parent_dir_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
-        assert!(loader.load_chat_agents("web", "../../../etc").is_none());
-    }
 
-    #[test]
-    fn load_chat_agents_rejects_cur_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        assert!(loader.load_chat_agents("web", "./thread").is_none());
+        let result = loader.load_soul("web", "t1", None, Some("../etc"));
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -515,5 +445,95 @@ mod tests {
                 .load_soul("../../../etc", "thread", None, None)
                 .is_none()
         );
+    }
+
+    // --- agent-specific SOUL/AGENTS tests ---
+
+    #[test]
+    fn load_soul_prefers_agent_soul() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("agents/alice/SOUL.md"), "Alice soul");
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+        write_file(&dir.path().join("souls/custom.md"), "Custom soul");
+
+        let result = loader.load_soul("web", "t1", Some("custom"), Some("alice"));
+        assert_eq!(result, Some("Alice soul".to_string()));
+    }
+
+    #[test]
+    fn load_soul_falls_back_to_channel_soul_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("souls/custom.md"), "Custom soul");
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+
+        let result = loader.load_soul("web", "t1", Some("custom"), Some("alice"));
+        assert_eq!(result, Some("Custom soul".to_string()));
+    }
+
+    #[test]
+    fn load_soul_falls_back_to_global_soul() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+
+        let result = loader.load_soul("web", "t1", None, Some("alice"));
+        assert_eq!(result, Some("Global soul".to_string()));
+    }
+
+    #[test]
+    fn build_agents_combines_global_and_agent_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("AGENTS.md"), "Global agents content");
+        write_file(
+            &dir.path().join("agents/alice/AGENTS.md"),
+            "Alice agents content",
+        );
+
+        let result = loader.build_agents_section("web", "t1", Some("alice"));
+        let section = result.expect("should return Some");
+        assert!(section.contains("Global agents content"));
+        assert!(section.contains("Alice agents content"));
+    }
+
+    #[test]
+    fn chat_specific_md_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+        write_file(
+            &dir.path().join("runtime/groups/web/thread1/SOUL.md"),
+            "Chat soul",
+        );
+        write_file(
+            &dir.path().join("runtime/groups/web/thread1/AGENTS.md"),
+            "Chat agents",
+        );
+
+        let soul = loader.load_soul("web", "thread1", None, None);
+        assert_eq!(soul, Some("Global soul".to_string()));
+
+        let agents = loader.build_agents_section("web", "thread1", None);
+        assert!(agents.is_none());
+    }
+
+    #[test]
+    fn agent_id_path_traversal_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        assert!(
+            loader
+                .load_soul("web", "t1", None, Some("../etc"))
+                .is_none()
+        );
+        assert!(
+            loader
+                .load_soul("web", "t1", None, Some("../../soul_agents"))
+                .is_none()
+        );
+        assert!(loader.load_soul("web", "t1", None, Some("")).is_none());
     }
 }

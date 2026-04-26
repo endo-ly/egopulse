@@ -556,9 +556,10 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
         .channels
         .get(channel_key.as_str())
         .and_then(|c| c.soul_path.as_deref());
-    let soul_content = state
-        .soul_agents
-        .load_soul(channel, thread, channel_soul_path, None);
+    let soul_content =
+        state
+            .soul_agents
+            .load_soul(channel, thread, channel_soul_path, Some(&context.agent_id));
 
     let mut prompt = String::new();
 
@@ -619,7 +620,11 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         chat_type = context.chat_type,
     ));
 
-    if let Some(memories) = state.soul_agents.build_agents_section(channel, thread) {
+    if let Some(memories) =
+        state
+            .soul_agents
+            .build_agents_section(channel, thread, Some(&context.agent_id))
+    {
         prompt.push_str("\n\n");
         prompt.push_str(&memories);
     }
@@ -1296,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_chat_agents_included() {
+    fn system_prompt_chat_agents_ignored_in_favor_of_global() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("AGENTS.md"), "Global agents content");
         let chat_agents = dir.path().join("runtime/groups/web/thread1/AGENTS.md");
@@ -1311,17 +1316,17 @@ mod tests {
             "should contain global AGENTS.md content"
         );
         assert!(
-            prompt.contains("<chat-agents>"),
-            "should contain <chat-agents>"
+            !prompt.contains("<chat-agents>"),
+            "should NOT contain <chat-agents>"
         );
         assert!(
-            prompt.contains("Chat-specific agents content"),
-            "should contain chat AGENTS.md content"
+            !prompt.contains("Chat-specific agents content"),
+            "should NOT contain chat AGENTS.md content"
         );
     }
 
     #[test]
-    fn system_prompt_chat_soul_overrides_global() {
+    fn system_prompt_chat_soul_no_longer_overrides_global() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "global soul content");
         let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
@@ -1331,12 +1336,12 @@ mod tests {
         let prompt = build_system_prompt(&state, &web_context("thread1"));
 
         assert!(
-            prompt.contains("chat soul content"),
-            "should contain chat SOUL content"
+            prompt.contains("global soul content"),
+            "should contain global SOUL content"
         );
         assert!(
-            !prompt.contains("global soul content"),
-            "should not contain global SOUL content when overridden"
+            !prompt.contains("chat soul content"),
+            "should NOT contain chat SOUL content"
         );
     }
 

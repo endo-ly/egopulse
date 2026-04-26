@@ -56,11 +56,12 @@ impl Config {
         agent_id: &AgentId,
         channel: &str,
     ) -> Result<ResolvedLlmConfig, ConfigError> {
-        let agent = self.agents.get(agent_id).ok_or_else(|| {
-            ConfigError::AgentNotFound {
+        let agent = self
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| ConfigError::AgentNotFound {
                 agent_id: agent_id.to_string(),
-            }
-        })?;
+            })?;
 
         let channel_key = ChannelName::new(channel);
 
@@ -275,11 +276,7 @@ impl Config {
 
     /// Discord session thread for a multi-agent Discord bot:
     /// `{channel_id}:agent:{agent_id}`.
-    pub fn discord_agent_surface_thread(
-        &self,
-        channel_id: &str,
-        agent_id: &AgentId,
-    ) -> String {
+    pub fn discord_agent_surface_thread(&self, channel_id: &str, agent_id: &AgentId) -> String {
         format!("{channel_id}:agent:{agent_id}")
     }
 
