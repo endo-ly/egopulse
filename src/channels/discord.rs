@@ -36,32 +36,51 @@ const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
 
 /// Sends outbound messages to Discord via the REST API.
 pub struct DiscordAdapter {
-    token: String,
+    /// Token used for legacy (non-agent-suffixed) outbound. May be empty when
+    /// all outbound channels are agent-suffixed.
+    legacy_token: String,
+    /// Map from agent_id to Discord bot token, built from [`Config::discord_agent_bots`].
+    agent_token_map: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
 }
 
 impl DiscordAdapter {
-    /// Creates a Discord adapter with the default HTTP client.
     pub fn new(token: String) -> Self {
-        Self::with_http_client(token, reqwest::Client::new())
+        Self {
+            legacy_token: token,
+            agent_token_map: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+        }
     }
 
-    /// Creates a Discord adapter with a caller-provided HTTP client.
     pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
-        Self { token, http_client }
+        Self {
+            legacy_token: token,
+            agent_token_map: std::collections::HashMap::new(),
+            http_client,
+        }
     }
 
-    /// Creates a Discord adapter with agent-token mapping for multi-agent support.
     pub fn new_for_agents(config: &crate::config::Config) -> Self {
-        // Select the first agent's token as the "primary" for legacy outbound.
-        // Full agent-token selection is implemented in Step 4 (external ID parsing).
-        let primary_token = config
+        let legacy_token = config.discord_bot_token().unwrap_or_default();
+        let agent_tokens: std::collections::HashMap<String, String> = config
             .discord_agent_bots()
             .into_iter()
-            .next()
-            .map(|b| b.token.to_string())
-            .unwrap_or_default();
-        Self::new(primary_token)
+            .map(|b| (b.agent_id.to_string(), b.token.to_string()))
+            .collect();
+        Self {
+            legacy_token,
+            agent_token_map: agent_tokens,
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    fn select_token(&self, external_chat_id: &str) -> &str {
+        match parse_discord_agent_id(external_chat_id) {
+            Some(agent_id) => self.agent_token_map.get(agent_id).map(String::as_str),
+            None => None,
+        }
+        .unwrap_or(&self.legacy_token)
     }
 }
 
@@ -77,11 +96,11 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
+        let token = self.select_token(external_chat_id);
 
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
         for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
-            // メンション展開を無効化し、LLM 出力が意図せず通知を飛ばすのを防ぐ。
             let body = json!({
                 "content": chunk,
                 "allowed_mentions": { "parse": [] },
@@ -95,7 +114,7 @@ impl ChannelAdapter for DiscordAdapter {
                     .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
                     .header(
                         reqwest::header::AUTHORIZATION,
-                        format!("Bot {}", self.token),
+                        format!("Bot {token}"),
                     )
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .json(&body)
@@ -371,11 +390,22 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
-    external_chat_id
-        .strip_prefix("discord:")
-        .unwrap_or(external_chat_id)
+    // Strip agent suffix if present: "123:agent:developer" → "123"
+    let bare = if let Some(pos) = external_chat_id.find(":agent:") {
+        &external_chat_id[..pos]
+    } else {
+        external_chat_id
+    };
+    bare.strip_prefix("discord:")
+        .unwrap_or(bare)
         .parse::<u64>()
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
+}
+
+fn parse_discord_agent_id(external_chat_id: &str) -> Option<&str> {
+    let pos = external_chat_id.find(":agent:")?;
+    let agent_id = &external_chat_id[pos + ":agent:".len()..];
+    if agent_id.is_empty() { None } else { Some(agent_id) }
 }
 
 /// Discord Interaction のコマンド名と引数を handle_slash_command が
@@ -543,6 +573,42 @@ mod tests {
             12345
         );
         assert!(parse_discord_chat_id("discord:not-a-number").is_err());
+    }
+
+    #[test]
+    fn parse_discord_chat_id_accepts_agent_suffix() {
+        assert_eq!(
+            parse_discord_chat_id("123:agent:developer").expect("agent suffix"),
+            123
+        );
+    }
+
+    #[test]
+    fn parse_discord_agent_id_from_external_chat_id() {
+        assert_eq!(
+            parse_discord_agent_id("123:agent:developer"),
+            Some("developer")
+        );
+        assert_eq!(parse_discord_agent_id("12345"), None);
+        assert_eq!(parse_discord_agent_id("discord:123"), None);
+    }
+
+    #[test]
+    fn parse_discord_chat_id_accepts_legacy_prefixed() {
+        assert_eq!(
+            parse_discord_chat_id("discord:12345").expect("legacy prefixed"),
+            12345
+        );
+    }
+
+    #[test]
+    fn parse_discord_chat_id_rejects_bad_agent_suffix() {
+        assert!(parse_discord_chat_id("abc:agent:developer").is_err());
+    }
+
+    #[test]
+    fn parse_discord_chat_id_rejects_empty_channel() {
+        assert!(parse_discord_chat_id(":agent:developer").is_err());
     }
 
     /// Interaction コマンド名 → "/command" 形式の正規化が正しいこと。
