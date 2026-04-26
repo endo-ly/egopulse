@@ -8,7 +8,6 @@ use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
 const GLOBAL_SCOPE: &str = "global";
-const CHANNEL_SCOPES: &[&str] = &["web", "discord", "telegram"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProfileScope {
@@ -71,7 +70,7 @@ pub async fn handle_command(
             .map(Some),
         "/models" => {
             let config = state.try_current_config()?;
-            let scope = parse_scope(&parts[1..], command_scope(context))?;
+            let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
             let resolved = resolved_for_scope(&config, &scope)?;
             let provider = config
                 .providers
@@ -98,7 +97,7 @@ async fn handle_provider_command(
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
     let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context))?;
+    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
 
     if parts.len() == 1 {
         let resolved = resolved_for_scope(&config, &scope)?;
@@ -183,7 +182,7 @@ async fn handle_model_command(
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
     let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context))?;
+    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
     let resolved = resolved_for_scope(&config, &scope)?;
 
     if parts.len() == 1 {
@@ -284,14 +283,18 @@ fn command_scope(context: &SurfaceContext) -> ProfileScope {
     }
 }
 
-fn parse_scope(args: &[&str], fallback: ProfileScope) -> Result<ProfileScope, EgoPulseError> {
+fn parse_scope(
+    args: &[&str],
+    fallback: ProfileScope,
+    config: &Config,
+) -> Result<ProfileScope, EgoPulseError> {
     let mut iter = args.iter().copied();
     while let Some(arg) = iter.next() {
         if arg == "--scope" {
             let value = iter
                 .next()
                 .ok_or_else(|| EgoPulseError::Internal("missing scope value".to_string()))?;
-            return normalize_scope(value, fallback);
+            return normalize_scope(value, fallback, config);
         }
     }
     Ok(fallback)
@@ -313,21 +316,27 @@ fn first_non_scope_arg<'a>(args: &'a [&str]) -> Option<&'a str> {
     None
 }
 
-fn normalize_scope(scope: &str, fallback: ProfileScope) -> Result<ProfileScope, EgoPulseError> {
+fn normalize_scope(
+    scope: &str,
+    fallback: ProfileScope,
+    config: &Config,
+) -> Result<ProfileScope, EgoPulseError> {
     let normalized = scope.trim().to_ascii_lowercase();
     if normalized == GLOBAL_SCOPE {
         return Ok(ProfileScope::Global);
     }
-    if CHANNEL_SCOPES
-        .iter()
-        .any(|candidate| *candidate == normalized)
-    {
+    if config.channels.contains_key(&ChannelName::new(&normalized)) {
         return Ok(ProfileScope::Channel(ChannelName::new(&normalized)));
     }
     if let Some(agent_id) = normalized.strip_prefix("agent:") {
         let channel = match fallback {
             ProfileScope::Agent { channel, .. } | ProfileScope::Channel(channel) => channel,
-            ProfileScope::Global => ChannelName::new("web"),
+            ProfileScope::Global => config
+                .channels
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| ChannelName::new("web")),
         };
         return Ok(ProfileScope::Agent {
             agent_id: AgentId::new(agent_id),

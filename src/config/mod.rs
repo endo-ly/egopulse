@@ -869,7 +869,7 @@ agents:
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", temp_dir.path());
 
-        for bad_id in ["../etc", "/etc", ""] {
+        for bad_id in ["../etc", "/etc", "", "foo:bar"] {
             let yaml = format!(
                 r#"default_provider: openai
 providers:

@@ -107,7 +107,7 @@ skills/
 
 チャット毎に独立したディレクトリを持ち、会話アーカイブを配置する。
 
-```
+```text
 groups/
 ├── telegram/{chat_id}/conversations/   ← compaction アーカイブ
 ├── discord/{chat_id}/conversations/

@@ -409,40 +409,33 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_provider_references<'a>(
+    providers: &HashMap<ProviderId, ProviderConfig>,
+    references: impl IntoIterator<Item = Option<&'a String>>,
+) -> Result<(), ConfigError> {
+    for provider in references.into_iter().flatten() {
+        let provider_id = ProviderId::new(provider);
+        if !providers.contains_key(&provider_id) {
+            return Err(ConfigError::InvalidProviderReference {
+                provider: provider.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_channel_provider_references(
     providers: &HashMap<ProviderId, ProviderConfig>,
     channels: &HashMap<ChannelName, ChannelConfig>,
 ) -> Result<(), ConfigError> {
-    for channel in channels.values() {
-        if let Some(provider) = channel.provider.as_ref() {
-            let provider_id = ProviderId::new(provider);
-            if !providers.contains_key(&provider_id) {
-                return Err(ConfigError::InvalidProviderReference {
-                    provider: provider.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(())
+    validate_provider_references(providers, channels.values().map(|c| c.provider.as_ref()))
 }
 
 fn validate_agent_provider_references(
     providers: &HashMap<ProviderId, ProviderConfig>,
     agents: &HashMap<AgentId, AgentConfig>,
 ) -> Result<(), ConfigError> {
-    for agent in agents.values() {
-        if let Some(provider) = agent.provider.as_ref() {
-            let provider_id = ProviderId::new(provider);
-            if !providers.contains_key(&provider_id) {
-                return Err(ConfigError::InvalidProviderReference {
-                    provider: provider.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(())
+    validate_provider_references(providers, agents.values().map(|a| a.provider.as_ref()))
 }
 
 fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelConfig>) {

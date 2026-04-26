@@ -535,5 +535,10 @@ mod tests {
                 .load_soul("web", "t1", None, Some("alice/bob"))
                 .is_none()
         );
+        assert!(
+            loader
+                .load_soul("web", "t1", None, Some("foo:bar"))
+                .is_none()
+        );
     }
 }
