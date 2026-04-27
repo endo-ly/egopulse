@@ -169,18 +169,22 @@ struct Handler {
 }
 
 impl Handler {
+    fn agent_thread(&self, thread: &str) -> String {
+        format!("{thread}:agent:{}", self.agent_id)
+    }
+
     fn make_context(&self, user: &str, thread: &str) -> SurfaceContext {
         SurfaceContext {
             channel: "discord".to_string(),
             surface_user: user.to_string(),
-            surface_thread: format!("{thread}:agent:{}", self.agent_id),
+            surface_thread: self.agent_thread(thread),
             chat_type: "discord".to_string(),
             agent_id: self.agent_id.clone(),
         }
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
-        self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id)
+        self.allowed_channels.contains(&channel_id)
     }
 }
 
@@ -204,7 +208,7 @@ impl EventHandler for Handler {
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
-                    let ext_id = format!("{thread}:agent:{}", self.agent_id);
+                    let ext_id = self.agent_thread(&thread);
                     let chat_type = "discord".to_string();
                     move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
                 })
@@ -347,7 +351,7 @@ impl EventHandler for Handler {
         let slash_chat_id =
             crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                 let channel = "discord".to_string();
-                let ext_id = thread.clone();
+                let ext_id = self.agent_thread(&thread);
                 let chat_type = "discord".to_string();
                 move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
             })
@@ -563,6 +567,29 @@ pub async fn start_discord_bot(
 mod tests {
     use super::*;
 
+    fn test_handler(allowed_channels: Vec<u64>) -> Handler {
+        Handler {
+            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
+                tempfile::tempdir()
+                    .expect("tempdir")
+                    .path()
+                    .to_str()
+                    .expect("utf8")
+                    .to_string(),
+                Box::new(crate::agent_loop::turn::FakeProvider {
+                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    }]),
+                }),
+            )),
+            agent_id: "developer".to_string(),
+            agent_label: "Developer".to_string(),
+            allowed_channels,
+        }
+    }
+
     #[test]
     fn adapter_name() {
         let adapter = DiscordAdapter::new("test-token".to_string());
@@ -622,6 +649,32 @@ mod tests {
     #[test]
     fn parse_discord_chat_id_rejects_empty_channel() {
         assert!(parse_discord_chat_id(":agent:developer").is_err());
+    }
+
+    #[test]
+    fn guild_allowed_rejects_empty_allowed_channels() {
+        let handler = test_handler(vec![]);
+
+        assert!(!handler.guild_allowed(123));
+    }
+
+    #[test]
+    fn guild_allowed_accepts_listed_channel_only() {
+        let handler = test_handler(vec![123, 456]);
+
+        assert!(handler.guild_allowed(123));
+        assert!(!handler.guild_allowed(789));
+    }
+
+    #[test]
+    fn interaction_chat_id_uses_agent_scoped_thread() {
+        let handler = test_handler(vec![123]);
+
+        assert_eq!(handler.agent_thread("123"), "123:agent:developer");
+        assert_eq!(
+            handler.make_context("user", "123").surface_thread,
+            "123:agent:developer"
+        );
     }
 
     /// Interaction コマンド名 → "/command" 形式の正規化が正しいこと。
