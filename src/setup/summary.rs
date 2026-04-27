@@ -174,23 +174,6 @@ pub(crate) fn save_config(
         },
     );
 
-    let channels = build_channel_configs(
-        auth_token,
-        discord_enabled,
-        telegram_enabled,
-        telegram_bot_token,
-        telegram_bot_username,
-    );
-
-    let agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig> =
-        std::collections::HashMap::from([(
-            crate::config::AgentId::new("default"),
-            crate::config::AgentConfig {
-                label: "Default Agent".to_string(),
-                ..Default::default()
-            },
-        )]);
-
     let discord_bots: Option<
         std::collections::HashMap<crate::config::BotId, crate::config::DiscordBotConfig>,
     > = if discord_enabled && !discord_bot_token.is_empty() {
@@ -212,6 +195,29 @@ pub(crate) fn save_config(
     } else {
         None
     };
+
+    let mut channels = build_channel_configs(
+        auth_token,
+        discord_enabled,
+        telegram_enabled,
+        telegram_bot_token,
+        telegram_bot_username,
+    );
+
+    if let Some(bots) = discord_bots {
+        if let Some(discord_channel) = channels.get_mut("discord") {
+            discord_channel.discord_bots = Some(bots);
+        }
+    }
+
+    let agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig> =
+        std::collections::HashMap::from([(
+            crate::config::AgentId::new("default"),
+            crate::config::AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        )]);
 
     let config = Config {
         default_provider: ProviderId::new(&provider_id),

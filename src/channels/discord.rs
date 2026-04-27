@@ -663,6 +663,7 @@ mod tests {
             "empty allowed_channels trivially allows (DM handler does the check)"
         );
     }
+    #[test]
     fn guild_allowed_accepts_listed_channel_only() {
         let handler = test_handler(vec![123, 456]);
 
