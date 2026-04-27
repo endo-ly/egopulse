@@ -191,26 +191,27 @@ pub(crate) fn save_config(
             },
         )]);
 
-    let discord_bots: Option<std::collections::HashMap<crate::config::BotId, crate::config::DiscordBotConfig>> =
-        if discord_enabled && !discord_bot_token.is_empty() {
-            let mut bots = std::collections::HashMap::new();
-            bots.insert(
-                crate::config::BotId::new("default"),
-                crate::config::DiscordBotConfig {
-                    token: Some(env_resolved_value(
-                        DISCORD_BOT_TOKEN_ENV_NAME,
-                        discord_bot_token,
-                    )),
-                    file_token: Some(yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
-                    default_agent: Some(crate::config::AgentId::new("default")),
-                    allowed_channels: None,
-                    channel_agents: None,
-                },
-            );
-            Some(bots)
-        } else {
-            None
-        };
+    let discord_bots: Option<
+        std::collections::HashMap<crate::config::BotId, crate::config::DiscordBotConfig>,
+    > = if discord_enabled && !discord_bot_token.is_empty() {
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("default"),
+            crate::config::DiscordBotConfig {
+                token: Some(env_resolved_value(
+                    DISCORD_BOT_TOKEN_ENV_NAME,
+                    discord_bot_token,
+                )),
+                file_token: Some(yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
+                default_agent: Some(crate::config::AgentId::new("default")),
+                allowed_channels: None,
+                channel_agents: None,
+            },
+        );
+        Some(bots)
+    } else {
+        None
+    };
 
     let config = Config {
         default_provider: ProviderId::new(&provider_id),

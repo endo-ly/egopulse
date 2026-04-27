@@ -4,7 +4,7 @@
 
 ## 概要
 
-EgoPulse は複数の AI エージェントを 1 プロセスで同時に運用できる。各エージェントは個別のアイデンティティ（label）、LLM 設定（provider / model）、Discord Bot Token を持つ。
+EgoPulse は複数の AI エージェントを 1 プロセスで同時に運用できる。各エージェントは個別のアイデンティティ（label）、LLM 設定（provider / model）を持つ。
 
 ## Agent 定義
 
@@ -31,40 +31,33 @@ Agent ごとに異なる LLM 設定が可能。解決優先度:
 
 ## Discord Multi-Bot
 
-Agent ごとに個別の Discord Bot Token を設定できる（1 Bot = 1 Agent）。
+Bot 単位で Discord 接続を定義し、Bot ごとに複数のエージェントをチャンネル別に割り当てられる。
 
 ### 設定例
 
 ```yaml
-agents:
-  developer:
-    label: Developer Bot
-    discord:
-      bot_token:
-        source: env
-        id: DISCORD_AGENT_BOT_TOKEN_DEVELOPER
-      allowed_channels:
-        - 1234567890123456789
-  reviewer:
-    label: Reviewer Bot
-    discord:
-      bot_token:
-        source: env
-        id: DISCORD_AGENT_BOT_TOKEN_REVIEWER
-      allowed_channels:
-        - 9876543210987654321
+channels:
+  discord:
+    enabled: true
+    bots:
+      main:
+        token:
+          source: env
+          id: DISCORD_BOT_TOKEN
+        default_agent: assistant
+        allowed_channels:
+          - 1234567890
+        channel_agents:
+          "9876543210": reviewer
 ```
 
 ### 起動時の動作
 
-- `discord.bot_token` を持つ Agent の数だけ Discord Bot クライアントが起動する
-- 各 Bot は Agent 固有の `allowed_channels` で応答可否を判定する
-- DM は常に許可される
-- 各 Bot のメッセージは Agent ID でタグ付けされたセッションに記録される
-
-### `channels.discord.bot_token` について
-
-`channels.discord.bot_token` は読み込まれない。Discord Bot を起動するには、各 Agent に `agents.<id>.discord.bot_token` を設定する必要がある。`channels.discord` には `enabled: true` のみを指定する。
+- `bots` に定義された Bot の数だけ Discord クライアントが起動する
+- 各メッセージは `select_agent(channel_id, is_dm)` によりエージェントを決定
+- ルーティング優先順位: `channel_agents[channel_id]` → `default_agent`
+- `allowed_channels` に含まれないギルドチャンネルは拒否。DM は常に `default_agent` で許可
+- 各 Bot+Agent ペアのメッセージは独立したセッションに記録される
 
 ## 内部セッション管理
 

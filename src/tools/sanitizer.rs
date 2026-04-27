@@ -184,6 +184,18 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
             ));
         }
     }
+    if let Some(discord) = config.channels.get("discord") {
+        if let Some(bots) = &discord.discord_bots {
+            for (bot_id, bot) in bots {
+                if let Some(rv) = &bot.token {
+                    secrets.push((
+                        format!("channel.discord.bots.{bot_id}.token"),
+                        rv.value().to_string(),
+                    ));
+                }
+            }
+        }
+    }
     secrets
 }
 
