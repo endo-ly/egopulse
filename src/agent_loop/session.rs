@@ -849,14 +849,17 @@ mod tests {
     }
 
     #[test]
-    fn discord_agent_scoped_thread_includes_agent_id() {
+    fn discord_surface_thread_includes_bot_and_agent_ids() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8").to_string());
 
-        let thread =
-            config.discord_agent_surface_thread("ch123", &crate::config::AgentId::new("alice"));
+        let thread = config.discord_surface_thread(
+            "ch123",
+            &crate::config::BotId::new("main"),
+            &crate::config::AgentId::new("alice"),
+        );
 
-        assert_eq!(thread, "ch123:agent:alice");
+        assert_eq!(thread, "ch123:bot:main:agent:alice");
     }
 
     #[tokio::test]
@@ -872,18 +875,22 @@ mod tests {
         let ctx_a = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state
-                .config
-                .discord_agent_surface_thread("ch999", &crate::config::AgentId::new("agent_a")),
+            surface_thread: state.config.discord_surface_thread(
+                "ch999",
+                &crate::config::BotId::new("bot1"),
+                &crate::config::AgentId::new("agent_a"),
+            ),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state
-                .config
-                .discord_agent_surface_thread("ch999", &crate::config::AgentId::new("agent_b")),
+            surface_thread: state.config.discord_surface_thread(
+                "ch999",
+                &crate::config::BotId::new("bot1"),
+                &crate::config::AgentId::new("agent_b"),
+            ),
             chat_type: "discord".to_string(),
             agent_id: "agent_b".to_string(),
         };
@@ -914,9 +921,11 @@ mod tests {
         let ctx = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state
-                .config
-                .discord_agent_surface_thread("ch555", &crate::config::AgentId::new("agent_a")),
+            surface_thread: state.config.discord_surface_thread(
+                "ch555",
+                &crate::config::BotId::new("bot1"),
+                &crate::config::AgentId::new("agent_a"),
+            ),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
         };

@@ -14,14 +14,17 @@ use crate::error::EgoPulseError;
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Serialize)]
-struct SerializableAgentDiscord {
+struct SerializableDiscordBot {
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
     )]
-    bot_token: Option<serde_yml::Value>,
+    token: Option<serde_yml::Value>,
+    default_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_channels: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_agents: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -31,8 +34,6 @@ struct SerializableAgent {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    discord: Option<SerializableAgentDiscord>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +101,8 @@ struct SerializableChannel {
     allowed_chat_ids: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     soul_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bots: Option<HashMap<String, SerializableDiscordBot>>,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -154,6 +157,26 @@ impl From<&Config> for SerializableConfig {
                         allowed_channels: c.allowed_channels.clone(),
                         allowed_chat_ids: c.allowed_chat_ids.clone(),
                         soul_path: c.soul_path.clone(),
+                        bots: c.discord_bots.as_ref().map(|bots| {
+                            bots.iter()
+                                .map(|(bot_id, bot)| {
+                                    let channel_agents = bot.channel_agents.as_ref().map(|map| {
+                                        map.iter()
+                                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                                            .collect()
+                                    });
+                                    (
+                                        bot_id.to_string(),
+                                        SerializableDiscordBot {
+                                            token: bot.file_token.clone(),
+                                            default_agent: bot.default_agent.to_string(),
+                                            allowed_channels: bot.allowed_channels.clone(),
+                                            channel_agents,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
                     },
                 )
             })
@@ -163,22 +186,12 @@ impl From<&Config> for SerializableConfig {
             .agents
             .iter()
             .map(|(id, a)| {
-                let discord =
-                    if a.discord.bot_token.is_some() || a.discord.allowed_channels.is_some() {
-                        Some(SerializableAgentDiscord {
-                            bot_token: a.discord.file_bot_token.clone(),
-                            allowed_channels: a.discord.allowed_channels.clone(),
-                        })
-                    } else {
-                        None
-                    };
                 (
                     id.to_string(),
                     SerializableAgent {
                         label: a.label.clone(),
                         provider: a.provider.clone(),
                         model: a.model.clone(),
-                        discord,
                     },
                 )
             })
@@ -245,21 +258,21 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
         let _ = id;
     }
 
-    for (name, channel) in &config.channels {
+    for channel in config.channels.values() {
         if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.auth_token {
             entries.push((env_id.clone(), value.clone()));
         }
         if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.bot_token {
             entries.push((env_id.clone(), value.clone()));
         }
-        let _ = name;
-    }
-
-    for (agent_id, agent) in &config.agents {
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &agent.discord.bot_token {
-            entries.push((env_id.clone(), value.clone()));
+        if let Some(bots) = &channel.discord_bots {
+            for (bot_id, bot) in bots {
+                if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
+                    entries.push((env_id.clone(), value.clone()));
+                }
+                let _ = bot_id;
+            }
         }
-        let _ = agent_id;
     }
 
     entries
@@ -347,7 +360,9 @@ mod tests {
     use crate::config::secret_ref::{
         DISCORD_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value,
     };
-    use crate::config::{ChannelConfig, ChannelName, ProviderConfig, ProviderId};
+    use crate::config::{
+        BotId, ChannelConfig, ChannelName, DiscordBotConfig, ProviderConfig, ProviderId,
+    };
     use serial_test::serial;
 
     fn sample_config() -> Config {
@@ -501,5 +516,50 @@ channels:
         assert!(yaml.contains(&format!("id: {DISCORD_BOT_TOKEN_ENV_NAME}")));
         assert!(!yaml.contains("web-override"));
         assert!(!yaml.contains("discord-override"));
+    }
+
+    #[test]
+    #[serial]
+    fn save_load_round_trip_preserves_discord_bots_and_default_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+
+        // Arrange: config with discord bots
+        let mut config = sample_config();
+        let discord_channel = config
+            .channels
+            .get_mut(&ChannelName::new("discord"))
+            .expect("discord channel");
+        discord_channel.discord_bots = Some({
+            let mut bots = HashMap::new();
+            bots.insert(
+                BotId::new("main"),
+                DiscordBotConfig {
+                    token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
+                    file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
+                    default_agent: crate::config::AgentId::new("default"),
+                    allowed_channels: Some(vec![111, 222]),
+                    channel_agents: None,
+                },
+            );
+            bots
+        });
+
+        // Act: save → load
+        save_config_with_secrets(&config, &path).expect("save");
+        let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load");
+
+        // Assert: bot is preserved
+        let bots = loaded.discord_bots();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(*bots[0].bot_id, BotId::new("main"));
+        assert_eq!(
+            *bots[0].default_agent,
+            crate::config::AgentId::new("default")
+        );
+        assert_eq!(bots[0].allowed_channels, &[111, 222]);
+
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert!(dotenv.contains("MY_DISCORD_BOT_TOKEN=bot-secret-123"));
     }
 }

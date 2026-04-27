@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -34,7 +35,6 @@ pub(crate) fn update_field_visibility(fields: &mut [Field]) {
 
 pub(crate) fn load_channel_fields(
     channels: &serde_yml::Value,
-    root: &serde_yml::Value,
     result: &mut HashMap<String, String>,
 ) {
     let Some(ch_map) = channels.as_mapping() else {
@@ -43,7 +43,6 @@ pub(crate) fn load_channel_fields(
 
     insert_channel_string(ch_map, "web", "auth_token", result, "WEB_AUTH_TOKEN");
     insert_channel_bool(ch_map, "discord", "enabled", result, "DISCORD_ENABLED");
-    insert_channel_string(ch_map, "discord", "bot_token", result, "DISCORD_BOT_TOKEN");
     insert_channel_bool(ch_map, "telegram", "enabled", result, "TELEGRAM_ENABLED");
     insert_channel_string(
         ch_map,
@@ -59,24 +58,19 @@ pub(crate) fn load_channel_fields(
         result,
         "TELEGRAM_BOT_USERNAME",
     );
+}
 
-    // Fallback: if DISCORD_BOT_TOKEN is not set from channels.discord.bot_token,
-    // check agents.default.discord.bot_token (the new config location).
-    if !result.contains_key("DISCORD_BOT_TOKEN") || result["DISCORD_BOT_TOKEN"].is_empty() {
-        if let Some(token) = root
-            .as_mapping()
-            .and_then(|m| m.get(yaml_key("agents")))
-            .and_then(|a| a.as_mapping())
-            .and_then(|m| m.get(yaml_key("default")))
-            .and_then(|a| a.as_mapping())
-            .and_then(|m| m.get(yaml_key("discord")))
-            .and_then(|d| d.as_mapping())
-            .and_then(|m| m.get(yaml_key("bot_token")))
-            .and_then(|v| v.as_str())
-        {
-            result.insert("DISCORD_BOT_TOKEN".into(), token.to_string());
-        }
-    }
+pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<String> {
+    let config = crate::config::Config::load_allow_missing_api_key(Some(config_path)).ok()?;
+    let token = config
+        .channels
+        .get("discord")?
+        .discord_bots
+        .as_ref()?
+        .get("default")?
+        .token
+        .as_ref()?;
+    Some(token.value().to_string())
 }
 
 pub(crate) fn extract_existing_state_root(

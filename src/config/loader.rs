@@ -7,12 +7,12 @@ use serde::Deserialize;
 use url::Url;
 
 use super::secret_ref::{
-    DISCORD_BOT_TOKEN_ENV_NAME, ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME,
-    WEB_AUTH_TOKEN_ENV_NAME, dotenv_path, read_dotenv, resolve_string_or_ref,
+    ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, dotenv_path,
+    read_dotenv, resolve_string_or_ref,
 };
 use super::{
-    AgentConfig, AgentDiscordConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig,
-    ProviderId,
+    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
+    ProviderConfig, ProviderId,
 };
 use crate::error::ConfigError;
 
@@ -39,12 +39,15 @@ struct FileChannelConfig {
     allowed_channels: Option<Vec<u64>>,
     allowed_chat_ids: Option<Vec<i64>>,
     soul_path: Option<String>,
+    bots: Option<HashMap<String, FileDiscordBotConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct FileAgentDiscordConfig {
-    bot_token: Option<StringOrRef>,
+struct FileDiscordBotConfig {
+    token: Option<StringOrRef>,
+    default_agent: Option<String>,
     allowed_channels: Option<Vec<u64>>,
+    channel_agents: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -52,7 +55,6 @@ struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
-    discord: Option<FileAgentDiscordConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -129,7 +131,6 @@ pub(super) fn build_config(
 
     let mut channels = normalize_channels(file_channels.unwrap_or_default(), &dotenv)?;
     apply_web_channel_env_overrides(&mut channels);
-    apply_channel_bot_token_env_override(&mut channels, "discord", DISCORD_BOT_TOKEN_ENV_NAME);
     apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
 
     validate_channel_provider_references(&providers, &channels)?;
@@ -162,6 +163,8 @@ pub(super) fn build_config(
     };
 
     validate_compaction_config(&config)?;
+
+    validate_discord_bot_references(&config)?;
 
     if config.web_enabled() && config.web_auth_token().is_none() {
         return Err(ConfigError::MissingWebAuthToken);
@@ -245,8 +248,18 @@ fn normalize_channels(
             allowed_channels: fc.allowed_channels,
             allowed_chat_ids: fc.allowed_chat_ids,
             soul_path: fc.soul_path,
+            discord_bots: None,
         };
+        let was_discord = key.as_str() == "discord";
         normalized.insert(key, config);
+
+        if was_discord {
+            if let Some(file_bots) = fc.bots {
+                let bots = normalize_discord_bots(file_bots, dotenv)?;
+                let discord_channel = normalized.get_mut("discord").expect("just inserted");
+                discord_channel.discord_bots = Some(bots);
+            }
+        }
     }
 
     if let Some(web) = normalized.get_mut("web") {
@@ -272,39 +285,96 @@ fn validate_agent_id(id: &AgentId) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_bot_id(id: &BotId) -> Result<(), ConfigError> {
+    let s = id.as_str();
+    if s.is_empty() || s.trim().is_empty() {
+        return Err(ConfigError::InvalidBotId { id: id.to_string() });
+    }
+    if s.contains("..") || s.contains('/') || s.contains('\\') || s.contains(':') {
+        return Err(ConfigError::InvalidBotId { id: id.to_string() });
+    }
+    Ok(())
+}
+
+fn normalize_discord_bots(
+    file_bots: HashMap<String, FileDiscordBotConfig>,
+    dotenv: &HashMap<String, String>,
+) -> Result<HashMap<BotId, DiscordBotConfig>, ConfigError> {
+    let mut bots = HashMap::new();
+    for (name, fb) in file_bots {
+        let bot_id = BotId::new(&name);
+        validate_bot_id(&bot_id)?;
+
+        if bots.contains_key(&bot_id) {
+            return Err(ConfigError::DuplicateBotId {
+                bot_id: bot_id.to_string(),
+                original_key: name,
+            });
+        }
+
+        let resolved_token = resolve_string_or_ref(fb.token, dotenv)?;
+        let file_token = resolved_token.as_ref().map(|rv| {
+            if matches!(rv, ResolvedValue::Literal(_)) {
+                serde_yml::Value::String(rv.value().to_string())
+            } else {
+                rv.to_yaml_value()
+            }
+        });
+
+        let default_agent = fb
+            .default_agent
+            .and_then(|s| normalize_string(Some(s)))
+            .map(|s| AgentId::new(&s))
+            .ok_or_else(|| ConfigError::MissingDiscordBotDefaultAgent {
+                bot_id: bot_id.to_string(),
+            })?;
+
+        let channel_agents = fb
+            .channel_agents
+            .map(|map| {
+                let mut result = HashMap::new();
+                for (k, v) in map {
+                    let channel_id: u64 =
+                        k.parse::<u64>()
+                            .map_err(|_| ConfigError::InvalidChannelAgentsKey {
+                                bot_id: bot_id.to_string(),
+                                key: k,
+                            })?;
+                    let agent_id = AgentId::new(&v);
+                    result.insert(channel_id, agent_id);
+                }
+                Ok(result)
+            })
+            .transpose()?
+            .filter(|m| !m.is_empty());
+
+        bots.insert(
+            bot_id,
+            DiscordBotConfig {
+                token: resolved_token,
+                file_token,
+                default_agent,
+                allowed_channels: fb.allowed_channels,
+                channel_agents,
+            },
+        );
+    }
+    Ok(bots)
+}
+
 fn normalize_agents(
     agents: HashMap<String, FileAgentConfig>,
-    dotenv: &HashMap<String, String>,
+    _dotenv: &HashMap<String, String>,
 ) -> Result<HashMap<AgentId, AgentConfig>, ConfigError> {
     let mut normalized = HashMap::new();
     for (name, fa) in agents {
         let key = AgentId::new(&name);
         validate_agent_id(&key)?;
 
-        let discord = match fa.discord {
-            Some(fd) => {
-                let resolved_bot = resolve_string_or_ref(fd.bot_token, dotenv)?;
-                let file_bot_token = resolved_bot.as_ref().map(|rv| {
-                    if matches!(rv, ResolvedValue::Literal(_)) {
-                        serde_yml::Value::String(rv.value().to_string())
-                    } else {
-                        rv.to_yaml_value()
-                    }
-                });
-                AgentDiscordConfig {
-                    bot_token: resolved_bot,
-                    file_bot_token,
-                    allowed_channels: fd.allowed_channels,
-                }
-            }
-            None => AgentDiscordConfig::default(),
-        };
-
         let config = AgentConfig {
             label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
-            discord,
         };
         normalized.insert(key, config);
     }
@@ -405,6 +475,36 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidCompactionConfig(
             "compact_keep_recent must be at least 1".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
+    let Some(discord) = config.channels.get("discord") else {
+        return Ok(());
+    };
+    let Some(bots) = &discord.discord_bots else {
+        return Ok(());
+    };
+
+    for (bot_id, bot) in bots {
+        if !config.agents.contains_key(&bot.default_agent) {
+            return Err(ConfigError::DiscordBotDefaultAgentNotFound {
+                bot_id: bot_id.to_string(),
+                agent_id: bot.default_agent.to_string(),
+            });
+        }
+        if let Some(channel_agents) = &bot.channel_agents {
+            for (channel_id, agent_id) in channel_agents {
+                if !config.agents.contains_key(agent_id) {
+                    return Err(ConfigError::DiscordBotChannelAgentNotFound {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                        agent_id: agent_id.to_string(),
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
