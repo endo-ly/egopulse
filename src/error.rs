@@ -105,6 +105,27 @@ pub enum ConfigError {
     DefaultAgentNotFound { agent_id: String },
     #[error("agent_not_found: {agent_id}")]
     AgentNotFound { agent_id: String },
+    #[error("invalid_bot_id: {id}")]
+    InvalidBotId { id: String },
+    #[error("missing_discord_bot_default_agent: bot={bot_id}")]
+    MissingDiscordBotDefaultAgent { bot_id: String },
+    #[error("discord_bot_default_agent_not_found: bot={bot_id} agent={agent_id}")]
+    DiscordBotDefaultAgentNotFound { bot_id: String, agent_id: String },
+    #[error(
+        "discord_bot_channel_agent_not_found: bot={bot_id} channel={channel_id} agent={agent_id}"
+    )]
+    DiscordBotChannelAgentNotFound {
+        bot_id: String,
+        channel_id: u64,
+        agent_id: String,
+    },
+    #[error("duplicate_bot_id: bot_id={bot_id} (normalized from '{original_key}')")]
+    DuplicateBotId {
+        bot_id: String,
+        original_key: String,
+    },
+    #[error("invalid_channel_agents_key: bot={bot_id} key='{key}' is not a valid u64")]
+    InvalidChannelAgentsKey { bot_id: String, key: String },
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,

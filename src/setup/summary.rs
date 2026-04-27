@@ -15,7 +15,7 @@ use super::provider::{
 };
 use super::{Field, SetupApp};
 use crate::config::secret_ref::{
-    DISCORD_AGENT_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
+    DISCORD_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
     provider_api_key_env_name,
 };
 use crate::config::{
@@ -174,7 +174,29 @@ pub(crate) fn save_config(
         },
     );
 
-    let channels = build_channel_configs(
+    let discord_bots: Option<
+        std::collections::HashMap<crate::config::BotId, crate::config::DiscordBotConfig>,
+    > = if discord_enabled && !discord_bot_token.is_empty() {
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("default"),
+            crate::config::DiscordBotConfig {
+                token: Some(env_resolved_value(
+                    DISCORD_BOT_TOKEN_ENV_NAME,
+                    discord_bot_token,
+                )),
+                file_token: Some(yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
+                default_agent: crate::config::AgentId::new("default"),
+                allowed_channels: None,
+                channel_agents: None,
+            },
+        );
+        Some(bots)
+    } else {
+        None
+    };
+
+    let mut channels = build_channel_configs(
         auth_token,
         discord_enabled,
         telegram_enabled,
@@ -182,23 +204,18 @@ pub(crate) fn save_config(
         telegram_bot_username,
     );
 
+    if let Some(bots) = discord_bots {
+        channels
+            .entry(crate::config::ChannelName::new("discord"))
+            .or_default()
+            .discord_bots = Some(bots);
+    }
+
     let agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig> =
         std::collections::HashMap::from([(
             crate::config::AgentId::new("default"),
             crate::config::AgentConfig {
                 label: "Default Agent".to_string(),
-                discord: if discord_enabled && !discord_bot_token.is_empty() {
-                    crate::config::AgentDiscordConfig {
-                        bot_token: Some(env_resolved_value(
-                            DISCORD_AGENT_BOT_TOKEN_ENV_NAME,
-                            discord_bot_token,
-                        )),
-                        file_bot_token: Some(yaml_value(DISCORD_AGENT_BOT_TOKEN_ENV_NAME)),
-                        ..Default::default()
-                    }
-                } else {
-                    Default::default()
-                },
                 ..Default::default()
             },
         )]);

@@ -38,7 +38,7 @@ session は `(channel, surface_thread)` から安定的に決まる。
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
 - `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
-- **Discord マルチボット**: `discord_agent_surface_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する。これにより同一チャンネル内でエージェントごとに独立したセッションが確保される
+- **Discord マルチボット**: `discord_surface_thread(channel_id, bot_id, agent_id)` ヘルパーが `{channel_id}:bot:{bot_id}:agent:{agent_id}` 形式の `surface_thread` を生成する。保存される session key / `external_chat_id` は `discord:{channel_id}:bot:{bot_id}:agent:{agent_id}` になる
 - **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
 
 ## 3. 保存モデル
