@@ -1,1 +1,0 @@
-`.github/workflows/ci-frontend.yml`内の各チェックコマンドを実行し、CIが通る状態にしてください。

@@ -3,12 +3,13 @@
 レビューコメント抽出スクリプト
 
 Usage:
-    python3 extract-reviews.py <PR_NUMBER>
+    python3 extract_reviews.py <PR_NUMBER> [--truncate N]
 
-トークン効率を重視し、レビューコメントを抽出します。
+デフォルトでコメント全文を表示します。--truncate N で N 文字に切り詰めます。
 Resolved状態のコメントは除外されます。
 """
 
+import argparse
 import json
 import subprocess
 import sys
@@ -29,8 +30,8 @@ def run_gh_command(args: list[str]) -> dict | list | None:
         return None
 
 
-def truncate_text(text: str, max_length: int | None = 300) -> str:
-    """テキストを指定長で切り詰める（デフォルト300文字、Noneで切り詰めなし）"""
+def truncate_text(text: str, max_length: int | None) -> str:
+    """テキストを指定長で切り詰める（Noneで切り詰めなし）"""
     if max_length is None or len(text) <= max_length:
         return text
     return text[:max_length] + "..."
@@ -91,14 +92,18 @@ def get_resolved_comment_ids(owner: str, repo: str, pr_number: str) -> set[int]:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 extract-reviews.py <PR_NUMBER> [--full]")
-        print("  --full: Show full comment text without truncation")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="レビューコメント抽出スクリプト"
+    )
+    parser.add_argument("pr_number", help="PR番号")
+    parser.add_argument(
+        "--truncate", type=int, default=None, metavar="N",
+        help="コメント本文をN文字に切り詰める（デフォルト: 全文表示）",
+    )
+    args = parser.parse_args()
 
-    pr_number = sys.argv[1]
-    show_full = "--full" in sys.argv
-    max_length = None if show_full else 300  # Noneは切り詰めなし
+    pr_number = args.pr_number
+    max_length = args.truncate
 
     print(f"Fetching data for PR #{pr_number}...", file=sys.stderr)
 
