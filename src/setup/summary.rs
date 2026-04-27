@@ -14,7 +14,10 @@ use super::provider::{
     provider_label_for,
 };
 use super::{Field, SetupApp};
-use crate::config::secret_ref::{env_resolved_value, provider_api_key_env_name};
+use crate::config::secret_ref::{
+    DISCORD_AGENT_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
+    provider_api_key_env_name,
+};
 use crate::config::{
     Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
     default_workspace_dir, is_valid_base_url,
@@ -174,11 +177,31 @@ pub(crate) fn save_config(
     let channels = build_channel_configs(
         auth_token,
         discord_enabled,
-        discord_bot_token,
         telegram_enabled,
         telegram_bot_token,
         telegram_bot_username,
     );
+
+    let agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig> =
+        std::collections::HashMap::from([(
+            crate::config::AgentId::new("default"),
+            crate::config::AgentConfig {
+                label: "Default Agent".to_string(),
+                discord: if discord_enabled && !discord_bot_token.is_empty() {
+                    crate::config::AgentDiscordConfig {
+                        bot_token: Some(env_resolved_value(
+                            DISCORD_AGENT_BOT_TOKEN_ENV_NAME,
+                            discord_bot_token,
+                        )),
+                        file_bot_token: Some(yaml_value(DISCORD_AGENT_BOT_TOKEN_ENV_NAME)),
+                        ..Default::default()
+                    }
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            },
+        )]);
 
     let config = Config {
         default_provider: ProviderId::new(&provider_id),
@@ -198,13 +221,7 @@ pub(crate) fn save_config(
         compact_keep_recent: 20,
         channels,
         default_agent: crate::config::AgentId::new("default"),
-        agents: std::collections::HashMap::from([(
-            crate::config::AgentId::new("default"),
-            crate::config::AgentConfig {
-                label: "Default Agent".to_string(),
-                ..Default::default()
-            },
-        )]),
+        agents,
     };
 
     config
@@ -246,6 +263,25 @@ pub(crate) fn save_config(
 
     if let Some(ref backup) = backup_path {
         completion_summary.push(format!("Previous config backed up to: {backup}"));
+    }
+
+    let existing_non_default = original_yaml
+        .as_ref()
+        .and_then(|yaml| yaml.as_mapping())
+        .and_then(|m| m.get(serde_yml::Value::String("agents".into())))
+        .and_then(|a| a.as_mapping())
+        .map(|m| {
+            m.keys()
+                .filter_map(|k| k.as_str())
+                .filter(|id| *id != "default")
+                .count()
+        })
+        .unwrap_or(0);
+    if existing_non_default > 0 {
+        completion_summary.push(format!(
+            "⚠ Existing {existing_non_default} custom agent(s) preserved in backup; \
+             re-add them to agents in config YAML if needed"
+        ));
     }
 
     Ok((backup_path, completion_summary))

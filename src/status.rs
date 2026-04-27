@@ -79,6 +79,8 @@ pub struct ChannelsStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChannelEntry {
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_count: Option<usize>,
 }
 
 /// Web チャネルの設定。
@@ -175,14 +177,19 @@ fn format_channels(channels: &ChannelsStatus, lines: &mut Vec<String>) {
         ));
     }
     if let Some(discord) = &channels.discord {
+        let detail = match discord.agent_count {
+            Some(n) if n > 0 => format!(" ({n} agent{})", if n == 1 { "" } else { "s" }),
+            _ => String::new(),
+        };
         lines.push(format!(
-            "  {:<9}{}",
+            "  {:<9}{}{}",
             "discord",
             if discord.enabled {
                 "enabled"
             } else {
                 "disabled"
             },
+            detail,
         ));
     }
     if let Some(telegram) = &channels.telegram {
@@ -239,8 +246,14 @@ mod tests {
                     host: Some("127.0.0.1".to_string()),
                     port: Some(10961),
                 }),
-                discord: Some(ChannelEntry { enabled: true }),
-                telegram: Some(ChannelEntry { enabled: true }),
+                discord: Some(ChannelEntry {
+                    enabled: true,
+                    agent_count: None,
+                }),
+                telegram: Some(ChannelEntry {
+                    enabled: true,
+                    agent_count: None,
+                }),
             },
             provider: ProviderStatus {
                 default: "openrouter".to_string(),
@@ -429,7 +442,10 @@ mod tests {
             host: None,
             port: None,
         });
-        snapshot.channels.discord = Some(ChannelEntry { enabled: false });
+        snapshot.channels.discord = Some(ChannelEntry {
+            enabled: false,
+            agent_count: None,
+        });
 
         // Act
         let output = format_snapshot(&snapshot);
