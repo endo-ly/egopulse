@@ -25,7 +25,7 @@ WT作成 → 実装(TDD) → コミット(意味ごとに分離) → PR作成
 | Discord runtime / adapter / handler | `src/runtime.rs`, `src/channels/discord.rs` |
 | Setup wizard | `src/setup/channels.rs`, `src/setup/summary.rs`, `src/setup/mod.rs` |
 | Secret redaction / status | `src/tools/sanitizer.rs`, `src/status.rs` |
-| Documentation | `docs/config.md`, `docs/multi-agent.md`, `docs/session-lifecycle.md`, `docs/security.md`, 必要に応じて `docs/commands.md` |
+| Documentation | `docs/config.md`, `docs/session-lifecycle.md`, `docs/security.md`, 必要に応じて `docs/commands.md` |
 
 ---
 
@@ -83,7 +83,7 @@ channels:
 - `BotId` newtype を追加し、空文字・`..`・`/`・`\`・`:` を拒否する。
 - `DiscordBotConfig` を追加し、`token`, `file_token`, `default_agent`, `allowed_channels`, `channel_agents` を持たせる。
 - `ChannelConfig` に Discord用 `bots` map を追加するか、よりよい構成があれば同等の責務分離で実装する。
-- `AgentDiscordConfig` はDiscord起動経路から外す。不要なら削除する。
+- `AgentDiscordConfig` は削除する。
 - `channels.discord.bot_token` はDiscord runtime用には読まない。Telegram等の既存 channel token 構造は壊さない。
 - loaderのプロセス環境変数オーバーライドは、Discordについては `channels.discord.bot_token` へ注入しない。Bot tokenは `channels.discord.bots.*.token` の SecretRef 解決だけで扱う。
 - loaderで `default_agent` / `channel_agents` の参照整合性を fail-fast 検証する。
@@ -242,7 +242,6 @@ docsとredactionを新仕様に合わせる。
 
 実装の目安:
 
-- `docs/multi-agent.md` はBot内定義を主仕様として書き直す。
 - `docs/config.md` から `agents.<id>.discord.*` を削除し、`channels.discord.bots.*` を追加する。
 - `docs/session-lifecycle.md` では、Discordの `surface_thread` は `{channel_id}:bot:{bot_id}:agent:{agent_id}`、保存される session key / `external_chat_id` は `discord:{channel_id}:bot:{bot_id}:agent:{agent_id}` と明記する。
 - `docs/security.md` / `docs/commands.md` の秘匿フィールド・設定マトリクスを更新する。
@@ -281,7 +280,7 @@ docsとredactionを新仕様に合わせる。
 
 | ファイル | 変更種別 | 内容 |
 |---|---|---|
-| `src/config/mod.rs` | 変更 | BotId / DiscordBotConfig / ChannelConfig bots 追加、AgentDiscordConfig削除または非使用化 |
+| `src/config/mod.rs` | 変更 | BotId / DiscordBotConfig / ChannelConfig bots 追加、AgentDiscordConfig削除 |
 | `src/config/loader.rs` | 変更 | `channels.discord.bots` 読み込み、SecretRef解決、参照検証 |
 | `src/config/persist.rs` | 変更 | Bot token SecretRef保存、`.env` 出力 |
 | `src/config/resolve.rs` | 変更 | `discord_bots()` runtime resolver 追加 |
@@ -293,7 +292,6 @@ docsとredactionを新仕様に合わせる。
 | `src/status.rs` | 変更 | Discord bot数表示 |
 | `src/tools/sanitizer.rs` | 変更 | Bot token redaction追加 |
 | `docs/config.md` | 変更 | 新YAML仕様へ更新 |
-| `docs/multi-agent.md` | 変更 | Bot内定義の運用ガイドへ更新 |
 | `docs/session-lifecycle.md` | 変更 | Bot+Agent session identityへ更新 |
 | `docs/security.md` | 変更 | 秘匿フィールド一覧更新 |
 | `docs/commands.md` | 変更 | 設定マトリクス更新 |

@@ -311,34 +311,10 @@ impl PartialEq for ResolvedLlmConfig {
 impl Eq for ResolvedLlmConfig {}
 
 #[derive(Clone, Default)]
-pub struct AgentDiscordConfig {
-    pub bot_token: Option<ResolvedValue>,
-    pub file_bot_token: Option<serde_yml::Value>,
-    pub allowed_channels: Option<Vec<u64>>,
-}
-
-impl std::fmt::Debug for AgentDiscordConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentDiscordConfig")
-            .field(
-                "bot_token",
-                &self
-                    .bot_token
-                    .as_ref()
-                    .map(|_| "<redacted>")
-                    .unwrap_or("<none>"),
-            )
-            .field("allowed_channels", &self.allowed_channels)
-            .finish()
-    }
-}
-
-#[derive(Clone, Default)]
 pub struct AgentConfig {
     pub label: String,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub discord: AgentDiscordConfig,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -347,7 +323,6 @@ impl std::fmt::Debug for AgentConfig {
             .field("label", &self.label)
             .field("provider", &self.provider)
             .field("model", &self.model)
-            .field("discord", &self.discord)
             .finish()
     }
 }
@@ -971,9 +946,9 @@ agents:
 
     #[test]
     #[serial]
-    fn persists_agents_without_leaking_secret_values() {
+    fn persists_agents_without_discord_config_surface() {
         use crate::config::persist::save_config_with_secrets;
-        use crate::config::secret_ref::{env_resolved_value, env_yaml_value};
+        use crate::config::secret_ref::env_resolved_value;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -984,15 +959,8 @@ agents:
             super::AgentId::new("alice"),
             super::AgentConfig {
                 label: "Alice".to_string(),
-                discord: super::AgentDiscordConfig {
-                    bot_token: Some(env_resolved_value(
-                        "DISCORD_BOT_TOKEN_ALICE",
-                        "discord-token-alice",
-                    )),
-                    file_bot_token: Some(env_yaml_value("DISCORD_BOT_TOKEN_ALICE")),
-                    allowed_channels: Some(vec![123456]),
-                },
-                ..Default::default()
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5".to_string()),
             },
         );
         agents.insert(
@@ -1032,12 +1000,9 @@ agents:
         let yaml = std::fs::read_to_string(&path).expect("yaml");
         assert!(yaml.contains("default_agent: alice"));
         assert!(yaml.contains("label: Alice"));
-        assert!(yaml.contains("id: DISCORD_BOT_TOKEN_ALICE"));
-        assert!(yaml.contains("source: env"));
-        assert!(!yaml.contains("discord-token-alice"));
-
-        let dotenv = std::fs::read_to_string(temp_dir.path().join(".env")).expect(".env");
-        assert!(dotenv.contains("DISCORD_BOT_TOKEN_ALICE=discord-token-alice"));
+        assert!(yaml.contains("provider: openai"));
+        assert!(yaml.contains("model: gpt-5"));
+        assert!(!yaml.contains("discord:"));
     }
 
     // --- Step 2: Agent LLM Resolution tests ---

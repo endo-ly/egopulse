@@ -42,20 +42,6 @@ pub struct DiscordAdapter {
 }
 
 impl DiscordAdapter {
-    pub fn new(token: String) -> Self {
-        Self {
-            bot_token_map: std::collections::HashMap::from([("legacy".into(), token)]),
-            http_client: reqwest::Client::new(),
-        }
-    }
-
-    pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
-        Self {
-            bot_token_map: std::collections::HashMap::from([("legacy".into(), token)]),
-            http_client,
-        }
-    }
-
     pub fn new_for_bots(config: &crate::config::Config) -> Self {
         let bot_tokens: std::collections::HashMap<String, String> = config
             .discord_bots()
@@ -411,9 +397,6 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
     // Strip bot+agent suffix: "123:bot:main:agent:developer" → "123"
     let bare = if let Some(pos) = external_chat_id.find(":bot:") {
         &external_chat_id[..pos]
-    } else if let Some(pos) = external_chat_id.find(":agent:") {
-        // legacy single-agent suffix
-        &external_chat_id[..pos]
     } else {
         external_chat_id
     };
@@ -538,15 +521,22 @@ mod tests {
         }
     }
 
+    fn test_adapter() -> DiscordAdapter {
+        DiscordAdapter {
+            bot_token_map: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
     #[test]
     fn adapter_name() {
-        let adapter = DiscordAdapter::new("test-token".to_string());
+        let adapter = test_adapter();
         assert_eq!(adapter.name(), "discord");
     }
 
     #[test]
     fn adapter_chat_type_routes() {
-        let adapter = DiscordAdapter::new("test-token".to_string());
+        let adapter = test_adapter();
         let routes = adapter.chat_type_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].0, "discord");
@@ -564,14 +554,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_discord_chat_id_accepts_agent_suffix() {
-        assert_eq!(
-            parse_discord_chat_id("123:agent:developer").expect("agent suffix"),
-            123
-        );
-    }
-
-    #[test]
     fn parse_discord_bot_id_from_external_chat_id() {
         assert_eq!(
             parse_discord_bot_id("123:bot:main:agent:developer"),
@@ -582,21 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_discord_chat_id_accepts_legacy_prefixed() {
+    fn parse_discord_chat_id_accepts_channel_prefixed() {
         assert_eq!(
-            parse_discord_chat_id("discord:12345").expect("legacy prefixed"),
+            parse_discord_chat_id("discord:12345").expect("channel prefixed"),
             12345
         );
-    }
-
-    #[test]
-    fn parse_discord_chat_id_rejects_bad_agent_suffix() {
-        assert!(parse_discord_chat_id("abc:agent:developer").is_err());
-    }
-
-    #[test]
-    fn parse_discord_chat_id_rejects_empty_channel() {
-        assert!(parse_discord_chat_id(":agent:developer").is_err());
     }
 
     #[test]

@@ -11,8 +11,8 @@ use super::secret_ref::{
     read_dotenv, resolve_string_or_ref,
 };
 use super::{
-    AgentConfig, AgentDiscordConfig, AgentId, BotId, ChannelConfig, ChannelName, Config,
-    DiscordBotConfig, ProviderConfig, ProviderId,
+    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
+    ProviderConfig, ProviderId,
 };
 use crate::error::ConfigError;
 
@@ -51,17 +51,10 @@ struct FileDiscordBotConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct FileAgentDiscordConfig {
-    bot_token: Option<StringOrRef>,
-    allowed_channels: Option<Vec<u64>>,
-}
-
-#[derive(Debug, Deserialize, Default)]
 struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
-    discord: Option<FileAgentDiscordConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -371,37 +364,17 @@ fn normalize_discord_bots(
 
 fn normalize_agents(
     agents: HashMap<String, FileAgentConfig>,
-    dotenv: &HashMap<String, String>,
+    _dotenv: &HashMap<String, String>,
 ) -> Result<HashMap<AgentId, AgentConfig>, ConfigError> {
     let mut normalized = HashMap::new();
     for (name, fa) in agents {
         let key = AgentId::new(&name);
         validate_agent_id(&key)?;
 
-        let discord = match fa.discord {
-            Some(fd) => {
-                let resolved_bot = resolve_string_or_ref(fd.bot_token, dotenv)?;
-                let file_bot_token = resolved_bot.as_ref().map(|rv| {
-                    if matches!(rv, ResolvedValue::Literal(_)) {
-                        serde_yml::Value::String(rv.value().to_string())
-                    } else {
-                        rv.to_yaml_value()
-                    }
-                });
-                AgentDiscordConfig {
-                    bot_token: resolved_bot,
-                    file_bot_token,
-                    allowed_channels: fd.allowed_channels,
-                }
-            }
-            None => AgentDiscordConfig::default(),
-        };
-
         let config = AgentConfig {
             label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
-            discord,
         };
         normalized.insert(key, config);
     }

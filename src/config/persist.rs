@@ -28,25 +28,12 @@ struct SerializableDiscordBot {
 }
 
 #[derive(Serialize)]
-struct SerializableAgentDiscord {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_yaml_value"
-    )]
-    bot_token: Option<serde_yml::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_channels: Option<Vec<u64>>,
-}
-
-#[derive(Serialize)]
 struct SerializableAgent {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    discord: Option<SerializableAgentDiscord>,
 }
 
 #[derive(Serialize)]
@@ -199,22 +186,12 @@ impl From<&Config> for SerializableConfig {
             .agents
             .iter()
             .map(|(id, a)| {
-                let discord =
-                    if a.discord.bot_token.is_some() || a.discord.allowed_channels.is_some() {
-                        Some(SerializableAgentDiscord {
-                            bot_token: a.discord.file_bot_token.clone(),
-                            allowed_channels: a.discord.allowed_channels.clone(),
-                        })
-                    } else {
-                        None
-                    };
                 (
                     id.to_string(),
                     SerializableAgent {
                         label: a.label.clone(),
                         provider: a.provider.clone(),
                         model: a.model.clone(),
-                        discord,
                     },
                 )
             })
@@ -296,13 +273,6 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
                 let _ = bot_id;
             }
         }
-    }
-
-    for (agent_id, agent) in &config.agents {
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &agent.discord.bot_token {
-            entries.push((env_id.clone(), value.clone()));
-        }
-        let _ = agent_id;
     }
 
     entries
