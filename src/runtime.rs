@@ -133,9 +133,9 @@ pub async fn build_app_state_with_path(
     channels.register(Arc::new(WebAdapter));
 
     #[cfg(feature = "channel-discord")]
-    if !config.discord_agent_bots().is_empty() {
+    if !config.discord_bots().is_empty() {
         channels.register(Arc::new(
-            crate::channels::discord::DiscordAdapter::new_for_agents(&config),
+            crate::channels::discord::DiscordAdapter::new_for_bots(&config),
         ));
     }
 
@@ -223,41 +223,44 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         handles.push(("web".to_string(), handle));
     }
 
-    // Discord bot 起動 — Agent ごとに 1 つの Discord client を起動する。
+    // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
     #[cfg(feature = "channel-discord")]
     {
-        let agent_bots: Vec<_> = state
+        let bot_configs: Vec<_> = state
             .config
-            .discord_agent_bots()
+            .discord_bots()
             .into_iter()
             .map(|b| {
                 (
-                    b.agent_id.clone(),
+                    b.bot_id.clone(),
                     b.token.to_string(),
                     b.allowed_channels.to_vec(),
-                    b.label.to_string(),
+                    b.default_agent.clone(),
+                    b.channel_agents.clone(),
                 )
             })
             .collect();
 
-        if !agent_bots.is_empty() {
+        if !bot_configs.is_empty() {
             has_active_channels = true;
-            for (agent_id, token, allowed_channels, label) in agent_bots {
+            for (bot_id, token, allowed_channels, default_agent, channel_agents) in bot_configs {
                 let discord_state = Arc::new(state.clone());
-                let handle_name = format!("discord[{agent_id}]");
-                info!("Starting Discord bot for agent '{agent_id}' ({label})...",);
-                let aid = agent_id.clone();
+                let handle_name = format!("discord[{bot_id}]");
+                info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
+                let bid = bot_id.clone();
                 let handle = tokio::spawn(async move {
-                    crate::channels::discord::start_discord_bot_for_agent(
+                    crate::channels::discord::start_discord_bot_for_bot(
                         discord_state,
                         &token,
-                        &aid,
+                        &bid,
+                        &default_agent,
                         &allowed_channels,
+                        &channel_agents,
                     )
                     .await
                     .map_err(|error| {
                         EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                            "discord bot (agent {aid}) failed: {error}",
+                            "discord bot ({bid}) failed: {error}",
                         )))
                     })
                 });
@@ -265,8 +268,8 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             }
         } else {
             tracing::warn!(
-                "Discord channel is enabled but no agents have a discord.bot_token configured. \
-                 Set agents.<id>.discord.bot_token in egopulse.config.yaml."
+                "Discord channel is enabled but no bots have a token configured. \
+                 Set channels.discord.bots.<id>.token in egopulse.config.yaml."
             );
         }
     }
@@ -383,7 +386,7 @@ async fn write_startup_status(state: &AppState) {
         None
     };
 
-    let discord_agent_count = state.config.discord_agent_bots().len();
+    let discord_agent_count = state.config.discord_bots().len();
     let discord = if discord_agent_count > 0 {
         Some(ChannelEntry {
             enabled: true,

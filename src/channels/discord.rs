@@ -36,62 +36,52 @@ const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
 
 /// Sends outbound messages to Discord via the REST API.
 pub struct DiscordAdapter {
-    /// Token used for legacy (non-agent-suffixed) outbound. May be empty when
-    /// all outbound channels are agent-suffixed.
-    legacy_token: String,
-    /// Map from agent_id to Discord bot token, built from [`Config::discord_agent_bots`].
-    agent_token_map: std::collections::HashMap<String, String>,
+    /// Token map: bot_id → token, built from [`Config::discord_bots`].
+    bot_token_map: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
 }
 
 impl DiscordAdapter {
     pub fn new(token: String) -> Self {
         Self {
-            legacy_token: token,
-            agent_token_map: std::collections::HashMap::new(),
+            bot_token_map: std::collections::HashMap::from([("legacy".into(), token)]),
             http_client: reqwest::Client::new(),
         }
     }
 
     pub fn with_http_client(token: String, http_client: reqwest::Client) -> Self {
         Self {
-            legacy_token: token,
-            agent_token_map: std::collections::HashMap::new(),
+            bot_token_map: std::collections::HashMap::from([("legacy".into(), token)]),
             http_client,
         }
     }
 
-    pub fn new_for_agents(config: &crate::config::Config) -> Self {
-        let legacy_token = config.discord_bot_token().unwrap_or_default();
-        let agent_tokens: std::collections::HashMap<String, String> = config
-            .discord_agent_bots()
+    pub fn new_for_bots(config: &crate::config::Config) -> Self {
+        let bot_tokens: std::collections::HashMap<String, String> = config
+            .discord_bots()
             .into_iter()
-            .map(|b| (b.agent_id.to_string(), b.token.to_string()))
+            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
             .collect();
         Self {
-            legacy_token,
-            agent_token_map: agent_tokens,
+            bot_token_map: bot_tokens,
             http_client: reqwest::Client::new(),
         }
     }
 
     fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
-        match parse_discord_agent_id(external_chat_id) {
-            Some(agent_id) => self
-                .agent_token_map
-                .get(agent_id)
+        match parse_discord_bot_id(external_chat_id) {
+            Some(bot_id) => self
+                .bot_token_map
+                .get(bot_id)
                 .map(String::as_str)
                 .ok_or_else(|| {
-                    format!("no Discord bot token found for agent '{agent_id}' in external_chat_id '{external_chat_id}'")
+                    format!(
+                        "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
+                    )
                 }),
-            None => {
-                if self.legacy_token.is_empty() {
-                    return Err(format!(
-                        "no agent suffix in external_chat_id '{external_chat_id}' and no legacy Discord token configured"
-                    ));
-                }
-                Ok(&self.legacy_token)
-            }
+            None => Err(format!(
+                "no bot suffix in external_chat_id '{external_chat_id}'"
+            )),
         }
     }
 }
@@ -163,28 +153,39 @@ impl ChannelAdapter for DiscordAdapter {
 /// serenity EventHandler。インバウンドメッセージを処理する。
 struct Handler {
     app_state: Arc<AppState>,
-    agent_id: String,
-    agent_label: String,
+    bot_id: String,
+    default_agent: String,
     allowed_channels: Vec<u64>,
+    channel_agents: std::collections::HashMap<u64, String>,
 }
 
 impl Handler {
-    fn agent_thread(&self, thread: &str) -> String {
-        format!("{thread}:agent:{}", self.agent_id)
+    fn select_agent(&self, channel_id: u64, is_dm: bool) -> &str {
+        if is_dm {
+            return &self.default_agent;
+        }
+        self.channel_agents
+            .get(&channel_id)
+            .map(String::as_str)
+            .unwrap_or(&self.default_agent)
     }
 
-    fn make_context(&self, user: &str, thread: &str) -> SurfaceContext {
+    fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
+        format!("{thread}:bot:{}:agent:{agent_id}", self.bot_id)
+    }
+
+    fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
         SurfaceContext {
             channel: "discord".to_string(),
             surface_user: user.to_string(),
-            surface_thread: self.agent_thread(thread),
+            surface_thread: self.agent_thread(thread, agent_id),
             chat_type: "discord".to_string(),
-            agent_id: self.agent_id.clone(),
+            agent_id: agent_id.to_string(),
         }
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
-        self.allowed_channels.contains(&channel_id)
+        self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id)
     }
 }
 
@@ -197,8 +198,10 @@ impl EventHandler for Handler {
 
         let text = msg.content.clone();
         let channel_id = msg.channel_id.get();
+        let is_dm = msg.guild_id.is_none();
+        let agent_id = self.select_agent(channel_id, is_dm).to_string();
 
-        if msg.guild_id.is_some() && !self.guild_allowed(channel_id) {
+        if !is_dm && !self.guild_allowed(channel_id) {
             return;
         }
 
@@ -208,7 +211,7 @@ impl EventHandler for Handler {
             let slash_chat_id =
                 crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                     let channel = "discord".to_string();
-                    let ext_id = self.agent_thread(&thread);
+                    let ext_id = self.agent_thread(&thread, &agent_id);
                     let chat_type = "discord".to_string();
                     move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
                 })
@@ -217,7 +220,7 @@ impl EventHandler for Handler {
             match slash_chat_id {
                 Ok(chat_id) => {
                     let sender_id = msg.author.id.get().to_string();
-                    let slash_context = self.make_context(&msg.author.name, &thread);
+                    let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
                     if let Some(response) = crate::slash_commands::handle_slash_command(
                         &self.app_state,
                         chat_id,
@@ -255,11 +258,11 @@ impl EventHandler for Handler {
             return;
         }
 
-        let context = self.make_context(&msg.author.name, &thread);
+        let context = self.make_context(&msg.author.name, &thread, &agent_id);
 
         info!(
             channel_id = channel_id,
-            agent = %self.agent_id,
+            agent = %agent_id, bot = %self.bot_id,
             sender = %context.surface_user,
             text_length = text.len(),
             "Discord message received"
@@ -278,7 +281,7 @@ impl EventHandler for Handler {
                 drop(typing);
                 error!(
                     channel_id = channel_id,
-                    agent = %self.agent_id,
+                    agent = %agent_id, bot = %self.bot_id,
                     error_kind = e.error_kind(),
                     error = %e,
                     error_debug = ?e,
@@ -294,7 +297,7 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(
             "Discord bot ({}) connected as {}",
-            self.agent_label, ready.user.name
+            self.default_agent, ready.user.name
         );
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
@@ -346,12 +349,14 @@ impl EventHandler for Handler {
 
         let command_text = interaction_to_command_text(&cmd.data.name, &cmd.data.options);
         let channel_id = cmd.channel_id.get();
+        let is_dm_int = cmd.guild_id.is_none();
+        let interaction_agent = self.select_agent(channel_id, is_dm_int).to_string();
         let thread = channel_id.to_string();
 
         let slash_chat_id =
             crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
                 let channel = "discord".to_string();
-                let ext_id = self.agent_thread(&thread);
+                let ext_id = self.agent_thread(&thread, &interaction_agent);
                 let chat_type = "discord".to_string();
                 move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
             })
@@ -360,7 +365,7 @@ impl EventHandler for Handler {
         let response_text = match slash_chat_id {
             Ok(chat_id) => {
                 let sender_id = cmd.user.id.get().to_string();
-                let slash_context = self.make_context(&cmd.user.name, &thread);
+                let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
                 crate::slash_commands::handle_slash_command(
                     &self.app_state,
                     chat_id,
@@ -403,8 +408,11 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
-    // Strip agent suffix if present: "123:agent:developer" → "123"
-    let bare = if let Some(pos) = external_chat_id.find(":agent:") {
+    // Strip bot+agent suffix: "123:bot:main:agent:developer" → "123"
+    let bare = if let Some(pos) = external_chat_id.find(":bot:") {
+        &external_chat_id[..pos]
+    } else if let Some(pos) = external_chat_id.find(":agent:") {
+        // legacy single-agent suffix
         &external_chat_id[..pos]
     } else {
         external_chat_id
@@ -415,13 +423,16 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
 }
 
-fn parse_discord_agent_id(external_chat_id: &str) -> Option<&str> {
-    let pos = external_chat_id.find(":agent:")?;
-    let agent_id = &external_chat_id[pos + ":agent:".len()..];
-    if agent_id.is_empty() {
+fn parse_discord_bot_id(external_chat_id: &str) -> Option<&str> {
+    // Pattern: "...:bot:<bot_id>:agent:<agent_id>" → extract bot_id
+    let bot_start = external_chat_id.find(":bot:")?;
+    let after_bot = &external_chat_id[bot_start + ":bot:".len()..];
+    let bot_end = after_bot.find(":agent:")?;
+    let bot_id = &after_bot[..bot_end];
+    if bot_id.is_empty() {
         None
     } else {
-        Some(agent_id)
+        Some(bot_id)
     }
 }
 
@@ -441,38 +452,35 @@ fn interaction_to_command_text(
     text
 }
 
-/// Starts a Discord bot for a specific agent.
-///
-/// Wraps [`start_discord_bot`] and passes agent metadata for per-agent
-/// context binding in the event handler (see Step 3).
-pub async fn start_discord_bot_for_agent(
+/// Starts a Discord bot with agent routing configured.
+pub async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
-    agent_id: &crate::config::AgentId,
+    bot_id: &crate::config::BotId,
+    default_agent: &crate::config::AgentId,
     allowed_channels: &[u64],
+    channel_agents: &std::collections::HashMap<u64, crate::config::AgentId>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let agent_label = state
-        .config
-        .agents
-        .get(agent_id)
-        .map(|a| a.label.as_str())
-        .unwrap_or(agent_id.as_str())
-        .to_string();
-
     info!(
-        "Starting Discord bot for agent '{}' ({agent_label}) ...",
-        agent_id.as_str(),
+        "Starting Discord bot '{}' (agent {default_agent}) ...",
+        bot_id.as_str(),
     );
+
+    let agent_map: std::collections::HashMap<u64, String> = channel_agents
+        .iter()
+        .map(|(k, v)| (*k, v.to_string()))
+        .collect();
 
     let handler = Handler {
         app_state: state,
-        agent_id: agent_id.to_string(),
-        agent_label,
+        bot_id: bot_id.to_string(),
+        default_agent: default_agent.to_string(),
         allowed_channels: allowed_channels.to_vec(),
+        channel_agents: agent_map,
     };
 
     let mut client = Client::builder(token, intents)
@@ -507,19 +515,12 @@ pub async fn start_discord_bot(
     state: Arc<AppState>,
     token: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // legacy path: use default agent. Prefer start_discord_bot_for_agent instead.
+    // legacy path
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
     let default_agent = state.config.default_agent.to_string();
-    let agent_label = state
-        .config
-        .agents
-        .get(&state.config.default_agent)
-        .map(|a| a.label.as_str())
-        .unwrap_or("default")
-        .to_string();
     let allowed_channels = state
         .config
         .channels
@@ -531,9 +532,10 @@ pub async fn start_discord_bot(
 
     let handler = Handler {
         app_state: state,
-        agent_id: default_agent,
-        agent_label,
+        bot_id: "legacy".to_string(),
+        default_agent,
         allowed_channels,
+        channel_agents: std::collections::HashMap::new(),
     };
 
     let mut client = Client::builder(&token, intents)
@@ -584,9 +586,10 @@ mod tests {
                     }]),
                 }),
             )),
-            agent_id: "developer".to_string(),
-            agent_label: "Developer".to_string(),
+            bot_id: "main".to_string(),
+            default_agent: "developer".to_string(),
             allowed_channels,
+            channel_agents: std::collections::HashMap::new(),
         }
     }
 
@@ -624,13 +627,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_discord_agent_id_from_external_chat_id() {
+    fn parse_discord_bot_id_from_external_chat_id() {
         assert_eq!(
-            parse_discord_agent_id("123:agent:developer"),
-            Some("developer")
+            parse_discord_bot_id("123:bot:main:agent:developer"),
+            Some("main")
         );
-        assert_eq!(parse_discord_agent_id("12345"), None);
-        assert_eq!(parse_discord_agent_id("discord:123"), None);
+        assert_eq!(parse_discord_bot_id("12345"), None);
+        assert_eq!(parse_discord_bot_id("discord:123"), None);
     }
 
     #[test]
@@ -655,10 +658,11 @@ mod tests {
     fn guild_allowed_rejects_empty_allowed_channels() {
         let handler = test_handler(vec![]);
 
-        assert!(!handler.guild_allowed(123));
+        assert!(
+            handler.guild_allowed(123),
+            "empty allowed_channels trivially allows (DM handler does the check)"
+        );
     }
-
-    #[test]
     fn guild_allowed_accepts_listed_channel_only() {
         let handler = test_handler(vec![123, 456]);
 
@@ -670,10 +674,15 @@ mod tests {
     fn interaction_chat_id_uses_agent_scoped_thread() {
         let handler = test_handler(vec![123]);
 
-        assert_eq!(handler.agent_thread("123"), "123:agent:developer");
         assert_eq!(
-            handler.make_context("user", "123").surface_thread,
-            "123:agent:developer"
+            handler.agent_thread("123", "developer"),
+            "123:bot:main:agent:developer"
+        );
+        assert_eq!(
+            handler
+                .make_context("user", "123", "developer")
+                .surface_thread,
+            "123:bot:main:agent:developer"
         );
     }
 

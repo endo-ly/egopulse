@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{AgentId, ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
+use super::{AgentId, BotId, ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
 use crate::error::ConfigError;
 
 impl Config {
@@ -274,10 +275,14 @@ impl Config {
             .join("AGENTS.md")
     }
 
-    /// Discord session thread for a multi-agent Discord bot:
-    /// `{channel_id}:agent:{agent_id}`.
-    pub fn discord_agent_surface_thread(&self, channel_id: &str, agent_id: &AgentId) -> String {
-        format!("{channel_id}:agent:{agent_id}")
+    /// Discord session thread: `{channel_id}:bot:{bot_id}:agent:{agent_id}`.
+    pub fn discord_surface_thread(
+        &self,
+        channel_id: &str,
+        bot_id: &BotId,
+        agent_id: &AgentId,
+    ) -> String {
+        format!("{channel_id}:bot:{bot_id}:agent:{agent_id}")
     }
 
     /// マルチソウル用ディレクトリ: `state_root/souls`。
@@ -320,58 +325,52 @@ impl Config {
         super::persist::save_config_with_secrets(self, yaml_path)
     }
 
-    /// Returns the list of agents that have their own Discord bot token configured.
+    /// Returns runtime info for every bot under `channels.discord.bots` that has
+    /// a resolved token.
     ///
-    /// Each returned entry contains the agent's id, label, resolved token string,
-    /// and allowed channel slice for this bot.
-    ///
-    /// Agents without a `discord.bot_token` are excluded. When `channels.discord`
-    /// is disabled no agents are returned.
-    pub fn discord_agent_bots(&self) -> Vec<DiscordAgentBot<'_>> {
+    /// Sorted by `bot_id` for deterministic startup. Empty when Discord is disabled.
+    pub fn discord_bots(&self) -> Vec<DiscordBotRuntime<'_>> {
         if !self.channel_enabled("discord") {
             return vec![];
         }
 
-        let mut bots: Vec<_> = self
-            .agents
+        let Some(discord) = self.channels.get("discord") else {
+            return vec![];
+        };
+        let Some(bots) = &discord.discord_bots else {
+            return vec![];
+        };
+
+        let mut runtime_bots: Vec<_> = bots
             .iter()
-            .filter_map(|(agent_id, agent)| {
-                let token = agent.discord.bot_token.as_ref()?;
-                Some(DiscordAgentBot {
-                    agent_id,
-                    label: agent.label.as_str(),
+            .filter_map(|(bot_id, bot)| {
+                let token = bot.token.as_ref()?;
+                Some(DiscordBotRuntime {
+                    bot_id,
                     token: token.value(),
-                    allowed_channels: agent
-                        .discord
-                        .allowed_channels
-                        .as_deref()
+                    default_agent: bot.default_agent.as_ref().unwrap_or(&self.default_agent),
+                    allowed_channels: bot.allowed_channels.as_deref().unwrap_or_default(),
+                    channel_agents: bot
+                        .channel_agents
+                        .as_ref()
+                        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
                         .unwrap_or_default(),
                 })
             })
             .collect();
-        bots.sort_by_key(|b| b.agent_id.as_str());
-        bots
+        runtime_bots.sort_by_key(|b| b.bot_id.as_str());
+        runtime_bots
     }
 }
 
-/// Information about an agent with its own Discord bot token.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DiscordAgentBot<'a> {
-    pub agent_id: &'a AgentId,
-    pub label: &'a str,
+/// Runtime data needed to start and operate one Discord bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscordBotRuntime<'a> {
+    pub bot_id: &'a BotId,
     pub token: &'a str,
+    pub default_agent: &'a AgentId,
     pub allowed_channels: &'a [u64],
-}
-
-impl std::fmt::Debug for DiscordAgentBot<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DiscordAgentBot")
-            .field("agent_id", &self.agent_id)
-            .field("label", &self.label)
-            .field("token", &"<redacted>")
-            .field("allowed_channels", &self.allowed_channels)
-            .finish()
-    }
+    pub channel_agents: HashMap<u64, AgentId>,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.
