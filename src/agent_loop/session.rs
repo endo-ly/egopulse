@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn discord_agent_scoped_thread_includes_agent_id() {
+    fn discord_surface_thread_includes_bot_and_agent_ids() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8").to_string());
 

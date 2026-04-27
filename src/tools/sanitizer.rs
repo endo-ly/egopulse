@@ -175,21 +175,11 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
         if let Some(rv) = &channel.bot_token {
             secrets.push((format!("channel.{name}.bot_token"), rv.value().to_string()));
         }
-    }
-    for (id, agent) in &config.agents {
-        if let Some(rv) = &agent.discord.bot_token {
-            secrets.push((
-                format!("agents.{id}.discord.bot_token"),
-                rv.value().to_string(),
-            ));
-        }
-    }
-    if let Some(discord) = config.channels.get("discord") {
-        if let Some(bots) = &discord.discord_bots {
+        if let Some(bots) = &channel.discord_bots {
             for (bot_id, bot) in bots {
                 if let Some(rv) = &bot.token {
                     secrets.push((
-                        format!("channel.discord.bots.{bot_id}.token"),
+                        format!("channels.{name}.bots.{bot_id}.token"),
                         rv.value().to_string(),
                     ));
                 }
@@ -508,5 +498,52 @@ mod tests {
         assert!(keys.contains(&"channel.discord.auth_token"));
         assert!(keys.contains(&"channel.discord.bot_token"));
         assert_eq!(secrets.len(), 2);
+    }
+
+    /// collect_config_secrets: channels.discord.bots.<bot_id>.token が抽出される。
+    #[test]
+    fn test_collect_config_secrets_extracts_discord_bot_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("bot123"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
+                file_token: None,
+                default_agent: None,
+                allowed_channels: None,
+                channel_agents: None,
+            },
+        );
+
+        let config = Config {
+            default_provider: ProviderId::new("local"),
+            default_model: None,
+            providers: std::collections::HashMap::new(),
+            state_root: dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: std::collections::HashMap::from([(
+                ChannelName::new("discord"),
+                ChannelConfig {
+                    enabled: Some(true),
+                    discord_bots: Some(bots),
+                    ..Default::default()
+                },
+            )]),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
+        };
+
+        let secrets = collect_config_secrets(&config);
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].0, "channels.discord.bots.bot123.token");
+        assert_eq!(secrets[0].1, "bot-token-value");
     }
 }

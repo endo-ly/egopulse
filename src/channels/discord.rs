@@ -185,7 +185,7 @@ impl Handler {
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
-        self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id)
+        !self.allowed_channels.is_empty() && self.allowed_channels.contains(&channel_id)
     }
 }
 
@@ -510,61 +510,6 @@ pub async fn start_discord_bot_for_bot(
     Ok(())
 }
 
-/// Starts the Discord bot and supervises its gateway lifecycle.
-pub async fn start_discord_bot(
-    state: Arc<AppState>,
-    token: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // legacy path
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
-
-    let default_agent = state.config.default_agent.to_string();
-    let allowed_channels = state
-        .config
-        .channels
-        .get("discord")
-        .and_then(|c| c.allowed_channels.clone())
-        .unwrap_or_default();
-
-    info!("Starting Discord bot (requesting MESSAGE_CONTENT intent)...");
-
-    let handler = Handler {
-        app_state: state,
-        bot_id: "legacy".to_string(),
-        default_agent,
-        allowed_channels,
-        channel_agents: std::collections::HashMap::new(),
-    };
-
-    let mut client = Client::builder(&token, intents)
-        .event_handler(handler)
-        .await
-        .map_err(|e| {
-            error!("Discord bot failed to start: {e}");
-            e
-        })?;
-
-    let shard_manager = client.shard_manager.clone();
-    let shutdown_task = tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Discord bot failed to listen for Ctrl-C: {e}");
-            return;
-        }
-        shard_manager.shutdown_all().await;
-    });
-
-    client.start().await.map_err(|e| {
-        error!("Discord bot error: {e}");
-        e
-    })?;
-
-    shutdown_task.abort();
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,12 +600,12 @@ mod tests {
     }
 
     #[test]
-    fn guild_allowed_rejects_empty_allowed_channels() {
+    fn guild_allowed_rejects_when_allowed_channels_empty() {
         let handler = test_handler(vec![]);
 
         assert!(
-            handler.guild_allowed(123),
-            "empty allowed_channels trivially allows (DM handler does the check)"
+            !handler.guild_allowed(123),
+            "empty allowed_channels should reject guild messages"
         );
     }
     #[test]

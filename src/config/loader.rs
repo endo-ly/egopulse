@@ -312,6 +312,13 @@ fn normalize_discord_bots(
         let bot_id = BotId::new(&name);
         validate_bot_id(&bot_id)?;
 
+        if bots.contains_key(&bot_id) {
+            return Err(ConfigError::DuplicateBotId {
+                bot_id: bot_id.to_string(),
+                original_key: name,
+            });
+        }
+
         let resolved_token = resolve_string_or_ref(fb.token, dotenv)?;
         let file_token = resolved_token.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
@@ -326,20 +333,24 @@ fn normalize_discord_bots(
             .filter(|s| !s.trim().is_empty())
             .map(|s| AgentId::new(&s));
 
-        let channel_agents = fb.channel_agents.and_then(|map| {
-            let mut result = HashMap::new();
-            for (k, v) in map {
-                if let Ok(channel_id) = k.parse::<u64>() {
+        let channel_agents = fb
+            .channel_agents
+            .map(|map| {
+                let mut result = HashMap::new();
+                for (k, v) in map {
+                    let channel_id: u64 =
+                        k.parse::<u64>()
+                            .map_err(|_| ConfigError::InvalidChannelAgentsKey {
+                                bot_id: bot_id.to_string(),
+                                key: k,
+                            })?;
                     let agent_id = AgentId::new(&v);
                     result.insert(channel_id, agent_id);
                 }
-            }
-            if result.is_empty() {
-                None
-            } else {
-                Some(result)
-            }
-        });
+                Ok(result)
+            })
+            .transpose()?
+            .filter(|m| !m.is_empty());
 
         bots.insert(
             bot_id,

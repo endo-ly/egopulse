@@ -61,7 +61,7 @@ channels:
 
 ## 内部セッション管理
 
-マルチエージェント Discord Bot では、セッションスレッド ID が `{channel_id}:agent:{agent_id}` 形式になり、同一チャネル内でもエージェントごとに独立した会話履歴が保持される。
+マルチエージェント Discord Bot では、セッションスレッド ID が `{channel_id}:bot:{bot_id}:agent:{agent_id}` 形式になり、同一チャネル内でも Bot+エージェントごとに独立した会話履歴が保持される。
 
 ## 関連ドキュメント
 

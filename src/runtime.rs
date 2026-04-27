@@ -386,11 +386,11 @@ async fn write_startup_status(state: &AppState) {
         None
     };
 
-    let discord_agent_count = state.config.discord_bots().len();
-    let discord = if discord_agent_count > 0 {
+    let discord_bot_count = state.config.discord_bots().len();
+    let discord = if discord_bot_count > 0 {
         Some(ChannelEntry {
             enabled: true,
-            agent_count: Some(discord_agent_count),
+            agent_count: Some(discord_bot_count),
         })
     } else if state.config.channel_enabled("discord") {
         Some(ChannelEntry {

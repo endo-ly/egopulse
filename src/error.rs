@@ -117,6 +117,13 @@ pub enum ConfigError {
         channel_id: u64,
         agent_id: String,
     },
+    #[error("duplicate_bot_id: bot_id={bot_id} (normalized from '{original_key}')")]
+    DuplicateBotId {
+        bot_id: String,
+        original_key: String,
+    },
+    #[error("invalid_channel_agents_key: bot={bot_id} key='{key}' is not a valid u64")]
+    InvalidChannelAgentsKey { bot_id: String, key: String },
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,

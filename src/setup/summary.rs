@@ -205,9 +205,10 @@ pub(crate) fn save_config(
     );
 
     if let Some(bots) = discord_bots {
-        if let Some(discord_channel) = channels.get_mut("discord") {
-            discord_channel.discord_bots = Some(bots);
-        }
+        channels
+            .entry(crate::config::ChannelName::new("discord"))
+            .or_default()
+            .discord_bots = Some(bots);
     }
 
     let agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig> =

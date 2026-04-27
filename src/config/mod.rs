@@ -1586,7 +1586,7 @@ channels:
 
     #[test]
     #[serial]
-    fn discord_bot_allowed_channels_empty_means_guild_reject() {
+    fn discord_bot_allowed_channels_defaults_to_empty_slice() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", temp_dir.path());
         write_env(&temp_dir, "MY_TOKEN=token\n");
