@@ -18,7 +18,8 @@ Plan 作成前に以下が揃っていること。揃っていなければユー
 
 ## Plan ファイルの配置先
 
-`docs/<プロジェクト略称>/plan-<topic>.md`
+`docs/plan/plan-<topic>.md`
+(実装済みのPlanは、`docs/plan/archived/`に移動)
 
 ## Plan ファイルの必須構造（12 セクション）
 

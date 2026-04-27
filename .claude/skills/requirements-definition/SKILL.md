@@ -94,7 +94,7 @@ Gherkin形式（Given/When/Then）を推奨。
 ---
 
 ### 8. Markdown ドキュメント生成
-`docs/00.project/requirements/[機能名].md` に生成する。
+`docs/requirements/[機能名].md` に生成する。
 フォーマットは `.github/ISSUE_TEMPLATE/requirements.md` を使用する。
 
 ---
