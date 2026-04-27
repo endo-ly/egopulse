@@ -336,7 +336,7 @@ impl Config {
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
-                    default_agent: bot.default_agent.as_ref().unwrap_or(&self.default_agent),
+                    default_agent: &bot.default_agent,
                     allowed_channels: bot.allowed_channels.as_deref().unwrap_or_default(),
                     channel_agents: bot
                         .channel_agents

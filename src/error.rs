@@ -107,6 +107,8 @@ pub enum ConfigError {
     AgentNotFound { agent_id: String },
     #[error("invalid_bot_id: {id}")]
     InvalidBotId { id: String },
+    #[error("missing_discord_bot_default_agent: bot={bot_id}")]
+    MissingDiscordBotDefaultAgent { bot_id: String },
     #[error("discord_bot_default_agent_not_found: bot={bot_id} agent={agent_id}")]
     DiscordBotDefaultAgentNotFound { bot_id: String, agent_id: String },
     #[error(

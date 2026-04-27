@@ -153,7 +153,7 @@ impl From<&str> for BotId {
 pub struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<serde_yml::Value>,
-    pub default_agent: Option<AgentId>,
+    pub default_agent: AgentId,
     pub allowed_channels: Option<Vec<u64>>,
     pub channel_agents: Option<HashMap<u64, AgentId>>,
 }
@@ -1298,14 +1298,7 @@ channels:
         assert_eq!(bots.len(), 1);
 
         let main_bot = bots.get("main").expect("main bot");
-        assert_eq!(
-            main_bot
-                .default_agent
-                .as_ref()
-                .expect("default_agent")
-                .as_str(),
-            "assistant"
-        );
+        assert_eq!(main_bot.default_agent.as_str(), "assistant");
         assert_eq!(
             main_bot.token.as_ref().expect("token").value(),
             "discord-bot-token-123"
@@ -1385,7 +1378,7 @@ channels:
 
     #[test]
     #[serial]
-    fn discord_bots_default_agent_falls_back_to_global_default() {
+    fn discord_bots_require_default_agent() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", temp_dir.path());
         write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
@@ -1400,12 +1393,15 @@ channels:
             ),
         );
 
-        let config = Config::load(Some(&file_path)).expect("load config");
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
 
-        let discord = config.channels.get("discord").expect("discord channel");
-        let bots = discord.discord_bots.as_ref().expect("bots");
-        let main_bot = bots.get("main").expect("main bot");
-        assert_eq!(main_bot.default_agent, None);
+        assert!(
+            matches!(
+                error,
+                ConfigError::MissingDiscordBotDefaultAgent { ref bot_id } if bot_id == "main"
+            ),
+            "expected MissingDiscordBotDefaultAgent, got {error:?}"
+        );
     }
 
     #[test]
@@ -1433,7 +1429,7 @@ channels:
             super::DiscordBotConfig {
                 token: Some(lit_val("DISCORD_BOT_TOKEN", "secret-bot-token")),
                 file_token: Some(lit_yaml("DISCORD_BOT_TOKEN")),
-                default_agent: Some(super::AgentId::new("assistant")),
+                default_agent: super::AgentId::new("assistant"),
                 allowed_channels: Some(vec![123456]),
                 channel_agents: None,
             },

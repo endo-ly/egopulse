@@ -512,7 +512,7 @@ mod tests {
             crate::config::DiscordBotConfig {
                 token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
                 file_token: None,
-                default_agent: None,
+                default_agent: crate::config::AgentId::new("default"),
                 allowed_channels: None,
                 channel_agents: None,
             },

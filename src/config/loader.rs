@@ -330,8 +330,11 @@ fn normalize_discord_bots(
 
         let default_agent = fb
             .default_agent
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| AgentId::new(&s));
+            .and_then(|s| normalize_string(Some(s)))
+            .map(|s| AgentId::new(&s))
+            .ok_or_else(|| ConfigError::MissingDiscordBotDefaultAgent {
+                bot_id: bot_id.to_string(),
+            })?;
 
         let channel_agents = fb
             .channel_agents
@@ -512,11 +515,10 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
     };
 
     for (bot_id, bot) in bots {
-        let effective_agent = bot.default_agent.as_ref().unwrap_or(&config.default_agent);
-        if !config.agents.contains_key(effective_agent) {
+        if !config.agents.contains_key(&bot.default_agent) {
             return Err(ConfigError::DiscordBotDefaultAgentNotFound {
                 bot_id: bot_id.to_string(),
-                agent_id: effective_agent.to_string(),
+                agent_id: bot.default_agent.to_string(),
             });
         }
         if let Some(channel_agents) = &bot.channel_agents {

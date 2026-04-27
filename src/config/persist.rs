@@ -20,7 +20,7 @@ struct SerializableDiscordBot {
         serialize_with = "serialize_optional_yaml_value"
     )]
     token: Option<serde_yml::Value>,
-    default_agent: Option<String>,
+    default_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_channels: Option<Vec<u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,10 +182,7 @@ impl From<&Config> for SerializableConfig {
                                         bot_id.to_string(),
                                         SerializableDiscordBot {
                                             token: bot.file_token.clone(),
-                                            default_agent: bot
-                                                .default_agent
-                                                .as_ref()
-                                                .map(|a| a.to_string()),
+                                            default_agent: bot.default_agent.to_string(),
                                             allowed_channels: bot.allowed_channels.clone(),
                                             channel_agents,
                                         },
@@ -570,7 +567,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: Some(crate::config::AgentId::new("default")),
+                    default_agent: crate::config::AgentId::new("default"),
                     allowed_channels: Some(vec![111, 222]),
                     channel_agents: None,
                 },

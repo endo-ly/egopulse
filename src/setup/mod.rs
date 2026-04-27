@@ -275,7 +275,11 @@ impl SetupApp {
             }
 
             if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
-                load_channel_fields(channels, &parsed, &mut result);
+                load_channel_fields(channels, &mut result);
+            }
+
+            if let Some(token) = load_discord_default_bot_token(config_path) {
+                result.insert("DISCORD_BOT_TOKEN".into(), token);
             }
         }
 
@@ -999,6 +1003,81 @@ api_key: sk-legacy
         assert!(!existing.contains_key("MODEL"));
         assert!(!existing.contains_key("BASE_URL"));
         assert!(!existing.contains_key("API_KEY"));
+    }
+
+    #[test]
+    fn load_existing_config_reads_discord_default_bot_token() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        std::fs::write(
+            temp_dir.path().join(".env"),
+            "DISCORD_BOT_TOKEN=discord-secret\n",
+        )
+        .expect("write .env");
+        std::fs::write(
+            &config_path,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+channels:
+  discord:
+    enabled: true
+    bots:
+      default:
+        token:
+          source: env
+          id: DISCORD_BOT_TOKEN
+        default_agent: default
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert_eq!(
+            existing.get("DISCORD_BOT_TOKEN"),
+            Some(&"discord-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn load_existing_config_ignores_legacy_discord_token_locations() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+    discord:
+      bot_token: legacy-agent-token
+channels:
+  discord:
+    enabled: true
+    bot_token: legacy-channel-token
+"#,
+        )
+        .expect("write config");
+
+        let (existing, _) = SetupApp::load_existing_config(&config_path);
+
+        assert!(!existing.contains_key("DISCORD_BOT_TOKEN"));
     }
 
     #[test]
