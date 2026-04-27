@@ -108,6 +108,74 @@ impl From<&str> for AgentId {
     }
 }
 
+/// Trimmed + lowercased Discord bot identifier.
+///
+/// Rejects empty strings, `..`, `/`, `\`, and `:` to avoid path-traversal or
+/// ambiguous session keys.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct BotId(String);
+
+impl BotId {
+    /// Creates a new `BotId` after trimming whitespace and lowercasing.
+    pub fn new(s: &str) -> Self {
+        Self(s.trim().to_ascii_lowercase())
+    }
+
+    /// Returns the bot identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for BotId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for BotId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
+///
+/// Each bot connects to Discord with its own token and routes messages to agents
+/// based on `channel_agents` or falls back to `default_agent`.
+#[derive(Clone)]
+pub struct DiscordBotConfig {
+    pub token: Option<ResolvedValue>,
+    pub file_token: Option<serde_yml::Value>,
+    pub default_agent: Option<AgentId>,
+    pub allowed_channels: Option<Vec<u64>>,
+    pub channel_agents: Option<HashMap<u64, AgentId>>,
+}
+
+impl std::fmt::Debug for DiscordBotConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordBotConfig")
+            .field(
+                "token",
+                &self
+                    .token
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
+            .field("default_agent", &self.default_agent)
+            .field("allowed_channels", &self.allowed_channels)
+            .field("channel_agents", &self.channel_agents)
+            .finish()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ChannelConfig {
     pub enabled: Option<bool>,
@@ -137,6 +205,8 @@ pub struct ChannelConfig {
     pub allowed_chat_ids: Option<Vec<i64>>,
     /// Soul file path for this channel. Relative path resolves from souls/ directory.
     pub soul_path: Option<String>,
+    /// Discord bot definitions keyed by bot identifier.
+    pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
 }
 
 impl std::fmt::Debug for ChannelConfig {
@@ -168,6 +238,7 @@ impl std::fmt::Debug for ChannelConfig {
             .field("allowed_channels", &self.allowed_channels)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("soul_path", &self.soul_path)
+            .field("discord_bots", &self.discord_bots)
             .finish()
     }
 }
@@ -1349,5 +1420,254 @@ agents:
 
         // Assert
         assert!(bots.is_empty());
+    }
+
+    // --- Discord Bot Config tests ---
+
+    fn write_env(temp_dir: &tempfile::TempDir, contents: &str) {
+        use std::io::Write as IoWrite;
+        let env_path = temp_dir.path().join(".env");
+        let mut f = std::fs::File::create(&env_path).expect("create .env");
+        write!(f, "{contents}").expect("write .env");
+    }
+
+    fn bot_config_yml(bot_section: &str) -> String {
+        format!(
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: assistant
+agents:
+  assistant:
+    label: Assistant
+  reviewer:
+    label: Reviewer
+channels:
+  discord:
+    enabled: true
+{bot_section}"#
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn loads_discord_bots_with_default_agent() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_DISCORD_TOKEN=discord-bot-token-123\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant
+        allowed_channels:
+          - 111222333
+        channel_agents:
+          "444555666": reviewer"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let discord = config.channels.get("discord").expect("discord channel");
+        let bots = discord.discord_bots.as_ref().expect("bots");
+        assert_eq!(bots.len(), 1);
+
+        let main_bot = bots.get("main").expect("main bot");
+        assert_eq!(
+            main_bot
+                .default_agent
+                .as_ref()
+                .expect("default_agent")
+                .as_str(),
+            "assistant"
+        );
+        assert_eq!(
+            main_bot.token.as_ref().expect("token").value(),
+            "discord-bot-token-123"
+        );
+        assert_eq!(
+            main_bot.allowed_channels.as_deref().map(|v| v.to_vec()),
+            Some(vec![111222333u64])
+        );
+        let channel_agents = main_bot.channel_agents.as_ref().expect("channel_agents");
+        assert_eq!(
+            channel_agents.get(&444555666u64),
+            Some(&super::AgentId::new("reviewer"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn discord_bots_validate_default_agent_exists() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: nonexistent_agent"#,
+            ),
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::DiscordBotDefaultAgentNotFound { ref bot_id, ref agent_id }
+                    if bot_id == "main" && agent_id == "nonexistent_agent"
+            ),
+            "expected DiscordBotDefaultAgentNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn discord_bots_validate_channel_agents_exist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant
+        channel_agents:
+          "999": ghost_agent"#,
+            ),
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::DiscordBotChannelAgentNotFound { ref bot_id, channel_id: 999, ref agent_id }
+                    if bot_id == "main" && agent_id == "ghost_agent"
+            ),
+            "expected DiscordBotChannelAgentNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn discord_bots_default_agent_falls_back_to_global_default() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let discord = config.channels.get("discord").expect("discord channel");
+        let bots = discord.discord_bots.as_ref().expect("bots");
+        let main_bot = bots.get("main").expect("main bot");
+        assert_eq!(main_bot.default_agent, None);
+    }
+
+    #[test]
+    #[serial]
+    fn discord_bots_preserve_secret_refs_on_save() {
+        use crate::config::persist::save_config_with_secrets;
+
+        // Arrange
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let path = temp_dir.path().join("egopulse.config.yaml");
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            super::AgentId::new("assistant"),
+            super::AgentConfig {
+                label: "Assistant".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let mut discord_bots = HashMap::new();
+        discord_bots.insert(
+            super::BotId::new("main"),
+            super::DiscordBotConfig {
+                token: Some(lit_val("DISCORD_BOT_TOKEN", "secret-bot-token")),
+                file_token: Some(lit_yaml("DISCORD_BOT_TOKEN")),
+                default_agent: Some(super::AgentId::new("assistant")),
+                allowed_channels: Some(vec![123456]),
+                channel_agents: None,
+            },
+        );
+
+        let mut channels = HashMap::new();
+        channels.insert(
+            super::ChannelName::new("discord"),
+            super::ChannelConfig {
+                enabled: Some(true),
+                discord_bots: Some(discord_bots),
+                ..Default::default()
+            },
+        );
+
+        let config = Config {
+            default_provider: super::ProviderId::new("openai"),
+            default_model: None,
+            providers: HashMap::from([(
+                super::ProviderId::new("openai"),
+                super::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(lit_val("OPENAI_API_KEY", "sk-test")),
+                    default_model: "gpt-5".to_string(),
+                    models: vec!["gpt-5".to_string()],
+                },
+            )]),
+            state_root: temp_dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels,
+            default_agent: super::AgentId::new("assistant"),
+            agents,
+        };
+
+        // Act
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        // Assert — YAML has SecretRef, not plain token
+        let yaml = std::fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("source: env"));
+        assert!(yaml.contains("id: DISCORD_BOT_TOKEN"));
+        assert!(!yaml.contains("secret-bot-token"));
+
+        // Assert — .env has the actual token
+        let dotenv = std::fs::read_to_string(temp_dir.path().join(".env")).expect(".env");
+        assert!(dotenv.contains("DISCORD_BOT_TOKEN=secret-bot-token"));
     }
 }

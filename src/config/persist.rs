@@ -14,6 +14,20 @@ use crate::error::EgoPulseError;
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Serialize)]
+struct SerializableDiscordBot {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    token: Option<serde_yml::Value>,
+    default_agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_channels: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_agents: Option<HashMap<String, String>>,
+}
+
+#[derive(Serialize)]
 struct SerializableAgentDiscord {
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -100,6 +114,8 @@ struct SerializableChannel {
     allowed_chat_ids: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     soul_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bots: Option<HashMap<String, SerializableDiscordBot>>,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -154,6 +170,29 @@ impl From<&Config> for SerializableConfig {
                         allowed_channels: c.allowed_channels.clone(),
                         allowed_chat_ids: c.allowed_chat_ids.clone(),
                         soul_path: c.soul_path.clone(),
+                        bots: c.discord_bots.as_ref().map(|bots| {
+                            bots.iter()
+                                .map(|(bot_id, bot)| {
+                                    let channel_agents = bot.channel_agents.as_ref().map(|map| {
+                                        map.iter()
+                                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                                            .collect()
+                                    });
+                                    (
+                                        bot_id.to_string(),
+                                        SerializableDiscordBot {
+                                            token: bot.file_token.clone(),
+                                            default_agent: bot.default_agent.as_ref().map_or_else(
+                                                || "default".to_string(),
+                                                |a| a.to_string(),
+                                            ),
+                                            allowed_channels: bot.allowed_channels.clone(),
+                                            channel_agents,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
                     },
                 )
             })
@@ -260,6 +299,17 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
             entries.push((env_id.clone(), value.clone()));
         }
         let _ = agent_id;
+    }
+
+    if let Some(discord) = config.channels.get("discord") {
+        if let Some(bots) = &discord.discord_bots {
+            for (bot_id, bot) in bots {
+                if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
+                    entries.push((env_id.clone(), value.clone()));
+                }
+                let _ = bot_id;
+            }
+        }
     }
 
     entries
