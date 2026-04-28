@@ -7,6 +7,7 @@ pub mod agent_loop;
 pub mod assets;
 pub mod channel_adapter;
 pub mod channels;
+pub mod codex_auth;
 pub mod config;
 pub mod error;
 pub mod gateway;
