@@ -1,6 +1,7 @@
 use super::*;
 use super::{messages::*, responses::*, sse::*};
 use reqwest::StatusCode;
+use reqwest::header::HeaderName;
 
 /// OpenAI-compatible LLM provider using Chat Completions and Responses APIs.
 pub(crate) struct OpenAiProvider {
@@ -9,10 +10,17 @@ pub(crate) struct OpenAiProvider {
     model: String,
     base_url: String,
     provider: String,
+    account_id: Option<String>,
+    is_codex: bool,
 }
 
 impl OpenAiProvider {
     /// Build a new provider from the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::InitFailed` if the HTTP client cannot be built, or if the
+    /// `openai-codex` provider is selected but no Codex auth token is available.
     pub fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
@@ -21,15 +29,29 @@ impl OpenAiProvider {
             .build()
             .map_err(|error| LlmError::InitFailed(error.to_string()))?;
 
+        let is_codex = crate::codex_auth::is_codex_provider(&config.provider);
+        let (api_key, account_id) = if is_codex {
+            let auth = crate::codex_auth::resolve_codex_auth()
+                .map_err(|error| LlmError::InitFailed(error.to_string()))?;
+            (None, auth.account_id)
+        } else {
+            (
+                config
+                    .api_key
+                    .as_ref()
+                    .map(|key| key.expose_secret().to_string()),
+                None,
+            )
+        };
+
         Ok(Self {
             http,
-            api_key: config
-                .api_key
-                .as_ref()
-                .map(|key| key.expose_secret().to_string()),
+            api_key,
             model: config.model.clone(),
             base_url: config.base_url.clone(),
             provider: config.provider.clone(),
+            account_id,
+            is_codex,
         })
     }
 
@@ -69,13 +91,25 @@ impl OpenAiProvider {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let Some(api_key) = &self.api_key else {
-            return Ok(headers);
-        };
+        if self.is_codex {
+            let auth = crate::codex_auth::resolve_codex_auth()
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            let auth_value = HeaderValue::from_str(&format!("Bearer {}", auth.bearer_token))
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
 
-        let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-        headers.insert(AUTHORIZATION, auth_value);
+            if let Some(account_id) = &self.account_id {
+                let header_name = HeaderName::from_static("chatgpt-account-id");
+                let value = HeaderValue::from_str(account_id)
+                    .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+                headers.insert(header_name, value);
+            }
+        } else if let Some(api_key) = &self.api_key {
+            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+
         Ok(headers)
     }
 
@@ -118,6 +152,13 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
+        if self.is_codex {
+            crate::codex_auth::refresh_if_needed(&self.http).await;
+            return self
+                .send_message_via_responses(system, messages, tools)
+                .await;
+        }
+
         if should_use_responses_api(&messages) {
             return self
                 .send_message_via_responses(system, messages, tools)
@@ -160,7 +201,8 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, LlmError> {
-        if should_use_responses_api(&messages)
+        if self.is_codex
+            || should_use_responses_api(&messages)
             || tools.as_ref().is_some_and(|tools| !tools.is_empty())
         {
             let response = self.send_message(system, messages, tools).await?;

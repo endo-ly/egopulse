@@ -76,6 +76,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 | ファイル | 種別 |
 |---|---|
 | `.env`, `.env.local`, `.env.production`, `.env.development` | 環境変数ファイル |
+| `auth.json` | OAuth 認証情報 |
 | `credentials`, `credentials.json` | クラウド認証情報 |
 | `token.json` | OAuth トークン |
 | `secrets.yaml`, `secrets.json` | シークレット定義 |
@@ -116,7 +117,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 
 起動時に Config から収集したシークレット値と完全一致する文字列を `[REDACTED:<キー名>]` に置換する。
 
-- 収集対象: `providers.*.api_key`, `channels.*.auth_token`, `channels.*.file_auth_token`, `channels.*.bot_token`, `channels.*.file_bot_token`
+- 収集対象: `providers.*.api_key`, `channels.*.auth_token`, `channels.*.file_auth_token`, `channels.*.bot_token`, `channels.*.file_bot_token`, `codex.bearer_token`（`openai-codex` プロバイダー使用時）
 - 8 文字未満の値はスキップ（誤検出防止）
 - 長い値から順に置換（部分一致の誤検出防止）
 

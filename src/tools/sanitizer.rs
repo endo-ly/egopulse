@@ -3,6 +3,7 @@
 //! Config 由来のシークレット値と well-known パターンの二層リダクションにより、
 //! ツール出力に秘密情報が漏洩しないようマスクする。
 
+use crate::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::config::Config;
 use crate::tools::ToolResult;
 
@@ -184,6 +185,15 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
                     ));
                 }
             }
+        }
+    }
+    let has_codex = config
+        .providers
+        .keys()
+        .any(|name| is_codex_provider(name.as_str()));
+    if has_codex {
+        if let Ok(auth) = resolve_codex_auth() {
+            secrets.push(("codex.bearer_token".to_string(), auth.bearer_token));
         }
     }
     secrets
@@ -545,5 +555,104 @@ mod tests {
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].0, "channels.discord.bots.bot123.token");
         assert_eq!(secrets[0].1, "bot-token-value");
+    }
+
+    /// collect_config_secrets: openai-codex プロバイダー存在時に bearer_token が抽出される。
+    #[test]
+    fn test_collect_config_secrets_extracts_codex_bearer_token() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("HOME", dir.path())
+            .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
+            .also_set("CODEX_HOME", "");
+
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"test-codex-bearer-abc123","refresh_token":"test-refresh"}}"#,
+        )
+        .expect("write auth.json");
+
+        let config = Config {
+            default_provider: ProviderId::new("openai-codex"),
+            default_model: None,
+            providers: std::collections::HashMap::from([(
+                ProviderId::new("openai-codex"),
+                ProviderConfig {
+                    label: "Codex".to_string(),
+                    base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                    api_key: None,
+                    default_model: "codex-mini".to_string(),
+                    models: vec!["codex-mini".to_string()],
+                },
+            )]),
+            state_root: dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: std::collections::HashMap::new(),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
+        };
+
+        // Act
+        let secrets = collect_config_secrets(&config);
+
+        // Assert
+        let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            keys.contains(&"codex.bearer_token"),
+            "expected codex.bearer_token in {keys:?}"
+        );
+        let bearer = secrets
+            .iter()
+            .find(|(k, _)| k == "codex.bearer_token")
+            .expect("bearer_token entry");
+        assert_eq!(bearer.1, "test-codex-bearer-abc123");
+    }
+
+    /// collect_config_secrets: openai-codex なしの場合は codex 系エントリが含まれない。
+    #[test]
+    fn test_collect_config_secrets_no_codex_without_provider() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let config = Config {
+            default_provider: ProviderId::new("openai"),
+            default_model: None,
+            providers: std::collections::HashMap::from([(
+                ProviderId::new("openai"),
+                ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
+                    default_model: "gpt-4o".to_string(),
+                    models: vec!["gpt-4o".to_string()],
+                },
+            )]),
+            state_root: dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            channels: std::collections::HashMap::new(),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
+        };
+
+        // Act
+        let secrets = collect_config_secrets(&config);
+
+        // Assert
+        let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with("codex.")),
+            "codex entries should not exist: {keys:?}"
+        );
     }
 }
