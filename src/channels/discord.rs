@@ -329,28 +329,37 @@ impl EventHandler for Handler {
         let mut saved_paths: Vec<PathBuf> = Vec::new();
         for attachment in &msg.attachments {
             match download_client.get(&attachment.url).send().await {
-                Ok(resp) => match resp.bytes().await {
-                    Ok(bytes) => {
-                        match crate::media::save_inbound_file(
-                            &workspace_dir,
-                            &attachment.filename,
-                            &bytes,
-                        ) {
-                            Ok(path) => saved_paths.push(path),
-                            Err(e) => {
-                                warn!(
-                                    filename = %attachment.filename,
-                                    error = %e,
-                                    "failed to save inbound attachment"
-                                );
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.bytes().await {
+                        Ok(bytes) => {
+                            match crate::media::save_inbound_file(
+                                &workspace_dir,
+                                &attachment.filename,
+                                &bytes,
+                            ) {
+                                Ok(path) => saved_paths.push(path),
+                                Err(e) => {
+                                    warn!(
+                                        filename = %attachment.filename,
+                                        error = %e,
+                                        "failed to save inbound attachment"
+                                    );
+                                }
                             }
                         }
-                    }
+                        Err(e) => {
+                            warn!(
+                                filename = %attachment.filename,
+                                error = %e,
+                                "failed to read attachment body"
+                            );
+                        }
+                    },
                     Err(e) => {
                         warn!(
                             filename = %attachment.filename,
                             error = %e,
-                            "failed to read attachment body"
+                            "attachment download returned non-success status"
                         );
                     }
                 },

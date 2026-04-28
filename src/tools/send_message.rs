@@ -111,14 +111,14 @@ impl Tool for SendMessageTool {
         };
 
         if let Some(path_str) = attachment_path {
-            if let Err(reason) = path_guard::check_path(path_str) {
-                return ToolResult::error(reason);
-            }
-
             let resolved = match resolve_workspace_path(&self.workspace_dir, path_str) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::error(e),
             };
+
+            if let Err(reason) = path_guard::check_path(&resolved.to_string_lossy()) {
+                return ToolResult::error(reason);
+            }
 
             if !resolved.is_file() {
                 return ToolResult::error(format!("File not found: {path_str}"));
