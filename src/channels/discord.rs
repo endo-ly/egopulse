@@ -3,6 +3,7 @@
 //! serenity 0.12 を用いて Discord Gateway からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Discord に返信する。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
 use crate::channel_adapter::ChannelAdapter;
@@ -240,7 +241,55 @@ impl EventHandler for Handler {
             }
         }
 
-        if text.is_empty() {
+        let workspace_dir = match self.app_state.config.workspace_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("failed to resolve workspace dir: {e}");
+                return;
+            }
+        };
+
+        let mut saved_paths: Vec<PathBuf> = Vec::new();
+        for attachment in &msg.attachments {
+            match reqwest::get(&attachment.url).await {
+                Ok(resp) => match resp.bytes().await {
+                    Ok(bytes) => {
+                        match crate::media::save_inbound_file(
+                            &workspace_dir,
+                            &attachment.filename,
+                            &bytes,
+                        ) {
+                            Ok(path) => saved_paths.push(path),
+                            Err(e) => {
+                                warn!(
+                                    filename = %attachment.filename,
+                                    error = %e,
+                                    "failed to save inbound attachment"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            filename = %attachment.filename,
+                            error = %e,
+                            "failed to read attachment body"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        filename = %attachment.filename,
+                        error = %e,
+                        "failed to download attachment"
+                    );
+                }
+            }
+        }
+
+        let combined_text = crate::media::format_attachment_text(&saved_paths, &text);
+
+        if combined_text.is_empty() {
             return;
         }
 
@@ -251,12 +300,13 @@ impl EventHandler for Handler {
             agent = %agent_id, bot = %self.bot_id,
             sender = %context.surface_user,
             text_length = text.len(),
+            attachments = saved_paths.len(),
             "Discord message received"
         );
 
         let typing = msg.channel_id.start_typing(&ctx.http);
 
-        match crate::agent_loop::process_turn(&self.app_state, &context, &text).await {
+        match crate::agent_loop::process_turn(&self.app_state, &context, &combined_text).await {
             Ok(response) => {
                 drop(typing);
                 if !response.is_empty() {
@@ -625,5 +675,38 @@ mod tests {
         // Assert: handle_slash_command が None を返す（未知コマンド）
         // ※ AppState が必要なため、ここでは正規化結果の形式のみ検証
         assert_eq!(command_text, "/nonexistent_cmd");
+    }
+
+    #[test]
+    fn discord_attachment_builds_combined_text() {
+        // Arrange
+        let paths = vec![
+            PathBuf::from("/workspace/media/inbound/20260428-120000-cat.png"),
+            PathBuf::from("/workspace/media/inbound/20260428-120001-notes.pdf"),
+        ];
+        let user_text = "check these files";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, user_text);
+
+        // Assert
+        assert!(combined.contains("[attachment: /workspace/media/inbound/20260428-120000-cat.png]"));
+        assert!(combined.contains("[attachment: /workspace/media/inbound/20260428-120001-notes.pdf]"));
+        assert!(combined.contains("check these files"));
+        assert!(combined.starts_with("[attachment:"));
+    }
+
+    #[test]
+    fn discord_text_only_no_regression() {
+        // Arrange
+        let paths: Vec<PathBuf> = vec![];
+        let user_text = "hello world";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, user_text);
+
+        // Assert
+        assert_eq!(combined, "hello world");
+        assert!(!combined.contains("[attachment:"));
     }
 }
