@@ -577,32 +577,53 @@ async fn download_and_extract(
     let tmp_dir = tempfile::tempdir()
         .map_err(|e| EgoPulseError::Internal(format!("failed to create temp dir: {e}")))?;
 
-    archive
+    let mut entries = archive
         .entries()
-        .map_err(|e| EgoPulseError::Internal(format!("failed to read archive entries: {e}")))?
-        .filter_map(|entry| entry.ok())
-        .for_each(|mut entry| {
-            if let Ok(path) = entry.path() {
-                if path.file_name().and_then(|n| n.to_str()) == Some("egopulse") {
-                    let _ = entry.unpack_in(tmp_dir.path());
-                }
+        .map_err(|e| EgoPulseError::Internal(format!("failed to read archive entries: {e}")))?;
+
+    let mut found = false;
+    loop {
+        let mut entry = match entries.next() {
+            None => break,
+            Some(Ok(entry)) => entry,
+            Some(Err(e)) => {
+                return Err(EgoPulseError::Internal(format!(
+                    "error reading archive entry: {e}"
+                )));
             }
-        });
+        };
 
-    let bin_path = tmp_dir.path().join("egopulse");
-    if !bin_path.exists() {
-        let found = walkdir::WalkDir::new(tmp_dir.path())
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .find(|e| e.file_name() == "egopulse")
-            .map(|e| e.path().to_path_buf());
+        let path = entry
+            .path()
+            .map_err(|e| EgoPulseError::Internal(format!("failed to resolve entry path: {e}")))?;
 
-        if let Some(p) = found {
-            return Ok(p);
+        if path.file_name().and_then(|n| n.to_str()) == Some("egopulse") {
+            entry
+                .unpack_in(tmp_dir.path())
+                .map_err(|e| EgoPulseError::Internal(format!("failed to extract binary: {e}")))?;
+            found = true;
         }
+    }
+
+    if !found {
         return Err(EgoPulseError::Internal(
             "could not find 'egopulse' binary in downloaded archive".into(),
         ));
+    }
+
+    let bin_path = tmp_dir.path().join("egopulse");
+    if !bin_path.exists() {
+        let bin_path = walkdir::WalkDir::new(tmp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name() == "egopulse")
+            .map(|e| e.path().to_path_buf())
+            .ok_or_else(|| {
+                EgoPulseError::Internal(
+                    "could not find 'egopulse' binary in downloaded archive".into(),
+                )
+            })?;
+        return Ok(bin_path);
     }
 
     Ok(bin_path)
