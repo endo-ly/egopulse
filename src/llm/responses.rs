@@ -67,10 +67,12 @@ pub(crate) fn parse_responses_response(
             }
             ResponsesOutputItem::FunctionCall {
                 call_id,
+                id,
                 name,
                 arguments,
             } => {
                 let arguments = parse_tool_arguments(&arguments, &name)?;
+                let call_id = call_id.or(id).unwrap_or_default();
                 tool_calls.push(ToolCall {
                     id: call_id,
                     name,
@@ -464,7 +466,10 @@ pub(crate) enum ResponsesOutputItem {
     },
     #[serde(rename = "function_call")]
     FunctionCall {
-        call_id: String,
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
         name: String,
         arguments: String,
     },
