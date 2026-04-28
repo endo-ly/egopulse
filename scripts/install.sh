@@ -92,19 +92,12 @@ detect_arch() {
 }
 
 detect_install_dir() {
-  if [ -n "${EGOPULSE_INSTALL_DIR:-}" ]; then
-    echo "$EGOPULSE_INSTALL_DIR"
-    return
-  fi
-  if [ -w "/usr/local/bin" ]; then
-    echo "/usr/local/bin"
-    return
-  fi
   if [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
     echo "$HOME/.local/bin"
     return
   fi
-  echo "/usr/local/bin"
+  err "Could not create install directory: $HOME/.local/bin"
+  exit 1
 }
 
 download_release_json() {
@@ -178,20 +171,14 @@ install_binary() {
   local tmp_target target_path
   target_path="$install_dir/$BIN_NAME"
   tmp_target="$install_dir/.${BIN_NAME}.tmp.$$"
-  if [ -w "$install_dir" ]; then
-    cp "$bin_path" "$tmp_target"
-    chmod +x "$tmp_target"
-    mv -f "$tmp_target" "$target_path"
-  else
-    if need_cmd sudo; then
-      sudo cp "$bin_path" "$tmp_target"
-      sudo chmod +x "$tmp_target"
-      sudo mv -f "$tmp_target" "$target_path"
-    else
-      err "No write permission for $install_dir and sudo not available"
-      return 1
-    fi
+  if [ ! -w "$install_dir" ]; then
+    err "No write permission for $install_dir"
+    return 1
   fi
+
+  cp "$bin_path" "$tmp_target"
+  chmod +x "$tmp_target"
+  mv -f "$tmp_target" "$target_path"
 }
 
 main() {
@@ -214,7 +201,7 @@ main() {
     err "No prebuilt binary found for ${os}/${arch} in the latest GitHub release."
     err "Use a separate install method instead:"
     err "  Build from source: cd egopulse && cargo build --release"
-    err "  Then install it: sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse"
+    err "  Then install it: install -m 0755 target/release/egopulse \"\$HOME/.local/bin/egopulse\""
     err "  Releases: https://github.com/${REPO}/releases"
     exit 1
   fi

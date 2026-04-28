@@ -22,11 +22,7 @@ Tailscale HTTPS による公開はオプションとして記載する。
 curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
 ```
 
-環境変数 `EGOPULSE_INSTALL_DIR` でインストール先を指定できる（デフォルト: `/usr/local/bin`、書き込み不可なら `$HOME/.local/bin` にフォールバック）。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | EGOPULSE_INSTALL_DIR="$HOME/.local/bin" bash
-```
+バイナリは `$HOME/.local/bin/egopulse` に配置する。`egopulse update` も同じパスを更新対象にする。
 
 確認:
 
@@ -40,13 +36,13 @@ GitHub Releases から直接ダウンロードする。
 
 ```bash
 # バイナリ配置先のディレクトリを作成
-sudo mkdir -p /usr/local/bin
+mkdir -p "$HOME/.local/bin"
 
 # 最新のリリースバイナリをダウンロード（x86_64 Linux の場合）
 # 完全なURLは GitHub Releases で確認してください
 curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf egopulse.tar.gz
-sudo mv egopulse /usr/local/bin/egopulse
+install -m 0755 egopulse "$HOME/.local/bin/egopulse"
 ```
 
 確認:
@@ -82,7 +78,8 @@ nvm install --lts
 git clone https://github.com/endo-ly/egopulse.git
 cd egopulse
 cargo build --release
-sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
+mkdir -p "$HOME/.local/bin"
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
 ```
 
 確認:
@@ -91,7 +88,7 @@ sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
 egopulse --version
 ```
 
-更新時も同じ手順で `target/release/egopulse` を `/usr/local/bin/egopulse` に上書きする。
+更新時も同じ手順で `target/release/egopulse` を `$HOME/.local/bin/egopulse` に上書きする。
 
 ## 3. 設定
 
@@ -207,7 +204,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 # バイナリパスと設定ファイルパスは環境に合わせて変更してください
-ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
+ExecStart=%h/.local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
 Restart=always
 RestartSec=10
 User=root
@@ -224,7 +221,7 @@ ProtectHome=read-only
 WantedBy=multi-user.target
 ```
 
-> ソースビルド時も `ExecStart` は `/usr/local/bin/egopulse` のままにし、`sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse` で配置してください。`~/.cargo/bin` への `cargo install` は配布版と競合しやすいため非推奨です。
+> ソースビルド時も `ExecStart` は `%h/.local/bin/egopulse` のままにし、`install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"` で配置してください。`~/.cargo/bin` への `cargo install` は配布版と競合しやすいため非推奨です。
 
 ### 4.3 起動・確認
 
@@ -294,7 +291,7 @@ egopulse gateway restart
 # 最新バイナリをダウンロードして上書き
 curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf egopulse.tar.gz
-sudo mv egopulse /usr/local/bin/egopulse
+install -m 0755 egopulse "$HOME/.local/bin/egopulse"
 egopulse gateway restart
 ```
 
@@ -304,7 +301,7 @@ egopulse gateway restart
 cd /path/to/egopulse
 git pull
 cargo build --release
-sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
 egopulse gateway restart
 ```
 

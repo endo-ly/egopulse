@@ -51,7 +51,7 @@ cd web && npm run dev
 
 | インストール方法 | バイナリパス | 備考 |
 |---|---|---|
-| `install-egopulse.sh` | `/usr/local/bin/egopulse` | 書き込み権限がない場合は `~/.local/bin/egopulse` |
+| `install-egopulse.sh` | `~/.local/bin/egopulse` | `egopulse update` の更新対象 |
 | `cargo build --release` | `{project}/target/release/egopulse` | 手動 cp するまで systemd には反映されない |
 | `cargo run` で `gateway install` | `{project}/target/debug/egopulse` | ⚠️ デバッグバイナリが登録される。リリース運用には不適 |
 
@@ -61,9 +61,9 @@ cd web && npm run dev
 
 ```bash
 cargo build --release -p egopulse
-sudo systemctl stop egopulse
-sudo cp target/release/egopulse /usr/local/bin/egopulse
-sudo systemctl start egopulse
+systemctl --user stop egopulse
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
+systemctl --user start egopulse
 ```
 
 リリースバイナリへ戻す場合は `egopulse update` で再ダウンロード → 自動再起動。

@@ -4,7 +4,7 @@
 //! 最新リリースへの更新処理をまとめる。
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::config::Config;
@@ -14,6 +14,13 @@ use clap::Subcommand;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SERVICE_NAME: &str = "egopulse.service";
+const USER_BIN_DIR: &str = ".local/bin";
+const BINARY_NAME: &str = "egopulse";
+
+struct ExtractedBinary {
+    _tmp_dir: tempfile::TempDir,
+    path: PathBuf,
+}
 
 fn unit_path() -> Result<PathBuf, EgoPulseError> {
     let home = dirs::home_dir()
@@ -458,6 +465,8 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
         .build()
         .map_err(|e| EgoPulseError::Internal(format!("failed to create HTTP client: {e}")))?;
 
+    ensure_user_updatable_install()?;
+
     let (tag_name, assets) = fetch_latest_release(&client).await?;
     let latest_version = tag_name.strip_prefix('v').unwrap_or(&tag_name);
 
@@ -474,7 +483,7 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     })?;
 
     let new_binary = download_and_extract(&client, &asset_url).await?;
-    replace_binary(&new_binary)?;
+    replace_binary(&new_binary.path)?;
 
     println!("Update completed ({VERSION} -> {latest_version}). Restarting service...");
     restart_service()?;
@@ -505,6 +514,34 @@ fn detect_target_triple() -> String {
         "macos" => format!("{arch}-apple-darwin"),
         _ => format!("{arch}-{os}"),
     }
+}
+
+fn user_binary_path() -> Result<PathBuf, EgoPulseError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| EgoPulseError::Internal("HOME directory could not be resolved".into()))?;
+    Ok(home.join(USER_BIN_DIR).join(BINARY_NAME))
+}
+
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn ensure_user_updatable_install() -> Result<(), EgoPulseError> {
+    let expected = user_binary_path()?;
+    let expected = normalize_existing_path(&expected);
+    let current = std::env::current_exe()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to get current exe: {e}")))?;
+    let current = normalize_existing_path(&current);
+
+    if current == expected {
+        return Ok(());
+    }
+
+    Err(EgoPulseError::Internal(format!(
+        "self-update requires a user-local install at {}. Current binary is {}. Reinstall EgoPulse with:\n  mkdir -p \"$HOME/.local/bin\"\n  curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash\nThen refresh the systemd user service with:\n  egopulse gateway install",
+        expected.display(),
+        current.display()
+    )))
 }
 
 /// Fetches tag_name and assets array from the GitHub Releases API.
@@ -557,7 +594,7 @@ fn resolve_asset_url(assets: &[serde_json::Value], target: &str) -> Option<Strin
 async fn download_and_extract(
     client: &reqwest::Client,
     url: &str,
-) -> Result<PathBuf, EgoPulseError> {
+) -> Result<ExtractedBinary, EgoPulseError> {
     let resp = client
         .get(url)
         .send()
@@ -597,7 +634,7 @@ async fn download_and_extract(
             .path()
             .map_err(|e| EgoPulseError::Internal(format!("failed to resolve entry path: {e}")))?;
 
-        if path.file_name().and_then(|n| n.to_str()) == Some("egopulse") {
+        if path.file_name().and_then(|n| n.to_str()) == Some(BINARY_NAME) {
             entry
                 .unpack_in(tmp_dir.path())
                 .map_err(|e| EgoPulseError::Internal(format!("failed to extract binary: {e}")))?;
@@ -611,29 +648,35 @@ async fn download_and_extract(
         ));
     }
 
-    let bin_path = tmp_dir.path().join("egopulse");
+    let bin_path = tmp_dir.path().join(BINARY_NAME);
     if !bin_path.exists() {
         let bin_path = walkdir::WalkDir::new(tmp_dir.path())
             .into_iter()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name() == "egopulse")
+            .find(|e| e.file_name() == BINARY_NAME)
             .map(|e| e.path().to_path_buf())
             .ok_or_else(|| {
                 EgoPulseError::Internal(
                     "could not find 'egopulse' binary in downloaded archive".into(),
                 )
             })?;
-        return Ok(bin_path);
+        return Ok(ExtractedBinary {
+            _tmp_dir: tmp_dir,
+            path: bin_path,
+        });
     }
 
-    Ok(bin_path)
+    Ok(ExtractedBinary {
+        _tmp_dir: tmp_dir,
+        path: bin_path,
+    })
 }
 
 /// Atomically replaces the currently running binary with the provided new binary.
 ///
 /// On success the old binary is kept as `.egopulse.old` in the same directory.
 /// On failure the original binary is restored.
-fn replace_binary(new_binary: &std::path::Path) -> Result<(), EgoPulseError> {
+fn replace_binary(new_binary: &Path) -> Result<(), EgoPulseError> {
     let current_exe = std::env::current_exe()
         .map_err(|e| EgoPulseError::Internal(format!("failed to get current exe: {e}")))?;
     let current_exe = current_exe
@@ -686,10 +729,11 @@ mod tests {
             "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
         );
 
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
+        let unit =
+            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/egopulse --config \"/home/user/.egopulse/egopulse.config.yaml\" run"
+            "ExecStart=/home/user/.local/bin/egopulse --config \"/home/user/.egopulse/egopulse.config.yaml\" run"
         ));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=10"));
@@ -704,7 +748,8 @@ mod tests {
         let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
         let service_env = BTreeMap::new();
 
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
+        let unit =
+            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
 
         assert!(unit.contains("/tmp/ego pulse/config dir/egopulse.config.yaml"));
         assert!(unit.contains("WantedBy=default.target"));
@@ -715,7 +760,8 @@ mod tests {
         let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
         let service_env = BTreeMap::new();
 
-        let unit = render_systemd_unit("/usr/local/bin/egopulse", &config_path, &service_env);
+        let unit =
+            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
 
         assert!(!unit.contains("Environment="));
     }
