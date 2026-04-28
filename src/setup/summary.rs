@@ -14,13 +14,14 @@ use super::provider::{
     provider_label_for,
 };
 use super::{Field, SetupApp};
+use crate::codex_auth;
 use crate::config::secret_ref::{
     DISCORD_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
     provider_api_key_env_name,
 };
 use crate::config::{
-    Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
-    default_workspace_dir, is_valid_base_url,
+    Config, ProviderConfig, ProviderId, default_state_root, default_workspace_dir,
+    is_valid_base_url,
 };
 use crate::error::EgoPulseError;
 
@@ -64,7 +65,9 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
 
     let api_key = field_value(fields, "API_KEY");
 
-    if !base_url_allows_empty_api_key(effective_base_url) && api_key.is_empty() {
+    if !codex_auth::provider_allows_empty_api_key(provider, effective_base_url)
+        && api_key.is_empty()
+    {
         return Err(
             "API key is required for non-local endpoints. Use a local URL (localhost/127.0.0.1) to skip.".into(),
         );

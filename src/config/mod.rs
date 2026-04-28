@@ -1597,4 +1597,79 @@ channels:
         let agents = &bots[0].channel_agents;
         assert_eq!(agents.get(&42), Some(&super::AgentId::new("reviewer")));
     }
+
+    #[test]
+    #[serial]
+    fn loads_openai_codex_without_api_key() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai-codex
+providers:
+  openai-codex:
+    label: OpenAI Codex
+    default_model: gpt-5.3-codex
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+        let config =
+            Config::load(Some(&file_path)).expect("should load openai-codex without api_key");
+        let resolved = config.web_llm().expect("web llm");
+        assert_eq!(resolved.provider, "openai-codex");
+        assert!(resolved.api_key.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn openai_codex_gets_default_base_url() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai-codex
+providers:
+  openai-codex:
+    label: OpenAI Codex
+    default_model: gpt-5.3-codex
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+        let config = Config::load(Some(&file_path)).expect("load");
+        let provider = config
+            .providers
+            .get(&super::ProviderId::new("openai-codex"))
+            .expect("provider");
+        assert_eq!(provider.base_url, "https://chatgpt.com/backend-api/codex");
+    }
+
+    #[test]
+    #[serial]
+    fn openai_codex_custom_base_url_preserved() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai-codex
+providers:
+  openai-codex:
+    label: OpenAI Codex
+    base_url: https://custom.proxy.example.com/codex
+    default_model: gpt-5.3-codex
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+        let config = Config::load(Some(&file_path)).expect("load");
+        let provider = config
+            .providers
+            .get(&super::ProviderId::new("openai-codex"))
+            .expect("provider");
+        assert_eq!(provider.base_url, "https://custom.proxy.example.com/codex");
+    }
 }
