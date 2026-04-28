@@ -58,7 +58,7 @@ pub(crate) fn parse_responses_response(
 
     for item in body.output {
         match item {
-            ResponsesOutputItem::Message { role, content } if role == "assistant" => {
+            ResponsesOutputItem::Message { role, content } if role.as_deref() != Some("user") => {
                 content_parts.extend(
                     content
                         .into_iter()
@@ -461,7 +461,8 @@ pub(crate) struct ResponsesApiUsage {
 pub(crate) enum ResponsesOutputItem {
     #[serde(rename = "message")]
     Message {
-        role: String,
+        #[serde(default)]
+        role: Option<String>,
         content: Vec<ResponsesOutputPart>,
     },
     #[serde(rename = "function_call")]
