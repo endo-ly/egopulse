@@ -20,8 +20,8 @@ use crate::config::secret_ref::{
     provider_api_key_env_name,
 };
 use crate::config::{
-    Config, ProviderConfig, ProviderId, base_url_allows_empty_api_key, default_state_root,
-    default_workspace_dir, is_valid_base_url,
+    Config, ProviderConfig, ProviderId, default_state_root, default_workspace_dir,
+    is_valid_base_url,
 };
 use crate::error::EgoPulseError;
 
@@ -65,8 +65,7 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
 
     let api_key = field_value(fields, "API_KEY");
 
-    if !base_url_allows_empty_api_key(effective_base_url)
-        && !codex_auth::is_codex_provider(provider)
+    if !codex_auth::provider_allows_empty_api_key(provider, effective_base_url)
         && api_key.is_empty()
     {
         return Err(
