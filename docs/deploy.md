@@ -94,11 +94,11 @@ egopulse --version
 
 ### 3.1 設定ファイル配置
 
-設定ファイルは `~/.egopulse/egopulse.config.yaml` に固定する。以下では root 運用を前提に `/root/.egopulse/egopulse.config.yaml` を使用する。
+設定ファイルは `$HOME/.egopulse/egopulse.config.yaml` に固定する。
 
 ```bash
-sudo mkdir -p /root/.egopulse
-sudo nano /root/.egopulse/egopulse.config.yaml
+mkdir -p "$HOME/.egopulse"
+nano "$HOME/.egopulse/egopulse.config.yaml"
 ```
 
 最小限の設定例:
@@ -132,7 +132,7 @@ openssl rand -base64 32
 EgoPulse は以下の固定ディレクトリを使用する。
 
 ```bash
-sudo mkdir -p /root/.egopulse/data /root/.egopulse/workspace
+mkdir -p "$HOME/.egopulse/data" "$HOME/.egopulse/workspace"
 ```
 
 ## 4. systemd 常駐
@@ -309,20 +309,20 @@ egopulse gateway restart
 
 ```bash
 # 設定ファイルの確認
-cat /root/.egopulse/egopulse.config.yaml
+cat "$HOME/.egopulse/egopulse.config.yaml"
 
 # 手動起動でエラー確認
-egopulse --config /root/.egopulse/egopulse.config.yaml run
+egopulse --config "$HOME/.egopulse/egopulse.config.yaml" run
 
 # systemd ログ詳細確認
-journalctl -u egopulse.service -n 200 --no-pager
+journalctl --user -u egopulse.service -n 200 --no-pager
 ```
 
 ### よくあるエラー
 
 | エラー | 原因 | 解決策 |
 |--------|------|--------|
-| `config file not found` | `--config` パスの誤り | `ls /root/.egopulse/egopulse.config.yaml` で確認 |
+| `config file not found` | `--config` パスの誤り | `ls "$HOME/.egopulse/egopulse.config.yaml"` で確認 |
 | `web channel: auth_token is required` | auth_token 未設定 | `openssl rand -base64 32` で生成して設定 |
 | `No such file or directory` (binary) | バイナリパスの誤り | `which egopulse` で実パスを確認し unit を修正 |
 | `permission denied` (data dir) | `ReadWritePaths` の不足 | systemd unit の `ReadWritePaths` にデータディレクトリを追加 |

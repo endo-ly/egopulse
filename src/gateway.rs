@@ -536,12 +536,30 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
 
 fn ensure_user_updatable_install() -> Result<(), EgoPulseError> {
     let expected = user_binary_path()?;
-    let expected = normalize_existing_path(&expected);
+
+    let expected_metadata = std::fs::symlink_metadata(&expected).map_err(|e| {
+        EgoPulseError::Internal(format!(
+            "self-update requires a user-local install at {}: {e}",
+            expected.display()
+        ))
+    })?;
+    if expected_metadata.file_type().is_symlink() {
+        return Err(EgoPulseError::Internal(format!(
+            "self-update requires {} to be a regular file, not a symlink. Reinstall EgoPulse with:\n  install -m 0755 target/release/egopulse \"$HOME/.local/bin/egopulse\"",
+            expected.display()
+        )));
+    }
+
     let current = std::env::current_exe()
         .map_err(|e| EgoPulseError::Internal(format!("failed to get current exe: {e}")))?;
     let current = normalize_existing_path(&current);
+    let expected_dir = expected.parent().ok_or_else(|| {
+        EgoPulseError::Internal("could not determine user binary directory".into())
+    })?;
 
-    if current == expected {
+    if current.file_name() == Some(std::ffi::OsStr::new(BINARY_NAME))
+        && current.parent() == Some(expected_dir)
+    {
         return Ok(());
     }
 
@@ -742,6 +760,7 @@ fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.split_whitespace();
     let digest = parts.next()?;
     let filename = parts.next()?.trim_start_matches('*');
+    let filename = filename.strip_prefix("./").unwrap_or(filename);
     if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
         Some((digest, filename))
     } else {
@@ -845,6 +864,20 @@ mod tests {
             render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
 
         assert!(!unit.contains("Environment="));
+    }
+
+    #[test]
+    fn parse_sha256sum_line_normalizes_generated_manifest_paths() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        assert_eq!(
+            parse_sha256sum_line(&format!("{digest}  ./egopulse-0.1.0-linux.tar.gz")),
+            Some((digest, "egopulse-0.1.0-linux.tar.gz"))
+        );
+        assert_eq!(
+            parse_sha256sum_line(&format!("{digest} *./egopulse-0.1.0-linux.tar.gz")),
+            Some((digest, "egopulse-0.1.0-linux.tar.gz"))
+        );
     }
 
     #[test]
