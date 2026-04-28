@@ -160,6 +160,12 @@ pub async fn build_app_state_with_path(
         tools.register_tool(adapter);
     }
 
+    tools.register_tool(Box::new(crate::tools::SendMessageTool::new(
+        workspace_dir.clone(),
+        Arc::clone(&channels),
+        Arc::clone(&db),
+    )));
+
     let tools = Arc::new(tools);
 
     let soul_agents = Arc::new(SoulAgentsLoader::new(&config));

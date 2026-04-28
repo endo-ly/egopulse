@@ -3,10 +3,12 @@
 //! serenity 0.12 を用いて Discord Gateway からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Discord に返信する。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::application::Command;
@@ -14,7 +16,7 @@ use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
 use crate::channel_adapter::ChannelAdapter;
@@ -134,6 +136,77 @@ impl ChannelAdapter for DiscordAdapter {
 
         Ok(())
     }
+
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        text: Option<&str>,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
+        let token = self.select_token(external_chat_id)?;
+        let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let file_bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| format!("failed to read file: {e}"))?;
+
+        let content = text.or(caption).unwrap_or("");
+
+        let mut attempt = 0;
+        loop {
+            let part = Part::bytes(file_bytes.clone())
+                .file_name(filename.clone())
+                .mime_str("application/octet-stream")
+                .expect("'application/octet-stream' is a valid MIME type");
+
+            let mut form = Form::new().part("file", part);
+
+            if !content.is_empty() {
+                let payload = json!({ "content": content });
+                form = form.text("payload_json", payload.to_string());
+            }
+
+            let resp = self
+                .http_client
+                .post(&url)
+                .timeout(Duration::from_secs(30))
+                .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| format!("Discord API request failed: {e}"))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+
+            if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Discord API error: HTTP {status} {}",
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+    }
 }
 
 /// serenity EventHandler。インバウンドメッセージを処理する。
@@ -240,7 +313,69 @@ impl EventHandler for Handler {
             }
         }
 
-        if text.is_empty() {
+        let workspace_dir = match self.app_state.config.workspace_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("failed to resolve workspace dir: {e}");
+                return;
+            }
+        };
+
+        let download_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default();
+
+        let mut saved_paths: Vec<PathBuf> = Vec::new();
+        for attachment in &msg.attachments {
+            match download_client.get(&attachment.url).send().await {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.bytes().await {
+                        Ok(bytes) => {
+                            match crate::media::save_inbound_file(
+                                &workspace_dir,
+                                &attachment.filename,
+                                &bytes,
+                            ) {
+                                Ok(path) => saved_paths.push(path),
+                                Err(e) => {
+                                    warn!(
+                                        filename = %attachment.filename,
+                                        error = %e,
+                                        "failed to save inbound attachment"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                filename = %attachment.filename,
+                                error = %e,
+                                "failed to read attachment body"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            filename = %attachment.filename,
+                            error = %e,
+                            "attachment download returned non-success status"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        filename = %attachment.filename,
+                        error = %e,
+                        "failed to download attachment"
+                    );
+                }
+            }
+        }
+
+        let combined_text = crate::media::format_attachment_text(&saved_paths, &text);
+
+        if combined_text.is_empty() {
             return;
         }
 
@@ -251,12 +386,13 @@ impl EventHandler for Handler {
             agent = %agent_id, bot = %self.bot_id,
             sender = %context.surface_user,
             text_length = text.len(),
+            attachments = saved_paths.len(),
             "Discord message received"
         );
 
         let typing = msg.channel_id.start_typing(&ctx.http);
 
-        match crate::agent_loop::process_turn(&self.app_state, &context, &text).await {
+        match crate::agent_loop::process_turn(&self.app_state, &context, &combined_text).await {
             Ok(response) => {
                 drop(typing);
                 if !response.is_empty() {
@@ -625,5 +761,42 @@ mod tests {
         // Assert: handle_slash_command が None を返す（未知コマンド）
         // ※ AppState が必要なため、ここでは正規化結果の形式のみ検証
         assert_eq!(command_text, "/nonexistent_cmd");
+    }
+
+    #[test]
+    fn discord_attachment_builds_combined_text() {
+        // Arrange
+        let paths = vec![
+            PathBuf::from("/workspace/media/inbound/20260428-120000-cat.png"),
+            PathBuf::from("/workspace/media/inbound/20260428-120001-notes.pdf"),
+        ];
+        let user_text = "check these files";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, user_text);
+
+        // Assert
+        assert!(
+            combined.contains("[attachment: /workspace/media/inbound/20260428-120000-cat.png]")
+        );
+        assert!(
+            combined.contains("[attachment: /workspace/media/inbound/20260428-120001-notes.pdf]")
+        );
+        assert!(combined.contains("check these files"));
+        assert!(combined.starts_with("[attachment:"));
+    }
+
+    #[test]
+    fn discord_text_only_no_regression() {
+        // Arrange
+        let paths: Vec<PathBuf> = vec![];
+        let user_text = "hello world";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, user_text);
+
+        // Assert
+        assert_eq!(combined, "hello world");
+        assert!(!combined.contains("[attachment:"));
     }
 }

@@ -3,13 +3,16 @@
 //! teloxide 0.17 を用いて Telegram Bot API (long polling) からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Telegram に返信する。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, MessageEntityKind};
+use teloxide::types::{ChatAction, FileId, InputFile, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
@@ -94,6 +97,89 @@ impl ChannelAdapter for TelegramAdapter {
 
         Ok(())
     }
+
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        text: Option<&str>,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let chat_id = parse_telegram_chat_id(external_chat_id)?;
+
+        let extension = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp");
+
+        let caption_text = caption.or(text).unwrap_or("");
+        let caption_value = if caption_text.len() > 1024 {
+            let mut end = 1024;
+            while end > 0 && !caption_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &caption_text[..end]
+        } else {
+            caption_text
+        };
+
+        if is_image {
+            let input_file = InputFile::file(file_path);
+            let mut req = self.bot.send_photo(ChatId(chat_id), input_file);
+            if !caption_value.is_empty() {
+                req = req.caption(caption_value);
+            }
+            req.await
+                .map_err(|e| format!("Telegram send_photo failed: {e}"))?;
+        } else {
+            let input_file = InputFile::file(file_path);
+            let mut req = self.bot.send_document(ChatId(chat_id), input_file);
+            if !caption_value.is_empty() {
+                req = req.caption(caption_value);
+            }
+            req.await
+                .map_err(|e| format!("Telegram send_document failed: {e}"))?;
+        }
+
+        if let Some(t) = text {
+            if caption.is_some() && !t.is_empty() {
+                for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
+                    self.bot
+                        .send_message(ChatId(chat_id), &chunk)
+                        .await
+                        .map_err(|e| format!("Telegram send_message failed: {e}"))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Telegram からファイルをダウンロードし、`workspace/media/inbound/` に保存する。
+async fn download_and_save(
+    bot: &Bot,
+    file_id: FileId,
+    filename: &str,
+    workspace_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let tg_file = bot.get_file(file_id).await?;
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "egopulse-tg-{}",
+        Utc::now().format("%Y%m%d%H%M%S%3f")
+    ));
+    {
+        let mut dst = tokio::fs::File::create(&temp_path).await?;
+        bot.download_file(&tg_file.path, &mut dst).await?;
+    }
+    let bytes = tokio::fs::read(&temp_path).await?;
+    let _ = tokio::fs::remove_file(&temp_path).await;
+
+    let saved = crate::media::save_inbound_file(workspace_dir, filename, &bytes)?;
+    Ok(saved)
 }
 
 /// Telegram メッセージハンドラ。
@@ -102,14 +188,52 @@ async fn handle_message(
     msg: teloxide::types::Message,
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // テキストメッセージのみ処理
-    let Some(text) = msg.text().map(str::to_string) else {
-        return Ok(());
+    let text = msg.text().map(str::to_string).unwrap_or_default();
+
+    let mut attachment_paths: Vec<PathBuf> = Vec::new();
+
+    let workspace_dir = match state.config.workspace_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "Telegram: failed to resolve workspace_dir");
+            return Ok(());
+        }
     };
 
-    if text.is_empty() {
+    // 写真 (最大サイズを使用)
+    if let Some(photos) = msg.photo() {
+        if let Some(largest) = photos.last() {
+            match download_and_save(&bot, largest.file.id.clone(), "photo.jpg", &workspace_dir)
+                .await
+            {
+                Ok(path) => attachment_paths.push(path),
+                Err(e) => tracing::warn!(error = %e, "Telegram: failed to download photo"),
+            }
+        }
+    }
+
+    // ドキュメント
+    if let Some(doc) = msg.document() {
+        let filename = doc.file_name.as_deref().unwrap_or("document");
+        match download_and_save(&bot, doc.file.id.clone(), filename, &workspace_dir).await {
+            Ok(path) => attachment_paths.push(path),
+            Err(e) => tracing::warn!(error = %e, "Telegram: failed to download document"),
+        }
+    }
+
+    // ボイスメッセージ
+    if let Some(voice) = msg.voice() {
+        match download_and_save(&bot, voice.file.id.clone(), "voice.ogg", &workspace_dir).await {
+            Ok(path) => attachment_paths.push(path),
+            Err(e) => tracing::warn!(error = %e, "Telegram: failed to download voice"),
+        }
+    }
+
+    if text.is_empty() && attachment_paths.is_empty() {
         return Ok(());
     }
+
+    let combined_text = crate::media::format_attachment_text(&attachment_paths, &text);
 
     let raw_chat_id = msg.chat.id.0;
 
@@ -220,7 +344,7 @@ async fn handle_message(
     // --- スラッシュコマンドインターセプト ---
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
-    if slash_commands::is_slash_command(&text) {
+    if attachment_paths.is_empty() && slash_commands::is_slash_command(&text) {
         if !is_mentioned {
             debug!(
                 chat_id = raw_chat_id,
@@ -301,6 +425,7 @@ async fn handle_message(
         chat_id = raw_chat_id,
         sender = %context.surface_user,
         text_length = text.len(),
+        attachments = attachment_paths.len(),
         "Telegram message received"
     );
 
@@ -316,7 +441,7 @@ async fn handle_message(
         }
     });
 
-    match crate::agent_loop::process_turn(&state, &context, &text).await {
+    match crate::agent_loop::process_turn(&state, &context, &combined_text).await {
         Ok(response) => {
             typing_handle.abort();
             if !response.is_empty() {
@@ -478,5 +603,83 @@ mod tests {
             assert_eq!(bot_cmd.command, reg.name);
             assert_eq!(bot_cmd.description, reg.description);
         }
+    }
+
+    // --- メディア添付テスト ---
+
+    #[test]
+    fn telegram_media_builds_combined_text() {
+        // Arrange
+        let paths = vec![PathBuf::from("/workspace/media/inbound/photo.jpg")];
+        let text = "check this";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, text);
+
+        // Assert
+        assert_eq!(
+            combined,
+            "[attachment: /workspace/media/inbound/photo.jpg]\ncheck this"
+        );
+    }
+
+    #[test]
+    fn telegram_text_only_no_regression() {
+        // Arrange
+        let paths: Vec<PathBuf> = vec![];
+        let text = "hello world";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, text);
+
+        // Assert
+        assert_eq!(combined, "hello world");
+    }
+
+    #[test]
+    fn telegram_media_without_user_text() {
+        // Arrange
+        let paths = vec![PathBuf::from("/workspace/media/inbound/voice.ogg")];
+        let text = "";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, text);
+
+        // Assert
+        assert_eq!(combined, "[attachment: /workspace/media/inbound/voice.ogg]");
+    }
+
+    #[test]
+    fn telegram_media_multiple_attachments() {
+        // Arrange
+        let paths = vec![
+            PathBuf::from("/workspace/media/inbound/photo.jpg"),
+            PathBuf::from("/workspace/media/inbound/doc.pdf"),
+        ];
+        let text = "see attached";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, text);
+
+        // Assert
+        assert_eq!(
+            combined,
+            "[attachment: /workspace/media/inbound/photo.jpg]\n\
+             [attachment: /workspace/media/inbound/doc.pdf]\n\
+             see attached"
+        );
+    }
+
+    #[test]
+    fn telegram_empty_text_and_no_attachments_yields_empty() {
+        // Arrange
+        let paths: Vec<PathBuf> = vec![];
+        let text = "";
+
+        // Act
+        let combined = crate::media::format_attachment_text(&paths, text);
+
+        // Assert
+        assert!(combined.is_empty());
     }
 }
