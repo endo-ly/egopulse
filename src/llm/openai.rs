@@ -62,16 +62,20 @@ impl OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut body = build_responses_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref(),
+        );
+        if self.is_codex {
+            body["store"] = serde_json::Value::Bool(false);
+        }
         let response = self
             .http
             .post(url)
             .headers(self.build_headers()?)
-            .json(&build_responses_request_body(
-                &self.model,
-                system,
-                &messages,
-                tools.as_deref(),
-            ))
+            .json(&body)
             .send()
             .await?;
 
