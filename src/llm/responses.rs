@@ -184,6 +184,50 @@ pub(crate) fn extract_text(content: OpenAiMessageContent) -> String {
     }
 }
 
+/// Parses a Codex Responses API payload that may arrive as either plain JSON or
+/// SSE stream text containing `response.done` events.
+///
+/// The Codex endpoint requires `stream: true`, so the response body consists of
+/// newline-delimited SSE events. The final `response.done` event carries the
+/// complete [`ResponsesApiResponse`] under its `"response"` key.
+pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiResponse, LlmError> {
+    if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
+        return Ok(parsed);
+    }
+    let mut last_response: Option<ResponsesApiResponse> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line.trim_start_matches("data:").trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+
+        if let Some(response_value) = value.get("response") {
+            if let Ok(parsed) =
+                serde_json::from_value::<ResponsesApiResponse>(response_value.clone())
+            {
+                last_response = Some(parsed);
+                if value.get("type").and_then(|v| v.as_str()) == Some("response.done") {
+                    break;
+                }
+            }
+        }
+    }
+
+    last_response.ok_or_else(|| {
+        LlmError::InvalidResponse(format!(
+            "Failed to parse Codex response payload. Body: {}",
+            preview_body(text)
+        ))
+    })
+}
+
 pub(crate) fn preview_body(body: &str) -> String {
     let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut preview = normalized.chars().take(200).collect::<String>();

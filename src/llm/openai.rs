@@ -66,6 +66,7 @@ impl OpenAiProvider {
             build_responses_request_body(&self.model, system, &messages, tools.as_deref());
         if self.is_codex {
             body["store"] = serde_json::Value::Bool(false);
+            body["stream"] = serde_json::Value::Bool(true);
         }
         let response = self
             .http
@@ -81,6 +82,12 @@ impl OpenAiProvider {
                 status,
                 response.text().await.unwrap_or_default(),
             ));
+        }
+
+        if self.is_codex {
+            let text = response.text().await?;
+            let parsed = parse_codex_responses_payload(&text)?;
+            return parse_responses_response(parsed);
         }
 
         let body: ResponsesApiResponse = response.json().await?;
