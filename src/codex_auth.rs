@@ -363,10 +363,8 @@ mod tests {
             r#"{"tokens":{"access_token":"file-access-token","refresh_token":"rt","account_id":"u-123"}}"#,
         )
         .expect("write");
-        {
-            let _env = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "");
-        }
-        let _home = EnvVarGuard::set("CODEX_HOME", dir.path());
+        let _guard =
+            EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "file-access-token");
@@ -381,10 +379,8 @@ mod tests {
             r#"{"OPENAI_API_KEY":"sk-fallback-key"}"#,
         )
         .expect("write");
-        {
-            let _env = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "");
-        }
-        let _home = EnvVarGuard::set("CODEX_HOME", dir.path());
+        let _guard =
+            EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "sk-fallback-key");
@@ -394,10 +390,8 @@ mod tests {
     #[test]
     fn resolve_auth_errors_when_no_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        {
-            let _env = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "");
-        }
-        let _home = EnvVarGuard::set("CODEX_HOME", dir.path());
+        let _guard =
+            EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
 
         let result = resolve_codex_auth();
         assert!(result.is_err());

@@ -9,8 +9,7 @@ static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// 環境変数のスコープガード。Drop時に元の値を復元する。
 pub(crate) struct EnvVarGuard {
-    key: &'static str,
-    original: Option<std::ffi::OsString>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -23,22 +22,39 @@ impl EnvVarGuard {
             std::env::set_var(key, value);
         }
         Self {
-            key,
-            original,
+            saved: vec![(key, original)],
             _lock: lock,
         }
+    }
+
+    /// 追加の環境変数を同じガード内で設定する。
+    ///
+    /// 同一ガード内で複数の環境変数を管理できるため、ミューテックスの再取得不要。
+    pub(crate) fn also_set(
+        mut self,
+        key: &'static str,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        self.saved.push((key, original));
+        self
     }
 }
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        match &self.original {
-            Some(value) => unsafe {
-                std::env::set_var(self.key, value);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
+        for (key, original) in &self.saved {
+            match original {
+                Some(value) => unsafe {
+                    std::env::set_var(key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(key);
+                },
+            }
         }
     }
 }
