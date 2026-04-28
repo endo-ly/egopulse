@@ -203,7 +203,9 @@ async fn handle_message(
     // 写真 (最大サイズを使用)
     if let Some(photos) = msg.photo() {
         if let Some(largest) = photos.last() {
-            match download_and_save(&bot, largest.file.id.clone(), "photo.jpg", &workspace_dir).await {
+            match download_and_save(&bot, largest.file.id.clone(), "photo.jpg", &workspace_dir)
+                .await
+            {
                 Ok(path) => attachment_paths.push(path),
                 Err(e) => tracing::warn!(error = %e, "Telegram: failed to download photo"),
             }
@@ -232,10 +234,6 @@ async fn handle_message(
     }
 
     let combined_text = crate::media::format_attachment_text(&attachment_paths, &text);
-
-    if text.is_empty() {
-        return Ok(());
-    }
 
     let raw_chat_id = msg.chat.id.0;
 

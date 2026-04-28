@@ -98,7 +98,9 @@ pub fn format_attachment_text(paths: &[PathBuf], user_text: &str) -> String {
 /// - 先頭のドットを除去（隠しファイル化防止）
 fn sanitize_filename(filename: &str) -> Result<String, MediaError> {
     if filename.is_empty() {
-        return Err(MediaError::InvalidFilename("filename must not be empty".to_string()));
+        return Err(MediaError::InvalidFilename(
+            "filename must not be empty".to_string(),
+        ));
     }
 
     if filename.contains("..") {
@@ -142,12 +144,13 @@ mod tests {
         // Assert
         let path = result.expect("save should succeed");
         assert!(path.exists());
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .ends_with("-photo.png"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("-photo.png")
+        );
         let saved = fs::read(&path).expect("should read saved file");
         assert_eq!(saved, content);
     }
@@ -200,7 +203,9 @@ mod tests {
     #[test]
     fn format_attachment_text_with_user_text() {
         // Arrange
-        let paths = vec![PathBuf::from("/workspace/media/inbound/20260428-123456-photo.png")];
+        let paths = vec![PathBuf::from(
+            "/workspace/media/inbound/20260428-123456-photo.png",
+        )];
         let user_text = "check this out";
 
         // Act
@@ -216,7 +221,9 @@ mod tests {
     #[test]
     fn format_attachment_text_without_user_text() {
         // Arrange
-        let paths = vec![PathBuf::from("/workspace/media/inbound/20260428-123456-photo.png")];
+        let paths = vec![PathBuf::from(
+            "/workspace/media/inbound/20260428-123456-photo.png",
+        )];
         let user_text = "";
 
         // Act

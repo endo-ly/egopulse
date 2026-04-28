@@ -321,9 +321,14 @@ impl EventHandler for Handler {
             }
         };
 
+        let download_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default();
+
         let mut saved_paths: Vec<PathBuf> = Vec::new();
         for attachment in &msg.attachments {
-            match reqwest::get(&attachment.url).await {
+            match download_client.get(&attachment.url).send().await {
                 Ok(resp) => match resp.bytes().await {
                     Ok(bytes) => {
                         match crate::media::save_inbound_file(
@@ -762,8 +767,12 @@ mod tests {
         let combined = crate::media::format_attachment_text(&paths, user_text);
 
         // Assert
-        assert!(combined.contains("[attachment: /workspace/media/inbound/20260428-120000-cat.png]"));
-        assert!(combined.contains("[attachment: /workspace/media/inbound/20260428-120001-notes.pdf]"));
+        assert!(
+            combined.contains("[attachment: /workspace/media/inbound/20260428-120000-cat.png]")
+        );
+        assert!(
+            combined.contains("[attachment: /workspace/media/inbound/20260428-120001-notes.pdf]")
+        );
         assert!(combined.contains("check these files"));
         assert!(combined.starts_with("[attachment:"));
     }

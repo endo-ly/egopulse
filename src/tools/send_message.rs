@@ -29,11 +29,7 @@ pub(crate) struct SendMessageTool {
 }
 
 impl SendMessageTool {
-    pub fn new(
-        workspace_dir: PathBuf,
-        channels: Arc<ChannelRegistry>,
-        db: Arc<Database>,
-    ) -> Self {
+    pub fn new(workspace_dir: PathBuf, channels: Arc<ChannelRegistry>, db: Arc<Database>) -> Self {
         Self {
             workspace_dir,
             channels,
@@ -77,9 +73,18 @@ impl Tool for SendMessageTool {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
-        let text = input.get("text").and_then(|v| v.as_str());
-        let attachment_path = input.get("attachment_path").and_then(|v| v.as_str());
-        let caption = input.get("caption").and_then(|v| v.as_str());
+        let text = input
+            .get("text")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        let attachment_path = input
+            .get("attachment_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        let caption = input
+            .get("caption")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
 
         if text.is_none() && attachment_path.is_none() {
             return ToolResult::error(
@@ -90,10 +95,7 @@ impl Tool for SendMessageTool {
         let chat_info = match lookup_chat_info(Arc::clone(&self.db), context.chat_id).await {
             Ok(Some(info)) => info,
             Ok(None) => {
-                return ToolResult::error(format!(
-                    "no chat found for chat_id {}",
-                    context.chat_id
-                ))
+                return ToolResult::error(format!("no chat found for chat_id {}", context.chat_id));
             }
             Err(e) => return ToolResult::error(format!("failed to resolve chat info: {e}")),
         };
@@ -104,7 +106,7 @@ impl Tool for SendMessageTool {
                 return ToolResult::error(format!(
                     "no adapter for channel '{}'",
                     chat_info.channel
-                ))
+                ));
             }
         };
 
@@ -118,7 +120,7 @@ impl Tool for SendMessageTool {
                 Err(e) => return ToolResult::error(e),
             };
 
-            if !resolved.exists() {
+            if !resolved.is_file() {
                 return ToolResult::error(format!("File not found: {path_str}"));
             }
 
