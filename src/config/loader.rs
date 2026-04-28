@@ -403,11 +403,14 @@ fn normalize_provider_map(
         let key =
             ProviderId::new(&normalize_string(Some(name)).ok_or(ConfigError::MissingProvider)?);
         let label = normalize_string(file_provider.label).unwrap_or_else(|| key.to_string());
-        let base_url = normalize_string(file_provider.base_url).ok_or_else(|| {
-            ConfigError::MissingProviderBaseUrl {
+        let base_url = normalize_string(file_provider.base_url)
+            .or_else(|| {
+                crate::codex_auth::is_codex_provider(key.as_str())
+                    .then_some("https://chatgpt.com/backend-api/codex".to_string())
+            })
+            .ok_or_else(|| ConfigError::MissingProviderBaseUrl {
                 provider: key.to_string(),
-            }
-        })?;
+            })?;
         validate_base_url(&base_url)?;
 
         let default_model = normalize_string(file_provider.default_model).ok_or_else(|| {
@@ -427,7 +430,9 @@ fn normalize_provider_map(
         }
 
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
-        if !allow_missing_api_key && api_key.is_none() && !base_url_allows_empty_api_key(&base_url)
+        if !allow_missing_api_key
+            && api_key.is_none()
+            && !crate::codex_auth::provider_allows_empty_api_key(key.as_str(), &base_url)
         {
             return Err(ConfigError::MissingProviderApiKey {
                 provider: key.to_string(),
@@ -627,7 +632,7 @@ fn is_local_url(value: &str) -> bool {
     )
 }
 
-/// Returns `true` if the base URL points to a local address that does not require an API key.
+/// Returns `true` if the given base URL points to a local address that does not require an API key.
 pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
     is_local_url(base_url)
 }
