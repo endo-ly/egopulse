@@ -68,6 +68,15 @@ impl OpenAiProvider {
             body["store"] = serde_json::Value::Bool(false);
             body["stream"] = serde_json::Value::Bool(true);
         }
+
+        if self.is_codex {
+            return self
+                .send_codex_with_retry(&url, &body)
+                .await
+                .and_then(|text| parse_codex_responses_payload(&text))
+                .and_then(parse_responses_response);
+        }
+
         let response = self
             .http
             .post(url)
@@ -84,14 +93,50 @@ impl OpenAiProvider {
             ));
         }
 
-        if self.is_codex {
-            let text = response.text().await?;
-            let parsed = parse_codex_responses_payload(&text)?;
-            return parse_responses_response(parsed);
-        }
+        let resp_body: ResponsesApiResponse = response.json().await?;
+        parse_responses_response(resp_body)
+    }
 
-        let body: ResponsesApiResponse = response.json().await?;
-        parse_responses_response(body)
+    /// Sends a Codex request with exponential-backoff retry on 429 responses.
+    ///
+    /// On success, returns the raw response text (which may be plain JSON or SSE).
+    /// On non-429 failure, attempts to extract a structured error message from the
+    /// response body before returning.
+    async fn send_codex_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, LlmError> {
+        let max_retries: u32 = 3;
+        let mut retries = 0u32;
+
+        loop {
+            let response = self
+                .http
+                .post(url)
+                .headers(self.build_headers()?)
+                .json(body)
+                .send()
+                .await?;
+
+            let status = response.status();
+            if status.is_success() {
+                return response.text().await.map_err(LlmError::RequestFailed);
+            }
+
+            if status.as_u16() == 429 && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                tracing::warn!(
+                    "Codex rate limited, retrying in {delay:?} (attempt {retries}/{max_retries})"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let text = response.text().await.unwrap_or_default();
+            return Err(Self::structured_api_error(status, &text));
+        }
     }
 
     fn build_headers(&self) -> Result<HeaderMap, LlmError> {
@@ -124,6 +169,19 @@ impl OpenAiProvider {
         LlmError::ApiError {
             status,
             body_preview: preview_body(&body),
+        }
+    }
+
+    fn structured_api_error(status: StatusCode, body: &str) -> LlmError {
+        if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(body) {
+            return LlmError::ApiError {
+                status,
+                body_preview: err.error.message,
+            };
+        }
+        LlmError::ApiError {
+            status,
+            body_preview: preview_body(body),
         }
     }
 

@@ -525,3 +525,13 @@ pub(crate) struct OaiFunction {
     pub(crate) name: String,
     pub(crate) arguments: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OaiErrorResponse {
+    pub(crate) error: OaiErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OaiErrorDetail {
+    pub(crate) message: String,
+}
