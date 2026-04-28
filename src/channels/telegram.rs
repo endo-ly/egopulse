@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, FileId, MessageEntityKind};
+use teloxide::types::{ChatAction, FileId, InputFile, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
@@ -91,6 +91,65 @@ impl ChannelAdapter for TelegramAdapter {
                         }
                         return Err(format!("Telegram send_message failed: {e}"));
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        text: Option<&str>,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let chat_id = parse_telegram_chat_id(external_chat_id)?;
+
+        let extension = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp");
+
+        let caption_text = caption.or(text).unwrap_or("");
+        let caption_value = if caption_text.len() > 1024 {
+            let mut end = 1024;
+            while end > 0 && !caption_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &caption_text[..end]
+        } else {
+            caption_text
+        };
+
+        if is_image {
+            let input_file = InputFile::file(file_path);
+            let mut req = self.bot.send_photo(ChatId(chat_id), input_file);
+            if !caption_value.is_empty() {
+                req = req.caption(caption_value);
+            }
+            req.await
+                .map_err(|e| format!("Telegram send_photo failed: {e}"))?;
+        } else {
+            let input_file = InputFile::file(file_path);
+            let mut req = self.bot.send_document(ChatId(chat_id), input_file);
+            if !caption_value.is_empty() {
+                req = req.caption(caption_value);
+            }
+            req.await
+                .map_err(|e| format!("Telegram send_document failed: {e}"))?;
+        }
+
+        if let Some(t) = text {
+            if caption.is_some() && !t.is_empty() {
+                for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
+                    self.bot
+                        .send_message(ChatId(chat_id), &chunk)
+                        .await
+                        .map_err(|e| format!("Telegram send_message failed: {e}"))?;
                 }
             }
         }

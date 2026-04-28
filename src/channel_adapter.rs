@@ -12,6 +12,7 @@ pub enum ConversationKind {
 }
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +32,25 @@ pub trait ChannelAdapter: Send + Sync {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
+
+    /// Sends a file attachment to the specified chat.
+    ///
+    /// Returns an error if the channel does not support file attachments.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the channel lacks attachment support, the file cannot
+    /// be read, or the upstream API rejects the request.
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        text: Option<&str>,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = (external_chat_id, text, file_path, caption);
+        Err("file attachments not supported on this channel".to_string())
+    }
 }
 
 /// Registry mapping database chat types to their channel adapters.

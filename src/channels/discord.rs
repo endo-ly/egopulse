@@ -3,11 +3,12 @@
 //! serenity 0.12 を用いて Discord Gateway からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Discord に返信する。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::application::Command;
@@ -134,6 +135,77 @@ impl ChannelAdapter for DiscordAdapter {
         }
 
         Ok(())
+    }
+
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        text: Option<&str>,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
+        let token = self.select_token(external_chat_id)?;
+        let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let file_bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| format!("failed to read file: {e}"))?;
+
+        let content = text.or(caption).unwrap_or("");
+
+        let mut attempt = 0;
+        loop {
+            let part = Part::bytes(file_bytes.clone())
+                .file_name(filename.clone())
+                .mime_str("application/octet-stream")
+                .expect("'application/octet-stream' is a valid MIME type");
+
+            let mut form = Form::new().part("file", part);
+
+            if !content.is_empty() {
+                let payload = json!({ "content": content });
+                form = form.text("payload_json", payload.to_string());
+            }
+
+            let resp = self
+                .http_client
+                .post(&url)
+                .timeout(Duration::from_secs(30))
+                .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| format!("Discord API request failed: {e}"))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+
+            if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Discord API error: HTTP {status} {}",
+                body.chars().take(300).collect::<String>()
+            ));
+        }
     }
 }
 

@@ -10,6 +10,7 @@ mod mcp_adapter;
 mod path_guard;
 mod sanitizer;
 mod search;
+mod send_message;
 mod shell;
 mod text;
 
@@ -22,6 +23,7 @@ pub(crate) use mcp_adapter::*;
 pub(crate) use path_guard::*;
 pub(crate) use sanitizer::*;
 pub(crate) use search::*;
+pub(crate) use send_message::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
 
