@@ -33,7 +33,7 @@ impl OpenAiProvider {
         let (api_key, account_id) = if is_codex {
             let auth = crate::codex_auth::resolve_codex_auth()
                 .map_err(|error| LlmError::InitFailed(error.to_string()))?;
-            (Some(auth.bearer_token), auth.account_id)
+            (None, auth.account_id)
         } else {
             (
                 config
@@ -91,19 +91,23 @@ impl OpenAiProvider {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let Some(api_key) = &self.api_key else {
-            return Ok(headers);
-        };
-
-        let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-        headers.insert(AUTHORIZATION, auth_value);
-
-        if let Some(account_id) = &self.account_id {
-            let header_name = HeaderName::from_static("chatgpt-account-id");
-            let value = HeaderValue::from_str(account_id)
+        if self.is_codex {
+            let auth = crate::codex_auth::resolve_codex_auth()
                 .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
-            headers.insert(header_name, value);
+            let auth_value = HeaderValue::from_str(&format!("Bearer {}", auth.bearer_token))
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
+
+            if let Some(account_id) = &self.account_id {
+                let header_name = HeaderName::from_static("chatgpt-account-id");
+                let value = HeaderValue::from_str(account_id)
+                    .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+                headers.insert(header_name, value);
+            }
+        } else if let Some(api_key) = &self.api_key {
+            let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
         }
 
         Ok(headers)
@@ -148,8 +152,14 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
-        if self.is_codex || should_use_responses_api(&messages) {
+        if self.is_codex {
             crate::codex_auth::refresh_if_needed(&self.http).await;
+            return self
+                .send_message_via_responses(system, messages, tools)
+                .await;
+        }
+
+        if should_use_responses_api(&messages) {
             return self
                 .send_message_via_responses(system, messages, tools)
                 .await;
