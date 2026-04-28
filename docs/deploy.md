@@ -1,8 +1,16 @@
-# EgoPulse Deploy (systemd)
+# EgoPulse Deploy
 
 Linux サーバー上で EgoPulse を systemd サービスとして常駐化する手順。
-Tailscale HTTPS による公開はオプションとして記載する。
-ローカルファースト運用のため、外部公開は前提にしない。
+
+## 目次
+
+1. [前提](#1-前提)
+2. [インストール](#2-インストール)
+3. [設定](#3-設定)
+4. [systemd 常駐](#4-systemd-常駐)
+5. [リリースプロセス](#5-リリースプロセス)
+
+---
 
 ## 1. 前提
 
@@ -274,60 +282,7 @@ journalctl --user -u egopulse.service -f
 journalctl --user -u egopulse.service -p err --no-pager
 ```
 
-## 5. アップデート
-
-### ワンライナーの場合
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
-egopulse gateway restart
-```
-
-### プリビルドバイナリの場合
-
-```bash
-# 最新バイナリをダウンロードして上書き
-curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
-tar -xzf egopulse.tar.gz
-install -m 0755 egopulse "$HOME/.local/bin/egopulse"
-egopulse gateway restart
-```
-
-### ソースビルドの場合
-
-```bash
-cd /path/to/egopulse
-git pull
-cargo build --release
-install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
-egopulse gateway restart
-```
-
-## 6. トラブルシューティング
-
-### サービスが起動しない
-
-```bash
-# 設定ファイルの確認
-cat "$HOME/.egopulse/egopulse.config.yaml"
-
-# 手動起動でエラー確認
-egopulse --config "$HOME/.egopulse/egopulse.config.yaml" run
-
-# systemd ログ詳細確認
-journalctl --user -u egopulse.service -n 200 --no-pager
-```
-
-### よくあるエラー
-
-| エラー | 原因 | 解決策 |
-|--------|------|--------|
-| `config file not found` | `--config` パスの誤り | `ls "$HOME/.egopulse/egopulse.config.yaml"` で確認 |
-| `web channel: auth_token is required` | auth_token 未設定 | `openssl rand -base64 32` で生成して設定 |
-| `No such file or directory` (binary) | バイナリパスの誤り | `which egopulse` で実パスを確認し unit を修正 |
-| `permission denied` (data dir) | `ReadWritePaths` の不足 | systemd unit の `ReadWritePaths` にデータディレクトリを追加 |
-
-## 7. リリースプロセス
+## 5. リリースプロセス
 
 main ブランチへのマージ時に自動で GitHub Release が作成される。
 

@@ -1,23 +1,33 @@
 # EgoPulse
 
-OpenAI互換の provider / model を切り替えながら動かせる、永続化AIエージェントランタイム。
+OpenAI 互換の provider / model を切り替えながら動かせる、永続化 AI エージェントランタイム。
 TUI / Web UI / Discord / Telegram を単一バイナリで提供。Rust (Tokio) 製。
 
-## Quick Start
+## Getting Started
 
 ```bash
-# インストール（リリースバイナリ）
+# 1. インストール
 curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
 
-# 初期セットアップ（対話型TUIウィザード → ~/.egopulse/egopulse.config.yaml を生成）
+# 2. 初期セットアップ（対話型 TUI ウィザード）
+#    プロバイダー選択 → API キー入力 → Discord/Telegram の有効化（任意）
 egopulse setup
 
-# systemd サービスとして起動（本番推奨）
-egopulse gateway install    # ユニット作成 + 有効化 + 起動
-
-# 前景実行（開発・確認用）
-egopulse run
+# 3. 起動
+egopulse run                     # 全チャネル前景実行（動作確認向け）
+egopulse gateway install         # systemd サービス登録 + 起動（本番向け）
 ```
+
+起動後、ブラウザで `http://127.0.0.1:10961` にアクセスすると WebUI が利用できる。
+
+CLI で直接チャットする場合：
+
+```bash
+egopulse chat                     # CLI チャットセッション
+egopulse chat --session mybot     # セッション名を指定
+```
+
+Discord / Telegram を使う場合は [channels.md](./docs/channels.md) を参照。
 
 ## Development
 
@@ -37,27 +47,23 @@ cargo check -p egopulse
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test -p egopulse
 
-# WebUI ビルド（build.rs が web/src の mtime を監視し変更時自動ビルドするが、手動も可能）
+# WebUI ビルド
 npm install --prefix web
 npm run build --prefix web
-
-# 開発時・WebUIのみ確認
-cd web && npm run dev
+cd web && npm run dev              # 開発時・WebUI のみ確認
 ```
 
 ## バイナリ配置
 
-インストール方法によってバイナリの配置場所が異なる。`gateway install` は **起動中のバイナリパス（`current_exe`）** を systemd ユニットの `ExecStart` に埋め込むため、どのバイナリから実行したかで登録内容が変わる。
+インストール方法によってバイナリの配置場所が異なる。`gateway install` は **起動中のバイナリパス（`current_exe`）** を systemd ユニットの `ExecStart` に埋め込む。
 
 | インストール方法 | バイナリパス | 備考 |
 |---|---|---|
 | `install-egopulse.sh` | `~/.local/bin/egopulse` | `egopulse update` の更新対象 |
 | `cargo build --release` | `{project}/target/release/egopulse` | 手動 cp するまで systemd には反映されない |
-| `cargo run` で `gateway install` | `{project}/target/debug/egopulse` | ⚠️ デバッグバイナリが登録される。リリース運用には不適 |
+| `cargo run` で `gateway install` | `{project}/target/debug/egopulse` | ⚠️ デバッグバイナリが登録される |
 
 ### systemd 運用中の差し替え
-
-バイナリに WebUI 資産が埋め込まれているため、リビルド → stop → cp → start の手順が必要。`cargo run` で起動中のバイナリを上書きできない点にも注意。
 
 ```bash
 cargo build --release -p egopulse
@@ -72,10 +78,16 @@ systemctl --user start egopulse
 
 | トピック | ドキュメント |
 |---|---|
+| アーキテクチャ概要 | [architecture.md](./docs/architecture.md) |
 | コマンド仕様 | [commands.md](./docs/commands.md) |
 | 設定仕様 | [config.md](./docs/config.md) |
+| チャネル仕様 (Web/Discord/Telegram/TUI/CLI) | [channels.md](./docs/channels.md) |
 | セッションライフサイクル | [session-lifecycle.md](./docs/session-lifecycle.md) |
-| MCP 統合 | [mcp.md](./docs/mcp.md) |
 | Built-in Tools | [tools.md](./docs/tools.md) |
-| DB Schema | [db.md](./docs/db.md) |
+| MCP 統合 | [mcp.md](./docs/mcp.md) |
+| System Prompt 構築 | [system-prompt.md](./docs/system-prompt.md) |
+| セキュリティ | [security.md](./docs/security.md) |
 | デプロイ手順 | [deploy.md](./docs/deploy.md) |
+| ディレクトリ構成 | [directory.md](./docs/directory.md) |
+| DB スキーマ | [db.md](./docs/db.md) |
+| WebUI API | [api.md](./docs/api.md) |

@@ -1,8 +1,17 @@
-# EgoPulse DB Schema — 現状
+# EgoPulse DB Schema
 
-> ソース: `egopulse/src/storage.rs`
+SQLite データベースのスキーマ・テーブル定義・マイグレーション機構。
 
-## 全体構成
+## 目次
+
+1. [全体構成と ER 図](#1-全体構成と-er-図)
+2. [テーブル定義](#2-テーブル定義)
+3. [Rust 構造体マッピング](#3-rust-構造体マッピング)
+4. [設計上の注意点](#4-設計上の注意点)
+
+---
+
+## 1. 全体構成と ER 図
 
 ```
 egopulse.db (SQLite / WAL mode)
@@ -89,7 +98,7 @@ egopulse.db (SQLite / WAL mode)
 
 ---
 
-## テーブル定義
+## 2. テーブル定義
 
 ### chats
 
@@ -322,7 +331,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 ---
 
-## Rust 構造体マッピング
+## 3. Rust 構造体マッピング
 
 | 構造体 | テーブル | フィールド |
 |--------|----------|-----------|
@@ -336,7 +345,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 ---
 
-## 設計上の注意点
+## 4. 設計上の注意点
 
 ### マイグレーション機構
 

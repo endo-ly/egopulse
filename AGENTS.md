@@ -54,6 +54,24 @@ coderabbit --prompt-only -t committed --base main
 - 文書作成時はどんな時でも **MECE** を意識する（セクション構成、要件定義、設計書、PR詳細などすべて）
 - 実装後、関連内容が `docs/` にある場合は必ず反映する
 
+#### ドキュメント一覧
+
+| トピック | ファイル |
+|---|---|
+| アーキテクチャ概要 | [architecture.md](./docs/architecture.md) |
+| コマンド仕様 | [commands.md](./docs/commands.md) |
+| 設定仕様 | [config.md](./docs/config.md) |
+| チャネル仕様 (Web/Discord/Telegram/TUI/CLI) | [channels.md](./docs/channels.md) |
+| セッションライフサイクル | [session-lifecycle.md](./docs/session-lifecycle.md) |
+| Built-in Tools | [tools.md](./docs/tools.md) |
+| MCP 統合 | [mcp.md](./docs/mcp.md) |
+| System Prompt 構築 | [system-prompt.md](./docs/system-prompt.md) |
+| セキュリティ | [security.md](./docs/security.md) |
+| デプロイ手順 | [deploy.md](./docs/deploy.md) |
+| ディレクトリ構成 | [directory.md](./docs/directory.md) |
+| DB スキーマ | [db.md](./docs/db.md) |
+| WebUI API | [api.md](./docs/api.md) |
+
 ### Git / CI / PR
 
 - GitHub Flow: ブランチ `<type>/<desc>`
@@ -68,24 +86,6 @@ coderabbit --prompt-only -t committed --base main
 
 - `.env` 系・ローカル秘密設定ファイルの読み取り禁止。秘密が必要な場合はユーザーに明示してもらう
 - `~/.egopulse/egopulse.config.yaml` も読み取り禁止
-
-## デバッグ
-
-| シナリオ             | 使用スキル                             |
-| -------------------- | -------------------------------------- |
-| LLM ToolCall検証     | `agent-tool-test`                      |
-
-## Claude 設定
-
-```
-.claude/
-├── agents/                ← エージェント定義 (code-reviewer, senior-developer, other-cli-reviewer)
-├── commands/              ← スラッシュコマンド (commit-push, pr-create, review-* 等)
-├── rules/
-│   ├── rust-best-practices.md    ← Rust コーディング規約
-│   └── react-best-practices.md   ← WebUI (React) コーディング規約
-└── skills/                ← スキル (brainstorming, implementation-plan, agent-tool-test 等)
-```
 
 ## Plan作成方針
 

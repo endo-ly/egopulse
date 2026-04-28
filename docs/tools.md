@@ -1,17 +1,25 @@
 # EgoPulse Built-in Tools
 
-現在の `egopulse` に実装されている built-in tools の一覧と仕様。  
+全 built-in tools の入力・挙動・エラーを記述したリファレンス。
 
-## 参考元
+## 目次
 
-- `pi-mono` repository
-  - https://github.com/badlogic/pi-mono
-- `coding-agent` README
-  - https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md
-- built-in tools 実装ディレクトリ
-  - https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/src/core/tools
+1. [前提](#1-前提)
+2. [Tool Registry](#2-tool-registry)
+3. [read](#3-read)
+4. [write](#4-write)
+5. [edit](#5-edit)
+6. [bash](#6-bash)
+7. [grep](#7-grep)
+8. [find](#8-find)
+9. [ls](#9-ls)
+10. [activate_skill](#10-activate_skill)
+11. [Skill Catalog](#11-skill-catalog)
+12. [セキュリティガード](#12-セキュリティガード)
 
-## 前提
+---
+
+## 1. 前提
 
 - 実装本体: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 - workspace ルート: `~/.egopulse/workspace`
@@ -21,7 +29,7 @@
 - `details` は tool によって `truncation`、`diff`、`firstChangedLine`、`fullOutputPath` などを含む
 - マルチモーダル画像対応: `read` tool で画像ファイルを検出した場合、base64 data URL として LLM に直接渡す。マルチモーダルメッセージが含まれる場合は OpenAI Responses API (`/responses`) に自動ルーティングされる（Chat Completions API はマルチモーダル tool result に非対応のため）。セッション永続化時は画像を SHA256 ハッシュで内容重複排除し、参照形式 (`input_image_ref`) で保存する
 
-## Tool Registry
+## 2. Tool Registry
 
 `ToolRegistry` は全 tool を `Box<dyn Tool>` として一元管理する。built-in / MCP の区別なく、統一的に定義列挙・実行 dispatch を行う。
 
@@ -62,7 +70,7 @@ MCP の詳細は以下を参照。
 
 - [mcp.md](./mcp.md)
 
-## `read`
+## 3. `read`
 
 - 目的: ファイル内容を読む
 - 入力:
@@ -87,7 +95,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `write`
+## 4. `write`
 
 - 目的: ファイルを新規作成または上書きする
 - 入力:
@@ -107,7 +115,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `edit`
+## 5. `edit`
 
 - 目的: 既存ファイルの exact text replacement
 - 入力:
@@ -142,7 +150,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `bash`
+## 6. `bash`
 
 - 目的: workspace を cwd にして bash command を実行する
 - 入力:
@@ -169,7 +177,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `grep`
+## 7. `grep`
 
 - 目的: file contents を検索する
 - 入力:
@@ -201,7 +209,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `find`
+## 8. `find`
 
 - 目的: glob pattern でファイルを探す
 - 入力:
@@ -228,7 +236,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `ls`
+## 9. `ls`
 
 - 目的: directory contents を一覧する
 - 入力:
@@ -252,7 +260,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## `activate_skill`
+## 10. `activate_skill`
 
 - 目的: 発見済み skill の本文をロードする
 - 入力:
@@ -267,7 +275,7 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## Skill Catalog
+## 11. Skill Catalog
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
@@ -276,27 +284,8 @@ MCP の詳細は以下を参照。
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
-## セキュリティガード
+## 12. セキュリティガード
 
 AI エージェントによるシークレット窃取を防ぐ多層防御。コマンド検閲・パス検閲・出力リダクションの 3 層で構成。
 
 → 詳細: [security.md](./security.md)
-
-## Path and Directory Rules
-
-- workspace root:
-  - [egopulse/src/config.rs](../../egopulse/src/config.rs)
-  - `~/.egopulse/workspace`
-- skills root:
-  - [egopulse/src/config.rs](../../egopulse/src/config.rs)
-  - `~/.egopulse/workspace/skills`
-- path guard:
-  - [egopulse/src/tools/path_guard.rs](../../egopulse/src/tools/path_guard.rs)
-  - `..` で workspace 外へ出る path は拒否する
-  - `.ssh`, `.aws`, `.env` 等の機密パスはブロック（詳細: [security.md](./security.md#2-パスガード)）
-
-## 現在残っている主な非互換
-
-- `read` は画像ファイルを検出して LLM に渡すところまで対応済み（Responses API 経由）
-- セッション永続化でも画像を SHA256 参照形式で保存・復元できる
-- 未対応: ストリーミングでのマルチモーダル tool result（tools 使用時はストリーミングを無効化して通常 API にフォールバックしている）
