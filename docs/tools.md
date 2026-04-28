@@ -14,8 +14,9 @@
 8. [find](#8-find)
 9. [ls](#9-ls)
 10. [activate_skill](#10-activate_skill)
-11. [Skill Catalog](#11-skill-catalog)
-12. [セキュリティガード](#12-セキュリティガード)
+11. [send_message](#11-send_message)
+12. [Skill Catalog](#12-skill-catalog)
+13. [セキュリティガード](#13-セキュリティガード)
 
 ---
 
@@ -35,7 +36,7 @@
 
 ### Built-in tool
 
-registry に静的登録されている tool は次の 8 つ。
+registry に静的登録されている tool は次の 9 つ。
 
 - `read`
 - `bash`
@@ -45,6 +46,7 @@ registry に静的登録されている tool は次の 8 つ。
 - `find`
 - `ls`
 - `activate_skill`
+- `send_message`
 
 登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 
@@ -275,7 +277,30 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
 
-## 11. Skill Catalog
+## 11. `send_message`
+
+- 目的: テキストメッセージまたはファイル添付を明示的にチャネルへ送信する
+- 入力:
+  - `text: string` 任意。送信するメッセージ本文（`attachment_path` 未指定時は必須）
+  - `attachment_path: string` 任意。添付ファイルのローカルパス
+  - `caption: string` 任意。添付ファイルのキャプション（`attachment_path` 指定時のみ使用）
+- 挙動:
+  - 通常のテキスト応答はランタイムが自動送信するため、このツールはファイル添付が必要な場合に使用する
+  - `attachment_path` がある場合: パスを解決し、ファイル存在確認後、channel adapter 経由で添付送信
+  - `attachment_path` がない場合: `text` を channel adapter 経由で送信
+  - `text` も `attachment_path` も空の場合はエラー
+- 成功時:
+  - `"Message sent successfully"`
+- 主な失敗:
+  - `"At least one of 'text' or 'attachment_path' must be provided"`
+  - `"no chat found for chat_id <id>"`
+  - `"no adapter for channel '<name>'"`
+  - `"File not found: <path>"`
+  - `"Failed to send message: <reason>"`
+
+実装: [egopulse/src/tools/send_message.rs](../../egopulse/src/tools/send_message.rs)
+
+## 12. Skill Catalog
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
@@ -284,7 +309,7 @@ MCP の詳細は以下を参照。
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
-## 12. セキュリティガード
+## 13. セキュリティガード
 
 AI エージェントによるシークレット窃取を防ぐ多層防御。コマンド検閲・パス検閲・出力リダクションの 3 層で構成。
 
