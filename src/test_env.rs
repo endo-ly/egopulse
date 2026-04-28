@@ -35,6 +35,12 @@ impl EnvVarGuard {
         key: &'static str,
         value: impl AsRef<std::ffi::OsStr>,
     ) -> Self {
+        if self.saved.iter().any(|(k, _)| *k == key) {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            return self;
+        }
         let original = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
@@ -46,7 +52,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        for (key, original) in &self.saved {
+        for (key, original) in self.saved.iter().rev() {
             match original {
                 Some(value) => unsafe {
                     std::env::set_var(key, value);

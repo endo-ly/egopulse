@@ -4,9 +4,11 @@
 //! JWT の有効期限切れを検知して refresh_token による自動更新を行う。
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use base64::Engine;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 use crate::error::ConfigError;
 
@@ -167,11 +169,17 @@ pub(crate) fn is_jwt_expired(token: &str) -> bool {
     }
 }
 
+/// プロセス内で refresh を直列化するミューテックス。
+static REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// access_token の有効期限が切れている場合、refresh_token を使って更新する。
 ///
-/// 更新に成功すると `~/.codex/auth.json` を新しいトークンで上書きする。
-/// 失敗した場合はサイレントに `Ok(())` を返す（起動をブロックしない）。
+/// プロセス内ミューテックスで直列化し、並列リクエストによる二重 refresh や
+/// auth.json の競合書き込みを防ぐ。更新に成功すると一時ファイル経由で原子的に
+/// auth.json を上書きする。失敗した場合はサイレントに戻る（起動をブロックしない）。
 pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
+    let _guard = REFRESH_LOCK.lock().await;
+
     let auth_path = default_codex_auth_path();
     if !auth_path.exists() {
         return;
@@ -267,19 +275,32 @@ pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
         }
     }
 
-    match serde_json::to_string_pretty(&parsed) {
-        Ok(updated) => {
-            if let Err(error) = std::fs::write(&auth_path, updated) {
-                tracing::warn!(
-                    path = %auth_path.display(),
-                    %error,
-                    "failed to write refreshed codex auth"
-                );
-            }
-        }
+    let updated = match serde_json::to_string_pretty(&parsed) {
+        Ok(s) => s,
         Err(error) => {
             tracing::warn!(%error, "failed to serialize refreshed codex auth");
+            return;
         }
+    };
+
+    write_atomic(&auth_path, &updated);
+}
+
+/// 一時ファイルに書き込み後にリネームして原子的に更新する。
+fn write_atomic(path: &Path, content: &str) {
+    let temp_path = path.with_extension("tmp");
+    if let Err(error) = std::fs::write(&temp_path, content) {
+        tracing::warn!(path = %temp_path.display(), %error, "failed to write temp codex auth");
+        return;
+    }
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        tracing::warn!(
+            from = %temp_path.display(),
+            to = %path.display(),
+            %error,
+            "failed to rename temp codex auth"
+        );
+        let _ = std::fs::remove_file(&temp_path);
     }
 }
 

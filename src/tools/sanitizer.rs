@@ -562,7 +562,9 @@ mod tests {
     fn test_collect_config_secrets_extracts_codex_bearer_token() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
+        let _guard = EnvVarGuard::set("HOME", dir.path())
+            .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
+            .also_set("CODEX_HOME", "");
 
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
