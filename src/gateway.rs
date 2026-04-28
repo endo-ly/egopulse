@@ -452,24 +452,200 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     println!("Current version: {VERSION}");
     println!("Updating EgoPulse from latest release...");
 
-    let script_url = "https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh";
-    let cmd = format!(
-        "(curl -fsSL '{url}' || wget -qO- '{url}') | bash -s -- --skip-run",
-        url = script_url
-    );
-    let status = ProcessCommand::new("sh")
-        .args(["-c", &cmd])
-        .status()
-        .map_err(|e| EgoPulseError::Internal(format!("failed to run install script: {e}")))?;
+    let client = reqwest::Client::builder()
+        .user_agent(format!("egopulse/{VERSION}"))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create HTTP client: {e}")))?;
 
-    if !status.success() {
+    let (tag_name, assets) = fetch_latest_release(&client).await?;
+    let latest_version = tag_name.strip_prefix('v').unwrap_or(&tag_name);
+
+    if latest_version == VERSION {
+        println!("Already up to date.");
+        return Ok(());
+    }
+
+    let target = detect_target_triple();
+    let asset_url = resolve_asset_url(&assets, &target).ok_or_else(|| {
+        EgoPulseError::Internal(format!(
+            "no binary found for {target} in the latest release ({latest_version})"
+        ))
+    })?;
+
+    let new_binary = download_and_extract(&client, &asset_url).await?;
+    replace_binary(&new_binary)?;
+
+    println!("Update completed ({VERSION} -> {latest_version}). Restarting service...");
+    restart_service()?;
+    Ok(())
+}
+
+fn repo_api_path() -> &'static str {
+    const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
+    const PREFIX: &str = "https://github.com/";
+    if let Some(stripped) = REPO_URL.strip_prefix(PREFIX) {
+        stripped
+    } else {
+        if let Some(pos) = REPO_URL.find("://") {
+            let rest = &REPO_URL[pos + 3..];
+            rest.trim_start_matches('/')
+        } else {
+            REPO_URL
+        }
+    }
+}
+
+/// Detects the current target triple matching the format used in release asset names.
+fn detect_target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match os {
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "macos" => format!("{arch}-apple-darwin"),
+        _ => format!("{arch}-{os}"),
+    }
+}
+
+/// Fetches tag_name and assets array from the GitHub Releases API.
+async fn fetch_latest_release(
+    client: &reqwest::Client,
+) -> Result<(String, Vec<serde_json::Value>), EgoPulseError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        repo_api_path()
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("failed to fetch latest release: {e}")))?
+        .error_for_status()
+        .map_err(|e| EgoPulseError::Internal(format!("GitHub API error: {e}")))?;
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("failed to parse release JSON: {e}")))?;
+
+    let tag_name = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| EgoPulseError::Internal("missing 'tag_name' in release response".into()))?
+        .to_string();
+
+    let assets = json["assets"]
+        .as_array()
+        .ok_or_else(|| EgoPulseError::Internal("missing 'assets' in release response".into()))?
+        .clone();
+
+    Ok((tag_name, assets))
+}
+
+/// Finds the download URL of the tar.gz asset matching the given target triple.
+fn resolve_asset_url(assets: &[serde_json::Value], target: &str) -> Option<String> {
+    assets.iter().find_map(|asset| {
+        let name = asset["name"].as_str().unwrap_or("");
+        if name.contains(target) && name.ends_with(".tar.gz") {
+            asset["browser_download_url"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
+}
+
+/// Downloads a tar.gz archive, extracts the `egopulse` binary, and returns its path.
+async fn download_and_extract(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<PathBuf, EgoPulseError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("download failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| EgoPulseError::Internal(format!("download error: {e}")))?;
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("failed to read response body: {e}")))?;
+
+    let gz = flate2::read::GzDecoder::new(bytes.as_ref());
+    let mut archive = tar::Archive::new(gz);
+
+    let tmp_dir = tempfile::tempdir()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create temp dir: {e}")))?;
+
+    archive
+        .entries()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to read archive entries: {e}")))?
+        .filter_map(|entry| entry.ok())
+        .for_each(|mut entry| {
+            if let Ok(path) = entry.path() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("egopulse") {
+                    let _ = entry.unpack_in(tmp_dir.path());
+                }
+            }
+        });
+
+    let bin_path = tmp_dir.path().join("egopulse");
+    if !bin_path.exists() {
+        let found = walkdir::WalkDir::new(tmp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name() == "egopulse")
+            .map(|e| e.path().to_path_buf());
+
+        if let Some(p) = found {
+            return Ok(p);
+        }
+        return Err(EgoPulseError::Internal(
+            "could not find 'egopulse' binary in downloaded archive".into(),
+        ));
+    }
+
+    Ok(bin_path)
+}
+
+/// Atomically replaces the currently running binary with the provided new binary.
+///
+/// On success the old binary is kept as `.egopulse.old` in the same directory.
+/// On failure the original binary is restored.
+fn replace_binary(new_binary: &std::path::Path) -> Result<(), EgoPulseError> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to get current exe: {e}")))?;
+    let current_exe = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.clone());
+
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| EgoPulseError::Internal("could not determine binary directory".into()))?;
+
+    let staged = exe_dir.join(".egopulse.new");
+    std::fs::copy(new_binary, &staged)
+        .map_err(|e| EgoPulseError::Internal(format!("failed to copy new binary: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| EgoPulseError::Internal(format!("failed to set permissions: {e}")))?;
+    }
+
+    let backup = exe_dir.join(".egopulse.old");
+    std::fs::rename(&current_exe, &backup).map_err(|e| {
+        EgoPulseError::Internal(format!("failed to move current binary aside: {e}"))
+    })?;
+
+    if let Err(e) = std::fs::rename(&staged, &current_exe) {
+        let _ = std::fs::rename(&backup, &current_exe);
         return Err(EgoPulseError::Internal(format!(
-            "update failed (exit code {status:?}). Run install script manually:\n  curl -fsSL {script_url} | bash"
+            "failed to install new binary (rolled back): {e}"
         )));
     }
 
-    println!("Update completed. Restarting service...");
-    restart_service()?;
     Ok(())
 }
 
