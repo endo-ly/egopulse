@@ -22,11 +22,7 @@ Tailscale HTTPS による公開はオプションとして記載する。
 curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
 ```
 
-環境変数 `EGOPULSE_INSTALL_DIR` でインストール先を指定できる（デフォルト: `/usr/local/bin`、書き込み不可なら `$HOME/.local/bin` にフォールバック）。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | EGOPULSE_INSTALL_DIR="$HOME/.local/bin" bash
-```
+バイナリは `$HOME/.local/bin/egopulse` に配置する。`egopulse update` も同じパスを更新対象にする。
 
 確認:
 
@@ -40,13 +36,13 @@ GitHub Releases から直接ダウンロードする。
 
 ```bash
 # バイナリ配置先のディレクトリを作成
-sudo mkdir -p /usr/local/bin
+mkdir -p "$HOME/.local/bin"
 
 # 最新のリリースバイナリをダウンロード（x86_64 Linux の場合）
 # 完全なURLは GitHub Releases で確認してください
 curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf egopulse.tar.gz
-sudo mv egopulse /usr/local/bin/egopulse
+install -m 0755 egopulse "$HOME/.local/bin/egopulse"
 ```
 
 確認:
@@ -82,7 +78,8 @@ nvm install --lts
 git clone https://github.com/endo-ly/egopulse.git
 cd egopulse
 cargo build --release
-sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
+mkdir -p "$HOME/.local/bin"
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
 ```
 
 確認:
@@ -91,17 +88,17 @@ sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
 egopulse --version
 ```
 
-更新時も同じ手順で `target/release/egopulse` を `/usr/local/bin/egopulse` に上書きする。
+更新時も同じ手順で `target/release/egopulse` を `$HOME/.local/bin/egopulse` に上書きする。
 
 ## 3. 設定
 
 ### 3.1 設定ファイル配置
 
-設定ファイルは `~/.egopulse/egopulse.config.yaml` に固定する。以下では root 運用を前提に `/root/.egopulse/egopulse.config.yaml` を使用する。
+設定ファイルは `$HOME/.egopulse/egopulse.config.yaml` に固定する。
 
 ```bash
-sudo mkdir -p /root/.egopulse
-sudo nano /root/.egopulse/egopulse.config.yaml
+mkdir -p "$HOME/.egopulse"
+nano "$HOME/.egopulse/egopulse.config.yaml"
 ```
 
 最小限の設定例:
@@ -135,7 +132,7 @@ openssl rand -base64 32
 EgoPulse は以下の固定ディレクトリを使用する。
 
 ```bash
-sudo mkdir -p /root/.egopulse/data /root/.egopulse/workspace
+mkdir -p "$HOME/.egopulse/data" "$HOME/.egopulse/workspace"
 ```
 
 ## 4. systemd 常駐
@@ -196,7 +193,7 @@ systemd unit を手動で作成する。
 > **パスについて**: 以下の例のパスは実際の環境に合わせて書き換えてください。
 > systemd の `ExecStart` はシェル展開を行わないため、絶対パスの指定が必要です。
 
-`/etc/systemd/system/egopulse.service`:
+`~/.config/systemd/user/egopulse.service`:
 
 ```ini
 [Unit]
@@ -206,33 +203,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# バイナリパスと設定ファイルパスは環境に合わせて変更してください
-ExecStart=/usr/local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
+ExecStart=%h/.local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
 Restart=always
 RestartSec=10
-User=root
-Group=root
 Environment=HOME=%h
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace
-ProtectHome=read-only
+ProtectHome=false
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
-> ソースビルド時も `ExecStart` は `/usr/local/bin/egopulse` のままにし、`sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse` で配置してください。`~/.cargo/bin` への `cargo install` は配布版と競合しやすいため非推奨です。
+> ソースビルド時も `ExecStart` は `%h/.local/bin/egopulse` のままにし、`install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"` で配置してください。`~/.cargo/bin` への `cargo install` は配布版と競合しやすいため非推奨です。
+> `egopulse update` と `egopulse gateway restart` はユーザーサービスと `$HOME/.local/bin/egopulse` を前提に管理します。
 
 ### 4.3 起動・確認
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable egopulse
-sudo systemctl start egopulse
-sudo systemctl status egopulse
+systemctl --user daemon-reload
+systemctl --user enable egopulse
+systemctl --user start egopulse
+systemctl --user status egopulse
 ```
 
 ### 4.4 再起動
@@ -243,7 +238,7 @@ systemd で常駐中のサービスを再起動する。
 egopulse gateway restart
 ```
 
-内部で `systemctl restart egopulse` を実行する。
+内部で `systemctl --user restart egopulse.service` を実行する。
 
 ### 4.5 更新
 
@@ -253,7 +248,7 @@ egopulse gateway restart
 egopulse update
 ```
 
-内部で install.sh を実行して最新バイナリを配置後、systemd を再起動する。
+内部で最新リリースを検証して `$HOME/.local/bin/egopulse` に配置後、systemd ユーザーサービスを再起動する。
 
 ### 4.6 Tailscale Serve（オプション）
 
@@ -270,13 +265,13 @@ sudo tailscale serve status
 
 ```bash
 # 最新ログ
-journalctl -u egopulse.service -n 100 --no-pager
+journalctl --user -u egopulse.service -n 100 --no-pager
 
 # リアルタイム監視
-journalctl -u egopulse.service -f
+journalctl --user -u egopulse.service -f
 
 # エラーのみ
-journalctl -u egopulse.service -p err --no-pager
+journalctl --user -u egopulse.service -p err --no-pager
 ```
 
 ## 5. アップデート
@@ -294,7 +289,7 @@ egopulse gateway restart
 # 最新バイナリをダウンロードして上書き
 curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf egopulse.tar.gz
-sudo mv egopulse /usr/local/bin/egopulse
+install -m 0755 egopulse "$HOME/.local/bin/egopulse"
 egopulse gateway restart
 ```
 
@@ -304,7 +299,7 @@ egopulse gateway restart
 cd /path/to/egopulse
 git pull
 cargo build --release
-sudo install -m 0755 target/release/egopulse /usr/local/bin/egopulse
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
 egopulse gateway restart
 ```
 
@@ -314,20 +309,20 @@ egopulse gateway restart
 
 ```bash
 # 設定ファイルの確認
-cat /root/.egopulse/egopulse.config.yaml
+cat "$HOME/.egopulse/egopulse.config.yaml"
 
 # 手動起動でエラー確認
-egopulse --config /root/.egopulse/egopulse.config.yaml run
+egopulse --config "$HOME/.egopulse/egopulse.config.yaml" run
 
 # systemd ログ詳細確認
-journalctl -u egopulse.service -n 200 --no-pager
+journalctl --user -u egopulse.service -n 200 --no-pager
 ```
 
 ### よくあるエラー
 
 | エラー | 原因 | 解決策 |
 |--------|------|--------|
-| `config file not found` | `--config` パスの誤り | `ls /root/.egopulse/egopulse.config.yaml` で確認 |
+| `config file not found` | `--config` パスの誤り | `ls "$HOME/.egopulse/egopulse.config.yaml"` で確認 |
 | `web channel: auth_token is required` | auth_token 未設定 | `openssl rand -base64 32` で生成して設定 |
 | `No such file or directory` (binary) | バイナリパスの誤り | `which egopulse` で実パスを確認し unit を修正 |
 | `permission denied` (data dir) | `ReadWritePaths` の不足 | systemd unit の `ReadWritePaths` にデータディレクトリを追加 |

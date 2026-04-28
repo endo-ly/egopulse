@@ -108,6 +108,8 @@ jobs:
 
       - name: Build release binary
         shell: bash
+        env:
+          EGOPULSE_RELEASE_TAG: ${{ needs.create-tag.outputs.release_tag }}
         run: cargo build --release
 
       - name: Package archive
@@ -154,10 +156,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${{ needs.create-tag.outputs.release_version }}"
           gh release create "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
-            -t "EgoPulse v${VERSION}" \
+            -t "${RELEASE_TAG}" \
             --generate-notes \
             --target "${{ github.sha }}" \
             dist/*

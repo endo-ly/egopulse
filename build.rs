@@ -19,6 +19,7 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=EGOPULSE_SKIP_WEB_BUILD");
+    println!("cargo:rerun-if-env-changed=EGOPULSE_RELEASE_TAG");
     println!("cargo:rerun-if-env-changed=NPM");
     ensure_web_assets();
 }
