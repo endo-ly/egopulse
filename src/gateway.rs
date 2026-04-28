@@ -10,8 +10,10 @@ use std::process::Command as ProcessCommand;
 use crate::config::Config;
 use crate::error::EgoPulseError;
 use clap::Subcommand;
+use sha2::{Digest, Sha256};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASE_TAG: Option<&str> = option_env!("EGOPULSE_RELEASE_TAG");
 
 const SERVICE_NAME: &str = "egopulse.service";
 const USER_BIN_DIR: &str = ".local/bin";
@@ -457,6 +459,9 @@ ACTIONS:
 /// Updates the installed EgoPulse binary from the latest GitHub release.
 pub async fn run_update() -> Result<(), EgoPulseError> {
     println!("Current version: {VERSION}");
+    if let Some(release_tag) = RELEASE_TAG {
+        println!("Current release: {release_tag}");
+    }
     println!("Updating EgoPulse from latest release...");
 
     let client = reqwest::Client::builder()
@@ -468,9 +473,7 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     ensure_user_updatable_install()?;
 
     let (tag_name, assets) = fetch_latest_release(&client).await?;
-    let latest_version = tag_name.strip_prefix('v').unwrap_or(&tag_name);
-
-    if latest_version == VERSION {
+    if RELEASE_TAG == Some(tag_name.as_str()) {
         println!("Already up to date.");
         return Ok(());
     }
@@ -478,14 +481,19 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     let target = detect_target_triple();
     let asset_url = resolve_asset_url(&assets, &target).ok_or_else(|| {
         EgoPulseError::Internal(format!(
-            "no binary found for {target} in the latest release ({latest_version})"
+            "no binary found for {target} in the latest release ({tag_name})"
+        ))
+    })?;
+    let checksum_url = resolve_checksum_url(&assets).ok_or_else(|| {
+        EgoPulseError::Internal(format!(
+            "no SHA256SUMS.txt found in the latest release ({tag_name})"
         ))
     })?;
 
-    let new_binary = download_and_extract(&client, &asset_url).await?;
+    let new_binary = download_and_extract(&client, &asset_url, &checksum_url).await?;
     replace_binary(&new_binary.path)?;
 
-    println!("Update completed ({VERSION} -> {latest_version}). Restarting service...");
+    println!("Update completed ({VERSION} -> {tag_name}). Restarting service...");
     restart_service()?;
     Ok(())
 }
@@ -590,10 +598,23 @@ fn resolve_asset_url(assets: &[serde_json::Value], target: &str) -> Option<Strin
     })
 }
 
+/// Finds the download URL of the release checksum manifest.
+fn resolve_checksum_url(assets: &[serde_json::Value]) -> Option<String> {
+    assets.iter().find_map(|asset| {
+        let name = asset["name"].as_str().unwrap_or("");
+        if name == "SHA256SUMS.txt" {
+            asset["browser_download_url"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
+}
+
 /// Downloads a tar.gz archive, extracts the `egopulse` binary, and returns its path.
 async fn download_and_extract(
     client: &reqwest::Client,
     url: &str,
+    checksum_url: &str,
 ) -> Result<ExtractedBinary, EgoPulseError> {
     let resp = client
         .get(url)
@@ -607,6 +628,8 @@ async fn download_and_extract(
         .bytes()
         .await
         .map_err(|e| EgoPulseError::Internal(format!("failed to read response body: {e}")))?;
+
+    verify_archive_checksum(client, url, checksum_url, bytes.as_ref()).await?;
 
     let gz = flate2::read::GzDecoder::new(bytes.as_ref());
     let mut archive = tar::Archive::new(gz);
@@ -672,6 +695,60 @@ async fn download_and_extract(
     })
 }
 
+async fn verify_archive_checksum(
+    client: &reqwest::Client,
+    archive_url: &str,
+    checksum_url: &str,
+    bytes: &[u8],
+) -> Result<(), EgoPulseError> {
+    let manifest = client
+        .get(checksum_url)
+        .send()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("failed to fetch SHA256SUMS.txt: {e}")))?
+        .error_for_status()
+        .map_err(|e| EgoPulseError::Internal(format!("SHA256SUMS.txt download error: {e}")))?
+        .text()
+        .await
+        .map_err(|e| EgoPulseError::Internal(format!("failed to read SHA256SUMS.txt: {e}")))?;
+
+    let archive_name = archive_url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| EgoPulseError::Internal("failed to derive archive filename".into()))?;
+
+    let expected = manifest
+        .lines()
+        .filter_map(parse_sha256sum_line)
+        .find_map(|(digest, filename)| (filename == archive_name).then_some(digest))
+        .ok_or_else(|| {
+            EgoPulseError::Internal(format!(
+                "SHA256SUMS.txt does not contain checksum for {archive_name}"
+            ))
+        })?;
+
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        return Err(EgoPulseError::Internal(format!(
+            "checksum mismatch for {archive_name}: expected {expected}, got {actual}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let digest = parts.next()?;
+    let filename = parts.next()?.trim_start_matches('*');
+    if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some((digest, filename))
+    } else {
+        None
+    }
+}
+
 /// Atomically replaces the currently running binary with the provided new binary.
 ///
 /// On success the old binary is kept as `.egopulse.old` in the same directory.
@@ -704,10 +781,14 @@ fn replace_binary(new_binary: &Path) -> Result<(), EgoPulseError> {
     })?;
 
     if let Err(e) = std::fs::rename(&staged, &current_exe) {
-        let _ = std::fs::rename(&backup, &current_exe);
-        return Err(EgoPulseError::Internal(format!(
-            "failed to install new binary (rolled back): {e}"
-        )));
+        return match std::fs::rename(&backup, &current_exe) {
+            Ok(()) => Err(EgoPulseError::Internal(format!(
+                "failed to install new binary (rolled back): {e}"
+            ))),
+            Err(rollback_error) => Err(EgoPulseError::Internal(format!(
+                "failed to install new binary and rollback failed: install error: {e}; rollback error: {rollback_error}"
+            ))),
+        };
     }
 
     Ok(())

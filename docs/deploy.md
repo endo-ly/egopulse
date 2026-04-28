@@ -193,7 +193,7 @@ systemd unit を手動で作成する。
 > **パスについて**: 以下の例のパスは実際の環境に合わせて書き換えてください。
 > systemd の `ExecStart` はシェル展開を行わないため、絶対パスの指定が必要です。
 
-`/etc/systemd/system/egopulse.service`:
+`~/.config/systemd/user/egopulse.service`:
 
 ```ini
 [Unit]
@@ -203,33 +203,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# バイナリパスと設定ファイルパスは環境に合わせて変更してください
 ExecStart=%h/.local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
 Restart=always
 RestartSec=10
-User=root
-Group=root
 Environment=HOME=%h
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace
-ProtectHome=read-only
+ProtectHome=false
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
 > ソースビルド時も `ExecStart` は `%h/.local/bin/egopulse` のままにし、`install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"` で配置してください。`~/.cargo/bin` への `cargo install` は配布版と競合しやすいため非推奨です。
+> `egopulse update` と `egopulse gateway restart` はユーザーサービスと `$HOME/.local/bin/egopulse` を前提に管理します。
 
 ### 4.3 起動・確認
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable egopulse
-sudo systemctl start egopulse
-sudo systemctl status egopulse
+systemctl --user daemon-reload
+systemctl --user enable egopulse
+systemctl --user start egopulse
+systemctl --user status egopulse
 ```
 
 ### 4.4 再起動
@@ -240,7 +238,7 @@ systemd で常駐中のサービスを再起動する。
 egopulse gateway restart
 ```
 
-内部で `systemctl restart egopulse` を実行する。
+内部で `systemctl --user restart egopulse.service` を実行する。
 
 ### 4.5 更新
 
@@ -250,7 +248,7 @@ egopulse gateway restart
 egopulse update
 ```
 
-内部で install.sh を実行して最新バイナリを配置後、systemd を再起動する。
+内部で最新リリースを検証して `$HOME/.local/bin/egopulse` に配置後、systemd ユーザーサービスを再起動する。
 
 ### 4.6 Tailscale Serve（オプション）
 
@@ -267,13 +265,13 @@ sudo tailscale serve status
 
 ```bash
 # 最新ログ
-journalctl -u egopulse.service -n 100 --no-pager
+journalctl --user -u egopulse.service -n 100 --no-pager
 
 # リアルタイム監視
-journalctl -u egopulse.service -f
+journalctl --user -u egopulse.service -f
 
 # エラーのみ
-journalctl -u egopulse.service -p err --no-pager
+journalctl --user -u egopulse.service -p err --no-pager
 ```
 
 ## 5. アップデート
