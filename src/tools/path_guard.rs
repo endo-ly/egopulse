@@ -9,6 +9,7 @@ const BLOCKED_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube"];
 const BLOCKED_SUBPATHS: &[&[&str]] = &[&[".config", "gcloud"]];
 
 const BLOCKED_FILE_NAMES: &[&str] = &[
+    "auth.json",
     "credentials",
     "credentials.json",
     "token.json",
@@ -479,6 +480,14 @@ mod tests {
         assert!(is_blocked(Path::new("/project/token.json")));
         assert!(is_blocked(Path::new("/project/secrets.yaml")));
         assert!(is_blocked(Path::new("/project/secrets.json")));
+    }
+
+    /// auth.json は任意のパスでブロックされる（OAuth トークンを含むため）。
+    #[test]
+    fn blocks_auth_json() {
+        assert!(is_blocked(Path::new("/home/user/.codex/auth.json")));
+        assert!(is_blocked(Path::new("/root/.codex/auth.json")));
+        assert!(is_blocked(Path::new("/project/auth.json")));
     }
 
     #[test]
