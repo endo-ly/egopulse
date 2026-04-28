@@ -18,6 +18,13 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
     },
     ProviderPreset {
+        id: "openai-codex",
+        label: "OpenAI Codex (OAuth)",
+        default_base_url: "https://chatgpt.com/backend-api/codex",
+        default_model: "gpt-5.3-codex",
+        models: &["gpt-5.3-codex", "codex-mini"],
+    },
+    ProviderPreset {
         id: "openrouter",
         label: "OpenRouter",
         default_base_url: "https://openrouter.ai/api/v1",
