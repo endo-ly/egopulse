@@ -96,7 +96,7 @@ pub(crate) fn translate_message_to_responses(message: &Message) -> Vec<serde_jso
                 items.push(serde_json::json!({
                     "type": "message",
                     "role": "assistant",
-                    "content": translate_content_to_responses_message(&message.content),
+                    "content": translate_text_first_responses_content(&message.content),
                 }));
             }
             items.extend(message.tool_calls.iter().map(|tool_call| {
@@ -127,7 +127,7 @@ pub(crate) fn translate_message_to_responses(message: &Message) -> Vec<serde_jso
         _ => vec![serde_json::json!({
             "type": "message",
             "role": message.role,
-            "content": translate_content_to_responses_message(&message.content),
+            "content": translate_text_first_responses_content(&message.content),
         })],
     }
 }
@@ -202,6 +202,7 @@ fn append_responses_tools(body: &mut serde_json::Value, tools: Option<&[ToolDefi
             })
             .collect(),
     );
+    body["tool_choice"] = serde_json::Value::String("auto".to_string());
 }
 
 fn default_detail(detail: &Option<String>) -> String {
@@ -235,5 +236,85 @@ fn responses_content_part(part: &MessageContentPart) -> serde_json::Value {
             "image_url": image_url,
             "detail": default_detail(detail),
         }),
+    }
+}
+
+fn translate_text_first_responses_content(content: &MessageContent) -> serde_json::Value {
+    match content {
+        MessageContent::Text(text) => serde_json::Value::String(text.clone()),
+        MessageContent::Parts(parts)
+            if parts
+                .iter()
+                .all(|part| matches!(part, MessageContentPart::InputText { .. })) =>
+        {
+            serde_json::Value::String(content.as_text_lossy())
+        }
+        MessageContent::Parts(_) => {
+            serde_json::Value::Array(translate_content_to_responses_message(content))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_request_uses_string_content_for_text_messages() {
+        let body = build_responses_request_body(
+            "gpt-5.3-codex",
+            "system",
+            &[Message::text("user", "hello")],
+            None,
+        );
+
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn responses_request_keeps_part_content_for_images() {
+        let body = build_responses_request_body(
+            "gpt-4o-mini",
+            "",
+            &[Message {
+                role: "user".to_string(),
+                content: MessageContent::parts(vec![
+                    MessageContentPart::InputText {
+                        text: "describe".to_string(),
+                    },
+                    MessageContentPart::InputImage {
+                        image_url: "data:image/png;base64,AAAA".to_string(),
+                        detail: Some("auto".to_string()),
+                    },
+                ]),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            None,
+        );
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn responses_request_sets_auto_tool_choice_when_tools_exist() {
+        let body = build_responses_request_body(
+            "gpt-5.3-codex",
+            "",
+            &[Message::text("user", "hello")],
+            Some(&[ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+        );
+
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "read");
     }
 }

@@ -71,6 +71,7 @@ coderabbit --prompt-only -t committed --base main
 | セッションライフサイクル | [session-lifecycle.md](./docs/session-lifecycle.md) |
 | Built-in Tools | [tools.md](./docs/tools.md) |
 | MCP 統合 | [mcp.md](./docs/mcp.md) |
+| OpenAI Codex Provider | [openai-codex.md](./docs/openai-codex.md) |
 | System Prompt 構築 | [system-prompt.md](./docs/system-prompt.md) |
 | セキュリティ | [security.md](./docs/security.md) |
 | デプロイ手順 | [deploy.md](./docs/deploy.md) |

@@ -52,7 +52,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
 pub(crate) fn parse_responses_response(
     body: ResponsesApiResponse,
 ) -> Result<MessagesResponse, LlmError> {
-    let usage = body.usage;
+    let diagnostics = body.diagnostics();
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -93,15 +93,15 @@ pub(crate) fn parse_responses_response(
     }
 
     if content.is_empty() && tool_calls.is_empty() {
-        return Err(LlmError::InvalidResponse(
-            "assistant content was empty".to_string(),
-        ));
+        return Err(LlmError::InvalidResponse(format!(
+            "assistant content was empty ({diagnostics})"
+        )));
     }
 
     Ok(MessagesResponse {
         content,
         tool_calls,
-        usage: usage.and_then(|u| {
+        usage: body.usage.and_then(|u| {
             u.input_tokens
                 .zip(u.output_tokens)
                 .map(|(it, ot)| LlmUsage {
@@ -110,6 +110,39 @@ pub(crate) fn parse_responses_response(
                 })
         }),
     })
+}
+
+impl ResponsesApiResponse {
+    fn diagnostics(&self) -> String {
+        let output_items = self.output.len();
+        let status = self.status.as_deref().unwrap_or("unknown");
+        let incomplete_reason = self
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            .unwrap_or("none");
+
+        let input_tokens = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.input_tokens)
+            .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+        let output_tokens = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens)
+            .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+        let reasoning_tokens = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens_details.as_ref())
+            .and_then(|details| details.reasoning_tokens)
+            .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+
+        format!(
+            "status={status}, output_items={output_items}, input_tokens={input_tokens}, output_tokens={output_tokens}, reasoning_tokens={reasoning_tokens}, incomplete_reason={incomplete_reason}"
+        )
+    }
 }
 
 pub(crate) fn parse_tool_call(raw: OaiToolCall) -> Result<ToolCall, LlmError> {
@@ -190,13 +223,17 @@ pub(crate) fn extract_text(content: OpenAiMessageContent) -> String {
 /// SSE stream text containing `response.done` events.
 ///
 /// The Codex endpoint requires `stream: true`, so the response body consists of
-/// newline-delimited SSE events. The final `response.done` event carries the
-/// complete [`ResponsesApiResponse`] under its `"response"` key.
+/// newline-delimited SSE events. The final `response.completed` (or
+/// `response.done`) event carries the complete [`ResponsesApiResponse`]
+/// under its `"response"` key.
 pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiResponse, LlmError> {
     if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
         return Ok(parsed);
     }
     let mut last_response: Option<ResponsesApiResponse> = None;
+    let mut streamed_text = String::new();
+    let mut streamed_items = Vec::new();
+
     for line in text.lines() {
         let line = line.trim();
         if !line.starts_with("data:") {
@@ -210,24 +247,80 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
             continue;
         };
 
+        if let Some(item_value) = value.get("item")
+            && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.clone())
+            && !matches!(item, ResponsesOutputItem::Ignored)
+        {
+            streamed_items.push(item);
+        }
+
+        let event_type = value.get("type").and_then(|v| v.as_str());
+        match event_type {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    streamed_text.push_str(delta);
+                }
+            }
+            Some("response.output_text.done") => {
+                if let Some(done_text) = value.get("text").and_then(|v| v.as_str())
+                    && !done_text.is_empty()
+                {
+                    streamed_text = done_text.to_string();
+                }
+            }
+            _ => {}
+        }
+
         if let Some(response_value) = value.get("response") {
             if let Ok(parsed) =
                 serde_json::from_value::<ResponsesApiResponse>(response_value.clone())
             {
                 last_response = Some(parsed);
-                if value.get("type").and_then(|v| v.as_str()) == Some("response.done") {
+                if event_type == Some("response.done") || event_type == Some("response.completed") {
                     break;
                 }
             }
         }
     }
 
-    last_response.ok_or_else(|| {
-        LlmError::InvalidResponse(format!(
-            "Failed to parse Codex response payload. Body: {}",
-            preview_body(text)
-        ))
-    })
+    if let Some(mut response) = last_response {
+        if response.output.is_empty() {
+            if !streamed_items.is_empty() {
+                response.output = streamed_items;
+            } else if !streamed_text.trim().is_empty() {
+                response.output.push(ResponsesOutputItem::Message {
+                    role: Some("assistant".to_string()),
+                    content: vec![ResponsesOutputPart::OutputText {
+                        text: streamed_text,
+                    }],
+                });
+            }
+        }
+        return Ok(response);
+    }
+
+    if !streamed_items.is_empty() || !streamed_text.trim().is_empty() {
+        let mut output = streamed_items;
+        if output.is_empty() {
+            output.push(ResponsesOutputItem::Message {
+                role: Some("assistant".to_string()),
+                content: vec![ResponsesOutputPart::OutputText {
+                    text: streamed_text,
+                }],
+            });
+        }
+        return Ok(ResponsesApiResponse {
+            status: Some("completed".to_string()),
+            output,
+            usage: None,
+            incomplete_details: None,
+        });
+    }
+
+    Err(LlmError::InvalidResponse(format!(
+        "Failed to parse Codex response payload. Body: {}",
+        preview_body(text)
+    )))
 }
 
 pub(crate) fn preview_body(body: &str) -> String {
@@ -443,9 +536,13 @@ pub(crate) struct OpenAiUsage {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiResponse {
+    #[serde(default)]
+    pub(crate) status: Option<String>,
     pub(crate) output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     pub(crate) usage: Option<ResponsesApiUsage>,
+    #[serde(default)]
+    pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +551,20 @@ pub(crate) struct ResponsesApiUsage {
     pub(crate) input_tokens: Option<i64>,
     #[serde(default)]
     pub(crate) output_tokens: Option<i64>,
+    #[serde(default)]
+    pub(crate) output_tokens_details: Option<ResponsesOutputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesOutputTokensDetails {
+    #[serde(default)]
+    pub(crate) reasoning_tokens: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,4 +651,92 @@ pub(crate) struct OaiErrorResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiErrorDetail {
     pub(crate) message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_codex_response_completed_sse_payload() {
+        let payload = r#"
+event: response.created
+data: {"type":"response.created","response":{"output":[]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.content, "ok");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_codex_streamed_text_when_completed_output_is_empty() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"hello "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"there"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.content, "hello there");
+    }
+
+    #[test]
+    fn parses_codex_streamed_output_item_when_completed_output_is_empty() {
+        let payload = r#"
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from item"}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.content, "from item");
+    }
+
+    #[test]
+    fn empty_responses_api_output_reports_diagnostics() {
+        let body: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [],
+            "incomplete_details": null,
+            "usage": {
+                "input_tokens": 123,
+                "output_tokens": 20,
+                "output_tokens_details": {
+                    "reasoning_tokens": 20
+                }
+            }
+        }))
+        .expect("body");
+
+        let error = parse_responses_response(body).expect_err("empty output");
+        let text = error.to_string();
+
+        assert!(text.contains("status=completed"), "{text}");
+        assert!(text.contains("output_items=0"), "{text}");
+        assert!(text.contains("output_tokens=20"), "{text}");
+        assert!(text.contains("reasoning_tokens=20"), "{text}");
+    }
 }
