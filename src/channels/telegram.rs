@@ -20,7 +20,6 @@ use crate::channel_adapter::ChannelAdapter;
 use crate::channel_adapter::ConversationKind;
 use crate::runtime::AppState;
 use crate::slash_commands;
-use crate::storage::call_blocking;
 use crate::text::split_text;
 
 /// Telegram メッセージ長制限 (文字数)。
@@ -353,27 +352,6 @@ async fn handle_message(
             return Ok(());
         }
 
-        let slash_chat_type = chat_type.clone();
-        let resolved_chat_id = match call_blocking(std::sync::Arc::clone(&state.db), {
-            let channel = "telegram".to_string();
-            let ext_id = external_chat_id.clone();
-            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &slash_chat_type)
-        })
-        .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                error!("failed to resolve chat_id for slash command: {e}");
-                send_telegram_response(
-                    &bot,
-                    msg.chat.id,
-                    "An error occurred processing the command.",
-                )
-                .await;
-                return Ok(());
-            }
-        };
-
         let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
         let slash_context = SurfaceContext {
             channel: "telegram".to_string(),
@@ -382,23 +360,40 @@ async fn handle_message(
             chat_type: chat_type.clone(),
             agent_id: state.config.default_agent.to_string(),
         };
-        if let Some(response) = slash_commands::handle_slash_command(
-            &state,
-            resolved_chat_id,
-            &slash_context,
-            &text,
-            sender_id.as_deref(),
-        )
-        .await
-        {
-            send_telegram_response(&bot, msg.chat.id, &response).await;
-        } else {
-            send_telegram_response(
-                &bot,
-                msg.chat.id,
-                &slash_commands::unknown_command_response(),
-            )
-            .await;
+
+        let resolved_chat_id =
+            crate::agent_loop::session::resolve_chat_id(&state, &slash_context).await;
+
+        match resolved_chat_id {
+            Ok(chat_id) => {
+                if let Some(response) = slash_commands::handle_slash_command(
+                    &state,
+                    chat_id,
+                    &slash_context,
+                    &text,
+                    sender_id.as_deref(),
+                )
+                .await
+                {
+                    send_telegram_response(&bot, msg.chat.id, &response).await;
+                } else {
+                    send_telegram_response(
+                        &bot,
+                        msg.chat.id,
+                        &slash_commands::unknown_command_response(),
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                error!("failed to resolve chat_id for slash command: {e}");
+                send_telegram_response(
+                    &bot,
+                    msg.chat.id,
+                    "An error occurred processing the command.",
+                )
+                .await;
+            }
         }
         return Ok(());
     }

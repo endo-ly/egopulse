@@ -197,15 +197,19 @@ pub(super) async fn start_stream_run(
     state.run_hub.create(&run_id, actor.to_string()).await;
 
     if crate::slash_commands::is_slash_command(&message) {
-        let slash_chat_id = match call_blocking(std::sync::Arc::clone(&state.app_state.db), {
-            let channel = context.channel.clone();
-            let ext_id = context.surface_thread.clone();
-            let chat_type = context.chat_type.clone();
-            move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
-        })
-        .await
-        {
-            Ok(id) => id,
+        let slash_chat_id =
+            crate::agent_loop::session::resolve_chat_id(&state.app_state, &context).await;
+
+        let response = match slash_chat_id {
+            Ok(id) => crate::slash_commands::handle_slash_command(
+                &state.app_state,
+                id,
+                &context,
+                &message,
+                Some(actor),
+            )
+            .await
+            .unwrap_or_else(crate::slash_commands::unknown_command_response),
             Err(e) => {
                 state
                     .run_hub
@@ -225,16 +229,6 @@ pub(super) async fn start_stream_run(
                 });
             }
         };
-
-        let response = crate::slash_commands::handle_slash_command(
-            &state.app_state,
-            slash_chat_id,
-            &context,
-            &message,
-            Some(actor),
-        )
-        .await
-        .unwrap_or_else(crate::slash_commands::unknown_command_response);
 
         state
             .run_hub

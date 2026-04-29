@@ -267,19 +267,13 @@ impl EventHandler for Handler {
         let thread = channel_id.to_string();
 
         if crate::slash_commands::is_slash_command(&text) {
+            let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
+            let sender_id = msg.author.id.get().to_string();
             let slash_chat_id =
-                crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
-                    let channel = "discord".to_string();
-                    let ext_id = self.agent_thread(&thread, &agent_id);
-                    let chat_type = "discord".to_string();
-                    move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
-                })
-                .await;
+                crate::agent_loop::session::resolve_chat_id(&self.app_state, &slash_context).await;
 
             match slash_chat_id {
                 Ok(chat_id) => {
-                    let sender_id = msg.author.id.get().to_string();
-                    let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
                     if let Some(response) = crate::slash_commands::handle_slash_command(
                         &self.app_state,
                         chat_id,
@@ -475,29 +469,21 @@ impl EventHandler for Handler {
         let interaction_agent = self.select_agent(channel_id, is_dm_int).to_string();
         let thread = channel_id.to_string();
 
+        let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
+        let sender_id = cmd.user.id.get().to_string();
         let slash_chat_id =
-            crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
-                let channel = "discord".to_string();
-                let ext_id = self.agent_thread(&thread, &interaction_agent);
-                let chat_type = "discord".to_string();
-                move |db| db.resolve_or_create_chat_id(&channel, &ext_id, None, &chat_type)
-            })
-            .await;
+            crate::agent_loop::session::resolve_chat_id(&self.app_state, &slash_context).await;
 
         let response_text = match slash_chat_id {
-            Ok(chat_id) => {
-                let sender_id = cmd.user.id.get().to_string();
-                let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
-                crate::slash_commands::handle_slash_command(
-                    &self.app_state,
-                    chat_id,
-                    &slash_context,
-                    &command_text,
-                    Some(&sender_id),
-                )
-                .await
-                .unwrap_or_else(crate::slash_commands::unknown_command_response)
-            }
+            Ok(chat_id) => crate::slash_commands::handle_slash_command(
+                &self.app_state,
+                chat_id,
+                &slash_context,
+                &command_text,
+                Some(&sender_id),
+            )
+            .await
+            .unwrap_or_else(crate::slash_commands::unknown_command_response),
             Err(e) => {
                 tracing::error!("failed to resolve chat_id for interaction: {e}");
                 "An error occurred processing the command.".to_string()

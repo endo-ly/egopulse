@@ -395,21 +395,9 @@ async fn run_loop(
                                     content: prompt.clone(),
                                 });
                                 chat.conversation_scroll = 0;
-                                let slash_chat_id = crate::storage::call_blocking(
-                                    std::sync::Arc::clone(&app.state.db),
-                                    {
-                                        let channel = chat.context.channel.clone();
-                                        let thread = chat.context.surface_thread.clone();
-                                        let chat_type = chat.context.chat_type.clone();
-                                        move |db| {
-                                            db.resolve_or_create_chat_id(
-                                                &channel,
-                                                &format!("tui:{thread}"),
-                                                Some(&thread),
-                                                &chat_type,
-                                            )
-                                        }
-                                    },
+                                let slash_chat_id = crate::agent_loop::session::resolve_chat_id(
+                                    &app.state,
+                                    &chat.context,
                                 )
                                 .await;
 
