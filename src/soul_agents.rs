@@ -91,8 +91,8 @@ impl SoulAgentsLoader {
         read_trimmed(&self.agents_path)
     }
 
-    pub fn build_soul_section(&self, content: &str, channel: &str) -> String {
-        format!("<soul>\n{content}\n</soul>\n\nYour name is EgoPulse. Current channel: {channel}.")
+    pub fn build_soul_section(&self, content: &str, _channel: &str) -> String {
+        format!("<soul>\n{content}\n</soul>")
     }
 
     pub fn build_agents_section(
@@ -361,12 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn build_soul_section_includes_identity_line() {
+    fn build_soul_section_wraps_in_xml_tags_only() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
         let result = loader.build_soul_section("I am helpful", "web");
-        assert!(result.contains("Your name is EgoPulse. Current channel: web."));
+        assert!(result.starts_with("<soul>\n"));
+        assert!(result.ends_with("</soul>"));
     }
 
     // --- build_agents_section tests ---
