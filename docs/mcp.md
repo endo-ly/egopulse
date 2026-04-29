@@ -9,9 +9,7 @@ MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様
 3. [Config](#3-config)
 4. [Transport](#4-transport)
 5. [Tool の公開と実行](#5-tool-の公開と実行)
-6. [失敗時の扱い](#6-失敗時の扱い)
-7. [設定例](#7-設定例)
-8. [現実装の制約](#8-現実装の制約)
+6. [障害と制約](#6-障害と制約)
 
 ---
 
@@ -79,6 +77,38 @@ MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様
 **`stdio`**: `command`, `args`, `env`
 **`streamable_http`**: `endpoint`, `headers`
 
+### 設定例
+
+#### `stdio`
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "request_timeout_secs": 120
+    }
+  }
+}
+```
+
+#### `streamable_http`
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "transport": "streamable_http",
+      "endpoint": "http://127.0.0.1:8080/mcp",
+      "headers": { "Authorization": "Bearer REPLACE_ME" },
+      "request_timeout_secs": 60
+    }
+  }
+}
+```
+
 ## 4. Transport
 
 ### `stdio`
@@ -126,52 +156,20 @@ LLM に見える名前は `mcp_{server}_{tool}` 形式。英数字と `_` 以外
 
 出力が空なら `(no output)`。
 
-## 6. 失敗時の扱い
+## 6. 障害と制約
 
-エラー種別:
+### エラー種別と runtime 方針
+
 - `mcp_config_read_failed` / `mcp_config_parse_failed`
 - `mcp_connection_failed` / `mcp_tool_list_failed`
 - `mcp_tool_call_failed`
 
-runtime 方針:
 1. config file 単位の失敗は skip して継続
 2. server 単位の接続失敗は warning を出して継続
 3. tool 実行時の失敗は tool error として LLM に返す
 4. 一部 server の失敗で runtime 全体は停止しない
 
-## 7. 設定例
-
-### `stdio`
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-      "request_timeout_secs": 120
-    }
-  }
-}
-```
-
-### `streamable_http`
-
-```json
-{
-  "mcpServers": {
-    "remote": {
-      "transport": "streamable_http",
-      "endpoint": "http://127.0.0.1:8080/mcp",
-      "headers": { "Authorization": "Bearer REPLACE_ME" },
-      "request_timeout_secs": 60
-    }
-  }
-}
-```
-
-## 8. 現実装の制約
+### 現実装の制約
 
 - health probe の常駐監視は未実装
 - retry / backoff / circuit breaker は未実装

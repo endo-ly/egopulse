@@ -37,7 +37,7 @@ egopulse.db (SQLite / WAL mode)
 
 ---
 
-## ER 図
+### ER 図
 
 ```
 ┌──────────────────┐       ┌──────────────────┐
@@ -406,17 +406,3 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 `ON DELETE` が一切定義されていない。チャット削除時に messages / sessions / tool_calls を手動でクリーンアップする必要がある。
 
 ---
-
-## Microclaw との差分サマリ
-
-| 観点 | EgoPulse（現状） | Microclaw（v19） |
-|------|------------------|------------------|
-| テーブル数 | 7（データ5 + マイグレーション基盤2） | 24 |
-| マイグレーション | バージョンベース（v1→v2） | バージョンベース（v1→v19） |
-| セッション設定 | messages_json のみ | label, thinking_level, verbose_level, reasoning_level, skill_envs_json, fork |
-| メモリ/知識管理 | なし | memories + reflector/injection/supersede（5テーブル） |
-| タスクスケジューリング | なし | scheduled_tasks + run_logs + dlq（3テーブル） |
-| 認証・認可 | なし（静的トークンのみ） | auth + api_keys + scopes（4テーブル） |
-| オブザーバビリティ | llm_usage_logs（1テーブル） | audit_logs + metrics + llm_usage（3テーブル） |
-| サブエージェント | なし | runs + announces + events + focus（4テーブル） |
-| ツール呼び出し記録 | tool_calls（独立テーブル） | sessions.messages_json 内に埋め込み |

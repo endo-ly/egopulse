@@ -21,6 +21,12 @@ cargo run -- setup          # 初回セットアップウィザード
 cargo run -- run            # 全チャネル起動
 cargo run -- chat           # CLI チャットセッション
 
+# === リリースビルド＆稼働中差し替え ===
+cargo build --release -p egopulse
+systemctl --user stop egopulse
+install -m 0755 target/release/egopulse ~/.local/bin/egopulse
+systemctl --user start egopulse
+
 # === Coderabbit review ===
 coderabbit --prompt-only -t uncommitted
 coderabbit --prompt-only -t committed --base main
