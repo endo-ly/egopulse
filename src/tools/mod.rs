@@ -131,6 +131,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     config_secrets: Vec<(String, String)>,
+    mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
 
 impl ToolRegistry {
@@ -143,6 +144,7 @@ impl ToolRegistry {
                 return Self {
                     tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
                     config_secrets: collect_config_secrets(config),
+                    mcp_manager: None,
                 };
             }
         };
@@ -165,6 +167,7 @@ impl ToolRegistry {
                 Box::new(ActivateSkillTool::new(skill_manager)),
             ],
             config_secrets: collect_config_secrets(config),
+            mcp_manager: None,
         }
     }
 
@@ -172,9 +175,24 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    pub fn set_mcp_manager(
+        &mut self,
+        mcp_manager: Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    ) {
+        self.mcp_manager = Some(mcp_manager);
+    }
+
     /// Collect tool definitions asynchronously.
     pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        let mut definitions: Vec<ToolDefinition> =
+            self.tools.iter().map(|tool| tool.definition()).collect();
+
+        if let Some(mcp_manager) = &self.mcp_manager {
+            let guard = mcp_manager.read().await;
+            definitions.extend(guard.all_tool_definitions());
+        }
+
+        definitions
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
@@ -188,6 +206,23 @@ impl ToolRegistry {
             if tool.name() == name {
                 let result = tool.execute(input, context).await;
                 return sanitize_tool_result(result, &self.config_secrets);
+            }
+        }
+        if let Some(mcp_manager) = &self.mcp_manager {
+            if name.starts_with("mcp_") {
+                let result = {
+                    let guard = mcp_manager.read().await;
+                    guard.execute_tool_by_name(name, input).await
+                };
+                if let Some(result) = result {
+                    return sanitize_tool_result(
+                        match result {
+                            Ok(output) => ToolResult::success(output),
+                            Err(error) => ToolResult::error(error.to_string()),
+                        },
+                        &self.config_secrets,
+                    );
+                }
             }
         }
         sanitize_tool_result(

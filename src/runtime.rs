@@ -153,12 +153,8 @@ pub async fn build_app_state_with_path(
     let workspace_dir = config.workspace_dir()?;
     let mcp_manager = crate::mcp::McpManager::new(&workspace_dir).await?;
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
-
-    // Register MCP tools as adapters
-    let adapters = crate::mcp::McpManager::create_tool_adapters(&mcp_arc).await;
-    for adapter in adapters {
-        tools.register_tool(adapter);
-    }
+    tools.set_mcp_manager(Arc::clone(&mcp_arc));
+    spawn_mcp_reconnect_loop(Arc::clone(&mcp_arc), workspace_dir.clone());
 
     tools.register_tool(Box::new(crate::tools::SendMessageTool::new(
         workspace_dir.clone(),
@@ -185,6 +181,43 @@ pub async fn build_app_state_with_path(
         assets,
         soul_agents,
     })
+}
+
+fn spawn_mcp_reconnect_loop(
+    mcp_manager: Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    workspace_dir: PathBuf,
+) {
+    tokio::spawn(async move {
+        const INITIAL_RETRY_SECS: u64 = 5;
+        const MAX_RETRY_SECS: u64 = 300;
+
+        let mut retry_secs = INITIAL_RETRY_SECS;
+        loop {
+            let has_failed_servers = {
+                let guard = mcp_manager.read().await;
+                guard.has_failed_servers()
+            };
+
+            if !has_failed_servers {
+                tokio::time::sleep(Duration::from_secs(MAX_RETRY_SECS)).await;
+                retry_secs = INITIAL_RETRY_SECS;
+                continue;
+            }
+
+            tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+
+            let reconnected = {
+                let mut guard = mcp_manager.write().await;
+                guard.reconnect_failed_once(&workspace_dir).await
+            };
+
+            if reconnected > 0 {
+                retry_secs = INITIAL_RETRY_SECS;
+            } else {
+                retry_secs = (retry_secs * 2).min(MAX_RETRY_SECS);
+            }
+        }
+    });
 }
 
 /// Sends a single prompt to the configured LLM without session state.

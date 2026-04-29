@@ -12,7 +12,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, timeout};
-use tracing::warn;
+use tracing::{info, warn};
 
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, Tool};
 use rmcp::service::{DynService, RoleClient, RunningService, ServiceExt};
@@ -70,7 +70,6 @@ pub struct McpConfigFile {
 
 struct FailedServer {
     name: String,
-    #[expect(dead_code, reason = "将来のリトライや再接続で設定を利用するため保持")]
     config: McpServerConfig,
     error: String,
 }
@@ -200,23 +199,11 @@ impl McpManager {
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir).await {
                 Ok((client, tools)) => {
-                    let mut seen_names = std::collections::HashSet::new();
-                    let mut filtered_tools = Vec::new();
-                    let mut tool_display_names = Vec::new();
-                    for t in &tools {
-                        let full = sanitize_tool_name(name, t.name.as_ref());
-                        if !seen_names.insert(full.clone()) {
-                            warn!(
-                                server = name,
-                                original = %t.name,
-                                sanitized = %full,
-                                "skipping MCP tool: sanitized name collides with existing tool"
-                            );
-                            continue;
-                        }
-                        tool_display_names.push(full);
-                        filtered_tools.push(t.clone());
-                    }
+                    let filtered_tools = filter_tools_for_server(name, &tools);
+                    let tool_display_names: Vec<String> = filtered_tools
+                        .iter()
+                        .map(|tool| sanitize_tool_name(name, tool.name.as_ref()))
+                        .collect();
 
                     tracing::info!(
                         server = name,
@@ -250,6 +237,58 @@ impl McpManager {
             servers,
             failed_servers,
         })
+    }
+
+    pub fn has_failed_servers(&self) -> bool {
+        !self.failed_servers.is_empty()
+    }
+
+    pub async fn reconnect_failed_once(&mut self, workspace_dir: &Path) -> usize {
+        let failed = std::mem::take(&mut self.failed_servers);
+        let mut reconnected = 0;
+
+        for server in failed {
+            if self
+                .servers
+                .iter()
+                .any(|connected| connected.name == server.name)
+            {
+                continue;
+            }
+
+            match connect_server(&server.name, &server.config, workspace_dir).await {
+                Ok((client, tools)) => {
+                    let filtered_tools = filter_tools_for_server(&server.name, &tools);
+                    let tool_display_names: Vec<String> = filtered_tools
+                        .iter()
+                        .map(|tool| sanitize_tool_name(&server.name, tool.name.as_ref()))
+                        .collect();
+
+                    info!(
+                        server = %server.name,
+                        tools = ?tool_display_names,
+                        "MCP server reconnected"
+                    );
+                    self.servers.push(ConnectedServer {
+                        name: server.name,
+                        config: server.config,
+                        client,
+                        cached_tools: filtered_tools,
+                    });
+                    reconnected += 1;
+                }
+                Err(error) => {
+                    warn!(server = %server.name, "MCP server reconnect failed: {error}");
+                    self.failed_servers.push(FailedServer {
+                        name: server.name,
+                        config: server.config,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        reconnected
     }
 
     /// 現在の接続状態をスナップショットとして返す。
@@ -301,6 +340,29 @@ impl McpManager {
                 })
             })
             .collect()
+    }
+
+    pub async fn execute_tool_by_name(
+        &self,
+        sanitized_name: &str,
+        input: serde_json::Value,
+    ) -> Option<Result<String, McpError>> {
+        for (server_idx, server) in self.servers.iter().enumerate() {
+            for tool in &server.cached_tools {
+                if sanitize_tool_name(&server.name, tool.name.as_ref()) == sanitized_name {
+                    return Some(
+                        self.execute_tool(
+                            server_idx,
+                            tool.name.to_string(),
+                            server.config.request_timeout_secs,
+                            input,
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Execute an MCP tool by name.
@@ -454,6 +516,27 @@ impl McpManager {
 
         adapters
     }
+}
+
+fn filter_tools_for_server(server_name: &str, tools: &[Tool]) -> Vec<Tool> {
+    let mut seen_names = std::collections::HashSet::new();
+    let mut filtered_tools = Vec::new();
+
+    for tool in tools {
+        let full = sanitize_tool_name(server_name, tool.name.as_ref());
+        if !seen_names.insert(full.clone()) {
+            warn!(
+                server = server_name,
+                original = %tool.name,
+                sanitized = %full,
+                "skipping MCP tool: sanitized name collides with existing tool"
+            );
+            continue;
+        }
+        filtered_tools.push(tool.clone());
+    }
+
+    filtered_tools
 }
 
 async fn connect_server(
