@@ -22,9 +22,19 @@ struct SerializableDiscordBot {
     token: Option<serde_yml::Value>,
     default_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_channels: Option<Vec<u64>>,
+    channels: Option<HashMap<String, SerializableDiscordChannel>>,
+}
+
+#[derive(Serialize)]
+struct SerializableDiscordChannel {
+    #[serde(skip_serializing_if = "is_default")]
+    require_mention: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    channel_agents: Option<HashMap<String, String>>,
+    agent: Option<String>,
+}
+
+fn is_default(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Serialize)]
@@ -96,13 +106,17 @@ struct SerializableChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
     bot_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_channels: Option<Vec<u64>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_chat_ids: Option<Vec<i64>>,
+    chats: Option<HashMap<String, SerializableTelegramChat>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     soul_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
+}
+
+#[derive(Serialize)]
+struct SerializableTelegramChat {
+    #[serde(skip_serializing_if = "is_default")]
+    require_mention: bool,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -154,24 +168,46 @@ impl From<&Config> for SerializableConfig {
                         allowed_origins: c.allowed_origins.clone(),
                         bot_token: c.file_bot_token.clone(),
                         bot_username: c.bot_username.clone(),
-                        allowed_channels: c.allowed_channels.clone(),
-                        allowed_chat_ids: c.allowed_chat_ids.clone(),
+                        chats: c.chats.as_ref().map(|chat_map| {
+                            chat_map
+                                .iter()
+                                .map(|(chat_id, chat_config)| {
+                                    (
+                                        chat_id.to_string(),
+                                        SerializableTelegramChat {
+                                            require_mention: chat_config.require_mention,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
                         soul_path: c.soul_path.clone(),
                         bots: c.discord_bots.as_ref().map(|bots| {
                             bots.iter()
                                 .map(|(bot_id, bot)| {
-                                    let channel_agents = bot.channel_agents.as_ref().map(|map| {
-                                        map.iter()
-                                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                                            .collect()
-                                    });
                                     (
                                         bot_id.to_string(),
                                         SerializableDiscordBot {
                                             token: bot.file_token.clone(),
                                             default_agent: bot.default_agent.to_string(),
-                                            allowed_channels: bot.allowed_channels.clone(),
-                                            channel_agents,
+                                            channels: bot.channels.as_ref().map(|ch_map| {
+                                                ch_map
+                                                    .iter()
+                                                    .map(|(ch_id, ch_config)| {
+                                                        (
+                                                            ch_id.to_string(),
+                                                            SerializableDiscordChannel {
+                                                                require_mention: ch_config
+                                                                    .require_mention,
+                                                                agent: ch_config
+                                                                    .agent
+                                                                    .as_ref()
+                                                                    .map(|a| a.to_string()),
+                                                            },
+                                                        )
+                                                    })
+                                                    .collect()
+                                            }),
                                         },
                                     )
                                 })
@@ -538,8 +574,14 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    allowed_channels: Some(vec![111, 222]),
-                    channel_agents: None,
+                    channels: Some(
+                        [
+                            (111u64, crate::config::DiscordChannelConfig::default()),
+                            (222u64, crate::config::DiscordChannelConfig::default()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
                 },
             );
             bots
@@ -557,7 +599,9 @@ channels:
             *bots[0].default_agent,
             crate::config::AgentId::new("default")
         );
-        assert_eq!(bots[0].allowed_channels, &[111, 222]);
+        assert_eq!(bots[0].allowed_channels.len(), 2);
+        assert!(bots[0].allowed_channels.contains(&111));
+        assert!(bots[0].allowed_channels.contains(&222));
 
         let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
         assert!(dotenv.contains("MY_DISCORD_BOT_TOKEN=bot-secret-123"));

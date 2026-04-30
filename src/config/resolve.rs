@@ -333,16 +333,26 @@ impl Config {
             .iter()
             .filter_map(|(bot_id, bot)| {
                 let token = bot.token.as_ref()?;
+                let allowed_channels: Vec<u64> = bot
+                    .channels
+                    .as_ref()
+                    .map(|m| m.keys().copied().collect())
+                    .unwrap_or_default();
+                let channel_agents: HashMap<u64, AgentId> = bot
+                    .channels
+                    .as_ref()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.agent.as_ref().map(|a| (*k, a.clone())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
                     default_agent: &bot.default_agent,
-                    allowed_channels: bot.allowed_channels.as_deref().unwrap_or_default(),
-                    channel_agents: bot
-                        .channel_agents
-                        .as_ref()
-                        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
-                        .unwrap_or_default(),
+                    allowed_channels: allowed_channels.into_boxed_slice(),
+                    channel_agents,
                 })
             })
             .collect();
@@ -357,7 +367,7 @@ pub struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
     pub default_agent: &'a AgentId,
-    pub allowed_channels: &'a [u64],
+    pub allowed_channels: Box<[u64]>,
     pub channel_agents: HashMap<u64, AgentId>,
 }
 

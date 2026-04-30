@@ -145,17 +145,36 @@ impl From<&str> for BotId {
     }
 }
 
+/// Per-channel Discord configuration stored inside `DiscordBotConfig.channels`.
+///
+/// When `agent` is `None`, the bot's `default_agent` is used.
+#[derive(Clone, Debug, Default)]
+pub struct DiscordChannelConfig {
+    /// Whether this channel requires an explicit @mention to trigger the bot.
+    pub require_mention: bool,
+    /// Agent override for this channel. `None` = use `default_agent`.
+    pub agent: Option<AgentId>,
+}
+
+/// Per-chat Telegram configuration stored inside `ChannelConfig.chats`.
+#[derive(Clone, Debug, Default)]
+pub struct TelegramChatConfig {
+    /// Whether this chat requires an explicit @mention to trigger the bot.
+    pub require_mention: bool,
+}
+
 /// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
 ///
 /// Each bot connects to Discord with its own token and routes messages to agents
-/// based on `channel_agents` or falls back to `default_agent`.
+/// based on per-channel config or falls back to `default_agent`.
 #[derive(Clone)]
 pub struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<serde_yml::Value>,
     pub default_agent: AgentId,
-    pub allowed_channels: Option<Vec<u64>>,
-    pub channel_agents: Option<HashMap<u64, AgentId>>,
+    /// Per-channel configuration keyed by Discord channel ID.
+    /// `None` means no channels are explicitly configured.
+    pub channels: Option<HashMap<u64, DiscordChannelConfig>>,
 }
 
 impl std::fmt::Debug for DiscordBotConfig {
@@ -170,8 +189,7 @@ impl std::fmt::Debug for DiscordBotConfig {
                     .unwrap_or("<none>"),
             )
             .field("default_agent", &self.default_agent)
-            .field("allowed_channels", &self.allowed_channels)
-            .field("channel_agents", &self.channel_agents)
+            .field("channels", &self.channels)
             .finish()
     }
 }
@@ -181,31 +199,17 @@ pub struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
-    /// LLM provider override for this channel.
     pub provider: Option<String>,
-    /// LLM model override for this channel.
     pub model: Option<String>,
-    /// Web: browser/client authentication token.
     pub auth_token: Option<ResolvedValue>,
-    /// YAML 保存用に auth_token の SecretRef 構造を保持する。
     pub file_auth_token: Option<serde_yml::Value>,
-    /// Web: allowed Origin values for WebSocket connections.
     pub allowed_origins: Option<Vec<String>>,
-    /// Discord / Telegram 共通: bot token
     pub bot_token: Option<ResolvedValue>,
-    /// YAML 保存用に bot_token の SecretRef 構造を保持する。
     pub file_bot_token: Option<serde_yml::Value>,
-    /// Telegram: bot username (group メンション検知用)
     pub bot_username: Option<String>,
-    /// Discord: 許可チャンネル ID。空 = ギルドメッセージ全拒否（DM は常に許可）。
-    /// 許可されたチャンネルでは @mention なしで即応答する。
-    pub allowed_channels: Option<Vec<u64>>,
-    /// Telegram: 許可グループ/スーパーグループの chat ID。空 = グループメッセージ全拒否（DM は常に許可）。
-    /// 許可されたチャットでは @mention なしで即応答する。
-    pub allowed_chat_ids: Option<Vec<i64>>,
-    /// Soul file path for this channel. Relative path resolves from souls/ directory.
     pub soul_path: Option<String>,
-    /// Discord bot definitions keyed by bot identifier.
+    /// Per-chat Telegram configuration keyed by chat ID.
+    pub chats: Option<HashMap<i64, TelegramChatConfig>>,
     pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
 }
 
@@ -235,8 +239,7 @@ impl std::fmt::Debug for ChannelConfig {
                     .unwrap_or("<none>"),
             )
             .field("bot_username", &self.bot_username)
-            .field("allowed_channels", &self.allowed_channels)
-            .field("allowed_chat_ids", &self.allowed_chat_ids)
+            .field("chats", &self.chats)
             .field("soul_path", &self.soul_path)
             .field("discord_bots", &self.discord_bots)
             .finish()
@@ -1249,10 +1252,10 @@ channels:
           source: env
           id: MY_DISCORD_TOKEN
         default_agent: assistant
-        allowed_channels:
-          - 111222333
-        channel_agents:
-          "444555666": reviewer"#,
+        channels:
+          "111222333": {}
+          "444555666":
+            agent: reviewer"#,
             ),
         );
 
@@ -1268,13 +1271,12 @@ channels:
             main_bot.token.as_ref().expect("token").value(),
             "discord-bot-token-123"
         );
+        let channels = main_bot.channels.as_ref().expect("channels");
+        assert_eq!(channels.len(), 2);
+        assert!(channels.contains_key(&111222333u64));
+        assert!(channels.contains_key(&444555666u64));
         assert_eq!(
-            main_bot.allowed_channels.as_deref().map(|v| v.to_vec()),
-            Some(vec![111222333u64])
-        );
-        let channel_agents = main_bot.channel_agents.as_ref().expect("channel_agents");
-        assert_eq!(
-            channel_agents.get(&444555666u64),
+            channels.get(&444555666u64).and_then(|c| c.agent.as_ref()),
             Some(&super::AgentId::new("reviewer"))
         );
     }
@@ -1324,8 +1326,9 @@ channels:
           source: env
           id: MY_DISCORD_TOKEN
         default_agent: assistant
-        channel_agents:
-          "999": ghost_agent"#,
+        channels:
+          "999":
+            agent: ghost_agent"#,
             ),
         );
 
@@ -1395,8 +1398,11 @@ channels:
                 token: Some(lit_val("DISCORD_BOT_TOKEN", "secret-bot-token")),
                 file_token: Some(lit_yaml("DISCORD_BOT_TOKEN")),
                 default_agent: super::AgentId::new("assistant"),
-                allowed_channels: Some(vec![123456]),
-                channel_agents: None,
+                channels: Some(
+                    [(123456u64, super::DiscordChannelConfig::default())]
+                        .into_iter()
+                        .collect(),
+                ),
             },
         );
 
@@ -1547,7 +1553,7 @@ channels:
 
     #[test]
     #[serial]
-    fn discord_bot_allowed_channels_defaults_to_empty_slice() {
+    fn discord_bot_channels_defaults_to_none() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", temp_dir.path());
         write_env(&temp_dir, "MY_TOKEN=token\n");
@@ -1567,7 +1573,7 @@ channels:
         let bots = config.discord_bots();
 
         assert_eq!(bots.len(), 1);
-        assert_eq!(bots[0].allowed_channels, &[] as &[u64]);
+        assert_eq!(bots[0].allowed_channels, Box::<[u64]>::default());
     }
 
     #[test]
@@ -1585,8 +1591,9 @@ channels:
           source: env
           id: MY_TOKEN
         default_agent: assistant
-        channel_agents:
-          "42": reviewer"#,
+        channels:
+          "42":
+            agent: reviewer"#,
             ),
         );
 
@@ -1671,5 +1678,289 @@ channels:
             .get(&super::ProviderId::new("openai-codex"))
             .expect("provider");
         assert_eq!(provider.base_url, "https://custom.proxy.example.com/codex");
+    }
+
+    // --- Structured channel/chat config tests ---
+
+    #[test]
+    #[serial]
+    fn discord_channels_parses_null_value() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+        default_agent: assistant
+        channels:
+          "123":"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let discord = config.channels.get("discord").expect("discord");
+        let bot = discord
+            .discord_bots
+            .as_ref()
+            .expect("bots")
+            .get("main")
+            .expect("main");
+        let channels = bot.channels.as_ref().expect("channels");
+        let ch = channels.get(&123u64).expect("channel 123");
+        assert!(!ch.require_mention);
+        assert!(ch.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn discord_channels_parses_require_mention() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+        default_agent: assistant
+        channels:
+          "123":
+            require_mention: true"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let discord = config.channels.get("discord").expect("discord");
+        let bot = discord
+            .discord_bots
+            .as_ref()
+            .expect("bots")
+            .get("main")
+            .expect("main");
+        let ch = bot
+            .channels
+            .as_ref()
+            .expect("channels")
+            .get(&123u64)
+            .expect("channel");
+        assert!(ch.require_mention);
+    }
+
+    #[test]
+    #[serial]
+    fn discord_channels_parses_agent_override() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+        default_agent: assistant
+        channels:
+          "123":
+            agent: reviewer"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let discord = config.channels.get("discord").expect("discord");
+        let bot = discord
+            .discord_bots
+            .as_ref()
+            .expect("bots")
+            .get("main")
+            .expect("main");
+        let ch = bot
+            .channels
+            .as_ref()
+            .expect("channels")
+            .get(&123u64)
+            .expect("channel");
+        assert_eq!(ch.agent.as_ref(), Some(&super::AgentId::new("reviewer")));
+    }
+
+    #[test]
+    #[serial]
+    fn discord_channels_empty_means_no_guild_allowed() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+        default_agent: assistant"#,
+            ),
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        let discord = config.channels.get("discord").expect("discord");
+        let bot = discord
+            .discord_bots
+            .as_ref()
+            .expect("bots")
+            .get("main")
+            .expect("main");
+        assert!(bot.channels.is_none());
+
+        let bots = config.discord_bots();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].allowed_channels, Box::<[u64]>::default());
+    }
+
+    #[test]
+    #[serial]
+    fn telegram_chats_parses_null_value() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+channels:
+  telegram:
+    enabled: true
+    bot_token: test-token
+    chats:
+      "123":"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let telegram = config.channels.get("telegram").expect("telegram");
+        let chats = telegram.chats.as_ref().expect("chats");
+        let chat = chats.get(&123i64).expect("chat 123");
+        assert!(!chat.require_mention);
+    }
+
+    #[test]
+    #[serial]
+    fn telegram_chats_parses_require_mention() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+channels:
+  telegram:
+    enabled: true
+    bot_token: test-token
+    chats:
+      "456":
+        require_mention: true"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let telegram = config.channels.get("telegram").expect("telegram");
+        let chat = telegram
+            .chats
+            .as_ref()
+            .expect("chats")
+            .get(&456i64)
+            .expect("chat");
+        assert!(chat.require_mention);
+    }
+
+    #[test]
+    #[serial]
+    fn discord_channels_invalid_key_not_u64() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        write_env(&temp_dir, "MY_TOKEN=tok\n");
+        let file_path = write_config(
+            &temp_dir,
+            &bot_config_yml(
+                r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+        default_agent: assistant
+        channels:
+          "not_a_number": {}"#,
+            ),
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidChannelsKey { ref bot_id, ref key }
+                    if bot_id == "main" && key == "not_a_number"
+            ),
+            "expected InvalidChannelsKey, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn telegram_chats_invalid_key_not_i64() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+channels:
+  telegram:
+    enabled: true
+    bot_token: test-token
+    chats:
+      "not_a_number": {}"#,
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("should fail");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidChatsKey { ref key } if key == "not_a_number"
+            ),
+            "expected InvalidChatsKey, got {error:?}"
+        );
     }
 }

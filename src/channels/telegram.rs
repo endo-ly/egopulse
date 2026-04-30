@@ -266,11 +266,12 @@ async fn handle_message(
     let external_chat_id = raw_chat_id.to_string();
 
     // グループアクセス制御: allowed_chat_ids に含まれるチャットのみ応答する。
-    let allowed_chat_ids = state
+    let allowed_chat_ids: Vec<i64> = state
         .config
         .channels
         .get("telegram")
-        .and_then(|c| c.allowed_chat_ids.clone())
+        .and_then(|c| c.chats.as_ref())
+        .map(|m| m.keys().copied().collect())
         .unwrap_or_default();
     let is_in_allowed_chat = if is_group {
         if allowed_chat_ids.is_empty() || !allowed_chat_ids.contains(&raw_chat_id) {
