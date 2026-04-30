@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{AgentId, BotId, ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
+use super::{AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId, ResolvedLlmConfig};
 use crate::error::ConfigError;
 
 impl Config {
@@ -333,26 +333,15 @@ impl Config {
             .iter()
             .filter_map(|(bot_id, bot)| {
                 let token = bot.token.as_ref()?;
-                let allowed_channels: Vec<u64> = bot
+                let channels: HashMap<u64, DiscordChannelConfig> = bot
                     .channels
-                    .as_ref()
-                    .map(|m| m.keys().copied().collect())
-                    .unwrap_or_default();
-                let channel_agents: HashMap<u64, AgentId> = bot
-                    .channels
-                    .as_ref()
-                    .map(|m| {
-                        m.iter()
-                            .filter_map(|(k, v)| v.agent.as_ref().map(|a| (*k, a.clone())))
-                            .collect()
-                    })
+                    .clone()
                     .unwrap_or_default();
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
                     default_agent: &bot.default_agent,
-                    allowed_channels: allowed_channels.into_boxed_slice(),
-                    channel_agents,
+                    channels,
                 })
             })
             .collect();
@@ -362,13 +351,13 @@ impl Config {
 }
 
 /// Runtime data needed to start and operate one Discord bot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
     pub default_agent: &'a AgentId,
-    pub allowed_channels: Box<[u64]>,
-    pub channel_agents: HashMap<u64, AgentId>,
+    /// Per-channel configuration. Empty map means no guild messages are allowed (DM-only).
+    pub channels: HashMap<u64, DiscordChannelConfig>,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.

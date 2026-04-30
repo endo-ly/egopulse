@@ -1573,7 +1573,7 @@ channels:
         let bots = config.discord_bots();
 
         assert_eq!(bots.len(), 1);
-        assert_eq!(bots[0].allowed_channels, Box::<[u64]>::default());
+        assert!(bots[0].channels.is_empty());
     }
 
     #[test]
@@ -1601,8 +1601,11 @@ channels:
         let bots = config.discord_bots();
 
         assert_eq!(bots.len(), 1);
-        let agents = &bots[0].channel_agents;
-        assert_eq!(agents.get(&42), Some(&super::AgentId::new("reviewer")));
+        let channels = &bots[0].channels;
+        assert_eq!(
+            channels.get(&42).and_then(|c| c.agent.as_ref()),
+            Some(&super::AgentId::new("reviewer"))
+        );
     }
 
     #[test]
@@ -1823,7 +1826,7 @@ channels:
 
         let bots = config.discord_bots();
         assert_eq!(bots.len(), 1);
-        assert_eq!(bots[0].allowed_channels, Box::<[u64]>::default());
+        assert!(bots[0].channels.is_empty());
     }
 
     #[test]

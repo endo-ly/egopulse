@@ -599,9 +599,9 @@ channels:
             *bots[0].default_agent,
             crate::config::AgentId::new("default")
         );
-        assert_eq!(bots[0].allowed_channels.len(), 2);
-        assert!(bots[0].allowed_channels.contains(&111));
-        assert!(bots[0].allowed_channels.contains(&222));
+        assert_eq!(bots[0].channels.len(), 2);
+        assert!(bots[0].channels.contains_key(&111));
+        assert!(bots[0].channels.contains_key(&222));
 
         let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
         assert!(dotenv.contains("MY_DISCORD_BOT_TOKEN=bot-secret-123"));
