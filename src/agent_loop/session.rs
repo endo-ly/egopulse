@@ -197,7 +197,7 @@ async fn snapshot_to_loaded(
     };
 
     Ok(LoadedSession {
-        messages,
+        messages: repair_orphan_tool_outputs(messages),
         session_updated_at: snapshot.updated_at,
     })
 }
@@ -213,6 +213,53 @@ fn restored_messages_or_recent(
     }
 
     Some(messages)
+}
+
+fn repair_orphan_tool_outputs(messages: Vec<Message>) -> Vec<Message> {
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut iter = messages.into_iter().peekable();
+
+    while let Some(message) = iter.next() {
+        if message.role == "assistant" && !message.tool_calls.is_empty() {
+            let expected_ids = message
+                .tool_calls
+                .iter()
+                .map(|tool_call| tool_call.id.clone())
+                .collect::<Vec<_>>();
+            repaired.push(message);
+
+            let mut seen_ids = std::collections::HashSet::new();
+            while iter
+                .peek()
+                .is_some_and(|candidate| candidate.role == "tool")
+            {
+                let tool_message = iter.next().expect("peeked tool message exists");
+                if let Some(id) = &tool_message.tool_call_id {
+                    seen_ids.insert(id.clone());
+                }
+                repaired.push(tool_message);
+            }
+
+            for missing_id in expected_ids.into_iter().filter(|id| !seen_ids.contains(id)) {
+                repaired.push(orphan_tool_output_message(missing_id));
+            }
+        } else {
+            repaired.push(message);
+        }
+    }
+
+    repaired
+}
+
+fn orphan_tool_output_message(tool_call_id: String) -> Message {
+    Message {
+        role: "tool".to_string(),
+        content: MessageContent::text(
+            r#"{"status":"error","error":"tool output was missing from the restored session snapshot"}"#,
+        ),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_call_id),
+    }
 }
 
 fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
@@ -388,7 +435,9 @@ mod tests {
     use crate::config::secret_ref::ResolvedValue;
     use crate::config::{Config, ProviderConfig};
     use crate::error::LlmError;
-    use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
+    use crate::llm::{
+        LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
+    };
     use crate::runtime::AppState;
     use crate::skills::SkillManager;
     use crate::storage::{Database, StoredMessage, call_blocking};
@@ -707,6 +756,60 @@ mod tests {
             }
             other => panic!("expected restored parts, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn load_messages_for_turn_repairs_orphan_tool_outputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("orphan-tool-output");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+        let snapshot = vec![
+            Message::text("user", "please inspect"),
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::text("I will inspect."),
+                tool_calls: vec![ToolCall {
+                    id: "call-missing".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+                tool_call_id: None,
+            },
+            Message::text("user", "what happened?"),
+        ];
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
+
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.save_session(chat_id, &snapshot_json)
+        })
+        .await
+        .expect("save snapshot");
+
+        let loaded = load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("load messages");
+
+        assert_eq!(loaded.messages.len(), 4);
+        assert_eq!(loaded.messages[2].role, "tool");
+        assert_eq!(
+            loaded.messages[2].tool_call_id.as_deref(),
+            Some("call-missing")
+        );
+        assert!(
+            loaded.messages[2]
+                .content
+                .as_text_lossy()
+                .contains("tool output was missing")
+        );
+        assert_eq!(loaded.messages[3].content.as_text_lossy(), "what happened?");
     }
 
     #[tokio::test]

@@ -526,7 +526,14 @@ where
         .await;
     let duration_ms = tool_start.elapsed().as_millis();
     let tool_payload = format_tool_result(&tool_call, &result);
-    update_tool_call_output(state, &tool_call.id, &tool_payload).await?;
+    update_tool_call_output(
+        state,
+        tool_context.chat_id,
+        assistant_message_id,
+        &tool_call.id,
+        &tool_payload,
+    )
+    .await?;
 
     emit_event(
         on_event,
@@ -661,13 +668,16 @@ async fn store_pending_tool_call(
 
 async fn update_tool_call_output(
     state: &AppState,
+    chat_id: i64,
+    message_id: &str,
     tool_call_id: &str,
     output: &str,
 ) -> Result<(), EgoPulseError> {
+    let message_id = message_id.to_string();
     let tool_call_id = tool_call_id.to_string();
     let output = output.to_string();
     call_blocking(Arc::clone(&state.db), move |db| {
-        db.update_tool_call_output(&tool_call_id, &output)
+        db.update_tool_call_output_for_message(chat_id, &message_id, &tool_call_id, &output)
     })
     .await
     .map_err(EgoPulseError::from)
@@ -1146,6 +1156,81 @@ mod tests {
         .await
         .expect("process turn");
         assert_eq!(reply, "Done reading. Final answer.");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repeated_provider_tool_call_ids_do_not_break_later_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/repeat.txt", uuid::Uuid::new_v4());
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![
+                    MessagesResponse {
+                        content: "Reading once.".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-repeat".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": relative_path.clone()}),
+                        }],
+                        usage: None,
+                    },
+                    MessagesResponse {
+                        content: "First done.".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    },
+                    MessagesResponse {
+                        content: "Reading again.".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-repeat".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": relative_path.clone()}),
+                        }],
+                        usage: None,
+                    },
+                    MessagesResponse {
+                        content: "Second done.".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    },
+                ]),
+            }),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let file_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
+        std::fs::write(&file_path, "repeat content").expect("repeat.txt");
+
+        let context = cli_context("repeated-tool-call-id");
+        let first = process_turn(&state, &context, "read once")
+            .await
+            .expect("first turn");
+        let second = process_turn(&state, &context, "read again")
+            .await
+            .expect("second turn");
+
+        assert_eq!(first, "First done.");
+        assert_eq!(second, "Second done.");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:repeated-tool-call-id",
+                Some("repeated-tool-call-id"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(tool_calls.iter().all(|call| call.id == "call-repeat"));
+        assert!(tool_calls.iter().all(|call| call.tool_output.is_some()));
     }
 
     #[tokio::test]
