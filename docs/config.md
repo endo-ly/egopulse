@@ -86,8 +86,14 @@
 |---|---|---|---|---|
 | `token` | `string \| SecretRef` | 必須 | なし | Discord Bot トークン。SecretRef 使用可能。秘匿フィールド |
 | `default_agent` | `string` | 必須 | なし | この Bot のデフォルト応答エージェント |
-| `allowed_channels` | `[u64]` | 任意 | `[]` | 応答するギルドチャンネル ID。空の場合はギルドメッセージを全拒否（DM は常に許可） |
-| `channel_agents` | `map<string → string>` | 任意 | なし | チャンネル ID → エージェント ID のマッピング。該当チャンネルで `default_agent` を上書きする |
+| `channels` | `map<u64, DiscordChannelConfig>` | 任意 | なし | チャンネルごとの設定。キーがチャンネル ID。キー存在 = 許可 |
+
+#### `DiscordChannelConfig` のフィールド
+
+| フィールド | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
+| `agent` | `string \| null` | `null` | チャンネル固有のエージェント。`null` なら `default_agent` |
 
 ### 2.5 Telegram チャネル（`channels.telegram`）
 
@@ -98,7 +104,13 @@
 | `bot_username` | `string` | 条件付き | なし | Bot のユーザー名。グループ内で `@botname` メンション検知に使用。有効時は必須 |
 | `provider` | `string \| null` | 任意 | `null` | このチャネル専用のプロバイダーオーバーライド |
 | `model` | `string \| null` | 任意 | `null` | このチャネル専用のモデルオーバーライド |
-| `allowed_chat_ids` | `[i64]` | 任意 | `[]` | Bot が応答するグループ/スーパーグループの chat ID。空の場合はグループメッセージを全拒否。リスト内のチャットでは @mention なしで即応答する |
+| `chats` | `map<i64, TelegramChatConfig>` | 任意 | なし | チャットごとの設定。キーが chat ID。キー存在 = 許可 |
+
+#### `TelegramChatConfig` のフィールド
+
+| フィールド | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 
 ### 2.6 完全 YAML 例
 
@@ -165,18 +177,21 @@ channels:
           source: env
           id: DISCORD_BOT_TOKEN
         default_agent: alice
-        allowed_channels:
-          - 1234567890123456789
+        channels:
+          "1234567890123456789":
+          "9876547890123456789":
+            require_mention: true
+            agent: reviewer
     provider: openrouter
     model: anthropic/claude-sonnet-4
   telegram:
     enabled: false
     bot_token: TELEGRAM_BOT_TOKEN_HERE
     bot_username: my_egopulse_bot
-    provider: null
-    model: null
-    allowed_chat_ids:
-      - -1001234567890
+    chats:
+      "-1001234567890":
+      "-1009876543210":
+        require_mention: true
 ```
 
 ### 2.7 環境変数オーバーライド
@@ -362,7 +377,7 @@ SecretRef 解決は以下の 2 層で構成される。
 - `log_level`, `compaction_*`, `max_*`
 - `channels.web.host`, `channels.web.port`, `channels.web.allowed_origins`
 - 各チャネルの `provider` / `model` オーバーライド
-- チャネル別アクセス制御（`allowed_channels`, `allowed_chat_ids`）
+- チャネル別アクセス制御（`channels`, `chats`）
 - 複数プロバイダーの追加
 
 ---
@@ -396,8 +411,10 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `channels.web.port` | バインドポートの変更 |
 | `channels.discord.enabled` | Discord Bot の接続/切断 |
 | `channels.discord.bots.<bot_id>.token` | Bot 認証の再確立 |
+| `channels.discord.bots.<bot_id>.channels` | チャンネルアクセス制御・メンション要件の変更 |
 | `channels.telegram.enabled` | Telegram Bot の接続/切断 |
 | `channels.telegram.bot_token` | Bot 認証の再確立 |
+| `channels.telegram.chats` | チャットアクセス制御・メンション要件の変更 |
 | `log_level` | ロガーの初期化が伴う |
 
 ### 9.2 ホットリロード可能なフィールド
