@@ -273,16 +273,15 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                 (
                     b.bot_id.clone(),
                     b.token.to_string(),
-                    b.allowed_channels.to_vec(),
                     b.default_agent.clone(),
-                    b.channel_agents.clone(),
+                    b.channels.clone(),
                 )
             })
             .collect();
 
         if !bot_configs.is_empty() {
             has_active_channels = true;
-            for (bot_id, token, allowed_channels, default_agent, channel_agents) in bot_configs {
+            for (bot_id, token, default_agent, channels) in bot_configs {
                 let discord_state = Arc::new(state.clone());
                 let handle_name = format!("discord[{bot_id}]");
                 info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
@@ -293,8 +292,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                         &token,
                         &bid,
                         &default_agent,
-                        &allowed_channels,
-                        &channel_agents,
+                        &channels,
                     )
                     .await
                     .map_err(|error| {

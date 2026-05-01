@@ -265,76 +265,82 @@ async fn handle_message(
     let is_group = chat_type != "telegram_private";
     let external_chat_id = raw_chat_id.to_string();
 
-    // グループアクセス制御: allowed_chat_ids に含まれるチャットのみ応答する。
-    let allowed_chat_ids = state
+    // グループアクセス制御: chats マップに含まれるチャットのみ応答する。
+    let chats = state
         .config
         .channels
         .get("telegram")
-        .and_then(|c| c.allowed_chat_ids.clone())
+        .and_then(|c| c.chats.clone())
         .unwrap_or_default();
-    let is_in_allowed_chat = if is_group {
-        if allowed_chat_ids.is_empty() || !allowed_chat_ids.contains(&raw_chat_id) {
-            debug!(
-                chat_id = raw_chat_id,
-                "Telegram: rejecting message from unauthorized group"
-            );
-            return Ok(());
+    let chat_config = if is_group {
+        match chats.get(&raw_chat_id) {
+            Some(config) => Some(config),
+            None => {
+                debug!(
+                    chat_id = raw_chat_id,
+                    "Telegram: rejecting message from unauthorized group"
+                );
+                return Ok(());
+            }
         }
-        true
     } else {
-        false
+        None
     };
 
     // グループメンション判定 (スラッシュコマンドと通常メッセージで共用)。
-    // BotCommand エンティティの @botname またはテキストメンションのいずれかで true。
-    // 許可済みチャットではメンション不要。DM は上流で既に処理済み。
-    let is_mentioned = if !is_group || is_in_allowed_chat {
+    // DM は常に「メンション済み」。グループは require_mention 設定に従う。
+    let is_mentioned = if !is_group {
         true
     } else {
-        let bot_username = state.config.telegram_bot_username();
-        let msg_text = text.as_str();
-        let is_own_command = msg
-            .entities()
-            .unwrap_or_default()
-            .iter()
-            .filter(|e| matches!(e.kind, MessageEntityKind::BotCommand))
-            .any(|e| {
-                let start = e.offset;
-                let end = start + e.length;
-                let cmd_text = msg_text.get(start..end).unwrap_or("");
-                if let Some(at_pos) = cmd_text.find('@') {
-                    let mention = &cmd_text[at_pos + 1..];
-                    bot_username.is_some_and(|u| mention.eq_ignore_ascii_case(u))
-                } else {
-                    bot_username.is_some()
-                }
-            });
-
-        if is_own_command {
+        let config = chat_config.expect("group should have chat_config");
+        if !config.require_mention {
             true
         } else {
-            match &bot_username {
-                Some(username) => msg
-                    .parse_entities()
-                    .into_iter()
-                    .flatten()
-                    .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
-                    .any(|e| {
-                        e.text()
-                            .strip_prefix('@')
-                            .is_some_and(|m| m.eq_ignore_ascii_case(username))
-                    }),
-                None => {
-                    if BOT_USERNAME_WARN_EMITTED
-                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        warn!(
-                            chat_id = raw_chat_id,
-                            "telegram_bot_username not set; group messages will be ignored"
-                        );
+            let bot_username = state.config.telegram_bot_username();
+            let msg_text = text.as_str();
+            let is_own_command = msg
+                .entities()
+                .unwrap_or_default()
+                .iter()
+                .filter(|e| matches!(e.kind, MessageEntityKind::BotCommand))
+                .any(|e| {
+                    let start = e.offset;
+                    let end = start + e.length;
+                    let cmd_text = msg_text.get(start..end).unwrap_or("");
+                    if let Some(at_pos) = cmd_text.find('@') {
+                        let mention = &cmd_text[at_pos + 1..];
+                        bot_username.is_some_and(|u| mention.eq_ignore_ascii_case(u))
+                    } else {
+                        bot_username.is_some()
                     }
-                    false
+                });
+
+            if is_own_command {
+                true
+            } else {
+                match &bot_username {
+                    Some(username) => msg
+                        .parse_entities()
+                        .into_iter()
+                        .flatten()
+                        .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
+                        .any(|e| {
+                            e.text()
+                                .strip_prefix('@')
+                                .is_some_and(|m| m.eq_ignore_ascii_case(username))
+                        }),
+                    None => {
+                        if BOT_USERNAME_WARN_EMITTED
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            warn!(
+                                chat_id = raw_chat_id,
+                                "telegram_bot_username not set; group messages will be ignored"
+                            );
+                        }
+                        false
+                    }
                 }
             }
         }

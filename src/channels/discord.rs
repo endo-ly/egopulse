@@ -3,8 +3,10 @@
 //! serenity 0.12 を用いて Discord Gateway からメッセージを受信し、
 //! EgoPulse agent runtime で処理した結果を Discord に返信する。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,13 +16,14 @@ use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::model::application::Command;
 use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
-use serenity::model::id::ChannelId;
+use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
 use crate::channel_adapter::ChannelAdapter;
 use crate::channel_adapter::ConversationKind;
+use crate::config::DiscordChannelConfig;
 use crate::runtime::AppState;
 use crate::text::split_text;
 
@@ -214,8 +217,8 @@ struct Handler {
     app_state: Arc<AppState>,
     bot_id: String,
     default_agent: String,
-    allowed_channels: Vec<u64>,
-    channel_agents: std::collections::HashMap<u64, String>,
+    channels: HashMap<u64, DiscordChannelConfig>,
+    bot_user_id: OnceLock<UserId>,
 }
 
 impl Handler {
@@ -223,9 +226,10 @@ impl Handler {
         if is_dm {
             return &self.default_agent;
         }
-        self.channel_agents
+        self.channels
             .get(&channel_id)
-            .map(String::as_str)
+            .and_then(|c| c.agent.as_ref())
+            .map(|a| a.as_str())
             .unwrap_or(&self.default_agent)
     }
 
@@ -244,7 +248,14 @@ impl Handler {
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
-        !self.allowed_channels.is_empty() && self.allowed_channels.contains(&channel_id)
+        self.channels.contains_key(&channel_id)
+    }
+
+    fn is_bot_mentioned(&self, msg: &DiscordMessage) -> bool {
+        let Some(bot_id) = self.bot_user_id.get() else {
+            return false;
+        };
+        msg.mentions.iter().any(|u| u.id == *bot_id)
     }
 }
 
@@ -255,17 +266,17 @@ impl EventHandler for Handler {
             return;
         }
 
-        let text = msg.content.clone();
         let channel_id = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
-        let agent_id = self.select_agent(channel_id, is_dm).to_string();
 
         if !is_dm && !self.guild_allowed(channel_id) {
             return;
         }
 
-        let thread = channel_id.to_string();
+        let text = msg.content.clone();
+        let agent_id = self.select_agent(channel_id, is_dm).to_string();
 
+        let thread = channel_id.to_string();
         if crate::slash_commands::is_slash_command(&text) {
             let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
             let sender_id = msg.author.id.get().to_string();
@@ -302,6 +313,14 @@ impl EventHandler for Handler {
                         "An error occurred processing the command.",
                     )
                     .await;
+                    return;
+                }
+            }
+        }
+
+        if !is_dm {
+            if let Some(config) = self.channels.get(&channel_id) {
+                if config.require_mention && !self.is_bot_mentioned(&msg) {
                     return;
                 }
             }
@@ -411,6 +430,8 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
+        let _ = self.bot_user_id.set(ready.user.id);
+
         info!(
             "Discord bot ({}) connected as {}",
             self.default_agent, ready.user.name
@@ -449,6 +470,22 @@ impl EventHandler for Handler {
         let Some(cmd) = interaction.clone().command() else {
             return;
         };
+
+        let channel_id = cmd.channel_id.get();
+        let is_dm_int = cmd.guild_id.is_none();
+        if !is_dm_int && !self.guild_allowed(channel_id) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    serenity::builder::CreateInteractionResponse::Message(
+                        serenity::builder::CreateInteractionResponseMessage::new()
+                            .content("This command is not available in this channel.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
 
         if let Err(e) = cmd
             .create_response(
@@ -563,8 +600,7 @@ pub async fn start_discord_bot_for_bot(
     token: &str,
     bot_id: &crate::config::BotId,
     default_agent: &crate::config::AgentId,
-    allowed_channels: &[u64],
-    channel_agents: &std::collections::HashMap<u64, crate::config::AgentId>,
+    channels: &HashMap<u64, DiscordChannelConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
@@ -575,17 +611,12 @@ pub async fn start_discord_bot_for_bot(
         bot_id.as_str(),
     );
 
-    let agent_map: std::collections::HashMap<u64, String> = channel_agents
-        .iter()
-        .map(|(k, v)| (*k, v.to_string()))
-        .collect();
-
     let handler = Handler {
         app_state: state,
         bot_id: bot_id.to_string(),
         default_agent: default_agent.to_string(),
-        allowed_channels: allowed_channels.to_vec(),
-        channel_agents: agent_map,
+        channels: channels.clone(),
+        bot_user_id: OnceLock::new(),
     };
 
     let mut client = Client::builder(token, intents)
@@ -619,7 +650,7 @@ pub async fn start_discord_bot_for_bot(
 mod tests {
     use super::*;
 
-    fn test_handler(allowed_channels: Vec<u64>) -> Handler {
+    fn test_handler(channels: HashMap<u64, DiscordChannelConfig>) -> Handler {
         Handler {
             app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
                 tempfile::tempdir()
@@ -638,14 +669,14 @@ mod tests {
             )),
             bot_id: "main".to_string(),
             default_agent: "developer".to_string(),
-            allowed_channels,
-            channel_agents: std::collections::HashMap::new(),
+            channels,
+            bot_user_id: OnceLock::new(),
         }
     }
 
     fn test_adapter() -> DiscordAdapter {
         DiscordAdapter {
-            bot_token_map: std::collections::HashMap::new(),
+            bot_token_map: HashMap::new(),
             http_client: reqwest::Client::new(),
         }
     }
@@ -694,17 +725,21 @@ mod tests {
     }
 
     #[test]
-    fn guild_allowed_rejects_when_allowed_channels_empty() {
-        let handler = test_handler(vec![]);
+    fn guild_allowed_rejects_when_channels_empty() {
+        let handler = test_handler(HashMap::new());
 
         assert!(
             !handler.guild_allowed(123),
-            "empty allowed_channels should reject guild messages"
+            "empty channels should reject guild messages"
         );
     }
+
     #[test]
     fn guild_allowed_accepts_listed_channel_only() {
-        let handler = test_handler(vec![123, 456]);
+        let mut channels = HashMap::new();
+        channels.insert(123, DiscordChannelConfig::default());
+        channels.insert(456, DiscordChannelConfig::default());
+        let handler = test_handler(channels);
 
         assert!(handler.guild_allowed(123));
         assert!(!handler.guild_allowed(789));
@@ -712,7 +747,9 @@ mod tests {
 
     #[test]
     fn interaction_chat_id_uses_agent_scoped_thread() {
-        let handler = test_handler(vec![123]);
+        let mut channels = HashMap::new();
+        channels.insert(123, DiscordChannelConfig::default());
+        let handler = test_handler(channels);
 
         assert_eq!(
             handler.agent_thread("123", "developer"),
@@ -784,5 +821,131 @@ mod tests {
         // Assert
         assert_eq!(combined, "hello world");
         assert!(!combined.contains("[attachment:"));
+    }
+
+    // --- New tests for require_mention and select_agent ---
+
+    #[test]
+    fn select_agent_returns_default_for_dm() {
+        // Arrange
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: false,
+                agent: Some(crate::config::AgentId::new("reviewer")),
+            },
+        );
+        let handler = test_handler(channels);
+
+        // Act & Assert: DM always uses default agent regardless of channel config
+        assert_eq!(handler.select_agent(999, true), "developer");
+    }
+
+    #[test]
+    fn select_agent_uses_channel_agent_when_set() {
+        // Arrange
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: false,
+                agent: Some(crate::config::AgentId::new("reviewer")),
+            },
+        );
+        let handler = test_handler(channels);
+
+        // Act & Assert
+        assert_eq!(handler.select_agent(123, false), "reviewer");
+    }
+
+    #[test]
+    fn select_agent_falls_back_to_default_when_no_channel_agent() {
+        // Arrange
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: false,
+                agent: None,
+            },
+        );
+        let handler = test_handler(channels);
+
+        // Act & Assert
+        assert_eq!(handler.select_agent(123, false), "developer");
+    }
+
+    #[test]
+    fn select_agent_falls_back_to_default_for_unknown_channel() {
+        // Arrange
+        let mut channels = HashMap::new();
+        channels.insert(123, DiscordChannelConfig::default());
+        let handler = test_handler(channels);
+
+        // Act & Assert: channel 456 not in map, falls back to default
+        assert_eq!(handler.select_agent(456, false), "developer");
+    }
+
+    #[test]
+    fn is_bot_mentioned_returns_false_when_no_bot_user_id() {
+        // Arrange
+        let handler = test_handler(HashMap::new());
+
+        // Assert: bot_user_id was never set (no ready event)
+        assert_eq!(handler.bot_user_id.get(), None);
+    }
+
+    #[test]
+    fn require_mention_true_skips_without_mention_logic() {
+        // Arrange: channel 123 requires mention, channel 456 does not
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: true,
+                agent: None,
+            },
+        );
+        channels.insert(
+            456,
+            DiscordChannelConfig {
+                require_mention: false,
+                agent: None,
+            },
+        );
+        let handler = test_handler(channels);
+
+        // Act & Assert: guild_allowed works for both
+        assert!(handler.guild_allowed(123));
+        assert!(handler.guild_allowed(456));
+
+        // Verify config is readable
+        assert!(handler.channels.get(&123).expect("config").require_mention);
+        assert!(!handler.channels.get(&456).expect("config").require_mention);
+    }
+
+    #[test]
+    fn dm_always_allowed_regardless_of_channels() {
+        // Arrange: empty channels (no guild allowed)
+        let handler = test_handler(HashMap::new());
+
+        // Act & Assert: DM (is_dm=true) bypasses guild_allowed entirely
+        // The select_agent for DM always returns default
+        assert_eq!(handler.select_agent(999, true), "developer");
+        // But guild is rejected
+        assert!(!handler.guild_allowed(123));
+    }
+
+    #[test]
+    fn interaction_rejected_in_non_allowed_channel() {
+        // Arrange
+        let mut channels = HashMap::new();
+        channels.insert(100, DiscordChannelConfig::default());
+        let handler = test_handler(channels);
+
+        // Act & Assert
+        assert!(!handler.guild_allowed(999));
+        assert!(handler.guild_allowed(100));
     }
 }

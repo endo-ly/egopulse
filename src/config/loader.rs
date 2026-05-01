@@ -12,9 +12,17 @@ use super::secret_ref::{
 };
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
-    ProviderConfig, ProviderId,
+    DiscordChannelConfig, ProviderConfig, ProviderId, TelegramChatConfig,
 };
 use crate::error::ConfigError;
+
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct FileProviderConfig {
@@ -36,8 +44,7 @@ struct FileChannelConfig {
     allowed_origins: Option<Vec<String>>,
     bot_token: Option<StringOrRef>,
     bot_username: Option<String>,
-    allowed_channels: Option<Vec<u64>>,
-    allowed_chat_ids: Option<Vec<i64>>,
+    chats: Option<HashMap<String, FileTelegramChatConfig>>,
     soul_path: Option<String>,
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
 }
@@ -46,8 +53,20 @@ struct FileChannelConfig {
 struct FileDiscordBotConfig {
     token: Option<StringOrRef>,
     default_agent: Option<String>,
-    allowed_channels: Option<Vec<u64>>,
-    channel_agents: Option<HashMap<String, String>>,
+    channels: Option<HashMap<String, FileDiscordChannelConfig>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileDiscordChannelConfig {
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    require_mention: bool,
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileTelegramChatConfig {
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    require_mention: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -233,6 +252,26 @@ fn normalize_channels(
             }
         });
 
+        let chats = fc
+            .chats
+            .map(|map| {
+                let mut result = HashMap::new();
+                for (k, v) in map {
+                    let chat_id: i64 = k
+                        .parse::<i64>()
+                        .map_err(|_| ConfigError::InvalidChatsKey { key: k.clone() })?;
+                    result.insert(
+                        chat_id,
+                        TelegramChatConfig {
+                            require_mention: v.require_mention,
+                        },
+                    );
+                }
+                Ok(result)
+            })
+            .transpose()?
+            .filter(|m| !m.is_empty());
+
         let config = ChannelConfig {
             enabled: fc.enabled,
             port: fc.port,
@@ -245,8 +284,7 @@ fn normalize_channels(
             bot_token: resolved_bot,
             file_bot_token,
             bot_username: fc.bot_username,
-            allowed_channels: fc.allowed_channels,
-            allowed_chat_ids: fc.allowed_chat_ids,
+            chats,
             soul_path: fc.soul_path,
             discord_bots: None,
         };
@@ -329,19 +367,28 @@ fn normalize_discord_bots(
                 bot_id: bot_id.to_string(),
             })?;
 
-        let channel_agents = fb
-            .channel_agents
+        let channels = fb
+            .channels
             .map(|map| {
                 let mut result = HashMap::new();
                 for (k, v) in map {
                     let channel_id: u64 =
                         k.parse::<u64>()
-                            .map_err(|_| ConfigError::InvalidChannelAgentsKey {
+                            .map_err(|_| ConfigError::InvalidChannelsKey {
                                 bot_id: bot_id.to_string(),
                                 key: k,
                             })?;
-                    let agent_id = AgentId::new(&v);
-                    result.insert(channel_id, agent_id);
+                    let agent = v
+                        .agent
+                        .and_then(|s| normalize_string(Some(s)))
+                        .map(|s| AgentId::new(&s));
+                    result.insert(
+                        channel_id,
+                        DiscordChannelConfig {
+                            require_mention: v.require_mention,
+                            agent,
+                        },
+                    );
                 }
                 Ok(result)
             })
@@ -354,8 +401,7 @@ fn normalize_discord_bots(
                 token: resolved_token,
                 file_token,
                 default_agent,
-                allowed_channels: fb.allowed_channels,
-                channel_agents,
+                channels,
             },
         );
     }
@@ -499,14 +545,16 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
                 agent_id: bot.default_agent.to_string(),
             });
         }
-        if let Some(channel_agents) = &bot.channel_agents {
-            for (channel_id, agent_id) in channel_agents {
-                if !config.agents.contains_key(agent_id) {
-                    return Err(ConfigError::DiscordBotChannelAgentNotFound {
-                        bot_id: bot_id.to_string(),
-                        channel_id: *channel_id,
-                        agent_id: agent_id.to_string(),
-                    });
+        if let Some(channels) = &bot.channels {
+            for (channel_id, channel_config) in channels {
+                if let Some(agent_id) = &channel_config.agent {
+                    if !config.agents.contains_key(agent_id) {
+                        return Err(ConfigError::DiscordBotChannelAgentNotFound {
+                            bot_id: bot_id.to_string(),
+                            channel_id: *channel_id,
+                            agent_id: agent_id.to_string(),
+                        });
+                    }
                 }
             }
         }

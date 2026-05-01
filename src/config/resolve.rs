@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{AgentId, BotId, ChannelName, Config, ProviderConfig, ProviderId, ResolvedLlmConfig};
+use super::{
+    AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId,
+    ResolvedLlmConfig,
+};
 use crate::error::ConfigError;
 
 impl Config {
@@ -333,16 +336,13 @@ impl Config {
             .iter()
             .filter_map(|(bot_id, bot)| {
                 let token = bot.token.as_ref()?;
+                let channels: HashMap<u64, DiscordChannelConfig> =
+                    bot.channels.clone().unwrap_or_default();
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
                     default_agent: &bot.default_agent,
-                    allowed_channels: bot.allowed_channels.as_deref().unwrap_or_default(),
-                    channel_agents: bot
-                        .channel_agents
-                        .as_ref()
-                        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
-                        .unwrap_or_default(),
+                    channels,
                 })
             })
             .collect();
@@ -352,13 +352,13 @@ impl Config {
 }
 
 /// Runtime data needed to start and operate one Discord bot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
     pub default_agent: &'a AgentId,
-    pub allowed_channels: &'a [u64],
-    pub channel_agents: HashMap<u64, AgentId>,
+    /// Per-channel configuration. Empty map means no guild messages are allowed (DM-only).
+    pub channels: HashMap<u64, DiscordChannelConfig>,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.
