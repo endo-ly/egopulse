@@ -113,7 +113,7 @@ where
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 impl Database {
     /// Open (or create) the database at `db_path` and initialize schema.
@@ -197,6 +197,32 @@ fn set_schema_version(conn: &Connection, version: i64, note: &str) -> Result<(),
         [],
     )?;
     conn.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
+         VALUES(?1, ?2, ?3)",
+        params![version, chrono::Utc::now().to_rfc3339(), note],
+    )?;
+    Ok(())
+}
+
+fn set_schema_version_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    version: i64,
+    note: &str,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO db_meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![version.to_string()],
+    )?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            note TEXT
+        )",
+        [],
+    )?;
+    tx.execute(
         "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
          VALUES(?1, ?2, ?3)",
         params![version, chrono::Utc::now().to_rfc3339(), note],
@@ -293,6 +319,54 @@ fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         )?;
         set_schema_version(conn, 2, "add llm_usage_logs table for LLM usage tracking")?;
         version = 2;
+    }
+
+    if version < 3 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_tool_calls_chat_id;
+            DROP INDEX IF EXISTS idx_tool_calls_chat_message_id;
+
+            CREATE TABLE IF NOT EXISTS tool_calls_v3 (
+                id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                tool_output TEXT,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (id, chat_id, message_id),
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            INSERT OR IGNORE INTO tool_calls_v3
+                (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+            SELECT
+                id,
+                COALESCE(chat_id, 0),
+                COALESCE(message_id, ''),
+                COALESCE(tool_name, ''),
+                COALESCE(tool_input, ''),
+                tool_output,
+                COALESCE(timestamp, '')
+            FROM tool_calls;
+
+            DROP TABLE tool_calls;
+            ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+                ON tool_calls(chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+                ON tool_calls(chat_id, message_id);",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            3,
+            "scope tool call uniqueness to chat and assistant message",
+        )?;
+        tx.commit()?;
+        version = 3;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -672,15 +746,25 @@ impl Database {
         Ok(())
     }
 
-    /// Update the output of a tool call.
-    pub fn update_tool_call_output(&self, id: &str, output: &str) -> Result<(), StorageError> {
+    /// Update the output of a tool call scoped to the assistant message that emitted it.
+    pub fn update_tool_call_output_for_message(
+        &self,
+        chat_id: i64,
+        message_id: &str,
+        id: &str,
+        output: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let rows_updated = conn.execute(
-            "UPDATE tool_calls SET tool_output = ?1 WHERE id = ?2",
-            params![output, id],
+            "UPDATE tool_calls
+             SET tool_output = ?1
+             WHERE chat_id = ?2 AND message_id = ?3 AND id = ?4",
+            params![output, chat_id, message_id, id],
         )?;
         if rows_updated == 0 {
-            return Err(StorageError::NotFound(format!("tool_call:{id}")));
+            return Err(StorageError::NotFound(format!(
+                "tool_call:{chat_id}:{message_id}:{id}"
+            )));
         }
         Ok(())
     }
@@ -1122,9 +1206,17 @@ mod tests {
     #[test]
     fn update_tool_call_output_fails_when_tool_call_is_missing() {
         let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .expect("create chat");
 
         let error = db
-            .update_tool_call_output("missing-tool-call", "output")
+            .update_tool_call_output_for_message(
+                chat_id,
+                "message-1",
+                "missing-tool-call",
+                "output",
+            )
             .expect_err("missing tool call should fail");
 
         assert!(matches!(error, StorageError::NotFound(_)));
@@ -1147,7 +1239,7 @@ mod tests {
         };
 
         db.store_tool_call(&tool_call).expect("store tool call");
-        db.update_tool_call_output("tool-1", "done")
+        db.update_tool_call_output_for_message(chat_id, "message-1", "tool-1", "done")
             .expect("update tool call");
 
         let calls = db
@@ -1158,10 +1250,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_ids_are_scoped_by_message() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .expect("create chat");
+        let first = ToolCall {
+            id: "tool-1".to_string(),
+            chat_id,
+            message_id: "message-1".to_string(),
+            tool_name: "fetch".to_string(),
+            tool_input: "{}".to_string(),
+            tool_output: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let second = ToolCall {
+            message_id: "message-2".to_string(),
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+            ..first.clone()
+        };
+
+        db.store_tool_call(&first).expect("store first tool call");
+        db.store_tool_call(&second)
+            .expect("store second tool call with duplicate provider id");
+        db.update_tool_call_output_for_message(chat_id, "message-2", "tool-1", "done")
+            .expect("update scoped output");
+
+        let calls = db
+            .get_tool_calls_for_chat(chat_id)
+            .expect("load tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool_output, None);
+        assert_eq!(calls[1].tool_output.as_deref(), Some("done"));
+    }
+
+    #[test]
     fn schema_version_is_tracked_on_init() {
         let (db, _dir) = test_db();
         let version = db.schema_version().expect("schema version");
-        assert_eq!(version, 2, "新規DBはスキーマバージョン2で初期化される");
+        assert_eq!(version, 3, "新規DBはスキーマバージョン3で初期化される");
     }
 
     #[test]
@@ -1179,11 +1306,13 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 2, "v1・v2 マイグレーションが2件記録される");
+        assert_eq!(rows.len(), 3, "v1・v2・v3 マイグレーションが3件記録される");
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
         assert!(rows[1].1.contains("llm_usage_logs"));
+        assert_eq!(rows[2].0, 3);
+        assert!(rows[2].1.contains("tool call"));
     }
 
     #[test]
@@ -1203,7 +1332,7 @@ mod tests {
             first_version, second_version,
             "再起動してもバージョンは変わらない"
         );
-        assert_eq!(second_version, 2);
+        assert_eq!(second_version, 3);
     }
 
     #[test]
@@ -1558,14 +1687,22 @@ mod tests {
                  CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS messages (id TEXT NOT NULL, chat_id INTEGER NOT NULL, PRIMARY KEY (id, chat_id));
                  CREATE TABLE IF NOT EXISTS sessions (chat_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS tool_calls (id TEXT PRIMARY KEY);",
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                    id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    tool_input TEXT NOT NULL,
+                    tool_output TEXT,
+                    timestamp TEXT NOT NULL
+                 );",
             )
             .expect("create v1 schema");
         }
 
         let db = Database::new(&db_path).expect("reopen");
         let version = db.schema_version().expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let conn = db.conn.lock().expect("lock");
         let table_exists: bool = conn
@@ -1579,12 +1716,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_increments_to_2() {
+    fn schema_version_increments_to_3() {
         let (db, _dir) = test_db();
         let version = db.schema_version().expect("version");
         assert_eq!(
-            version, 2,
-            "スキーマバージョンが2にインクリメントされていること"
+            version, 3,
+            "スキーマバージョンが3にインクリメントされていること"
         );
     }
 }

@@ -29,7 +29,7 @@ egopulse.db (SQLite / WAL mode)
 | テーブル数 | 7（データテーブル 5 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 6 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v2） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v3） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -63,8 +63,10 @@ egopulse.db (SQLite / WAL mode)
         │       │  tool_calls      │
         │       │──────────────────│
         └───────│ chat_id (FK)     │
-                │ id (PK)          │
+                │ id               │
                 │ message_id       │
+                │ (id, chat_id,    │
+                │  message_id) PK  │
                 │ tool_name        │
                 │ tool_input       │
                 │ tool_output      │
@@ -205,13 +207,14 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 ```sql
 CREATE TABLE IF NOT EXISTS tool_calls (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
     tool_input TEXT NOT NULL,
     tool_output TEXT,
     timestamp TEXT NOT NULL,
+    PRIMARY KEY (id, chat_id, message_id),
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
 );
 
@@ -224,9 +227,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
-| id | TEXT | PK | ツール呼び出しID |
-| chat_id | INTEGER | NOT NULL, FK | chats.chat_id |
-| message_id | TEXT | NOT NULL | 対象メッセージID |
+| id | TEXT | NOT NULL, composite PK | プロバイダ由来のツール呼び出しID |
+| chat_id | INTEGER | NOT NULL, FK, composite PK | chats.chat_id |
+| message_id | TEXT | NOT NULL, composite PK | 対象 assistant メッセージID |
 | tool_name | TEXT | NOT NULL | ツール/ファンクション名 |
 | tool_input | TEXT | NOT NULL | 入力パラメータ（JSON） |
 | tool_output | TEXT | nullable | 出力結果（JSON） |
@@ -235,8 +238,13 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
 **操作**:
 - `store_tool_call(tool_call)` — INSERT
 - `update_tool_call_output(id, output)` — 出力の事後更新
+- `update_tool_call_output_for_message(chat_id, message_id, id, output)` — assistant メッセージ単位でスコープした出力更新
 - `get_tool_calls_for_message(chat_id, message_id)` — メッセージ単位の呼び出し履歴
 - `get_tool_calls_for_chat(chat_id)` — チャット単位の全呼び出し履歴
+
+**設計ポイント**:
+- `id` は OpenAI/Codex などのプロバイダが返す call id であり、永続化上のグローバルIDではない
+- 同じプロバイダ call id が別 assistant メッセージで再利用されても履歴を保持できるよう、主キーは `(id, chat_id, message_id)`
 
 ---
 
@@ -356,39 +364,59 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `2`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `3`）に到達したら完了。`debug_assert_eq!` で検証
 
 **新規マイグレーションの追加手順**:
-1. `SCHEMA_VERSION` 定数をインクリメント（例: `1` → `2`）
-2. `run_migrations()` に `if version < 2 { ... }` ブロックを追加
+1. `SCHEMA_VERSION` 定数をインクリメント（例: `3` → `4`）
+2. `run_migrations()` に `if version < 4 { ... }` ブロックを追加
 3. ブロック内で `conn.execute_batch("ALTER TABLE ...")` 等の DDL を実行
-4. `set_schema_version(conn, 2, "description")` を呼び出し
+4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
+5. `set_schema_version(conn, 4, "description")` または transaction 用 helper を呼び出し
 
 ```rust
-// 既存のテンプレート（storage.rs 内）
-// if version < 2 {
-//     conn.execute_batch(
-//         "CREATE TABLE IF NOT EXISTS llm_usage_logs (
-//             id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 現行の v2 -> v3 例（storage.rs 内）
+// if version < 3 {
+//     let tx = conn.unchecked_transaction()?;
+//     tx.execute_batch(
+//         "DROP INDEX IF EXISTS idx_tool_calls_chat_id;
+//         DROP INDEX IF EXISTS idx_tool_calls_chat_message_id;
+//
+//         CREATE TABLE IF NOT EXISTS tool_calls_v3 (
+//             id TEXT NOT NULL,
 //             chat_id INTEGER NOT NULL,
-//             caller_channel TEXT NOT NULL,
-//             provider TEXT NOT NULL,
-//             model TEXT NOT NULL,
-//             input_tokens INTEGER NOT NULL,
-//             output_tokens INTEGER NOT NULL,
-//             total_tokens INTEGER NOT NULL,
-//             request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-//             created_at TEXT NOT NULL
+//             message_id TEXT NOT NULL,
+//             tool_name TEXT NOT NULL,
+//             tool_input TEXT NOT NULL,
+//             tool_output TEXT,
+//             timestamp TEXT NOT NULL,
+//             PRIMARY KEY (id, chat_id, message_id),
+//             FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
 //         );
 //
-//         CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
-//             ON llm_usage_logs(chat_id, created_at);
+//         INSERT OR IGNORE INTO tool_calls_v3
+//             (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+//         SELECT
+//             id,
+//             COALESCE(chat_id, 0),
+//             COALESCE(message_id, ''),
+//             COALESCE(tool_name, ''),
+//             COALESCE(tool_input, ''),
+//             tool_output,
+//             COALESCE(timestamp, '')
+//         FROM tool_calls;
 //
-//         CREATE INDEX IF NOT EXISTS idx_llm_usage_created
-//             ON llm_usage_logs(created_at);",
+//         DROP TABLE tool_calls;
+//         ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
+//
+//         CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+//             ON tool_calls(chat_id);
+//
+//         CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+//             ON tool_calls(chat_id, message_id);",
 //     )?;
-//     set_schema_version(conn, 2, "add llm_usage_logs table for LLM usage tracking")?;
-//     version = 2;
+//     set_schema_version_in_tx(&tx, 3, "scope tool call uniqueness to chat and assistant message")?;
+//     tx.commit()?;
+//     version = 3;
 // }
 ```
 

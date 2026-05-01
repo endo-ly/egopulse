@@ -89,12 +89,14 @@ turn 開始時は次の順で session を復元する。
 1. `sessions.messages_json` があればそれを使う
 2. JSON を `Message` 配列へ戻す
 3. image は `input_image_ref` から asset store 経由で hydrate する
-4. snapshot が無い、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
+4. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う
+5. snapshot が無い、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
 
 原則:
 
 - 真の次ターン入力は `sessions.messages_json`
 - `messages` は fallback 用
+- LLM API に再送する履歴では、assistant の tool call と tool output の対応関係を必ず保つ
 
 ## 4. Turn 中の保存
 
