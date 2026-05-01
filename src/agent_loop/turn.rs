@@ -256,12 +256,19 @@ where
 }
 
 fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut seen_ids = std::collections::HashSet::new();
     tool_calls
         .into_iter()
         .filter(|tc| {
             if tc.name.trim().is_empty() || tc.id.trim().is_empty() {
                 warn!(
                     "skipping malformed tool call (empty name or id): id='{}' name='{}'",
+                    tc.id, tc.name
+                );
+                false
+            } else if !seen_ids.insert(tc.id.clone()) {
+                warn!(
+                    "skipping duplicate tool call id in assistant response: id='{}' name='{}'",
                     tc.id, tc.name
                 );
                 false
@@ -1231,6 +1238,82 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert!(tool_calls.iter().all(|call| call.id == "call-repeat"));
         assert!(tool_calls.iter().all(|call| call.tool_output.is_some()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_tool_call_ids_in_same_response_are_executed_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/duplicate.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Reading.".to_string(),
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-duplicate".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": relative_path.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-duplicate".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": relative_path.clone()}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let file_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
+        std::fs::write(&file_path, "duplicate content").expect("duplicate.txt");
+
+        let reply = process_turn(&state, &cli_context("duplicate-tool-call-id"), "read it")
+            .await
+            .expect("process turn");
+
+        assert_eq!(reply, "Done.");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:duplicate-tool-call-id",
+                Some("duplicate-tool-call-id"),
+                "cli",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call-duplicate");
+        assert!(tool_calls[0].tool_output.is_some());
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        assert_eq!(seen_messages[1][1].role, "assistant");
+        assert_eq!(seen_messages[1][1].tool_calls.len(), 1);
+        assert_eq!(seen_messages[1][1].tool_calls[0].id, "call-duplicate");
+        assert_eq!(seen_messages[1][2].role, "tool");
+        assert_eq!(
+            seen_messages[1][2].tool_call_id.as_deref(),
+            Some("call-duplicate")
+        );
     }
 
     #[tokio::test]
