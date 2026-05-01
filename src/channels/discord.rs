@@ -474,6 +474,16 @@ impl EventHandler for Handler {
         let channel_id = cmd.channel_id.get();
         let is_dm_int = cmd.guild_id.is_none();
         if !is_dm_int && !self.guild_allowed(channel_id) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    serenity::builder::CreateInteractionResponse::Message(
+                        serenity::builder::CreateInteractionResponseMessage::new()
+                            .content("This command is not available in this channel.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
 
