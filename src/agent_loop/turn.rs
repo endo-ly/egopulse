@@ -256,27 +256,31 @@ where
 }
 
 fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
-    let mut seen_ids = std::collections::HashSet::new();
-    tool_calls
-        .into_iter()
-        .filter(|tc| {
-            if tc.name.trim().is_empty() || tc.id.trim().is_empty() {
-                warn!(
-                    "skipping malformed tool call (empty name or id): id='{}' name='{}'",
-                    tc.id, tc.name
-                );
-                false
-            } else if !seen_ids.insert(tc.id.clone()) {
-                warn!(
-                    "skipping duplicate tool call id in assistant response: id='{}' name='{}'",
-                    tc.id, tc.name
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect()
+    let mut index_by_id = std::collections::HashMap::new();
+    let mut valid = Vec::new();
+
+    for tool_call in tool_calls {
+        if tool_call.name.trim().is_empty() || tool_call.id.trim().is_empty() {
+            warn!(
+                "skipping malformed tool call (empty name or id): id='{}' name='{}'",
+                tool_call.id, tool_call.name
+            );
+            continue;
+        }
+
+        if let Some(index) = index_by_id.get(&tool_call.id).copied() {
+            warn!(
+                "replacing duplicate tool call id in assistant response with latest item: id='{}' name='{}'",
+                tool_call.id, tool_call.name
+            );
+            valid[index] = tool_call;
+        } else {
+            index_by_id.insert(tool_call.id.clone(), valid.len());
+            valid.push(tool_call);
+        }
+    }
+
+    valid
 }
 
 fn evaluate_end_turn(
@@ -1253,7 +1257,7 @@ mod tests {
                         ToolCall {
                             id: "call-duplicate".to_string(),
                             name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path.clone()}),
+                            arguments: serde_json::json!({}),
                         },
                         ToolCall {
                             id: "call-duplicate".to_string(),
@@ -1302,6 +1306,7 @@ mod tests {
         .expect("tool calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call-duplicate");
+        assert!(tool_calls[0].tool_input.contains(&relative_path));
         assert!(tool_calls[0].tool_output.is_some());
 
         let seen_messages = provider.seen_messages();
@@ -1309,6 +1314,10 @@ mod tests {
         assert_eq!(seen_messages[1][1].role, "assistant");
         assert_eq!(seen_messages[1][1].tool_calls.len(), 1);
         assert_eq!(seen_messages[1][1].tool_calls[0].id, "call-duplicate");
+        assert_eq!(
+            seen_messages[1][1].tool_calls[0].arguments["path"],
+            relative_path
+        );
         assert_eq!(seen_messages[1][2].role, "tool");
         assert_eq!(
             seen_messages[1][2].tool_call_id.as_deref(),
