@@ -273,19 +273,10 @@ impl EventHandler for Handler {
             return;
         }
 
-        if !is_dm {
-            if let Some(config) = self.channels.get(&channel_id) {
-                if config.require_mention && !self.is_bot_mentioned(&msg) {
-                    return;
-                }
-            }
-        }
-
         let text = msg.content.clone();
         let agent_id = self.select_agent(channel_id, is_dm).to_string();
 
         let thread = channel_id.to_string();
-
         if crate::slash_commands::is_slash_command(&text) {
             let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
             let sender_id = msg.author.id.get().to_string();
@@ -322,6 +313,14 @@ impl EventHandler for Handler {
                         "An error occurred processing the command.",
                     )
                     .await;
+                    return;
+                }
+            }
+        }
+
+        if !is_dm {
+            if let Some(config) = self.channels.get(&channel_id) {
+                if config.require_mention && !self.is_bot_mentioned(&msg) {
                     return;
                 }
             }

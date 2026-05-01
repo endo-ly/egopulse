@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use super::{AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId, ResolvedLlmConfig};
+use super::{
+    AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId,
+    ResolvedLlmConfig,
+};
 use crate::error::ConfigError;
 
 impl Config {
@@ -333,10 +336,8 @@ impl Config {
             .iter()
             .filter_map(|(bot_id, bot)| {
                 let token = bot.token.as_ref()?;
-                let channels: HashMap<u64, DiscordChannelConfig> = bot
-                    .channels
-                    .clone()
-                    .unwrap_or_default();
+                let channels: HashMap<u64, DiscordChannelConfig> =
+                    bot.channels.clone().unwrap_or_default();
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
