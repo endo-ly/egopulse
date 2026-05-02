@@ -73,9 +73,11 @@ impl BotChainState {
         let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
         let now = Instant::now();
 
+        chains.retain(|_, e| now.duration_since(e.last_updated) < self.ttl);
+
         let entry = chains.get_mut(&channel_id);
         match entry {
-            Some(e) if now.duration_since(e.last_updated) < self.ttl => {
+            Some(e) => {
                 if e.depth >= BOT_CHAIN_MAX_DEPTH {
                     false
                 } else {
@@ -84,7 +86,7 @@ impl BotChainState {
                     true
                 }
             }
-            Some(_) | None => {
+            None => {
                 chains.insert(
                     channel_id,
                     ChainEntry {
@@ -376,6 +378,10 @@ impl EventHandler for Handler {
         let is_dm = msg.guild_id.is_none();
 
         if !is_dm && !self.guild_allowed(channel_id) {
+            return;
+        }
+
+        if self.is_self_message(msg.author.id.get()) {
             return;
         }
 
