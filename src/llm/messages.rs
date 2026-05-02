@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 pub(crate) fn build_request_body(
     model: &str,
@@ -35,16 +36,71 @@ pub(crate) fn build_responses_request_body(
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
-        "input": messages
-            .iter()
-            .flat_map(translate_message_to_responses)
-            .collect::<Vec<_>>(),
+        "input": translate_messages_to_responses(messages),
     });
     if !system.trim().is_empty() {
         body["instructions"] = serde_json::Value::String(system.to_string());
     }
     append_responses_tools(&mut body, tools);
     body
+}
+
+fn translate_messages_to_responses(messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut seen_function_call_ids = HashSet::new();
+    let mut input = Vec::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "assistant" if !message.tool_calls.is_empty() => {
+                for tool_call in &message.tool_calls {
+                    seen_function_call_ids.insert(tool_call.id.clone());
+                }
+                input.extend(translate_message_to_responses(message));
+            }
+            "tool" if tool_output_has_matching_call(message, &seen_function_call_ids) => {
+                input.extend(translate_message_to_responses(message));
+            }
+            "tool" => input.extend(orphan_tool_output_to_responses_context(message)),
+            _ => input.extend(translate_message_to_responses(message)),
+        }
+    }
+
+    input
+}
+
+fn tool_output_has_matching_call(
+    message: &Message,
+    seen_function_call_ids: &HashSet<String>,
+) -> bool {
+    message
+        .tool_call_id
+        .as_ref()
+        .is_some_and(|call_id| seen_function_call_ids.contains(call_id))
+}
+
+fn orphan_tool_output_to_responses_context(message: &Message) -> Vec<serde_json::Value> {
+    let call_id = message
+        .tool_call_id
+        .as_deref()
+        .filter(|call_id| !call_id.trim().is_empty())
+        .unwrap_or("unknown");
+    let text = format!(
+        "Previous tool output could not be linked to a function call ({call_id}). Treat this as historical context only.\n{}",
+        message.content.as_text_lossy()
+    );
+    let mut items = vec![serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": text,
+    })];
+    if message.content.is_multimodal() {
+        items.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": synthetic_tool_attachment_parts(&message.content),
+        }));
+    }
+    items
 }
 
 pub(crate) fn translate_message_to_openai(message: &Message) -> serde_json::Value {
@@ -316,5 +372,60 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn responses_request_keeps_matched_tool_output_as_function_call_output() {
+        let body = build_responses_request_body(
+            "gpt-5.3-codex",
+            "",
+            &[
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::text(""),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "README.md"}),
+                    }],
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: MessageContent::text("read result"),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call_1".to_string()),
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_request_converts_orphan_tool_output_to_context_message() {
+        let body = build_responses_request_body(
+            "gpt-5.3-codex",
+            "",
+            &[Message {
+                role: "tool".to_string(),
+                content: MessageContent::text("orphan result"),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_missing".to_string()),
+            }],
+            None,
+        );
+
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert!(
+            body["input"][0]["content"]
+                .as_str()
+                .expect("content string")
+                .contains("call_missing")
+        );
     }
 }
