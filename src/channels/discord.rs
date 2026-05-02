@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -38,6 +40,76 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
+
+/// Bot-to-bot chain maximum depth per channel/thread.
+const BOT_CHAIN_MAX_DEPTH: u32 = 5;
+
+/// Bot-to-bot chain state TTL in seconds.
+const BOT_CHAIN_TTL_SECS: u64 = 300;
+
+struct ChainEntry {
+    depth: u32,
+    last_updated: Instant,
+}
+
+pub(crate) struct BotChainState {
+    ttl: Duration,
+    chains: Mutex<HashMap<u64, ChainEntry>>,
+}
+
+impl BotChainState {
+    pub(crate) fn new() -> Self {
+        Self::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS))
+    }
+
+    pub(crate) fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            chains: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn check_and_increment(&self, channel_id: u64) -> bool {
+        let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
+        let now = Instant::now();
+
+        chains.retain(|_, e| now.duration_since(e.last_updated) < self.ttl);
+
+        let entry = chains.get_mut(&channel_id);
+        match entry {
+            Some(e) => {
+                if e.depth >= BOT_CHAIN_MAX_DEPTH {
+                    false
+                } else {
+                    e.depth += 1;
+                    e.last_updated = now;
+                    true
+                }
+            }
+            None => {
+                chains.insert(
+                    channel_id,
+                    ChainEntry {
+                        depth: 1,
+                        last_updated: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    pub(crate) fn reset(&self, channel_id: u64) {
+        let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
+        chains.remove(&channel_id);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReceiveDecision {
+    Accept { reset_chain: bool },
+    Reject,
+}
 
 /// Sends outbound messages to Discord via the REST API.
 pub struct DiscordAdapter {
@@ -219,6 +291,7 @@ struct Handler {
     default_agent: String,
     channels: HashMap<u64, DiscordChannelConfig>,
     bot_user_id: OnceLock<UserId>,
+    chain_state: Arc<BotChainState>,
 }
 
 impl Handler {
@@ -257,19 +330,58 @@ impl Handler {
         };
         msg.mentions.iter().any(|u| u.id == *bot_id)
     }
+
+    fn is_self_message(&self, author_id: u64) -> bool {
+        self.bot_user_id
+            .get()
+            .is_some_and(|id| id.get() == author_id)
+    }
+
+    fn should_process_message(
+        &self,
+        author_id: u64,
+        author_is_bot: bool,
+        is_dm: bool,
+        channel_id: u64,
+        mentions_bot: bool,
+    ) -> ReceiveDecision {
+        if self.is_self_message(author_id) {
+            return ReceiveDecision::Reject;
+        }
+
+        if author_is_bot {
+            if !mentions_bot {
+                return ReceiveDecision::Reject;
+            }
+            if !self.chain_state.check_and_increment(channel_id) {
+                return ReceiveDecision::Reject;
+            }
+            return ReceiveDecision::Accept { reset_chain: false };
+        }
+
+        if !is_dm {
+            if let Some(config) = self.channels.get(&channel_id) {
+                if config.require_mention && !mentions_bot {
+                    return ReceiveDecision::Reject;
+                }
+            }
+        }
+
+        ReceiveDecision::Accept { reset_chain: true }
+    }
 }
 
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: DiscordMessage) {
-        if msg.author.bot {
-            return;
-        }
-
         let channel_id = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
 
         if !is_dm && !self.guild_allowed(channel_id) {
+            return;
+        }
+
+        if self.is_self_message(msg.author.id.get()) {
             return;
         }
 
@@ -318,12 +430,21 @@ impl EventHandler for Handler {
             }
         }
 
-        if !is_dm {
-            if let Some(config) = self.channels.get(&channel_id) {
-                if config.require_mention && !self.is_bot_mentioned(&msg) {
-                    return;
-                }
+        let mentions_bot = self.is_bot_mentioned(&msg);
+        let decision = self.should_process_message(
+            msg.author.id.get(),
+            msg.author.bot,
+            is_dm,
+            channel_id,
+            mentions_bot,
+        );
+
+        match decision {
+            ReceiveDecision::Accept { reset_chain: true } => {
+                self.chain_state.reset(channel_id);
             }
+            ReceiveDecision::Accept { reset_chain: false } => {}
+            ReceiveDecision::Reject => return,
         }
 
         let workspace_dir = match self.app_state.config.workspace_dir() {
@@ -595,12 +716,14 @@ fn interaction_to_command_text(
 }
 
 /// Starts a Discord bot with agent routing configured.
+#[allow(private_interfaces)]
 pub async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
     default_agent: &crate::config::AgentId,
     channels: &HashMap<u64, DiscordChannelConfig>,
+    chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
@@ -617,6 +740,7 @@ pub async fn start_discord_bot_for_bot(
         default_agent: default_agent.to_string(),
         channels: channels.clone(),
         bot_user_id: OnceLock::new(),
+        chain_state,
     };
 
     let mut client = Client::builder(token, intents)
@@ -671,6 +795,68 @@ mod tests {
             default_agent: "developer".to_string(),
             channels,
             bot_user_id: OnceLock::new(),
+            chain_state: Arc::new(BotChainState::new()),
+        }
+    }
+
+    fn test_handler_with_bot_id(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        bot_user_id: u64,
+    ) -> Handler {
+        let lock = OnceLock::new();
+        lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
+        Handler {
+            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
+                tempfile::tempdir()
+                    .expect("tempdir")
+                    .path()
+                    .to_str()
+                    .expect("utf8")
+                    .to_string(),
+                Box::new(crate::agent_loop::turn::FakeProvider {
+                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    }]),
+                }),
+            )),
+            bot_id: "main".to_string(),
+            default_agent: "developer".to_string(),
+            channels,
+            bot_user_id: lock,
+            chain_state: Arc::new(BotChainState::new()),
+        }
+    }
+
+    fn test_handler_with_chain(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        bot_user_id: u64,
+        chain_state: Arc<BotChainState>,
+    ) -> Handler {
+        let lock = OnceLock::new();
+        lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
+        Handler {
+            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
+                tempfile::tempdir()
+                    .expect("tempdir")
+                    .path()
+                    .to_str()
+                    .expect("utf8")
+                    .to_string(),
+                Box::new(crate::agent_loop::turn::FakeProvider {
+                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    }]),
+                }),
+            )),
+            bot_id: "bot_a".to_string(),
+            default_agent: "developer".to_string(),
+            channels,
+            bot_user_id: lock,
+            chain_state,
         }
     }
 
@@ -947,5 +1133,303 @@ mod tests {
         // Act & Assert
         assert!(!handler.guild_allowed(999));
         assert!(handler.guild_allowed(100));
+    }
+
+    // --- BotChainState tests ---
+
+    #[test]
+    fn bot_chain_starts_at_one() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        assert!(
+            state.check_and_increment(100),
+            "first call should be allowed"
+        );
+    }
+
+    #[test]
+    fn bot_chain_allows_at_max_depth() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(
+                state.check_and_increment(200),
+                "should be allowed up to and including max depth"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_chain_rejects_after_max_depth() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(state.check_and_increment(300));
+        }
+        assert!(
+            !state.check_and_increment(300),
+            "should reject after exceeding max depth"
+        );
+    }
+
+    #[test]
+    fn bot_chain_resets_on_human_message() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        assert!(state.check_and_increment(400));
+        assert!(state.check_and_increment(400));
+        state.reset(400);
+        assert!(
+            state.check_and_increment(400),
+            "after reset, should start fresh at depth 1"
+        );
+    }
+
+    #[test]
+    fn bot_chain_ttl_expiry_restarts_at_one() {
+        let state = BotChainState::with_ttl(Duration::from_millis(1));
+        assert!(state.check_and_increment(500));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            state.check_and_increment(500),
+            "after TTL expiry, should restart at depth 1"
+        );
+    }
+
+    #[test]
+    fn bot_chain_scopes_by_thread_id() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(state.check_and_increment(600));
+        }
+        assert!(
+            state.check_and_increment(700),
+            "different channel_id should have independent state"
+        );
+        assert!(
+            !state.check_and_increment(600),
+            "original channel should still be at max"
+        );
+    }
+
+    // --- Sender-type receive judgment tests ---
+
+    #[test]
+    fn self_message_is_ignored() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        assert!(handler.is_self_message(9999));
+        assert!(!handler.is_self_message(1000));
+
+        assert_eq!(
+            handler.should_process_message(9999, true, false, 100, false),
+            ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn human_message_obeys_require_mention_false() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: false,
+                agent: None,
+            },
+        );
+        let handler = test_handler_with_bot_id(channels, 9999);
+
+        assert_eq!(
+            handler.should_process_message(1000, false, false, 100, false),
+            ReceiveDecision::Accept { reset_chain: true }
+        );
+    }
+
+    #[test]
+    fn human_message_obeys_require_mention_true() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: true,
+                agent: None,
+            },
+        );
+        let handler = test_handler_with_bot_id(channels, 9999);
+
+        assert_eq!(
+            handler.should_process_message(1000, false, false, 100, false),
+            ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn human_mentioning_this_bot_is_allowed() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: true,
+                agent: None,
+            },
+        );
+        let handler = test_handler_with_bot_id(channels, 9999);
+
+        assert_eq!(
+            handler.should_process_message(1000, false, false, 100, true),
+            ReceiveDecision::Accept { reset_chain: true }
+        );
+    }
+
+    #[test]
+    fn human_mentioning_other_bot_only_is_ignored() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: true,
+                agent: None,
+            },
+        );
+        let handler = test_handler_with_bot_id(channels, 9999);
+
+        // mentions_bot=false: this bot is not mentioned (other bot mentioned instead)
+        assert_eq!(
+            handler.should_process_message(1000, false, false, 100, false),
+            ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn accepted_human_message_resets_bot_chain() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        // Build up chain depth
+        for _ in 0..3 {
+            assert!(handler.chain_state.check_and_increment(100));
+        }
+
+        // Human message should request chain reset
+        assert_eq!(
+            handler.should_process_message(1000, false, true, 100, false),
+            ReceiveDecision::Accept { reset_chain: true }
+        );
+
+        // Simulate the reset (as Handler::message() would)
+        handler.chain_state.reset(100);
+
+        // Next bot message should start at depth 1
+        assert!(
+            handler.chain_state.check_and_increment(100),
+            "after human message resets chain, bot should start at depth 1"
+        );
+    }
+
+    #[test]
+    fn bot_mentioning_this_bot_is_allowed_within_depth() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        assert_eq!(
+            handler.should_process_message(1111, true, false, 200, true),
+            ReceiveDecision::Accept { reset_chain: false }
+        );
+    }
+
+    #[test]
+    fn bot_without_this_bot_mention_is_ignored() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        assert_eq!(
+            handler.should_process_message(1111, true, false, 100, false),
+            ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn bot_mentioning_this_bot_is_ignored_after_depth_limit() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert_eq!(
+                handler.should_process_message(1111, true, false, 200, true),
+                ReceiveDecision::Accept { reset_chain: false }
+            );
+        }
+
+        assert_eq!(
+            handler.should_process_message(1111, true, false, 200, true),
+            ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn text_slash_command_keeps_existing_pre_mention_behavior() {
+        let handler = test_handler_with_bot_id(HashMap::new(), 9999);
+
+        // Bot messages are rejected by sender-type judgment regardless of content
+        assert_eq!(
+            handler.should_process_message(1111, true, false, 100, false),
+            ReceiveDecision::Reject
+        );
+
+        // Slash commands are recognized independently and processed
+        // before should_process_message in the Handler::message() flow
+        assert!(crate::slash_commands::is_slash_command("/status"));
+        assert!(crate::slash_commands::is_slash_command("/new"));
+    }
+
+    #[test]
+    fn discord_handlers_share_bot_chain_state() {
+        let shared = Arc::new(BotChainState::new());
+
+        let handler1 = test_handler_with_chain(HashMap::new(), 1001, Arc::clone(&shared));
+        let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
+
+        assert_eq!(
+            handler1.should_process_message(1111, true, false, 500, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "handler1: first bot mention on channel 500 should be accepted"
+        );
+
+        assert_eq!(
+            handler2.should_process_message(3333, true, false, 500, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "handler2: second bot mention on same channel 500 should see depth 2"
+        );
+
+        for _ in 2..BOT_CHAIN_MAX_DEPTH {
+            assert!(
+                shared.check_and_increment(500),
+                "should allow up to max depth"
+            );
+        }
+
+        assert!(
+            !shared.check_and_increment(500),
+            "shared state should track cumulative depth across handlers"
+        );
+    }
+
+    #[test]
+    fn discord_handlers_keep_chain_state_per_thread() {
+        let shared = Arc::new(BotChainState::new());
+
+        let handler1 = test_handler_with_chain(HashMap::new(), 1001, Arc::clone(&shared));
+
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert_eq!(
+                handler1.should_process_message(1111, true, false, 100, true),
+                ReceiveDecision::Accept { reset_chain: false },
+                "fill channel 100 to max depth"
+            );
+        }
+
+        assert!(
+            !shared.check_and_increment(100),
+            "channel 100 should be at max"
+        );
+
+        let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
+        assert_eq!(
+            handler2.should_process_message(3333, true, false, 200, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "channel 200 should be independent and start at depth 1"
+        );
     }
 }
