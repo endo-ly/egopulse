@@ -710,12 +710,14 @@ fn interaction_to_command_text(
 }
 
 /// Starts a Discord bot with agent routing configured.
+#[allow(private_interfaces)]
 pub async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
     default_agent: &crate::config::AgentId,
     channels: &HashMap<u64, DiscordChannelConfig>,
+    chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
@@ -732,7 +734,7 @@ pub async fn start_discord_bot_for_bot(
         default_agent: default_agent.to_string(),
         channels: channels.clone(),
         bot_user_id: OnceLock::new(),
-        chain_state: Arc::new(BotChainState::new()),
+        chain_state,
     };
 
     let mut client = Client::builder(token, intents)
@@ -818,6 +820,37 @@ mod tests {
             channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
+        }
+    }
+
+    fn test_handler_with_chain(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        bot_user_id: u64,
+        chain_state: Arc<BotChainState>,
+    ) -> Handler {
+        let lock = OnceLock::new();
+        lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
+        Handler {
+            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
+                tempfile::tempdir()
+                    .expect("tempdir")
+                    .path()
+                    .to_str()
+                    .expect("utf8")
+                    .to_string(),
+                Box::new(crate::agent_loop::turn::FakeProvider {
+                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    }]),
+                }),
+            )),
+            bot_id: "bot_a".to_string(),
+            default_agent: "developer".to_string(),
+            channels,
+            bot_user_id: lock,
+            chain_state,
         }
     }
 
@@ -1333,5 +1366,64 @@ mod tests {
         // before should_process_message in the Handler::message() flow
         assert!(crate::slash_commands::is_slash_command("/status"));
         assert!(crate::slash_commands::is_slash_command("/new"));
+    }
+
+    #[test]
+    fn discord_handlers_share_bot_chain_state() {
+        let shared = Arc::new(BotChainState::new());
+
+        let handler1 = test_handler_with_chain(HashMap::new(), 1001, Arc::clone(&shared));
+        let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
+
+        assert_eq!(
+            handler1.should_process_message(1111, true, false, 500, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "handler1: first bot mention on channel 500 should be accepted"
+        );
+
+        assert_eq!(
+            handler2.should_process_message(3333, true, false, 500, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "handler2: second bot mention on same channel 500 should see depth 2"
+        );
+
+        for _ in 2..BOT_CHAIN_MAX_DEPTH {
+            assert!(
+                shared.check_and_increment(500),
+                "should allow up to max depth"
+            );
+        }
+
+        assert!(
+            !shared.check_and_increment(500),
+            "shared state should track cumulative depth across handlers"
+        );
+    }
+
+    #[test]
+    fn discord_handlers_keep_chain_state_per_thread() {
+        let shared = Arc::new(BotChainState::new());
+
+        let handler1 = test_handler_with_chain(HashMap::new(), 1001, Arc::clone(&shared));
+
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert_eq!(
+                handler1.should_process_message(1111, true, false, 100, true),
+                ReceiveDecision::Accept { reset_chain: false },
+                "fill channel 100 to max depth"
+            );
+        }
+
+        assert!(
+            !shared.check_and_increment(100),
+            "channel 100 should be at max"
+        );
+
+        let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
+        assert_eq!(
+            handler2.should_process_message(3333, true, false, 200, true),
+            ReceiveDecision::Accept { reset_chain: false },
+            "channel 200 should be independent and start at depth 1"
+        );
     }
 }
