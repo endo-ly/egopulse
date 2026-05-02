@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -38,6 +40,73 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
+
+/// Bot-to-bot chain maximum depth per channel/thread.
+#[allow(dead_code)]
+const BOT_CHAIN_MAX_DEPTH: u32 = 5;
+
+/// Bot-to-bot chain state TTL in seconds.
+#[allow(dead_code)]
+const BOT_CHAIN_TTL_SECS: u64 = 300;
+
+#[allow(dead_code)]
+struct ChainEntry {
+    depth: u32,
+    last_updated: Instant,
+}
+
+#[allow(dead_code)]
+pub(crate) struct BotChainState {
+    ttl: Duration,
+    chains: Mutex<HashMap<u64, ChainEntry>>,
+}
+
+#[allow(dead_code)]
+impl BotChainState {
+    pub(crate) fn new() -> Self {
+        Self::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS))
+    }
+
+    pub(crate) fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            chains: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn check_and_increment(&self, channel_id: u64) -> bool {
+        let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
+        let now = Instant::now();
+
+        let entry = chains.get_mut(&channel_id);
+        match entry {
+            Some(e) if now.duration_since(e.last_updated) < self.ttl => {
+                if e.depth >= BOT_CHAIN_MAX_DEPTH {
+                    false
+                } else {
+                    e.depth += 1;
+                    e.last_updated = now;
+                    true
+                }
+            }
+            Some(_) | None => {
+                chains.insert(
+                    channel_id,
+                    ChainEntry {
+                        depth: 1,
+                        last_updated: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    pub(crate) fn reset(&self, channel_id: u64) {
+        let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
+        chains.remove(&channel_id);
+    }
+}
 
 /// Sends outbound messages to Discord via the REST API.
 pub struct DiscordAdapter {
@@ -947,5 +1016,78 @@ mod tests {
         // Act & Assert
         assert!(!handler.guild_allowed(999));
         assert!(handler.guild_allowed(100));
+    }
+
+    // --- BotChainState tests ---
+
+    #[test]
+    fn bot_chain_starts_at_one() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        assert!(
+            state.check_and_increment(100),
+            "first call should be allowed"
+        );
+    }
+
+    #[test]
+    fn bot_chain_allows_at_max_depth() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(
+                state.check_and_increment(200),
+                "should be allowed up to and including max depth"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_chain_rejects_after_max_depth() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(state.check_and_increment(300));
+        }
+        assert!(
+            !state.check_and_increment(300),
+            "should reject after exceeding max depth"
+        );
+    }
+
+    #[test]
+    fn bot_chain_resets_on_human_message() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        assert!(state.check_and_increment(400));
+        assert!(state.check_and_increment(400));
+        state.reset(400);
+        assert!(
+            state.check_and_increment(400),
+            "after reset, should start fresh at depth 1"
+        );
+    }
+
+    #[test]
+    fn bot_chain_ttl_expiry_restarts_at_one() {
+        let state = BotChainState::with_ttl(Duration::from_millis(1));
+        assert!(state.check_and_increment(500));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            state.check_and_increment(500),
+            "after TTL expiry, should restart at depth 1"
+        );
+    }
+
+    #[test]
+    fn bot_chain_scopes_by_thread_id() {
+        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
+        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+            assert!(state.check_and_increment(600));
+        }
+        assert!(
+            state.check_and_increment(700),
+            "different channel_id should have independent state"
+        );
+        assert!(
+            !state.check_and_increment(600),
+            "original channel should still be at max"
+        );
     }
 }
