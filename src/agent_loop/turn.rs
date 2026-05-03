@@ -929,11 +929,10 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
 #[cfg(test)]
 pub(crate) fn test_config_with_compaction(
     state_root: String,
-    max_session_messages: usize,
+    _max_session_messages: usize,
     compact_keep_recent: usize,
 ) -> crate::config::Config {
     let mut config = crate::test_util::test_config(&state_root);
-    config.max_session_messages = max_session_messages;
     config.compact_keep_recent = compact_keep_recent;
     config
 }

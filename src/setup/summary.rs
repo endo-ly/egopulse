@@ -148,12 +148,21 @@ pub(crate) fn save_config(
     let preset_default_model = preset
         .map(|p| p.default_model.to_string())
         .unwrap_or_else(|| model.clone());
-    let preset_models: Vec<String> = preset
-        .map(|p| p.models.iter().map(|m| (*m).to_string()).collect())
+    let preset_models: std::collections::HashMap<String, crate::config::ModelConfig> = preset
+        .map(|p| {
+            p.models
+                .iter()
+                .map(|m| ((*m).to_string(), crate::config::ModelConfig::default()))
+                .collect()
+        })
         .unwrap_or_else(|| {
-            let mut m = vec![model.clone()];
-            if m[0] != preset_default_model {
-                m.insert(0, preset_default_model.clone());
+            let mut m = std::collections::HashMap::new();
+            m.insert(model.clone(), crate::config::ModelConfig::default());
+            if !m.contains_key(&preset_default_model) {
+                m.insert(
+                    preset_default_model.clone(),
+                    crate::config::ModelConfig::default(),
+                );
             }
             m
         });
@@ -236,8 +245,10 @@ pub(crate) fn save_config(
         log_level: "info".to_string(),
         compaction_timeout_secs: 180,
         max_history_messages: 50,
-        max_session_messages: 40,
         compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
         channels,
         default_agent: crate::config::AgentId::new("default"),
         agents,

@@ -29,15 +29,20 @@ pub fn test_config(state_root: &str) -> Config {
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
                 default_model: "gpt-4o-mini".to_string(),
-                models: vec!["gpt-4o-mini".to_string()],
+                models: std::collections::HashMap::from([(
+                    "gpt-4o-mini".to_string(),
+                    crate::config::ModelConfig::default(),
+                )]),
             },
         )]),
         state_root: state_root.to_string(),
         log_level: "info".to_string(),
         compaction_timeout_secs: 180,
         max_history_messages: 50,
-        max_session_messages: 40,
         compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
         channels: std::collections::HashMap::from([(
             ChannelName::new("web"),
             ChannelConfig {

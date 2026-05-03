@@ -229,13 +229,14 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                         if trimmed.is_empty() {
                             None
                         } else {
-                            Some(trimmed.to_string())
+                            Some((trimmed.to_string(), crate::config::ModelConfig::default()))
                         }
                     })
                     .collect();
-                if !existing.models.contains(&final_default) {
-                    existing.models.push(final_default);
-                }
+                existing
+                    .models
+                    .entry(final_default)
+                    .or_insert_with(crate::config::ModelConfig::default);
             }
             let env_name = provider_api_key_env_name(&id);
             apply_api_key_update(&mut existing.api_key, update.api_key, &env_name);
@@ -265,13 +266,13 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                     if trimmed.is_empty() {
                         None
                     } else {
-                        Some(trimmed.to_string())
+                        Some((trimmed.to_string(), crate::config::ModelConfig::default()))
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect::<std::collections::HashMap<_, _>>();
 
-            if !models.contains(&default_model) {
-                models.push(default_model.clone());
+            if !models.contains_key(&default_model) {
+                models.insert(default_model.clone(), crate::config::ModelConfig::default());
             }
 
             let mut api_key = None;
@@ -398,7 +399,7 @@ fn payload_from_config(
             label: provider.label.clone(),
             base_url: provider.base_url.clone(),
             default_model: provider.default_model.clone(),
-            models: provider.models.clone(),
+            models: provider.models.keys().cloned().collect(),
             has_api_key: provider.api_key.is_some(),
         })
         .collect::<Vec<_>>();

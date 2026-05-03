@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use url::Url;
 
+use super::ModelConfig;
 use super::secret_ref::{
     ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, dotenv_path,
     read_dotenv, resolve_string_or_ref,
@@ -24,13 +25,21 @@ where
     Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
 }
 
+/// Deserialization helper that accepts both old list format and new map format for models.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FileModels {
+    List(Vec<String>),
+    Map(HashMap<String, ModelConfig>),
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct FileProviderConfig {
     label: Option<String>,
     base_url: Option<String>,
     api_key: Option<StringOrRef>,
     default_model: Option<String>,
-    models: Option<Vec<String>>,
+    models: Option<FileModels>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -84,8 +93,10 @@ struct FileConfig {
     log_level: Option<String>,
     compaction_timeout_secs: Option<u64>,
     max_history_messages: Option<usize>,
-    max_session_messages: Option<usize>,
     compact_keep_recent: Option<usize>,
+    default_context_window_tokens: Option<usize>,
+    compaction_threshold_ratio: Option<f64>,
+    compaction_target_ratio: Option<f64>,
     channels: Option<HashMap<String, FileChannelConfig>>,
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
@@ -109,8 +120,10 @@ pub(super) fn build_config(
         log_level: file_log_level,
         compaction_timeout_secs: file_compaction_timeout_secs,
         max_history_messages: file_max_history_messages,
-        max_session_messages: file_max_session_messages,
         compact_keep_recent: file_compact_keep_recent,
+        default_context_window_tokens: file_default_context_window_tokens,
+        compaction_threshold_ratio: file_compaction_threshold_ratio,
+        compaction_target_ratio: file_compaction_target_ratio,
         channels: file_channels,
         default_agent: file_default_agent,
         agents: file_agents,
@@ -143,10 +156,14 @@ pub(super) fn build_config(
         .unwrap_or_else(super::resolve::default_compaction_timeout_secs);
     let max_history_messages =
         file_max_history_messages.unwrap_or_else(super::resolve::default_max_history_messages);
-    let max_session_messages =
-        file_max_session_messages.unwrap_or_else(super::resolve::default_max_session_messages);
     let compact_keep_recent =
         file_compact_keep_recent.unwrap_or_else(super::resolve::default_compact_keep_recent);
+    let default_context_window_tokens = file_default_context_window_tokens
+        .unwrap_or(super::resolve::default_context_window_tokens());
+    let compaction_threshold_ratio = file_compaction_threshold_ratio
+        .unwrap_or(super::resolve::default_compaction_threshold_ratio());
+    let compaction_target_ratio =
+        file_compaction_target_ratio.unwrap_or(super::resolve::default_compaction_target_ratio());
 
     let mut channels = normalize_channels(file_channels.unwrap_or_default(), &dotenv)?;
     apply_web_channel_env_overrides(&mut channels);
@@ -174,8 +191,10 @@ pub(super) fn build_config(
         log_level,
         compaction_timeout_secs,
         max_history_messages,
-        max_session_messages,
         compact_keep_recent,
+        default_context_window_tokens,
+        compaction_threshold_ratio,
+        compaction_target_ratio,
         channels,
         default_agent,
         agents,
@@ -465,14 +484,18 @@ fn normalize_provider_map(
             }
         })?;
 
-        let mut models = file_provider
-            .models
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|model| normalize_string(Some(model)))
-            .collect::<Vec<_>>();
-        if !models.iter().any(|model| model == &default_model) {
-            models.insert(0, default_model.clone());
+        let models = match file_provider.models {
+            Some(FileModels::Map(map)) => map,
+            Some(FileModels::List(list)) => list
+                .into_iter()
+                .filter_map(|model| normalize_string(Some(model)))
+                .map(|m| (m, ModelConfig::default()))
+                .collect(),
+            None => HashMap::new(),
+        };
+        let mut models = models;
+        if !models.contains_key(&default_model) {
+            models.insert(default_model.clone(), ModelConfig::default());
         }
 
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
@@ -517,15 +540,48 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
             "max_history_messages must be at least 1".to_string(),
         ));
     }
-    if config.max_session_messages == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "max_session_messages must be at least 1".to_string(),
-        ));
-    }
     if config.compact_keep_recent == 0 {
         return Err(ConfigError::InvalidCompactionConfig(
             "compact_keep_recent must be at least 1".to_string(),
         ));
+    }
+    if config.compaction_threshold_ratio <= 0.0 || config.compaction_threshold_ratio > 1.0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compaction_threshold_ratio must be between 0 (exclusive) and 1.0 (inclusive)"
+                .to_string(),
+        ));
+    }
+    if config.compaction_target_ratio <= 0.0 || config.compaction_target_ratio > 1.0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compaction_target_ratio must be between 0 (exclusive) and 1.0 (inclusive)".to_string(),
+        ));
+    }
+    if config.compaction_target_ratio >= config.compaction_threshold_ratio {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "compaction_target_ratio must be less than compaction_threshold_ratio".to_string(),
+        ));
+    }
+    if config.default_context_window_tokens == 0 {
+        return Err(ConfigError::InvalidCompactionConfig(
+            "default_context_window_tokens must be at least 1".to_string(),
+        ));
+    }
+    const MAX_DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
+    if config.default_context_window_tokens > MAX_DEFAULT_CONTEXT_WINDOW_TOKENS {
+        return Err(ConfigError::InvalidCompactionConfig(format!(
+            "default_context_window_tokens must not exceed {MAX_DEFAULT_CONTEXT_WINDOW_TOKENS}"
+        )));
+    }
+    for (provider_id, provider) in &config.providers {
+        for (model_name, model_config) in &provider.models {
+            if let Some(tokens) = model_config.context_window_tokens {
+                if tokens == 0 {
+                    return Err(ConfigError::InvalidCompactionConfig(format!(
+                        "context_window_tokens for {provider_id}/{model_name} must be at least 1"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }

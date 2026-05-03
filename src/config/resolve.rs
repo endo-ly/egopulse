@@ -299,6 +299,18 @@ impl Config {
         self.runtime_dir().join("status.json")
     }
 
+    /// Resolves the context window for a given provider+model pair.
+    ///
+    /// Falls back to `default_context_window_tokens` when the model entry
+    /// has no explicit `context_window_tokens`.
+    pub fn resolve_context_window_tokens(&self, provider_id: &ProviderId, model: &str) -> usize {
+        self.providers
+            .get(provider_id)
+            .and_then(|provider| provider.models.get(model))
+            .and_then(|model_config| model_config.context_window_tokens)
+            .unwrap_or(self.default_context_window_tokens)
+    }
+
     /// Atomically writes the current config to a YAML file.
     ///
     /// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
@@ -394,8 +406,16 @@ pub(super) fn default_max_history_messages() -> usize {
     50
 }
 
-pub(super) fn default_max_session_messages() -> usize {
-    40
+pub(super) fn default_context_window_tokens() -> usize {
+    32768
+}
+
+pub(super) fn default_compaction_threshold_ratio() -> f64 {
+    0.80
+}
+
+pub(super) fn default_compaction_target_ratio() -> f64 {
+    0.40
 }
 
 pub(super) fn default_compact_keep_recent() -> usize {

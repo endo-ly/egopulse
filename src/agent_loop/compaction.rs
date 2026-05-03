@@ -16,7 +16,9 @@ pub(crate) async fn maybe_compact_messages(
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    if messages.len() <= state.config.max_session_messages {
+    // Safety compaction threshold will be token-based (Step 2).
+    // Until then, use a high message count to effectively disable old compaction.
+    if messages.len() <= 9999 {
         return Ok(messages.to_vec());
     }
 
