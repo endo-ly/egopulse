@@ -402,8 +402,8 @@ mod tests {
 
     #[test]
     fn resolve_auth_prefers_env_var() {
-        clear_auth_cache();
         let _guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "env-token-xyz");
+        clear_auth_cache();
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "env-token-xyz");
         assert!(auth.account_id.is_none());
@@ -411,7 +411,6 @@ mod tests {
 
     #[test]
     fn resolve_auth_reads_access_token() {
-        clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("auth.json"),
@@ -420,6 +419,7 @@ mod tests {
         .expect("write");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "file-access-token");
@@ -428,7 +428,6 @@ mod tests {
 
     #[test]
     fn resolve_auth_falls_back_to_openai_api_key() {
-        clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("auth.json"),
@@ -437,6 +436,7 @@ mod tests {
         .expect("write");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "sk-fallback-key");
@@ -445,10 +445,10 @@ mod tests {
 
     #[test]
     fn resolve_auth_errors_when_no_source() {
-        clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let result = resolve_codex_auth();
         assert!(result.is_err());
@@ -522,7 +522,6 @@ mod tests {
 
     #[test]
     fn cache_returns_same_value_within_ttl() {
-        clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("auth.json"),
@@ -531,6 +530,7 @@ mod tests {
         .expect("write");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let first = resolve_codex_auth().expect("first");
         assert_eq!(first.bearer_token, "cached-token");
@@ -547,7 +547,6 @@ mod tests {
 
     #[test]
     fn cache_bypassed_for_env_var() {
-        clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("auth.json"),
@@ -557,11 +556,13 @@ mod tests {
         {
             let _guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "")
                 .also_set("CODEX_HOME", dir.path());
+            clear_auth_cache();
             let file_auth = resolve_codex_auth().expect("file");
             assert_eq!(file_auth.bearer_token, "file-token");
         }
 
         let _env_guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "env-override");
+        clear_auth_cache();
         let env_auth = resolve_codex_auth().expect("env");
         assert_eq!(env_auth.bearer_token, "env-override");
     }

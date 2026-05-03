@@ -569,11 +569,11 @@ mod tests {
     #[test]
     fn test_collect_config_secrets_extracts_codex_bearer_token() {
         // Arrange
-        crate::codex_auth::clear_auth_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard = EnvVarGuard::set("HOME", dir.path())
             .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
             .also_set("CODEX_HOME", "");
+        crate::codex_auth::clear_auth_cache();
 
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
