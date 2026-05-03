@@ -48,10 +48,17 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
 
 /// Truncate a string to `max_chars` characters, appending `"..."` if truncated.
 pub fn truncate_by_chars(value: &str, max_chars: usize) -> String {
-    let mut result: String = value.chars().take(max_chars).collect();
-    if value.chars().count() > max_chars {
-        result.push_str("...");
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
     }
+
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+
+    let mut result: String = value.chars().take(max_chars - 3).collect();
+    result.push_str("...");
     result
 }
 

@@ -641,7 +641,7 @@ impl EventHandler for Handler {
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     let http = &ctx.http;
-    let _ = crate::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
+    if let Err(error) = crate::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
         let msg = CreateMessage::new()
             .content(chunk)
             .allowed_mentions(CreateAllowedMentions::new());
@@ -654,7 +654,14 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
                 .map_err(|e| format!("Discord: failed to send message chunk: {e}"))
         })
     })
-    .await;
+    .await
+    {
+        error!(
+            channel_id = channel_id.get(),
+            error = %error,
+            "Discord: failed to send chunked response"
+        );
+    }
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {

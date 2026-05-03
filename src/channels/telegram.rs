@@ -477,12 +477,21 @@ async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
         let bot = bot.clone();
         let chunk = chunk.to_string();
         Box::pin(async move {
-            if let Err(e) = bot.send_message(chat_id, &chunk).await {
-                warn!("Telegram: failed to send message chunk, retrying: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                bot.send_message(chat_id, &chunk).await.map_err(|e| {
-                    format!("Telegram: failed to send message chunk after retry: {e}")
-                })?;
+            match bot.send_message(chat_id, &chunk).await {
+                Ok(_) => {}
+                Err(teloxide::RequestError::RetryAfter(seconds)) => {
+                    warn!(
+                        retry_after = seconds.duration().as_secs(),
+                        "Telegram: rate limited while sending message chunk"
+                    );
+                    tokio::time::sleep(seconds.duration()).await;
+                    bot.send_message(chat_id, &chunk).await.map_err(|e| {
+                        format!("Telegram: failed to send message chunk after retry: {e}")
+                    })?;
+                }
+                Err(e) => {
+                    return Err(format!("Telegram: failed to send message chunk: {e}"));
+                }
             }
             Ok(())
         })
