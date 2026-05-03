@@ -44,8 +44,10 @@
 | `log_level` | `"info" \| "debug" \| "warn" \| "error"` | 任意 | `"info"` | ログ出力レベル |
 | `compaction_timeout_secs` | `u64` | 任意 | `180` | 履歴圧縮（compaction）時の LLM 呼び出しタイムアウト秒数 |
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
-| `max_session_messages` | `usize` | 任意 | `40` | 履歴圧縮をトリガーするメッセージ閾値 |
-| `compact_keep_recent` | `usize` | 任意 | `20` | 圧縮後に保持する直近メッセージ数 |
+| `default_context_window_tokens` | `usize` | 任意 | `32768` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
+| `compaction_threshold_ratio` | `f64` | 任意 | `0.80` | 推定 prompt tokens が usable context のこの割合に達したら compaction を発火。`(0, 1]` |
+| `compaction_target_ratio` | `f64` | 任意 | `0.40` | compaction 後の目標 token 量を usable context に対する割合で指定。threshold 未満 `(0, threshold)` |
+| `compact_keep_recent` | `usize` | 任意 | `20` | compaction 時に Tail としてそのまま保持する直近メッセージ数の下限 |
 
 ### 2.2 プロバイダー定義（`providers.<id>`）
 
@@ -57,7 +59,13 @@
 | `base_url` | `string` | **必須** | OpenAI 互換 API エンドポイント URL |
 | `api_key` | `string \| SecretRef \| null` | 条件付き | API 認証キー。`localhost` 系および `openai-codex` プリセットでは不要（OAuth セッショントークンを自動利用）。SecretRef 使用可能（後述）。秘匿フィールド |
 | `default_model` | `string` | **必須** | このプロバイダーのデフォルトモデル |
-| `models` | `[string]` | 任意 | 利用可能なモデル一覧。UI のドロップダウン等で使用 |
+| `models` | `map<string, ModelConfig>` または `[string]` | 任意 | 利用可能なモデル一覧。map 形式の場合、各モデルにメタデータを設定可能。配列形式（文字列リスト）も後方互換でサポート |
+
+#### `ModelConfig` のフィールド
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
 
 ### 2.3 Web チャネル（`channels.web`）
 
@@ -135,7 +143,9 @@ agents:
 log_level: info
 compaction_timeout_secs: 180
 max_history_messages: 50
-max_session_messages: 40
+default_context_window_tokens: 32768
+compaction_threshold_ratio: 0.80
+compaction_target_ratio: 0.40
 compact_keep_recent: 20
 
 # プロバイダー定義
@@ -146,9 +156,12 @@ providers:
     api_key: sk-or-v1-xxxxxxxxxxxxx
     default_model: anthropic/claude-sonnet-4
     models:
-      - anthropic/claude-sonnet-4
-      - google/gemini-2.5-pro
-      - openai/gpt-4.1
+      anthropic/claude-sonnet-4:
+        context_window_tokens: 200000
+      google/gemini-2.5-pro:
+        context_window_tokens: 1048576
+      openai/gpt-4.1:
+        context_window_tokens: 1047576
   ollama:
     label: Ollama (Local)
     base_url: http://localhost:11434/v1
@@ -374,7 +387,7 @@ SecretRef 解決は以下の 2 層で構成される。
 
 ### ウィザードで設定できないフィールド
 
-- `log_level`, `compaction_*`, `max_*`
+- `log_level`, `compaction_*`, `max_*`, `default_context_window_tokens`
 - `channels.web.host`, `channels.web.port`, `channels.web.allowed_origins`
 - 各チャネルの `provider` / `model` オーバーライド
 - チャネル別アクセス制御（`channels`, `chats`）
