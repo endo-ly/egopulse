@@ -73,6 +73,16 @@ pub async fn process_slash_command(
         return SlashCommandOutcome::NotHandled;
     }
 
+    let command_name = extract_command_name(text);
+    let needs_chat_id = matches!(command_name, Some("/new" | "/compact" | "/status"));
+
+    if !needs_chat_id {
+        let response = handle_slash_command(state, 0, context, text, sender_id)
+            .await
+            .unwrap_or_else(unknown_command_response);
+        return SlashCommandOutcome::Respond(response);
+    }
+
     match resolve_chat_id(state, context).await {
         Ok(chat_id) => {
             let response = handle_slash_command(state, chat_id, context, text, sender_id)
@@ -85,6 +95,16 @@ pub async fn process_slash_command(
             SlashCommandOutcome::Error("An error occurred processing the command.".to_string())
         }
     }
+}
+
+fn extract_command_name(text: &str) -> Option<&str> {
+    let normalized = normalized_slash_command(text)?;
+    let bare = normalized
+        .split_once('@')
+        .map(|(cmd, _)| cmd)
+        .unwrap_or(normalized);
+    let lower = bare.split_whitespace().next()?;
+    Some(lower)
 }
 
 /// スラッシュコマンドを実行し、結果メッセージを返す。

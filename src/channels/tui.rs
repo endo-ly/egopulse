@@ -4,6 +4,7 @@
 //! ローカル対話を 1 つの端末 UI で扱う。
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -25,7 +26,7 @@ use crate::agent_loop;
 use crate::agent_loop::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
 use crate::runtime::AppState;
-use crate::storage::SessionSummary;
+use crate::storage::{SessionSummary, call_blocking};
 
 /// Owns terminal setup and teardown for the TUI lifecycle.
 struct TuiSession {
@@ -203,11 +204,22 @@ impl TuiApp {
     }
 
     async fn open_session(&mut self, summary: SessionSummary) -> Result<(), EgoPulseError> {
+        let chat_info = call_blocking(Arc::clone(&self.state.db), {
+            let chat_id = summary.chat_id;
+            move |db| db.get_chat_by_id(chat_id)
+        })
+        .await?
+        .ok_or_else(|| {
+            EgoPulseError::Storage(crate::error::StorageError::NotFound(
+                "chat not found".to_string(),
+            ))
+        })?;
+
         let context = SurfaceContext::new(
-            summary.channel.clone(),
+            chat_info.channel,
             "local_user".to_string(),
             summary.surface_thread.clone(),
-            summary.channel,
+            chat_info.chat_type,
             self.state.config.default_agent.to_string(),
         );
         let messages = agent_loop::load_session_messages(&self.state, &context).await?;
@@ -398,6 +410,11 @@ async fn run_loop(
                             .await
                             {
                                 crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+                                    if crate::slash_commands::is_slash_command(&prompt)
+                                        && prompt.trim_start().starts_with("/new")
+                                    {
+                                        chat.messages.clear();
+                                    }
                                     chat.messages.push(RenderedMessage {
                                         role: "user".to_string(),
                                         content: prompt.clone(),

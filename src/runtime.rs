@@ -119,17 +119,12 @@ impl AppState {
         resolved: &crate::config::ResolvedLlmConfig,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
         let key = resolved.cache_key();
-        {
-            let cache = self.llm_cache.lock().expect("llm_cache lock");
-            if let Some(provider) = cache.get(&key) {
-                return Ok(Arc::clone(provider));
-            }
+        let mut cache = self.llm_cache.lock().expect("llm_cache lock");
+        if let Some(provider) = cache.get(&key) {
+            return Ok(Arc::clone(provider));
         }
         let provider: Arc<dyn crate::llm::LlmProvider> = Arc::from(create_provider(resolved)?);
-        {
-            let mut cache = self.llm_cache.lock().expect("llm_cache lock");
-            cache.insert(key, Arc::clone(&provider));
-        }
+        cache.insert(key, Arc::clone(&provider));
         Ok(provider)
     }
 }
