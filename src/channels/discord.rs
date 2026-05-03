@@ -47,6 +47,8 @@ const BOT_CHAIN_MAX_DEPTH: u32 = 5;
 /// Bot-to-bot chain state TTL in seconds.
 const BOT_CHAIN_TTL_SECS: u64 = 300;
 
+const DISCORD_ALLOWED_MENTIONS_MAX_USERS: usize = 100;
+
 struct ChainEntry {
     depth: u32,
     last_updated: Instant,
@@ -166,9 +168,13 @@ impl ChannelAdapter for DiscordAdapter {
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
         for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
+            let mentioned_users = extract_user_mention_ids(&chunk);
             let body = json!({
                 "content": chunk,
-                "allowed_mentions": { "parse": [] },
+                "allowed_mentions": {
+                    "parse": [],
+                    "users": mentioned_users,
+                },
             });
             send_discord_api(&self.http_client, |client| {
                 client
@@ -215,7 +221,13 @@ impl ChannelAdapter for DiscordAdapter {
             let mut form = Form::new().part("file", part);
 
             if !content.is_empty() {
-                let payload = json!({ "content": content });
+                let payload = json!({
+                    "content": content,
+                    "allowed_mentions": {
+                        "parse": [],
+                        "users": extract_user_mention_ids(content),
+                    },
+                });
                 form = form.text("payload_json", payload.to_string());
             }
 
@@ -642,9 +654,10 @@ impl EventHandler for Handler {
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     let http = &ctx.http;
     if let Err(error) = crate::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
+        let mentioned_users = extract_user_mention_ids(chunk);
         let msg = CreateMessage::new()
             .content(chunk)
-            .allowed_mentions(CreateAllowedMentions::new());
+            .allowed_mentions(CreateAllowedMentions::new().users(mentioned_users));
         let http = http.clone();
         Box::pin(async move {
             channel_id
@@ -662,6 +675,41 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
             "Discord: failed to send chunked response"
         );
     }
+}
+
+fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+
+    while ids.len() < DISCORD_ALLOWED_MENTIONS_MAX_USERS {
+        let Some(start) = rest.find("<@") else {
+            break;
+        };
+        rest = &rest[start + 2..];
+
+        if let Some(after_bang) = rest.strip_prefix('!') {
+            rest = after_bang;
+        }
+
+        let Some(end) = rest.find('>') else {
+            break;
+        };
+
+        let raw_id = &rest[..end];
+        if !raw_id.is_empty()
+            && raw_id.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(id) = raw_id.parse::<u64>()
+        {
+            let user_id = UserId::new(id);
+            if !ids.contains(&user_id) {
+                ids.push(user_id);
+            }
+        }
+
+        rest = &rest[end + 1..];
+    }
+
+    ids
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
@@ -898,6 +946,27 @@ mod tests {
         );
         assert_eq!(parse_discord_bot_id("12345"), None);
         assert_eq!(parse_discord_bot_id("discord:123"), None);
+    }
+
+    #[test]
+    fn extract_user_mention_ids_accepts_standard_and_nickname_forms() {
+        let ids = extract_user_mention_ids("hi <@123> and <@!456>");
+
+        assert_eq!(ids, vec![UserId::new(123), UserId::new(456)]);
+    }
+
+    #[test]
+    fn extract_user_mention_ids_ignores_roles_everyone_and_invalid_values() {
+        let ids = extract_user_mention_ids("@everyone <@&789> <@abc> <@123");
+
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn extract_user_mention_ids_deduplicates_mentions() {
+        let ids = extract_user_mention_ids("<@123> <@!123> <@456>");
+
+        assert_eq!(ids, vec![UserId::new(123), UserId::new(456)]);
     }
 
     #[test]
