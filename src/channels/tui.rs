@@ -389,47 +389,32 @@ async fn run_loop(
                     }
                     PendingAction::SendMessage(prompt) => {
                         if let View::Chat(chat) = &mut app.view {
-                            if crate::slash_commands::is_slash_command(&prompt) {
-                                chat.messages.push(RenderedMessage {
-                                    role: "user".to_string(),
-                                    content: prompt.clone(),
-                                });
-                                chat.conversation_scroll = 0;
-                                let slash_chat_id = crate::agent_loop::session::resolve_chat_id(
-                                    &app.state,
-                                    &chat.context,
-                                )
-                                .await;
-
-                                match slash_chat_id {
-                                    Ok(chat_id) => {
-                                        if let Some(response) =
-                                            crate::slash_commands::handle_slash_command(
-                                                &app.state,
-                                                chat_id,
-                                                &chat.context,
-                                                &prompt,
-                                                None,
-                                            )
-                                            .await
-                                        {
-                                            chat.messages.push(RenderedMessage {
-                                                role: "assistant".to_string(),
-                                                content: response,
-                                            });
-                                            chat.status = "Command applied".to_string();
-                                            chat.conversation_scroll = 0;
-                                        } else {
-                                            chat.status =
-                                                crate::slash_commands::unknown_command_response();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        chat.status = format!("Command error: {e}");
-                                    }
+                            match crate::slash_commands::process_slash_command(
+                                &app.state,
+                                &chat.context,
+                                &prompt,
+                                None,
+                            )
+                            .await
+                            {
+                                crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+                                    chat.messages.push(RenderedMessage {
+                                        role: "user".to_string(),
+                                        content: prompt.clone(),
+                                    });
+                                    chat.messages.push(RenderedMessage {
+                                        role: "assistant".to_string(),
+                                        content: response,
+                                    });
+                                    chat.status = "Command applied".to_string();
+                                    chat.conversation_scroll = 0;
                                 }
-                            } else {
-                                start_send(app, prompt);
+                                crate::slash_commands::SlashCommandOutcome::Error(msg) => {
+                                    chat.status = msg;
+                                }
+                                crate::slash_commands::SlashCommandOutcome::NotHandled => {
+                                    start_send(app, prompt);
+                                }
                             }
                         }
                     }
