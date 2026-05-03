@@ -15,6 +15,7 @@ Responses API に似ているが完全互換ではないため、通常の OpenA
 | `response.completed.response.output` が空でも本文が生成されていることがある | 中間 SSE event の `response.output_text.delta` / `response.output_text.done` / `response.output_item.done` から本文や item を復元する |
 | text-only message を parts 配列にすると挙動差が出やすい | text-only は `content: "..."`、画像などがある場合だけ parts 配列にする |
 | tools 指定時の選択挙動を backend 任せにすると不安定になり得る | tools がある場合は `tool_choice: "auto"` を明示する |
+| `function_call_output` は同じ input 内の `function_call` と対応している必要がある | 孤立 tool output は `function_call_output` にせず履歴 context message として渡す。compaction は assistant tool call と直後の tool outputs を分断しない |
 | 空応答の原因が見えにくい | `status`, `output_items`, `input_tokens`, `output_tokens`, `reasoning_tokens`, `incomplete_reason` をエラー文に含める |
 
 ## Request Shape

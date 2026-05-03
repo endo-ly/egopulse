@@ -58,7 +58,7 @@ async fn summarize_and_compact(
         return Ok(messages.to_vec());
     }
 
-    let split_at = messages.len() - keep_recent;
+    let split_at = tool_safe_split_at(messages, messages.len() - keep_recent);
     let old_messages = &messages[..split_at];
     let recent_messages = &messages[split_at..];
 
@@ -235,6 +235,40 @@ pub(crate) fn truncate_compaction_summary_input(mut summary_input: String) -> St
     summary_input
 }
 
+pub(crate) fn tool_safe_split_at(messages: &[Message], preferred_split_at: usize) -> usize {
+    let mut split_at = preferred_split_at.min(messages.len());
+
+    while split_at < messages.len() && messages[split_at].role == "tool" {
+        let Some(tool_call_id) = messages[split_at].tool_call_id.as_deref() else {
+            split_at += 1;
+            continue;
+        };
+
+        let Some(parent_index) = find_tool_call_parent(messages, split_at, tool_call_id) else {
+            split_at += 1;
+            continue;
+        };
+
+        split_at = parent_index;
+    }
+
+    split_at
+}
+
+fn find_tool_call_parent(
+    messages: &[Message],
+    before_index: usize,
+    tool_call_id: &str,
+) -> Option<usize> {
+    messages[..before_index].iter().rposition(|message| {
+        message.role == "assistant"
+            && message
+                .tool_calls
+                .iter()
+                .any(|tool_call| tool_call.id == tool_call_id)
+    })
+}
+
 pub(crate) fn append_compacted_message(compacted: &mut Vec<Message>, message: &Message) {
     let Some(last) = compacted.last_mut() else {
         compacted.push(message.clone());
@@ -272,7 +306,7 @@ mod tests {
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
     use crate::error::LlmError;
-    use crate::llm::{Message, MessagesResponse};
+    use crate::llm::{Message, MessagesResponse, ToolCall};
     use crate::storage::call_blocking;
     use serial_test::serial;
     use std::sync::Arc;
@@ -292,6 +326,80 @@ mod tests {
 
         let expected = format!("{}\n... (truncated)", "a".repeat(19_999) + "あ");
         assert_eq!(truncated, expected);
+    }
+
+    #[test]
+    fn tool_safe_split_at_rewinds_from_tool_output_to_parent_call() {
+        let messages = vec![
+            Message::text("user", "old"),
+            assistant_tool_call("call_1"),
+            tool_output("call_1"),
+            Message::text("user", "next"),
+        ];
+
+        assert_eq!(tool_safe_split_at(&messages, 2), 1);
+    }
+
+    #[test]
+    fn tool_safe_split_at_keeps_multi_tool_call_block_together() {
+        let messages = vec![
+            Message::text("user", "old"),
+            Message {
+                role: "assistant".to_string(),
+                content: crate::llm::MessageContent::text(""),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_a".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "call_b".to_string(),
+                        name: "grep".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+                tool_call_id: None,
+            },
+            tool_output("call_a"),
+            tool_output("call_b"),
+            Message::text("assistant", "done"),
+        ];
+
+        assert_eq!(tool_safe_split_at(&messages, 3), 1);
+    }
+
+    #[test]
+    fn tool_safe_split_at_skips_orphan_tool_outputs() {
+        let messages = vec![
+            Message::text("user", "old"),
+            tool_output("call_missing"),
+            Message::text("user", "next"),
+        ];
+
+        assert_eq!(tool_safe_split_at(&messages, 1), 2);
+    }
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: crate::llm::MessageContent::text(""),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            tool_call_id: None,
+        }
+    }
+
+    fn tool_output(id: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: crate::llm::MessageContent::text("result"),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(id.to_string()),
+        }
     }
 
     #[tokio::test]
