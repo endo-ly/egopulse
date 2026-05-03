@@ -480,9 +480,9 @@ async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
             if let Err(e) = bot.send_message(chat_id, &chunk).await {
                 warn!("Telegram: failed to send message chunk, retrying: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                bot.send_message(chat_id, &chunk)
-                    .await
-                    .map_err(|e| format!("Telegram: failed to send message chunk after retry: {e}"))?;
+                bot.send_message(chat_id, &chunk).await.map_err(|e| {
+                    format!("Telegram: failed to send message chunk after retry: {e}")
+                })?;
             }
             Ok(())
         })

@@ -144,11 +144,7 @@ where
         let request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
         let response = channel_llm
-            .send_message(
-                &system_prompt,
-                request_messages,
-                Some(tool_defs.clone()),
-            )
+            .send_message(&system_prompt, request_messages, Some(tool_defs.clone()))
             .await
             .inspect_err(|e| {
                 warn!(error = %e, iteration, "LLM send_message failed");

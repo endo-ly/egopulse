@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::assets::AssetStore;
 use crate::channel_adapter::ChannelRegistry;
 use crate::config::{
     AgentConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId,
@@ -13,7 +14,6 @@ use crate::runtime::AppState;
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
-use crate::assets::AssetStore;
 
 /// テスト用の最小 Config を生成する。
 ///

@@ -523,10 +523,9 @@ fn build_tool_name_index(servers: &[ConnectedServer]) -> HashMap<String, (usize,
     for (server_idx, server) in servers.iter().enumerate() {
         for tool in &server.cached_tools {
             let sanitized = sanitize_tool_name(&server.name, tool.name.as_ref());
-            index.entry(sanitized).or_insert((
-                server_idx,
-                tool.name.to_string(),
-            ));
+            index
+                .entry(sanitized)
+                .or_insert((server_idx, tool.name.to_string()));
         }
     }
     index

@@ -51,13 +51,8 @@ impl SoulAgentsLoader {
         read_trimmed(&self.agents_dir.join(agent_id).join(file_name))
     }
 
-    fn cached_read_trimmed(
-        path: &Path,
-        cache: &Mutex<Option<CachedContent>>,
-    ) -> Option<String> {
-        let current_mtime = std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+    fn cached_read_trimmed(path: &Path, cache: &Mutex<Option<CachedContent>>) -> Option<String> {
+        let current_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         let mut guard = cache.lock().expect("soul_agents cache lock");
         if let (Some(cached), Some(mtime)) = (&*guard, current_mtime) {
             if cached.mtime == mtime {
