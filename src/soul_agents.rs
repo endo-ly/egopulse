@@ -1,7 +1,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 const DEFAULT_SOUL_MD: &str = include_str!("default_soul.md");
+
+struct CachedContent {
+    content: String,
+    mtime: SystemTime,
+}
 
 pub struct SoulAgentsLoader {
     state_root: PathBuf,
@@ -9,6 +16,8 @@ pub struct SoulAgentsLoader {
     agents_path: PathBuf,
     agents_dir: PathBuf,
     souls_dir: PathBuf,
+    soul_cache: Mutex<Option<CachedContent>>,
+    agents_cache: Mutex<Option<CachedContent>>,
 }
 
 impl SoulAgentsLoader {
@@ -19,6 +28,8 @@ impl SoulAgentsLoader {
             agents_path: config.agents_path(),
             agents_dir: PathBuf::from(&config.state_root).join("agents"),
             souls_dir: config.souls_dir(),
+            soul_cache: Mutex::new(None),
+            agents_cache: Mutex::new(None),
         }
     }
 
@@ -40,6 +51,29 @@ impl SoulAgentsLoader {
         read_trimmed(&self.agents_dir.join(agent_id).join(file_name))
     }
 
+    fn cached_read_trimmed(
+        path: &Path,
+        cache: &Mutex<Option<CachedContent>>,
+    ) -> Option<String> {
+        let current_mtime = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let mut guard = cache.lock().expect("soul_agents cache lock");
+        if let (Some(cached), Some(mtime)) = (&*guard, current_mtime) {
+            if cached.mtime == mtime {
+                return Some(cached.content.clone());
+            }
+        }
+        let content = read_trimmed(path)?;
+        if let Some(mtime) = current_mtime {
+            *guard = Some(CachedContent {
+                content: content.clone(),
+                mtime,
+            });
+        }
+        Some(content)
+    }
+
     fn load_base_soul(
         &self,
         channel_soul_path: Option<&str>,
@@ -58,7 +92,7 @@ impl SoulAgentsLoader {
             }
         }
 
-        read_trimmed(&self.soul_path)
+        Self::cached_read_trimmed(&self.soul_path, &self.soul_cache)
     }
 
     /// souls/ ディレクトリから名前指定で読み込み。
@@ -88,7 +122,7 @@ impl SoulAgentsLoader {
 
     /// グローバル AGENTS.md を読み込む
     pub fn load_global_agents(&self) -> Option<String> {
-        read_trimmed(&self.agents_path)
+        Self::cached_read_trimmed(&self.agents_path, &self.agents_cache)
     }
 
     pub fn build_soul_section(&self, content: &str, _channel: &str) -> String {
@@ -160,6 +194,8 @@ mod tests {
             agents_path: dir.join("AGENTS.md"),
             agents_dir: dir.join("agents"),
             souls_dir: dir.join("souls"),
+            soul_cache: Mutex::new(None),
+            agents_cache: Mutex::new(None),
         }
     }
 

@@ -156,7 +156,8 @@ pub(crate) async fn archive_conversation(
 ) {
     let groups_dir = groups_dir.to_path_buf();
     let channel = channel.to_string();
-    let messages = messages.to_vec();
+    let messages: std::sync::Arc<[Message]> =
+        std::sync::Arc::from(messages.to_vec().into_boxed_slice());
     let join_channel = channel.clone();
     let join_result = tokio::task::spawn_blocking(move || {
         archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages);

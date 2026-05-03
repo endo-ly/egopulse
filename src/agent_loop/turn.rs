@@ -137,6 +137,8 @@ where
     let mut declarative_retry_attempted = false;
     let mut retry_messages: Option<Vec<Message>> = None;
 
+    let tool_defs = state.tools.definitions_async().await;
+
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         emit_event(&on_event, AgentEvent::Iteration { iteration });
         let request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
@@ -145,7 +147,7 @@ where
             .send_message(
                 &system_prompt,
                 request_messages,
-                Some(state.tools.definitions_async().await),
+                Some(tool_defs.clone()),
             )
             .await
             .inspect_err(|e| {
@@ -901,46 +903,7 @@ impl RecordingProvider {
 
 #[cfg(test)]
 pub(crate) fn test_config(state_root: String) -> crate::config::Config {
-    use crate::config::{AgentConfig, AgentId, ChannelName, ProviderId};
-    crate::config::Config {
-        default_provider: ProviderId::new("openai"),
-        default_model: Some("gpt-4o-mini".to_string()),
-        providers: std::collections::HashMap::from([(
-            ProviderId::new("openai"),
-            crate::config::ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(crate::config::secret_ref::ResolvedValue::Literal(
-                    "sk-test".to_string(),
-                )),
-                default_model: "gpt-4o-mini".to_string(),
-                models: vec!["gpt-4o-mini".to_string()],
-            },
-        )]),
-        state_root,
-        log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
-        max_history_messages: 50,
-        max_session_messages: 40,
-        compact_keep_recent: 20,
-        channels: std::collections::HashMap::from([(
-            ChannelName::new("web"),
-            crate::config::ChannelConfig {
-                enabled: Some(true),
-                host: Some("127.0.0.1".to_string()),
-                port: Some(10961),
-                ..Default::default()
-            },
-        )]),
-        default_agent: AgentId::new("default"),
-        agents: std::collections::HashMap::from([(
-            AgentId::new("default"),
-            AgentConfig {
-                label: "Default Agent".to_string(),
-                ..Default::default()
-            },
-        )]),
-    }
+    crate::test_util::test_config(&state_root)
 }
 
 #[cfg(test)]
@@ -949,7 +912,7 @@ pub(crate) fn test_config_with_compaction(
     max_session_messages: usize,
     compact_keep_recent: usize,
 ) -> crate::config::Config {
-    let mut config = test_config(state_root);
+    let mut config = crate::test_util::test_config(&state_root);
     config.max_session_messages = max_session_messages;
     config.compact_keep_recent = compact_keep_recent;
     config
@@ -957,13 +920,7 @@ pub(crate) fn test_config_with_compaction(
 
 #[cfg(test)]
 pub(crate) fn cli_context(session: &str) -> SurfaceContext {
-    SurfaceContext {
-        channel: "cli".to_string(),
-        surface_user: "local_user".to_string(),
-        surface_thread: session.to_string(),
-        chat_type: "cli".to_string(),
-        agent_id: "default".to_string(),
-    }
+    crate::test_util::cli_context(session)
 }
 
 #[cfg(test)]

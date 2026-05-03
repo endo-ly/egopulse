@@ -172,9 +172,6 @@ impl Tool for GrepTool {
         if let Err(reason) = check_resolved_path(&resolved) {
             return ToolResult::error(reason);
         }
-        if !resolved.exists() {
-            return ToolResult::error(format!("Path not found: {}", resolved.display()));
-        }
 
         let limit = input
             .get("limit")
@@ -421,9 +418,6 @@ impl Tool for FindTool {
         };
         if let Err(reason) = check_resolved_path(&resolved) {
             return ToolResult::error(reason);
-        }
-        if !resolved.exists() {
-            return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
 
         let limit = input

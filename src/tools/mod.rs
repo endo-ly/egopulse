@@ -346,7 +346,7 @@ pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
-    use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
+    use crate::config::{ChannelConfig, ChannelName, Config};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
     use crate::test_env::EnvVarGuard;
@@ -384,44 +384,11 @@ mod tests {
     }
 
     fn test_config(state_root: &str) -> Config {
-        Config {
-            default_provider: ProviderId::new("local"),
-            default_model: Some("gpt-4o-mini".to_string()),
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("local"),
-                ProviderConfig {
-                    label: "Local".to_string(),
-                    base_url: "http://127.0.0.1:1234/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: vec!["gpt-4o-mini".to_string()],
-                },
-            )]),
-            state_root: state_root.to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels: std::collections::HashMap::from([(
-                ChannelName::new("web"),
-                ChannelConfig {
-                    enabled: Some(true),
-                    ..Default::default()
-                },
-            )]),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-        }
+        crate::test_util::test_config(state_root)
     }
 
     fn test_context() -> ToolExecutionContext {
-        ToolExecutionContext {
-            chat_id: 1,
-            channel: "cli".to_string(),
-            surface_thread: "demo".to_string(),
-            chat_type: "cli".to_string(),
-        }
+        crate::test_util::test_tool_context()
     }
 
     fn test_registry(config: &Config) -> ToolRegistry {

@@ -128,13 +128,11 @@ export function useStream({
           const delta = typeof payload.delta === "string" ? payload.delta : "";
           if (!delta) continue;
           setMessages((prev) => {
-            const existing = prev.find((item) => item.id === draftId);
-            if (existing) {
-              return prev.map((item) =>
-                item.id === draftId
-                  ? { ...item, content: item.content + delta }
-                  : item,
-              );
+            const idx = prev.findIndex((item) => item.id === draftId);
+            if (idx !== -1) {
+              const updated = [...prev];
+              updated[idx] = { ...updated[idx], content: updated[idx].content + delta };
+              return updated;
             }
             return [
               ...prev,
@@ -161,13 +159,11 @@ export function useStream({
             typeof payload.response === "string" ? payload.response : "";
           if (responseText) {
             setMessages((prev) => {
-              const existing = prev.find((item) => item.id === draftId);
-              if (existing) {
-                return prev.map((item) =>
-                  item.id === draftId
-                    ? { ...item, id: `${draftId}:done`, content: responseText }
-                    : item,
-                );
+              const idx = prev.findIndex((item) => item.id === draftId);
+              if (idx !== -1) {
+                const updated = [...prev];
+                updated[idx] = { ...updated[idx], id: `${draftId}:done`, content: responseText };
+                return updated;
               }
               return [
                 ...prev,
@@ -181,13 +177,13 @@ export function useStream({
               ];
             });
           } else {
-            setMessages((prev) =>
-              prev.map((item) =>
-                item.id === draftId
-                  ? { ...item, id: `${draftId}:done` }
-                  : item,
-              ),
-            );
+            setMessages((prev) => {
+              const idx = prev.findIndex((item) => item.id === draftId);
+              if (idx === -1) return prev;
+              const updated = [...prev];
+              updated[idx] = { ...updated[idx], id: `${draftId}:done` };
+              return updated;
+            });
           }
           setStatus({ tone: "ok", text: "Response received" });
           break;

@@ -434,7 +434,11 @@ async fn handle_message(
     let typing_bot = bot.clone();
     let typing_chat_id = msg.chat.id;
     let typing_handle = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             let _ = typing_bot
                 .send_chat_action(typing_chat_id, ChatAction::Typing)
                 .await;
