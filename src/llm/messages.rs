@@ -207,7 +207,7 @@ pub(crate) fn synthetic_tool_attachment_parts(content: &MessageContent) -> Vec<s
     })];
     if let MessageContent::Parts(items) = content {
         parts.extend(items.iter().filter_map(|part| match part {
-            MessageContentPart::InputText { .. } => None,
+            MessageContentPart::InputText { .. } | MessageContentPart::InputImageRef { .. } => None,
             MessageContentPart::InputImage { image_url, detail } => Some(serde_json::json!({
                 "type": "input_image",
                 "image_url": image_url,
@@ -278,6 +278,10 @@ fn chat_content_part(part: &MessageContentPart) -> serde_json::Value {
                 "detail": default_detail(detail),
             }
         }),
+        MessageContentPart::InputImageRef { .. } => serde_json::json!({
+            "type": "text",
+            "text": "[image reference - not hydrated]",
+        }),
     }
 }
 
@@ -291,6 +295,10 @@ fn responses_content_part(part: &MessageContentPart) -> serde_json::Value {
             "type": "input_image",
             "image_url": image_url,
             "detail": default_detail(detail),
+        }),
+        MessageContentPart::InputImageRef { .. } => serde_json::json!({
+            "type": "input_text",
+            "text": "[image reference - not hydrated]",
         }),
     }
 }

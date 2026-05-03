@@ -73,6 +73,19 @@ pub enum MessageContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// Asset-store reference used in session persistence.
+    ///
+    /// When a session snapshot is serialized to disk, `InputImage` parts are
+    /// converted to `InputImageRef` so the actual image bytes are stored in
+    /// the content-addressable asset store rather than inline as data URLs.
+    /// On restore, `InputImageRef` parts are hydrated back to `InputImage`.
+    #[serde(rename = "input_image_ref")]
+    InputImageRef {
+        image_ref: String,
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 impl Default for MessageContent {
@@ -94,7 +107,7 @@ impl MessageContent {
 
     /// Returns `true` if the content includes at least one image part.
     pub fn is_multimodal(&self) -> bool {
-        matches!(self, Self::Parts(parts) if parts.iter().any(|part| matches!(part, MessageContentPart::InputImage { .. })))
+        matches!(self, Self::Parts(parts) if parts.iter().any(|part| matches!(part, MessageContentPart::InputImage { .. } | MessageContentPart::InputImageRef { .. })))
     }
 
     /// Extract all text, discarding images (lossy conversion).
@@ -105,7 +118,7 @@ impl MessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     MessageContentPart::InputText { text } => Some(text.clone()),
-                    MessageContentPart::InputImage { .. } => None,
+                    MessageContentPart::InputImage { .. } | MessageContentPart::InputImageRef { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

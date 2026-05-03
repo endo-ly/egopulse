@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::agent_loop::SurfaceContext;
 use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
@@ -26,37 +24,6 @@ pub(crate) struct LoadedSession {
 pub(crate) struct PersistedTurn {
     pub(crate) updated_at: String,
     pub(crate) messages: Vec<Message>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PersistedMessage {
-    role: String,
-    content: PersistedMessageContent,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<crate::llm::ToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-enum PersistedMessageContent {
-    Text(String),
-    Parts(Vec<PersistedMessageContentPart>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type")]
-enum PersistedMessageContentPart {
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "input_image_ref")]
-    InputImageRef {
-        image_ref: String,
-        mime_type: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
 }
 
 /// Resolves or creates the internal chat ID for a conversation surface.
@@ -295,14 +262,15 @@ async fn serialize_snapshot(
     .map_err(EgoPulseError::Storage)
 }
 
+/// Convert `InputImage` parts to `InputImageRef` for disk serialization.
 fn persist_messages(
     assets: &AssetStore,
     messages: &[Message],
-) -> Result<Vec<PersistedMessage>, StorageError> {
+) -> Result<Vec<Message>, StorageError> {
     messages
         .iter()
         .map(|message| {
-            Ok(PersistedMessage {
+            Ok(Message {
                 role: message.role.clone(),
                 content: persist_content(assets, &message.content)?,
                 tool_calls: message.tool_calls.clone(),
@@ -315,10 +283,10 @@ fn persist_messages(
 fn persist_content(
     assets: &AssetStore,
     content: &MessageContent,
-) -> Result<PersistedMessageContent, StorageError> {
+) -> Result<MessageContent, StorageError> {
     match content {
-        MessageContent::Text(text) => Ok(PersistedMessageContent::Text(text.clone())),
-        MessageContent::Parts(parts) => Ok(PersistedMessageContent::Parts(
+        MessageContent::Text(text) => Ok(MessageContent::Text(text.clone())),
+        MessageContent::Parts(parts) => Ok(MessageContent::Parts(
             parts
                 .iter()
                 .map(|part| persist_part(assets, part))
@@ -330,57 +298,57 @@ fn persist_content(
 fn persist_part(
     assets: &AssetStore,
     part: &MessageContentPart,
-) -> Result<PersistedMessageContentPart, StorageError> {
+) -> Result<MessageContentPart, StorageError> {
     match part {
         MessageContentPart::InputText { text } => {
-            Ok(PersistedMessageContentPart::InputText { text: text.clone() })
+            Ok(MessageContentPart::InputText { text: text.clone() })
         }
         MessageContentPart::InputImage { image_url, detail } => {
             let stored = assets.persist_image_data_url(image_url)?;
-            Ok(PersistedMessageContentPart::InputImageRef {
+            Ok(MessageContentPart::InputImageRef {
                 image_ref: stored.image_ref,
                 mime_type: stored.mime_type,
                 detail: detail.clone(),
             })
         }
+        MessageContentPart::InputImageRef { .. } => Ok(part.clone()),
     }
 }
 
+/// Deserialize snapshot JSON as `Vec<Message>` and hydrate `InputImageRef` → `InputImage`.
 fn restore_snapshot_messages(
     assets: &AssetStore,
     json: &str,
 ) -> Result<Vec<Message>, StorageError> {
-    let persisted: Vec<PersistedMessage> =
+    let messages: Vec<Message> =
         serde_json::from_str(json).map_err(StorageError::SessionSerialize)?;
-    persisted
+    Ok(messages
         .into_iter()
-        .map(|message| {
-            Ok(Message {
-                role: message.role,
-                content: restore_content(assets, message.content),
-                tool_calls: message.tool_calls,
-                tool_call_id: message.tool_call_id,
-            })
-        })
-        .collect()
+        .map(|message| hydrate_message(assets, message))
+        .collect())
 }
 
-fn restore_content(assets: &AssetStore, content: PersistedMessageContent) -> MessageContent {
+fn hydrate_message(assets: &AssetStore, message: Message) -> Message {
+    Message {
+        content: hydrate_content(assets, message.content),
+        ..message
+    }
+}
+
+fn hydrate_content(assets: &AssetStore, content: MessageContent) -> MessageContent {
     match content {
-        PersistedMessageContent::Text(text) => MessageContent::text(text),
-        PersistedMessageContent::Parts(parts) => MessageContent::parts(
-            parts
-                .into_iter()
-                .map(|part| restore_part(assets, part))
-                .collect(),
+        MessageContent::Text(text) => MessageContent::Text(text),
+        MessageContent::Parts(parts) => MessageContent::Parts(
+            parts.into_iter().map(|part| hydrate_part(assets, part)).collect(),
         ),
     }
 }
 
-fn restore_part(assets: &AssetStore, part: PersistedMessageContentPart) -> MessageContentPart {
+fn hydrate_part(assets: &AssetStore, part: MessageContentPart) -> MessageContentPart {
     match part {
-        PersistedMessageContentPart::InputText { text } => MessageContentPart::InputText { text },
-        PersistedMessageContentPart::InputImageRef {
+        MessageContentPart::InputText { text } => MessageContentPart::InputText { text },
+        MessageContentPart::InputImage { .. } => part,
+        MessageContentPart::InputImageRef {
             image_ref,
             mime_type,
             detail,
