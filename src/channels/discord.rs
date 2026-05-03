@@ -294,13 +294,13 @@ impl Handler {
     }
 
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: user.to_string(),
-            surface_thread: self.agent_thread(thread, agent_id),
-            chat_type: "discord".to_string(),
-            agent_id: agent_id.to_string(),
-        }
+        SurfaceContext::new(
+            "discord".to_string(),
+            user.to_string(),
+            self.agent_thread(thread, agent_id),
+            "discord".to_string(),
+            agent_id.to_string(),
+        )
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {

@@ -346,6 +346,14 @@ async fn handle_message(
         }
     };
 
+    let context = SurfaceContext::new(
+        "telegram".to_string(),
+        sender_name,
+        external_chat_id.clone(),
+        chat_type,
+        state.config.default_agent.to_string(),
+    );
+
     // --- スラッシュコマンドインターセプト ---
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
@@ -359,23 +367,16 @@ async fn handle_message(
         }
 
         let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
-        let slash_context = SurfaceContext {
-            channel: "telegram".to_string(),
-            surface_user: sender_name.clone(),
-            surface_thread: external_chat_id.clone(),
-            chat_type: chat_type.clone(),
-            agent_id: state.config.default_agent.to_string(),
-        };
 
         let resolved_chat_id =
-            crate::agent_loop::session::resolve_chat_id(&state, &slash_context).await;
+            crate::agent_loop::session::resolve_chat_id(&state, &context).await;
 
         match resolved_chat_id {
             Ok(chat_id) => {
                 if let Some(response) = slash_commands::handle_slash_command(
                     &state,
                     chat_id,
-                    &slash_context,
+                    &context,
                     &text,
                     sender_id.as_deref(),
                 )
@@ -413,14 +414,6 @@ async fn handle_message(
         );
         return Ok(());
     }
-
-    let context = SurfaceContext {
-        channel: "telegram".to_string(),
-        surface_user: sender_name,
-        surface_thread: external_chat_id.clone(),
-        chat_type: chat_type.clone(),
-        agent_id: state.config.default_agent.to_string(),
-    };
 
     info!(
         chat_id = raw_chat_id,

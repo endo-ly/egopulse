@@ -156,26 +156,26 @@ pub(super) async fn start_stream_run(
                     .to_string();
                 (
                     format!("chat:{}", chat_id),
-                    SurfaceContext {
-                        channel: info.channel,
-                        surface_user: actor.to_string(),
+                    SurfaceContext::new(
+                        info.channel,
+                        actor.to_string(),
                         surface_thread,
-                        chat_type: info.chat_type,
-                        agent_id: state.app_state.config.default_agent.to_string(),
-                    },
+                        info.chat_type,
+                        state.app_state.config.default_agent.to_string(),
+                    ),
                 )
             }
             None => {
                 let key = web_session_key(raw_session_key);
                 (
                     key.clone(),
-                    SurfaceContext {
-                        channel: "web".to_string(),
-                        surface_user: actor.to_string(),
-                        surface_thread: key,
-                        chat_type: "web".to_string(),
-                        agent_id: state.app_state.config.default_agent.to_string(),
-                    },
+                    SurfaceContext::new(
+                        "web".to_string(),
+                        actor.to_string(),
+                        key,
+                        "web".to_string(),
+                        state.app_state.config.default_agent.to_string(),
+                    ),
                 )
             }
         }
@@ -183,13 +183,13 @@ pub(super) async fn start_stream_run(
         let key = web_session_key(raw_session_key);
         (
             key.clone(),
-            SurfaceContext {
-                channel: "web".to_string(),
-                surface_user: actor.to_string(),
-                surface_thread: key,
-                chat_type: "web".to_string(),
-                agent_id: state.app_state.config.default_agent.to_string(),
-            },
+            SurfaceContext::new(
+                "web".to_string(),
+                actor.to_string(),
+                key,
+                "web".to_string(),
+                state.app_state.config.default_agent.to_string(),
+            ),
         )
     };
 

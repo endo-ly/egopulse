@@ -13,13 +13,13 @@ use crate::runtime::AppState;
 pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let context = SurfaceContext {
-        channel: "cli".to_string(),
-        surface_user: "local_user".to_string(),
-        surface_thread: session.to_string(),
-        chat_type: "cli".to_string(),
-        agent_id: state.config.default_agent.to_string(),
-    };
+    let context = SurfaceContext::new(
+        "cli".to_string(),
+        "local_user".to_string(),
+        session.to_string(),
+        "cli".to_string(),
+        state.config.default_agent.to_string(),
+    );
 
     writeln!(stdout, "session: {}", session)
         .map_err(crate::error::StorageError::Io)
