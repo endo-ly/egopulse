@@ -473,7 +473,7 @@ async fn handle_message(
 
 /// Telegram にメッセージを送信 (4096文字制限で自動分割)。
 async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
-    let _ = crate::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
+    if let Err(error) = crate::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
         let bot = bot.clone();
         let chunk = chunk.to_string();
         Box::pin(async move {
@@ -496,7 +496,14 @@ async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
             Ok(())
         })
     })
-    .await;
+    .await
+    {
+        error!(
+            chat_id = chat_id.0,
+            error = %error,
+            "Telegram: failed to send chunked response"
+        );
+    }
 }
 
 fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
