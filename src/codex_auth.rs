@@ -198,7 +198,7 @@ static AUTH_CACHE: LazyLock<std::sync::Mutex<Option<(std::time::Instant, CodexAu
 const CODEX_AUTH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[cfg(test)]
-fn clear_auth_cache() {
+pub(crate) fn clear_auth_cache() {
     *AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 

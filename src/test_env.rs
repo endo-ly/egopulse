@@ -16,7 +16,7 @@ pub(crate) struct EnvVarGuard {
 impl EnvVarGuard {
     /// 環境変数を設定し、元の値を保持するガードを作成する。
     pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
