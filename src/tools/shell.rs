@@ -14,7 +14,8 @@ use crate::llm::ToolDefinition;
 use super::text::{format_size, shell_quote, truncate_tail};
 use super::{
     DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
-    ToolResult, command_guard, path_guard, redact_known_secret_patterns, schema_object,
+    ToolResult, command_guard, kill_process_group, path_guard, redact_known_secret_patterns,
+    schema_object,
 };
 
 /// Executes bash commands in the workspace with configurable timeout and output capture.
@@ -171,18 +172,6 @@ pub(crate) fn bash_error_result(
     } else {
         let _ = fs::remove_file(temp_path);
         ToolResult::error(text)
-    }
-}
-
-fn kill_process_group(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // 負の PID でプロセスグループ全体に SIGKILL を送信
-        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if ret != 0 {
-            let _ = child.start_kill();
-        }
-    } else {
-        let _ = child.start_kill();
     }
 }
 
