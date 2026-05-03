@@ -964,6 +964,7 @@ pub(crate) fn build_state(
         mcp_manager: None,
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents,
+        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
