@@ -119,6 +119,15 @@ pub(crate) fn sanitize_message_content(
                             detail: detail.map(|value| sanitize_output_string(&value, secrets)),
                         }
                     }
+                    MessageContentPart::InputImageRef {
+                        image_ref,
+                        mime_type,
+                        detail,
+                    } => MessageContentPart::InputImageRef {
+                        image_ref: sanitize_output_string(&image_ref, secrets),
+                        mime_type: sanitize_output_string(&mime_type, secrets),
+                        detail: detail.map(|value| sanitize_output_string(&value, secrets)),
+                    },
                 })
                 .collect(),
         ),
@@ -564,6 +573,7 @@ mod tests {
         let _guard = EnvVarGuard::set("HOME", dir.path())
             .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
             .also_set("CODEX_HOME", "");
+        crate::codex_auth::clear_auth_cache();
 
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).expect("create .codex dir");

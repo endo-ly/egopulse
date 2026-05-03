@@ -156,26 +156,26 @@ pub(super) async fn start_stream_run(
                     .to_string();
                 (
                     format!("chat:{}", chat_id),
-                    SurfaceContext {
-                        channel: info.channel,
-                        surface_user: actor.to_string(),
+                    SurfaceContext::new(
+                        info.channel,
+                        actor.to_string(),
                         surface_thread,
-                        chat_type: info.chat_type,
-                        agent_id: state.app_state.config.default_agent.to_string(),
-                    },
+                        info.chat_type,
+                        state.app_state.config.default_agent.to_string(),
+                    ),
                 )
             }
             None => {
                 let key = web_session_key(raw_session_key);
                 (
                     key.clone(),
-                    SurfaceContext {
-                        channel: "web".to_string(),
-                        surface_user: actor.to_string(),
-                        surface_thread: key,
-                        chat_type: "web".to_string(),
-                        agent_id: state.app_state.config.default_agent.to_string(),
-                    },
+                    SurfaceContext::new(
+                        "web".to_string(),
+                        actor.to_string(),
+                        key,
+                        "web".to_string(),
+                        state.app_state.config.default_agent.to_string(),
+                    ),
                 )
             }
         }
@@ -183,65 +183,56 @@ pub(super) async fn start_stream_run(
         let key = web_session_key(raw_session_key);
         (
             key.clone(),
-            SurfaceContext {
-                channel: "web".to_string(),
-                surface_user: actor.to_string(),
-                surface_thread: key,
-                chat_type: "web".to_string(),
-                agent_id: state.app_state.config.default_agent.to_string(),
-            },
+            SurfaceContext::new(
+                "web".to_string(),
+                actor.to_string(),
+                key,
+                "web".to_string(),
+                state.app_state.config.default_agent.to_string(),
+            ),
         )
     };
 
     let run_id = Uuid::new_v4().to_string();
     state.run_hub.create(&run_id, actor.to_string()).await;
 
-    if crate::slash_commands::is_slash_command(&message) {
-        let slash_chat_id =
-            crate::agent_loop::session::resolve_chat_id(&state.app_state, &context).await;
-
-        let response = match slash_chat_id {
-            Ok(id) => crate::slash_commands::handle_slash_command(
-                &state.app_state,
-                id,
-                &context,
-                &message,
-                Some(actor),
-            )
-            .await
-            .unwrap_or_else(crate::slash_commands::unknown_command_response),
-            Err(e) => {
-                state
-                    .run_hub
-                    .publish(
-                        &run_id,
-                        "error",
-                        json!({"error": e.to_string()}).to_string(),
-                    )
-                    .await;
-                state
-                    .run_hub
-                    .remove_later(run_id.clone(), RUN_TTL_SECONDS)
-                    .await;
-                return Ok(StartedRun {
-                    run_id,
-                    session_key,
-                });
-            }
-        };
-
-        state
-            .run_hub
-            .publish(&run_id, "done", json!({"response": response}).to_string())
-            .await;
-        state
-            .run_hub
-            .remove_later(run_id.clone(), RUN_TTL_SECONDS)
-            .await;
-        return Ok(StartedRun {
-            run_id,
-            session_key,
-        });
+    match crate::slash_commands::process_slash_command(
+        &state.app_state,
+        &context,
+        &message,
+        Some(actor),
+    )
+    .await
+    {
+        crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+            state
+                .run_hub
+                .publish(&run_id, "done", json!({"response": response}).to_string())
+                .await;
+            state
+                .run_hub
+                .remove_later(run_id.clone(), RUN_TTL_SECONDS)
+                .await;
+            return Ok(StartedRun {
+                run_id,
+                session_key,
+            });
+        }
+        crate::slash_commands::SlashCommandOutcome::Error(e) => {
+            state
+                .run_hub
+                .publish(&run_id, "error", json!({"error": e}).to_string())
+                .await;
+            state
+                .run_hub
+                .remove_later(run_id.clone(), RUN_TTL_SECONDS)
+                .await;
+            return Ok(StartedRun {
+                run_id,
+                session_key,
+            });
+        }
+        crate::slash_commands::SlashCommandOutcome::NotHandled => {}
     }
 
     let state_for_task = state.clone();

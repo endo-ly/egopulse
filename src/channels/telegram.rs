@@ -19,7 +19,7 @@ use crate::agent_loop::SurfaceContext;
 use crate::channel_adapter::ChannelAdapter;
 use crate::channel_adapter::ConversationKind;
 use crate::runtime::AppState;
-use crate::slash_commands;
+use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 use crate::text::split_text;
 
 /// Telegram メッセージ長制限 (文字数)。
@@ -346,11 +346,19 @@ async fn handle_message(
         }
     };
 
+    let context = SurfaceContext::new(
+        "telegram".to_string(),
+        sender_name,
+        external_chat_id.clone(),
+        chat_type,
+        state.config.default_agent.to_string(),
+    );
+
     // --- スラッシュコマンドインターセプト ---
     // process_turn より先に chat_id を解決し、
     // スラッシュコマンドであればエージェントループに入らずに即応答する。
-    if attachment_paths.is_empty() && slash_commands::is_slash_command(&text) {
-        if !is_mentioned {
+    if attachment_paths.is_empty() {
+        if !is_mentioned && slash_commands::is_slash_command(&text) {
             debug!(
                 chat_id = raw_chat_id,
                 "Telegram: skipping non-mentioned slash command in group"
@@ -359,49 +367,17 @@ async fn handle_message(
         }
 
         let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
-        let slash_context = SurfaceContext {
-            channel: "telegram".to_string(),
-            surface_user: sender_name.clone(),
-            surface_thread: external_chat_id.clone(),
-            chat_type: chat_type.clone(),
-            agent_id: state.config.default_agent.to_string(),
-        };
-
-        let resolved_chat_id =
-            crate::agent_loop::session::resolve_chat_id(&state, &slash_context).await;
-
-        match resolved_chat_id {
-            Ok(chat_id) => {
-                if let Some(response) = slash_commands::handle_slash_command(
-                    &state,
-                    chat_id,
-                    &slash_context,
-                    &text,
-                    sender_id.as_deref(),
-                )
-                .await
-                {
-                    send_telegram_response(&bot, msg.chat.id, &response).await;
-                } else {
-                    send_telegram_response(
-                        &bot,
-                        msg.chat.id,
-                        &slash_commands::unknown_command_response(),
-                    )
-                    .await;
-                }
+        match process_slash_command(&state, &context, &text, sender_id.as_deref()).await {
+            SlashCommandOutcome::Respond(response) => {
+                send_telegram_response(&bot, msg.chat.id, &response).await;
+                return Ok(());
             }
-            Err(e) => {
-                error!("failed to resolve chat_id for slash command: {e}");
-                send_telegram_response(
-                    &bot,
-                    msg.chat.id,
-                    "An error occurred processing the command.",
-                )
-                .await;
+            SlashCommandOutcome::Error(response) => {
+                send_telegram_response(&bot, msg.chat.id, &response).await;
+                return Ok(());
             }
+            SlashCommandOutcome::NotHandled => {}
         }
-        return Ok(());
     }
     // --- インターセプトここまで ---
 
@@ -413,14 +389,6 @@ async fn handle_message(
         );
         return Ok(());
     }
-
-    let context = SurfaceContext {
-        channel: "telegram".to_string(),
-        surface_user: sender_name,
-        surface_thread: external_chat_id.clone(),
-        chat_type: chat_type.clone(),
-        agent_id: state.config.default_agent.to_string(),
-    };
 
     info!(
         chat_id = raw_chat_id,

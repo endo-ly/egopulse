@@ -313,6 +313,26 @@ impl PartialEq for ResolvedLlmConfig {
 
 impl Eq for ResolvedLlmConfig {}
 
+impl ResolvedLlmConfig {
+    /// Returns a deterministic hash of all config fields for use as a cache key.
+    ///
+    /// Includes `api_key` via `expose_secret()` so that different keys
+    /// produce different hashes. The key value itself is never stored.
+    pub fn cache_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.provider.hash(&mut hasher);
+        self.label.hash(&mut hasher);
+        self.base_url.hash(&mut hasher);
+        self.model.hash(&mut hasher);
+        if let Some(key) = &self.api_key {
+            secrecy::ExposeSecret::expose_secret(key).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AgentConfig {
     pub label: String,

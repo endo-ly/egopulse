@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::force_compact;
-use crate::agent_loop::session::load_messages_for_turn;
+use crate::agent_loop::session::{load_messages_for_turn, resolve_chat_id};
 use crate::llm_profile;
 use crate::runtime::AppState;
 use crate::storage::call_blocking;
@@ -37,6 +37,74 @@ pub fn is_slash_command(text: &str) -> bool {
         return false;
     }
     true
+}
+
+/// [`process_slash_command`] の戻り値。
+///
+/// 各チャネルはこの結果に基づいてチャネル固有の方法で応答を送信する。
+#[derive(Debug)]
+pub enum SlashCommandOutcome {
+    /// コマンドが正常に処理され、応答メッセージが生成された。
+    Respond(String),
+    /// chat_id の解決に失敗した等の内部的エラー。
+    Error(String),
+    /// テキストがスラッシュコマンドではなかった。
+    NotHandled,
+}
+
+/// スラッシュコマンドの判定・chat_id 解決・実行を一括で行う。
+///
+/// 各チャネルのスラッシュコマンド処理ブロックを共通化するためのエントリポイント。
+/// チャネル側は戻り値の [`SlashCommandOutcome`] に従って応答を送信すればよい。
+///
+/// # Arguments
+///
+/// * `state` — アプリケーション状態
+/// * `context` — チャネルごとのサーフェスコンテキスト
+/// * `text` — ユーザー入力テキスト
+/// * `sender_id` — 送信者 ID（`/status` で表示）
+pub async fn process_slash_command(
+    state: &AppState,
+    context: &SurfaceContext,
+    text: &str,
+    sender_id: Option<&str>,
+) -> SlashCommandOutcome {
+    if !is_slash_command(text) {
+        return SlashCommandOutcome::NotHandled;
+    }
+
+    let command_name = extract_command_name(text);
+    let needs_chat_id = matches!(command_name, Some("/new" | "/compact" | "/status"));
+
+    if !needs_chat_id {
+        let response = handle_slash_command(state, 0, context, text, sender_id)
+            .await
+            .unwrap_or_else(unknown_command_response);
+        return SlashCommandOutcome::Respond(response);
+    }
+
+    match resolve_chat_id(state, context).await {
+        Ok(chat_id) => {
+            let response = handle_slash_command(state, chat_id, context, text, sender_id)
+                .await
+                .unwrap_or_else(unknown_command_response);
+            SlashCommandOutcome::Respond(response)
+        }
+        Err(e) => {
+            tracing::warn!("failed to resolve chat_id for slash command: {e}");
+            SlashCommandOutcome::Error("An error occurred processing the command.".to_string())
+        }
+    }
+}
+
+fn extract_command_name(text: &str) -> Option<&str> {
+    let normalized = normalized_slash_command(text)?;
+    let bare = normalized
+        .split_once('@')
+        .map(|(cmd, _)| cmd)
+        .unwrap_or(normalized);
+    let lower = bare.split_whitespace().next()?;
+    Some(lower)
 }
 
 /// スラッシュコマンドを実行し、結果メッセージを返す。
@@ -325,7 +393,10 @@ mod tests {
     use crate::runtime::AppState;
     use crate::storage::{StoredMessage, call_blocking};
 
-    use super::{all_commands, find_command, handle_slash_command, is_slash_command};
+    use super::{
+        SlashCommandOutcome, all_commands, find_command, handle_slash_command, is_slash_command,
+        process_slash_command,
+    };
 
     // -- is_slash_command tests ---------------------------------------------------
 
@@ -954,5 +1025,62 @@ agents:
         let mut state = build_state(config, Box::new(NoOpProvider));
         state.config_path = Some(path.clone());
         (state, dir, path)
+    }
+
+    // -- process_slash_command tests -------------------------------------------
+
+    #[tokio::test]
+    async fn process_slash_command_responds_to_known_command() {
+        // Arrange
+        let (state, _dir) = build_test_state();
+        let context = test_context();
+
+        // Act
+        let outcome = process_slash_command(&state, &context, "/skills", None).await;
+
+        // Assert
+        match outcome {
+            SlashCommandOutcome::Respond(response) => {
+                assert!(
+                    response.contains("No skills loaded."),
+                    "expected skills response, got: {response}"
+                );
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_slash_command_returns_not_handled_for_plain_text() {
+        // Arrange
+        let (state, _dir) = build_test_state();
+        let context = test_context();
+
+        // Act
+        let outcome = process_slash_command(&state, &context, "hello world", None).await;
+
+        // Assert
+        assert!(
+            matches!(outcome, SlashCommandOutcome::NotHandled),
+            "plain text should not be handled as slash command"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_slash_command_returns_respond_for_unknown_command() {
+        // Arrange
+        let (state, _dir) = build_test_state();
+        let context = test_context();
+
+        // Act
+        let outcome = process_slash_command(&state, &context, "/foobar", None).await;
+
+        // Assert
+        match outcome {
+            SlashCommandOutcome::Respond(response) => {
+                assert_eq!(response, "Unknown command.");
+            }
+            other => panic!("expected Respond with unknown fallback, got {other:?}"),
+        }
     }
 }

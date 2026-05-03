@@ -108,7 +108,7 @@ src/
 │   └── secret_ref.rs    # SecretRef 型、.env 読み書き
 │
 ├── tools/               # ツールシステム
-│   ├── mod.rs           # ToolRegistry, Tool trait
+│   ├── mod.rs           # ToolRegistry, Tool trait, is_read_only()
 │   ├── mcp_adapter.rs   # MCP tool → Tool trait アダプター
 │   ├── command_guard.rs # bash コマンド検閲
 │   ├── path_guard.rs    # 機密パスブロック
@@ -116,12 +116,15 @@ src/
 │
 ├── storage.rs           # SQLite 永続化
 ├── mcp.rs               # MCP クライアント
+├── codex_auth.rs        # Codex auth 解決、AUTH_CACHE
 ├── channel_adapter.rs   # ChannelAdapter trait, ChannelRegistry
 ├── skills.rs            # スキル管理
+├── slash_commands.rs    # slash command dispatcher、SlashCommandOutcome
 ├── soul_agents.rs       # SOUL.md / AGENTS.md 読み込み
 ├── error.rs             # エラー型
 ├── gateway.rs           # systemd サービス管理
-└── status.rs            # ランタイムステータス
+├── status.rs            # ランタイムステータス
+└── test_env.rs          # テスト用 EnvVarGuard、ENV_MUTEX
 ```
 
 ---
@@ -142,12 +145,14 @@ pub struct AppState {
     pub mcp_manager: Option<Arc<RwLock<McpManager>>>,
     pub assets: Arc<AssetStore>,               // 埋め込みアセット
     pub soul_agents: Arc<SoulAgentsLoader>,    // SOUL/AGENTS ローダー
+    pub llm_cache: Mutex<HashMap<u64, Arc<dyn LlmProvider>>>,  // LLM provider cache
 }
 ```
 
 ### SurfaceContext
 
 メッセージの送信元を識別する型。チャネル・ユーザー・スレッドの組み合わせで一意になる。
+`SurfaceContext::new()` が全チャネルで使用される正規コンストラクタ。
 
 ```rust
 pub struct SurfaceContext {
@@ -196,7 +201,7 @@ pub trait ChannelAdapter: Send + Sync {
       ├─ 3e. LLM に messages + tools を送信
       │      │
       │      ├─ tool_call があれば:
-      │      │  ├ ツール実行 (built-in / MCP adapter)
+      │      │  ├ ツール実行 (read-only は join_all で並列、それ以外は逐次)
       │      │  ├ 結果を messages に追加
       │      │  └ 3e に戻る (最大 50 イテレーション)
       │      │
@@ -271,3 +276,6 @@ pub trait ChannelAdapter: Send + Sync {
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |
 | **Feature Flag** | `Cargo.toml` | Discord / Telegram をオプショナルに |
 | **Graceful Shutdown** | `runtime.rs` | 10 秒タイムアウト付きで全チャネルを安全停止 |
+| **LLM Provider Cache** | `runtime.rs` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
+| **Codex Auth Cache** | `codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
+| **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |

@@ -19,6 +19,7 @@ use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use crate::web::sse::AgentEvent;
+use futures_util::future::join_all;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tracing::warn;
@@ -487,17 +488,40 @@ where
     messages = persisted.messages;
     let session_updated_at = Some(persisted.updated_at);
 
-    for tool_call in valid_tool_calls {
-        messages.push(
-            execute_tool_call(
-                state,
-                on_event,
-                tool_context,
-                &assistant_message_id,
-                tool_call,
-            )
-            .await?,
-        );
+    let all_read_only = valid_tool_calls
+        .iter()
+        .all(|tc| state.tools.is_read_only(&tc.name));
+
+    if all_read_only {
+        let tool_futures: Vec<_> = valid_tool_calls
+            .into_iter()
+            .map(|tool_call| {
+                execute_tool_call(
+                    state,
+                    on_event,
+                    tool_context,
+                    &assistant_message_id,
+                    tool_call,
+                )
+            })
+            .collect();
+        let results = join_all(tool_futures).await;
+        for result in results {
+            messages.push(result?);
+        }
+    } else {
+        for tool_call in valid_tool_calls {
+            messages.push(
+                execute_tool_call(
+                    state,
+                    on_event,
+                    tool_context,
+                    &assistant_message_id,
+                    tool_call,
+                )
+                .await?,
+            );
+        }
     }
 
     Ok((messages, session_updated_at))
@@ -964,6 +988,7 @@ pub(crate) fn build_state(
         mcp_manager: None,
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents,
+        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -1729,5 +1754,126 @@ mod tests {
         assert_eq!(result, "agent reply");
         let systems = provider.seen_systems();
         assert_eq!(systems.len(), 1, "should have exactly one LLM call");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn parallel_read_only_tools_execute_concurrently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
+        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Reading.".to_string(),
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-2".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_b.clone()}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        for path in &[&file_a, &file_b] {
+            let full = workspace.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+            std::fs::write(&full, format!("content of {}", path)).expect("write");
+        }
+
+        let reply = process_turn(&state, &cli_context("parallel-read"), "read both")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id("cli", "cli:parallel-read", Some("parallel-read"), "cli")
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mixed_tools_execute_sequentially() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Mixed.".to_string(),
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-2".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "echo ok"}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let full = workspace.join(&file_a);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+        std::fs::write(&full, "hello").expect("write");
+
+        let reply = process_turn(&state, &cli_context("mixed-tools"), "mixed")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id("cli", "cli:mixed-tools", Some("mixed-tools"), "cli")
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
     }
 }

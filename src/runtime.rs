@@ -2,8 +2,10 @@
 //!
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -37,6 +39,7 @@ pub struct AppState {
     pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     pub assets: Arc<AssetStore>,
     pub soul_agents: Arc<SoulAgentsLoader>,
+    pub llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
 }
 
 impl Clone for AppState {
@@ -52,6 +55,7 @@ impl Clone for AppState {
             mcp_manager: self.mcp_manager.clone(),
             assets: Arc::clone(&self.assets),
             soul_agents: Arc::clone(&self.soul_agents),
+            llm_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -80,9 +84,8 @@ impl AppState {
         }
 
         let config = self.try_current_config()?;
-        Ok(Arc::from(create_provider(
-            &config.resolve_llm_for_channel(channel)?,
-        )?))
+        let resolved = config.resolve_llm_for_channel(channel)?;
+        self.cached_provider(&resolved)
     }
 
     /// Returns the global default LLM provider for CLI/TUI surfaces.
@@ -92,7 +95,8 @@ impl AppState {
         }
 
         let config = self.try_current_config()?;
-        Ok(Arc::from(create_provider(&config.resolve_global_llm())?))
+        let resolved = config.resolve_global_llm();
+        self.cached_provider(&resolved)
     }
 
     /// Returns the LLM provider resolved for the agent and channel in the given context.
@@ -106,9 +110,22 @@ impl AppState {
 
         let config = self.try_current_config()?;
         let agent_id = crate::config::AgentId::new(&context.agent_id);
-        Ok(Arc::from(create_provider(
-            &config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?,
-        )?))
+        let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
+        self.cached_provider(&resolved)
+    }
+
+    fn cached_provider(
+        &self,
+        resolved: &crate::config::ResolvedLlmConfig,
+    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
+        let key = resolved.cache_key();
+        let mut cache = self.llm_cache.lock().expect("llm_cache lock");
+        if let Some(provider) = cache.get(&key) {
+            return Ok(Arc::clone(provider));
+        }
+        let provider: Arc<dyn crate::llm::LlmProvider> = Arc::from(create_provider(resolved)?);
+        cache.insert(key, Arc::clone(&provider));
+        Ok(provider)
     }
 }
 
@@ -180,6 +197,7 @@ pub async fn build_app_state_with_path(
         mcp_manager: Some(mcp_arc),
         assets,
         soul_agents,
+        llm_cache: Mutex::new(HashMap::new()),
     })
 }
 
@@ -479,6 +497,7 @@ async fn write_startup_status(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolvedLlmConfig;
     use crate::soul_agents::SoulAgentsLoader;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
@@ -490,7 +509,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
-        // soul_agents が初期化されてアクセス可能であることを検証
         let _ = &*state.soul_agents;
     }
 
@@ -501,14 +519,98 @@ mod tests {
         let config = test_config_for_runtime(state_root);
         let loader = SoulAgentsLoader::new(&config);
 
-        // ファイルが存在しない場合は None
         assert!(loader.load_global_agents().is_none());
 
-        // AGENTS.md を書き込むと読み取れる
         std::fs::write(dir.path().join("AGENTS.md"), "test agents content").expect("write");
         assert_eq!(
             loader.load_global_agents(),
             Some("test agents content".to_string())
         );
+    }
+
+    fn resolved_config(provider: &str, model: &str, base_url: &str) -> ResolvedLlmConfig {
+        ResolvedLlmConfig {
+            provider: provider.to_string(),
+            label: format!("{provider} label"),
+            base_url: base_url.to_string(),
+            api_key: Some(secrecy::SecretString::new(
+                "sk-test".to_string().into_boxed_str(),
+            )),
+            model: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn cache_key_differs_when_provider_differs() {
+        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let b = resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn cache_key_differs_when_model_differs() {
+        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let b = resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn cache_key_differs_when_base_url_differs() {
+        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let b = resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn cache_key_differs_when_api_key_differs() {
+        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let mut b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        b.api_key = Some(secrecy::SecretString::new(
+            "sk-other".to_string().into_boxed_str(),
+        ));
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn cache_key_same_for_identical_configs() {
+        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[tokio::test]
+    async fn global_llm_reuses_cached_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+
+        let a = state.global_llm().expect("llm");
+        let b = state.global_llm().expect("llm");
+
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn llm_override_bypasses_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let mut state = build_app_state(config).await.expect("build state");
+
+        let override_provider: Arc<dyn crate::llm::LlmProvider> = Arc::from(
+            crate::llm::create_provider(&resolved_config(
+                "override",
+                "model-x",
+                "https://example.com/v1",
+            ))
+            .expect("provider"),
+        );
+
+        state.llm_override = Some(Arc::clone(&override_provider));
+
+        let result = state.global_llm().expect("llm");
+        assert!(Arc::ptr_eq(&result, &override_provider));
+
+        let cache = state.llm_cache.lock().expect("lock");
+        assert!(cache.is_empty());
     }
 }

@@ -79,6 +79,7 @@ pub fn build_state_with_provider(
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
+        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 

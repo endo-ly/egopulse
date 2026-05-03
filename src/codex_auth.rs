@@ -101,6 +101,26 @@ pub(crate) fn resolve_codex_auth() -> Result<CodexAuth, ConfigError> {
         }
     }
 
+    {
+        let guard = AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((instant, cached)) = guard.as_ref() {
+            if instant.elapsed() < CODEX_AUTH_TTL {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
+    let auth = resolve_codex_auth_from_file()?;
+
+    {
+        let mut guard = AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((std::time::Instant::now(), auth.clone()));
+    }
+
+    Ok(auth)
+}
+
+fn resolve_codex_auth_from_file() -> Result<CodexAuth, ConfigError> {
     let auth_path = default_codex_auth_path();
     if auth_path.exists() {
         let content = std::fs::read_to_string(&auth_path).map_err(|source| {
@@ -171,6 +191,16 @@ pub(crate) fn is_jwt_expired(token: &str) -> bool {
 
 /// プロセス内で refresh を直列化するミューテックス。
 static REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+static AUTH_CACHE: LazyLock<std::sync::Mutex<Option<(std::time::Instant, CodexAuth)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+const CODEX_AUTH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(test)]
+pub(crate) fn clear_auth_cache() {
+    *AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 /// access_token の有効期限が切れている場合、refresh_token を使って更新する。
 ///
@@ -284,6 +314,8 @@ pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
     };
 
     write_atomic(&auth_path, &updated);
+
+    AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).take();
 }
 
 /// 一時ファイルに書き込み後にリネームして原子的に更新する。
@@ -371,6 +403,7 @@ mod tests {
     #[test]
     fn resolve_auth_prefers_env_var() {
         let _guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "env-token-xyz");
+        clear_auth_cache();
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "env-token-xyz");
         assert!(auth.account_id.is_none());
@@ -386,6 +419,7 @@ mod tests {
         .expect("write");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "file-access-token");
@@ -402,6 +436,7 @@ mod tests {
         .expect("write");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let auth = resolve_codex_auth().expect("resolve");
         assert_eq!(auth.bearer_token, "sk-fallback-key");
@@ -413,6 +448,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard =
             EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
 
         let result = resolve_codex_auth();
         assert!(result.is_err());
@@ -482,5 +518,52 @@ mod tests {
             "openai",
             "https://api.openai.com/v1"
         ));
+    }
+
+    #[test]
+    fn cache_returns_same_value_within_ttl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"cached-token","refresh_token":"rt"}}"#,
+        )
+        .expect("write");
+        let _guard =
+            EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+        clear_auth_cache();
+
+        let first = resolve_codex_auth().expect("first");
+        assert_eq!(first.bearer_token, "cached-token");
+
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"updated-token","refresh_token":"rt"}}"#,
+        )
+        .expect("overwrite");
+
+        let second = resolve_codex_auth().expect("second");
+        assert_eq!(second.bearer_token, "cached-token");
+    }
+
+    #[test]
+    fn cache_bypassed_for_env_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"file-token","refresh_token":"rt"}}"#,
+        )
+        .expect("write");
+        {
+            let _guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "")
+                .also_set("CODEX_HOME", dir.path());
+            clear_auth_cache();
+            let file_auth = resolve_codex_auth().expect("file");
+            assert_eq!(file_auth.bearer_token, "file-token");
+        }
+
+        let _env_guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "env-override");
+        clear_auth_cache();
+        let env_auth = resolve_codex_auth().expect("env");
+        assert_eq!(env_auth.bearer_token, "env-override");
     }
 }

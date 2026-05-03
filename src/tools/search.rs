@@ -106,6 +106,10 @@ impl Tool for GrepTool {
         "grep"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".to_string(),
@@ -376,6 +380,10 @@ impl Tool for FindTool {
         "find"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "find".to_string(),
@@ -594,6 +602,10 @@ impl LsTool {
 impl Tool for LsTool {
     fn name(&self) -> &str {
         "ls"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn definition(&self) -> ToolDefinition {

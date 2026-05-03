@@ -306,13 +306,13 @@ impl Handler {
     }
 
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: user.to_string(),
-            surface_thread: self.agent_thread(thread, agent_id),
-            chat_type: "discord".to_string(),
-            agent_id: agent_id.to_string(),
-        }
+        SurfaceContext::new(
+            "discord".to_string(),
+            user.to_string(),
+            self.agent_thread(thread, agent_id),
+            "discord".to_string(),
+            agent_id.to_string(),
+        )
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
@@ -384,44 +384,27 @@ impl EventHandler for Handler {
         let agent_id = self.select_agent(channel_id, is_dm).to_string();
 
         let thread = channel_id.to_string();
-        if crate::slash_commands::is_slash_command(&text) {
+        {
             let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
             let sender_id = msg.author.id.get().to_string();
-            let slash_chat_id =
-                crate::agent_loop::session::resolve_chat_id(&self.app_state, &slash_context).await;
+            let outcome = crate::slash_commands::process_slash_command(
+                &self.app_state,
+                &slash_context,
+                &text,
+                Some(&sender_id),
+            )
+            .await;
 
-            match slash_chat_id {
-                Ok(chat_id) => {
-                    if let Some(response) = crate::slash_commands::handle_slash_command(
-                        &self.app_state,
-                        chat_id,
-                        &slash_context,
-                        &text,
-                        Some(&sender_id),
-                    )
-                    .await
-                    {
-                        send_discord_response(&ctx, msg.channel_id, &response).await;
-                    } else {
-                        send_discord_response(
-                            &ctx,
-                            msg.channel_id,
-                            &crate::slash_commands::unknown_command_response(),
-                        )
-                        .await;
-                    }
+            match outcome {
+                crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+                    send_discord_response(&ctx, msg.channel_id, &response).await;
                     return;
                 }
-                Err(e) => {
-                    error!("failed to resolve chat_id for slash command: {e}");
-                    send_discord_response(
-                        &ctx,
-                        msg.channel_id,
-                        "An error occurred processing the command.",
-                    )
-                    .await;
+                crate::slash_commands::SlashCommandOutcome::Error(response) => {
+                    send_discord_response(&ctx, msg.channel_id, &response).await;
                     return;
                 }
+                crate::slash_commands::SlashCommandOutcome::NotHandled => {}
             }
         }
 
@@ -619,22 +602,19 @@ impl EventHandler for Handler {
 
         let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
         let sender_id = cmd.user.id.get().to_string();
-        let slash_chat_id =
-            crate::agent_loop::session::resolve_chat_id(&self.app_state, &slash_context).await;
 
-        let response_text = match slash_chat_id {
-            Ok(chat_id) => crate::slash_commands::handle_slash_command(
-                &self.app_state,
-                chat_id,
-                &slash_context,
-                &command_text,
-                Some(&sender_id),
-            )
-            .await
-            .unwrap_or_else(crate::slash_commands::unknown_command_response),
-            Err(e) => {
-                tracing::error!("failed to resolve chat_id for interaction: {e}");
-                "An error occurred processing the command.".to_string()
+        let response_text = match crate::slash_commands::process_slash_command(
+            &self.app_state,
+            &slash_context,
+            &command_text,
+            Some(&sender_id),
+        )
+        .await
+        {
+            crate::slash_commands::SlashCommandOutcome::Respond(response)
+            | crate::slash_commands::SlashCommandOutcome::Error(response) => response,
+            crate::slash_commands::SlashCommandOutcome::NotHandled => {
+                crate::slash_commands::unknown_command_response()
             }
         };
 

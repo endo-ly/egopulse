@@ -4,6 +4,7 @@
 //! ローカル対話を 1 つの端末 UI で扱う。
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -25,7 +26,7 @@ use crate::agent_loop;
 use crate::agent_loop::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
 use crate::runtime::AppState;
-use crate::storage::SessionSummary;
+use crate::storage::{SessionSummary, call_blocking};
 
 /// Owns terminal setup and teardown for the TUI lifecycle.
 struct TuiSession {
@@ -173,13 +174,13 @@ impl TuiApp {
 
     async fn open_new_session(&mut self) -> Result<(), EgoPulseError> {
         let session_id = format!("local-{}", short_uuid());
-        let context = SurfaceContext {
-            channel: "tui".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: session_id,
-            chat_type: "tui".to_string(),
-            agent_id: self.state.config.default_agent.to_string(),
-        };
+        let context = SurfaceContext::new(
+            "tui".to_string(),
+            "local_user".to_string(),
+            session_id,
+            "tui".to_string(),
+            self.state.config.default_agent.to_string(),
+        );
         let messages = agent_loop::load_session_messages(&self.state, &context).await?;
         self.view = View::Chat(Box::new(ChatState {
             context,
@@ -203,13 +204,24 @@ impl TuiApp {
     }
 
     async fn open_session(&mut self, summary: SessionSummary) -> Result<(), EgoPulseError> {
-        let context = SurfaceContext {
-            channel: summary.channel.clone(),
-            surface_user: "local_user".to_string(),
-            surface_thread: summary.surface_thread.clone(),
-            chat_type: summary.channel,
-            agent_id: self.state.config.default_agent.to_string(),
-        };
+        let chat_info = call_blocking(Arc::clone(&self.state.db), {
+            let chat_id = summary.chat_id;
+            move |db| db.get_chat_by_id(chat_id)
+        })
+        .await?
+        .ok_or_else(|| {
+            EgoPulseError::Storage(crate::error::StorageError::NotFound(
+                "chat not found".to_string(),
+            ))
+        })?;
+
+        let context = SurfaceContext::new(
+            chat_info.channel,
+            "local_user".to_string(),
+            summary.surface_thread.clone(),
+            chat_info.chat_type,
+            self.state.config.default_agent.to_string(),
+        );
         let messages = agent_loop::load_session_messages(&self.state, &context).await?;
         self.view = View::Chat(Box::new(ChatState {
             context,
@@ -389,47 +401,37 @@ async fn run_loop(
                     }
                     PendingAction::SendMessage(prompt) => {
                         if let View::Chat(chat) = &mut app.view {
-                            if crate::slash_commands::is_slash_command(&prompt) {
-                                chat.messages.push(RenderedMessage {
-                                    role: "user".to_string(),
-                                    content: prompt.clone(),
-                                });
-                                chat.conversation_scroll = 0;
-                                let slash_chat_id = crate::agent_loop::session::resolve_chat_id(
-                                    &app.state,
-                                    &chat.context,
-                                )
-                                .await;
-
-                                match slash_chat_id {
-                                    Ok(chat_id) => {
-                                        if let Some(response) =
-                                            crate::slash_commands::handle_slash_command(
-                                                &app.state,
-                                                chat_id,
-                                                &chat.context,
-                                                &prompt,
-                                                None,
-                                            )
-                                            .await
-                                        {
-                                            chat.messages.push(RenderedMessage {
-                                                role: "assistant".to_string(),
-                                                content: response,
-                                            });
-                                            chat.status = "Command applied".to_string();
-                                            chat.conversation_scroll = 0;
-                                        } else {
-                                            chat.status =
-                                                crate::slash_commands::unknown_command_response();
-                                        }
+                            match crate::slash_commands::process_slash_command(
+                                &app.state,
+                                &chat.context,
+                                &prompt,
+                                None,
+                            )
+                            .await
+                            {
+                                crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+                                    if crate::slash_commands::is_slash_command(&prompt)
+                                        && prompt.trim_start().starts_with("/new")
+                                    {
+                                        chat.messages.clear();
                                     }
-                                    Err(e) => {
-                                        chat.status = format!("Command error: {e}");
-                                    }
+                                    chat.messages.push(RenderedMessage {
+                                        role: "user".to_string(),
+                                        content: prompt.clone(),
+                                    });
+                                    chat.messages.push(RenderedMessage {
+                                        role: "assistant".to_string(),
+                                        content: response,
+                                    });
+                                    chat.status = "Command applied".to_string();
+                                    chat.conversation_scroll = 0;
                                 }
-                            } else {
-                                start_send(app, prompt);
+                                crate::slash_commands::SlashCommandOutcome::Error(msg) => {
+                                    chat.status = msg;
+                                }
+                                crate::slash_commands::SlashCommandOutcome::NotHandled => {
+                                    start_send(app, prompt);
+                                }
                             }
                         }
                     }

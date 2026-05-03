@@ -3,23 +3,23 @@
 //! 標準入出力を使った永続化チャットセッションを提供し、入力ごとに agent loop を実行する。
 
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
 
 use crate::agent_loop::{SurfaceContext, process_turn};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
+use crate::slash_commands::{SlashCommandOutcome, process_slash_command};
 
 /// Runs an interactive CLI chat loop for the given persistent session.
 pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let context = SurfaceContext {
-        channel: "cli".to_string(),
-        surface_user: "local_user".to_string(),
-        surface_thread: session.to_string(),
-        chat_type: "cli".to_string(),
-        agent_id: state.config.default_agent.to_string(),
-    };
+    let context = SurfaceContext::new(
+        "cli".to_string(),
+        "local_user".to_string(),
+        session.to_string(),
+        "cli".to_string(),
+        state.config.default_agent.to_string(),
+    );
 
     writeln!(stdout, "session: {}", session)
         .map_err(crate::error::StorageError::Io)
@@ -40,40 +40,18 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
             break;
         }
 
-        if crate::slash_commands::is_slash_command(trimmed) {
-            let slash_chat_id = crate::storage::call_blocking(Arc::clone(&state.db), {
-                let channel = context.channel.clone();
-                let thread = context.surface_thread.clone();
-                let chat_type = context.chat_type.clone();
-                move |db| {
-                    db.resolve_or_create_chat_id(
-                        &channel,
-                        &format!("cli:{thread}"),
-                        Some(&thread),
-                        &chat_type,
-                    )
-                }
-            })
-            .await
-            .map_err(EgoPulseError::from)?;
-
-            let response = crate::slash_commands::handle_slash_command(
-                state,
-                slash_chat_id,
-                &context,
-                trimmed,
-                None,
-            )
-            .await
-            .unwrap_or_else(crate::slash_commands::unknown_command_response);
-            writeln!(stdout, "assistant: {response}")
-                .map_err(crate::error::StorageError::Io)
-                .map_err(EgoPulseError::from)?;
-            stdout
-                .flush()
-                .map_err(crate::error::StorageError::Io)
-                .map_err(EgoPulseError::from)?;
-            continue;
+        match process_slash_command(state, &context, trimmed, None).await {
+            SlashCommandOutcome::Respond(response) | SlashCommandOutcome::Error(response) => {
+                writeln!(stdout, "assistant: {response}")
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                stdout
+                    .flush()
+                    .map_err(crate::error::StorageError::Io)
+                    .map_err(EgoPulseError::from)?;
+                continue;
+            }
+            SlashCommandOutcome::NotHandled => {}
         }
 
         writeln!(stdout, "you: {trimmed}")

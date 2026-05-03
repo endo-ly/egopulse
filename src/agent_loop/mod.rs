@@ -23,8 +23,74 @@ pub struct SurfaceContext {
 }
 
 impl SurfaceContext {
+    /// Creates a new `SurfaceContext` identifying the external conversation surface.
+    pub fn new(
+        channel: String,
+        surface_user: String,
+        surface_thread: String,
+        chat_type: String,
+        agent_id: String,
+    ) -> Self {
+        Self {
+            channel,
+            surface_user,
+            surface_thread,
+            chat_type,
+            agent_id,
+        }
+    }
+
     /// Returns the stable session key in `channel:surface_thread` format.
     pub fn session_key(&self) -> String {
         format!("{}:{}", self.channel, self.surface_thread)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_assigns_all_fields() {
+        // Arrange
+        let channel = "cli".to_string();
+        let surface_user = "alice".to_string();
+        let surface_thread = "session-1".to_string();
+        let chat_type = "cli".to_string();
+        let agent_id = "developer".to_string();
+
+        // Act
+        let ctx = SurfaceContext::new(
+            channel.clone(),
+            surface_user.clone(),
+            surface_thread.clone(),
+            chat_type.clone(),
+            agent_id.clone(),
+        );
+
+        // Assert
+        assert_eq!(ctx.channel, channel);
+        assert_eq!(ctx.surface_user, surface_user);
+        assert_eq!(ctx.surface_thread, surface_thread);
+        assert_eq!(ctx.chat_type, chat_type);
+        assert_eq!(ctx.agent_id, agent_id);
+    }
+
+    #[test]
+    fn session_key_format_is_channel_colon_thread() {
+        // Arrange
+        let ctx = SurfaceContext::new(
+            "discord".to_string(),
+            "bob".to_string(),
+            "123:bot:main:agent:dev".to_string(),
+            "discord".to_string(),
+            "dev".to_string(),
+        );
+
+        // Act
+        let key = ctx.session_key();
+
+        // Assert
+        assert_eq!(key, "discord:123:bot:main:agent:dev");
     }
 }
