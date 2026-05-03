@@ -119,13 +119,15 @@ pub(crate) fn sanitize_message_content(
                             detail: detail.map(|value| sanitize_output_string(&value, secrets)),
                         }
                     }
-                    MessageContentPart::InputImageRef { image_ref, mime_type, detail } => {
-                        MessageContentPart::InputImageRef {
-                            image_ref: sanitize_output_string(&image_ref, secrets),
-                            mime_type: sanitize_output_string(&mime_type, secrets),
-                            detail: detail.map(|value| sanitize_output_string(&value, secrets)),
-                        }
-                    }
+                    MessageContentPart::InputImageRef {
+                        image_ref,
+                        mime_type,
+                        detail,
+                    } => MessageContentPart::InputImageRef {
+                        image_ref: sanitize_output_string(&image_ref, secrets),
+                        mime_type: sanitize_output_string(&mime_type, secrets),
+                        detail: detail.map(|value| sanitize_output_string(&value, secrets)),
+                    },
                 })
                 .collect(),
         ),

@@ -68,7 +68,8 @@ pub(crate) fn tool_message_content(
                 text: payload.to_string(),
             });
             content.extend(parts.iter().filter_map(|part| match part {
-                crate::llm::MessageContentPart::InputText { .. } | crate::llm::MessageContentPart::InputImageRef { .. } => None,
+                crate::llm::MessageContentPart::InputText { .. }
+                | crate::llm::MessageContentPart::InputImageRef { .. } => None,
                 crate::llm::MessageContentPart::InputImage { image_url, detail } => {
                     Some(crate::llm::MessageContentPart::InputImage {
                         image_url: image_url.clone(),
@@ -253,7 +254,8 @@ pub(crate) fn tool_result_payload(message: &Message) -> Option<&str> {
         crate::llm::MessageContent::Text(text) => Some(text.as_str()),
         crate::llm::MessageContent::Parts(parts) => parts.iter().find_map(|part| match part {
             crate::llm::MessageContentPart::InputText { text } => Some(text.as_str()),
-            crate::llm::MessageContentPart::InputImage { .. } | crate::llm::MessageContentPart::InputImageRef { .. } => None,
+            crate::llm::MessageContentPart::InputImage { .. }
+            | crate::llm::MessageContentPart::InputImageRef { .. } => None,
         }),
     }
 }

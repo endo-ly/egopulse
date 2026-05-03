@@ -555,8 +555,8 @@ mod tests {
         )
         .expect("write");
         {
-            let _guard =
-                EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "").also_set("CODEX_HOME", dir.path());
+            let _guard = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "")
+                .also_set("CODEX_HOME", dir.path());
             let file_auth = resolve_codex_auth().expect("file");
             assert_eq!(file_auth.bearer_token, "file-token");
         }

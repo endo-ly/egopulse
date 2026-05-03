@@ -339,7 +339,10 @@ fn hydrate_content(assets: &AssetStore, content: MessageContent) -> MessageConte
     match content {
         MessageContent::Text(text) => MessageContent::Text(text),
         MessageContent::Parts(parts) => MessageContent::Parts(
-            parts.into_iter().map(|part| hydrate_part(assets, part)).collect(),
+            parts
+                .into_iter()
+                .map(|part| hydrate_part(assets, part))
+                .collect(),
         ),
     }
 }

@@ -118,7 +118,8 @@ impl MessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     MessageContentPart::InputText { text } => Some(text.clone()),
-                    MessageContentPart::InputImage { .. } | MessageContentPart::InputImageRef { .. } => None,
+                    MessageContentPart::InputImage { .. }
+                    | MessageContentPart::InputImageRef { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

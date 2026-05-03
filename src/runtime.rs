@@ -538,7 +538,9 @@ mod tests {
             provider: provider.to_string(),
             label: format!("{provider} label"),
             base_url: base_url.to_string(),
-            api_key: Some(secrecy::SecretString::new("sk-test".to_string().into_boxed_str())),
+            api_key: Some(secrecy::SecretString::new(
+                "sk-test".to_string().into_boxed_str(),
+            )),
             model: model.to_string(),
         }
     }
