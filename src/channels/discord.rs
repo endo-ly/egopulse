@@ -699,6 +699,7 @@ fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
         if !raw_id.is_empty()
             && raw_id.bytes().all(|b| b.is_ascii_digit())
             && let Ok(id) = raw_id.parse::<u64>()
+            && id != 0
         {
             let user_id = UserId::new(id);
             if !ids.contains(&user_id) {
@@ -958,6 +959,13 @@ mod tests {
     #[test]
     fn extract_user_mention_ids_ignores_roles_everyone_and_invalid_values() {
         let ids = extract_user_mention_ids("@everyone <@&789> <@abc> <@123");
+
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn extract_user_mention_ids_ignores_zero_id() {
+        let ids = extract_user_mention_ids("<@0>");
 
         assert!(ids.is_empty());
     }
