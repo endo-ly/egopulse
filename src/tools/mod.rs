@@ -125,6 +125,14 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
     -> ToolResult;
+
+    /// Whether this tool only reads data without side effects.
+    ///
+    /// Read-only tools can be executed in parallel when multiple tool calls
+    /// appear in a single LLM response. Default is `false`.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Owns all tool instances and dispatches execution by tool name.
@@ -237,6 +245,13 @@ impl ToolRegistry {
             &self.config_secrets,
         )
     }
+
+    /// Returns `true` if the named tool is a read-only tool safe for parallel execution.
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.tool_index
+            .get(name)
+            .is_some_and(|&idx| self.tools[idx].is_read_only())
+    }
 }
 
 /// Loads a skill's full instructions on demand by name.
@@ -254,6 +269,10 @@ impl ActivateSkillTool {
 impl Tool for ActivateSkillTool {
     fn name(&self) -> &str {
         "activate_skill"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -830,5 +849,59 @@ mod tests {
         assert!(find_result.content.contains("src/lib.rs"));
         assert!(!find_result.content.contains(".env"));
         assert!(!find_result.content.contains(".ssh/id_rsa"));
+    }
+
+    #[test]
+    #[serial]
+    fn read_only_tools_report_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        assert!(registry.is_read_only("read"));
+        assert!(registry.is_read_only("grep"));
+        assert!(registry.is_read_only("find"));
+        assert!(registry.is_read_only("ls"));
+        assert!(registry.is_read_only("activate_skill"));
+    }
+
+    #[test]
+    #[serial]
+    fn write_tools_report_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        assert!(!registry.is_read_only("bash"));
+        assert!(!registry.is_read_only("write"));
+        assert!(!registry.is_read_only("edit"));
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_tool_is_not_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        assert!(!registry.is_read_only("nonexistent_tool"));
+    }
+
+    #[test]
+    #[serial]
+    fn registered_custom_tool_defaults_to_not_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let mut registry = test_registry(&config);
+        registry.register_tool(Box::new(StaticTool {
+            name: "custom",
+            result: ToolResult::success("ok".to_string()),
+        }));
+
+        assert!(!registry.is_read_only("custom"));
     }
 }

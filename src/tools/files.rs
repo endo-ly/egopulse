@@ -69,6 +69,10 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_string(),
