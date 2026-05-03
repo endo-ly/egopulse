@@ -170,43 +170,15 @@ impl ChannelAdapter for DiscordAdapter {
                 "content": chunk,
                 "allowed_mentions": { "parse": [] },
             });
-            let mut attempt = 0;
-
-            loop {
-                let resp = self
-                    .http_client
+            send_discord_api(&self.http_client, |client| {
+                client
                     .post(&url)
                     .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
                     .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Discord API request failed: {e}"))?;
-
-                let status = resp.status();
-                if status.is_success() {
-                    break;
-                }
-
-                if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
-                    let retry_after = resp
-                        .headers()
-                        .get("Retry-After")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
-                    tokio::time::sleep(Duration::from_secs(retry_after)).await;
-                    attempt += 1;
-                    continue;
-                }
-
-                let body = resp.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Discord API error: HTTP {status} {}",
-                    body.chars().take(300).collect::<String>()
-                ));
-            }
+            })
+            .await?;
         }
 
         Ok(())
@@ -234,8 +206,7 @@ impl ChannelAdapter for DiscordAdapter {
 
         let content = text.or(caption).unwrap_or("");
 
-        let mut attempt = 0;
-        loop {
+        send_discord_api(&self.http_client, |client| {
             let part = Part::bytes(file_bytes.clone())
                 .file_name(filename.clone())
                 .mime_str("application/octet-stream")
@@ -248,39 +219,50 @@ impl ChannelAdapter for DiscordAdapter {
                 form = form.text("payload_json", payload.to_string());
             }
 
-            let resp = self
-                .http_client
+            client
                 .post(&url)
                 .timeout(Duration::from_secs(30))
                 .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
                 .multipart(form)
-                .send()
-                .await
-                .map_err(|e| format!("Discord API request failed: {e}"))?;
+        })
+        .await
+    }
+}
 
-            let status = resp.status();
-            if status.is_success() {
-                return Ok(());
-            }
+/// Send a Discord API request with automatic 429 retry handling.
+async fn send_discord_api<F>(client: &reqwest::Client, build_request: F) -> Result<(), String>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        let resp = build_request(client)
+            .send()
+            .await
+            .map_err(|e| format!("Discord API request failed: {e}"))?;
 
-            if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
-                tokio::time::sleep(Duration::from_secs(retry_after)).await;
-                attempt += 1;
-                continue;
-            }
-
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Discord API error: HTTP {status} {}",
-                body.chars().take(300).collect::<String>()
-            ));
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
         }
+
+        if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DISCORD_RETRY_AFTER_FALLBACK_SECS);
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            attempt += 1;
+            continue;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Discord API error: HTTP {status} {}",
+            body.chars().take(300).collect::<String>()
+        ));
     }
 }
 
@@ -292,6 +274,7 @@ struct Handler {
     channels: HashMap<u64, DiscordChannelConfig>,
     bot_user_id: OnceLock<UserId>,
     chain_state: Arc<BotChainState>,
+    http_client: reqwest::Client,
 }
 
 impl Handler {
@@ -455,14 +438,9 @@ impl EventHandler for Handler {
             }
         };
 
-        let download_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_default();
-
         let mut saved_paths: Vec<PathBuf> = Vec::new();
         for attachment in &msg.attachments {
-            match download_client.get(&attachment.url).send().await {
+            match self.http_client.get(&attachment.url).send().await {
                 Ok(resp) => match resp.error_for_status() {
                     Ok(resp) => match resp.bytes().await {
                         Ok(bytes) => {
@@ -662,14 +640,27 @@ impl EventHandler for Handler {
 
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
-    for chunk in split_text(text, DISCORD_MAX_MESSAGE_LEN) {
+    let http = &ctx.http;
+    if let Err(error) = crate::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
         let msg = CreateMessage::new()
             .content(chunk)
             .allowed_mentions(CreateAllowedMentions::new());
-        if let Err(e) = channel_id.send_message(&ctx.http, msg).await {
-            error!("Discord: failed to send message chunk: {e}");
-            break;
-        }
+        let http = http.clone();
+        Box::pin(async move {
+            channel_id
+                .send_message(&http, msg)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("Discord: failed to send message chunk: {e}"))
+        })
+    })
+    .await
+    {
+        error!(
+            channel_id = channel_id.get(),
+            error = %error,
+            "Discord: failed to send chunked response"
+        );
     }
 }
 
@@ -741,6 +732,10 @@ pub async fn start_discord_bot_for_bot(
         channels: channels.clone(),
         bot_user_id: OnceLock::new(),
         chain_state,
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default(),
     };
 
     let mut client = Client::builder(token, intents)
@@ -796,6 +791,7 @@ mod tests {
             channels,
             bot_user_id: OnceLock::new(),
             chain_state: Arc::new(BotChainState::new()),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -826,6 +822,7 @@ mod tests {
             channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -857,6 +854,7 @@ mod tests {
             channels,
             bot_user_id: lock,
             chain_state,
+            http_client: reqwest::Client::new(),
         }
     }
 

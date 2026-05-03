@@ -46,6 +46,39 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+/// Truncate a string to `max_chars` characters, appending `"..."` if truncated.
+pub fn truncate_by_chars(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+
+    let mut result: String = value.chars().take(max_chars - 3).collect();
+    result.push_str("...");
+    result
+}
+
+/// Send text in chunks, calling `send_fn` for each.
+///
+/// Iterates over `split_text(text, max_len)` chunks and awaits the
+/// provided closure. Stops at the first error.
+pub async fn send_chunked<F>(text: &str, max_len: usize, mut send_fn: F) -> Result<(), String>
+where
+    F: FnMut(
+        &str,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+{
+    for chunk in split_text(text, max_len) {
+        send_fn(&chunk).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -431,17 +431,13 @@ mod tests {
 
     use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::SurfaceContext;
-    use crate::assets::AssetStore;
-    use crate::config::secret_ref::ResolvedValue;
-    use crate::config::{Config, ProviderConfig};
+    use crate::config::Config;
     use crate::error::LlmError;
     use crate::llm::{
         LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
     };
     use crate::runtime::AppState;
-    use crate::skills::SkillManager;
-    use crate::storage::{Database, StoredMessage, call_blocking};
-    use crate::tools::ToolRegistry;
+    use crate::storage::{StoredMessage, call_blocking};
 
     struct FakeProvider {
         response: String,
@@ -477,75 +473,15 @@ mod tests {
     }
 
     fn test_config(state_root: String) -> Config {
-        use crate::config::{AgentConfig, AgentId, ChannelName, ProviderId};
-        Config {
-            default_provider: ProviderId::new("openai"),
-            default_model: Some("gpt-4o-mini".to_string()),
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: vec!["gpt-4o-mini".to_string()],
-                },
-            )]),
-            state_root,
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels: std::collections::HashMap::from([(
-                ChannelName::new("web"),
-                crate::config::ChannelConfig {
-                    enabled: Some(true),
-                    host: Some("127.0.0.1".to_string()),
-                    port: Some(10961),
-                    ..Default::default()
-                },
-            )]),
-            default_agent: AgentId::new("default"),
-            agents: std::collections::HashMap::from([(
-                AgentId::new("default"),
-                AgentConfig {
-                    label: "Default Agent".to_string(),
-                    ..Default::default()
-                },
-            )]),
-        }
+        crate::test_util::test_config(&state_root)
     }
 
     fn cli_context(session: &str) -> SurfaceContext {
-        SurfaceContext {
-            channel: "cli".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: session.to_string(),
-            chat_type: "cli".to_string(),
-            agent_id: "default".to_string(),
-        }
+        crate::test_util::cli_context(session)
     }
 
     fn build_state_with_provider(state_root: String, llm: Box<dyn LlmProvider>) -> AppState {
-        use crate::channel_adapter::ChannelRegistry;
-        let config = test_config(state_root.clone());
-        let skills = Arc::new(SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
-        AppState {
-            db: Arc::new(Database::new(&config.db_path()).expect("db")),
-            config: config.clone(),
-            config_path: None,
-            llm_override: Some(Arc::from(llm)),
-            channels: Arc::new(ChannelRegistry::new()),
-            skills: Arc::clone(&skills),
-            tools: Arc::new(ToolRegistry::new(&config, skills)),
-            mcp_manager: None,
-            assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
-        }
+        crate::test_util::build_state_with_provider(&state_root, llm)
     }
 
     #[tokio::test]

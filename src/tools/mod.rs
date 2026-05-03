@@ -130,6 +130,7 @@ pub trait Tool: Send + Sync {
 /// Owns all tool instances and dispatches execution by tool name.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
     mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
@@ -141,8 +142,11 @@ impl ToolRegistry {
             Ok(dir) => dir,
             Err(error) => {
                 tracing::warn!("failed to resolve workspace dir: {error}");
+                let tools: Vec<Box<dyn Tool>> =
+                    vec![Box::new(ActivateSkillTool::new(skill_manager))];
                 return Self {
-                    tools: vec![Box::new(ActivateSkillTool::new(skill_manager))],
+                    tool_index: build_tool_index(&tools),
+                    tools,
                     config_secrets: collect_config_secrets(config),
                     mcp_manager: None,
                 };
@@ -155,24 +159,29 @@ impl ToolRegistry {
             );
         }
 
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadTool::new(workspace_dir.clone())),
+            Box::new(BashTool::new(workspace_dir.clone())),
+            Box::new(EditTool::new(workspace_dir.clone())),
+            Box::new(WriteTool::new(workspace_dir.clone())),
+            Box::new(GrepTool::new(workspace_dir.clone())),
+            Box::new(FindTool::new(workspace_dir.clone())),
+            Box::new(LsTool::new(workspace_dir)),
+            Box::new(ActivateSkillTool::new(skill_manager)),
+        ];
         Self {
-            tools: vec![
-                Box::new(ReadTool::new(workspace_dir.clone())),
-                Box::new(BashTool::new(workspace_dir.clone())),
-                Box::new(EditTool::new(workspace_dir.clone())),
-                Box::new(WriteTool::new(workspace_dir.clone())),
-                Box::new(GrepTool::new(workspace_dir.clone())),
-                Box::new(FindTool::new(workspace_dir.clone())),
-                Box::new(LsTool::new(workspace_dir)),
-                Box::new(ActivateSkillTool::new(skill_manager)),
-            ],
+            tool_index: build_tool_index(&tools),
+            tools,
             config_secrets: collect_config_secrets(config),
             mcp_manager: None,
         }
     }
 
     pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
+        let name = tool.name().to_string();
+        let idx = self.tools.len();
         self.tools.push(tool);
+        self.tool_index.insert(name, idx);
     }
 
     pub fn set_mcp_manager(
@@ -202,11 +211,9 @@ impl ToolRegistry {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
-        for tool in &self.tools {
-            if tool.name() == name {
-                let result = tool.execute(input, context).await;
-                return sanitize_tool_result(result, &self.config_secrets);
-            }
+        if let Some(&idx) = self.tool_index.get(name) {
+            let result = self.tools[idx].execute(input, context).await;
+            return sanitize_tool_result(result, &self.config_secrets);
         }
         if let Some(mcp_manager) = &self.mcp_manager {
             if name.starts_with("mcp_") {
@@ -313,10 +320,33 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
     })
 }
 
+fn build_tool_index(tools: &[Box<dyn Tool>]) -> std::collections::HashMap<String, usize> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name().to_string(), i))
+        .collect()
+}
+
+/// Send SIGKILL to the process group of `child`.
+///
+/// Uses the negative PID convention to target the whole group; falls back to
+/// `start_kill` when the PID is unavailable or the group signal fails.
+pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if ret != 0 {
+            let _ = child.start_kill();
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
-    use crate::config::{ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId};
+    use crate::config::{ChannelConfig, ChannelName, Config};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
     use crate::test_env::EnvVarGuard;
@@ -354,44 +384,11 @@ mod tests {
     }
 
     fn test_config(state_root: &str) -> Config {
-        Config {
-            default_provider: ProviderId::new("local"),
-            default_model: Some("gpt-4o-mini".to_string()),
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("local"),
-                ProviderConfig {
-                    label: "Local".to_string(),
-                    base_url: "http://127.0.0.1:1234/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: vec!["gpt-4o-mini".to_string()],
-                },
-            )]),
-            state_root: state_root.to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels: std::collections::HashMap::from([(
-                ChannelName::new("web"),
-                ChannelConfig {
-                    enabled: Some(true),
-                    ..Default::default()
-                },
-            )]),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-        }
+        crate::test_util::test_config(state_root)
     }
 
     fn test_context() -> ToolExecutionContext {
-        ToolExecutionContext {
-            chat_id: 1,
-            channel: "cli".to_string(),
-            surface_thread: "demo".to_string(),
-            chat_type: "cli".to_string(),
-        }
+        crate::test_util::test_tool_context()
     }
 
     fn test_registry(config: &Config) -> ToolRegistry {

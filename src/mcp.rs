@@ -77,6 +77,8 @@ struct FailedServer {
 pub struct McpManager {
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
+    /// Pre-computed index: sanitized tool name → (server index, original tool name).
+    tool_name_index: HashMap<String, (usize, String)>,
 }
 
 struct ConnectedServer {
@@ -233,9 +235,11 @@ impl McpManager {
             total = configs.len(),
             "MCP initialization complete"
         );
+        let tool_name_index = build_tool_name_index(&servers);
         Ok(Self {
             servers,
             failed_servers,
+            tool_name_index,
         })
     }
 
@@ -288,6 +292,7 @@ impl McpManager {
             }
         }
 
+        self.tool_name_index = build_tool_name_index(&self.servers);
         reconnected
     }
 
@@ -347,22 +352,17 @@ impl McpManager {
         sanitized_name: &str,
         input: serde_json::Value,
     ) -> Option<Result<String, McpError>> {
-        for (server_idx, server) in self.servers.iter().enumerate() {
-            for tool in &server.cached_tools {
-                if sanitize_tool_name(&server.name, tool.name.as_ref()) == sanitized_name {
-                    return Some(
-                        self.execute_tool(
-                            server_idx,
-                            tool.name.to_string(),
-                            server.config.request_timeout_secs,
-                            input,
-                        )
-                        .await,
-                    );
-                }
-            }
-        }
-        None
+        let (server_idx, original_name) = self.tool_name_index.get(sanitized_name)?;
+        let server = self.servers.get(*server_idx)?;
+        Some(
+            self.execute_tool(
+                *server_idx,
+                original_name.clone(),
+                server.config.request_timeout_secs,
+                input,
+            )
+            .await,
+        )
     }
 
     /// Execute an MCP tool by name.
@@ -516,6 +516,19 @@ impl McpManager {
 
         adapters
     }
+}
+
+fn build_tool_name_index(servers: &[ConnectedServer]) -> HashMap<String, (usize, String)> {
+    let mut index = HashMap::new();
+    for (server_idx, server) in servers.iter().enumerate() {
+        for tool in &server.cached_tools {
+            let sanitized = sanitize_tool_name(&server.name, tool.name.as_ref());
+            index
+                .entry(sanitized)
+                .or_insert((server_idx, tool.name.to_string()));
+        }
+    }
+    index
 }
 
 fn filter_tools_for_server(server_name: &str, tools: &[Tool]) -> Vec<Tool> {

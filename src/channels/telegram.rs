@@ -434,7 +434,11 @@ async fn handle_message(
     let typing_bot = bot.clone();
     let typing_chat_id = msg.chat.id;
     let typing_handle = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             let _ = typing_bot
                 .send_chat_action(typing_chat_id, ChatAction::Typing)
                 .await;
@@ -469,14 +473,36 @@ async fn handle_message(
 
 /// Telegram にメッセージを送信 (4096文字制限で自動分割)。
 async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
-    for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
-        if let Err(e) = bot.send_message(chat_id, &chunk).await {
-            warn!("Telegram: failed to send message chunk, retrying: {e}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(e) = bot.send_message(chat_id, &chunk).await {
-                error!("Telegram: failed to send message chunk after retry: {e}");
+    if let Err(error) = crate::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
+        let bot = bot.clone();
+        let chunk = chunk.to_string();
+        Box::pin(async move {
+            match bot.send_message(chat_id, &chunk).await {
+                Ok(_) => {}
+                Err(teloxide::RequestError::RetryAfter(seconds)) => {
+                    warn!(
+                        retry_after = seconds.duration().as_secs(),
+                        "Telegram: rate limited while sending message chunk"
+                    );
+                    tokio::time::sleep(seconds.duration()).await;
+                    bot.send_message(chat_id, &chunk).await.map_err(|e| {
+                        format!("Telegram: failed to send message chunk after retry: {e}")
+                    })?;
+                }
+                Err(e) => {
+                    return Err(format!("Telegram: failed to send message chunk: {e}"));
+                }
             }
-        }
+            Ok(())
+        })
+    })
+    .await
+    {
+        error!(
+            chat_id = chat_id.0,
+            error = %error,
+            "Telegram: failed to send chunked response"
+        );
     }
 }
 

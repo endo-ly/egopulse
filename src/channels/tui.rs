@@ -893,10 +893,5 @@ fn short_uuid() -> String {
 }
 
 fn truncate_preview(value: &str) -> String {
-    const MAX_LEN: usize = 60;
-    let mut preview = value.chars().take(MAX_LEN).collect::<String>();
-    if value.chars().count() > MAX_LEN {
-        preview.push_str("...");
-    }
-    preview
+    crate::text::truncate_by_chars(value, 60)
 }

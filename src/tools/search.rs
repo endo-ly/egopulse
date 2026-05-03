@@ -85,14 +85,7 @@ fn validate_grep_pattern(pattern: &str, literal: bool) -> Result<(), String> {
 
 /// タイムアウト時にプロセスグループへ SIGKILL を送信し、終了を待機する。
 async fn kill_on_timeout(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if ret != 0 {
-            let _ = child.start_kill();
-        }
-    } else {
-        let _ = child.start_kill();
-    }
+    super::kill_process_group(child);
     let _ = child.wait().await;
 }
 
@@ -178,9 +171,6 @@ impl Tool for GrepTool {
         };
         if let Err(reason) = check_resolved_path(&resolved) {
             return ToolResult::error(reason);
-        }
-        if !resolved.exists() {
-            return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
 
         let limit = input
@@ -428,9 +418,6 @@ impl Tool for FindTool {
         };
         if let Err(reason) = check_resolved_path(&resolved) {
             return ToolResult::error(reason);
-        }
-        if !resolved.exists() {
-            return ToolResult::error(format!("Path not found: {}", resolved.display()));
         }
 
         let limit = input

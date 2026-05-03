@@ -482,38 +482,7 @@ mod tests {
     use crate::soul_agents::SoulAgentsLoader;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
-        use crate::config::{AgentConfig, AgentId, ProviderId};
-        crate::config::Config {
-            default_provider: ProviderId::new("openai"),
-            default_model: Some("gpt-4o-mini".to_string()),
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("openai"),
-                crate::config::ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(crate::config::secret_ref::ResolvedValue::Literal(
-                        "sk-test".to_string(),
-                    )),
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: vec!["gpt-4o-mini".to_string()],
-                },
-            )]),
-            state_root,
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            channels: std::collections::HashMap::new(),
-            default_agent: AgentId::new("default"),
-            agents: std::collections::HashMap::from([(
-                AgentId::new("default"),
-                AgentConfig {
-                    label: "Default Agent".to_string(),
-                    ..Default::default()
-                },
-            )]),
-        }
+        crate::test_util::test_config(&state_root)
     }
 
     #[tokio::test]
