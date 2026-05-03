@@ -473,15 +473,21 @@ async fn handle_message(
 
 /// Telegram にメッセージを送信 (4096文字制限で自動分割)。
 async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
-    for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
-        if let Err(e) = bot.send_message(chat_id, &chunk).await {
-            warn!("Telegram: failed to send message chunk, retrying: {e}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    let _ = crate::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
+        let bot = bot.clone();
+        let chunk = chunk.to_string();
+        Box::pin(async move {
             if let Err(e) = bot.send_message(chat_id, &chunk).await {
-                error!("Telegram: failed to send message chunk after retry: {e}");
+                warn!("Telegram: failed to send message chunk, retrying: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                bot.send_message(chat_id, &chunk)
+                    .await
+                    .map_err(|e| format!("Telegram: failed to send message chunk after retry: {e}"))?;
             }
-        }
-    }
+            Ok(())
+        })
+    })
+    .await;
 }
 
 fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
