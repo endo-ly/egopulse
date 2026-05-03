@@ -934,6 +934,7 @@ pub(crate) fn test_config_with_compaction(
 ) -> crate::config::Config {
     let mut config = crate::test_util::test_config(&state_root);
     config.compact_keep_recent = compact_keep_recent;
+    config.default_context_window_tokens = 30;
     config
 }
 
