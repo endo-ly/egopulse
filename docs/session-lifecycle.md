@@ -135,7 +135,7 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 - **old**: 古いメッセージ。summary 対象
 - **recent**: `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護
 
-**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう段階的に削減（軽量化 → message 単位削減）。summary 生成後も target を超える場合は、recent を保護したまま summary 本文をさらに縮める。
+**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も target を超える場合は、recent を保護したまま summary 本文をさらに縮める。
 
 **要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
 
