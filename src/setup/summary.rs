@@ -169,9 +169,7 @@ pub(crate) fn save_config(
             m
         });
     // Ensure the user's chosen model is always in the models map.
-    preset_models
-        .entry(model.clone())
-        .or_default();
+    preset_models.entry(model.clone()).or_default();
 
     let mut providers = HashMap::new();
     providers.insert(
