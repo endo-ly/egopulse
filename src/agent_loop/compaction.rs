@@ -132,7 +132,9 @@ pub(crate) fn estimate_prompt_tokens(
 }
 
 pub(crate) fn usable_context_tokens(context_window_tokens: usize) -> usize {
-    context_window_tokens.saturating_sub(CONTEXT_RESERVE_TOKENS)
+    context_window_tokens
+        .saturating_sub(CONTEXT_RESERVE_TOKENS)
+        .max(1)
 }
 
 pub(crate) fn should_compact(
@@ -140,12 +142,12 @@ pub(crate) fn should_compact(
     usable_context: usize,
     threshold_ratio: f64,
 ) -> bool {
-    let threshold = (usable_context as f64 * threshold_ratio) as usize;
+    let threshold = ((usable_context as f64 * threshold_ratio) as usize).max(1);
     estimated_tokens >= threshold
 }
 
 pub(crate) fn compaction_target_tokens(usable_context: usize, target_ratio: f64) -> usize {
-    (usable_context as f64 * target_ratio) as usize
+    ((usable_context as f64 * target_ratio) as usize).max(1)
 }
 
 #[cfg(test)]
@@ -191,7 +193,10 @@ async fn safety_compact(
         return Ok(messages.to_vec());
     }
 
-    let split_at = tool_safe_split_at(messages, messages.len() - keep_recent);
+    let split_at = compaction_split_at(messages, keep_recent);
+    if split_at == 0 {
+        return Ok(messages.to_vec());
+    }
     let old_messages = &messages[..split_at];
     let recent_messages = &messages[split_at..];
 
@@ -339,6 +344,18 @@ fn truncate_summary_for_target(summary: &str, max_chars: usize) -> String {
     let mut truncated = summary[..cutoff].to_string();
     truncated.push_str("\n... (summary truncated to fit compaction target)");
     truncated
+}
+
+fn compaction_split_at(messages: &[Message], keep_recent: usize) -> usize {
+    let desired_split = messages
+        .len()
+        .saturating_sub(keep_recent.min(messages.len()));
+    let latest_user_split = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(desired_split);
+    let preferred_split = desired_split.min(latest_user_split);
+    tool_safe_split_at(messages, preferred_split)
 }
 
 fn build_summary_input(
@@ -623,7 +640,7 @@ mod tests {
             usable_context_tokens(100_000),
             100_000 - CONTEXT_RESERVE_TOKENS
         );
-        assert_eq!(usable_context_tokens(5000), 0);
+        assert_eq!(usable_context_tokens(5000), 1);
     }
 
     #[test]
@@ -647,6 +664,22 @@ mod tests {
         let usable = 100_000;
         assert_eq!(compaction_target_tokens(usable, 0.40), 40_000);
         assert_eq!(compaction_target_tokens(usable, 0.30), 30_000);
+        assert_eq!(compaction_target_tokens(1, 0.30), 1);
+    }
+
+    #[test]
+    fn split_preserves_latest_user_message_with_recent_tail() {
+        let messages = vec![
+            Message::text("user", "old request"),
+            Message::text("assistant", "old answer"),
+            Message::text("user", "fresh request"),
+            Message::text("assistant", "draft answer"),
+        ];
+
+        let split_at = compaction_split_at(&messages, 1);
+
+        assert_eq!(split_at, 2);
+        assert_eq!(messages[split_at].content.as_text_lossy(), "fresh request");
     }
 
     #[test]
@@ -986,6 +1019,7 @@ mod tests {
         let messages = vec![
             Message::text("user", "msg-1"),
             Message::text("assistant", "reply-1"),
+            Message::text("user", "msg-2"),
         ];
 
         let result = force_compact(&state, &context, 1, &messages, &llm)
