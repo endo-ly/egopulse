@@ -109,6 +109,23 @@ pub(crate) async fn persist_phase(
     messages: &[Message],
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
+    persist_phase_messages(
+        state,
+        message,
+        vec![phase_message],
+        messages,
+        session_updated_at,
+    )
+    .await
+}
+
+pub(crate) async fn persist_phase_messages(
+    state: &AppState,
+    message: StoredMessage,
+    phase_messages: Vec<Message>,
+    messages: &[Message],
+    session_updated_at: Option<String>,
+) -> Result<PersistedTurn, EgoPulseError> {
     let persisted = store_phase_snapshot(
         state,
         message.clone(),
@@ -121,12 +138,12 @@ pub(crate) async fn persist_phase(
     }
 
     // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
-    // 今回の phase だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
+    // 今回の phase 群だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
     let LoadedSession {
         messages: mut refreshed_messages,
         session_updated_at: refreshed_updated_at,
     } = load_messages_for_turn(state, message.chat_id).await?;
-    refreshed_messages.push(phase_message);
+    refreshed_messages.extend(phase_messages);
 
     store_phase_snapshot(state, message, refreshed_messages, refreshed_updated_at)
         .await

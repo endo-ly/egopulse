@@ -305,13 +305,13 @@ fn is_quit_key(key: KeyEvent) -> bool {
 }
 
 fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Option<PendingAction> {
-    if matches!(app.view, View::Browser) {
-        return handle_browser_key(app, key);
-    }
-
-    match &mut app.view {
-        View::Chat(chat) => handle_chat_key(chat, key),
-        View::Browser => None,
+    match std::mem::replace(&mut app.view, View::Browser) {
+        View::Browser => handle_browser_key(app, key),
+        View::Chat(mut chat) => {
+            let action = handle_chat_key(&mut chat, key);
+            app.view = View::Chat(chat);
+            action
+        }
     }
 }
 

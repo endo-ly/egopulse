@@ -12,7 +12,8 @@ use crate::agent_loop::formatting::{
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::session::{
-    PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_once, resolve_chat_id,
+    PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
+    persist_phase_once, resolve_chat_id,
 };
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
@@ -500,7 +501,16 @@ where
         valid_tool_calls,
     )
     .await?;
-    messages.extend(tool_messages);
+    let persisted = persist_tool_result_messages(
+        state,
+        tool_context.chat_id,
+        messages,
+        tool_messages,
+        session_updated_at,
+    )
+    .await?;
+    messages = persisted.messages;
+    let session_updated_at = Some(persisted.updated_at);
 
     Ok((messages, session_updated_at))
 }
@@ -540,6 +550,49 @@ async fn persist_tool_call_assistant_message(
         session_updated_at,
     )
     .await
+}
+
+async fn persist_tool_result_messages(
+    state: &AppState,
+    chat_id: i64,
+    messages: Vec<Message>,
+    tool_messages: Vec<Message>,
+    session_updated_at: Option<String>,
+) -> Result<PersistedTurn, EgoPulseError> {
+    if tool_messages.is_empty() {
+        return Ok(PersistedTurn {
+            updated_at: session_updated_at.unwrap_or_default(),
+            messages,
+        });
+    }
+
+    let mut messages_with_tools = messages;
+    messages_with_tools.extend(tool_messages.iter().cloned());
+    let preview = summarize_tool_result_messages(&tool_messages);
+    persist_phase_messages(
+        state,
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content: preview,
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        tool_messages,
+        &messages_with_tools,
+        session_updated_at,
+    )
+    .await
+}
+
+fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
+    let joined = tool_messages
+        .iter()
+        .map(|message| message.content.as_text_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    preview_text(&joined, 160)
 }
 
 async fn execute_tool_calls<F>(

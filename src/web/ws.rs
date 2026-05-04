@@ -281,6 +281,16 @@ fn handle_connect(
     id: &str,
     params: serde_json::Value,
 ) -> bool {
+    if context.connected.load(Ordering::SeqCst) {
+        return send_error(
+            context.tx,
+            id,
+            "already_connected",
+            "connection already established".to_string(),
+        )
+        .is_err();
+    }
+
     let payload = match serde_json::from_value::<ConnectParams>(params) {
         Ok(payload) => payload,
         Err(error) => {

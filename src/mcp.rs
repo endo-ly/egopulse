@@ -482,7 +482,11 @@ fn format_mcp_tool_result(result: CallToolResult) -> String {
 
     let output = parts.join("\n");
     if output.is_empty() {
-        "(no output)".to_string()
+        if result.is_error == Some(true) {
+            "[error]".to_string()
+        } else {
+            "(no output)".to_string()
+        }
     } else {
         output
     }
