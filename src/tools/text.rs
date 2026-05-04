@@ -65,36 +65,23 @@ pub(crate) fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -
     let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult {
-            content: content.to_string(),
-            truncated: false,
-            truncated_by: None,
-            total_lines,
-            total_bytes,
-            output_lines: total_lines,
-            output_bytes: total_bytes,
-            last_line_partial: false,
-            first_line_exceeds_limit: false,
-            max_lines,
-            max_bytes,
-        };
+        return untruncated_result(content, total_lines, total_bytes, max_lines, max_bytes);
     }
 
     let first_line_bytes = lines.first().map(|line| line.len()).unwrap_or(0);
     if first_line_bytes > max_bytes {
-        return TruncationResult {
-            content: String::new(),
-            truncated: true,
-            truncated_by: Some("bytes"),
+        return truncated_result(
+            String::new(),
+            Some("bytes"),
             total_lines,
             total_bytes,
-            output_lines: 0,
-            output_bytes: 0,
-            last_line_partial: false,
-            first_line_exceeds_limit: true,
             max_lines,
             max_bytes,
-        };
+            TruncationFlags {
+                last_line_partial: false,
+                first_line_exceeds_limit: true,
+            },
+        );
     }
 
     let mut selected = Vec::new();
@@ -115,19 +102,18 @@ pub(crate) fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -
     }
 
     let output = selected.join("\n");
-    TruncationResult {
-        content: output.clone(),
-        truncated: true,
+    truncated_result(
+        output,
         truncated_by,
         total_lines,
         total_bytes,
-        output_lines: selected.len(),
-        output_bytes: output.len(),
-        last_line_partial: false,
-        first_line_exceeds_limit: false,
         max_lines,
         max_bytes,
-    }
+        TruncationFlags {
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+        },
+    )
 }
 
 pub(crate) fn truncate_string_to_bytes_from_end(value: &str, max_bytes: usize) -> String {
@@ -149,19 +135,7 @@ pub(crate) fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -
     let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult {
-            content: content.to_string(),
-            truncated: false,
-            truncated_by: None,
-            total_lines,
-            total_bytes,
-            output_lines: total_lines,
-            output_bytes: total_bytes,
-            last_line_partial: false,
-            first_line_exceeds_limit: false,
-            max_lines,
-            max_bytes,
-        };
+        return untruncated_result(content, total_lines, total_bytes, max_lines, max_bytes);
     }
 
     let mut selected = Vec::new();
@@ -188,16 +162,72 @@ pub(crate) fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -
     }
     selected.reverse();
     let output = selected.join("\n");
+    truncated_result(
+        output,
+        truncated_by,
+        total_lines,
+        total_bytes,
+        max_lines,
+        max_bytes,
+        TruncationFlags {
+            last_line_partial,
+            first_line_exceeds_limit: false,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TruncationFlags {
+    last_line_partial: bool,
+    first_line_exceeds_limit: bool,
+}
+
+fn untruncated_result(
+    content: &str,
+    total_lines: usize,
+    total_bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+) -> TruncationResult {
     TruncationResult {
-        content: output.clone(),
+        content: content.to_string(),
+        truncated: false,
+        truncated_by: None,
+        total_lines,
+        total_bytes,
+        output_lines: total_lines,
+        output_bytes: total_bytes,
+        last_line_partial: false,
+        first_line_exceeds_limit: false,
+        max_lines,
+        max_bytes,
+    }
+}
+
+fn truncated_result(
+    content: String,
+    truncated_by: Option<&'static str>,
+    total_lines: usize,
+    total_bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    flags: TruncationFlags,
+) -> TruncationResult {
+    let output_lines = if content.is_empty() && flags.first_line_exceeds_limit {
+        0
+    } else {
+        content.split('\n').count()
+    };
+    TruncationResult {
+        output_lines,
+        output_bytes: content.len(),
+        content,
         truncated: true,
         truncated_by,
         total_lines,
         total_bytes,
-        output_lines: selected.len(),
-        output_bytes: output.len(),
-        last_line_partial,
-        first_line_exceeds_limit: false,
+        last_line_partial: flags.last_line_partial,
+        first_line_exceeds_limit: flags.first_line_exceeds_limit,
         max_lines,
         max_bytes,
     }
