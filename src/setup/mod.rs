@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -761,182 +761,208 @@ async fn run_inner(
     loop {
         draw(terminal, app);
 
-        if app.completed {
-            if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
-                if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                    if key.kind == KeyEventKind::Press {
-                        return Ok(());
-                    }
-                }
-            }
+        let Some(key) = read_setup_key()? else {
             continue;
+        };
+
+        if app.completed {
+            return Ok(());
         }
 
-        if event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
-            let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
-                continue;
-            };
-
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            match app.mode {
-                SetupMode::Selector(ref mut state) => match key.code {
-                    KeyCode::Esc => {
-                        if let Some(field) =
-                            app.fields.iter_mut().find(|f| f.key == state.field_key)
-                        {
-                            field.value = state.original_value.clone();
-                        }
-                        app.mode = SetupMode::Navigate;
-                        app.status =
-                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
-                                    .into();
-                    }
-                    KeyCode::Enter => {
-                        let filtered = filtered_items(&state.items, &state.filter);
-                        if filtered.is_empty() {
-                            if let Some(field) =
-                                app.fields.iter_mut().find(|f| f.key == state.field_key)
-                            {
-                                field.value = state.filter.clone();
-                            }
-                        } else {
-                            state.selected = (state.selected).min(filtered.len() - 1);
-                            let selected_value = filtered[state.selected].value.clone();
-                            if let Some(field) =
-                                app.fields.iter_mut().find(|f| f.key == state.field_key)
-                            {
-                                field.value = selected_value;
-                            }
-                        }
-                        let field_key = state.field_key.clone();
-                        app.apply_selector_selection(&field_key);
-                        app.mode = SetupMode::Navigate;
-                        app.status =
-                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
-                                    .into();
-                    }
-                    KeyCode::Up | KeyCode::Char('k')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let filtered = filtered_items(&state.items, &state.filter);
-                        if !filtered.is_empty() && state.selected > 0 {
-                            state.selected -= 1;
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let filtered = filtered_items(&state.items, &state.filter);
-                        if !filtered.is_empty() {
-                            state.selected = (state.selected + 1).min(filtered.len() - 1);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        state.filter.pop();
-                        let filtered = filtered_items(&state.items, &state.filter);
-                        if !filtered.is_empty() {
-                            state.selected = state.selected.min(filtered.len() - 1);
-                        } else {
-                            state.selected = 0;
-                        }
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.filter.push(c);
-                        let filtered = filtered_items(&state.items, &state.filter);
-                        if !filtered.is_empty() {
-                            state.selected = state.selected.min(filtered.len() - 1);
-                        } else {
-                            state.selected = 0;
-                        }
-                    }
-                    _ => {}
-                },
-                SetupMode::Edit => match key.code {
-                    KeyCode::Esc | KeyCode::Enter => {
-                        if let Some(field) = app.current_field() {
-                            if field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED" {
-                                update_field_visibility(&mut app.fields);
-                            }
-                        }
-                        app.mode = SetupMode::Navigate;
-                        app.status =
-                                "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel"
-                                    .into();
-                    }
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match app.save() {
-                            Ok(()) => {
-                                app.mode = SetupMode::Navigate;
-                                app.status = "Config saved successfully!".into();
-                            }
-                            Err(e) => {
-                                app.status = format!("Save failed: {e}");
-                            }
-                        }
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err("Setup cancelled".into());
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(field) = app.current_field_mut() {
-                            field.value.push(c);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(field) = app.current_field_mut() {
-                            field.value.pop();
-                        }
-                    }
-                    _ => {}
-                },
-                SetupMode::Navigate => match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err("Setup cancelled".into());
-                    }
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match app.save() {
-                            Ok(()) => {
-                                app.status = "Config saved successfully!".into();
-                            }
-                            Err(e) => {
-                                app.status = format!("Save failed: {e}");
-                            }
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(field) = app.current_field() {
-                            let key_name = field.key.clone();
-                            match key_name.as_str() {
-                                "PROVIDER" | "MODEL" => {
-                                    app.mode = SetupMode::Selector(app.enter_selector(&key_name));
-                                    app.status =
-                                        "Selector: type to filter, Enter: select, Esc: cancel"
-                                            .into();
-                                }
-                                _ => {
-                                    app.mode = SetupMode::Edit;
-                                    app.status = "Editing... (Enter/Esc to finish)".into();
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        app.move_selection(-1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        app.move_selection(1);
-                    }
-                    _ => {}
-                },
-            }
+        if handle_setup_key(app, key)? {
+            return Ok(());
         }
+    }
+}
+
+fn read_setup_key() -> Result<Option<KeyEvent>, String> {
+    if !event::poll(std::time::Duration::from_millis(200)).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+
+    let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+
+    Ok((key.kind == KeyEventKind::Press).then_some(key))
+}
+
+fn handle_setup_key(app: &mut SetupApp, key: KeyEvent) -> Result<bool, String> {
+    let mode = std::mem::replace(&mut app.mode, SetupMode::Navigate);
+    match mode {
+        SetupMode::Selector(state) => handle_selector_key(app, key, state),
+        SetupMode::Edit => handle_edit_key(app, key),
+        SetupMode::Navigate => handle_navigate_key(app, key),
+    }
+}
+
+fn handle_selector_key(
+    app: &mut SetupApp,
+    key: KeyEvent,
+    mut state: SelectorState,
+) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(field) = app.fields.iter_mut().find(|f| f.key == state.field_key) {
+                field.value = state.original_value.clone();
+            }
+            enter_navigate_mode(app);
+        }
+        KeyCode::Enter => {
+            apply_selector_value(app, &mut state);
+            let field_key = state.field_key.clone();
+            app.apply_selector_selection(&field_key);
+            enter_navigate_mode(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_selector_selection(&mut state, -1);
+            app.mode = SetupMode::Selector(state);
+        }
+        KeyCode::Down | KeyCode::Char('j') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_selector_selection(&mut state, 1);
+            app.mode = SetupMode::Selector(state);
+        }
+        KeyCode::Backspace => {
+            state.filter.pop();
+            clamp_selector_selection(&mut state);
+            app.mode = SetupMode::Selector(state);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.filter.push(c);
+            clamp_selector_selection(&mut state);
+            app.mode = SetupMode::Selector(state);
+        }
+        _ => app.mode = SetupMode::Selector(state),
+    }
+    Ok(false)
+}
+
+fn handle_edit_key(app: &mut SetupApp, key: KeyEvent) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            finish_editing(app);
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            save_setup(app);
+            app.mode = SetupMode::Navigate;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Err("Setup cancelled".into());
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(field) = app.current_field_mut() {
+                field.value.push(c);
+            }
+            app.mode = SetupMode::Edit;
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = app.current_field_mut() {
+                field.value.pop();
+            }
+            app.mode = SetupMode::Edit;
+        }
+        _ => app.mode = SetupMode::Edit,
+    }
+    Ok(false)
+}
+
+fn handle_navigate_key(app: &mut SetupApp, key: KeyEvent) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Err("Setup cancelled".into());
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => save_setup(app),
+        KeyCode::Enter => open_current_field(app),
+        KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_selection(-1);
+            app.mode = SetupMode::Navigate;
+        }
+        KeyCode::Down | KeyCode::Char('j') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_selection(1);
+            app.mode = SetupMode::Navigate;
+        }
+        _ => app.mode = SetupMode::Navigate,
+    }
+    Ok(false)
+}
+
+fn enter_navigate_mode(app: &mut SetupApp) {
+    app.mode = SetupMode::Navigate;
+    app.status = "Enter: edit | Up/Down: navigate | Ctrl+S: save & exit | Ctrl+C: cancel".into();
+}
+
+fn finish_editing(app: &mut SetupApp) {
+    if let Some(field) = app.current_field()
+        && (field.key == "DISCORD_ENABLED" || field.key == "TELEGRAM_ENABLED")
+    {
+        update_field_visibility(&mut app.fields);
+    }
+    enter_navigate_mode(app);
+}
+
+fn save_setup(app: &mut SetupApp) {
+    match app.save() {
+        Ok(()) => {
+            app.status = "Config saved successfully!".into();
+        }
+        Err(e) => {
+            app.status = format!("Save failed: {e}");
+        }
+    }
+}
+
+fn open_current_field(app: &mut SetupApp) {
+    let Some(field) = app.current_field() else {
+        app.mode = SetupMode::Navigate;
+        return;
+    };
+    let key_name = field.key.clone();
+    match key_name.as_str() {
+        "PROVIDER" | "MODEL" => {
+            app.mode = SetupMode::Selector(app.enter_selector(&key_name));
+            app.status = "Selector: type to filter, Enter: select, Esc: cancel".into();
+        }
+        _ => {
+            app.mode = SetupMode::Edit;
+            app.status = "Editing... (Enter/Esc to finish)".into();
+        }
+    }
+}
+
+fn apply_selector_value(app: &mut SetupApp, state: &mut SelectorState) {
+    let filtered = filtered_items(&state.items, &state.filter);
+    let selected_value = if filtered.is_empty() {
+        state.filter.clone()
+    } else {
+        state.selected = state.selected.min(filtered.len() - 1);
+        filtered[state.selected].value.clone()
+    };
+
+    if let Some(field) = app
+        .fields
+        .iter_mut()
+        .find(|field| field.key == state.field_key)
+    {
+        field.value = selected_value;
+    }
+}
+
+fn move_selector_selection(state: &mut SelectorState, delta: isize) {
+    let filtered = filtered_items(&state.items, &state.filter);
+    if filtered.is_empty() {
+        state.selected = 0;
+        return;
+    }
+    let len = filtered.len() as isize;
+    state.selected = (state.selected as isize + delta).clamp(0, len - 1) as usize;
+}
+
+fn clamp_selector_selection(state: &mut SelectorState) {
+    let filtered = filtered_items(&state.items, &state.filter);
+    if filtered.is_empty() {
+        state.selected = 0;
+    } else {
+        state.selected = state.selected.min(filtered.len() - 1);
     }
 }
 
