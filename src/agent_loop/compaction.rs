@@ -7,8 +7,8 @@
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
-use crate::error::EgoPulseError;
-use crate::llm::Message;
+use crate::error::{EgoPulseError, LlmError};
+use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::runtime::AppState;
 use tracing::{info, warn};
 
@@ -171,6 +171,28 @@ pub(crate) fn shrink_summary_input(text: String, budget_tokens: usize) -> String
     truncated
 }
 
+struct CompactionSlices<'a> {
+    old_messages: &'a [Message],
+    recent_messages: &'a [Message],
+}
+
+struct CompactionResultInput<'a> {
+    context: &'a SurfaceContext,
+    chat_id: i64,
+    llm: &'a std::sync::Arc<dyn LlmProvider>,
+    original_count: usize,
+    old_count: usize,
+    recent_messages: &'a [Message],
+    summary: &'a str,
+    usable_context: usize,
+    target_ratio: f64,
+}
+
+enum SummarizeOutcome {
+    Summary(String),
+    KeepOriginal,
+}
+
 async fn safety_compact(
     state: &AppState,
     context: &SurfaceContext,
@@ -180,6 +202,48 @@ async fn safety_compact(
     usable_context: usize,
     target_ratio: f64,
 ) -> Result<Vec<Message>, EgoPulseError> {
+    archive_current_conversation(state, context, chat_id, messages).await;
+
+    let Some(slices) = select_compaction_slices(messages, state.config.compact_keep_recent) else {
+        return Ok(messages.to_vec());
+    };
+
+    let summary = match summarize_old_messages(
+        state,
+        context,
+        chat_id,
+        slices.old_messages,
+        llm,
+        usable_context,
+        target_ratio,
+    )
+    .await
+    {
+        SummarizeOutcome::Summary(summary) => summary,
+        SummarizeOutcome::KeepOriginal => return Ok(messages.to_vec()),
+    };
+
+    let compacted = build_compaction_result(CompactionResultInput {
+        context,
+        chat_id,
+        llm,
+        original_count: messages.len(),
+        old_count: slices.old_messages.len(),
+        recent_messages: slices.recent_messages,
+        summary: &summary,
+        usable_context,
+        target_ratio,
+    });
+
+    Ok(compacted)
+}
+
+async fn archive_current_conversation(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    messages: &[Message],
+) {
     archive_conversation(
         &state.config.groups_dir(),
         &context.channel,
@@ -187,24 +251,78 @@ async fn safety_compact(
         messages,
     )
     .await;
+}
 
-    let keep_recent = state.config.compact_keep_recent.min(messages.len());
+fn select_compaction_slices(
+    messages: &[Message],
+    compact_keep_recent: usize,
+) -> Option<CompactionSlices<'_>> {
+    let keep_recent = compact_keep_recent.min(messages.len());
     if keep_recent == messages.len() {
-        return Ok(messages.to_vec());
+        return None;
     }
 
     let split_at = compaction_split_at(messages, keep_recent);
-    if split_at == 0 {
-        return Ok(messages.to_vec());
-    }
-    let old_messages = &messages[..split_at];
-    let recent_messages = &messages[split_at..];
+    (split_at != 0).then_some(CompactionSlices {
+        old_messages: &messages[..split_at],
+        recent_messages: &messages[split_at..],
+    })
+}
 
+async fn summarize_old_messages(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    old_messages: &[Message],
+    llm: &std::sync::Arc<dyn LlmProvider>,
+    usable_context: usize,
+    target_ratio: f64,
+) -> SummarizeOutcome {
     let mut summary_input = build_summary_input(old_messages, usable_context, target_ratio);
     summary_input = redact_summary_text(&summary_input, state);
-
     let timeout_secs = state.config.compaction_timeout_secs;
-    let summary_result = tokio::time::timeout(
+
+    let summary_result = send_summary_request(llm, summary_input, timeout_secs).await;
+    let summary = match summary_result {
+        Ok(response) => {
+            log_summarizer_usage(state, context, chat_id, llm, &response);
+            strip_thinking(&response.content)
+        }
+        Err(SummarizeError::Provider(error)) => {
+            warn!("safety_compact summarization failed: {error}; keeping original messages");
+            log_compaction_metrics(context, chat_id, llm, 0, 0, old_messages.len(), false);
+            return SummarizeOutcome::KeepOriginal;
+        }
+        Err(SummarizeError::Timeout) => {
+            warn!(
+                "safety_compact timed out after {timeout_secs}s for {}:{}; keeping original messages",
+                context.channel, chat_id
+            );
+            log_compaction_metrics(context, chat_id, llm, 0, 0, old_messages.len(), false);
+            return SummarizeOutcome::KeepOriginal;
+        }
+    };
+
+    if summary.trim().is_empty() {
+        warn!("safety_compact returned empty text; keeping original messages");
+        log_compaction_metrics(context, chat_id, llm, 0, 0, old_messages.len(), false);
+        return SummarizeOutcome::KeepOriginal;
+    }
+
+    SummarizeOutcome::Summary(redact_summary_text(&summary, state))
+}
+
+enum SummarizeError {
+    Provider(LlmError),
+    Timeout,
+}
+
+async fn send_summary_request(
+    llm: &std::sync::Arc<dyn LlmProvider>,
+    summary_input: String,
+    timeout_secs: u64,
+) -> Result<MessagesResponse, SummarizeError> {
+    tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         llm.send_message(
             SUMMARIZER_SYSTEM_PROMPT,
@@ -212,86 +330,73 @@ async fn safety_compact(
             None,
         ),
     )
-    .await;
+    .await
+    .map_err(|_| SummarizeError::Timeout)?
+    .map_err(SummarizeError::Provider)
+}
 
-    let summary = match summary_result {
-        Ok(Ok(response)) => {
-            if let Some(usage) = &response.usage {
-                let db = std::sync::Arc::clone(&state.db);
-                let channel = context.channel.clone();
-                let provider = llm.provider_name().to_string();
-                let model = llm.model_name().to_string();
-                let input_tokens = usage.input_tokens;
-                let output_tokens = usage.output_tokens;
-                tokio::spawn(async move {
-                    let _ = crate::storage::call_blocking(db, move |db| {
-                        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                            chat_id,
-                            caller_channel: &channel,
-                            provider: &provider,
-                            model: &model,
-                            input_tokens,
-                            output_tokens,
-                            request_kind: "summarize",
-                        })
-                    })
-                    .await
-                    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
-                });
-            }
-            strip_thinking(&response.content)
-        }
-        Ok(Err(error)) => {
-            warn!("safety_compact summarization failed: {error}; keeping original messages");
-            log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
-            return Ok(messages.to_vec());
-        }
-        Err(_) => {
-            warn!(
-                "safety_compact timed out after {timeout_secs}s for {}:{}; keeping original messages",
-                context.channel, chat_id
-            );
-            log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
-            return Ok(messages.to_vec());
-        }
+fn log_summarizer_usage(
+    state: &AppState,
+    context: &SurfaceContext,
+    chat_id: i64,
+    llm: &std::sync::Arc<dyn LlmProvider>,
+    response: &MessagesResponse,
+) {
+    let Some(usage) = &response.usage else {
+        return;
     };
 
-    if summary.trim().is_empty() {
-        warn!("safety_compact returned empty text; keeping original messages");
-        log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
-        return Ok(messages.to_vec());
-    }
+    let db = std::sync::Arc::clone(&state.db);
+    let channel = context.channel.clone();
+    let provider = llm.provider_name().to_string();
+    let model = llm.model_name().to_string();
+    let input_tokens = usage.input_tokens;
+    let output_tokens = usage.output_tokens;
+    tokio::spawn(async move {
+        let _ = crate::storage::call_blocking(db, move |db| {
+            db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                chat_id,
+                caller_channel: &channel,
+                provider: &provider,
+                model: &model,
+                input_tokens,
+                output_tokens,
+                request_kind: "summarize",
+            })
+        })
+        .await
+        .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
+    });
+}
 
-    let summary = redact_summary_text(&summary, state);
-
-    let old_count = old_messages.len();
-    let target = compaction_target_tokens(usable_context, target_ratio);
-    let compacted = build_targeted_compacted_messages(&summary, recent_messages, target);
+fn build_compaction_result(input: CompactionResultInput<'_>) -> Vec<Message> {
+    let target = compaction_target_tokens(input.usable_context, input.target_ratio);
+    let compacted = build_targeted_compacted_messages(input.summary, input.recent_messages, target);
 
     let new_count = compacted.len();
     log_compaction_metrics(
-        context,
-        chat_id,
-        llm,
-        old_count,
+        input.context,
+        input.chat_id,
+        input.llm,
+        input.old_count,
         new_count,
-        messages.len(),
+        input.original_count,
         true,
     );
 
     let post_tokens = estimate_prompt_tokens("", &compacted, None);
     if post_tokens > target {
         warn!(
-            channel = %context.channel,
-            chat_id,
+            channel = %input.context.channel,
+            chat_id = input.chat_id,
             post_tokens,
             target_tokens = target,
-            target_ratio,
+            target_ratio = input.target_ratio,
             "compaction exceeded target ratio; context may still be large"
         );
     }
 
-    Ok(compacted)
+    compacted
 }
 
 fn build_targeted_compacted_messages(
