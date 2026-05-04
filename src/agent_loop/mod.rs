@@ -6,6 +6,7 @@
 pub(crate) mod compaction;
 mod formatting;
 pub(crate) mod guards;
+pub(crate) mod prompt_builder;
 pub(crate) mod session;
 pub(crate) mod turn;
 
