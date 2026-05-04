@@ -2,6 +2,10 @@
 //!
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
+pub mod gateway;
+pub mod logging;
+pub mod status;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,19 +17,20 @@ use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
 use crate::assets::AssetStore;
-use crate::channel_adapter::ChannelRegistry;
 use crate::channels;
+use crate::channels::adapter::ChannelRegistry;
+use crate::channels::web::WebAdapter;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
+use crate::runtime::status as status_mod;
+use crate::runtime::status::{
+    ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
+};
 use crate::skills::SkillManager;
 use crate::soul_agents::SoulAgentsLoader;
-use crate::status::{
-    self, ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
-};
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
-use crate::web::WebAdapter;
 
 /// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
@@ -276,7 +281,9 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         let port = state.config.web_port();
         info!("Starting Web UI server on {host}:{port}");
         let handle =
-            tokio::spawn(async move { crate::web::run_server(web_state, &host, port).await });
+            tokio::spawn(
+                async move { crate::channels::web::run_server(web_state, &host, port).await },
+            );
         handles.push(("web".to_string(), handle));
     }
 
@@ -489,7 +496,7 @@ async fn write_startup_status(state: &AppState) {
     };
 
     let state_root = PathBuf::from(&state.config.state_root);
-    if let Err(error) = status::write_status(&state_root, &snapshot) {
+    if let Err(error) = status_mod::write_status(&state_root, &snapshot) {
         tracing::warn!("failed to write startup status: {error}");
     }
 }
