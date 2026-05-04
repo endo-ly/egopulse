@@ -1,9 +1,9 @@
 //! Safety Compaction: token-aware context window management.
 //!
-//! When estimated prompt size approaches the context window limit, only the
-//! *Middle* portion of the conversation is replaced with a reference-only
-//! summary.  The latest user message, recent context, and tool call/result
-//! blocks are always preserved verbatim.
+//! When estimated prompt size approaches the context window limit, the old
+//! portion of the conversation is replaced with a reference-only summary. The
+//! latest user message, recent context, and tool call/result blocks are always
+//! preserved verbatim.
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
@@ -260,7 +260,8 @@ async fn safety_compact(
     let summary = redact_summary_text(&summary, state);
 
     let old_count = old_messages.len();
-    let compacted = build_compacted_messages(&summary, recent_messages);
+    let target = compaction_target_tokens(usable_context, target_ratio);
+    let compacted = build_targeted_compacted_messages(&summary, recent_messages, target);
 
     let new_count = compacted.len();
     log_compaction_metrics(
@@ -273,7 +274,6 @@ async fn safety_compact(
         true,
     );
 
-    let target = compaction_target_tokens(usable_context, target_ratio);
     let post_tokens = estimate_prompt_tokens("", &compacted, None);
     if post_tokens > target {
         warn!(
@@ -287,6 +287,58 @@ async fn safety_compact(
     }
 
     Ok(compacted)
+}
+
+fn build_targeted_compacted_messages(
+    summary: &str,
+    recent_messages: &[Message],
+    target_tokens: usize,
+) -> Vec<Message> {
+    let compacted = build_compacted_messages(summary, recent_messages);
+    if target_tokens == 0 {
+        return compacted;
+    }
+    if estimate_prompt_tokens("", &compacted, None) <= target_tokens {
+        return compacted;
+    }
+
+    let mut best = None;
+    let mut low = 0;
+    let mut high = summary.chars().count();
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate_summary = truncate_summary_for_target(summary, mid);
+        let candidate = build_compacted_messages(&candidate_summary, recent_messages);
+        if estimate_prompt_tokens("", &candidate, None) <= target_tokens {
+            best = Some(candidate);
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    best.unwrap_or_else(|| build_compacted_messages("", recent_messages))
+}
+
+fn truncate_summary_for_target(summary: &str, max_chars: usize) -> String {
+    let total_chars = summary.chars().count();
+    if max_chars >= total_chars {
+        return summary.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let cutoff = summary
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(summary.len());
+    let mut truncated = summary[..cutoff].to_string();
+    truncated.push_str("\n... (summary truncated to fit compaction target)");
+    truncated
 }
 
 fn build_summary_input(
@@ -612,6 +664,44 @@ mod tests {
         let result = shrink_summary_input(input, budget_tokens);
         assert!(result.chars().count() < max_chars * 2);
         assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn shrinks_compacted_summary_to_target() {
+        let recent = vec![Message::text("user", "fresh question")];
+        let full = build_compacted_messages(&"summary ".repeat(1000), &recent);
+        let minimum = build_compacted_messages("", &recent);
+        let target = estimate_prompt_tokens("", &minimum, None) + 10;
+
+        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target);
+
+        assert!(estimate_prompt_tokens("", &full, None) > target);
+        assert!(estimate_prompt_tokens("", &result, None) <= target);
+        assert!(
+            result[0]
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        );
+        assert_eq!(
+            result.last().expect("recent").content.as_text_lossy(),
+            "fresh question"
+        );
+    }
+
+    #[test]
+    fn keeps_protected_recent_when_target_is_impossible() {
+        let recent = vec![Message::text("user", "fresh question".repeat(500))];
+
+        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, 1);
+
+        assert_eq!(result.last().expect("recent").role, "user");
+        assert!(
+            result[0]
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        );
     }
 
     #[test]
