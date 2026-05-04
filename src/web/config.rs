@@ -218,6 +218,10 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                 let trimmed = model.trim();
                 if !trimmed.is_empty() {
                     existing.default_model = trimmed.to_string();
+                    existing
+                        .models
+                        .entry(existing.default_model.clone())
+                        .or_insert_with(crate::config::ModelConfig::default);
                 }
             }
             if let Some(models) = update.models {
@@ -452,8 +456,11 @@ fn infer_provider_label(provider: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_api_key_update;
+    use std::collections::HashMap;
+
+    use super::{ProviderUpdatePayload, apply_api_key_update, apply_provider_updates};
     use crate::config::secret_ref::ResolvedValue;
+    use crate::config::{Config, ModelConfig, ProviderConfig, ProviderId};
 
     #[test]
     fn apply_api_key_update_stores_env_ref() {
@@ -466,5 +473,50 @@ mod tests {
             Some(ResolvedValue::EnvRef { ref id, ref value })
                 if id == "OPENAI_API_KEY" && value == "sk-test"
         ));
+    }
+
+    #[test]
+    fn provider_default_model_update_registers_model_entry() {
+        let mut config = Config {
+            default_provider: ProviderId::new("openai"),
+            default_model: None,
+            providers: HashMap::from([(
+                ProviderId::new("openai"),
+                ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: None,
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: HashMap::from([("gpt-4o-mini".to_string(), ModelConfig::default())]),
+                },
+            )]),
+            state_root: "/tmp/egopulse-test".to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 30,
+            max_history_messages: 100,
+            compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
+            channels: HashMap::new(),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: HashMap::new(),
+        };
+        let updates = HashMap::from([(
+            "openai".to_string(),
+            ProviderUpdatePayload {
+                label: None,
+                base_url: None,
+                api_key: None,
+                default_model: Some("gpt-5".to_string()),
+                models: None,
+            },
+        )]);
+
+        apply_provider_updates(&mut config, updates);
+
+        let provider = config.providers.get("openai").expect("provider");
+        assert_eq!(provider.default_model, "gpt-5");
+        assert!(provider.models.contains_key("gpt-5"));
     }
 }
