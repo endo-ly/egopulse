@@ -273,6 +273,19 @@ async fn safety_compact(
         true,
     );
 
+    let target = compaction_target_tokens(usable_context, target_ratio);
+    let post_tokens = estimate_prompt_tokens("", &compacted, None);
+    if post_tokens > target {
+        warn!(
+            channel = %context.channel,
+            chat_id,
+            post_tokens,
+            target_tokens = target,
+            target_ratio,
+            "compaction exceeded target ratio; context may still be large"
+        );
+    }
+
     Ok(compacted)
 }
 

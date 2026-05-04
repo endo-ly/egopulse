@@ -161,7 +161,7 @@ providers:
       google/gemini-2.5-pro:
         context_window_tokens: 1048576
       openai/gpt-4.1:
-        context_window_tokens: 1047576
+        context_window_tokens: 1048576
   ollama:
     label: Ollama (Local)
     base_url: http://localhost:11434/v1

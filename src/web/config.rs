@@ -222,6 +222,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
             }
             if let Some(models) = update.models {
                 let final_default = existing.default_model.clone();
+                let old_models = std::mem::take(&mut existing.models);
                 existing.models = models
                     .into_iter()
                     .filter_map(|m| {
@@ -229,7 +230,8 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                         if trimmed.is_empty() {
                             None
                         } else {
-                            Some((trimmed.to_string(), crate::config::ModelConfig::default()))
+                            let config = old_models.get(trimmed).cloned().unwrap_or_default();
+                            Some((trimmed.to_string(), config))
                         }
                     })
                     .collect();

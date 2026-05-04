@@ -130,13 +130,12 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 **usable context 算出**: `context_window_tokens - CONTEXT_RESERVE_TOKENS(8192)`。reserve は出力生成・tool schema・system/margin の内部予約。
 
-**分割**: message list を Head / Middle / Tail の 3 領域に分ける。
+**分割**: `tool_safe_split_at` で message list を old / recent の 2 領域に分ける。境界は tool call/result block を不可分として保護。
 
-- **Head**: 既存 compaction summary（あれば）。再圧縮時に summary の有効情報を統合
-- **Middle**: 古い完了済みメッセージ。summary 対象
-- **Tail**: `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護
+- **old**: 古いメッセージ。summary 対象
+- **recent**: `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護
 
-**要約入力**: Middle を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。summarizer budget（`usable context - 4096` tokens）を超えないよう段階的に削減（軽量化 → message 単位削減 → Head 寄り Middle 削除）。
+**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう段階的に削減（軽量化 → message 単位削減）。
 
 **要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + Middle dump。
 

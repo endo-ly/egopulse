@@ -243,6 +243,19 @@ where
         session_updated_at = updated_at;
         empty_reply_retry_attempted = false;
         declarative_retry_attempted = false;
+
+        if let Ok(compacted) = maybe_compact_messages(
+            state,
+            context,
+            chat_id,
+            &messages,
+            &channel_llm,
+            &prompt_ctx,
+        )
+        .await
+        {
+            messages = compacted;
+        }
     }
 
     Err(EgoPulseError::Internal(format!(
