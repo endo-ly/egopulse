@@ -70,7 +70,16 @@ pub(crate) async fn maybe_compact_messages(
         "safety compaction triggered"
     );
 
-    safety_compact(state, context, chat_id, messages, llm, usable).await
+    safety_compact(
+        state,
+        context,
+        chat_id,
+        messages,
+        llm,
+        usable,
+        state.config.compaction_target_ratio,
+    )
+    .await
 }
 
 pub async fn force_compact(
@@ -90,7 +99,16 @@ pub async fn force_compact(
         .resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
 
-    safety_compact(state, context, chat_id, messages, llm, usable).await
+    safety_compact(
+        state,
+        context,
+        chat_id,
+        messages,
+        llm,
+        usable,
+        state.config.compaction_target_ratio,
+    )
+    .await
 }
 
 pub(crate) fn estimate_prompt_tokens(
@@ -126,11 +144,11 @@ pub(crate) fn should_compact(
     estimated_tokens >= threshold
 }
 
-#[cfg(test)]
 pub(crate) fn compaction_target_tokens(usable_context: usize, target_ratio: f64) -> usize {
     (usable_context as f64 * target_ratio) as usize
 }
 
+#[cfg(test)]
 pub(crate) fn summarizer_input_budget(usable_context: usize) -> usize {
     usable_context.saturating_sub(SUMMARIZER_OUTPUT_RESERVE)
 }
@@ -158,6 +176,7 @@ async fn safety_compact(
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     usable_context: usize,
+    target_ratio: f64,
 ) -> Result<Vec<Message>, EgoPulseError> {
     archive_conversation(
         &state.config.groups_dir(),
@@ -176,7 +195,7 @@ async fn safety_compact(
     let old_messages = &messages[..split_at];
     let recent_messages = &messages[split_at..];
 
-    let mut summary_input = build_summary_input(old_messages, usable_context);
+    let mut summary_input = build_summary_input(old_messages, usable_context, target_ratio);
     summary_input = redact_summary_text(&summary_input, state);
 
     let timeout_secs = state.config.compaction_timeout_secs;
@@ -257,8 +276,13 @@ async fn safety_compact(
     Ok(compacted)
 }
 
-fn build_summary_input(old_messages: &[Message], usable_context: usize) -> String {
-    let budget = summarizer_input_budget(usable_context);
+fn build_summary_input(
+    old_messages: &[Message],
+    usable_context: usize,
+    target_ratio: f64,
+) -> String {
+    let target_tokens = compaction_target_tokens(usable_context, target_ratio);
+    let budget = target_tokens.saturating_sub(SUMMARIZER_OUTPUT_RESERVE);
     let max_chars = budget * CHARS_PER_TOKEN_ESTIMATE;
 
     let mut summary_input = String::new();
@@ -297,14 +321,46 @@ fn build_compacted_messages(summary: &str, recent_messages: &[Message]) -> Vec<M
     )];
 
     for message in recent_messages {
-        append_compacted_message(&mut compacted, message);
+        compacted.push(message.clone());
     }
+
+    merge_compacted_skipping_summary(&mut compacted);
 
     if matches!(compacted.last(), Some(last) if last.role == "assistant") {
         compacted.pop();
     }
 
     compacted
+}
+
+fn merge_compacted_skipping_summary(compacted: &mut Vec<Message>) {
+    let start_idx = 1;
+    if compacted.len() <= start_idx + 1 {
+        return;
+    }
+
+    let mut write = start_idx;
+    for read in start_idx + 1..compacted.len() {
+        let can_merge = {
+            let left = &compacted[write];
+            let right = &compacted[read];
+            can_merge_compacted_messages(left, right)
+        };
+        if can_merge {
+            let merged = format!(
+                "{}\n{}",
+                compacted[write].content.as_text_lossy(),
+                compacted[read].content.as_text_lossy()
+            );
+            compacted[write].content = crate::llm::MessageContent::text(merged);
+        } else {
+            write += 1;
+            if write != read {
+                compacted.swap(write, read);
+            }
+        }
+    }
+    compacted.truncate(write + 1);
 }
 
 fn log_compaction_metrics(
@@ -432,26 +488,7 @@ fn find_tool_call_parent(
     })
 }
 
-pub(crate) fn append_compacted_message(compacted: &mut Vec<Message>, message: &Message) {
-    let Some(last) = compacted.last_mut() else {
-        compacted.push(message.clone());
-        return;
-    };
-
-    if can_merge_compacted_messages(last, message) {
-        let merged = format!(
-            "{}\n{}",
-            last.content.as_text_lossy(),
-            message.content.as_text_lossy()
-        );
-        last.content = crate::llm::MessageContent::text(merged);
-        return;
-    }
-
-    compacted.push(message.clone());
-}
-
-pub(crate) fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
+fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
     left.role == right.role
         && left.tool_calls.is_empty()
         && right.tool_calls.is_empty()
