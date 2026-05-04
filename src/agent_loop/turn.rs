@@ -4,7 +4,7 @@
 //! 1 本の turn loop としてまとめて扱う。
 
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::compaction::maybe_compact_messages;
+use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::formatting::{
     format_tool_result, preview_text, sanitize_assistant_response_text, strip_thinking,
     summarize_tool_calls_with_content, tool_message_content,
@@ -121,6 +121,14 @@ where
     })?;
 
     let user_message = Message::text("user", user_input);
+
+    let tool_defs = state.tools.definitions_async().await;
+    let tools_json = serde_json::to_string(&tool_defs).ok();
+    let prompt_ctx = PromptContext {
+        system_prompt: &system_prompt,
+        tools_json: tools_json.as_deref(),
+    };
+
     let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
         state,
         context,
@@ -128,6 +136,7 @@ where
         &user_message,
         user_input,
         &channel_llm,
+        &prompt_ctx,
     )
     .await?;
 
@@ -137,8 +146,6 @@ where
     let mut empty_reply_retry_attempted = false;
     let mut declarative_retry_attempted = false;
     let mut retry_messages: Option<Vec<Message>> = None;
-
-    let tool_defs = state.tools.definitions_async().await;
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         emit_event(&on_event, AgentEvent::Iteration { iteration });
@@ -723,6 +730,7 @@ async fn persist_user_turn_with_compaction(
     user_message: &Message,
     user_input: &str,
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, chat_id).await?;
     let stored_message = StoredMessage {
@@ -735,9 +743,17 @@ async fn persist_user_turn_with_compaction(
     };
 
     for attempt in 0..2 {
-        let candidate_messages =
-            build_candidate_messages(state, context, chat_id, &loaded.messages, user_message, llm)
-                .await?;
+        let mut candidate_messages = loaded.messages.clone();
+        candidate_messages.push(user_message.clone());
+        let candidate_messages = maybe_compact_messages(
+            state,
+            context,
+            chat_id,
+            &candidate_messages,
+            llm,
+            prompt_ctx,
+        )
+        .await?;
 
         let persist_result = persist_phase_once(
             state,
@@ -760,19 +776,6 @@ async fn persist_user_turn_with_compaction(
     Err(EgoPulseError::Storage(
         StorageError::SessionSnapshotConflict,
     ))
-}
-
-async fn build_candidate_messages(
-    state: &AppState,
-    context: &SurfaceContext,
-    chat_id: i64,
-    loaded_messages: &[Message],
-    user_message: &Message,
-    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
-) -> Result<Vec<Message>, EgoPulseError> {
-    let mut candidate_messages = loaded_messages.to_vec();
-    candidate_messages.push(user_message.clone());
-    maybe_compact_messages(state, context, chat_id, &candidate_messages, llm).await
 }
 
 async fn handle_user_turn_persist_error(

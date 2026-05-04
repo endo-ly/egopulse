@@ -36,19 +36,26 @@ const SUMMARIZER_SYSTEM_PROMPT: &str = "You are a helpful summarizer. Summarize 
      preserving key facts, decisions, tool results, and context needed to \
      continue. Be brief but thorough. Write the summary in the same language \
      the user was using.";
+pub(crate) struct PromptContext<'a> {
+    pub system_prompt: &'a str,
+    pub tools_json: Option<&'a str>,
+}
+
 pub(crate) async fn maybe_compact_messages(
     state: &AppState,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    prompt_ctx: &PromptContext<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let provider_id = crate::config::ProviderId::new(llm.provider_name());
     let context_window = state
         .config
         .resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
-    let estimated = estimate_prompt_tokens("", messages, None);
+    let estimated =
+        estimate_prompt_tokens(prompt_ctx.system_prompt, messages, prompt_ctx.tools_json);
 
     if !should_compact(estimated, usable, state.config.compaction_threshold_ratio) {
         return Ok(messages.to_vec());
