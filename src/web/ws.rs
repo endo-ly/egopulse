@@ -135,6 +135,13 @@ struct GatewayChatContent {
     text: String,
 }
 
+struct SocketRequestContext<'a> {
+    tx: &'a mpsc::UnboundedSender<Message>,
+    connected: &'a AtomicBool,
+    in_flight_chat_sends: &'a Arc<AtomicUsize>,
+    conn_id: &'a str,
+}
+
 /// Upgrades an authenticated request into the web gateway WebSocket.
 pub(super) async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -229,234 +236,233 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
         };
 
         match frame {
-            ClientFrame::Request { id, method, params } => match method.as_str() {
-                "connect" => {
-                    let payload = match serde_json::from_value::<ConnectParams>(params) {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            if send_error(&out_tx, &id, "invalid_params", error.to_string())
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-
-                    if payload.min_protocol > PROTOCOL_VERSION
-                        || payload.max_protocol < PROTOCOL_VERSION
-                    {
-                        if send_error(
-                            &out_tx,
-                            &id,
-                            "unsupported_protocol",
-                            format!("server supports protocol {PROTOCOL_VERSION}"),
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    if !auth::is_valid_ws_token(
-                        &state.app_state.config,
-                        payload.auth_token.as_deref(),
-                    ) {
-                        if send_error(
-                            &out_tx,
-                            &id,
-                            "unauthorized",
-                            "invalid web auth token".to_string(),
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    connected.store(true, Ordering::SeqCst);
-                    if send_response(
-                        &out_tx,
-                        &id,
-                        ConnectPayload {
-                            protocol: PROTOCOL_VERSION,
-                            server: ConnectServer {
-                                version: env!("CARGO_PKG_VERSION").to_string(),
-                                conn_id: conn_id.clone(),
-                            },
-                            features: ConnectFeatures {
-                                methods: vec!["connect", "chat.send"],
-                                events: vec!["connect.challenge", "chat"],
-                            },
-                        },
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
+            ClientFrame::Request { id, method, params } => {
+                let request_context = SocketRequestContext {
+                    tx: &out_tx,
+                    connected: &connected,
+                    in_flight_chat_sends: &in_flight_chat_sends,
+                    conn_id: &conn_id,
+                };
+                if handle_request(&state, request_context, id, method, params).await {
+                    break;
                 }
-                "chat.send" => {
-                    if !connected.load(Ordering::SeqCst) {
-                        if send_error(&out_tx, &id, "not_connected", "connect first".to_string())
-                            .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    let payload = match serde_json::from_value::<ChatSendParams>(params) {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            if send_error(&out_tx, &id, "invalid_params", error.to_string())
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-
-                    if in_flight_chat_sends
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                            (current < MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION)
-                                .then_some(current + 1)
-                        })
-                        .is_err()
-                    {
-                        if send_error(
-                            &out_tx,
-                            &id,
-                            "busy",
-                            "another chat.send is still running".to_string(),
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    let _in_flight_permit = InFlightChatPermit::new(in_flight_chat_sends.clone());
-
-                    let started = match start_stream_run(
-                        state.clone(),
-                        SendRequest {
-                            session_key: Some(payload.session_key),
-                            message: payload.message,
-                        },
-                        WEB_ACTOR,
-                    )
-                    .await
-                    {
-                        Ok(started) => started,
-                        Err((status, message)) => {
-                            if send_error(
-                                &out_tx,
-                                &id,
-                                if status == axum::http::StatusCode::BAD_REQUEST {
-                                    "invalid_params"
-                                } else {
-                                    "internal_error"
-                                },
-                                message,
-                            )
-                            .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-
-                    if send_response(
-                        &out_tx,
-                        &id,
-                        ChatAckPayload {
-                            run_id: started.run_id.clone(),
-                            status: "accepted",
-                        },
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
-
-                    let state_for_stream = state.clone();
-                    let out_tx_for_stream = out_tx.clone();
-                    let stream_permit = _in_flight_permit;
-                    let run_id = started.run_id.clone();
-                    let session_key = started.session_key.clone();
-                    tokio::spawn(async move {
-                        let _stream_permit = stream_permit;
-                        let Ok((mut rx, replay, done, _, _)) = state_for_stream
-                            .run_hub
-                            .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
-                            .await
-                        else {
-                            return;
-                        };
-
-                        let sequence = Arc::new(AtomicU64::new(1));
-                        // まず保持済みイベントを流し、その後に live イベントへ追従する。
-                        for event in replay {
-                            if forward_run_event(
-                                &out_tx_for_stream,
-                                &run_id,
-                                &session_key,
-                                &sequence,
-                                event,
-                            ) {
-                                return;
-                            }
-                        }
-
-                        if done {
-                            return;
-                        }
-
-                        loop {
-                            match rx.recv().await {
-                                Ok(event) => {
-                                    if forward_run_event(
-                                        &out_tx_for_stream,
-                                        &run_id,
-                                        &session_key,
-                                        &sequence,
-                                        event,
-                                    ) {
-                                        break;
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    continue;
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    });
-                }
-                _ => {
-                    if send_error(
-                        &out_tx,
-                        &id,
-                        "unknown_method",
-                        format!("unknown method: {method}"),
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-            },
+            }
         }
     }
 
     // writer を閉じて送信タスクも終了させ、接続ライフサイクルをここで完結させる。
     drop(out_tx);
     let _ = writer.await;
+}
+
+async fn handle_request(
+    state: &WebState,
+    context: SocketRequestContext<'_>,
+    id: String,
+    method: String,
+    params: serde_json::Value,
+) -> bool {
+    match method.as_str() {
+        "connect" => handle_connect(state, context, &id, params),
+        "chat.send" => handle_chat_send(state, context, &id, params).await,
+        _ => send_error(
+            context.tx,
+            &id,
+            "unknown_method",
+            format!("unknown method: {method}"),
+        )
+        .is_err(),
+    }
+}
+
+fn handle_connect(
+    state: &WebState,
+    context: SocketRequestContext<'_>,
+    id: &str,
+    params: serde_json::Value,
+) -> bool {
+    let payload = match serde_json::from_value::<ConnectParams>(params) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return send_error(context.tx, id, "invalid_params", error.to_string()).is_err();
+        }
+    };
+
+    if payload.min_protocol > PROTOCOL_VERSION || payload.max_protocol < PROTOCOL_VERSION {
+        return send_error(
+            context.tx,
+            id,
+            "unsupported_protocol",
+            format!("server supports protocol {PROTOCOL_VERSION}"),
+        )
+        .is_err();
+    }
+
+    if !auth::is_valid_ws_token(&state.app_state.config, payload.auth_token.as_deref()) {
+        return send_error(
+            context.tx,
+            id,
+            "unauthorized",
+            "invalid web auth token".to_string(),
+        )
+        .is_err();
+    }
+
+    context.connected.store(true, Ordering::SeqCst);
+    send_response(
+        context.tx,
+        id,
+        ConnectPayload {
+            protocol: PROTOCOL_VERSION,
+            server: ConnectServer {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                conn_id: context.conn_id.to_string(),
+            },
+            features: ConnectFeatures {
+                methods: vec!["connect", "chat.send"],
+                events: vec!["connect.challenge", "chat"],
+            },
+        },
+    )
+    .is_err()
+}
+
+async fn handle_chat_send(
+    state: &WebState,
+    context: SocketRequestContext<'_>,
+    id: &str,
+    params: serde_json::Value,
+) -> bool {
+    if !context.connected.load(Ordering::SeqCst) {
+        return send_error(context.tx, id, "not_connected", "connect first".to_string()).is_err();
+    }
+
+    let payload = match serde_json::from_value::<ChatSendParams>(params) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return send_error(context.tx, id, "invalid_params", error.to_string()).is_err();
+        }
+    };
+
+    if !try_acquire_chat_send(context.in_flight_chat_sends) {
+        return send_error(
+            context.tx,
+            id,
+            "busy",
+            "another chat.send is still running".to_string(),
+        )
+        .is_err();
+    }
+
+    let in_flight_permit = InFlightChatPermit::new(context.in_flight_chat_sends.clone());
+    let started = match start_stream_run(
+        state.clone(),
+        SendRequest {
+            session_key: Some(payload.session_key),
+            message: payload.message,
+        },
+        WEB_ACTOR,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err((status, message)) => {
+            drop(in_flight_permit);
+            return send_error(
+                context.tx,
+                id,
+                if status == axum::http::StatusCode::BAD_REQUEST {
+                    "invalid_params"
+                } else {
+                    "internal_error"
+                },
+                message,
+            )
+            .is_err();
+        }
+    };
+
+    if send_response(
+        context.tx,
+        id,
+        ChatAckPayload {
+            run_id: started.run_id.clone(),
+            status: "accepted",
+        },
+    )
+    .is_err()
+    {
+        return true;
+    }
+
+    spawn_chat_stream_forwarder(
+        state.clone(),
+        context.tx.clone(),
+        in_flight_permit,
+        started.run_id,
+        started.session_key,
+    );
+    false
+}
+
+fn try_acquire_chat_send(in_flight_chat_sends: &AtomicUsize) -> bool {
+    in_flight_chat_sends
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn spawn_chat_stream_forwarder(
+    state: WebState,
+    tx: mpsc::UnboundedSender<Message>,
+    stream_permit: InFlightChatPermit,
+    run_id: String,
+    session_key: String,
+) {
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        forward_chat_stream(state, tx, run_id, session_key).await;
+    });
+}
+
+async fn forward_chat_stream(
+    state: WebState,
+    tx: mpsc::UnboundedSender<Message>,
+    run_id: String,
+    session_key: String,
+) {
+    let Ok((mut rx, replay, done, _, _)) = state
+        .run_hub
+        .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
+        .await
+    else {
+        return;
+    };
+
+    let sequence = Arc::new(AtomicU64::new(1));
+    // まず保持済みイベントを流し、その後に live イベントへ追従する。
+    for event in replay {
+        if forward_run_event(&tx, &run_id, &session_key, &sequence, event) {
+            return;
+        }
+    }
+
+    if done {
+        return;
+    }
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if forward_run_event(&tx, &run_id, &session_key, &sequence, event) {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn receive_next_message(
