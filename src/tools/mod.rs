@@ -296,11 +296,17 @@ impl Tool for ActivateSkillTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(skill_name) = input.get("skill_name").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: skill_name".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            skill_name: String,
+        }
+
+        let params: Params = match parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
 
-        match self.skill_manager.load_skill_checked(skill_name) {
+        match self.skill_manager.load_skill_checked(&params.skill_name) {
             Ok(LoadedSkill {
                 metadata,
                 instructions,
@@ -329,6 +335,11 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
         "maxLines": truncation.max_lines,
         "maxBytes": truncation.max_bytes
     })
+}
+
+/// Parse tool input into a typed parameter struct.
+fn parse_params<T: serde::de::DeserializeOwned>(input: serde_json::Value) -> Result<T, ToolResult> {
+    serde_json::from_value(input).map_err(|e| ToolResult::error(e.to_string()))
 }
 
 fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {

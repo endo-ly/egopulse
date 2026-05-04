@@ -102,9 +102,20 @@ impl Tool for ReadTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(path) = input.get("path").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: path".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            path: String,
+            #[serde(default)]
+            offset: Option<u64>,
+            #[serde(default)]
+            limit: Option<u64>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
+        let path = &params.path;
         let resolved = match resolve_workspace_path(&self.workspace_dir, path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
@@ -137,26 +148,19 @@ impl Tool for ReadTool {
 
         let normalized = normalize_newlines(&content);
         let all_lines = normalized.split('\n').collect::<Vec<_>>();
-        let start_line = input
-            .get("offset")
-            .and_then(|value| value.as_u64())
+        let start_line = params
+            .offset
             .map(|value| value.saturating_sub(1) as usize)
             .unwrap_or(0);
         if start_line >= all_lines.len() && !all_lines.is_empty() {
-            let requested = input
-                .get("offset")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(1);
+            let requested = params.offset.unwrap_or(1);
             return ToolResult::error(format!(
                 "Offset {requested} is beyond end of file ({} lines total)",
                 all_lines.len()
             ));
         }
 
-        let user_limit = input
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize);
+        let user_limit = params.limit.map(|value| value as usize);
         let selected_content = if let Some(limit) = user_limit {
             let end = min(start_line + limit, all_lines.len());
             all_lines[start_line..end].join("\n")
@@ -210,12 +214,18 @@ impl Tool for WriteTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(path) = input.get("path").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: path".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            path: String,
+            content: String,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        let Some(content) = input.get("content").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: content".to_string());
-        };
+        let path = &params.path;
+        let content = &params.content;
         let resolved = match resolve_workspace_path(&self.workspace_dir, path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),

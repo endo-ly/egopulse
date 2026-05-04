@@ -73,18 +73,23 @@ impl Tool for SendMessageTool {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
-        let text = input
-            .get("text")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
-        let attachment_path = input
-            .get("attachment_path")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
-        let caption = input
-            .get("caption")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            #[serde(default)]
+            text: Option<String>,
+            #[serde(default)]
+            attachment_path: Option<String>,
+            #[serde(default)]
+            caption: Option<String>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let text = params.text.filter(|s| !s.trim().is_empty());
+        let attachment_path = params.attachment_path.filter(|s| !s.trim().is_empty());
+        let caption = params.caption.filter(|s| !s.trim().is_empty());
 
         if text.is_none() && attachment_path.is_none() {
             return ToolResult::error(
@@ -110,7 +115,7 @@ impl Tool for SendMessageTool {
             }
         };
 
-        if let Some(path_str) = attachment_path {
+        if let Some(path_str) = &attachment_path {
             let resolved = match resolve_workspace_path(&self.workspace_dir, path_str) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::error(e),
@@ -125,7 +130,12 @@ impl Tool for SendMessageTool {
             }
 
             match adapter
-                .send_attachment(&chat_info.external_chat_id, text, &resolved, caption)
+                .send_attachment(
+                    &chat_info.external_chat_id,
+                    text.as_deref(),
+                    &resolved,
+                    caption.as_deref(),
+                )
                 .await
             {
                 Ok(()) => ToolResult::success("Message sent successfully".to_string()),
@@ -133,7 +143,7 @@ impl Tool for SendMessageTool {
             }
         } else if let Some(text_content) = text {
             match adapter
-                .send_text(&chat_info.external_chat_id, text_content)
+                .send_text(&chat_info.external_chat_id, &text_content)
                 .await
             {
                 Ok(()) => ToolResult::success("Message sent successfully".to_string()),

@@ -77,19 +77,25 @@ impl Tool for BashTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(command) = input.get("command").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: command".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            command: String,
+            #[serde(default)]
+            timeout: Option<u64>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
+        let command = &params.command;
         if let Err(reason) = command_guard::check_command(command) {
             return ToolResult::error(reason);
         }
         if let Err(reason) = path_guard::check_command_paths(command) {
             return ToolResult::error(reason);
         }
-        let timeout_secs = input
-            .get("timeout")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        let timeout_secs = params.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let temp_dir = self.temp_dir();
         if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
             return ToolResult::error(format!(
