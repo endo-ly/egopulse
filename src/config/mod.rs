@@ -246,13 +246,22 @@ impl std::fmt::Debug for ChannelConfig {
     }
 }
 
+/// Per-model metadata stored inside `ProviderConfig.models`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModelConfig {
+    /// Maximum context window in tokens for this model.
+    /// When `None`, falls back to `Config.default_context_window_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct ProviderConfig {
     pub label: String,
     pub base_url: String,
     pub api_key: Option<ResolvedValue>,
     pub default_model: String,
-    pub models: Vec<String>,
+    pub models: HashMap<String, ModelConfig>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -354,15 +363,16 @@ impl std::fmt::Debug for AgentConfig {
 #[derive(Clone)]
 pub struct Config {
     pub default_provider: ProviderId,
-    /// Optional global model override (YAML `default_model`).
     pub default_model: Option<String>,
     pub providers: HashMap<ProviderId, ProviderConfig>,
     pub state_root: String,
     pub log_level: String,
     pub compaction_timeout_secs: u64,
     pub max_history_messages: usize,
-    pub max_session_messages: usize,
     pub compact_keep_recent: usize,
+    pub default_context_window_tokens: usize,
+    pub compaction_threshold_ratio: f64,
+    pub compaction_target_ratio: f64,
     pub channels: HashMap<ChannelName, ChannelConfig>,
     pub default_agent: AgentId,
     pub agents: HashMap<AgentId, AgentConfig>,
@@ -378,8 +388,16 @@ impl std::fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("compaction_timeout_secs", &self.compaction_timeout_secs)
             .field("max_history_messages", &self.max_history_messages)
-            .field("max_session_messages", &self.max_session_messages)
             .field("compact_keep_recent", &self.compact_keep_recent)
+            .field(
+                "default_context_window_tokens",
+                &self.default_context_window_tokens,
+            )
+            .field(
+                "compaction_threshold_ratio",
+                &self.compaction_threshold_ratio,
+            )
+            .field("compaction_target_ratio", &self.compaction_target_ratio)
             .field("channels", &self.channels)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)
@@ -433,8 +451,8 @@ providers:
     api_key: sk-openai
     default_model: gpt-4o-mini
     models:
-      - gpt-4o-mini
-      - gpt-5
+      gpt-4o-mini: {}
+      gpt-5: {}
   local:
     label: Local OpenAI-compatible
     base_url: http://127.0.0.1:1234/v1
@@ -1004,15 +1022,17 @@ agents:
                     base_url: "https://api.openai.com/v1".to_string(),
                     api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
                     default_model: "gpt-5".to_string(),
-                    models: vec!["gpt-5".to_string()],
+                    models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
                 },
             )]),
             state_root: temp_dir.path().to_str().expect("path").to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
-            max_session_messages: 40,
             compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
             channels: std::collections::HashMap::new(),
             default_agent: super::AgentId::new("alice"),
             agents,
@@ -1446,15 +1466,17 @@ channels:
                     base_url: "https://api.openai.com/v1".to_string(),
                     api_key: Some(lit_val("OPENAI_API_KEY", "sk-test")),
                     default_model: "gpt-5".to_string(),
-                    models: vec!["gpt-5".to_string()],
+                    models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
                 },
             )]),
             state_root: temp_dir.path().to_str().expect("path").to_string(),
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
-            max_session_messages: 40,
             compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
             channels,
             default_agent: super::AgentId::new("assistant"),
             agents,
@@ -1985,5 +2007,319 @@ channels:
             ),
             "expected InvalidChatsKey, got {error:?}"
         );
+    }
+
+    // --- Safety Compaction config tests ---
+
+    #[test]
+    #[serial]
+    fn loads_provider_models_with_context_windows() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 32768
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+    models:
+      gpt-5:
+        context_window_tokens: 200000
+      gpt-4o-mini:
+        context_window_tokens: 128000
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        let provider = config.providers.get("openai").expect("openai provider");
+
+        let gpt5 = provider.models.get("gpt-5").expect("gpt-5 model");
+        assert_eq!(gpt5.context_window_tokens, Some(200000));
+
+        let mini = provider
+            .models
+            .get("gpt-4o-mini")
+            .expect("gpt-4o-mini model");
+        assert_eq!(mini.context_window_tokens, Some(128000));
+    }
+
+    #[test]
+    #[serial]
+    fn uses_default_context_window_when_model_context_missing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 32768
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini: {}
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+
+        // Model has no explicit context_window_tokens → falls back to default
+        assert_eq!(
+            config.resolve_context_window_tokens(&super::ProviderId::new("openai"), "gpt-4o-mini"),
+            32768
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn loads_compaction_ratios_from_top_level() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 65536
+compaction_threshold_ratio: 0.90
+compaction_target_ratio: 0.30
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        assert!((config.compaction_threshold_ratio - 0.90).abs() < f64::EPSILON);
+        assert!((config.compaction_target_ratio - 0.30).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_compaction_ratios_to_issue_values() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 32768
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let config = Config::load(Some(&file_path)).expect("load config");
+        assert!((config.compaction_threshold_ratio - 0.80).abs() < f64::EPSILON);
+        assert!((config.compaction_target_ratio - 0.40).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_invalid_compaction_ratios() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+
+        let cases = [
+            // (threshold, target, description)
+            (0.0, 0.40, "zero threshold"),
+            (1.01, 0.40, "threshold over 1.0"),
+            (0.80, 0.0, "zero target"),
+            (0.80, 1.01, "target over 1.0"),
+            (0.50, 0.50, "target equals threshold"),
+            (0.40, 0.60, "target greater than threshold"),
+        ];
+
+        for (threshold, target, desc) in cases {
+            let yaml = format!(
+                r#"default_provider: openai
+default_context_window_tokens: 32768
+compaction_threshold_ratio: {threshold}
+compaction_target_ratio: {target}
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#
+            );
+            let file_path = write_config(&temp_dir, &yaml);
+            let error = Config::load(Some(&file_path)).expect_err(desc);
+            assert!(
+                matches!(error, ConfigError::InvalidCompactionConfig(_)),
+                "{desc}: expected InvalidCompactionConfig, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_zero_context_window_tokens() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+
+        // default_context_window_tokens = 0
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 0
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+        let error = Config::load(Some(&file_path)).expect_err("zero default");
+        assert!(
+            matches!(error, ConfigError::InvalidCompactionConfig(_)),
+            "expected InvalidCompactionConfig for zero default, got {error:?}"
+        );
+
+        // model context_window_tokens = 0
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 32768
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        context_window_tokens: 0
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+        let error = Config::load(Some(&file_path)).expect_err("zero model context");
+        assert!(
+            matches!(error, ConfigError::InvalidCompactionConfig(_)),
+            "expected InvalidCompactionConfig for zero model context, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_unsafe_default_context_window_tokens() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(
+            &temp_dir,
+            r#"default_provider: openai
+default_context_window_tokens: 2000000
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+        );
+
+        let error = Config::load(Some(&file_path)).expect_err("unsafe default");
+        assert!(
+            matches!(error, ConfigError::InvalidCompactionConfig(_)),
+            "expected InvalidCompactionConfig for unsafe default, got {error:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn persists_provider_model_contexts_without_secret_leak() {
+        use crate::config::ModelConfig;
+        use crate::config::persist::save_config_with_secrets;
+        use crate::config::secret_ref::env_resolved_value;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", temp_dir.path());
+        let path = temp_dir.path().join("egopulse.config.yaml");
+
+        let config = Config {
+            default_provider: super::ProviderId::new("openai"),
+            default_model: None,
+            providers: HashMap::from([(
+                super::ProviderId::new("openai"),
+                super::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-secret-key-12345")),
+                    default_model: "gpt-5".to_string(),
+                    models: HashMap::from([
+                        (
+                            "gpt-5".to_string(),
+                            ModelConfig {
+                                context_window_tokens: Some(200000),
+                            },
+                        ),
+                        ("gpt-4o-mini".to_string(), ModelConfig::default()),
+                    ]),
+                },
+            )]),
+            state_root: temp_dir.path().to_str().expect("path").to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
+            channels: HashMap::new(),
+            default_agent: super::AgentId::new("default"),
+            agents: HashMap::from([(
+                super::AgentId::new("default"),
+                super::AgentConfig {
+                    label: "Default Agent".to_string(),
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        let yaml = std::fs::read_to_string(&path).expect("yaml");
+        // Model context_window_tokens should be present
+        assert!(yaml.contains("context_window_tokens: 200000"));
+        // Secret must NOT appear in YAML
+        assert!(!yaml.contains("sk-secret-key-12345"));
+        // SecretRef should be used instead
+        assert!(yaml.contains("source: env"));
+        assert!(yaml.contains("OPENAI_API_KEY"));
     }
 }

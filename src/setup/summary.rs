@@ -115,8 +115,10 @@ pub(crate) fn save_config(
 
     let api_key = field_value(fields, "API_KEY").to_string();
 
-    let existing_token = Config::load_allow_missing_api_key(Some(config_path))
-        .ok()
+    let existing_config = Config::load_allow_missing_api_key(Some(config_path)).ok();
+
+    let existing_token = existing_config
+        .as_ref()
         .and_then(|config| config.web_auth_token().map(str::to_string));
     let has_existing_token = existing_token.is_some();
     let auth_token = existing_token.unwrap_or_else(generate_auth_token);
@@ -148,15 +150,26 @@ pub(crate) fn save_config(
     let preset_default_model = preset
         .map(|p| p.default_model.to_string())
         .unwrap_or_else(|| model.clone());
-    let preset_models: Vec<String> = preset
-        .map(|p| p.models.iter().map(|m| (*m).to_string()).collect())
+    let mut preset_models: std::collections::HashMap<String, crate::config::ModelConfig> = preset
+        .map(|p| {
+            p.models
+                .iter()
+                .map(|m| ((*m).to_string(), crate::config::ModelConfig::default()))
+                .collect()
+        })
         .unwrap_or_else(|| {
-            let mut m = vec![model.clone()];
-            if m[0] != preset_default_model {
-                m.insert(0, preset_default_model.clone());
+            let mut m = std::collections::HashMap::new();
+            m.insert(model.clone(), crate::config::ModelConfig::default());
+            if !m.contains_key(&preset_default_model) {
+                m.insert(
+                    preset_default_model.clone(),
+                    crate::config::ModelConfig::default(),
+                );
             }
             m
         });
+    // Ensure the user's chosen model is always in the models map.
+    preset_models.entry(model.clone()).or_default();
 
     let mut providers = HashMap::new();
     providers.insert(
@@ -234,10 +247,30 @@ pub(crate) fn save_config(
                 .into_owned()
         }),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
-        max_history_messages: 50,
-        max_session_messages: 40,
-        compact_keep_recent: 20,
+        compaction_timeout_secs: existing_config
+            .as_ref()
+            .map(|c| c.compaction_timeout_secs)
+            .unwrap_or(180),
+        max_history_messages: existing_config
+            .as_ref()
+            .map(|c| c.max_history_messages)
+            .unwrap_or(50),
+        compact_keep_recent: existing_config
+            .as_ref()
+            .map(|c| c.compact_keep_recent)
+            .unwrap_or(20),
+        default_context_window_tokens: existing_config
+            .as_ref()
+            .map(|c| c.default_context_window_tokens)
+            .unwrap_or(32768),
+        compaction_threshold_ratio: existing_config
+            .as_ref()
+            .map(|c| c.compaction_threshold_ratio)
+            .unwrap_or(0.80),
+        compaction_target_ratio: existing_config
+            .as_ref()
+            .map(|c| c.compaction_target_ratio)
+            .unwrap_or(0.40),
         channels,
         default_agent: crate::config::AgentId::new("default"),
         agents,

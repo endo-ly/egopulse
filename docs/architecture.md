@@ -191,7 +191,7 @@ pub trait ChannelAdapter: Send + Sync {
       │
       ├─ 3a. chat_id を解決 (chats テーブルを upsert)
       ├─ 3b. session snapshot をロード (sessions テーブル)
-      ├─ 3c. compaction 判定 (messages.len > max_session_messages)
+      ├─ 3c. Safety Compaction 判定 (token estimate >= threshold)
       │
       ├─ 3d. system prompt を構築
       │      ├ SOUL.md (agent → channel → global の順に解決)

@@ -110,32 +110,40 @@ turn 中の保存は phase ごとに進む。
 
 compaction は保存の別系統ではなく、「保存前に session を整形する段」として扱う。
 
-## 5. Compaction
+## 5. Safety Compaction
 
-長い会話で古い文脈を要約に畳み、recent なやり取りをそのまま残す機構。
+長い会話で context window 上限に近づく前に、中間文脈を reference-only summary へ畳み、最新依頼・直近文脈・tool call/result の整合性を保つ安全装置。
 
 ### 目的
 
-1. context window を超えにくくする
-2. 古い会話の要点を維持する
-3. recent な往復はそのまま残す
+1. context window 上限による API エラーを防ぐ
+2. 中間会話の要点を reference-only summary として維持する
+3. 最新ユーザーメッセージ・直近 tool block はそのまま残す
 
 ### Trigger
 
-最初の LLM 呼び出し前に行う。`messages.len() > max_session_messages` で発火。
+最初の LLM 呼び出し前と、tool result 追加後の次回 LLM 呼び出し前に判定する。推定 prompt tokens が usable context の `compaction_threshold_ratio`（デフォルト 80%）に達したら発火。
+
+推定は保守的 chars-based 近似（`chars / 3`）を用い、system prompt・messages・tool schema を含める。過小評価を避けるため、実際の token 量より多めに見積もる。
 
 ### Algorithm
 
-**分割**: message list を `old_messages`（要約対象）と `recent_messages`（保持）に分ける。`recent_messages` の件数は `compact_keep_recent`。
+**usable context 算出**: `context_window_tokens - CONTEXT_RESERVE_TOKENS(8192)`。reserve は出力生成・tool schema・system/margin の内部予約。
 
-**要約入力**: `old_messages` を `[user]: ...` / `[assistant]: ...` 形式で text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は `[tool_result]: ...` に変換。tool result body は 200 文字でカット。入力が 20,000 文字を超える場合は char-boundary-safe に切り詰め。
+**分割**: `tool_safe_split_at` で message list を old / recent の 2 領域に分ける。境界は tool call/result block を不可分として保護。
 
-**要約呼び出し**: system prompt `You are a helpful summarizer.` + 会話要約要求 + old_messages dump。
+- **old**: 古いメッセージ。summary 対象
+- **recent**: `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護
+
+**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も target を超える場合は、recent を保護したまま summary 本文をさらに縮める。
+
+**要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
+
+**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照。
 
 **Compact 後の形**:
-1. `user`: `[Conversation Summary]\n{summary}`
-2. `assistant`: `Understood, I have the conversation context. How can I help?`
-3. `recent_messages`
+1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）
+2. Tail messages（直近メッセージ・tool block をそのまま保持）
 
 **Role 補正**: 同じ role の plain-text message で `tool_calls` 空かつ `tool_call_id` が `None` の場合のみ merge。末尾が assistant なら除去。
 
@@ -143,9 +151,9 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 要約は best effort。失敗時は session を壊さないことを優先する。
 
-- **Summarizer Error**: 要約失敗 → `recent_messages` のみ残す
-- **Summarizer Timeout**: `compaction_timeout_secs` 超 → `recent_messages` のみ
-- **Empty Summary**: 要約結果が空 → `recent_messages` のみ
+- **Summarizer Error**: 要約失敗 → 元の messages をすべてそのまま保持する
+- **Summarizer Timeout**: `compaction_timeout_secs` 超 → 元の messages をすべてそのまま保持する
+- **Empty Summary**: 要約結果が空 → 元の messages をすべてそのまま保持する
 
 ## 7. Archive
 
@@ -161,6 +169,10 @@ compaction 発火時は、compact 前の全文会話を markdown として archi
 
 - compact 前の verbatim context を後から追えるようにする
 - デバッグや監査で元の会話を確認できるようにする
+
+### 秘匿情報に関する注意
+
+archive はローカル監査用の sensitive artifact であり、secret redaction の保証対象外である。summary やログの redaction とは責務を分け、archive は元の会話全文を verbatim で保存する。
 
 ### 形式
 
@@ -204,12 +216,16 @@ stale snapshot に単純 append だけを再試行すると、compaction 前の 
 |------|-----------:|------|
 | `compaction_timeout_secs` | `180` | 要約 compaction の timeout 秒数 |
 | `max_history_messages` | `50` | snapshot が使えない時に `messages` テーブルから復元する件数 |
-| `max_session_messages` | `40` | compaction を発火させる message 数の閾値 |
-| `compact_keep_recent` | `20` | compact 後にそのまま残す recent message 数 |
+| `default_context_window_tokens` | `32768` | context window トークン数のフォールバック値 |
+| `compaction_threshold_ratio` | `0.80` | 推定 prompt tokens が usable context のこの割合に達したら compaction 発火 |
+| `compaction_target_ratio` | `0.40` | compaction 後の目標 token 量（usable context に対する割合） |
+| `compact_keep_recent` | `20` | Tail としてそのまま残す直近メッセージ数の下限 |
 
 ### Validation
 
 - `compaction_timeout_secs >= 1`
 - `max_history_messages >= 1`
-- `max_session_messages >= 1`
+- `default_context_window_tokens >= 1` かつ `<= 1,000,000`
+- `compaction_threshold_ratio`: `(0, 1]`
+- `compaction_target_ratio`: `(0, threshold)`
 - `compact_keep_recent >= 1`

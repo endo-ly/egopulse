@@ -8,6 +8,7 @@ use fs2::FileExt;
 use serde::Serialize;
 
 use super::Config;
+use super::ModelConfig;
 use super::secret_ref::{ResolvedValue, dotenv_path, save_dotenv};
 use crate::error::EgoPulseError;
 
@@ -55,8 +56,10 @@ struct SerializableConfig {
     log_level: String,
     compaction_timeout_secs: u64,
     max_history_messages: usize,
-    max_session_messages: usize,
     compact_keep_recent: usize,
+    default_context_window_tokens: usize,
+    compaction_threshold_ratio: f64,
+    compaction_target_ratio: f64,
     providers: HashMap<String, SerializableProvider>,
     channels: HashMap<String, SerializableChannel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,8 +78,8 @@ struct SerializableProvider {
     )]
     api_key: Option<serde_yml::Value>,
     default_model: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    models: Vec<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    models: HashMap<String, ModelConfig>,
 }
 
 #[derive(Serialize)]
@@ -240,8 +243,10 @@ impl From<&Config> for SerializableConfig {
             log_level: config.log_level.clone(),
             compaction_timeout_secs: config.compaction_timeout_secs,
             max_history_messages: config.max_history_messages,
-            max_session_messages: config.max_session_messages,
             compact_keep_recent: config.compact_keep_recent,
+            default_context_window_tokens: config.default_context_window_tokens,
+            compaction_threshold_ratio: config.compaction_threshold_ratio,
+            compaction_target_ratio: config.compaction_target_ratio,
             providers,
             channels,
             default_agent: Some(config.default_agent.to_string()),
@@ -402,7 +407,7 @@ mod tests {
     use serial_test::serial;
 
     fn sample_config() -> Config {
-        use super::super::{AgentConfig, AgentId};
+        use super::super::{AgentConfig, AgentId, ModelConfig};
         let mut providers = HashMap::new();
         providers.insert(
             ProviderId::new("openai"),
@@ -411,7 +416,7 @@ mod tests {
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
                 default_model: "gpt-5".to_string(),
-                models: vec!["gpt-5".to_string()],
+                models: HashMap::from([("gpt-5".to_string(), ModelConfig::default())]),
             },
         );
 
@@ -457,8 +462,10 @@ mod tests {
             log_level: "info".to_string(),
             compaction_timeout_secs: 180,
             max_history_messages: 50,
-            max_session_messages: 40,
             compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
             channels,
             default_agent: AgentId::new("default"),
             agents,

@@ -78,7 +78,7 @@ pub async fn handle_command(
                 .ok_or_else(|| EgoPulseError::Internal("provider not found".to_string()))?;
             let lines = provider
                 .models
-                .iter()
+                .keys()
                 .map(|model| {
                     let marker = if model == &resolved.model { "*" } else { "-" };
                     format!("{marker} {model}")
@@ -234,9 +234,11 @@ async fn handle_model_command(
             config.default_model = Some(value.to_string());
             let default_provider = config.default_provider.clone();
             if let Some(provider) = config.providers.get_mut(&default_provider)
-                && !provider.models.iter().any(|m| m == value)
+                && !provider.models.contains_key(value)
             {
-                provider.models.push(value.to_string());
+                provider
+                    .models
+                    .insert(value.to_string(), crate::config::ModelConfig::default());
             }
         }
         ProfileScope::Channel(channel_name) => {
@@ -254,9 +256,11 @@ async fn handle_model_command(
             })?;
             agent.model = Some(value.to_string());
             if let Some(provider) = config.providers.get_mut(provider_name.as_str())
-                && !provider.models.iter().any(|m| m == value)
+                && !provider.models.contains_key(value)
             {
-                provider.models.push(value.to_string());
+                provider
+                    .models
+                    .insert(value.to_string(), crate::config::ModelConfig::default());
             }
         }
     }

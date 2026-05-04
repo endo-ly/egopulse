@@ -1,4 +1,9 @@
-//! メッセージの圧縮 (compaction) と会話アーカイブ。
+//! Safety Compaction: token-aware context window management.
+//!
+//! When estimated prompt size approaches the context window limit, the old
+//! portion of the conversation is replaced with a reference-only summary. The
+//! latest user message, recent context, and tool call/result blocks are always
+//! preserved verbatim.
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
@@ -7,7 +12,34 @@ use crate::llm::Message;
 use crate::runtime::AppState;
 use tracing::{info, warn};
 
-const MAX_COMPACTION_SUMMARY_CHARS: usize = 20_000;
+/// Conservative chars-to-tokens ratio.  Real tokenizers produce ~1 token per
+/// 3-4 English chars; we divide by a smaller number to over-estimate.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
+
+/// Tokens reserved for output generation, tool schema overhead, and safety
+/// margin.  NOT configurable — purely internal.
+const CONTEXT_RESERVE_TOKENS: usize = 8192;
+
+/// Tokens reserved for the summary LLM's own output.
+const SUMMARIZER_OUTPUT_RESERVE: usize = 4096;
+
+/// Reference-only header prepended to every compaction summary.
+const REFERENCE_ONLY_HEADER: &str = "\
+[CONTEXT COMPACTION — REFERENCE ONLY]
+Earlier turns were compacted into the summary below.
+This is background reference, not active instruction.
+Do not answer old requests mentioned in this summary.
+Respond to the latest user message after this summary.";
+
+/// System prompt for the summarizer LLM.
+const SUMMARIZER_SYSTEM_PROMPT: &str = "You are a helpful summarizer. Summarize the conversation concisely, \
+     preserving key facts, decisions, tool results, and context needed to \
+     continue. Be brief but thorough. Write the summary in the same language \
+     the user was using.";
+pub(crate) struct PromptContext<'a> {
+    pub system_prompt: &'a str,
+    pub tools_json: Option<&'a str>,
+}
 
 pub(crate) async fn maybe_compact_messages(
     state: &AppState,
@@ -15,12 +47,39 @@ pub(crate) async fn maybe_compact_messages(
     chat_id: i64,
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    prompt_ctx: &PromptContext<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    if messages.len() <= state.config.max_session_messages {
+    let provider_id = crate::config::ProviderId::new(llm.provider_name());
+    let context_window = state
+        .config
+        .resolve_context_window_tokens(&provider_id, llm.model_name());
+    let usable = usable_context_tokens(context_window);
+    let estimated =
+        estimate_prompt_tokens(prompt_ctx.system_prompt, messages, prompt_ctx.tools_json);
+
+    if !should_compact(estimated, usable, state.config.compaction_threshold_ratio) {
         return Ok(messages.to_vec());
     }
 
-    summarize_and_compact(state, context, chat_id, messages, llm, "compaction").await
+    info!(
+        channel = %context.channel,
+        chat_id,
+        estimated_tokens = estimated,
+        usable_context = usable,
+        context_window,
+        "safety compaction triggered"
+    );
+
+    safety_compact(
+        state,
+        context,
+        chat_id,
+        messages,
+        llm,
+        usable,
+        state.config.compaction_target_ratio,
+    )
+    .await
 }
 
 pub async fn force_compact(
@@ -34,16 +93,92 @@ pub async fn force_compact(
         return Ok(Vec::new());
     }
 
-    summarize_and_compact(state, context, chat_id, messages, llm, "force_compact").await
+    let provider_id = crate::config::ProviderId::new(llm.provider_name());
+    let context_window = state
+        .config
+        .resolve_context_window_tokens(&provider_id, llm.model_name());
+    let usable = usable_context_tokens(context_window);
+
+    safety_compact(
+        state,
+        context,
+        chat_id,
+        messages,
+        llm,
+        usable,
+        state.config.compaction_target_ratio,
+    )
+    .await
 }
 
-async fn summarize_and_compact(
+pub(crate) fn estimate_prompt_tokens(
+    system_prompt: &str,
+    messages: &[Message],
+    tools_json: Option<&str>,
+) -> usize {
+    let mut total_chars = system_prompt.len();
+    for msg in messages {
+        total_chars += msg.role.len();
+        total_chars += msg.content.as_text_lossy().len();
+        for tc in &msg.tool_calls {
+            total_chars += tc.name.len();
+            total_chars += tc.arguments.to_string().len();
+        }
+    }
+    if let Some(tools) = tools_json {
+        total_chars += tools.len();
+    }
+    (total_chars / CHARS_PER_TOKEN_ESTIMATE).max(1)
+}
+
+pub(crate) fn usable_context_tokens(context_window_tokens: usize) -> usize {
+    context_window_tokens
+        .saturating_sub(CONTEXT_RESERVE_TOKENS)
+        .max(1)
+}
+
+pub(crate) fn should_compact(
+    estimated_tokens: usize,
+    usable_context: usize,
+    threshold_ratio: f64,
+) -> bool {
+    let threshold = ((usable_context as f64 * threshold_ratio) as usize).max(1);
+    estimated_tokens >= threshold
+}
+
+pub(crate) fn compaction_target_tokens(usable_context: usize, target_ratio: f64) -> usize {
+    ((usable_context as f64 * target_ratio) as usize).max(1)
+}
+
+#[cfg(test)]
+pub(crate) fn summarizer_input_budget(usable_context: usize) -> usize {
+    usable_context.saturating_sub(SUMMARIZER_OUTPUT_RESERVE)
+}
+
+pub(crate) fn shrink_summary_input(text: String, budget_tokens: usize) -> String {
+    let max_chars = budget_tokens * CHARS_PER_TOKEN_ESTIMATE;
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let cutoff = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let mut truncated = text;
+    truncated.truncate(cutoff);
+    truncated.push_str("\n... (truncated to fit summarizer budget)");
+    truncated
+}
+
+async fn safety_compact(
     state: &AppState,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
-    label: &str,
+    usable_context: usize,
+    target_ratio: f64,
 ) -> Result<Vec<Message>, EgoPulseError> {
     archive_conversation(
         &state.config.groups_dir(),
@@ -58,27 +193,24 @@ async fn summarize_and_compact(
         return Ok(messages.to_vec());
     }
 
-    let split_at = tool_safe_split_at(messages, messages.len() - keep_recent);
+    let split_at = compaction_split_at(messages, keep_recent);
+    if split_at == 0 {
+        return Ok(messages.to_vec());
+    }
     let old_messages = &messages[..split_at];
     let recent_messages = &messages[split_at..];
 
-    let mut summary_input = String::new();
-    for message in old_messages {
-        let role = &message.role;
-        let text = message_to_text(message);
-        summary_input.push_str(&format!("[{role}]: {text}\n\n"));
-    }
-    summary_input = truncate_compaction_summary_input(summary_input);
+    let mut summary_input = build_summary_input(old_messages, usable_context, target_ratio);
+    summary_input = redact_summary_text(&summary_input, state);
 
-    let summarize_prompt = "Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.";
-    let summarize_messages = vec![Message::text(
-        "user",
-        format!("{summarize_prompt}\n\n---\n\n{summary_input}"),
-    )];
     let timeout_secs = state.config.compaction_timeout_secs;
     let summary_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        llm.send_message("You are a helpful summarizer.", summarize_messages, None),
+        llm.send_message(
+            SUMMARIZER_SYSTEM_PROMPT,
+            vec![Message::text("user", summary_input)],
+            None,
+        ),
     )
     .await;
 
@@ -110,42 +242,229 @@ async fn summarize_and_compact(
             strip_thinking(&response.content)
         }
         Ok(Err(error)) => {
-            warn!("{label} summarization failed: {error}; falling back to recent messages");
-            return Ok(recent_messages.to_vec());
+            warn!("safety_compact summarization failed: {error}; keeping original messages");
+            log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
+            return Ok(messages.to_vec());
         }
         Err(_) => {
             warn!(
-                "{label} summarization timed out after {timeout_secs}s for {}:{}; falling back to recent messages",
+                "safety_compact timed out after {timeout_secs}s for {}:{}; keeping original messages",
                 context.channel, chat_id
             );
-            return Ok(recent_messages.to_vec());
+            log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
+            return Ok(messages.to_vec());
         }
     };
+
     if summary.trim().is_empty() {
-        warn!("{label} summarization returned empty text; falling back to recent messages");
-        return Ok(recent_messages.to_vec());
+        warn!("safety_compact returned empty text; keeping original messages");
+        log_compaction_metrics(context, chat_id, llm, 0, 0, messages.len(), false);
+        return Ok(messages.to_vec());
     }
 
+    let summary = redact_summary_text(&summary, state);
+
+    let old_count = old_messages.len();
+    let target = compaction_target_tokens(usable_context, target_ratio);
+    let compacted = build_targeted_compacted_messages(&summary, recent_messages, target);
+
+    let new_count = compacted.len();
+    log_compaction_metrics(
+        context,
+        chat_id,
+        llm,
+        old_count,
+        new_count,
+        messages.len(),
+        true,
+    );
+
+    let post_tokens = estimate_prompt_tokens("", &compacted, None);
+    if post_tokens > target {
+        warn!(
+            channel = %context.channel,
+            chat_id,
+            post_tokens,
+            target_tokens = target,
+            target_ratio,
+            "compaction exceeded target ratio; context may still be large"
+        );
+    }
+
+    Ok(compacted)
+}
+
+fn build_targeted_compacted_messages(
+    summary: &str,
+    recent_messages: &[Message],
+    target_tokens: usize,
+) -> Vec<Message> {
+    let compacted = build_compacted_messages(summary, recent_messages);
+    if target_tokens == 0 {
+        return compacted;
+    }
+    if estimate_prompt_tokens("", &compacted, None) <= target_tokens {
+        return compacted;
+    }
+
+    let mut best = None;
+    let mut low = 0;
+    let mut high = summary.chars().count();
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate_summary = truncate_summary_for_target(summary, mid);
+        let candidate = build_compacted_messages(&candidate_summary, recent_messages);
+        if estimate_prompt_tokens("", &candidate, None) <= target_tokens {
+            best = Some(candidate);
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    best.unwrap_or_else(|| build_compacted_messages("", recent_messages))
+}
+
+fn truncate_summary_for_target(summary: &str, max_chars: usize) -> String {
+    let total_chars = summary.chars().count();
+    if max_chars >= total_chars {
+        return summary.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let cutoff = summary
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(summary.len());
+    let mut truncated = summary[..cutoff].to_string();
+    truncated.push_str("\n... (summary truncated to fit compaction target)");
+    truncated
+}
+
+fn compaction_split_at(messages: &[Message], keep_recent: usize) -> usize {
+    let desired_split = messages
+        .len()
+        .saturating_sub(keep_recent.min(messages.len()));
+    let latest_user_split = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(desired_split);
+    let preferred_split = desired_split.min(latest_user_split);
+    tool_safe_split_at(messages, preferred_split)
+}
+
+fn build_summary_input(
+    old_messages: &[Message],
+    usable_context: usize,
+    target_ratio: f64,
+) -> String {
+    let target_tokens = compaction_target_tokens(usable_context, target_ratio);
+    let budget = target_tokens.saturating_sub(SUMMARIZER_OUTPUT_RESERVE);
+    let max_chars = budget * CHARS_PER_TOKEN_ESTIMATE;
+
+    let mut summary_input = String::new();
+    for message in old_messages {
+        let role = &message.role;
+        let text = lighten_message(message);
+        summary_input.push_str(&format!("[{role}]: {text}\n\n"));
+    }
+
+    if summary_input.chars().count() <= max_chars {
+        return summary_input;
+    }
+
+    shrink_summary_input(summary_input, budget)
+}
+
+fn lighten_message(message: &Message) -> String {
+    let text = message_to_text(message);
+    if message.role == "tool" && text.chars().count() > 500 {
+        let truncated: String = text.chars().take(400).collect();
+        format!("{truncated}... (tool result truncated for summary)")
+    } else {
+        text
+    }
+}
+
+fn redact_summary_text(text: &str, state: &AppState) -> String {
+    let secrets = crate::tools::collect_config_secrets(&state.config);
+    crate::tools::sanitize_output_string(text, &secrets)
+}
+
+fn build_compacted_messages(summary: &str, recent_messages: &[Message]) -> Vec<Message> {
     let mut compacted = vec![Message::text(
         "user",
-        format!("[Conversation Summary]\n{summary}"),
+        format!("{REFERENCE_ONLY_HEADER}\n\n{summary}"),
     )];
-    if !matches!(recent_messages.first(), Some(message) if message.role == "assistant") {
-        compacted.push(Message::text(
-            "assistant",
-            "Understood, I have the conversation context. How can I help?",
-        ));
-    }
 
     for message in recent_messages {
-        append_compacted_message(&mut compacted, message);
+        compacted.push(message.clone());
     }
+
+    merge_compacted_skipping_summary(&mut compacted);
 
     if matches!(compacted.last(), Some(last) if last.role == "assistant") {
         compacted.pop();
     }
 
-    Ok(compacted)
+    compacted
+}
+
+fn merge_compacted_skipping_summary(compacted: &mut Vec<Message>) {
+    let start_idx = 1;
+    if compacted.len() <= start_idx + 1 {
+        return;
+    }
+
+    let mut write = start_idx;
+    for read in start_idx + 1..compacted.len() {
+        let can_merge = {
+            let left = &compacted[write];
+            let right = &compacted[read];
+            can_merge_compacted_messages(left, right)
+        };
+        if can_merge {
+            let merged = format!(
+                "{}\n{}",
+                compacted[write].content.as_text_lossy(),
+                compacted[read].content.as_text_lossy()
+            );
+            compacted[write].content = crate::llm::MessageContent::text(merged);
+        } else {
+            write += 1;
+            if write != read {
+                compacted.swap(write, read);
+            }
+        }
+    }
+    compacted.truncate(write + 1);
+}
+
+fn log_compaction_metrics(
+    context: &SurfaceContext,
+    chat_id: i64,
+    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    old_count: usize,
+    new_count: usize,
+    total_count: usize,
+    success: bool,
+) {
+    info!(
+        channel = %context.channel,
+        chat_id,
+        provider = llm.provider_name(),
+        model = llm.model_name(),
+        old_count,
+        new_count,
+        total_count,
+        success,
+        "safety_compact completed"
+    );
 }
 
 pub(crate) async fn archive_conversation(
@@ -217,25 +536,6 @@ pub(crate) fn archive_conversation_blocking(
     }
 }
 
-/// Truncate the compaction summary input by character count, not by bytes.
-///
-/// The limit keeps UTF-8 text intact and appends `\n... (truncated)` when the
-/// input exceeds `MAX_COMPACTION_SUMMARY_CHARS` characters.
-pub(crate) fn truncate_compaction_summary_input(mut summary_input: String) -> String {
-    if summary_input.chars().count() <= MAX_COMPACTION_SUMMARY_CHARS {
-        return summary_input;
-    }
-
-    let cutoff = summary_input
-        .char_indices()
-        .nth(MAX_COMPACTION_SUMMARY_CHARS)
-        .map(|(idx, _)| idx)
-        .unwrap_or(summary_input.len());
-    summary_input.truncate(cutoff);
-    summary_input.push_str("\n... (truncated)");
-    summary_input
-}
-
 pub(crate) fn tool_safe_split_at(messages: &[Message], preferred_split_at: usize) -> usize {
     let mut split_at = preferred_split_at.min(messages.len());
 
@@ -270,26 +570,7 @@ fn find_tool_call_parent(
     })
 }
 
-pub(crate) fn append_compacted_message(compacted: &mut Vec<Message>, message: &Message) {
-    let Some(last) = compacted.last_mut() else {
-        compacted.push(message.clone());
-        return;
-    };
-
-    if can_merge_compacted_messages(last, message) {
-        let merged = format!(
-            "{}\n{}",
-            last.content.as_text_lossy(),
-            message.content.as_text_lossy()
-        );
-        last.content = crate::llm::MessageContent::text(merged);
-        return;
-    }
-
-    compacted.push(message.clone());
-}
-
-pub(crate) fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
+fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
     left.role == right.role
         && left.tool_calls.is_empty()
         && right.tool_calls.is_empty()
@@ -313,20 +594,147 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn truncate_compaction_summary_input_keeps_exact_character_limit() {
-        let input = format!("{}{}{}", "a".repeat(19_998), "あ", "い");
-        let truncated = truncate_compaction_summary_input(input.clone());
-
-        assert_eq!(truncated, input);
+    fn shrink_summary_input_keeps_text_under_budget() {
+        let budget_tokens = 100;
+        let max_chars = budget_tokens * CHARS_PER_TOKEN_ESTIMATE;
+        let input = "a".repeat(max_chars);
+        let result = shrink_summary_input(input.clone(), budget_tokens);
+        assert_eq!(result, input);
     }
 
     #[test]
-    fn truncate_compaction_summary_input_truncates_by_character_count() {
-        let input = format!("{}{}{}", "a".repeat(19_999), "あ", "い");
-        let truncated = truncate_compaction_summary_input(input);
+    fn shrink_summary_input_truncates_when_over_budget() {
+        let budget_tokens = 100;
+        let max_chars = budget_tokens * CHARS_PER_TOKEN_ESTIMATE;
+        let input = "a".repeat(max_chars + 10);
+        let result = shrink_summary_input(input, budget_tokens);
+        assert!(result.ends_with("... (truncated to fit summarizer budget)"));
+        assert!(result.chars().count() <= max_chars + 50);
+    }
 
-        let expected = format!("{}\n... (truncated)", "a".repeat(19_999) + "あ");
-        assert_eq!(truncated, expected);
+    #[test]
+    fn estimates_prompt_tokens_from_system_messages_and_tools() {
+        let system = "You are a helpful assistant.";
+        let messages = vec![
+            Message::text("user", "Hello world"),
+            Message::text("assistant", "Hi there! How can I help?"),
+        ];
+        let tools = r#"[{"name":"read","parameters":{}}]"#;
+
+        let tokens = estimate_prompt_tokens(system, &messages, Some(tools));
+
+        let total_chars = system.len()
+            + "user".len()
+            + "Hello world".len()
+            + "assistant".len()
+            + "Hi there! How can I help?".len()
+            + tools.len();
+        let expected = (total_chars / CHARS_PER_TOKEN_ESTIMATE).max(1);
+        assert_eq!(tokens, expected);
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn computes_usable_context_from_context_window_and_reserves() {
+        assert_eq!(
+            usable_context_tokens(100_000),
+            100_000 - CONTEXT_RESERVE_TOKENS
+        );
+        assert_eq!(usable_context_tokens(5000), 1);
+    }
+
+    #[test]
+    fn triggers_when_estimate_reaches_threshold() {
+        let usable = 50_000;
+        let threshold_ratio = 0.80;
+        let estimated = 40_000;
+        assert!(should_compact(estimated, usable, threshold_ratio));
+    }
+
+    #[test]
+    fn does_not_trigger_below_threshold() {
+        let usable = 50_000;
+        let threshold_ratio = 0.80;
+        let estimated = 39_999;
+        assert!(!should_compact(estimated, usable, threshold_ratio));
+    }
+
+    #[test]
+    fn targets_configured_compaction_ratio() {
+        let usable = 100_000;
+        assert_eq!(compaction_target_tokens(usable, 0.40), 40_000);
+        assert_eq!(compaction_target_tokens(usable, 0.30), 30_000);
+        assert_eq!(compaction_target_tokens(1, 0.30), 1);
+    }
+
+    #[test]
+    fn split_preserves_latest_user_message_with_recent_tail() {
+        let messages = vec![
+            Message::text("user", "old request"),
+            Message::text("assistant", "old answer"),
+            Message::text("user", "fresh request"),
+            Message::text("assistant", "draft answer"),
+        ];
+
+        let split_at = compaction_split_at(&messages, 1);
+
+        assert_eq!(split_at, 2);
+        assert_eq!(messages[split_at].content.as_text_lossy(), "fresh request");
+    }
+
+    #[test]
+    fn caps_summary_input_to_summarizer_budget() {
+        let usable = 50_000;
+        let budget = summarizer_input_budget(usable);
+        assert_eq!(budget, usable - SUMMARIZER_OUTPUT_RESERVE);
+    }
+
+    #[test]
+    fn shrinks_summary_input_until_under_budget() {
+        let budget_tokens = 50;
+        let max_chars = budget_tokens * CHARS_PER_TOKEN_ESTIMATE;
+        let input = "x".repeat(max_chars * 3);
+        let result = shrink_summary_input(input, budget_tokens);
+        assert!(result.chars().count() < max_chars * 2);
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn shrinks_compacted_summary_to_target() {
+        let recent = vec![Message::text("user", "fresh question")];
+        let full = build_compacted_messages(&"summary ".repeat(1000), &recent);
+        let minimum = build_compacted_messages("", &recent);
+        let target = estimate_prompt_tokens("", &minimum, None) + 10;
+
+        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target);
+
+        assert!(estimate_prompt_tokens("", &full, None) > target);
+        assert!(estimate_prompt_tokens("", &result, None) <= target);
+        assert!(
+            result[0]
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        );
+        assert_eq!(
+            result.last().expect("recent").content.as_text_lossy(),
+            "fresh question"
+        );
+    }
+
+    #[test]
+    fn keeps_protected_recent_when_target_is_impossible() {
+        let recent = vec![Message::text("user", "fresh question".repeat(500))];
+
+        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, 1);
+
+        assert_eq!(result.last().expect("recent").role, "user");
+        assert!(
+            result[0]
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        );
     }
 
     #[test]
@@ -456,19 +864,13 @@ mod tests {
 
         let seen_systems = provider.seen_systems();
         assert_eq!(seen_systems.len(), 2);
-        assert_eq!(seen_systems[0], "You are a helpful summarizer.");
+        assert_eq!(seen_systems[0], SUMMARIZER_SYSTEM_PROMPT);
 
         let seen_messages = provider.seen_messages();
         assert_eq!(seen_messages.len(), 2);
-        assert_eq!(
-            seen_messages[1][0].content.as_text_lossy(),
-            "[Conversation Summary]\nsummary text"
-        );
-        assert_eq!(seen_messages[1][1].role, "assistant");
-        assert_eq!(
-            seen_messages[1][1].content.as_text_lossy(),
-            "old-assistant-2"
-        );
+        let summary_text = seen_messages[1][0].content.as_text_lossy();
+        assert!(summary_text.contains("[CONTEXT COMPACTION — REFERENCE ONLY]"));
+        assert!(summary_text.contains("summary text"));
         assert_eq!(
             seen_messages[1]
                 .last()
@@ -481,10 +883,9 @@ mod tests {
         let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
             .await
             .expect("loaded session");
-        assert_eq!(
-            loaded.messages[0].content.as_text_lossy(),
-            "[Conversation Summary]\nsummary text"
-        );
+        let loaded_summary = loaded.messages[0].content.as_text_lossy();
+        assert!(loaded_summary.contains("[CONTEXT COMPACTION — REFERENCE ONLY]"));
+        assert!(loaded_summary.contains("summary text"));
         assert_eq!(
             loaded
                 .messages
@@ -565,12 +966,9 @@ mod tests {
             !message
                 .content
                 .as_text_lossy()
-                .contains("[Conversation Summary]")
+                .contains("[CONTEXT COMPACTION — REFERENCE ONLY]")
         }));
-        assert_eq!(
-            seen_messages[1][0].content.as_text_lossy(),
-            "old-assistant-2"
-        );
+        assert_eq!(seen_messages[1][0].content.as_text_lossy(), "old-user-1");
         assert_eq!(
             seen_messages[1]
                 .last()
@@ -587,12 +985,9 @@ mod tests {
             !message
                 .content
                 .as_text_lossy()
-                .contains("[Conversation Summary]")
+                .contains("[CONTEXT COMPACTION — REFERENCE ONLY]")
         }));
-        assert_eq!(
-            loaded.messages[0].content.as_text_lossy(),
-            "old-assistant-2"
-        );
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "old-user-1");
         assert_eq!(
             loaded
                 .messages
@@ -624,6 +1019,7 @@ mod tests {
         let messages = vec![
             Message::text("user", "msg-1"),
             Message::text("assistant", "reply-1"),
+            Message::text("user", "msg-2"),
         ];
 
         let result = force_compact(&state, &context, 1, &messages, &llm)
@@ -631,12 +1027,12 @@ mod tests {
             .expect("force_compact");
 
         assert_eq!(provider.seen_systems().len(), 1);
-        assert_eq!(provider.seen_systems()[0], "You are a helpful summarizer.");
-        assert!(
-            result
-                .first()
-                .is_some_and(|m| m.content.as_text_lossy().contains("[Conversation Summary]"))
-        );
+        assert_eq!(provider.seen_systems()[0], SUMMARIZER_SYSTEM_PROMPT);
+        assert!(result.first().is_some_and(|m| {
+            m.content
+                .as_text_lossy()
+                .contains("[CONTEXT COMPACTION — REFERENCE ONLY]")
+        }));
     }
 
     #[tokio::test]
