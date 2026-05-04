@@ -155,20 +155,33 @@ impl Tool for GrepTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: pattern".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            pattern: String,
+            #[serde(default)]
+            literal: Option<bool>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            limit: Option<u64>,
+            #[serde(default, rename = "ignoreCase")]
+            ignore_case: Option<bool>,
+            #[serde(default)]
+            context: Option<u64>,
+            #[serde(default)]
+            glob: Option<String>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        let literal = input
-            .get("literal")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let pattern = &params.pattern;
+        let literal = params.literal.unwrap_or(false);
         if let Err(error) = validate_grep_pattern(pattern, literal) {
             return ToolResult::error(error);
         }
-        let requested_path = input
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or(".");
+        let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
@@ -177,21 +190,13 @@ impl Tool for GrepTool {
             return ToolResult::error(reason);
         }
 
-        let limit = input
-            .get("limit")
-            .and_then(|value| value.as_u64())
+        let limit = params
+            .limit
             .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_GREP_LIMIT);
-        let ignore_case = input
-            .get("ignoreCase")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let context_lines = input
-            .get("context")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-            .unwrap_or(0);
-        let file_glob = input.get("glob").and_then(|value| value.as_str());
+        let ignore_case = params.ignore_case.unwrap_or(false);
+        let context_lines = params.context.map(|value| value as usize).unwrap_or(0);
+        let file_glob = params.glob.as_deref();
 
         let (cwd, target) = command_scope_for_path(&resolved);
         let mut command = Command::new("rg");
@@ -413,13 +418,20 @@ impl Tool for FindTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: pattern".to_string());
+        #[derive(serde::Deserialize)]
+        struct Params {
+            pattern: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            limit: Option<u64>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        let requested_path = input
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or(".");
+        let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
@@ -428,9 +440,8 @@ impl Tool for FindTool {
             return ToolResult::error(reason);
         }
 
-        let limit = input
-            .get("limit")
-            .and_then(|value| value.as_u64())
+        let limit = params
+            .limit
             .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_FIND_LIMIT);
         let search_dir = if resolved.is_dir() {
@@ -465,7 +476,7 @@ impl Tool for FindTool {
         }
         command
             .arg("--")
-            .arg(pattern)
+            .arg(&params.pattern)
             .arg(search_dir.to_string_lossy().to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -633,10 +644,19 @@ impl Tool for LsTool {
         input: serde_json::Value,
         _context: &ToolExecutionContext,
     ) -> ToolResult {
-        let requested_path = input
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or(".");
+        #[derive(serde::Deserialize)]
+        struct Params {
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            limit: Option<u64>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
@@ -650,9 +670,8 @@ impl Tool for LsTool {
         if !resolved.is_dir() {
             return ToolResult::error(format!("Not a directory: {}", resolved.display()));
         }
-        let limit = input
-            .get("limit")
-            .and_then(|value| value.as_u64())
+        let limit = params
+            .limit
             .map(|value| value.max(1) as usize)
             .unwrap_or(DEFAULT_LS_LIMIT);
 

@@ -209,25 +209,7 @@ fn set_schema_version_in_tx(
     version: i64,
     note: &str,
 ) -> Result<(), StorageError> {
-    tx.execute(
-        "INSERT INTO db_meta(key, value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![version.to_string()],
-    )?;
-    tx.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT NOT NULL,
-            note TEXT
-        )",
-        [],
-    )?;
-    tx.execute(
-        "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
-         VALUES(?1, ?2, ?3)",
-        params![version, chrono::Utc::now().to_rfc3339(), note],
-    )?;
-    Ok(())
+    set_schema_version(tx, version, note)
 }
 
 /// 未適用のマイグレーションを逐次実行する。
@@ -496,16 +478,7 @@ impl Database {
         )?;
 
         let mut messages = stmt
-            .query_map(params![chat_id, limit as i64], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    sender_name: row.get(2)?,
-                    content: row.get(3)?,
-                    is_from_bot: row.get::<_, i32>(4)? != 0,
-                    timestamp: row.get(5)?,
-                })
-            })?
+            .query_map(params![chat_id, limit as i64], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()?;
         messages.reverse();
         Ok(messages)
@@ -520,18 +493,9 @@ impl Database {
              WHERE chat_id = ?1
              ORDER BY timestamp ASC",
         )?;
-        stmt.query_map(params![chat_id], |row| {
-            Ok(StoredMessage {
-                id: row.get(0)?,
-                chat_id: row.get(1)?,
-                sender_name: row.get(2)?,
-                content: row.get(3)?,
-                is_from_bot: row.get::<_, i32>(4)? != 0,
-                timestamp: row.get(5)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        stmt.query_map(params![chat_id], row_to_stored_message)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// List all chats with their last message preview, ordered by most recent activity.
@@ -677,16 +641,7 @@ impl Database {
                  LIMIT ?2",
             )?;
             let mut messages = stmt
-                .query_map(params![chat_id, limit as i64], |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        sender_name: row.get(2)?,
-                        content: row.get(3)?,
-                        is_from_bot: row.get::<_, i32>(4)? != 0,
-                        timestamp: row.get(5)?,
-                    })
-                })?
+                .query_map(params![chat_id, limit as i64], row_to_stored_message)?
                 .collect::<Result<Vec<_>, _>>()?;
             messages.reverse();
             messages
@@ -782,17 +737,7 @@ impl Database {
         )?;
 
         let calls = stmt
-            .query_map(params![chat_id, message_id], |row| {
-                Ok(ToolCall {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    message_id: row.get(2)?,
-                    tool_name: row.get(3)?,
-                    tool_input: row.get(4)?,
-                    tool_output: row.get(5)?,
-                    timestamp: row.get(6)?,
-                })
-            })?
+            .query_map(params![chat_id, message_id], row_to_tool_call)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(calls)
@@ -807,17 +752,7 @@ impl Database {
         )?;
 
         let calls = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(ToolCall {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    message_id: row.get(2)?,
-                    tool_name: row.get(3)?,
-                    tool_input: row.get(4)?,
-                    tool_output: row.get(5)?,
-                    timestamp: row.get(6)?,
-                })
-            })?
+            .query_map(params![chat_id], row_to_tool_call)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(calls)
@@ -988,6 +923,29 @@ fn logical_session_thread(
     }
 
     external_chat_id.to_string()
+}
+
+fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    Ok(StoredMessage {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        sender_name: row.get(2)?,
+        content: row.get(3)?,
+        is_from_bot: row.get::<_, i32>(4)? != 0,
+        timestamp: row.get(5)?,
+    })
+}
+
+fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCall> {
+    Ok(ToolCall {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        message_id: row.get(2)?,
+        tool_name: row.get(3)?,
+        tool_input: row.get(4)?,
+        tool_output: row.get(5)?,
+        timestamp: row.get(6)?,
+    })
 }
 
 #[cfg(test)]
