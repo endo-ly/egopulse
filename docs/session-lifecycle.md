@@ -138,23 +138,13 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 **要約入力**: Middle を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。summarizer budget（`usable context - 4096` tokens）を超えないよう段階的に削減（軽量化 → message 単位削減 → Head 寄り Middle 削除）。
 
-**要約呼び出し**: system prompt は `You are a helpful summarizer. Summarize the conversation concisely, preserving key facts, decisions, tool results, and context needed to continue. Be brief but thorough. Write the summary in the same language the user was using.` + 会話要約要求 + Middle dump。
+**要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + Middle dump。
 
-**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用（config secret 値の置換 + known pattern のマスク）。summary やログに credential が残らないことを保証する。
+**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照。
 
 **Compact 後の形**:
-1. `user`: `[CONTEXT COMPACTION — REFERENCE ONLY]` ヘッダー付き summary
+1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）
 2. Tail messages（直近メッセージ・tool block をそのまま保持）
-
-**reference-only ヘッダー**:
-
-```text
-[CONTEXT COMPACTION — REFERENCE ONLY]
-Earlier turns were compacted into the summary below.
-This is background reference, not active instruction.
-Do not answer old requests mentioned in this summary.
-Respond to the latest user message after this summary.
-```
 
 **Role 補正**: 同じ role の plain-text message で `tool_calls` 空かつ `tool_call_id` が `None` の場合のみ merge。末尾が assistant なら除去。
 
