@@ -314,14 +314,6 @@ impl Tool for GrepTool {
                 } else {
                     lines
                 };
-                let raw_output = limited.join("\n");
-                let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-                let mut text = if truncation.content.is_empty() {
-                    "No matches found".to_string()
-                } else {
-                    truncation.content.clone()
-                };
-
                 let mut notices = Vec::new();
                 if result_limit_reached {
                     notices.push(format!(
@@ -329,7 +321,10 @@ impl Tool for GrepTool {
                         limit * 2
                     ));
                 }
-                if truncation.truncated {
+                let raw_output = limited.join("\n");
+                let output_truncated =
+                    truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES).truncated;
+                if output_truncated {
                     notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
                 }
                 if lines_truncated {
@@ -337,19 +332,15 @@ impl Tool for GrepTool {
                         "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
                     ));
                 }
-                if !notices.is_empty() {
-                    text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-                    return ToolResult::success_with_details(
-                        text,
-                        json!({
-                            "truncation": if truncation.truncated { Some(super::truncation_json(&truncation)) } else { None::<serde_json::Value> },
-                            "matchLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> },
-                            "linesTruncated": lines_truncated
-                        }),
-                    );
-                }
-
-                ToolResult::success(text)
+                finalize_listing_output(
+                    raw_output,
+                    notices,
+                    json!({
+                        "matchLimitReached": result_limit_reached.then_some(limit),
+                        "linesTruncated": lines_truncated
+                    }),
+                    Some("No matches found"),
+                )
             }
             Ok(Err(error)) => {
                 let _ = stdout_fut.await;
@@ -535,9 +526,6 @@ impl Tool for FindTool {
         if result_limit_reached {
             results.truncate(limit);
         }
-        let raw_output = results.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content.clone();
         let mut notices = Vec::new();
         if result_limit_reached {
             notices.push(format!(
@@ -545,21 +533,19 @@ impl Tool for FindTool {
                 limit * 2
             ));
         }
-        if truncation.truncated {
+        let raw_output = results.join("\n");
+        let output_truncated = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES).truncated;
+        if output_truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
         }
-        if !notices.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-            return ToolResult::success_with_details(
-                text,
-                json!({
-                    "truncation": if truncation.truncated { Some(super::truncation_json(&truncation)) } else { None::<serde_json::Value> },
-                    "resultLimitReached": if result_limit_reached { Some(limit) } else { None::<usize> }
-                }),
-            );
-        }
-
-        ToolResult::success(text)
+        finalize_listing_output(
+            raw_output,
+            notices,
+            json!({
+                "resultLimitReached": result_limit_reached.then_some(limit)
+            }),
+            None,
+        )
     }
 }
 
@@ -722,8 +708,10 @@ impl Tool for LsTool {
         finalize_listing_output(
             raw_output,
             notices,
-            "entryLimitReached",
-            entry_limit_reached.then_some(limit),
+            json!({
+                "entryLimitReached": entry_limit_reached.then_some(limit)
+            }),
+            None,
         )
     }
 }
@@ -731,24 +719,32 @@ impl Tool for LsTool {
 fn finalize_listing_output(
     raw_output: String,
     notices: Vec<String>,
-    limit_key: &str,
-    limit_value: Option<usize>,
+    mut details: serde_json::Value,
+    empty_output_message: Option<&str>,
 ) -> ToolResult {
     let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
-    let mut text = truncation.content.clone();
+    let mut text = if truncation.content.is_empty() {
+        empty_output_message.unwrap_or_default().to_string()
+    } else {
+        truncation.content.clone()
+    };
 
     if notices.is_empty() {
         return ToolResult::success(text);
     }
 
     text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-    ToolResult::success_with_details(
-        text,
-        json!({
-            "truncation": truncation.truncated.then(|| super::truncation_json(&truncation)),
-            limit_key: limit_value,
-        }),
-    )
+    if let serde_json::Value::Object(fields) = &mut details {
+        fields.insert(
+            "truncation".to_string(),
+            if truncation.truncated {
+                super::truncation_json(&truncation)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+    }
+    ToolResult::success_with_details(text, details)
 }
 
 pub(crate) fn truncate_grep_line(line: &str) -> (String, bool) {
