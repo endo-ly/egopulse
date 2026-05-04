@@ -14,7 +14,10 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
+    RawContent, ResourceContents, Tool,
+};
 use rmcp::service::{DynService, RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
     StreamableHttpClientTransport, TokioChildProcess,
@@ -415,62 +418,7 @@ impl McpManager {
             }
         };
 
-        let mut parts: Vec<String> = result
-            .content
-            .into_iter()
-            .map(|content| match content.raw {
-                rmcp::model::RawContent::Text(text) => text.text.clone(),
-                rmcp::model::RawContent::Image(img) => {
-                    format!("[image: {} ({} bytes)]", img.mime_type, img.data.len())
-                }
-                rmcp::model::RawContent::Resource(res) => {
-                    let desc = match &res.resource {
-                        rmcp::model::ResourceContents::TextResourceContents {
-                            uri,
-                            mime_type,
-                            ..
-                        } => {
-                            format!(
-                                "resource: {uri} ({})",
-                                mime_type.as_deref().unwrap_or("unknown")
-                            )
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            uri,
-                            mime_type,
-                            ..
-                        } => {
-                            format!(
-                                "blob: {uri} ({})",
-                                mime_type.as_deref().unwrap_or("unknown")
-                            )
-                        }
-                    };
-                    format!("[{desc}]")
-                }
-                rmcp::model::RawContent::Audio(audio) => {
-                    format!("[audio: {} ({} bytes)]", audio.mime_type, audio.data.len())
-                }
-                rmcp::model::RawContent::ResourceLink(link) => {
-                    format!("[resource_link: {} ({})]", link.uri, link.name)
-                }
-            })
-            .collect();
-
-        if let Some(structured) = result.structured_content {
-            parts.push(format!(
-                "[structured_content: {}]",
-                serde_json::to_string(&structured).unwrap_or_default()
-            ));
-        }
-
-        let output = parts.join("\n");
-
-        Ok(if output.is_empty() {
-            "(no output)".to_string()
-        } else {
-            output
-        })
+        Ok(format_mcp_tool_result(result))
     }
 
     /// 接続済み全サーバーの全ツールについて McpToolAdapter を生成する。
@@ -515,6 +463,64 @@ impl McpManager {
         }
 
         adapters
+    }
+}
+
+fn format_mcp_tool_result(result: CallToolResult) -> String {
+    let mut parts: Vec<String> = result
+        .content
+        .into_iter()
+        .map(|content| format_mcp_content(content.raw))
+        .collect();
+
+    if let Some(structured) = result.structured_content {
+        parts.push(format!(
+            "[structured_content: {}]",
+            serde_json::to_string(&structured).unwrap_or_default()
+        ));
+    }
+
+    let output = parts.join("\n");
+    if output.is_empty() {
+        if result.is_error == Some(true) {
+            "[error]".to_string()
+        } else {
+            "(no output)".to_string()
+        }
+    } else {
+        output
+    }
+}
+
+fn format_mcp_content(raw: RawContent) -> String {
+    match raw {
+        RawContent::Text(text) => text.text,
+        RawContent::Image(image) => {
+            format!("[image: {} ({} bytes)]", image.mime_type, image.data.len())
+        }
+        RawContent::Resource(resource) => {
+            let description = match resource.resource {
+                ResourceContents::TextResourceContents { uri, mime_type, .. } => {
+                    format!(
+                        "resource: {uri} ({})",
+                        mime_type.as_deref().unwrap_or("unknown")
+                    )
+                }
+                ResourceContents::BlobResourceContents { uri, mime_type, .. } => {
+                    format!(
+                        "blob: {uri} ({})",
+                        mime_type.as_deref().unwrap_or("unknown")
+                    )
+                }
+            };
+            format!("[{description}]")
+        }
+        RawContent::Audio(audio) => {
+            format!("[audio: {} ({} bytes)]", audio.mime_type, audio.data.len())
+        }
+        RawContent::ResourceLink(link) => {
+            format!("[resource_link: {} ({})]", link.uri, link.name)
+        }
     }
 }
 

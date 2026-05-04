@@ -9,6 +9,18 @@ use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::slash_commands::{SlashCommandOutcome, process_slash_command};
 
+fn map_io_error(error: std::io::Error) -> EgoPulseError {
+    crate::error::StorageError::Io(error).into()
+}
+
+fn write_line(stdout: &mut impl Write, args: std::fmt::Arguments<'_>) -> Result<(), EgoPulseError> {
+    writeln!(stdout, "{args}").map_err(map_io_error)
+}
+
+fn flush(stdout: &mut impl Write) -> Result<(), EgoPulseError> {
+    stdout.flush().map_err(map_io_error)
+}
+
 /// Runs an interactive CLI chat loop for the given persistent session.
 pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseError> {
     let stdin = io::stdin();
@@ -21,17 +33,11 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         state.config.default_agent.to_string(),
     );
 
-    writeln!(stdout, "session: {}", session)
-        .map_err(crate::error::StorageError::Io)
-        .map_err(EgoPulseError::from)?;
-    writeln!(stdout, "type `/exit` to leave the chat")
-        .map_err(crate::error::StorageError::Io)
-        .map_err(EgoPulseError::from)?;
+    write_line(&mut stdout, format_args!("session: {session}"))?;
+    write_line(&mut stdout, format_args!("type `/exit` to leave the chat"))?;
 
     for line in stdin.lock().lines() {
-        let input = line
-            .map_err(crate::error::StorageError::Io)
-            .map_err(EgoPulseError::from)?;
+        let input = line.map_err(map_io_error)?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
             continue;
@@ -42,29 +48,17 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
 
         match process_slash_command(state, &context, trimmed, None).await {
             SlashCommandOutcome::Respond(response) | SlashCommandOutcome::Error(response) => {
-                writeln!(stdout, "assistant: {response}")
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
-                stdout
-                    .flush()
-                    .map_err(crate::error::StorageError::Io)
-                    .map_err(EgoPulseError::from)?;
+                write_line(&mut stdout, format_args!("assistant: {response}"))?;
+                flush(&mut stdout)?;
                 continue;
             }
             SlashCommandOutcome::NotHandled => {}
         }
 
-        writeln!(stdout, "you: {trimmed}")
-            .map_err(crate::error::StorageError::Io)
-            .map_err(EgoPulseError::from)?;
+        write_line(&mut stdout, format_args!("you: {trimmed}"))?;
         let response = process_turn(state, &context, trimmed).await?;
-        writeln!(stdout, "assistant: {response}")
-            .map_err(crate::error::StorageError::Io)
-            .map_err(EgoPulseError::from)?;
-        stdout
-            .flush()
-            .map_err(crate::error::StorageError::Io)
-            .map_err(EgoPulseError::from)?;
+        write_line(&mut stdout, format_args!("assistant: {response}"))?;
+        flush(&mut stdout)?;
     }
 
     Ok(())

@@ -7,7 +7,7 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -268,175 +268,234 @@ async fn run_loop(
             .draw(|frame| draw(frame, app))
             .map_err(|error| TuiError::RenderFailed(error.to_string()))?;
 
-        if event::poll(Duration::from_millis(200))
-            .map_err(|error| TuiError::EventFailed(error.to_string()))?
+        let Some(key) = read_pressed_key()? else {
+            continue;
+        };
+
+        if is_quit_key(key) {
+            return Ok(());
+        }
+
+        if let Some(action) = handle_key(app, key)
+            && execute_action(app, action).await?
         {
-            let Event::Key(key) =
-                event::read().map_err(|error| TuiError::EventFailed(error.to_string()))?
-            else {
-                continue;
-            };
+            return Ok(());
+        }
+    }
+}
 
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+fn read_pressed_key() -> Result<Option<KeyEvent>, EgoPulseError> {
+    if !event::poll(Duration::from_millis(200))
+        .map_err(|error| TuiError::EventFailed(error.to_string()))?
+    {
+        return Ok(None);
+    }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                return Ok(());
-            }
+    let Event::Key(key) =
+        event::read().map_err(|error| TuiError::EventFailed(error.to_string()))?
+    else {
+        return Ok(None);
+    };
 
-            let mut next_action: Option<PendingAction> = None;
-            match &mut app.view {
-                View::Browser => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => next_action = Some(PendingAction::Exit),
-                    KeyCode::Char('r') => next_action = Some(PendingAction::RefreshSessions),
-                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.move_selection(5);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.move_selection(-5);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Char('n') => next_action = Some(PendingAction::NewSession),
-                    KeyCode::Enter => next_action = Some(PendingAction::OpenSelected),
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        app.move_selection(1);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        app.move_selection(-1);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Char('g') => {
-                        app.select_first();
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::Char('G') => {
-                        app.select_last();
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::PageDown => {
-                        app.move_selection(5);
-                        app.status = app.browser_status();
-                    }
-                    KeyCode::PageUp => {
-                        app.move_selection(-5);
-                        app.status = app.browser_status();
-                    }
-                    _ => {}
-                },
-                View::Chat(chat) => match key.code {
-                    KeyCode::Esc => {
-                        if chat.pending_send.is_some() {
-                            chat.status = "Wait for the current request to finish".to_string();
-                        } else {
-                            next_action = Some(PendingAction::GoBrowser);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        backspace_input(chat);
-                    }
-                    KeyCode::Delete => {
-                        delete_input(chat);
-                    }
-                    KeyCode::Left => {
-                        chat.input_cursor = chat.input_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Right => {
-                        chat.input_cursor = (chat.input_cursor + 1).min(chat.input.chars().count());
-                    }
-                    KeyCode::Up => {
-                        handle_up_arrow(chat);
-                    }
-                    KeyCode::Down => {
-                        if chat.history_index.is_some() {
-                            handle_down_arrow(chat);
-                        } else {
-                            // 入力履歴の走査中でなければ、会話ログのスクロールとして扱う。
-                            chat.conversation_scroll = chat.conversation_scroll.saturating_sub(1);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if chat.pending_send.is_some() {
-                            chat.status = "A request is already in progress".to_string();
-                            continue;
-                        }
-                        let raw_input = chat.input.trim().to_string();
-                        if !raw_input.is_empty() {
-                            if !raw_input.is_empty() {
-                                push_input_history(chat, raw_input.clone());
-                            }
-                            chat.input.clear();
-                            chat.input_cursor = 0;
-                            chat.history_index = None;
-                            chat.draft_input = None;
-                            next_action = Some(PendingAction::SendMessage(raw_input));
-                        }
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        insert_input_char(chat, c);
-                    }
-                    _ => {}
-                },
-            }
+    Ok((key.kind == KeyEventKind::Press).then_some(key))
+}
 
-            if let Some(action) = next_action {
-                match action {
-                    PendingAction::Exit => return Ok(()),
-                    PendingAction::RefreshSessions => {
-                        app.refresh_sessions().await?;
-                    }
-                    PendingAction::NewSession => {
-                        app.open_new_session().await?;
-                    }
-                    PendingAction::OpenSelected => {
-                        app.open_selected_session().await?;
-                    }
-                    PendingAction::GoBrowser => {
-                        app.refresh_sessions().await?;
-                        // ブラウザ復帰時に再読込し、直前の送受信を一覧へ即反映する。
-                        app.view = View::Browser;
-                        app.status = app.browser_status();
-                    }
-                    PendingAction::SendMessage(prompt) => {
-                        if let View::Chat(chat) = &mut app.view {
-                            match crate::slash_commands::process_slash_command(
-                                &app.state,
-                                &chat.context,
-                                &prompt,
-                                None,
-                            )
-                            .await
-                            {
-                                crate::slash_commands::SlashCommandOutcome::Respond(response) => {
-                                    if crate::slash_commands::is_slash_command(&prompt)
-                                        && prompt.trim_start().starts_with("/new")
-                                    {
-                                        chat.messages.clear();
-                                    }
-                                    chat.messages.push(RenderedMessage {
-                                        role: "user".to_string(),
-                                        content: prompt.clone(),
-                                    });
-                                    chat.messages.push(RenderedMessage {
-                                        role: "assistant".to_string(),
-                                        content: response,
-                                    });
-                                    chat.status = "Command applied".to_string();
-                                    chat.conversation_scroll = 0;
-                                }
-                                crate::slash_commands::SlashCommandOutcome::Error(msg) => {
-                                    chat.status = msg;
-                                }
-                                crate::slash_commands::SlashCommandOutcome::NotHandled => {
-                                    start_send(app, prompt);
-                                }
-                            }
-                        }
-                    }
-                }
+fn is_quit_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+}
+
+fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Option<PendingAction> {
+    match std::mem::replace(&mut app.view, View::Browser) {
+        View::Browser => handle_browser_key(app, key),
+        View::Chat(mut chat) => {
+            let action = handle_chat_key(&mut chat, key);
+            app.view = View::Chat(chat);
+            action
+        }
+    }
+}
+
+fn handle_browser_key(app: &mut TuiApp, key: KeyEvent) -> Option<PendingAction> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => Some(PendingAction::Exit),
+        KeyCode::Char('r') => Some(PendingAction::RefreshSessions),
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_browser_selection(app, 5);
+            None
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_browser_selection(app, -5);
+            None
+        }
+        KeyCode::Char('n') => Some(PendingAction::NewSession),
+        KeyCode::Enter => Some(PendingAction::OpenSelected),
+        KeyCode::Char('j') | KeyCode::Down => {
+            move_browser_selection(app, 1);
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            move_browser_selection(app, -1);
+            None
+        }
+        KeyCode::Char('g') => {
+            app.select_first();
+            app.status = app.browser_status();
+            None
+        }
+        KeyCode::Char('G') => {
+            app.select_last();
+            app.status = app.browser_status();
+            None
+        }
+        KeyCode::PageDown => {
+            move_browser_selection(app, 5);
+            None
+        }
+        KeyCode::PageUp => {
+            move_browser_selection(app, -5);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn move_browser_selection(app: &mut TuiApp, delta: isize) {
+    app.move_selection(delta);
+    app.status = app.browser_status();
+}
+
+fn handle_chat_key(chat: &mut ChatState, key: KeyEvent) -> Option<PendingAction> {
+    match key.code {
+        KeyCode::Esc => {
+            if chat.pending_send.is_some() {
+                chat.status = "Wait for the current request to finish".to_string();
+                None
+            } else {
+                Some(PendingAction::GoBrowser)
             }
+        }
+        KeyCode::Backspace => {
+            backspace_input(chat);
+            None
+        }
+        KeyCode::Delete => {
+            delete_input(chat);
+            None
+        }
+        KeyCode::Left => {
+            chat.input_cursor = chat.input_cursor.saturating_sub(1);
+            None
+        }
+        KeyCode::Right => {
+            chat.input_cursor = (chat.input_cursor + 1).min(chat.input.chars().count());
+            None
+        }
+        KeyCode::Up => {
+            handle_up_arrow(chat);
+            None
+        }
+        KeyCode::Down => {
+            if chat.history_index.is_some() {
+                handle_down_arrow(chat);
+            } else {
+                // 入力履歴の走査中でなければ、会話ログのスクロールとして扱う。
+                chat.conversation_scroll = chat.conversation_scroll.saturating_sub(1);
+            }
+            None
+        }
+        KeyCode::Enter => queue_chat_input(chat),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            insert_input_char(chat, c);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn queue_chat_input(chat: &mut ChatState) -> Option<PendingAction> {
+    if chat.pending_send.is_some() {
+        chat.status = "A request is already in progress".to_string();
+        return None;
+    }
+
+    let raw_input = chat.input.trim().to_string();
+    if raw_input.is_empty() {
+        return None;
+    }
+
+    push_input_history(chat, raw_input.clone());
+    chat.input.clear();
+    chat.input_cursor = 0;
+    chat.history_index = None;
+    chat.draft_input = None;
+    Some(PendingAction::SendMessage(raw_input))
+}
+
+async fn execute_action(app: &mut TuiApp, action: PendingAction) -> Result<bool, EgoPulseError> {
+    match action {
+        PendingAction::Exit => Ok(true),
+        PendingAction::RefreshSessions => {
+            app.refresh_sessions().await?;
+            Ok(false)
+        }
+        PendingAction::NewSession => {
+            app.open_new_session().await?;
+            Ok(false)
+        }
+        PendingAction::OpenSelected => {
+            app.open_selected_session().await?;
+            Ok(false)
+        }
+        PendingAction::GoBrowser => {
+            app.refresh_sessions().await?;
+            // ブラウザ復帰時に再読込し、直前の送受信を一覧へ即反映する。
+            app.view = View::Browser;
+            app.status = app.browser_status();
+            Ok(false)
+        }
+        PendingAction::SendMessage(prompt) => {
+            handle_send_message_action(app, prompt).await;
+            Ok(false)
+        }
+    }
+}
+
+async fn handle_send_message_action(app: &mut TuiApp, prompt: String) {
+    let context = match &app.view {
+        View::Chat(chat) => chat.context.clone(),
+        View::Browser => return,
+    };
+    let state = app.state.clone();
+    let outcome =
+        crate::slash_commands::process_slash_command(&state, &context, &prompt, None).await;
+
+    let View::Chat(chat) = &mut app.view else {
+        return;
+    };
+
+    match outcome {
+        crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+            if crate::slash_commands::is_slash_command(&prompt)
+                && prompt.trim_start().starts_with("/new")
+            {
+                chat.messages.clear();
+            }
+            chat.messages.push(RenderedMessage {
+                role: "user".to_string(),
+                content: prompt,
+            });
+            chat.messages.push(RenderedMessage {
+                role: "assistant".to_string(),
+                content: response,
+            });
+            chat.status = "Command applied".to_string();
+            chat.conversation_scroll = 0;
+        }
+        crate::slash_commands::SlashCommandOutcome::Error(msg) => {
+            chat.status = msg;
+        }
+        crate::slash_commands::SlashCommandOutcome::NotHandled => {
+            start_send(app, prompt);
         }
     }
 }
