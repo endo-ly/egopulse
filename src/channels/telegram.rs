@@ -16,11 +16,11 @@ use teloxide::types::{ChatAction, FileId, InputFile, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
-use crate::channel_adapter::ChannelAdapter;
-use crate::channel_adapter::ConversationKind;
+use crate::channels::adapter::ChannelAdapter;
+use crate::channels::adapter::ConversationKind;
+use crate::channels::utils::text::split_text;
 use crate::runtime::AppState;
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
-use crate::text::split_text;
 
 /// Telegram メッセージ長制限 (文字数)。
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
@@ -177,7 +177,7 @@ async fn download_and_save(
     let bytes = tokio::fs::read(&temp_path).await?;
     let _ = tokio::fs::remove_file(&temp_path).await;
 
-    let saved = crate::media::save_inbound_file(workspace_dir, filename, &bytes)?;
+    let saved = crate::channels::utils::media::save_inbound_file(workspace_dir, filename, &bytes)?;
     Ok(saved)
 }
 
@@ -232,7 +232,8 @@ async fn handle_message(
         return Ok(());
     }
 
-    let combined_text = crate::media::format_attachment_text(&attachment_paths, &text);
+    let combined_text =
+        crate::channels::utils::media::format_attachment_text(&attachment_paths, &text);
 
     let raw_chat_id = msg.chat.id.0;
 
@@ -441,30 +442,31 @@ async fn handle_message(
 
 /// Telegram にメッセージを送信 (4096文字制限で自動分割)。
 async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
-    if let Err(error) = crate::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
-        let bot = bot.clone();
-        let chunk = chunk.to_string();
-        Box::pin(async move {
-            match bot.send_message(chat_id, &chunk).await {
-                Ok(_) => {}
-                Err(teloxide::RequestError::RetryAfter(seconds)) => {
-                    warn!(
-                        retry_after = seconds.duration().as_secs(),
-                        "Telegram: rate limited while sending message chunk"
-                    );
-                    tokio::time::sleep(seconds.duration()).await;
-                    bot.send_message(chat_id, &chunk).await.map_err(|e| {
-                        format!("Telegram: failed to send message chunk after retry: {e}")
-                    })?;
+    if let Err(error) =
+        crate::channels::utils::text::send_chunked(text, TELEGRAM_MAX_MESSAGE_LEN, |chunk| {
+            let bot = bot.clone();
+            let chunk = chunk.to_string();
+            Box::pin(async move {
+                match bot.send_message(chat_id, &chunk).await {
+                    Ok(_) => {}
+                    Err(teloxide::RequestError::RetryAfter(seconds)) => {
+                        warn!(
+                            retry_after = seconds.duration().as_secs(),
+                            "Telegram: rate limited while sending message chunk"
+                        );
+                        tokio::time::sleep(seconds.duration()).await;
+                        bot.send_message(chat_id, &chunk).await.map_err(|e| {
+                            format!("Telegram: failed to send message chunk after retry: {e}")
+                        })?;
+                    }
+                    Err(e) => {
+                        return Err(format!("Telegram: failed to send message chunk: {e}"));
+                    }
                 }
-                Err(e) => {
-                    return Err(format!("Telegram: failed to send message chunk: {e}"));
-                }
-            }
-            Ok(())
+                Ok(())
+            })
         })
-    })
-    .await
+        .await
     {
         error!(
             chat_id = chat_id.0,
@@ -609,7 +611,7 @@ mod tests {
         let text = "check this";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
 
         // Assert
         assert_eq!(
@@ -625,7 +627,7 @@ mod tests {
         let text = "hello world";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
 
         // Assert
         assert_eq!(combined, "hello world");
@@ -638,7 +640,7 @@ mod tests {
         let text = "";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
 
         // Assert
         assert_eq!(combined, "[attachment: /workspace/media/inbound/voice.ogg]");
@@ -654,7 +656,7 @@ mod tests {
         let text = "see attached";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
 
         // Assert
         assert_eq!(
@@ -672,7 +674,7 @@ mod tests {
         let text = "";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
 
         // Assert
         assert!(combined.is_empty());

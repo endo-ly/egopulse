@@ -10,11 +10,11 @@ use egopulse::agent_loop;
 use egopulse::channels::cli;
 use egopulse::config::{Config, default_config_path};
 use egopulse::error::{ConfigError, EgoPulseError};
-use egopulse::gateway::{self, GatewayAction};
-use egopulse::logging::init_logging;
 use egopulse::runtime;
+use egopulse::runtime::gateway::{self, GatewayAction};
+use egopulse::runtime::logging::init_logging;
+use egopulse::runtime::status;
 use egopulse::setup;
-use egopulse::status;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

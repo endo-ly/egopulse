@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::assets::AssetStore;
-use crate::channel_adapter::ChannelRegistry;
+use crate::channels::adapter::ChannelRegistry;
 use crate::config::{
     AgentConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId,
     secret_ref::ResolvedValue,
