@@ -234,9 +234,11 @@ impl Database {
     }
 
     pub(crate) fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
-        conn.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
-        conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        tx.commit()?;
         Ok(())
     }
 

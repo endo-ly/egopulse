@@ -398,7 +398,7 @@ impl std::fmt::Display for ProfileScope {
     }
 }
 
-pub(crate) async fn handle_command(
+async fn handle_command(
     state: &AppState,
     context: &SurfaceContext,
     input: &str,
@@ -408,9 +408,11 @@ pub(crate) async fn handle_command(
     }
 
     let parts = input.split_whitespace().collect::<Vec<_>>();
-    let Some(command) = parts.first().copied() else {
+    let Some(raw) = parts.first().copied() else {
         return Ok(None);
     };
+    // Strip @bot suffix (e.g. "/providers@mybot" → "/providers")
+    let command = raw.split_once('@').map(|(c, _)| c).unwrap_or(raw);
 
     match command {
         "/providers" => {
