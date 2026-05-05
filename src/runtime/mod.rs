@@ -561,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_llm_reuses_cached_provider() {
+    async fn llm_for_context_reuses_cached_provider() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");

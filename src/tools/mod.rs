@@ -198,7 +198,7 @@ impl ToolRegistry {
     }
 
     /// Collect tool definitions asynchronously.
-    pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
+    pub(crate) async fn definitions_async(&self) -> Vec<ToolDefinition> {
         let mut definitions: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
 
@@ -211,7 +211,7 @@ impl ToolRegistry {
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
         name: &str,
         input: serde_json::Value,

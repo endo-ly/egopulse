@@ -192,7 +192,7 @@ fn convert_transport(tt: &TransportType) -> crate::runtime::status::TransportTyp
 }
 
 impl McpManager {
-    pub async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
+    pub(crate) async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
         let configs = load_and_merge_mcp_configs(workspace_dir)?;
         let mut servers = Vec::new();
         let mut failed_servers = Vec::new();
@@ -246,7 +246,7 @@ impl McpManager {
         !self.failed_servers.is_empty()
     }
 
-    pub async fn reconnect_failed_once(&mut self, workspace_dir: &Path) -> usize {
+    pub(crate) async fn reconnect_failed_once(&mut self, workspace_dir: &Path) -> usize {
         let failed = std::mem::take(&mut self.failed_servers);
         let mut reconnected = 0;
 
@@ -346,7 +346,7 @@ impl McpManager {
             .collect()
     }
 
-    pub async fn execute_tool_by_name(
+    pub(crate) async fn execute_tool_by_name(
         &self,
         sanitized_name: &str,
         input: serde_json::Value,
@@ -366,7 +366,7 @@ impl McpManager {
 
     /// Execute an MCP tool by name.
     /// Takes pre-extracted server info to avoid holding RwLock across await.
-    pub async fn execute_tool(
+    pub(crate) async fn execute_tool(
         &self,
         server_idx: usize,
         original_tool_name: String,
@@ -793,7 +793,6 @@ mod tests {
     #[test]
     fn parse_full_config_file() {
         let json = r#"{
-            "defaultProtocolVersion": "2024-11-05",
             "mcpServers": {
                 "filesystem": {
                     "transport": "stdio",

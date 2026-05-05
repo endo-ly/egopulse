@@ -23,12 +23,12 @@ macro_rules! define_lowercase_id {
 
         impl $name {
             /// Creates a new identifier after trimming whitespace and lowercasing.
-            pub(crate) fn new(s: &str) -> Self {
+            $vis fn new(s: &str) -> Self {
                 Self(s.trim().to_ascii_lowercase())
             }
 
             /// Returns the identifier as a string slice.
-            pub(crate) fn as_str(&self) -> &str {
+            $vis fn as_str(&self) -> &str {
                 &self.0
             }
         }
@@ -259,7 +259,7 @@ pub struct Config {
     pub(crate) default_model: Option<String>,
     pub(crate) providers: HashMap<ProviderId, ProviderConfig>,
     pub(crate) state_root: String,
-    pub log_level: String,
+    pub(crate) log_level: String,
     pub(crate) compaction_timeout_secs: u64,
     pub(crate) max_history_messages: usize,
     pub(crate) compact_keep_recent: usize,
@@ -299,6 +299,11 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    /// Returns the configured logging level.
+    pub fn log_level(&self) -> &str {
+        &self.log_level
+    }
+
     /// Load configuration, requiring an API key for remote endpoints.
     pub fn load(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         super::loader::build_config(config_path, false)

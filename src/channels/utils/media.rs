@@ -64,15 +64,6 @@ pub(crate) fn save_inbound_file(
 ///
 /// 各パスについて `[attachment: {full_path}]` 行を先頭に並べ、
 /// `user_text` が空でなければ末尾に追加する。
-///
-/// ```
-/// use std::path::PathBuf;
-/// use egopulse::channels::utils::media::format_attachment_text;
-///
-/// let paths = vec![PathBuf::from("/tmp/photo.png")];
-/// let text = format_attachment_text(&paths, "see this");
-/// assert_eq!(text, "[attachment: /tmp/photo.png]\nsee this");
-/// ```
 pub(crate) fn format_attachment_text(paths: &[PathBuf], user_text: &str) -> String {
     if paths.is_empty() && user_text.is_empty() {
         return String::new();

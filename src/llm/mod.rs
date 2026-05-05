@@ -155,7 +155,7 @@ pub(crate) struct MessagesResponse {
     pub usage: Option<LlmUsage>,
 }
 
-/// Trait for LLM providers supporting non-streaming and streaming message sending.
+/// Trait for LLM providers that send a single request and return a complete message response.
 #[async_trait]
 pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;

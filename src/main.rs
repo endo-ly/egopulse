@@ -98,7 +98,7 @@ async fn run_foreground(cli_config: Option<&PathBuf>) -> Result<(), EgoPulseErro
         None => Config::resolve_config_path().map_err(EgoPulseError::Config)?,
     };
     let config = Config::load_allow_missing_api_key(resolved_config_path.as_deref())?;
-    init_logging(&config.log_level)?;
+    init_logging(config.log_level())?;
     let state = runtime::build_app_state_with_path(config, resolved_config_path).await?;
     runtime::start_channels(state).await
 }
@@ -122,7 +122,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         },
     };
     let config = Config::load(resolved_config_path.as_deref())?;
-    init_logging(&config.log_level)?;
+    init_logging(config.log_level())?;
 
     match &cli.command {
         Some(Command::Ask { session, prompt }) => match if let Some(session) = session.as_deref() {
