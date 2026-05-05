@@ -29,7 +29,7 @@ egopulse.db (SQLite / WAL mode)
 | テーブル数 | 7（データテーブル 5 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 6 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v3） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v4） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -49,6 +49,7 @@ egopulse.db (SQLite / WAL mode)
 │ last_message_time│       │ is_from_bot      │
 │ channel          │       │ timestamp        │
 │ external_chat_id │       └──────────────────┘
+│ agent_id         │
 │                  │
 │                  │1    1 ┌──────────────────┐
 │                  │───────│   sessions       │
@@ -113,7 +114,8 @@ CREATE TABLE IF NOT EXISTS chats (
     chat_type TEXT NOT NULL DEFAULT 'private',
     last_message_time TEXT NOT NULL,
     channel TEXT,
-    external_chat_id TEXT
+    external_chat_id TEXT,
+    agent_id TEXT NOT NULL DEFAULT 'lyre'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
@@ -128,6 +130,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 | last_message_time | TEXT | NOT NULL | 最終メッセージ時刻（RFC3339） |
 | channel | TEXT | nullable | チャンネル識別子（`cli`, `web`, `discord`, `telegram`） |
 | external_chat_id | TEXT | nullable | 外部プラットフォームのチャットID |
+| agent_id | TEXT | NOT NULL DEFAULT 'lyre' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紐付けに使用 |
 
 **操作**:
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
@@ -344,8 +347,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | 構造体 | テーブル | フィールド |
 |--------|----------|-----------|
 | `StoredMessage` | messages | id, chat_id, sender_name, content, is_from_bot, timestamp |
-| `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type |
-| `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview |
+| `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
+| `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
 | `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
 | `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
 | `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |
@@ -364,14 +367,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `3`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `4`）に到達したら完了。`debug_assert_eq!` で検証
 
 **新規マイグレーションの追加手順**:
-1. `SCHEMA_VERSION` 定数をインクリメント（例: `3` → `4`）
-2. `run_migrations()` に `if version < 4 { ... }` ブロックを追加
+1. `SCHEMA_VERSION` 定数をインクリメント（例: `4` → `5`）
+2. `run_migrations()` に `if version < 5 { ... }` ブロックを追加
 3. ブロック内で `conn.execute_batch("ALTER TABLE ...")` 等の DDL を実行
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
-5. `set_schema_version(conn, 4, "description")` または transaction 用 helper を呼び出し
+5. `set_schema_version(conn, 5, "description")` または transaction 用 helper を呼び出し
 
 ```rust
 // 現行の v2 -> v3 例（storage.rs 内）
@@ -417,6 +420,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 //     set_schema_version_in_tx(&tx, 3, "scope tool call uniqueness to chat and assistant message")?;
 //     tx.commit()?;
 //     version = 3;
+// }
+//
+// // v3 -> v4: agent_id カラム追加
+// if version < 4 {
+//     conn.execute_batch(
+//         "ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';",
+//     )?;
+//     set_schema_version(conn, 4, "add NOT NULL agent_id column to chats (default: 'lyre')")?;
+//     version = 4;
 // }
 ```
 
