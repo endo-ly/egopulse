@@ -23,6 +23,7 @@ use crate::channels::web::WebAdapter;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
+use crate::memory::MemoryLoader;
 use crate::runtime::status as status_mod;
 use crate::runtime::status::{
     ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
@@ -44,6 +45,7 @@ pub struct AppState {
     pub(crate) mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
+    pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
 }
 
@@ -60,6 +62,7 @@ impl Clone for AppState {
             mcp_manager: self.mcp_manager.clone(),
             assets: Arc::clone(&self.assets),
             soul_agents: Arc::clone(&self.soul_agents),
+            memory_loader: Arc::clone(&self.memory_loader),
             llm_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -166,6 +169,10 @@ pub async fn build_app_state_with_path(
         tracing::warn!("failed to provision default SOUL.md: {error}");
     }
 
+    let memory_loader = Arc::new(MemoryLoader::new(
+        PathBuf::from(&config.state_root).join("agents"),
+    ));
+
     Ok(AppState {
         db,
         config,
@@ -177,6 +184,7 @@ pub async fn build_app_state_with_path(
         mcp_manager: Some(mcp_arc),
         assets,
         soul_agents,
+        memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
     })
 }
