@@ -58,7 +58,7 @@ pub(crate) struct ReadTool {
 }
 
 impl ReadTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }
@@ -178,7 +178,7 @@ pub(crate) struct WriteTool {
 }
 
 impl WriteTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }
@@ -255,7 +255,7 @@ pub(crate) struct EditTool {
 }
 
 impl EditTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }

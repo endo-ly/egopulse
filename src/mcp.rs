@@ -36,17 +36,15 @@ type DynClient = RunningService<RoleClient, Box<dyn DynService<RoleClient>>>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TransportType {
+pub(crate) enum TransportType {
     Stdio,
     StreamableHttp,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct McpServerConfig {
+pub(crate) struct McpServerConfig {
     #[serde(alias = "type")]
     pub transport: TransportType,
-    #[serde(default)]
-    pub protocol_version: Option<String>,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     pub command: Option<String>,
@@ -65,9 +63,7 @@ fn default_request_timeout_secs() -> u64 {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct McpConfigFile {
-    #[serde(default)]
-    pub default_protocol_version: Option<String>,
+pub(crate) struct McpConfigFile {
     pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
@@ -77,7 +73,7 @@ struct FailedServer {
     error: String,
 }
 
-pub struct McpManager {
+pub(crate) struct McpManager {
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
     /// Pre-computed index: sanitized tool name → (server index, original tool name).
@@ -91,7 +87,7 @@ struct ConnectedServer {
     cached_tools: Vec<Tool>,
 }
 
-pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+pub(crate) fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let state_root = default_state_root()?;
     Ok(vec![
         state_root.join("mcp.json"),
@@ -101,7 +97,7 @@ pub fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, ConfigErro
     ])
 }
 
-pub fn load_and_merge_mcp_configs(
+pub(crate) fn load_and_merge_mcp_configs(
     workspace_dir: &Path,
 ) -> Result<HashMap<String, McpServerConfig>, ConfigError> {
     let paths = mcp_config_paths(workspace_dir)?;
@@ -157,7 +153,7 @@ fn read_mcp_config_file(path: &Path) -> Result<McpConfigFile, McpError> {
     })
 }
 
-pub fn sanitize_tool_name(server: &str, tool: &str) -> String {
+pub(crate) fn sanitize_tool_name(server: &str, tool: &str) -> String {
     let sanitize = |s: &str| -> String {
         s.chars()
             .map(|c| {
@@ -246,7 +242,7 @@ impl McpManager {
         })
     }
 
-    pub fn has_failed_servers(&self) -> bool {
+    pub(crate) fn has_failed_servers(&self) -> bool {
         !self.failed_servers.is_empty()
     }
 
@@ -300,7 +296,7 @@ impl McpManager {
     }
 
     /// 現在の接続状態をスナップショットとして返す。
-    pub fn status_snapshot(&self) -> crate::runtime::status::McpStatus {
+    pub(crate) fn status_snapshot(&self) -> crate::runtime::status::McpStatus {
         let mut connected: Vec<crate::runtime::status::ConnectedMcpServer> = self
             .servers
             .iter()
@@ -333,7 +329,7 @@ impl McpManager {
         crate::runtime::status::McpStatus { connected, failed }
     }
 
-    pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
         self.servers
             .iter()
             .flat_map(|server| {
@@ -419,50 +415,6 @@ impl McpManager {
         };
 
         Ok(format_mcp_tool_result(result))
-    }
-
-    /// 接続済み全サーバーの全ツールについて McpToolAdapter を生成する。
-    ///
-    /// 名前衝突したツールはスキップする（初期化時の warn ログと同じ方針）。
-    pub async fn create_tool_adapters(
-        manager: &std::sync::Arc<tokio::sync::RwLock<Self>>,
-    ) -> Vec<Box<dyn crate::tools::Tool>> {
-        use crate::tools::McpToolAdapter;
-
-        let guard = manager.read().await;
-        let mut adapters: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-        let mut seen_names = std::collections::HashSet::new();
-
-        for (idx, server) in guard.servers.iter().enumerate() {
-            for tool in &server.cached_tools {
-                let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
-                if !seen_names.insert(full_name.clone()) {
-                    warn!(
-                        server = %server.name,
-                        original = %tool.name,
-                        sanitized = %full_name,
-                        "skipping MCP tool adapter: sanitized name collides across servers"
-                    );
-                    continue;
-                }
-                let definition = ToolDefinition {
-                    name: full_name.clone(),
-                    description: tool.description.clone().unwrap_or_default().to_string(),
-                    parameters: serde_json::to_value(&tool.input_schema)
-                        .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
-                };
-                adapters.push(Box::new(McpToolAdapter::new(
-                    full_name,
-                    tool.name.to_string(),
-                    idx,
-                    server.config.request_timeout_secs,
-                    definition,
-                    std::sync::Arc::clone(manager),
-                )));
-            }
-        }
-
-        adapters
     }
 }
 

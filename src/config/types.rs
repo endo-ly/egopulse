@@ -23,12 +23,12 @@ macro_rules! define_lowercase_id {
 
         impl $name {
             /// Creates a new identifier after trimming whitespace and lowercasing.
-            pub fn new(s: &str) -> Self {
+            pub(crate) fn new(s: &str) -> Self {
                 Self(s.trim().to_ascii_lowercase())
             }
 
             /// Returns the identifier as a string slice.
-            pub fn as_str(&self) -> &str {
+            pub(crate) fn as_str(&self) -> &str {
                 &self.0
             }
         }
@@ -55,29 +55,29 @@ macro_rules! define_lowercase_id {
 
 define_lowercase_id! {
     /// 小文字正規化済みのプロバイダー識別子。
-    pub struct ProviderId
+    pub(crate) struct ProviderId
 }
 
 define_lowercase_id! {
     /// トリム + 小文字正規化済みのチャネル名。
-    pub struct ChannelName
+    pub(crate) struct ChannelName
 }
 
 define_lowercase_id! {
     /// Trimmed + lowercased agent identifier.
-    pub struct AgentId
+    pub(crate) struct AgentId
 }
 
 define_lowercase_id! {
     /// Trimmed + lowercased Discord bot identifier.
-    pub struct BotId
+    pub(crate) struct BotId
 }
 
 /// Per-channel Discord configuration stored inside `DiscordBotConfig.channels`.
 ///
 /// When `agent` is `None`, the bot's `default_agent` is used.
 #[derive(Clone, Debug, Default)]
-pub struct DiscordChannelConfig {
+pub(crate) struct DiscordChannelConfig {
     /// Whether this channel requires an explicit @mention to trigger the bot.
     pub require_mention: bool,
     /// Agent override for this channel. `None` = use `default_agent`.
@@ -86,7 +86,7 @@ pub struct DiscordChannelConfig {
 
 /// Per-chat Telegram configuration stored inside `ChannelConfig.chats`.
 #[derive(Clone, Debug, Default)]
-pub struct TelegramChatConfig {
+pub(crate) struct TelegramChatConfig {
     /// Whether this chat requires an explicit @mention to trigger the bot.
     pub require_mention: bool,
 }
@@ -96,7 +96,7 @@ pub struct TelegramChatConfig {
 /// Each bot connects to Discord with its own token and routes messages to agents
 /// based on per-channel config or falls back to `default_agent`.
 #[derive(Clone)]
-pub struct DiscordBotConfig {
+pub(crate) struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<serde_yml::Value>,
     pub default_agent: AgentId,
@@ -116,7 +116,7 @@ impl std::fmt::Debug for DiscordBotConfig {
 }
 
 #[derive(Clone, Default)]
-pub struct ChannelConfig {
+pub(crate) struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
@@ -155,7 +155,7 @@ impl std::fmt::Debug for ChannelConfig {
 
 /// Per-model metadata stored inside `ProviderConfig.models`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct ModelConfig {
+pub(crate) struct ModelConfig {
     /// Maximum context window in tokens for this model.
     /// When `None`, falls back to `Config.default_context_window_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,7 +163,7 @@ pub struct ModelConfig {
 }
 
 #[derive(Clone)]
-pub struct ProviderConfig {
+pub(crate) struct ProviderConfig {
     pub label: String,
     pub base_url: String,
     pub api_key: Option<ResolvedValue>,
@@ -184,7 +184,7 @@ impl std::fmt::Debug for ProviderConfig {
 }
 
 #[derive(Clone)]
-pub struct ResolvedLlmConfig {
+pub(crate) struct ResolvedLlmConfig {
     pub provider: String,
     pub label: String,
     pub base_url: String,
@@ -220,7 +220,7 @@ impl ResolvedLlmConfig {
     ///
     /// Includes `api_key` via `expose_secret()` so that different keys
     /// produce different hashes. The key value itself is never stored.
-    pub fn cache_key(&self) -> u64 {
+    pub(crate) fn cache_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -236,7 +236,7 @@ impl ResolvedLlmConfig {
 }
 
 #[derive(Clone, Default)]
-pub struct AgentConfig {
+pub(crate) struct AgentConfig {
     pub label: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -255,20 +255,20 @@ impl std::fmt::Debug for AgentConfig {
 /// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
-    pub default_provider: ProviderId,
-    pub default_model: Option<String>,
-    pub providers: HashMap<ProviderId, ProviderConfig>,
-    pub state_root: String,
+    pub(crate) default_provider: ProviderId,
+    pub(crate) default_model: Option<String>,
+    pub(crate) providers: HashMap<ProviderId, ProviderConfig>,
+    pub(crate) state_root: String,
     pub log_level: String,
-    pub compaction_timeout_secs: u64,
-    pub max_history_messages: usize,
-    pub compact_keep_recent: usize,
-    pub default_context_window_tokens: usize,
-    pub compaction_threshold_ratio: f64,
-    pub compaction_target_ratio: f64,
-    pub channels: HashMap<ChannelName, ChannelConfig>,
-    pub default_agent: AgentId,
-    pub agents: HashMap<AgentId, AgentConfig>,
+    pub(crate) compaction_timeout_secs: u64,
+    pub(crate) max_history_messages: usize,
+    pub(crate) compact_keep_recent: usize,
+    pub(crate) default_context_window_tokens: usize,
+    pub(crate) compaction_threshold_ratio: f64,
+    pub(crate) compaction_target_ratio: f64,
+    pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
+    pub(crate) default_agent: AgentId,
+    pub(crate) agents: HashMap<AgentId, AgentConfig>,
 }
 
 impl std::fmt::Debug for Config {

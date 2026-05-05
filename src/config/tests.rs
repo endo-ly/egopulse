@@ -80,7 +80,7 @@ fn loads_provider_based_config() {
     assert!(config.web_enabled());
     assert_eq!(config.web_auth_token(), Some("web-secret"));
 
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.provider, "openai");
     assert_eq!(web_llm.model, "gpt-4o-mini");
     assert_eq!(web_llm.base_url, "https://api.openai.com/v1");
@@ -117,7 +117,7 @@ channels:
     );
 
     let config = Config::load(Some(&file_path)).expect("load local config");
-    let resolved = config.web_llm().expect("resolved llm");
+    let resolved = config.resolve_llm_for_channel("web").expect("resolved llm");
     assert!(resolved.api_key.is_none());
 }
 
@@ -195,7 +195,7 @@ channels:
     );
 
     let config = Config::load_allow_missing_api_key(Some(&file_path)).expect("allow missing key");
-    assert!(config.web_llm().expect("resolved").api_key.is_none());
+    assert!(config.resolve_llm_for_channel("web").expect("resolved").api_key.is_none());
 }
 
 #[test]
@@ -229,7 +229,7 @@ channels:
     assert_eq!(global.model, "gpt-5");
 
     // channel without model override also falls back to config.default_model
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.model, "gpt-5");
 }
 
@@ -411,7 +411,7 @@ channels:
     let config = Config::load(Some(&file_path)).expect("load config");
 
     // channel.model > config.default_model
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.model, "gpt-4o");
 
     // channel.model > config.default_model (different provider)
@@ -1246,7 +1246,7 @@ channels:
     auth_token: web-secret"#,
     );
     let config = Config::load(Some(&file_path)).expect("should load openai-codex without api_key");
-    let resolved = config.web_llm().expect("web llm");
+    let resolved = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(resolved.provider, "openai-codex");
     assert!(resolved.api_key.is_none());
 }

@@ -45,14 +45,14 @@ pub(crate) async fn resolve_chat_id(
 }
 
 /// Lists all persisted sessions available in the local database.
-pub async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary>, EgoPulseError> {
+pub(crate) async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary>, EgoPulseError> {
     call_blocking(Arc::clone(&state.db), move |db| db.list_sessions())
         .await
         .map_err(EgoPulseError::from)
 }
 
 /// Loads a session history and converts it into plain LLM messages.
-pub async fn load_session_messages(
+pub(crate) async fn load_session_messages(
     state: &AppState,
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {

@@ -11,7 +11,7 @@ use tracing;
 
 /// メディア処理に関するエラー型。
 #[derive(Error, Debug)]
-pub enum MediaError {
+pub(crate) enum MediaError {
     /// I/O 操作に失敗した。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -36,7 +36,7 @@ pub enum MediaError {
 /// - `filename` に `..` が含まれる場合 → [`MediaError::PathTraversal`]
 /// - `filename` に `/` または `\` が含まれる場合 → [`MediaError::InvalidFilename`]
 /// - ディレクトリ作成やファイル書き込みに失敗した場合 → [`MediaError::Io`]
-pub fn save_inbound_file(
+pub(crate) fn save_inbound_file(
     workspace_dir: &Path,
     filename: &str,
     data: &[u8],
@@ -73,7 +73,7 @@ pub fn save_inbound_file(
 /// let text = format_attachment_text(&paths, "see this");
 /// assert_eq!(text, "[attachment: /tmp/photo.png]\nsee this");
 /// ```
-pub fn format_attachment_text(paths: &[PathBuf], user_text: &str) -> String {
+pub(crate) fn format_attachment_text(paths: &[PathBuf], user_text: &str) -> String {
     if paths.is_empty() && user_text.is_empty() {
         return String::new();
     }

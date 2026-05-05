@@ -18,7 +18,7 @@ pub struct Database {
 
 /// A single chat message persisted in the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredMessage {
+pub(crate) struct StoredMessage {
     pub id: String,
     pub chat_id: i64,
     pub sender_name: String,
@@ -29,7 +29,7 @@ pub struct StoredMessage {
 
 /// Metadata for listing sessions without loading full message history.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSummary {
+pub(crate) struct SessionSummary {
     pub chat_id: i64,
     pub channel: String,
     pub surface_thread: String,
@@ -40,7 +40,7 @@ pub struct SessionSummary {
 
 /// chat_id から引けるチャネル識別情報。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatInfo {
+pub(crate) struct ChatInfo {
     pub chat_id: i64,
     pub channel: String,
     pub external_chat_id: String,
@@ -49,7 +49,7 @@ pub struct ChatInfo {
 
 /// Combined session snapshot: serialized messages JSON plus recent message records.
 #[derive(Debug, Clone)]
-pub struct SessionSnapshot {
+pub(crate) struct SessionSnapshot {
     pub messages_json: Option<String>,
     pub updated_at: Option<String>,
     pub recent_messages: Vec<StoredMessage>,
@@ -57,7 +57,7 @@ pub struct SessionSnapshot {
 
 /// Persisted tool call record for tracking tool execution history.
 #[derive(Debug, Clone)]
-pub struct ToolCall {
+pub(crate) struct ToolCall {
     pub id: String,
     pub chat_id: i64,
     pub message_id: String,
@@ -68,7 +68,7 @@ pub struct ToolCall {
 }
 
 /// LLM使用量ログの記録用データ。
-pub struct LlmUsageLogEntry<'a> {
+pub(crate) struct LlmUsageLogEntry<'a> {
     pub chat_id: i64,
     pub caller_channel: &'a str,
     pub provider: &'a str,
@@ -80,7 +80,8 @@ pub struct LlmUsageLogEntry<'a> {
 
 /// LLM使用量の集計サマリ。
 #[derive(Debug, PartialEq)]
-pub struct LlmUsageSummary {
+#[allow(dead_code)]
+pub(crate) struct LlmUsageSummary {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -90,7 +91,8 @@ pub struct LlmUsageSummary {
 
 /// モデル別のLLM使用量サマリ。
 #[derive(Debug, PartialEq)]
-pub struct LlmModelUsageSummary {
+#[allow(dead_code)]
+pub(crate) struct LlmModelUsageSummary {
     pub model: String,
     pub requests: i64,
     pub input_tokens: i64,
@@ -117,7 +119,7 @@ const SCHEMA_VERSION: i64 = 3;
 
 impl Database {
     /// Open (or create) the database at `db_path` and initialize schema.
-    pub fn new(db_path: &Path) -> Result<Self, StorageError> {
+    pub(crate) fn new(db_path: &Path) -> Result<Self, StorageError> {
         let legacy_db = db_path
             .parent()
             .and_then(|runtime| runtime.parent())
@@ -150,7 +152,8 @@ impl Database {
     }
 
     /// 現在のスキーマバージョンを返す。
-    pub fn schema_version(&self) -> Result<i64, StorageError> {
+    #[allow(dead_code)]
+    pub(crate) fn schema_version(&self) -> Result<i64, StorageError> {
         let conn = self.lock_conn()?;
         schema_version(&conn)
     }
@@ -358,7 +361,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 impl Database {
     /// Look up the internal chat_id for a (channel, external_chat_id) pair.
     /// Returns `None` if no matching chat exists.
-    pub fn resolve_chat_id(
+    pub(crate) fn resolve_chat_id(
         &self,
         channel: &str,
         external_chat_id: &str,
@@ -376,7 +379,7 @@ impl Database {
     }
 
     /// chat_id からチャネル・外部 ID の情報を取得する。
-    pub fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
+    pub(crate) fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
         let conn = self.lock_conn()?;
         match conn.query_row(
             "SELECT channel, external_chat_id, chat_type FROM chats WHERE chat_id = ?1 LIMIT 1",
@@ -397,7 +400,7 @@ impl Database {
     }
 
     /// Resolve or create a chat row. Updates title/type/timestamp on existing rows.
-    pub fn resolve_or_create_chat_id(
+    pub(crate) fn resolve_or_create_chat_id(
         &self,
         channel: &str,
         external_chat_id: &str,
@@ -445,7 +448,8 @@ impl Database {
     }
 
     /// Insert or replace a message record.
-    pub fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
+    #[allow(dead_code)]
+    pub(crate) fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
@@ -463,7 +467,7 @@ impl Database {
     }
 
     /// Fetch the most recent `limit` messages for a chat, ordered oldest-first.
-    pub fn get_recent_messages(
+    pub(crate) fn get_recent_messages(
         &self,
         chat_id: i64,
         limit: usize,
@@ -485,7 +489,7 @@ impl Database {
     }
 
     /// Fetch all messages for a chat, ordered by timestamp ascending.
-    pub fn get_all_messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>, StorageError> {
+    pub(crate) fn get_all_messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
@@ -499,7 +503,7 @@ impl Database {
     }
 
     /// List all chats with their last message preview, ordered by most recent activity.
-    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
+    pub(crate) fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT
@@ -540,7 +544,7 @@ impl Database {
     }
 
     /// Upsert the serialized session JSON for a chat.
-    pub fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
+    pub(crate) fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -555,7 +559,7 @@ impl Database {
     }
 
     /// セッションスナップショットとメッセージ履歴を削除する。
-    pub fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
+    pub(crate) fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
         conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
@@ -565,7 +569,7 @@ impl Database {
     /// Atomically store a message and update the session snapshot.
     /// Uses optimistic concurrency via `expected_updated_at`; returns
     /// `SessionSnapshotConflict` on stale writes.
-    pub fn store_message_with_session(
+    pub(crate) fn store_message_with_session(
         &self,
         message: &StoredMessage,
         messages_json: &str,
@@ -616,7 +620,7 @@ impl Database {
     }
 
     /// Load the session snapshot: serialized messages JSON plus recent message records.
-    pub fn load_session_snapshot(
+    pub(crate) fn load_session_snapshot(
         &self,
         chat_id: i64,
         limit: usize,
@@ -662,7 +666,8 @@ impl Database {
 
     /// Load the raw session JSON and `updated_at` timestamp for a chat.
     /// Returns `None` if the chat has no saved session.
-    pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
+    #[allow(dead_code)]
+    pub(crate) fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
         let conn = self.lock_conn()?;
         let result = conn.query_row(
             "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
@@ -683,7 +688,7 @@ impl Database {
     }
 
     /// Store a tool call record.
-    pub fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
+    pub(crate) fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
@@ -702,7 +707,7 @@ impl Database {
     }
 
     /// Update the output of a tool call scoped to the assistant message that emitted it.
-    pub fn update_tool_call_output_for_message(
+    pub(crate) fn update_tool_call_output_for_message(
         &self,
         chat_id: i64,
         message_id: &str,
@@ -725,7 +730,8 @@ impl Database {
     }
 
     /// Get all tool calls for a specific message within a chat.
-    pub fn get_tool_calls_for_message(
+    #[allow(dead_code)]
+    pub(crate) fn get_tool_calls_for_message(
         &self,
         chat_id: i64,
         message_id: &str,
@@ -744,7 +750,8 @@ impl Database {
     }
 
     /// Get all tool calls for a specific chat.
-    pub fn get_tool_calls_for_chat(&self, chat_id: i64) -> Result<Vec<ToolCall>, StorageError> {
+    #[allow(dead_code)]
+    pub(crate) fn get_tool_calls_for_chat(&self, chat_id: i64) -> Result<Vec<ToolCall>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
@@ -759,7 +766,7 @@ impl Database {
     }
 
     /// LLM使用量ログを記録し、挿入された行IDを返す。
-    pub fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
+    pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
         let conn = self.lock_conn()?;
         let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -785,7 +792,7 @@ impl Database {
     /// LLM使用量の集計サマリを取得する。
     ///
     /// `chat_id`, `since`, `request_kind` でフィルタリング可能。
-    pub fn get_llm_usage_summary(
+    pub(crate) fn get_llm_usage_summary(
         &self,
         chat_id: Option<i64>,
         since: Option<&str>,
@@ -848,7 +855,7 @@ impl Database {
     /// モデル別のLLM使用量サマリを取得する。
     ///
     /// `total_tokens` の降順で返す。`chat_id`, `since`, `request_kind` でフィルタリング可能。
-    pub fn get_llm_usage_by_model(
+    pub(crate) fn get_llm_usage_by_model(
         &self,
         chat_id: Option<i64>,
         since: Option<&str>,

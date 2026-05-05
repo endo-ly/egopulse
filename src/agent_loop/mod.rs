@@ -10,12 +10,13 @@ pub(crate) mod prompt_builder;
 pub(crate) mod session;
 pub(crate) mod turn;
 
-pub use session::{list_sessions, load_session_messages};
-pub use turn::{ask_in_session, process_turn, process_turn_with_events, send_turn};
+pub(crate) use session::{list_sessions, load_session_messages};
+pub use turn::ask_in_session;
+pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Identifies the external conversation surface mapped to a persisted session.
-pub struct SurfaceContext {
+pub(crate) struct SurfaceContext {
     pub channel: String,
     pub surface_user: String,
     pub surface_thread: String,
@@ -25,7 +26,7 @@ pub struct SurfaceContext {
 
 impl SurfaceContext {
     /// Creates a new `SurfaceContext` identifying the external conversation surface.
-    pub fn new(
+    pub(crate) fn new(
         channel: String,
         surface_user: String,
         surface_thread: String,
@@ -42,7 +43,7 @@ impl SurfaceContext {
     }
 
     /// Returns the stable session key in `channel:surface_thread` format.
-    pub fn session_key(&self) -> String {
+    pub(crate) fn session_key(&self) -> String {
         format!("{}:{}", self.channel, self.surface_thread)
     }
 }

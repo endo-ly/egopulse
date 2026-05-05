@@ -1,19 +1,16 @@
 //! LLM プロバイダークライアント。
 //!
 //! OpenAI 互換 Chat Completions API および Responses API へのリクエスト構築・送信・
-//! レスポンス解析を行う。ストリーミング (SSE) とツールコールに対応する。
+//! レスポンス解析を行う。ツールコールに対応する。
 
 mod messages;
 mod openai;
 mod responses;
-mod sse;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::ResolvedLlmConfig;
 use crate::error::LlmError;
@@ -23,12 +20,10 @@ pub(crate) use messages::*;
 pub(crate) use openai::*;
 #[allow(unused_imports)]
 pub(crate) use responses::*;
-#[allow(unused_imports)]
-pub(crate) use sse::*;
 
 /// A single tool call requested by the LLM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolCall {
+pub(crate) struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
@@ -36,7 +31,7 @@ pub struct ToolCall {
 
 /// Tool definition passed to the LLM for function calling.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolDefinition {
+pub(crate) struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
@@ -44,7 +39,7 @@ pub struct ToolDefinition {
 
 /// Chat message in a conversation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Message {
+pub(crate) struct Message {
     pub role: String,
     pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -56,7 +51,7 @@ pub struct Message {
 /// Message content: either plain text or multimodal parts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-pub enum MessageContent {
+pub(crate) enum MessageContent {
     Text(String),
     Parts(Vec<MessageContentPart>),
 }
@@ -64,7 +59,8 @@ pub enum MessageContent {
 /// A single part of a multimodal message.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
-pub enum MessageContentPart {
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum MessageContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
@@ -96,22 +92,22 @@ impl Default for MessageContent {
 
 impl MessageContent {
     /// Wrap plain text into `MessageContent::Text`.
-    pub fn text(text: impl Into<String>) -> Self {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
     }
 
     /// Wrap multimodal parts into `MessageContent::Parts`.
-    pub fn parts(parts: Vec<MessageContentPart>) -> Self {
+    pub(crate) fn parts(parts: Vec<MessageContentPart>) -> Self {
         Self::Parts(parts)
     }
 
     /// Returns `true` if the content includes at least one image part.
-    pub fn is_multimodal(&self) -> bool {
+    pub(crate) fn is_multimodal(&self) -> bool {
         matches!(self, Self::Parts(parts) if parts.iter().any(|part| matches!(part, MessageContentPart::InputImage { .. } | MessageContentPart::InputImageRef { .. })))
     }
 
     /// Extract all text, discarding images (lossy conversion).
-    pub fn as_text_lossy(&self) -> String {
+    pub(crate) fn as_text_lossy(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
             Self::Parts(parts) => parts
@@ -127,14 +123,14 @@ impl MessageContent {
     }
 
     /// Returns `true` if there is no textual content after trimming.
-    pub fn is_empty_textual(&self) -> bool {
+    pub(crate) fn is_empty_textual(&self) -> bool {
         self.as_text_lossy().trim().is_empty()
     }
 }
 
 impl Message {
     /// Create a plain-text message with the given role.
-    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+    pub(crate) fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             content: MessageContent::text(content),
@@ -146,14 +142,14 @@ impl Message {
 
 /// LLM API レスポンスに含まれるトークン使用量。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LlmUsage {
+pub(crate) struct LlmUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
 }
 
 /// Parsed response from the LLM containing text and/or tool calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MessagesResponse {
+pub(crate) struct MessagesResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<LlmUsage>,
@@ -161,7 +157,7 @@ pub struct MessagesResponse {
 
 /// Trait for LLM providers supporting non-streaming and streaming message sending.
 #[async_trait]
-pub trait LlmProvider: Send + Sync {
+pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
 
@@ -171,26 +167,10 @@ pub trait LlmProvider: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError>;
-
-    async fn send_message_stream(
-        &self,
-        system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-        text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        let response = self.send_message(system, messages, tools).await?;
-        if let Some(tx) = text_tx
-            && !response.content.is_empty()
-        {
-            let _ = tx.send(response.content.clone());
-        }
-        Ok(response)
-    }
 }
 
 /// Create the default LLM provider based on the resolved request-time configuration.
-pub fn create_provider(config: &ResolvedLlmConfig) -> Result<Box<dyn LlmProvider>, LlmError> {
+pub(crate) fn create_provider(config: &ResolvedLlmConfig) -> Result<Box<dyn LlmProvider>, LlmError> {
     Ok(Box::new(OpenAiProvider::new(config)?))
 }
 

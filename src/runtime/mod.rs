@@ -34,17 +34,17 @@ use crate::tools::ToolRegistry;
 
 /// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
-    pub db: Arc<Database>,
-    pub config: Config,
-    pub config_path: Option<PathBuf>,
-    pub llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
-    pub channels: Arc<ChannelRegistry>,
-    pub skills: Arc<SkillManager>,
-    pub tools: Arc<ToolRegistry>,
-    pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
-    pub assets: Arc<AssetStore>,
-    pub soul_agents: Arc<SoulAgentsLoader>,
-    pub llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
+    pub(crate) db: Arc<Database>,
+    pub(crate) config: Config,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
+    pub(crate) channels: Arc<ChannelRegistry>,
+    pub(crate) skills: Arc<SkillManager>,
+    pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    pub(crate) assets: Arc<AssetStore>,
+    pub(crate) soul_agents: Arc<SoulAgentsLoader>,
+    pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
 }
 
 impl Clone for AppState {
@@ -80,7 +80,8 @@ impl AppState {
     }
 
     /// Returns the LLM provider resolved for the given channel.
-    pub fn llm_for_channel(
+    #[allow(dead_code)]
+    pub(crate) fn llm_for_channel(
         &self,
         channel: &str,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
@@ -94,7 +95,8 @@ impl AppState {
     }
 
     /// Returns the global default LLM provider for CLI/TUI surfaces.
-    pub fn global_llm(&self) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
+    #[allow(dead_code)]
+    pub(crate) fn global_llm(&self) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
         if let Some(provider) = self.llm_override.clone() {
             return Ok(provider);
         }
@@ -105,7 +107,7 @@ impl AppState {
     }
 
     /// Returns the LLM provider resolved for the agent and channel in the given context.
-    pub fn llm_for_context(
+    pub(crate) fn llm_for_context(
         &self,
         context: &crate::agent_loop::SurfaceContext,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {

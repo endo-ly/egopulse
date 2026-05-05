@@ -55,7 +55,7 @@ pub async fn ask_in_session(
 }
 
 /// Processes a turn and aborts cleanly when Ctrl-C is received.
-pub async fn send_turn(
+pub(crate) async fn send_turn(
     state: &AppState,
     context: &SurfaceContext,
     prompt: &str,
@@ -67,7 +67,7 @@ pub async fn send_turn(
 }
 
 /// Processes one user turn against the persisted session state.
-pub async fn process_turn(
+pub(crate) async fn process_turn(
     state: &AppState,
     context: &SurfaceContext,
     user_input: &str,
@@ -76,7 +76,7 @@ pub async fn process_turn(
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
-pub async fn process_turn_with_events<F>(
+pub(crate) async fn process_turn_with_events<F>(
     state: &AppState,
     context: &SurfaceContext,
     user_input: &str,

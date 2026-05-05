@@ -291,15 +291,6 @@ pub(super) async fn start_stream_run(
                             )
                             .await;
                     }
-                    AgentEvent::TextDelta { delta } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "delta",
-                                json!({"delta": delta}).to_string(),
-                            )
-                            .await;
-                    }
                     AgentEvent::FinalResponse { text } => {
                         run_hub
                             .publish(

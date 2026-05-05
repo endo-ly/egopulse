@@ -260,7 +260,7 @@ impl From<&Config> for SerializableConfig {
 /// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
 /// file-level lock (`fs2`) for cross-process safety. The write is atomic via
 /// temp-file + rename.
-pub fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
+pub(crate) fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
     let _guard = CONFIG_WRITE_LOCK
         .lock()
         .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
@@ -275,7 +275,7 @@ pub fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
 ///
 /// Writes the YAML with SecretRef objects for secrets, and writes actual values
 /// for env-mode secrets to the .env file.
-pub fn save_config_with_secrets(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
+pub(crate) fn save_config_with_secrets(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
     let dotenv_entries = collect_dotenv_entries(config);
     if !dotenv_entries.is_empty() {
         if let Some(config_dir) = yaml_path.parent() {

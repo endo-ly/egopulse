@@ -82,7 +82,7 @@ pub(crate) async fn maybe_compact_messages(
     .await
 }
 
-pub async fn force_compact(
+pub(crate) async fn force_compact(
     state: &AppState,
     context: &SurfaceContext,
     chat_id: i64,

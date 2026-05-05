@@ -24,7 +24,7 @@ pub(crate) struct BashTool {
 }
 
 impl BashTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 

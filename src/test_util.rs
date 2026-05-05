@@ -18,7 +18,7 @@ use crate::tools::ToolRegistry;
 /// テスト用の最小 Config を生成する。
 ///
 /// OpenAI プロバイダ (`sk-test`) を含み、`state_root` 配下に一時ディレクトリを置く。
-pub fn test_config(state_root: &str) -> Config {
+pub(crate) fn test_config(state_root: &str) -> Config {
     Config {
         default_provider: ProviderId::new("openai"),
         default_model: Some("gpt-4o-mini".to_string()),
@@ -64,7 +64,7 @@ pub fn test_config(state_root: &str) -> Config {
 }
 
 /// テスト用 AppState を構築する。LLM プロバイダを注入可能。
-pub fn build_state_with_provider(
+pub(crate) fn build_state_with_provider(
     state_root: &str,
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
@@ -89,7 +89,7 @@ pub fn build_state_with_provider(
 }
 
 /// テスト用 CLI SurfaceContext。
-pub fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
+pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
     crate::agent_loop::SurfaceContext {
         channel: "cli".to_string(),
         surface_user: "local_user".to_string(),
@@ -100,7 +100,7 @@ pub fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
 }
 
 /// テスト用 ToolExecutionContext。
-pub fn test_tool_context() -> crate::tools::ToolExecutionContext {
+pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
     crate::tools::ToolExecutionContext {
         chat_id: 1,
         channel: "cli".to_string(),

@@ -95,7 +95,7 @@ pub(crate) struct GrepTool {
 }
 
 impl GrepTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }
@@ -365,7 +365,7 @@ pub(crate) struct FindTool {
 }
 
 impl FindTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }
@@ -590,7 +590,7 @@ pub(crate) struct LsTool {
 }
 
 impl LsTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
     }
 }

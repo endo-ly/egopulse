@@ -20,7 +20,7 @@ use crate::storage::call_blocking;
 ///
 /// 先頭のメンションをループで除去した後、残りのテキストが `/` で始まる場合に
 /// `true` を返す。`//` (二重スラッシュ) や単独の `/` はコマンドとは見なさない。
-pub fn is_slash_command(text: &str) -> bool {
+pub(crate) fn is_slash_command(text: &str) -> bool {
     let Some(normalized) = normalized_slash_command(text) else {
         return false;
     };
@@ -43,7 +43,7 @@ pub fn is_slash_command(text: &str) -> bool {
 ///
 /// 各チャネルはこの結果に基づいてチャネル固有の方法で応答を送信する。
 #[derive(Debug)]
-pub enum SlashCommandOutcome {
+pub(crate) enum SlashCommandOutcome {
     /// コマンドが正常に処理され、応答メッセージが生成された。
     Respond(String),
     /// chat_id の解決に失敗した等の内部的エラー。
@@ -63,7 +63,7 @@ pub enum SlashCommandOutcome {
 /// * `context` — チャネルごとのサーフェスコンテキスト
 /// * `text` — ユーザー入力テキスト
 /// * `sender_id` — 送信者 ID（`/status` で表示）
-pub async fn process_slash_command(
+pub(crate) async fn process_slash_command(
     state: &AppState,
     context: &SurfaceContext,
     text: &str,
@@ -110,7 +110,7 @@ fn extract_command_name(text: &str) -> Option<&str> {
 /// スラッシュコマンドを実行し、結果メッセージを返す。
 ///
 /// コマンドが未知または空の場合は `None` を返す。
-pub async fn handle_slash_command(
+pub(crate) async fn handle_slash_command(
     state: &AppState,
     chat_id: i64,
     context: &SurfaceContext,
@@ -178,7 +178,7 @@ fn normalized_slash_command(text: &str) -> Option<&str> {
 }
 
 /// 未知コマンド時の応答メッセージを返す。
-pub fn unknown_command_response() -> String {
+pub(crate) fn unknown_command_response() -> String {
     "Unknown command.".to_string()
 }
 
@@ -310,7 +310,7 @@ async fn handle_llm_profile(
 ///
 /// 各チャネル (Telegram, Discord, WebUI) はこのレジストリを通じて
 /// コマンド名・説明・使用法を参照する。
-pub struct CommandDef {
+pub(crate) struct CommandDef {
     /// コマンド名（`/` なし）。
     pub name: &'static str,
     /// コマンドの短い説明。
@@ -320,7 +320,7 @@ pub struct CommandDef {
 }
 
 /// 登録済みコマンド一覧を返す。
-pub const fn all_commands() -> &'static [CommandDef] {
+pub(crate) const fn all_commands() -> &'static [CommandDef] {
     &[
         CommandDef {
             name: "new",
@@ -370,11 +370,6 @@ pub const fn all_commands() -> &'static [CommandDef] {
     ]
 }
 
-/// 名前から CommandDef を検索する。
-pub fn find_command(name: &str) -> Option<&'static CommandDef> {
-    all_commands().iter().find(|c| c.name == name)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -394,7 +389,7 @@ mod tests {
     use crate::storage::{StoredMessage, call_blocking};
 
     use super::{
-        SlashCommandOutcome, all_commands, find_command, handle_slash_command, is_slash_command,
+        SlashCommandOutcome, all_commands, handle_slash_command, is_slash_command,
         process_slash_command,
     };
 
@@ -798,26 +793,6 @@ mod tests {
         let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len());
-    }
-
-    #[test]
-    fn find_command_by_name_known() {
-        // Arrange & Act
-        let found = find_command("status");
-
-        // Assert
-        let cmd = found.expect("status command should exist");
-        assert_eq!(cmd.name, "status");
-        assert_eq!(cmd.usage, "/status");
-    }
-
-    #[test]
-    fn find_command_by_name_unknown() {
-        // Arrange & Act
-        let found = find_command("nonexistent");
-
-        // Assert
-        assert!(found.is_none());
     }
 
     // -- Step 4: SurfaceContext agent_id propagation tests --------------------------
