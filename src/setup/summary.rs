@@ -14,7 +14,7 @@ use super::provider::{
     provider_label_for,
 };
 use super::{Field, SetupApp};
-use crate::codex_auth;
+use crate::llm::codex_auth;
 use crate::config::secret_ref::{
     DISCORD_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
     provider_api_key_env_name,

@@ -470,7 +470,7 @@ fn normalize_provider_map(
         let label = normalize_string(file_provider.label).unwrap_or_else(|| key.to_string());
         let base_url = normalize_string(file_provider.base_url)
             .or_else(|| {
-                crate::codex_auth::is_codex_provider(key.as_str())
+                crate::llm::codex_auth::is_codex_provider(key.as_str())
                     .then_some("https://chatgpt.com/backend-api/codex".to_string())
             })
             .ok_or_else(|| ConfigError::MissingProviderBaseUrl {
@@ -501,7 +501,7 @@ fn normalize_provider_map(
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
         if !allow_missing_api_key
             && api_key.is_none()
-            && !crate::codex_auth::provider_allows_empty_api_key(key.as_str(), &base_url)
+            && !crate::llm::codex_auth::provider_allows_empty_api_key(key.as_str(), &base_url)
         {
             return Err(ConfigError::MissingProviderApiKey {
                 provider: key.to_string(),

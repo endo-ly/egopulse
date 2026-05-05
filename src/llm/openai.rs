@@ -29,9 +29,9 @@ impl OpenAiProvider {
             .build()
             .map_err(|error| LlmError::InitFailed(error.to_string()))?;
 
-        let is_codex = crate::codex_auth::is_codex_provider(&config.provider);
+        let is_codex = crate::llm::codex_auth::is_codex_provider(&config.provider);
         let (api_key, account_id) = if is_codex {
-            let auth = crate::codex_auth::resolve_codex_auth()
+            let auth = crate::llm::codex_auth::resolve_codex_auth()
                 .map_err(|error| LlmError::InitFailed(error.to_string()))?;
             (None, auth.account_id)
         } else {
@@ -144,7 +144,7 @@ impl OpenAiProvider {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         if self.is_codex {
-            let auth = crate::codex_auth::resolve_codex_auth()
+            let auth = crate::llm::codex_auth::resolve_codex_auth()
                 .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
             let auth_value = HeaderValue::from_str(&format!("Bearer {}", auth.bearer_token))
                 .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
@@ -203,7 +203,7 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, LlmError> {
         if self.is_codex {
-            crate::codex_auth::refresh_if_needed(&self.http).await;
+            crate::llm::codex_auth::refresh_if_needed(&self.http).await;
             return self
                 .send_message_via_responses(system, messages, tools)
                 .await;
