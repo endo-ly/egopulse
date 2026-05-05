@@ -45,7 +45,8 @@ coderabbit --prompt-only -t committed --base main
 - **コードレビューで一つも指摘されないレベル**のコード品質を目指す。Coderabbit, Codex のレビューはとても細かいです。
 - 場当たり的な対応は禁止（バグフォールバック、ビルド/テスト通過のためだけの本質的でない修正）
 - 「後方互換」は負債。既存利用維持のための互換分岐や旧仕様フォールバックは追加しない。新仕様へ一直線に置き換える
-- うまくいかない時にコードを増やし続けない。コードを削除する勇気を持つ。シンプルが最も美しい
+- 公開範囲は最小化する。新規APIは`private`から始め、必要に応じて `pub(crate)` / `pub(super)` を選択する。`pub` は binary entrypoint や外部公開が必要な場合だけ使う
+- 大きめの実装・リファクタ後は `cargo clippy --all-targets --all-features -- -D warnings` に加え、公開範囲起因の dead code を疑って確認する
 - Rust 実装後は `fmt`, `test`, `check`, `clippy` 必須
 
 | 項目      | ルール                                          |
