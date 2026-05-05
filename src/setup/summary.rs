@@ -14,7 +14,6 @@ use super::provider::{
     provider_label_for,
 };
 use super::{Field, SetupApp};
-use crate::codex_auth;
 use crate::config::secret_ref::{
     DISCORD_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
     provider_api_key_env_name,
@@ -24,6 +23,7 @@ use crate::config::{
     is_valid_base_url,
 };
 use crate::error::EgoPulseError;
+use crate::llm::codex_auth;
 
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;

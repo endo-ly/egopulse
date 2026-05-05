@@ -1,337 +1,27 @@
-//! SQLite ベースの会話永続化レイヤー。
-//!
-//! チャットセッション・メッセージ履歴・ツールコール記録を単一の SQLite DB に保存する。
-//! WAL モードで排他制御し、`Mutex<Connection>` でスレッド安全性を担保する。
-
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 use crate::error::StorageError;
 
-/// Thread-safe SQLite database wrapper for conversation persistence.
-pub struct Database {
-    conn: Mutex<Connection>,
-}
+use super::{
+    ChatInfo, Database, LlmUsageLogEntry, SessionSnapshot, SessionSummary, StoredMessage, ToolCall,
+};
 
-/// A single chat message persisted in the database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredMessage {
-    pub id: String,
-    pub chat_id: i64,
-    pub sender_name: String,
-    pub content: String,
-    pub is_from_bot: bool,
-    pub timestamp: String,
-}
-
-/// Metadata for listing sessions without loading full message history.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionSummary {
-    pub chat_id: i64,
-    pub channel: String,
-    pub surface_thread: String,
-    pub chat_title: Option<String>,
-    pub last_message_time: String,
-    pub last_message_preview: Option<String>,
-}
-
-/// chat_id から引けるチャネル識別情報。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChatInfo {
-    pub chat_id: i64,
-    pub channel: String,
-    pub external_chat_id: String,
-    pub chat_type: String,
-}
-
-/// Combined session snapshot: serialized messages JSON plus recent message records.
-#[derive(Debug, Clone)]
-pub(crate) struct SessionSnapshot {
-    pub messages_json: Option<String>,
-    pub updated_at: Option<String>,
-    pub recent_messages: Vec<StoredMessage>,
-}
-
-/// Persisted tool call record for tracking tool execution history.
-#[derive(Debug, Clone)]
-pub(crate) struct ToolCall {
-    pub id: String,
-    pub chat_id: i64,
-    pub message_id: String,
-    pub tool_name: String,
-    pub tool_input: String,
-    pub tool_output: Option<String>,
-    pub timestamp: String,
-}
-
-/// LLM使用量ログの記録用データ。
-pub(crate) struct LlmUsageLogEntry<'a> {
-    pub chat_id: i64,
-    pub caller_channel: &'a str,
-    pub provider: &'a str,
-    pub model: &'a str,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub request_kind: &'a str,
-}
-
-/// Run a blocking database operation on a tokio blocking thread.
-pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
-where
-    T: Send + 'static,
-    F: FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || f(db.as_ref()))
-        .await
-        .map_err(|error| StorageError::TaskJoin(error.to_string()))?
-}
-
-/// 現在のスキーマバージョン。
-///
-/// 新しいマイグレーションを追加する際はこの値をインクリメントし、
-/// `run_migrations` に対応する `if version < N` ブロックを追加する。
-const SCHEMA_VERSION: i64 = 3;
-
-impl Database {
-    /// Open (or create) the database at `db_path` and initialize schema.
-    pub(crate) fn new(db_path: &Path) -> Result<Self, StorageError> {
-        let legacy_db = db_path
-            .parent()
-            .and_then(|runtime| runtime.parent())
-            .map(|root| root.join("data").join("egopulse.db"))
-            .unwrap_or_else(|| Path::new("data").join("egopulse.db"));
-        if legacy_db.exists() && !db_path.exists() {
-            return Err(StorageError::InitFailed(format!(
-                "legacy_db_pending_migration: found {}, but {} does not exist. \
-                 run 'mv {} {}' to migrate.",
-                legacy_db.display(),
-                db_path.display(),
-                legacy_db.display(),
-                db_path.display(),
-            )));
-        }
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-
-        run_migrations(&conn)?;
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
+fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    Ok(StoredMessage {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        sender_name: row.get(2)?,
+        content: row.get(3)?,
+        is_from_bot: row.get::<_, i32>(4)? != 0,
+        timestamp: row.get(5)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Migration infrastructure
+// Chats
 // ---------------------------------------------------------------------------
 
-/// `db_meta` に格納されたスキーマバージョンを読み取る。
-///
-/// テーブルが存在しない場合は作成し、バージョン未設定なら `0` を返す。
-fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS db_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        [],
-    )?;
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM db_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(raw.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
-}
-
-/// スキーマバージョンを更新し、`schema_migrations` に適用履歴を記録する。
-fn set_schema_version(conn: &Connection, version: i64, note: &str) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT INTO db_meta(key, value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![version.to_string()],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT NOT NULL,
-            note TEXT
-        )",
-        [],
-    )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
-         VALUES(?1, ?2, ?3)",
-        params![version, chrono::Utc::now().to_rfc3339(), note],
-    )?;
-    Ok(())
-}
-
-fn set_schema_version_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    version: i64,
-    note: &str,
-) -> Result<(), StorageError> {
-    set_schema_version(tx, version, note)
-}
-
-/// 未適用のマイグレーションを逐次実行する。
-///
-/// 各マイグレーションは `if version < N` でガードされ、
-/// 適用後に `set_schema_version` でバージョンを更新する。
-/// `SCHEMA_VERSION` に到達したら完了。
-fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
-    let mut version = schema_version(conn)?;
-
-    if version < 1 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                chat_title TEXT,
-                chat_type TEXT NOT NULL DEFAULT 'private',
-                last_message_time TEXT NOT NULL,
-                channel TEXT,
-                external_chat_id TEXT
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
-                ON chats(channel, external_chat_id);
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                sender_name TEXT NOT NULL,
-                content TEXT NOT NULL,
-                is_from_bot INTEGER NOT NULL DEFAULT 0,
-                timestamp TEXT NOT NULL,
-                PRIMARY KEY (id, chat_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
-                ON messages(chat_id, timestamp);
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                chat_id INTEGER PRIMARY KEY,
-                messages_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id TEXT PRIMARY KEY,
-                chat_id INTEGER NOT NULL,
-                message_id TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                tool_input TEXT NOT NULL,
-                tool_output TEXT,
-                timestamp TEXT NOT NULL,
-                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
-                ON tool_calls(chat_id);
-
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
-                ON tool_calls(chat_id, message_id);",
-        )?;
-        set_schema_version(
-            conn,
-            1,
-            "initial schema: chats, messages, sessions, tool_calls",
-        )?;
-        version = 1;
-    }
-
-    if version < 2 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS llm_usage_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                caller_channel TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
-                ON llm_usage_logs(chat_id, created_at);
-
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_created
-                ON llm_usage_logs(created_at);",
-        )?;
-        set_schema_version(conn, 2, "add llm_usage_logs table for LLM usage tracking")?;
-        version = 2;
-    }
-
-    if version < 3 {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
-            "DROP INDEX IF EXISTS idx_tool_calls_chat_id;
-            DROP INDEX IF EXISTS idx_tool_calls_chat_message_id;
-
-            CREATE TABLE IF NOT EXISTS tool_calls_v3 (
-                id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                message_id TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                tool_input TEXT NOT NULL,
-                tool_output TEXT,
-                timestamp TEXT NOT NULL,
-                PRIMARY KEY (id, chat_id, message_id),
-                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-            );
-
-            INSERT OR IGNORE INTO tool_calls_v3
-                (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
-            SELECT
-                id,
-                COALESCE(chat_id, 0),
-                COALESCE(message_id, ''),
-                COALESCE(tool_name, ''),
-                COALESCE(tool_input, ''),
-                tool_output,
-                COALESCE(timestamp, '')
-            FROM tool_calls;
-
-            DROP TABLE tool_calls;
-            ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
-
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
-                ON tool_calls(chat_id);
-
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
-                ON tool_calls(chat_id, message_id);",
-        )?;
-        set_schema_version_in_tx(
-            &tx,
-            3,
-            "scope tool call uniqueness to chat and assistant message",
-        )?;
-        tx.commit()?;
-        version = 3;
-    }
-
-    debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
-    Ok(())
-}
-
 impl Database {
-    /// Look up the internal chat_id for a (channel, external_chat_id) pair.
-    /// Returns `None` if no matching chat exists.
     pub(crate) fn resolve_chat_id(
         &self,
         channel: &str,
@@ -349,7 +39,6 @@ impl Database {
         }
     }
 
-    /// chat_id からチャネル・外部 ID の情報を取得する。
     pub(crate) fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
         let conn = self.lock_conn()?;
         match conn.query_row(
@@ -370,7 +59,6 @@ impl Database {
         }
     }
 
-    /// Resolve or create a chat row. Updates title/type/timestamp on existing rows.
     pub(crate) fn resolve_or_create_chat_id(
         &self,
         channel: &str,
@@ -418,46 +106,6 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Fetch the most recent `limit` messages for a chat, ordered oldest-first.
-    pub(crate) fn get_recent_messages(
-        &self,
-        chat_id: i64,
-        limit: usize,
-    ) -> Result<Vec<StoredMessage>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
-             FROM messages
-             WHERE chat_id = ?1
-             ORDER BY timestamp DESC
-             LIMIT ?2",
-        )?;
-
-        let mut messages = stmt
-            .query_map(params![chat_id, limit as i64], row_to_stored_message)?
-            .collect::<Result<Vec<_>, _>>()?;
-        messages.reverse();
-        Ok(messages)
-    }
-
-    /// Fetch all messages for a chat, ordered by timestamp ascending.
-    pub(crate) fn get_all_messages(
-        &self,
-        chat_id: i64,
-    ) -> Result<Vec<StoredMessage>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
-             FROM messages
-             WHERE chat_id = ?1
-             ORDER BY timestamp ASC",
-        )?;
-        stmt.query_map(params![chat_id], row_to_stored_message)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    /// List all chats with their last message preview, ordered by most recent activity.
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -497,8 +145,76 @@ impl Database {
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
     }
+}
 
-    /// Upsert the serialized session JSON for a chat.
+fn logical_session_thread(
+    channel: &str,
+    external_chat_id: &str,
+    chat_title: Option<&str>,
+) -> String {
+    if let Some(title) = chat_title.map(str::trim).filter(|value| !value.is_empty()) {
+        return title.to_string();
+    }
+
+    let prefix = format!("{channel}:");
+    if let Some(stripped) = external_chat_id.strip_prefix(&prefix) {
+        let trimmed = stripped.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    external_chat_id.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+impl Database {
+    pub(crate) fn get_recent_messages(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE chat_id = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+
+        let mut messages = stmt
+            .query_map(params![chat_id, limit as i64], row_to_stored_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub(crate) fn get_all_messages(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE chat_id = ?1
+             ORDER BY timestamp ASC",
+        )?;
+        stmt.query_map(params![chat_id], row_to_stored_message)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+impl Database {
     pub(crate) fn save_session(
         &self,
         chat_id: i64,
@@ -517,17 +233,15 @@ impl Database {
         Ok(())
     }
 
-    /// セッションスナップショットとメッセージ履歴を削除する。
     pub(crate) fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
-        conn.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
-        conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Atomically store a message and update the session snapshot.
-    /// Uses optimistic concurrency via `expected_updated_at`; returns
-    /// `SessionSnapshotConflict` on stale writes.
     pub(crate) fn store_message_with_session(
         &self,
         message: &StoredMessage,
@@ -578,7 +292,6 @@ impl Database {
         Ok(now)
     }
 
-    /// Load the session snapshot: serialized messages JSON plus recent message records.
     pub(crate) fn load_session_snapshot(
         &self,
         chat_id: i64,
@@ -622,14 +335,13 @@ impl Database {
             recent_messages,
         })
     }
+}
 
-    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
-        self.conn
-            .lock()
-            .map_err(|error| StorageError::InitFailed(error.to_string()))
-    }
+// ---------------------------------------------------------------------------
+// Tool calls & LLM usage
+// ---------------------------------------------------------------------------
 
-    /// Store a tool call record.
+impl Database {
     pub(crate) fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -648,7 +360,6 @@ impl Database {
         Ok(())
     }
 
-    /// Update the output of a tool call scoped to the assistant message that emitted it.
     pub(crate) fn update_tool_call_output_for_message(
         &self,
         chat_id: i64,
@@ -671,7 +382,6 @@ impl Database {
         Ok(())
     }
 
-    /// LLM使用量ログを記録し、挿入された行IDを返す。
     pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
         let conn = self.lock_conn()?;
         let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
@@ -694,38 +404,6 @@ impl Database {
         )?;
         Ok(conn.last_insert_rowid())
     }
-}
-
-// セッション一覧の表示名: chat_title → external_chat_id のチャネルプレフィクス除去 → そのまま
-fn logical_session_thread(
-    channel: &str,
-    external_chat_id: &str,
-    chat_title: Option<&str>,
-) -> String {
-    if let Some(title) = chat_title.map(str::trim).filter(|value| !value.is_empty()) {
-        return title.to_string();
-    }
-
-    let prefix = format!("{channel}:");
-    if let Some(stripped) = external_chat_id.strip_prefix(&prefix) {
-        let trimmed = stripped.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    external_chat_id.to_string()
-}
-
-fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
-    Ok(StoredMessage {
-        id: row.get(0)?,
-        chat_id: row.get(1)?,
-        sender_name: row.get(2)?,
-        content: row.get(3)?,
-        is_from_bot: row.get::<_, i32>(4)? != 0,
-        timestamp: row.get(5)?,
-    })
 }
 
 #[cfg(test)]
@@ -780,8 +458,7 @@ impl Database {
 mod tests {
     use crate::error::StorageError;
 
-    use super::{Database, LlmUsageLogEntry, StoredMessage, ToolCall};
-    use rusqlite::Connection;
+    use super::*;
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1076,30 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_history_is_recorded() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = Database::new(&dir.path().join("runtime").join("egopulse.db")).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let mut stmt = conn
-            .prepare("SELECT version, note FROM schema_migrations ORDER BY version")
-            .expect("prepare");
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
-        assert_eq!(rows.len(), 3, "v1・v2・v3 マイグレーションが3件記録される");
-        assert_eq!(rows[0].0, 1);
-        assert!(rows[0].1.contains("initial schema"));
-        assert_eq!(rows[1].0, 2);
-        assert!(rows[1].1.contains("llm_usage_logs"));
-        assert_eq!(rows[2].0, 3);
-        assert!(rows[2].1.contains("tool call"));
-    }
-
-    #[test]
     fn log_llm_usage_inserts_record() {
         let (db, _dir) = test_db();
 
@@ -1124,7 +777,7 @@ mod tests {
             .expect("row");
 
         assert_eq!(total_tokens, 150);
-        assert!(created_at.contains('T'), "RFC3339形式であること");
+        assert!(created_at.contains('T'));
     }
 
     #[test]
@@ -1144,77 +797,5 @@ mod tests {
             .expect("log usage");
 
         assert!(row_id > 0);
-    }
-
-    #[test]
-    fn migration_v2_creates_llm_usage_logs_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-
-        assert!(table_exists, "llm_usage_logsテーブルが存在すること");
-
-        let index_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_llm_usage_%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check indexes");
-
-        assert_eq!(index_count, 2, "2つのインデックスが作成されること");
-    }
-
-    #[test]
-    fn migration_v2_applied_on_existing_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // 生のConnectionでv1スキーマを手動構築（db_meta + schema_migrations + v1テーブル）
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '1');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (1, '2025-01-01T00:00:00Z', 'test v1');
-                 CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY);
-                 CREATE TABLE IF NOT EXISTS messages (id TEXT NOT NULL, chat_id INTEGER NOT NULL, PRIMARY KEY (id, chat_id));
-                 CREATE TABLE IF NOT EXISTS sessions (chat_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                    id TEXT PRIMARY KEY,
-                    chat_id INTEGER NOT NULL,
-                    message_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    tool_input TEXT NOT NULL,
-                    tool_output TEXT,
-                    timestamp TEXT NOT NULL
-                 );",
-            )
-            .expect("create v1 schema");
-        }
-
-        let db = Database::new(&db_path).expect("reopen");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-        assert!(table_exists);
     }
 }

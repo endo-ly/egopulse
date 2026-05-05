@@ -3,8 +3,8 @@
 //! Config 由来のシークレット値と well-known パターンの二層リダクションにより、
 //! ツール出力に秘密情報が漏洩しないようマスクする。
 
-use crate::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::config::Config;
+use crate::llm::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::tools::ToolResult;
 
 /// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。
@@ -582,7 +582,7 @@ mod tests {
         let _guard = EnvVarGuard::set("HOME", dir.path())
             .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
             .also_set("CODEX_HOME", "");
-        crate::codex_auth::clear_auth_cache();
+        crate::llm::codex_auth::clear_auth_cache();
 
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).expect("create .codex dir");

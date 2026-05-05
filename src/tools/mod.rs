@@ -7,6 +7,7 @@
 mod activate_skill;
 mod command_guard;
 mod files;
+pub(crate) mod mcp;
 mod path_guard;
 mod sanitizer;
 mod search;
@@ -138,7 +139,7 @@ pub(crate) struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
-    mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
 }
 
 impl ToolRegistry {
@@ -192,7 +193,7 @@ impl ToolRegistry {
 
     pub(crate) fn set_mcp_manager(
         &mut self,
-        mcp_manager: Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+        mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
     ) {
         self.mcp_manager = Some(mcp_manager);
     }

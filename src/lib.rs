@@ -6,12 +6,9 @@
 pub mod agent_loop;
 pub mod assets;
 pub mod channels;
-pub mod codex_auth;
 pub mod config;
 pub mod error;
 pub mod llm;
-pub mod llm_profile;
-pub mod mcp;
 pub mod runtime;
 pub mod setup;
 pub mod skills;
