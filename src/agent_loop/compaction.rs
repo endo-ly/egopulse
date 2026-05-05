@@ -1120,7 +1120,7 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-threshold");
-        let llm = state.global_llm().expect("llm");
+        let llm = state.llm_for_context(&context).expect("llm");
         let messages = vec![
             Message::text("user", "msg-1"),
             Message::text("assistant", "reply-1"),
@@ -1156,7 +1156,7 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-recent");
-        let llm = state.global_llm().expect("llm");
+        let llm = state.llm_for_context(&context).expect("llm");
         let messages = vec![
             Message::text("user", "old-1"),
             Message::text("assistant", "old-2"),
@@ -1192,7 +1192,7 @@ mod tests {
         let config = test_config_with_compaction(state_root.clone(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
-        let llm = state.global_llm().expect("llm");
+        let llm = state.llm_for_context(&context).expect("llm");
         let chat_id: i64 = 42;
         let messages = vec![
             Message::text("user", "msg-1"),
@@ -1274,19 +1274,17 @@ mod tests {
         assert_eq!(reply, "final answer");
 
         for _ in 0..20 {
-            let summary = call_blocking(Arc::clone(&state.db), move |db| {
-                db.get_llm_usage_summary(Some(chat_id), None, None)
-            })
-            .await
-            .expect("summary");
-            if summary.requests > 0 {
-                assert_eq!(
-                    summary.requests, 1,
-                    "compaction LLM call should be logged once"
-                );
-                assert_eq!(summary.input_tokens, 100);
-                assert_eq!(summary.output_tokens, 200);
-                assert_eq!(summary.total_tokens, 300);
+            let (requests, input_tokens, output_tokens, total_tokens) =
+                call_blocking(Arc::clone(&state.db), move |db| {
+                    db.get_llm_usage_summary(Some(chat_id), None, None)
+                })
+                .await
+                .expect("summary");
+            if requests > 0 {
+                assert_eq!(requests, 1, "compaction LLM call should be logged once");
+                assert_eq!(input_tokens, 100);
+                assert_eq!(output_tokens, 200);
+                assert_eq!(total_tokens, 300);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

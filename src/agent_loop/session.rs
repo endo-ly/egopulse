@@ -523,8 +523,8 @@ mod tests {
         .expect("seed session");
 
         let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
-            db.load_session(chat_id)
-                .map(|session| session.expect("session").1)
+            db.load_session_snapshot(chat_id, 1)
+                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
         })
         .await
         .expect("stale updated_at");
@@ -622,8 +622,12 @@ mod tests {
         .expect("persist image turn");
 
         let (session_json, _) = call_blocking(Arc::clone(&state.db), move |db| {
-            db.load_session(chat_id)
-                .map(|session| session.expect("session row"))
+            db.load_session_snapshot(chat_id, 10).map(|snapshot| {
+                (
+                    snapshot.messages_json.expect("session json"),
+                    snapshot.updated_at.expect("session updated_at"),
+                )
+            })
         })
         .await
         .expect("load session row");
@@ -804,8 +808,8 @@ mod tests {
         .expect("save seed snapshot");
 
         let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
-            db.load_session(chat_id)
-                .map(|session| session.expect("session").1)
+            db.load_session_snapshot(chat_id, 1)
+                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
         })
         .await
         .expect("stale updated_at");
@@ -875,20 +879,6 @@ mod tests {
         assert_eq!(context.agent_id, "default");
     }
 
-    #[test]
-    fn discord_surface_thread_includes_bot_and_agent_ids() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8").to_string());
-
-        let thread = config.discord_surface_thread(
-            "ch123",
-            &crate::config::BotId::new("main"),
-            &crate::config::AgentId::new("alice"),
-        );
-
-        assert_eq!(thread, "ch123:bot:main:agent:alice");
-    }
-
     #[tokio::test]
     async fn same_discord_thread_different_agents_create_different_chats() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -902,22 +892,14 @@ mod tests {
         let ctx_a = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state.config.discord_surface_thread(
-                "ch999",
-                &crate::config::BotId::new("bot1"),
-                &crate::config::AgentId::new("agent_a"),
-            ),
+            surface_thread: "ch999:bot:bot1:agent:agent_a".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state.config.discord_surface_thread(
-                "ch999",
-                &crate::config::BotId::new("bot1"),
-                &crate::config::AgentId::new("agent_b"),
-            ),
+            surface_thread: "ch999:bot:bot1:agent:agent_b".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_b".to_string(),
         };
@@ -948,11 +930,7 @@ mod tests {
         let ctx = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: state.config.discord_surface_thread(
-                "ch555",
-                &crate::config::BotId::new("bot1"),
-                &crate::config::AgentId::new("agent_a"),
-            ),
+            surface_thread: "ch555:bot:bot1:agent:agent_a".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
         };

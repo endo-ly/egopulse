@@ -66,7 +66,11 @@ pub(crate) fn truncate_by_chars(value: &str, max_chars: usize) -> String {
 ///
 /// Iterates over `split_text(text, max_len)` chunks and awaits the
 /// provided closure. Stops at the first error.
-pub(crate) async fn send_chunked<F>(text: &str, max_len: usize, mut send_fn: F) -> Result<(), String>
+pub(crate) async fn send_chunked<F>(
+    text: &str,
+    max_len: usize,
+    mut send_fn: F,
+) -> Result<(), String>
 where
     F: FnMut(
         &str,

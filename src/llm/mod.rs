@@ -170,7 +170,9 @@ pub(crate) trait LlmProvider: Send + Sync {
 }
 
 /// Create the default LLM provider based on the resolved request-time configuration.
-pub(crate) fn create_provider(config: &ResolvedLlmConfig) -> Result<Box<dyn LlmProvider>, LlmError> {
+pub(crate) fn create_provider(
+    config: &ResolvedLlmConfig,
+) -> Result<Box<dyn LlmProvider>, LlmError> {
     Ok(Box::new(OpenAiProvider::new(config)?))
 }
 

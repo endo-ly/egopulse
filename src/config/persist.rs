@@ -275,7 +275,10 @@ pub(crate) fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseErro
 ///
 /// Writes the YAML with SecretRef objects for secrets, and writes actual values
 /// for env-mode secrets to the .env file.
-pub(crate) fn save_config_with_secrets(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
+pub(crate) fn save_config_with_secrets(
+    config: &Config,
+    yaml_path: &Path,
+) -> Result<(), EgoPulseError> {
     let dotenv_entries = collect_dotenv_entries(config);
     if !dotenv_entries.is_empty() {
         if let Some(config_dir) = yaml_path.parent() {

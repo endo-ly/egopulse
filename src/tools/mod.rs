@@ -540,7 +540,11 @@ mod tests {
             .execute("grep", json!({"pattern": "demo"}), &test_context())
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("src/lib.rs:1:pub(crate) fn demo() {}"));
+        assert!(
+            result
+                .content
+                .contains("src/lib.rs:1:pub(crate) fn demo() {}")
+        );
     }
 
     #[tokio::test]

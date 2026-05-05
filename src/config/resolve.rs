@@ -112,13 +112,11 @@ impl Config {
     /// # Errors
     ///
     /// See [`resolve_llm_for_agent_channel`].
-    pub(crate) fn resolve_llm_for_channel(&self, channel: &str) -> Result<ResolvedLlmConfig, ConfigError> {
+    pub(crate) fn resolve_llm_for_channel(
+        &self,
+        channel: &str,
+    ) -> Result<ResolvedLlmConfig, ConfigError> {
         self.resolve_llm_for_agent_channel(&self.default_agent, channel)
-    }
-
-    /// Returns the web channel's resolved LLM settings.
-    pub(crate) fn web_llm(&self) -> Result<ResolvedLlmConfig, ConfigError> {
-        self.resolve_llm_for_channel("web")
     }
 
     /// Returns `true` if the web channel is enabled.
@@ -250,74 +248,25 @@ impl Config {
         Path::new(&self.state_root).join("AGENTS.md")
     }
 
-    /// Agent-specific SOUL.md: `state_root/agents/{agent_id}/SOUL.md`.
-    pub(crate) fn agent_soul_path(&self, agent_id: &AgentId) -> PathBuf {
-        Path::new(&self.state_root)
-            .join("agents")
-            .join(agent_id.as_str())
-            .join("SOUL.md")
-    }
-
-    /// Agent-specific AGENTS.md: `state_root/agents/{agent_id}/AGENTS.md`.
-    pub(crate) fn agent_agents_path(&self, agent_id: &AgentId) -> PathBuf {
-        Path::new(&self.state_root)
-            .join("agents")
-            .join(agent_id.as_str())
-            .join("AGENTS.md")
-    }
-
-    /// Discord session thread: `{channel_id}:bot:{bot_id}:agent:{agent_id}`.
-    pub(crate) fn discord_surface_thread(
-        &self,
-        channel_id: &str,
-        bot_id: &BotId,
-        agent_id: &AgentId,
-    ) -> String {
-        format!("{channel_id}:bot:{bot_id}:agent:{agent_id}")
-    }
-
     /// マルチソウル用ディレクトリ: `state_root/souls`。
     pub(crate) fn souls_dir(&self) -> PathBuf {
         Path::new(&self.state_root).join("souls")
-    }
-
-    /// チャット別 AGENTS.md: `state_root/runtime/groups/{channel}/{thread}/AGENTS.md`。
-    pub(crate) fn chat_agents_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir()
-            .join(channel)
-            .join(thread)
-            .join("AGENTS.md")
-    }
-
-    /// チャット別 SOUL.md: `state_root/runtime/groups/{channel}/{thread}/SOUL.md`。
-    pub(crate) fn chat_soul_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir().join(channel).join(thread).join("SOUL.md")
-    }
-
-    /// ステータスファイルパス: `state_root/runtime/status.json`。
-    pub(crate) fn status_json_path(&self) -> PathBuf {
-        self.runtime_dir().join("status.json")
     }
 
     /// Resolves the context window for a given provider+model pair.
     ///
     /// Falls back to `default_context_window_tokens` when the model entry
     /// has no explicit `context_window_tokens`.
-    pub(crate) fn resolve_context_window_tokens(&self, provider_id: &ProviderId, model: &str) -> usize {
+    pub(crate) fn resolve_context_window_tokens(
+        &self,
+        provider_id: &ProviderId,
+        model: &str,
+    ) -> usize {
         self.providers
             .get(provider_id)
             .and_then(|provider| provider.models.get(model))
             .and_then(|model_config| model_config.context_window_tokens)
             .unwrap_or(self.default_context_window_tokens)
-    }
-
-    /// Atomically writes the current config to a YAML file.
-    ///
-    /// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
-    /// file-level lock (`fs2`) for cross-process safety. The write is atomic via
-    /// temp-file + rename.
-    pub(crate) fn save_yaml(&self, path: &Path) -> Result<(), crate::error::EgoPulseError> {
-        super::persist::save_yaml(self, path)
     }
 
     /// Saves config with SecretRef-aware YAML and .env file.

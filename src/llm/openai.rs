@@ -243,6 +243,4 @@ impl LlmProvider for OpenAiProvider {
         let body: OpenAiResponse = response.json().await?;
         parse_openai_response(body)
     }
-
-
 }

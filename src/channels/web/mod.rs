@@ -269,7 +269,11 @@ fn asset_or_index(uri: &Uri) -> Response {
 }
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
-pub(crate) async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
+pub(crate) async fn run_server(
+    state: AppState,
+    host: &str,
+    port: u16,
+) -> Result<(), EgoPulseError> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {

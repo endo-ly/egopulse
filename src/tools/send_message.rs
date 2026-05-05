@@ -29,7 +29,11 @@ pub(crate) struct SendMessageTool {
 }
 
 impl SendMessageTool {
-    pub(crate) fn new(workspace_dir: PathBuf, channels: Arc<ChannelRegistry>, db: Arc<Database>) -> Self {
+    pub(crate) fn new(
+        workspace_dir: PathBuf,
+        channels: Arc<ChannelRegistry>,
+        db: Arc<Database>,
+    ) -> Self {
         Self {
             workspace_dir,
             channels,

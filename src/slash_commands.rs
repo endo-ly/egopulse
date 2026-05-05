@@ -515,14 +515,18 @@ mod tests {
 
         call_blocking(Arc::clone(&state.db), {
             move |db| {
-                db.store_message(&StoredMessage {
-                    id: "msg-1".to_string(),
-                    chat_id,
-                    sender_name: "user".to_string(),
-                    content: "hello".to_string(),
-                    is_from_bot: false,
-                    timestamp: "2024-01-01T00:00:00Z".to_string(),
-                })
+                db.store_message_with_session(
+                    &StoredMessage {
+                        id: "msg-1".to_string(),
+                        chat_id,
+                        sender_name: "user".to_string(),
+                        content: "hello".to_string(),
+                        is_from_bot: false,
+                        timestamp: "2024-01-01T00:00:00Z".to_string(),
+                    },
+                    r#"[{"role":"user","content":"hello"}]"#,
+                    None,
+                )
             }
         })
         .await

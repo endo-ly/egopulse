@@ -78,28 +78,6 @@ pub(crate) struct LlmUsageLogEntry<'a> {
     pub request_kind: &'a str,
 }
 
-/// LLM使用量の集計サマリ。
-#[derive(Debug, PartialEq)]
-#[allow(dead_code)]
-pub(crate) struct LlmUsageSummary {
-    pub requests: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
-    pub last_request_at: Option<String>,
-}
-
-/// モデル別のLLM使用量サマリ。
-#[derive(Debug, PartialEq)]
-#[allow(dead_code)]
-pub(crate) struct LlmModelUsageSummary {
-    pub model: String,
-    pub requests: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
-}
-
 /// Run a blocking database operation on a tokio blocking thread.
 pub async fn call_blocking<T, F>(db: Arc<Database>, f: F) -> Result<T, StorageError>
 where
@@ -149,13 +127,6 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
         })
-    }
-
-    /// 現在のスキーマバージョンを返す。
-    #[allow(dead_code)]
-    pub(crate) fn schema_version(&self) -> Result<i64, StorageError> {
-        let conn = self.lock_conn()?;
-        schema_version(&conn)
     }
 }
 
@@ -447,25 +418,6 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Insert or replace a message record.
-    #[allow(dead_code)]
-    pub(crate) fn store_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                message.id,
-                message.chat_id,
-                message.sender_name,
-                message.content,
-                message.is_from_bot as i32,
-                message.timestamp,
-            ],
-        )?;
-        Ok(())
-    }
-
     /// Fetch the most recent `limit` messages for a chat, ordered oldest-first.
     pub(crate) fn get_recent_messages(
         &self,
@@ -489,7 +441,10 @@ impl Database {
     }
 
     /// Fetch all messages for a chat, ordered by timestamp ascending.
-    pub(crate) fn get_all_messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>, StorageError> {
+    pub(crate) fn get_all_messages(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
@@ -544,7 +499,11 @@ impl Database {
     }
 
     /// Upsert the serialized session JSON for a chat.
-    pub(crate) fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), StorageError> {
+    pub(crate) fn save_session(
+        &self,
+        chat_id: i64,
+        messages_json: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -664,23 +623,6 @@ impl Database {
         })
     }
 
-    /// Load the raw session JSON and `updated_at` timestamp for a chat.
-    /// Returns `None` if the chat has no saved session.
-    #[allow(dead_code)]
-    pub(crate) fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, StorageError> {
-        let conn = self.lock_conn()?;
-        let result = conn.query_row(
-            "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
-            params![chat_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        );
-        match result {
-            Ok(pair) => Ok(Some(pair)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.conn
             .lock()
@@ -729,42 +671,6 @@ impl Database {
         Ok(())
     }
 
-    /// Get all tool calls for a specific message within a chat.
-    #[allow(dead_code)]
-    pub(crate) fn get_tool_calls_for_message(
-        &self,
-        chat_id: i64,
-        message_id: &str,
-    ) -> Result<Vec<ToolCall>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
-             FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 ORDER BY timestamp",
-        )?;
-
-        let calls = stmt
-            .query_map(params![chat_id, message_id], row_to_tool_call)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(calls)
-    }
-
-    /// Get all tool calls for a specific chat.
-    #[allow(dead_code)]
-    pub(crate) fn get_tool_calls_for_chat(&self, chat_id: i64) -> Result<Vec<ToolCall>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
-             FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
-        )?;
-
-        let calls = stmt
-            .query_map(params![chat_id], row_to_tool_call)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(calls)
-    }
-
     /// LLM使用量ログを記録し、挿入された行IDを返す。
     pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
         let conn = self.lock_conn()?;
@@ -787,127 +693,6 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
-    }
-
-    /// LLM使用量の集計サマリを取得する。
-    ///
-    /// `chat_id`, `since`, `request_kind` でフィルタリング可能。
-    pub(crate) fn get_llm_usage_summary(
-        &self,
-        chat_id: Option<i64>,
-        since: Option<&str>,
-        request_kind: Option<&str>,
-    ) -> Result<LlmUsageSummary, StorageError> {
-        let conn = self.lock_conn()?;
-
-        let mut sql = String::from(
-            "SELECT COUNT(*) as requests,
-                    COALESCE(SUM(input_tokens), 0) as input_tokens,
-                    COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(total_tokens), 0) as total_tokens,
-                    MAX(created_at) as last_request_at
-             FROM llm_usage_logs WHERE 1=1",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(cid) = chat_id {
-            sql.push_str(" AND chat_id = ?");
-            param_values.push(Box::new(cid));
-        }
-        if let Some(s) = since {
-            let normalized = chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-                .unwrap_or_else(|_| s.to_string());
-            sql.push_str(" AND created_at >= ?");
-            param_values.push(Box::new(normalized));
-        }
-        if let Some(kind) = request_kind {
-            sql.push_str(" AND request_kind = ?");
-            param_values.push(Box::new(kind.to_string()));
-        }
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let result = conn.query_row(&sql, params_refs.as_slice(), |row| {
-            Ok(LlmUsageSummary {
-                requests: row.get(0)?,
-                input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                total_tokens: row.get(3)?,
-                last_request_at: row.get(4)?,
-            })
-        });
-
-        match result {
-            Ok(summary) => Ok(summary),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(LlmUsageSummary {
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                last_request_at: None,
-            }),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// モデル別のLLM使用量サマリを取得する。
-    ///
-    /// `total_tokens` の降順で返す。`chat_id`, `since`, `request_kind` でフィルタリング可能。
-    pub(crate) fn get_llm_usage_by_model(
-        &self,
-        chat_id: Option<i64>,
-        since: Option<&str>,
-        request_kind: Option<&str>,
-    ) -> Result<Vec<LlmModelUsageSummary>, StorageError> {
-        let conn = self.lock_conn()?;
-
-        let mut sql = String::from(
-            "SELECT model,
-                    COUNT(*) as requests,
-                    COALESCE(SUM(input_tokens), 0) as input_tokens,
-                    COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(total_tokens), 0) as total_tokens
-             FROM llm_usage_logs WHERE 1=1",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(cid) = chat_id {
-            sql.push_str(" AND chat_id = ?");
-            param_values.push(Box::new(cid));
-        }
-        if let Some(s) = since {
-            let normalized = chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-                .unwrap_or_else(|_| s.to_string());
-            sql.push_str(" AND created_at >= ?");
-            param_values.push(Box::new(normalized));
-        }
-        if let Some(kind) = request_kind {
-            sql.push_str(" AND request_kind = ?");
-            param_values.push(Box::new(kind.to_string()));
-        }
-
-        sql.push_str(" GROUP BY model ORDER BY total_tokens DESC");
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(LlmModelUsageSummary {
-                    model: row.get(0)?,
-                    requests: row.get(1)?,
-                    input_tokens: row.get(2)?,
-                    output_tokens: row.get(3)?,
-                    total_tokens: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(rows)
     }
 }
 
@@ -943,16 +728,52 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
     })
 }
 
-fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCall> {
-    Ok(ToolCall {
-        id: row.get(0)?,
-        chat_id: row.get(1)?,
-        message_id: row.get(2)?,
-        tool_name: row.get(3)?,
-        tool_input: row.get(4)?,
-        tool_output: row.get(5)?,
-        timestamp: row.get(6)?,
-    })
+#[cfg(test)]
+impl Database {
+    pub(crate) fn get_tool_calls_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ToolCall>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+             FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
+        )?;
+        let calls = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input: row.get(4)?,
+                    tool_output: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(calls)
+    }
+
+    pub(crate) fn get_llm_usage_summary(
+        &self,
+        chat_id: Option<i64>,
+        _since: Option<&str>,
+        _request_kind: Option<&str>,
+    ) -> Result<(i64, i64, i64, i64), StorageError> {
+        let conn = self.lock_conn()?;
+        let mut sql = String::from(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0)
+             FROM llm_usage_logs WHERE 1=1",
+        );
+        if let Some(cid) = chat_id {
+            sql.push_str(&format!(" AND chat_id = {cid}"));
+        }
+        let result = conn.query_row(&sql, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -969,32 +790,38 @@ mod tests {
         (db, dir)
     }
 
+    fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
+        let conn = db.conn.lock().expect("lock");
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, chat_id, "alice", content, 0, ts],
+        )
+        .expect("store message");
+    }
+
     #[test]
     fn message_full_lifecycle() {
         let (db, _dir) = test_db();
 
         for index in 0..5 {
-            db.store_message(&StoredMessage {
-                id: format!("chat1_msg{index}"),
-                chat_id: 100,
-                sender_name: "alice".into(),
-                content: format!("chat1 message {index}"),
-                is_from_bot: false,
-                timestamp: format!("2024-01-01T00:00:{index:02}Z"),
-            })
-            .expect("store message");
+            store_msg(
+                &db,
+                &format!("chat1_msg{index}"),
+                100,
+                &format!("chat1 message {index}"),
+                &format!("2024-01-01T00:00:{index:02}Z"),
+            );
         }
 
         for index in 0..3 {
-            db.store_message(&StoredMessage {
-                id: format!("chat2_msg{index}"),
-                chat_id: 200,
-                sender_name: "bob".into(),
-                content: format!("chat2 message {index}"),
-                is_from_bot: false,
-                timestamp: format!("2024-01-01T00:00:{index:02}Z"),
-            })
-            .expect("store message");
+            store_msg(
+                &db,
+                &format!("chat2_msg{index}"),
+                200,
+                &format!("chat2 message {index}"),
+                &format!("2024-01-01T00:00:{index:02}Z"),
+            );
         }
 
         let chat1_messages = db.get_all_messages(100).expect("chat1 messages");
@@ -1017,13 +844,20 @@ mod tests {
     fn session_lifecycle() {
         let (db, _dir) = test_db();
 
-        assert!(db.load_session(100).expect("missing session").is_none());
+        assert!(
+            db.load_session_snapshot(100, 10)
+                .expect("missing session")
+                .messages_json
+                .is_none()
+        );
 
         let json1 = r#"[{"role":"user","content":"hello"}]"#;
         db.save_session(100, json1).expect("save session");
 
-        let (loaded, first_updated_at) = db.load_session(100).expect("load session").expect("row");
-        assert_eq!(loaded, json1);
+        let snapshot = db.load_session_snapshot(100, 10).expect("load session");
+        assert_eq!(snapshot.messages_json.as_deref(), Some(json1));
+        assert!(snapshot.updated_at.is_some());
+        let first_updated_at = snapshot.updated_at.unwrap();
         assert!(!first_updated_at.is_empty());
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1031,13 +865,17 @@ mod tests {
         let json2 = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
         db.save_session(100, json2).expect("update session");
 
-        let (loaded_again, second_updated_at) = db
-            .load_session(100)
-            .expect("load updated session")
-            .expect("row");
-        assert_eq!(loaded_again, json2);
-        assert!(second_updated_at >= first_updated_at);
-        assert!(db.load_session(200).expect("other chat").is_none());
+        let snapshot = db
+            .load_session_snapshot(100, 10)
+            .expect("load updated session");
+        assert_eq!(snapshot.messages_json.as_deref(), Some(json2));
+        assert!(snapshot.updated_at.unwrap() >= first_updated_at);
+        assert!(
+            db.load_session_snapshot(200, 10)
+                .expect("other chat")
+                .messages_json
+                .is_none()
+        );
     }
 
     #[test]
@@ -1047,28 +885,17 @@ mod tests {
 
         db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
             .expect("save session");
-        db.store_message(&StoredMessage {
-            id: "msg-1".to_string(),
-            chat_id,
-            sender_name: "alice".to_string(),
-            content: "hello".to_string(),
-            is_from_bot: false,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-        })
-        .expect("store first message");
-        db.store_message(&StoredMessage {
-            id: "msg-2".to_string(),
-            chat_id,
-            sender_name: "assistant".to_string(),
-            content: "hi".to_string(),
-            is_from_bot: true,
-            timestamp: "2024-01-01T00:00:01Z".to_string(),
-        })
-        .expect("store second message");
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
 
         db.clear_session(chat_id).expect("clear session");
 
-        assert!(db.load_session(chat_id).expect("load session").is_none());
+        assert!(
+            db.load_session_snapshot(chat_id, 10)
+                .expect("load session")
+                .messages_json
+                .is_none()
+        );
         assert!(
             db.get_recent_messages(chat_id, 10)
                 .expect("load recent messages")
@@ -1139,15 +966,7 @@ mod tests {
         let chat_id = db
             .resolve_or_create_chat_id("cli", "cli:demo", Some("demo"), "cli")
             .expect("create chat");
-        db.store_message(&StoredMessage {
-            id: "msg-1".to_string(),
-            chat_id,
-            sender_name: "local_user".to_string(),
-            content: "hello".to_string(),
-            is_from_bot: false,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-        })
-        .expect("store message");
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
         db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
             .expect("save session");
 
@@ -1207,11 +1026,15 @@ mod tests {
         db.update_tool_call_output_for_message(chat_id, "message-1", "tool-1", "done")
             .expect("update tool call");
 
-        let calls = db
-            .get_tool_calls_for_message(chat_id, "message-1")
-            .expect("load tool calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool_output.as_deref(), Some("done"));
+        let conn = db.conn.lock().expect("lock");
+        let output: String = conn
+            .query_row(
+                "SELECT tool_output FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 AND id = ?3",
+                rusqlite::params![chat_id, "message-1", "tool-1"],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(output, "done");
     }
 
     #[test]
@@ -1241,19 +1064,15 @@ mod tests {
         db.update_tool_call_output_for_message(chat_id, "message-2", "tool-1", "done")
             .expect("update scoped output");
 
-        let calls = db
-            .get_tool_calls_for_chat(chat_id)
-            .expect("load tool calls");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tool_output, None);
-        assert_eq!(calls[1].tool_output.as_deref(), Some("done"));
-    }
-
-    #[test]
-    fn schema_version_is_tracked_on_init() {
-        let (db, _dir) = test_db();
-        let version = db.schema_version().expect("schema version");
-        assert_eq!(version, 3, "新規DBはスキーマバージョン3で初期化される");
+        let conn = db.conn.lock().expect("lock");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -1278,26 +1097,6 @@ mod tests {
         assert!(rows[1].1.contains("llm_usage_logs"));
         assert_eq!(rows[2].0, 3);
         assert!(rows[2].1.contains("tool call"));
-    }
-
-    #[test]
-    fn reopen_db_preserves_schema_version() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-
-        let first_version = {
-            let db = Database::new(&db_path).expect("db");
-            db.schema_version().expect("version")
-        };
-
-        let db = Database::new(&db_path).expect("reopen db");
-        let second_version = db.schema_version().expect("version");
-
-        assert_eq!(
-            first_version, second_version,
-            "再起動してもバージョンは変わらない"
-        );
-        assert_eq!(second_version, 3);
     }
 
     #[test]
@@ -1345,265 +1144,6 @@ mod tests {
             .expect("log usage");
 
         assert!(row_id > 0);
-    }
-
-    #[test]
-    fn get_llm_usage_summary_returns_zeros_when_empty() {
-        let (db, _dir) = test_db();
-
-        let summary = db.get_llm_usage_summary(None, None, None).expect("summary");
-
-        assert_eq!(summary.requests, 0);
-        assert_eq!(summary.input_tokens, 0);
-        assert_eq!(summary.output_tokens, 0);
-        assert_eq!(summary.total_tokens, 0);
-        assert!(summary.last_request_at.is_none());
-    }
-
-    #[test]
-    fn get_llm_usage_summary_aggregates_all() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 200,
-            output_tokens: 100,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 200,
-            caller_channel: "web",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 300,
-            output_tokens: 150,
-            request_kind: "agent_loop",
-        })
-        .expect("log 3");
-
-        let summary = db.get_llm_usage_summary(None, None, None).expect("summary");
-
-        assert_eq!(summary.requests, 3);
-        assert_eq!(summary.input_tokens, 600);
-        assert_eq!(summary.output_tokens, 300);
-        assert_eq!(summary.total_tokens, 900);
-        assert!(summary.last_request_at.is_some());
-    }
-
-    #[test]
-    fn get_llm_usage_summary_filters_by_chat_id() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 200,
-            caller_channel: "web",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 200,
-            output_tokens: 100,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-
-        let summary = db
-            .get_llm_usage_summary(Some(100), None, None)
-            .expect("summary");
-
-        assert_eq!(summary.requests, 1);
-        assert_eq!(summary.input_tokens, 100);
-        assert_eq!(summary.output_tokens, 50);
-    }
-
-    #[test]
-    fn get_llm_usage_summary_filters_by_since() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let cutoff = chrono::Utc::now().to_rfc3339();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 200,
-            output_tokens: 100,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-
-        let summary = db
-            .get_llm_usage_summary(None, Some(&cutoff), None)
-            .expect("summary");
-
-        assert_eq!(summary.requests, 1);
-        assert_eq!(summary.input_tokens, 200);
-    }
-
-    #[test]
-    fn get_llm_usage_summary_filters_by_chat_id_and_since() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let cutoff = chrono::Utc::now().to_rfc3339();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 200,
-            caller_channel: "web",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 200,
-            output_tokens: 100,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 300,
-            output_tokens: 150,
-            request_kind: "agent_loop",
-        })
-        .expect("log 3");
-
-        let summary = db
-            .get_llm_usage_summary(Some(100), Some(&cutoff), None)
-            .expect("summary");
-
-        assert_eq!(summary.requests, 1);
-        assert_eq!(summary.input_tokens, 300);
-    }
-
-    #[test]
-    fn get_llm_usage_by_model_groups_correctly() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 200,
-            output_tokens: 100,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "claude-3",
-            input_tokens: 300,
-            output_tokens: 150,
-            request_kind: "agent_loop",
-        })
-        .expect("log 3");
-
-        let models = db.get_llm_usage_by_model(None, None, None).expect("models");
-
-        assert_eq!(models.len(), 2);
-        let gpt4 = models.iter().find(|m| m.model == "gpt-4").expect("gpt-4");
-        assert_eq!(gpt4.requests, 2);
-        assert_eq!(gpt4.input_tokens, 300);
-        assert_eq!(gpt4.output_tokens, 150);
-
-        let claude = models
-            .iter()
-            .find(|m| m.model == "claude-3")
-            .expect("claude-3");
-        assert_eq!(claude.requests, 1);
-        assert_eq!(claude.input_tokens, 300);
-    }
-
-    #[test]
-    fn get_llm_usage_by_model_orders_by_total_tokens_desc() {
-        let (db, _dir) = test_db();
-
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-        })
-        .expect("log 1");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "claude-3",
-            input_tokens: 300,
-            output_tokens: 150,
-            request_kind: "agent_loop",
-        })
-        .expect("log 2");
-
-        let models = db.get_llm_usage_by_model(None, None, None).expect("models");
-
-        assert_eq!(models.len(), 2);
-        assert!(
-            models[0].total_tokens >= models[1].total_tokens,
-            "total_tokens降順であること"
-        );
-        assert_eq!(models[0].model, "claude-3");
     }
 
     #[test]
@@ -1666,8 +1206,6 @@ mod tests {
         }
 
         let db = Database::new(&db_path).expect("reopen");
-        let version = db.schema_version().expect("version");
-        assert_eq!(version, 3);
 
         let conn = db.conn.lock().expect("lock");
         let table_exists: bool = conn
@@ -1678,15 +1216,5 @@ mod tests {
             )
             .expect("check table");
         assert!(table_exists);
-    }
-
-    #[test]
-    fn schema_version_increments_to_3() {
-        let (db, _dir) = test_db();
-        let version = db.schema_version().expect("version");
-        assert_eq!(
-            version, 3,
-            "スキーマバージョンが3にインクリメントされていること"
-        );
     }
 }

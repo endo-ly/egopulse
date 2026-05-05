@@ -39,7 +39,10 @@ impl AssetStore {
     }
 
     /// Parse a `data:<mime>;base64,...` URL, write the decoded bytes to disk (deduplicated by SHA-256).
-    pub(crate) fn persist_image_data_url(&self, data_url: &str) -> Result<StoredImageAsset, StorageError> {
+    pub(crate) fn persist_image_data_url(
+        &self,
+        data_url: &str,
+    ) -> Result<StoredImageAsset, StorageError> {
         let (mime_type, bytes) = parse_image_data_url(data_url)?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let data_path = self.image_data_path(&sha256);
@@ -146,5 +149,4 @@ mod tests {
         assert_eq!(stored.mime_type, "image/png");
         assert_eq!(hydrated, data_url);
     }
-
 }

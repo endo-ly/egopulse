@@ -74,7 +74,6 @@ impl ChannelRegistry {
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn ChannelAdapter>> {
         self.adapters.get(name)
     }
-
 }
 
 #[cfg(test)]

@@ -266,8 +266,6 @@ mod tests {
         assert_eq!(result, None);
     }
 
-
-
     // --- resolve_soul_path tests ---
 
     #[test]

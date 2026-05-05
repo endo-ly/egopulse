@@ -79,33 +79,6 @@ impl AppState {
         }
     }
 
-    /// Returns the LLM provider resolved for the given channel.
-    #[allow(dead_code)]
-    pub(crate) fn llm_for_channel(
-        &self,
-        channel: &str,
-    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        if let Some(provider) = self.llm_override.clone() {
-            return Ok(provider);
-        }
-
-        let config = self.try_current_config()?;
-        let resolved = config.resolve_llm_for_channel(channel)?;
-        self.cached_provider(&resolved)
-    }
-
-    /// Returns the global default LLM provider for CLI/TUI surfaces.
-    #[allow(dead_code)]
-    pub(crate) fn global_llm(&self) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        if let Some(provider) = self.llm_override.clone() {
-            return Ok(provider);
-        }
-
-        let config = self.try_current_config()?;
-        let resolved = config.resolve_global_llm();
-        self.cached_provider(&resolved)
-    }
-
     /// Returns the LLM provider resolved for the agent and channel in the given context.
     pub(crate) fn llm_for_context(
         &self,
@@ -592,9 +565,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
+        let context = crate::test_util::cli_context("cache-test");
 
-        let a = state.global_llm().expect("llm");
-        let b = state.global_llm().expect("llm");
+        let a = state.llm_for_context(&context).expect("llm");
+        let b = state.llm_for_context(&context).expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -615,8 +589,9 @@ mod tests {
         );
 
         state.llm_override = Some(Arc::clone(&override_provider));
+        let context = crate::test_util::cli_context("override-test");
 
-        let result = state.global_llm().expect("llm");
+        let result = state.llm_for_context(&context).expect("llm");
         assert!(Arc::ptr_eq(&result, &override_provider));
 
         let cache = state.llm_cache.lock().expect("lock");
