@@ -41,7 +41,7 @@ pub struct AppState {
     pub(crate) channels: Arc<ChannelRegistry>,
     pub(crate) skills: Arc<SkillManager>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    pub(crate) mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
@@ -148,7 +148,7 @@ pub async fn build_app_state_with_path(
     let mut tools = ToolRegistry::new(&config, Arc::clone(&skills));
 
     let workspace_dir = config.workspace_dir()?;
-    let mcp_manager = crate::mcp::McpManager::new(&workspace_dir).await?;
+    let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
     tools.set_mcp_manager(Arc::clone(&mcp_arc));
     spawn_mcp_reconnect_loop(Arc::clone(&mcp_arc), workspace_dir.clone());
@@ -182,7 +182,7 @@ pub async fn build_app_state_with_path(
 }
 
 fn spawn_mcp_reconnect_loop(
-    mcp_manager: Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
     workspace_dir: PathBuf,
 ) {
     tokio::spawn(async move {

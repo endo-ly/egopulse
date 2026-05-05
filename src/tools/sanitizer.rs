@@ -3,7 +3,7 @@
 //! Config 由来のシークレット値と well-known パターンの二層リダクションにより、
 //! ツール出力に秘密情報が漏洩しないようマスクする。
 
-use crate::codex_auth::{is_codex_provider, resolve_codex_auth};
+use crate::config::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::config::Config;
 use crate::tools::ToolResult;
 
