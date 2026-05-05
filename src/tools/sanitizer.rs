@@ -3,8 +3,8 @@
 //! Config 由来のシークレット値と well-known パターンの二層リダクションにより、
 //! ツール出力に秘密情報が漏洩しないようマスクする。
 
-use crate::llm::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::config::Config;
+use crate::llm::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::tools::ToolResult;
 
 /// Well-known secret パターン。出力に含まれる場合 [REDACTED] に置換する。

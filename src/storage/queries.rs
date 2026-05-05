@@ -2,7 +2,9 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::error::StorageError;
 
-use super::{ChatInfo, Database, LlmUsageLogEntry, SessionSnapshot, SessionSummary, StoredMessage, ToolCall};
+use super::{
+    ChatInfo, Database, LlmUsageLogEntry, SessionSnapshot, SessionSummary, StoredMessage, ToolCall,
+};
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
@@ -37,10 +39,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn get_chat_by_id(
-        &self,
-        chat_id: i64,
-    ) -> Result<Option<ChatInfo>, StorageError> {
+    pub(crate) fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
         let conn = self.lock_conn()?;
         match conn.query_row(
             "SELECT channel, external_chat_id, chat_type FROM chats WHERE chat_id = ?1 LIMIT 1",
