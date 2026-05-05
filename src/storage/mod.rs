@@ -32,6 +32,7 @@ pub(crate) struct SessionSummary {
     pub chat_title: Option<String>,
     pub last_message_time: String,
     pub last_message_preview: Option<String>,
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub(crate) struct ChatInfo {
     pub channel: String,
     pub external_chat_id: String,
     pub chat_type: String,
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone)]

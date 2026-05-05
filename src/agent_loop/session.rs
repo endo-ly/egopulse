@@ -36,8 +36,15 @@ pub(crate) async fn resolve_chat_id(
         let session_key = context.session_key();
         let surface_thread = context.surface_thread.clone();
         let chat_type = context.chat_type.clone();
+        let agent_id = context.agent_id.clone();
         move |db| {
-            db.resolve_or_create_chat_id(&channel, &session_key, Some(&surface_thread), &chat_type)
+            db.resolve_or_create_chat_id(
+                &channel,
+                &session_key,
+                Some(&surface_thread),
+                &chat_type,
+                &agent_id,
+            )
         }
     })
     .await
@@ -488,12 +495,14 @@ mod tests {
             let session_key = context.session_key();
             let surface_thread = context.surface_thread.clone();
             let chat_type = context.chat_type.clone();
+            let agent_id = context.agent_id.clone();
             move |db| {
                 db.resolve_or_create_chat_id(
                     &channel,
                     &session_key,
                     Some(&surface_thread),
                     &chat_type,
+                    &agent_id,
                 )
             }
         })

@@ -1036,6 +1036,9 @@ pub(crate) fn build_state(
         config.skills_dir().expect("skills_dir"),
     ));
     let soul_agents = std::sync::Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config));
+    let memory_loader = std::sync::Arc::new(crate::memory::MemoryLoader::new(
+        std::path::PathBuf::from(&config.state_root).join("agents"),
+    ));
     AppState {
         db,
         config: config.clone(),
@@ -1047,6 +1050,7 @@ pub(crate) fn build_state(
         mcp_manager: None,
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents,
+        memory_loader,
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
@@ -1112,7 +1116,13 @@ mod tests {
         assert_eq!(reply, "All set");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id("cli", "cli:tool-flow", Some("tool-flow"), "cli")
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:tool-flow",
+                Some("tool-flow"),
+                "cli",
+                "default",
+            )
         })
         .await
         .expect("chat id");
@@ -1267,6 +1277,7 @@ mod tests {
                 "cli:repeated-tool-call-id",
                 Some("repeated-tool-call-id"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1332,6 +1343,7 @@ mod tests {
                 "cli:duplicate-tool-call-id",
                 Some("duplicate-tool-call-id"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1650,6 +1662,7 @@ mod tests {
                 "cli:usage-log-single",
                 Some("usage-log-single"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1725,6 +1738,7 @@ mod tests {
                 "cli:usage-log-multi",
                 Some("usage-log-multi"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1867,7 +1881,13 @@ mod tests {
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id("cli", "cli:parallel-read", Some("parallel-read"), "cli")
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:parallel-read",
+                Some("parallel-read"),
+                "cli",
+                "default",
+            )
         })
         .await
         .expect("chat id");
@@ -1926,7 +1946,13 @@ mod tests {
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id("cli", "cli:mixed-tools", Some("mixed-tools"), "cli")
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:mixed-tools",
+                Some("mixed-tools"),
+                "cli",
+                "default",
+            )
         })
         .await
         .expect("chat id");
