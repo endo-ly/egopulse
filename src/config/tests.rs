@@ -80,7 +80,7 @@ fn loads_provider_based_config() {
     assert!(config.web_enabled());
     assert_eq!(config.web_auth_token(), Some("web-secret"));
 
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.provider, "openai");
     assert_eq!(web_llm.model, "gpt-4o-mini");
     assert_eq!(web_llm.base_url, "https://api.openai.com/v1");
@@ -117,7 +117,7 @@ channels:
     );
 
     let config = Config::load(Some(&file_path)).expect("load local config");
-    let resolved = config.web_llm().expect("resolved llm");
+    let resolved = config.resolve_llm_for_channel("web").expect("resolved llm");
     assert!(resolved.api_key.is_none());
 }
 
@@ -195,7 +195,13 @@ channels:
     );
 
     let config = Config::load_allow_missing_api_key(Some(&file_path)).expect("allow missing key");
-    assert!(config.web_llm().expect("resolved").api_key.is_none());
+    assert!(
+        config
+            .resolve_llm_for_channel("web")
+            .expect("resolved")
+            .api_key
+            .is_none()
+    );
 }
 
 #[test]
@@ -229,7 +235,7 @@ channels:
     assert_eq!(global.model, "gpt-5");
 
     // channel without model override also falls back to config.default_model
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.model, "gpt-5");
 }
 
@@ -290,20 +296,17 @@ fn agents_path_returns_state_root_agents_md() {
 
 #[test]
 #[serial]
-fn chat_agents_path_returns_groups_channel_chatid() {
+fn groups_dir_returns_runtime_groups() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, sample_config());
     let config = Config::load(Some(&file_path)).expect("load config");
 
     assert_eq!(
-        config.chat_agents_path("web", "thread-1"),
+        config.groups_dir(),
         PathBuf::from(&config.state_root)
             .join("runtime")
             .join("groups")
-            .join("web")
-            .join("thread-1")
-            .join("AGENTS.md")
     );
 }
 
@@ -318,25 +321,6 @@ fn souls_dir_returns_state_root_souls() {
     assert_eq!(
         config.souls_dir(),
         PathBuf::from(&config.state_root).join("souls")
-    );
-}
-
-#[test]
-#[serial]
-fn chat_soul_path_returns_groups_channel_chatid() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.chat_soul_path("discord", "thread-42"),
-        PathBuf::from(&config.state_root)
-            .join("runtime")
-            .join("groups")
-            .join("discord")
-            .join("thread-42")
-            .join("SOUL.md")
     );
 }
 
@@ -411,7 +395,7 @@ channels:
     let config = Config::load(Some(&file_path)).expect("load config");
 
     // channel.model > config.default_model
-    let web_llm = config.web_llm().expect("web llm");
+    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(web_llm.model, "gpt-4o");
 
     // channel.model > config.default_model (different provider)
@@ -784,40 +768,6 @@ fn resolve_llm_for_channel_delegates_to_default_agent() {
         .expect("via agent");
 
     assert_eq!(via_channel, via_agent);
-}
-
-#[test]
-#[serial]
-fn agent_soul_path_returns_agents_dir_soul() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, agent_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.agent_soul_path(&super::AgentId::new("alice")),
-        PathBuf::from(&config.state_root)
-            .join("agents")
-            .join("alice")
-            .join("SOUL.md")
-    );
-}
-
-#[test]
-#[serial]
-fn agent_agents_path_returns_agents_dir_agents() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, agent_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.agent_agents_path(&super::AgentId::new("bob")),
-        PathBuf::from(&config.state_root)
-            .join("agents")
-            .join("bob")
-            .join("AGENTS.md")
-    );
 }
 
 // --- Step 1: Discord Agent Bot Config Helper tests ---
@@ -1246,7 +1196,7 @@ channels:
     auth_token: web-secret"#,
     );
     let config = Config::load(Some(&file_path)).expect("should load openai-codex without api_key");
-    let resolved = config.web_llm().expect("web llm");
+    let resolved = config.resolve_llm_for_channel("web").expect("web llm");
     assert_eq!(resolved.provider, "openai-codex");
     assert!(resolved.api_key.is_none());
 }

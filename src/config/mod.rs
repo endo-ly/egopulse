@@ -1,11 +1,12 @@
-pub mod loader;
-pub mod persist;
-pub mod resolve;
+pub(crate) mod loader;
+pub(crate) mod persist;
+pub(crate) mod resolve;
 pub(crate) mod secret_ref;
-pub mod types;
+pub(crate) mod types;
 
-pub use loader::{base_url_allows_empty_api_key, is_valid_base_url};
-pub use resolve::{default_config_path, default_state_root, default_workspace_dir};
+pub(crate) use loader::is_valid_base_url;
+pub use resolve::default_config_path;
+pub(crate) use resolve::{default_state_root, default_workspace_dir};
 pub use types::*;
 
 #[cfg(test)]

@@ -11,14 +11,14 @@ use crate::error::ConfigError;
 impl Config {
     /// Invariant: `build_config` validates that `default_provider` exists in `providers`.
     /// This accessor relies on that validated config construction path.
-    pub fn global_provider(&self) -> &ProviderConfig {
+    pub(crate) fn global_provider(&self) -> &ProviderConfig {
         self.providers
             .get(&self.default_provider)
             .expect("default_provider must reference an existing provider")
     }
 
     /// Resolves the global default provider/model pair used by CLI/TUI.
-    pub fn resolve_global_llm(&self) -> ResolvedLlmConfig {
+    pub(crate) fn resolve_global_llm(&self) -> ResolvedLlmConfig {
         let provider = self.global_provider();
         ResolvedLlmConfig {
             provider: self.default_provider.to_string(),
@@ -33,7 +33,7 @@ impl Config {
     }
 
     /// Returns the normalized provider key used for the given channel.
-    pub fn effective_provider_name(&self, channel: &str) -> String {
+    pub(crate) fn effective_provider_name(&self, channel: &str) -> String {
         let channel_key = ChannelName::new(channel);
         self.channels
             .get(&channel_key)
@@ -55,7 +55,7 @@ impl Config {
     /// Returns [`ConfigError::AgentNotFound`] if `agent_id` is not in `self.agents`.
     /// Returns [`ConfigError::InvalidProviderReference`] if the resolved provider name
     /// does not reference an existing provider.
-    pub fn resolve_llm_for_agent_channel(
+    pub(crate) fn resolve_llm_for_agent_channel(
         &self,
         agent_id: &AgentId,
         channel: &str,
@@ -112,17 +112,15 @@ impl Config {
     /// # Errors
     ///
     /// See [`resolve_llm_for_agent_channel`].
-    pub fn resolve_llm_for_channel(&self, channel: &str) -> Result<ResolvedLlmConfig, ConfigError> {
+    pub(crate) fn resolve_llm_for_channel(
+        &self,
+        channel: &str,
+    ) -> Result<ResolvedLlmConfig, ConfigError> {
         self.resolve_llm_for_agent_channel(&self.default_agent, channel)
     }
 
-    /// Returns the web channel's resolved LLM settings.
-    pub fn web_llm(&self) -> Result<ResolvedLlmConfig, ConfigError> {
-        self.resolve_llm_for_channel("web")
-    }
-
     /// Returns `true` if the web channel is enabled.
-    pub fn web_enabled(&self) -> bool {
+    pub(crate) fn web_enabled(&self) -> bool {
         self.channels
             .get("web")
             .and_then(|c| c.enabled)
@@ -130,7 +128,7 @@ impl Config {
     }
 
     /// Returns the web channel host, defaulting to `127.0.0.1`.
-    pub fn web_host(&self) -> &str {
+    pub(crate) fn web_host(&self) -> &str {
         self.channels
             .get("web")
             .and_then(|c| c.host.as_deref())
@@ -138,7 +136,7 @@ impl Config {
     }
 
     /// Returns the web channel port, defaulting to `10961`.
-    pub fn web_port(&self) -> u16 {
+    pub(crate) fn web_port(&self) -> u16 {
         self.channels
             .get("web")
             .and_then(|c| c.port)
@@ -146,7 +144,7 @@ impl Config {
     }
 
     /// Returns the web auth token if configured and non-empty.
-    pub fn web_auth_token(&self) -> Option<&str> {
+    pub(crate) fn web_auth_token(&self) -> Option<&str> {
         self.channels
             .get("web")
             .and_then(|c| c.auth_token.as_ref().map(|rv| rv.value()))
@@ -155,7 +153,7 @@ impl Config {
     }
 
     /// Returns the list of allowed WebSocket origins for the web channel.
-    pub fn web_allowed_origins(&self) -> Vec<String> {
+    pub(crate) fn web_allowed_origins(&self) -> Vec<String> {
         self.channels
             .get("web")
             .and_then(|c| c.allowed_origins.clone())
@@ -166,7 +164,7 @@ impl Config {
     }
 
     /// Returns `true` if the named channel is enabled.
-    pub fn channel_enabled(&self, channel: &str) -> bool {
+    pub(crate) fn channel_enabled(&self, channel: &str) -> bool {
         let needle = ChannelName::new(channel);
         self.channels
             .get(&needle)
@@ -187,7 +185,7 @@ impl Config {
     }
 
     /// Telegram bot token (env override or config file).
-    pub fn telegram_bot_token(&self) -> Option<String> {
+    pub(crate) fn telegram_bot_token(&self) -> Option<String> {
         env::var("TELEGRAM_BOT_TOKEN")
             .ok()
             .and_then(|v| super::loader::normalize_string(Some(v)))
@@ -199,111 +197,71 @@ impl Config {
     }
 
     /// Telegram bot username for group mention detection.
-    pub fn telegram_bot_username(&self) -> Option<&str> {
+    pub(crate) fn telegram_bot_username(&self) -> Option<&str> {
         self.channels
             .get("telegram")
             .and_then(|c| c.bot_username.as_deref())
     }
 
     /// 組み込みスキルディレクトリ: `state_root/skills`。
-    pub fn skills_dir(&self) -> Result<PathBuf, ConfigError> {
+    pub(crate) fn skills_dir(&self) -> Result<PathBuf, ConfigError> {
         Ok(Path::new(&self.state_root).join("skills"))
     }
 
     /// ユーザースキルディレクトリ: `state_root/workspace/skills`。
-    pub fn user_skills_dir(&self) -> Result<PathBuf, ConfigError> {
+    pub(crate) fn user_skills_dir(&self) -> Result<PathBuf, ConfigError> {
         Ok(self.workspace_dir()?.join("skills"))
     }
 
     /// エージェント作業ディレクトリ: `state_root/workspace`。
-    pub fn workspace_dir(&self) -> Result<PathBuf, ConfigError> {
+    pub(crate) fn workspace_dir(&self) -> Result<PathBuf, ConfigError> {
         Ok(Path::new(&self.state_root).join("workspace"))
     }
 
     /// ランタイムデータディレクトリ: `state_root/runtime`。
-    pub fn runtime_dir(&self) -> PathBuf {
+    pub(crate) fn runtime_dir(&self) -> PathBuf {
         Path::new(&self.state_root).join("runtime")
     }
 
     /// データベースファイルパス: `state_root/runtime/egopulse.db`。
-    pub fn db_path(&self) -> PathBuf {
+    pub(crate) fn db_path(&self) -> PathBuf {
         self.runtime_dir().join("egopulse.db")
     }
 
     /// アセットディレクトリ: `state_root/runtime/assets`。
-    pub fn assets_dir(&self) -> PathBuf {
+    pub(crate) fn assets_dir(&self) -> PathBuf {
         self.runtime_dir().join("assets")
     }
 
     /// アーカイブディレクトリ: `state_root/runtime/groups`。
-    pub fn groups_dir(&self) -> PathBuf {
+    pub(crate) fn groups_dir(&self) -> PathBuf {
         self.runtime_dir().join("groups")
     }
 
     /// デフォルト SOUL.md パス: `state_root/SOUL.md`。
-    pub fn soul_path(&self) -> PathBuf {
+    pub(crate) fn soul_path(&self) -> PathBuf {
         Path::new(&self.state_root).join("SOUL.md")
     }
 
     /// デフォルト AGENTS.md パス: `state_root/AGENTS.md`。
-    pub fn agents_path(&self) -> PathBuf {
+    pub(crate) fn agents_path(&self) -> PathBuf {
         Path::new(&self.state_root).join("AGENTS.md")
     }
 
-    /// Agent-specific SOUL.md: `state_root/agents/{agent_id}/SOUL.md`.
-    pub fn agent_soul_path(&self, agent_id: &AgentId) -> PathBuf {
-        Path::new(&self.state_root)
-            .join("agents")
-            .join(agent_id.as_str())
-            .join("SOUL.md")
-    }
-
-    /// Agent-specific AGENTS.md: `state_root/agents/{agent_id}/AGENTS.md`.
-    pub fn agent_agents_path(&self, agent_id: &AgentId) -> PathBuf {
-        Path::new(&self.state_root)
-            .join("agents")
-            .join(agent_id.as_str())
-            .join("AGENTS.md")
-    }
-
-    /// Discord session thread: `{channel_id}:bot:{bot_id}:agent:{agent_id}`.
-    pub fn discord_surface_thread(
-        &self,
-        channel_id: &str,
-        bot_id: &BotId,
-        agent_id: &AgentId,
-    ) -> String {
-        format!("{channel_id}:bot:{bot_id}:agent:{agent_id}")
-    }
-
     /// マルチソウル用ディレクトリ: `state_root/souls`。
-    pub fn souls_dir(&self) -> PathBuf {
+    pub(crate) fn souls_dir(&self) -> PathBuf {
         Path::new(&self.state_root).join("souls")
-    }
-
-    /// チャット別 AGENTS.md: `state_root/runtime/groups/{channel}/{thread}/AGENTS.md`。
-    pub fn chat_agents_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir()
-            .join(channel)
-            .join(thread)
-            .join("AGENTS.md")
-    }
-
-    /// チャット別 SOUL.md: `state_root/runtime/groups/{channel}/{thread}/SOUL.md`。
-    pub fn chat_soul_path(&self, channel: &str, thread: &str) -> PathBuf {
-        self.groups_dir().join(channel).join(thread).join("SOUL.md")
-    }
-
-    /// ステータスファイルパス: `state_root/runtime/status.json`。
-    pub fn status_json_path(&self) -> PathBuf {
-        self.runtime_dir().join("status.json")
     }
 
     /// Resolves the context window for a given provider+model pair.
     ///
     /// Falls back to `default_context_window_tokens` when the model entry
     /// has no explicit `context_window_tokens`.
-    pub fn resolve_context_window_tokens(&self, provider_id: &ProviderId, model: &str) -> usize {
+    pub(crate) fn resolve_context_window_tokens(
+        &self,
+        provider_id: &ProviderId,
+        model: &str,
+    ) -> usize {
         self.providers
             .get(provider_id)
             .and_then(|provider| provider.models.get(model))
@@ -311,17 +269,8 @@ impl Config {
             .unwrap_or(self.default_context_window_tokens)
     }
 
-    /// Atomically writes the current config to a YAML file.
-    ///
-    /// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
-    /// file-level lock (`fs2`) for cross-process safety. The write is atomic via
-    /// temp-file + rename.
-    pub fn save_yaml(&self, path: &Path) -> Result<(), crate::error::EgoPulseError> {
-        super::persist::save_yaml(self, path)
-    }
-
     /// Saves config with SecretRef-aware YAML and .env file.
-    pub fn save_config_with_secrets(
+    pub(crate) fn save_config_with_secrets(
         &self,
         yaml_path: &Path,
     ) -> Result<(), crate::error::EgoPulseError> {
@@ -332,7 +281,7 @@ impl Config {
     /// a resolved token.
     ///
     /// Sorted by `bot_id` for deterministic startup. Empty when Discord is disabled.
-    pub fn discord_bots(&self) -> Vec<DiscordBotRuntime<'_>> {
+    pub(crate) fn discord_bots(&self) -> Vec<DiscordBotRuntime<'_>> {
         if !self.channel_enabled("discord") {
             return vec![];
         }
@@ -365,7 +314,7 @@ impl Config {
 
 /// Runtime data needed to start and operate one Discord bot.
 #[derive(Clone, Debug)]
-pub struct DiscordBotRuntime<'a> {
+pub(crate) struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
     pub default_agent: &'a AgentId,
@@ -379,14 +328,14 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Default state root directory: `~/.egopulse`.
-pub fn default_state_root() -> Result<PathBuf, ConfigError> {
+pub(crate) fn default_state_root() -> Result<PathBuf, ConfigError> {
     dirs::home_dir()
         .map(|home| home.join(".egopulse"))
         .ok_or(ConfigError::HomeDirectoryUnresolved)
 }
 
 /// Default workspace directory: `~/.egopulse/workspace`.
-pub fn default_workspace_dir() -> Result<PathBuf, ConfigError> {
+pub(crate) fn default_workspace_dir() -> Result<PathBuf, ConfigError> {
     default_state_root().map(|root| root.join("workspace"))
 }
 

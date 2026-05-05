@@ -32,7 +32,7 @@ pub enum EgoPulseError {
 
 impl EgoPulseError {
     /// 構造化ログの `error_kind` フィールドやユーザー向けメッセージの振り分けに使用する分類タグ。
-    pub fn error_kind(&self) -> &'static str {
+    pub(crate) fn error_kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
             Self::Llm(_) => "llm",
@@ -47,12 +47,12 @@ impl EgoPulseError {
     }
 
     /// エラー全文をそのままユーザーに返す。
-    pub fn user_message(&self) -> String {
+    pub(crate) fn user_message(&self) -> String {
         format!("Error: {self}")
     }
 
     /// ネットワーク到達不能など、ユーザー通知を抑制すべきノイズエラーなら true。
-    pub fn should_suppress_user_error(&self) -> bool {
+    pub(crate) fn should_suppress_user_error(&self) -> bool {
         let text = self.to_string().to_ascii_lowercase();
         text.contains("error sending request for url")
     }

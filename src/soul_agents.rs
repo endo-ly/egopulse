@@ -10,7 +10,7 @@ struct CachedContent {
     mtime: SystemTime,
 }
 
-pub struct SoulAgentsLoader {
+pub(crate) struct SoulAgentsLoader {
     state_root: PathBuf,
     soul_path: PathBuf,
     agents_path: PathBuf,
@@ -21,7 +21,7 @@ pub struct SoulAgentsLoader {
 }
 
 impl SoulAgentsLoader {
-    pub fn new(config: &crate::config::Config) -> Self {
+    pub(crate) fn new(config: &crate::config::Config) -> Self {
         Self {
             state_root: PathBuf::from(&config.state_root),
             soul_path: config.soul_path(),
@@ -34,7 +34,7 @@ impl SoulAgentsLoader {
     }
 
     /// Agent SOUL → channel soul_path → global SOUL.md
-    pub fn load_soul(
+    pub(crate) fn load_soul(
         &self,
         _channel: &str,
         _thread: &str,
@@ -90,14 +90,6 @@ impl SoulAgentsLoader {
         Self::cached_read_trimmed(&self.soul_path, &self.soul_cache)
     }
 
-    /// souls/ ディレクトリから名前指定で読み込み。
-    /// "work" → souls/work.md, "work.md" → souls/work.md
-    pub fn load_soul_by_name(&self, name: &str) -> Option<String> {
-        let stripped = name.strip_suffix(".md").unwrap_or(name);
-        let path = self.souls_dir.join(format!("{stripped}.md"));
-        read_trimmed(&path)
-    }
-
     /// 相対パスを解決する。
     /// - まず souls/ から探す
     /// - 次に state_root から探す
@@ -116,15 +108,15 @@ impl SoulAgentsLoader {
     }
 
     /// グローバル AGENTS.md を読み込む
-    pub fn load_global_agents(&self) -> Option<String> {
+    pub(crate) fn load_global_agents(&self) -> Option<String> {
         Self::cached_read_trimmed(&self.agents_path, &self.agents_cache)
     }
 
-    pub fn build_soul_section(&self, content: &str, _channel: &str) -> String {
+    pub(crate) fn build_soul_section(&self, content: &str, _channel: &str) -> String {
         format!("<soul>\n{content}\n</soul>")
     }
 
-    pub fn build_agents_section(
+    pub(crate) fn build_agents_section(
         &self,
         _channel: &str,
         _thread: &str,
@@ -147,7 +139,7 @@ impl SoulAgentsLoader {
         Some(section)
     }
 
-    pub fn provision_default_soul(&self) -> io::Result<bool> {
+    pub(crate) fn provision_default_soul(&self) -> io::Result<bool> {
         if self.soul_path.exists() {
             return Ok(false);
         }
@@ -271,37 +263,6 @@ mod tests {
         let loader = make_loader(dir.path());
 
         let result = loader.load_soul("web", "thread1", None, None);
-        assert_eq!(result, None);
-    }
-
-    // --- load_soul_by_name tests ---
-
-    #[test]
-    fn load_soul_from_souls_dir_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("souls/work.md"), "Work soul content");
-
-        let result = loader.load_soul_by_name("work");
-        assert_eq!(result, Some("Work soul content".to_string()));
-    }
-
-    #[test]
-    fn load_soul_from_souls_dir_with_md_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("souls/work.md"), "Work soul content");
-
-        let result = loader.load_soul_by_name("work.md");
-        assert_eq!(result, Some("Work soul content".to_string()));
-    }
-
-    #[test]
-    fn load_soul_from_souls_dir_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.load_soul_by_name("nonexistent");
         assert_eq!(result, None);
     }
 

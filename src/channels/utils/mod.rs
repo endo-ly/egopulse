@@ -1,2 +1,2 @@
-pub mod media;
-pub mod text;
+pub(crate) mod media;
+pub(crate) mod text;

@@ -114,14 +114,14 @@ enum ReceiveDecision {
 }
 
 /// Sends outbound messages to Discord via the REST API.
-pub struct DiscordAdapter {
+pub(crate) struct DiscordAdapter {
     /// Token map: bot_id → token, built from [`Config::discord_bots`].
     bot_token_map: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
 }
 
 impl DiscordAdapter {
-    pub fn new_for_bots(config: &crate::config::Config) -> Self {
+    pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
         let bot_tokens: std::collections::HashMap<String, String> = config
             .discord_bots()
             .into_iter()
@@ -739,7 +739,7 @@ fn interaction_to_command_text(
 
 /// Starts a Discord bot with agent routing configured.
 #[allow(private_interfaces)]
-pub async fn start_discord_bot_for_bot(
+pub(crate) async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,

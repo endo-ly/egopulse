@@ -34,13 +34,13 @@ static BOT_USERNAME_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Telegram チャネルアダプター。
 ///
 /// アウトバウンドメッセージ送信用。Bot API 経由で Telegram にメッセージを送信する。
-pub struct TelegramAdapter {
+pub(crate) struct TelegramAdapter {
     bot: Bot,
 }
 
 impl TelegramAdapter {
     /// Creates a Telegram adapter backed by the provided bot client.
-    pub fn new(bot: Bot) -> Self {
+    pub(crate) fn new(bot: Bot) -> Self {
         Self { bot }
     }
 }
@@ -487,7 +487,7 @@ fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
 /// Telegram bot を起動。
 ///
 /// Long polling モードでメッセージの受信を開始する。
-pub async fn start_telegram_bot(
+pub(crate) async fn start_telegram_bot(
     state: Arc<AppState>,
     token: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

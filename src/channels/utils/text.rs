@@ -6,7 +6,7 @@
 /// UTF-8安全なインデックスクランプ。
 ///
 /// 指定インデックスが文字境界でない場合、前の文字境界まで下げる。
-pub fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     let len = s.len();
     if index >= len {
         return len;
@@ -23,7 +23,7 @@ pub fn floor_char_boundary(s: &str, mut index: usize) -> usize {
 ///
 /// 改行境界で優先的に分割し、各チャンクが max_len を超えないようにする。
 /// Discord (2000文字) / Telegram (4096文字) のメッセージ長制限対応。
-pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
+pub(crate) fn split_text(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
     }
@@ -47,7 +47,7 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
 }
 
 /// Truncate a string to `max_chars` characters, appending `"..."` if truncated.
-pub fn truncate_by_chars(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_by_chars(value: &str, max_chars: usize) -> String {
     let char_count = value.chars().count();
     if char_count <= max_chars {
         return value.to_string();
@@ -66,7 +66,11 @@ pub fn truncate_by_chars(value: &str, max_chars: usize) -> String {
 ///
 /// Iterates over `split_text(text, max_len)` chunks and awaits the
 /// provided closure. Stops at the first error.
-pub async fn send_chunked<F>(text: &str, max_len: usize, mut send_fn: F) -> Result<(), String>
+pub(crate) async fn send_chunked<F>(
+    text: &str,
+    max_len: usize,
+    mut send_fn: F,
+) -> Result<(), String>
 where
     F: FnMut(
         &str,

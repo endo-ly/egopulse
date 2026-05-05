@@ -246,7 +246,7 @@ impl TuiApp {
 }
 
 /// Starts the Ratatui application for browsing and chatting with sessions.
-pub async fn run(state: AppState) -> Result<(), EgoPulseError> {
+pub(crate) async fn run(state: AppState) -> Result<(), EgoPulseError> {
     let sessions = agent_loop::list_sessions(&state).await?;
     let mut app = TuiApp::new(state, sessions);
     if app.sessions.is_empty() {

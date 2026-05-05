@@ -32,8 +32,6 @@ struct CodexAuthFile {
 #[derive(Debug, Deserialize)]
 struct CodexAuthTokens {
     access_token: Option<String>,
-    #[expect(dead_code)]
-    refresh_token: Option<String>,
     account_id: Option<String>,
 }
 

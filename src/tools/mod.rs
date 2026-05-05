@@ -7,7 +7,6 @@
 mod activate_skill;
 mod command_guard;
 mod files;
-mod mcp_adapter;
 mod path_guard;
 mod sanitizer;
 mod search;
@@ -18,8 +17,6 @@ mod text;
 #[allow(unused_imports)] // re-export for future use from other modules
 pub(crate) use command_guard::*;
 pub(crate) use files::*;
-#[allow(unused_imports)] // re-export for future use from other modules
-pub(crate) use mcp_adapter::*;
 #[allow(unused_imports)] // re-export for future use from other modules
 pub(crate) use path_guard::*;
 pub(crate) use sanitizer::*;
@@ -48,7 +45,7 @@ const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolExecutionContext {
+pub(crate) struct ToolExecutionContext {
     pub chat_id: i64,
     pub channel: String,
     pub surface_thread: String,
@@ -57,7 +54,7 @@ pub struct ToolExecutionContext {
 
 /// Uniform result type returned by all tool implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
+pub(crate) struct ToolResult {
     pub content: String,
     pub is_error: bool,
     pub details: Option<serde_json::Value>,
@@ -66,7 +63,7 @@ pub struct ToolResult {
 
 impl ToolResult {
     /// Create a successful result with plain text content.
-    pub fn success(content: String) -> Self {
+    pub(crate) fn success(content: String) -> Self {
         Self {
             llm_content: crate::llm::MessageContent::text(content.clone()),
             content,
@@ -76,7 +73,7 @@ impl ToolResult {
     }
 
     /// Create a successful result with structured details (e.g. truncation metadata).
-    pub fn success_with_details(content: String, details: serde_json::Value) -> Self {
+    pub(crate) fn success_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
             llm_content: crate::llm::MessageContent::text(content.clone()),
             content,
@@ -86,7 +83,7 @@ impl ToolResult {
     }
 
     /// Create a successful result with separate LLM-facing multimodal content (e.g. images).
-    pub fn success_with_llm_content(
+    pub(crate) fn success_with_llm_content(
         content: String,
         llm_content: crate::llm::MessageContent,
     ) -> Self {
@@ -99,7 +96,7 @@ impl ToolResult {
     }
 
     /// Create an error result with plain text content.
-    pub fn error(content: String) -> Self {
+    pub(crate) fn error(content: String) -> Self {
         Self {
             llm_content: crate::llm::MessageContent::text(content.clone()),
             content,
@@ -109,7 +106,7 @@ impl ToolResult {
     }
 
     /// Create an error result with structured details.
-    pub fn error_with_details(content: String, details: serde_json::Value) -> Self {
+    pub(crate) fn error_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
             llm_content: crate::llm::MessageContent::text(content.clone()),
             content,
@@ -121,7 +118,7 @@ impl ToolResult {
 
 /// Trait implemented by every tool available to the LLM agent.
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
@@ -137,7 +134,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Owns all tool instances and dispatches execution by tool name.
-pub struct ToolRegistry {
+pub(crate) struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
@@ -146,7 +143,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Instantiate all built-in tools scoped to the configured workspace.
-    pub fn new(config: &Config, skill_manager: Arc<SkillManager>) -> Self {
+    pub(crate) fn new(config: &Config, skill_manager: Arc<SkillManager>) -> Self {
         let workspace_dir = match config.workspace_dir() {
             Ok(dir) => dir,
             Err(error) => {
@@ -186,14 +183,14 @@ impl ToolRegistry {
         }
     }
 
-    pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
+    pub(crate) fn register_tool(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
         let idx = self.tools.len();
         self.tools.push(tool);
         self.tool_index.insert(name, idx);
     }
 
-    pub fn set_mcp_manager(
+    pub(crate) fn set_mcp_manager(
         &mut self,
         mcp_manager: Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
     ) {
@@ -201,7 +198,7 @@ impl ToolRegistry {
     }
 
     /// Collect tool definitions asynchronously.
-    pub async fn definitions_async(&self) -> Vec<ToolDefinition> {
+    pub(crate) async fn definitions_async(&self) -> Vec<ToolDefinition> {
         let mut definitions: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
 
@@ -214,7 +211,7 @@ impl ToolRegistry {
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
         name: &str,
         input: serde_json::Value,
@@ -248,7 +245,7 @@ impl ToolRegistry {
     }
 
     /// Returns `true` if the named tool is a read-only tool safe for parallel execution.
-    pub fn is_read_only(&self, name: &str) -> bool {
+    pub(crate) fn is_read_only(&self, name: &str) -> bool {
         self.tool_index
             .get(name)
             .is_some_and(|&idx| self.tools[idx].is_read_only())
@@ -518,7 +515,7 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
-        std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}").expect("lib");
+        std::fs::write(workspace.join("src/lib.rs"), "pub(crate) fn demo() {}").expect("lib");
         let registry = test_registry(&config);
 
         let result = registry
@@ -536,14 +533,18 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
-        std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}\n").expect("lib");
+        std::fs::write(workspace.join("src/lib.rs"), "pub(crate) fn demo() {}\n").expect("lib");
         let registry = test_registry(&config);
 
         let result = registry
             .execute("grep", json!({"pattern": "demo"}), &test_context())
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("src/lib.rs:1:pub fn demo() {}"));
+        assert!(
+            result
+                .content
+                .contains("src/lib.rs:1:pub(crate) fn demo() {}")
+        );
     }
 
     #[tokio::test]
@@ -779,7 +780,7 @@ mod tests {
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(workspace.join("src")).expect("src");
         std::fs::create_dir_all(workspace.join(".ssh")).expect(".ssh");
-        std::fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}").expect("lib");
+        std::fs::write(workspace.join("src/lib.rs"), "pub(crate) fn demo() {}").expect("lib");
         std::fs::write(workspace.join(".env"), "SECRET=1").expect(".env");
         std::fs::write(workspace.join(".ssh/id_rsa"), "private").expect("id_rsa");
         let registry = test_registry(&config);

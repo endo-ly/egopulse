@@ -725,24 +725,8 @@ pub(super) fn normalize_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn is_local_url(value: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
-
-    matches!(
-        url.host_str(),
-        Some("localhost") | Some("127.0.0.1") | Some("0.0.0.0") | Some("::1")
-    )
-}
-
-/// Returns `true` if the given base URL points to a local address that does not require an API key.
-pub fn base_url_allows_empty_api_key(base_url: &str) -> bool {
-    is_local_url(base_url)
-}
-
 /// URL として有効か検証する。setup wizard からも使用。
-pub fn is_valid_base_url(url: &str) -> bool {
+pub(crate) fn is_valid_base_url(url: &str) -> bool {
     Url::parse(url).is_ok()
 }
 

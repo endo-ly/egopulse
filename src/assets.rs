@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -10,13 +9,13 @@ use crate::error::StorageError;
 
 /// Content-addressable file store for image assets under `{state_root}/runtime/assets/images/`.
 #[derive(Debug, Clone)]
-pub struct AssetStore {
+pub(crate) struct AssetStore {
     root: PathBuf,
 }
 
 /// Reference to a stored image, keyed by SHA-256 hash of the original bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredImageAsset {
+pub(crate) struct StoredImageAsset {
     pub image_ref: String,
     pub mime_type: String,
 }
@@ -32,7 +31,7 @@ struct ImageAssetMetadata {
 
 impl AssetStore {
     /// Create the asset store, ensuring the `images/` directory tree exists.
-    pub fn new(assets_dir: &Path) -> Result<Self, StorageError> {
+    pub(crate) fn new(assets_dir: &Path) -> Result<Self, StorageError> {
         std::fs::create_dir_all(assets_dir.join("images"))?;
         Ok(Self {
             root: assets_dir.to_path_buf(),
@@ -40,7 +39,10 @@ impl AssetStore {
     }
 
     /// Parse a `data:<mime>;base64,...` URL, write the decoded bytes to disk (deduplicated by SHA-256).
-    pub fn persist_image_data_url(&self, data_url: &str) -> Result<StoredImageAsset, StorageError> {
+    pub(crate) fn persist_image_data_url(
+        &self,
+        data_url: &str,
+    ) -> Result<StoredImageAsset, StorageError> {
         let (mime_type, bytes) = parse_image_data_url(data_url)?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let data_path = self.image_data_path(&sha256);
@@ -69,7 +71,7 @@ impl AssetStore {
     }
 
     /// Read a stored image back as a `data:<mime>;base64,...` URL.
-    pub fn load_image_data_url(
+    pub(crate) fn load_image_data_url(
         &self,
         image_ref: &str,
         mime_type: &str,
@@ -80,41 +82,6 @@ impl AssetStore {
             "data:{mime_type};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         ))
-    }
-
-    /// Garbage-collect image assets not present in `referenced`. Returns the list of removed refs.
-    pub fn sweep_unreferenced_images(
-        &self,
-        referenced: &HashSet<String>,
-    ) -> Result<Vec<String>, StorageError> {
-        let mut removed = Vec::new();
-        let images_dir = self.root.join("images");
-        if !images_dir.exists() {
-            return Ok(removed);
-        }
-
-        for entry in std::fs::read_dir(images_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if referenced.contains(stem) {
-                continue;
-            }
-
-            let metadata_path = self.image_metadata_path(stem);
-            if metadata_path.exists() {
-                std::fs::remove_file(&metadata_path)?;
-            }
-            std::fs::remove_file(&path)?;
-            removed.push(stem.to_string());
-        }
-
-        Ok(removed)
     }
 
     fn image_data_path(&self, image_ref: &str) -> PathBuf {
@@ -164,8 +131,6 @@ mod tests {
     //! data URL 形式の画像を SHA-256 ハッシュで内容アドレス指定し、
     //! 重複排除付きでファイルシステムに永続化する。未参照アセットの GC も提供する。
 
-    use std::collections::HashSet;
-
     use super::AssetStore;
 
     #[test]
@@ -183,26 +148,5 @@ mod tests {
 
         assert_eq!(stored.mime_type, "image/png");
         assert_eq!(hydrated, data_url);
-    }
-
-    #[test]
-    fn deduplicates_identical_images_and_sweeps_unreferenced() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = AssetStore::new(dir.path()).expect("store");
-        let data_url = "data:image/png;base64,AAAA";
-
-        let first = store
-            .persist_image_data_url(data_url)
-            .expect("persist first image");
-        let second = store
-            .persist_image_data_url(data_url)
-            .expect("persist second image");
-
-        assert_eq!(first.image_ref, second.image_ref);
-
-        let removed = store
-            .sweep_unreferenced_images(&HashSet::new())
-            .expect("sweep images");
-        assert_eq!(removed, vec![first.image_ref]);
     }
 }

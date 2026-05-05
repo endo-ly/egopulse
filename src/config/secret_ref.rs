@@ -37,7 +37,7 @@ pub(crate) enum StringOrRef {
 }
 
 #[derive(Clone)]
-pub enum ResolvedValue {
+pub(crate) enum ResolvedValue {
     Literal(String),
     EnvRef { value: String, id: String },
     ExecRef { value: String, command: String },

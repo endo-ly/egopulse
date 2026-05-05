@@ -13,7 +13,7 @@ const STATUS_FILE: &str = "status.json";
 
 /// ステータススナップショットの全体。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct StatusSnapshot {
+pub(crate) struct StatusSnapshot {
     pub version: String,
     pub pid: u32,
     pub started_at: String,
@@ -25,7 +25,7 @@ pub struct StatusSnapshot {
 
 /// MCP サーバーの接続結果。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct McpStatus {
+pub(crate) struct McpStatus {
     #[serde(default)]
     pub connected: Vec<ConnectedMcpServer>,
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct McpStatus {
 
 /// 接続成功した MCP サーバー。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ConnectedMcpServer {
+pub(crate) struct ConnectedMcpServer {
     pub name: String,
     pub transport: TransportType,
     pub tools: Vec<String>,
@@ -42,7 +42,7 @@ pub struct ConnectedMcpServer {
 
 /// 接続失敗した MCP サーバー。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FailedMcpServer {
+pub(crate) struct FailedMcpServer {
     pub name: String,
     pub error: String,
 }
@@ -50,7 +50,7 @@ pub struct FailedMcpServer {
 /// トランスポート種別。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TransportType {
+pub(crate) enum TransportType {
     Stdio,
     StreamableHttp,
 }
@@ -66,7 +66,7 @@ impl fmt::Display for TransportType {
 
 /// 各チャネルの起動設定。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ChannelsStatus {
+pub(crate) struct ChannelsStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web: Option<WebChannelStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,7 +77,7 @@ pub struct ChannelsStatus {
 
 /// チャネルの基本エントリ。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ChannelEntry {
+pub(crate) struct ChannelEntry {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_count: Option<usize>,
@@ -85,7 +85,7 @@ pub struct ChannelEntry {
 
 /// Web チャネルの設定。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WebChannelStatus {
+pub(crate) struct WebChannelStatus {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -95,13 +95,13 @@ pub struct WebChannelStatus {
 
 /// LLM Provider の設定。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderStatus {
+pub(crate) struct ProviderStatus {
     pub default: String,
     pub model: String,
 }
 
 /// `status.json` にスナップショットを書き出す。
-pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Result<()> {
+pub(crate) fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Result<()> {
     let runtime_dir = state_root.join("runtime");
     std::fs::create_dir_all(&runtime_dir)?;
     let path = runtime_dir.join(STATUS_FILE);
@@ -112,14 +112,14 @@ pub fn write_status(state_root: &Path, snapshot: &StatusSnapshot) -> std::io::Re
 /// `status.json` からスナップショットを読み取る。
 ///
 /// ファイルが存在しない、またはパースに失敗した場合は `None` を返す。
-pub fn read_status(state_root: &Path) -> Option<StatusSnapshot> {
+pub(crate) fn read_status(state_root: &Path) -> Option<StatusSnapshot> {
     let path = state_root.join("runtime").join(STATUS_FILE);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
 /// スナップショットを人間可読な ASCII テキストにフォーマットする。
-pub fn format_snapshot(snapshot: &StatusSnapshot) -> String {
+pub(crate) fn format_snapshot(snapshot: &StatusSnapshot) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     lines.push(format!(

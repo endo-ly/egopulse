@@ -1,5 +1,5 @@
 use super::*;
-use super::{messages::*, responses::*, sse::*};
+use super::{messages::*, responses::*};
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
 
@@ -21,7 +21,7 @@ impl OpenAiProvider {
     ///
     /// Returns `LlmError::InitFailed` if the HTTP client cannot be built, or if the
     /// `openai-codex` provider is selected but no Codex auth token is available.
-    pub fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
+    pub(crate) fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -184,21 +184,6 @@ impl OpenAiProvider {
             body_preview: preview_body(body),
         }
     }
-
-    fn stream_text_piece(
-        piece: Option<String>,
-        text: &mut String,
-        text_tx: Option<&UnboundedSender<String>>,
-    ) {
-        let Some(piece) = piece.filter(|piece| !piece.is_empty()) else {
-            return;
-        };
-
-        text.push_str(&piece);
-        if let Some(tx) = text_tx {
-            let _ = tx.send(piece);
-        }
-    }
 }
 
 #[async_trait]
@@ -257,99 +242,5 @@ impl LlmProvider for OpenAiProvider {
 
         let body: OpenAiResponse = response.json().await?;
         parse_openai_response(body)
-    }
-
-    async fn send_message_stream(
-        &self,
-        system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-        text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        if self.is_codex
-            || should_use_responses_api(&messages)
-            || tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        {
-            let response = self.send_message(system, messages, tools).await?;
-            if let Some(tx) = text_tx
-                && !response.content.is_empty()
-            {
-                let _ = tx.send(response.content.clone());
-            }
-            return Ok(response);
-        }
-
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let headers = self.build_headers()?;
-
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&build_request_body(
-                &self.model,
-                system,
-                &messages,
-                None,
-                Some(true),
-            ))
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-            ));
-        }
-
-        let mut byte_stream = response.bytes_stream();
-        let mut sse = SseEventParser::default();
-        let mut text = String::new();
-        let mut done = false;
-
-        'outer: while let Some(chunk_res) = byte_stream.next().await {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(error) => return Err(LlmError::RequestFailed(error)),
-            };
-            for data in sse.push_chunk(chunk.as_ref()) {
-                if data == "[DONE]" {
-                    done = true;
-                    break 'outer;
-                }
-                Self::stream_text_piece(process_openai_stream_event(&data), &mut text, text_tx);
-            }
-        }
-
-        if !done {
-            for data in sse.finish() {
-                if data == "[DONE]" {
-                    done = true;
-                    break;
-                }
-                Self::stream_text_piece(process_openai_stream_event(&data), &mut text, text_tx);
-            }
-        }
-
-        if !done {
-            return Err(LlmError::InvalidResponse(
-                "stream ended before [DONE]".to_string(),
-            ));
-        }
-
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return Err(LlmError::InvalidResponse(
-                "assistant content was empty".to_string(),
-            ));
-        }
-
-        Ok(MessagesResponse {
-            content: text,
-            tool_calls: Vec::new(),
-            usage: None,
-        })
     }
 }

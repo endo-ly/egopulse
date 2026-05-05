@@ -26,7 +26,7 @@ mod auth;
 mod config;
 mod health;
 mod sessions;
-pub mod sse;
+pub(crate) mod sse;
 mod stream;
 mod ws;
 
@@ -40,7 +40,7 @@ pub(crate) const RUN_HISTORY_LIMIT: usize = 512;
 pub(crate) const RUN_TTL_SECONDS: u64 = 300;
 
 /// Adapts the local web surface to the shared channel interface.
-pub struct WebAdapter;
+pub(crate) struct WebAdapter;
 
 #[async_trait]
 impl ChannelAdapter for WebAdapter {
@@ -50,14 +50,6 @@ impl ChannelAdapter for WebAdapter {
 
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
         vec![("web", ConversationKind::Private)]
-    }
-
-    fn is_local_only(&self) -> bool {
-        true
-    }
-
-    fn allows_cross_chat(&self) -> bool {
-        false
     }
 
     async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
@@ -277,7 +269,11 @@ fn asset_or_index(uri: &Uri) -> Response {
 }
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
-pub async fn run_server(state: AppState, host: &str, port: u16) -> Result<(), EgoPulseError> {
+pub(crate) async fn run_server(
+    state: AppState,
+    host: &str,
+    port: u16,
+) -> Result<(), EgoPulseError> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
@@ -370,8 +366,6 @@ mod tests {
         let adapter = WebAdapter;
 
         assert_eq!(adapter.name(), "web");
-        assert!(adapter.is_local_only());
-        assert!(!adapter.allows_cross_chat());
         assert_eq!(
             adapter.chat_type_routes(),
             vec![("web", ConversationKind::Private)]

@@ -29,7 +29,7 @@ impl std::fmt::Display for ProfileScope {
     }
 }
 
-pub async fn handle_command(
+pub(crate) async fn handle_command(
     state: &AppState,
     context: &SurfaceContext,
     input: &str,
