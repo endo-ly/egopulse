@@ -12,13 +12,12 @@ src/
 ├── runtime/             # AppState 構築・チャネル起動・ライフサイクル管理
 ├── agent_loop/          # LLM 対話ターン実行・プロンプト構築・セッション管理
 ├── channels/            # チャネル実装 (TUI / CLI / Web / Discord / Telegram)
-├── web/                 # Axum Web サーバー (HTTP API / SSE / WebSocket)
 ├── llm/                 # LLM プロバイダー抽象化・Codex 認証
 ├── config/              # YAML 設定の読み込み・永続化・解決
 ├── storage/             # SQLite 永続化 (DB・マイグレーション・クエリ)
 ├── tools/               # ツールシステム (built-in + MCP)
+├── setup/               # 初回セットアップウィザード
 │
-├── channel_adapter.rs   # ChannelAdapter trait
 ├── slash_commands.rs    # スラッシュコマンド・LLM プロファイル管理
 ├── skills.rs            # スキル発見・読み込み・カタログ生成
 ├── soul_agents.rs       # SOUL.md / AGENTS.md 読み込み
