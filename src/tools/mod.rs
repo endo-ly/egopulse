@@ -4,6 +4,7 @@
 //! 7 種のファイル操作ツールと、スキル遅延読み込み用の activate_skill を提供する。
 //! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
 
+mod activate_skill;
 mod command_guard;
 mod files;
 mod mcp_adapter;
@@ -34,7 +35,7 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::llm::ToolDefinition;
-use crate::skills::{LoadedSkill, SkillManager};
+use crate::skills::SkillManager;
 
 const DEFAULT_MAX_LINES: usize = 2000;
 const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -254,73 +255,7 @@ impl ToolRegistry {
     }
 }
 
-/// Loads a skill's full instructions on demand by name.
-struct ActivateSkillTool {
-    skill_manager: Arc<SkillManager>,
-}
-
-impl ActivateSkillTool {
-    fn new(skill_manager: Arc<SkillManager>) -> Self {
-        Self { skill_manager }
-    }
-}
-
-#[async_trait]
-impl Tool for ActivateSkillTool {
-    fn name(&self) -> &str {
-        "activate_skill"
-    }
-
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "activate_skill".to_string(),
-            description: "Load the full instructions for a discovered skill. Use this when a skill from the available skills catalog matches the task.".to_string(),
-            parameters: schema_object(
-                json!({
-                    "skill_name": {
-                        "type": "string",
-                        "description": "The skill name to load"
-                    }
-                }),
-                &["skill_name"],
-            ),
-        }
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _context: &ToolExecutionContext,
-    ) -> ToolResult {
-        #[derive(serde::Deserialize)]
-        struct Params {
-            skill_name: String,
-        }
-
-        let params: Params = match parse_params(input) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-
-        match self.skill_manager.load_skill_checked(&params.skill_name) {
-            Ok(LoadedSkill {
-                metadata,
-                instructions,
-            }) => ToolResult::success(format!(
-                "# Skill: {}\n\nDescription: {}\nSkill directory: {}\n\n## Instructions\n\n{}",
-                metadata.name,
-                metadata.description,
-                metadata.dir_path.display(),
-                instructions
-            )),
-            Err(error) => ToolResult::error(error),
-        }
-    }
-}
+pub(crate) use activate_skill::ActivateSkillTool;
 
 fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
     json!({
@@ -338,11 +273,13 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
 }
 
 /// Parse tool input into a typed parameter struct.
-fn parse_params<T: serde::de::DeserializeOwned>(input: serde_json::Value) -> Result<T, ToolResult> {
+pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(
+    input: serde_json::Value,
+) -> Result<T, ToolResult> {
     serde_json::from_value(input).map_err(|e| ToolResult::error(e.to_string()))
 }
 
-fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": properties,

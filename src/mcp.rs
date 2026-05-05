@@ -188,10 +188,10 @@ fn sha2_short(input: &str) -> String {
     result[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn convert_transport(tt: &TransportType) -> crate::status::TransportType {
+fn convert_transport(tt: &TransportType) -> crate::runtime::status::TransportType {
     match tt {
-        TransportType::Stdio => crate::status::TransportType::Stdio,
-        TransportType::StreamableHttp => crate::status::TransportType::StreamableHttp,
+        TransportType::Stdio => crate::runtime::status::TransportType::Stdio,
+        TransportType::StreamableHttp => crate::runtime::status::TransportType::StreamableHttp,
     }
 }
 
@@ -300,8 +300,8 @@ impl McpManager {
     }
 
     /// 現在の接続状態をスナップショットとして返す。
-    pub fn status_snapshot(&self) -> crate::status::McpStatus {
-        let mut connected: Vec<crate::status::ConnectedMcpServer> = self
+    pub fn status_snapshot(&self) -> crate::runtime::status::McpStatus {
+        let mut connected: Vec<crate::runtime::status::ConnectedMcpServer> = self
             .servers
             .iter()
             .map(|server| {
@@ -310,7 +310,7 @@ impl McpManager {
                     .iter()
                     .map(|t| t.name.as_ref().to_string())
                     .collect();
-                crate::status::ConnectedMcpServer {
+                crate::runtime::status::ConnectedMcpServer {
                     name: server.name.clone(),
                     transport: convert_transport(&server.config.transport),
                     tools,
@@ -318,10 +318,10 @@ impl McpManager {
             })
             .collect();
 
-        let mut failed: Vec<crate::status::FailedMcpServer> = self
+        let mut failed: Vec<crate::runtime::status::FailedMcpServer> = self
             .failed_servers
             .iter()
-            .map(|server| crate::status::FailedMcpServer {
+            .map(|server| crate::runtime::status::FailedMcpServer {
                 name: server.name.clone(),
                 error: server.error.clone(),
             })
@@ -330,7 +330,7 @@ impl McpManager {
         connected.sort_by(|a, b| a.name.cmp(&b.name));
         failed.sort_by(|a, b| a.name.cmp(&b.name));
 
-        crate::status::McpStatus { connected, failed }
+        crate::runtime::status::McpStatus { connected, failed }
     }
 
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {

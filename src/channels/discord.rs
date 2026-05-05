@@ -23,11 +23,11 @@ use serenity::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
-use crate::channel_adapter::ChannelAdapter;
-use crate::channel_adapter::ConversationKind;
+use crate::channels::adapter::ChannelAdapter;
+use crate::channels::adapter::ConversationKind;
+use crate::channels::utils::text::split_text;
 use crate::config::DiscordChannelConfig;
 use crate::runtime::AppState;
-use crate::text::split_text;
 
 /// Discord API リクエストのタイムアウト (秒)。
 const DISCORD_REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -439,7 +439,7 @@ impl EventHandler for Handler {
                 Ok(resp) => match resp.error_for_status() {
                     Ok(resp) => match resp.bytes().await {
                         Ok(bytes) => {
-                            match crate::media::save_inbound_file(
+                            match crate::channels::utils::media::save_inbound_file(
                                 &workspace_dir,
                                 &attachment.filename,
                                 &bytes,
@@ -480,7 +480,8 @@ impl EventHandler for Handler {
             }
         }
 
-        let combined_text = crate::media::format_attachment_text(&saved_paths, &text);
+        let combined_text =
+            crate::channels::utils::media::format_attachment_text(&saved_paths, &text);
 
         if combined_text.is_empty() {
             return;
@@ -633,21 +634,22 @@ impl EventHandler for Handler {
 /// Discord にメッセージを送信 (2000文字制限で自動分割)。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     let http = &ctx.http;
-    if let Err(error) = crate::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
-        let mentioned_users = extract_user_mention_ids(chunk);
-        let msg = CreateMessage::new()
-            .content(chunk)
-            .allowed_mentions(CreateAllowedMentions::new().users(mentioned_users));
-        let http = http.clone();
-        Box::pin(async move {
-            channel_id
-                .send_message(&http, msg)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("Discord: failed to send message chunk: {e}"))
+    if let Err(error) =
+        crate::channels::utils::text::send_chunked(text, DISCORD_MAX_MESSAGE_LEN, |chunk| {
+            let mentioned_users = extract_user_mention_ids(chunk);
+            let msg = CreateMessage::new()
+                .content(chunk)
+                .allowed_mentions(CreateAllowedMentions::new().users(mentioned_users));
+            let http = http.clone();
+            Box::pin(async move {
+                channel_id
+                    .send_message(&http, msg)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("Discord: failed to send message chunk: {e}"))
+            })
         })
-    })
-    .await
+        .await
     {
         error!(
             channel_id = channel_id.get(),
@@ -1037,7 +1039,7 @@ mod tests {
         let user_text = "check these files";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, user_text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, user_text);
 
         // Assert
         assert!(
@@ -1057,7 +1059,7 @@ mod tests {
         let user_text = "hello world";
 
         // Act
-        let combined = crate::media::format_attachment_text(&paths, user_text);
+        let combined = crate::channels::utils::media::format_attachment_text(&paths, user_text);
 
         // Assert
         assert_eq!(combined, "hello world");

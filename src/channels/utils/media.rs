@@ -67,7 +67,7 @@ pub fn save_inbound_file(
 ///
 /// ```
 /// use std::path::PathBuf;
-/// use egopulse::media::format_attachment_text;
+/// use egopulse::channels::utils::media::format_attachment_text;
 ///
 /// let paths = vec![PathBuf::from("/tmp/photo.png")];
 /// let text = format_attachment_text(&paths, "see this");

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::channel_adapter::ChannelRegistry;
+use crate::channels::adapter::ChannelRegistry;
 use crate::error::StorageError;
 use crate::llm::ToolDefinition;
 use crate::storage::{Database, call_blocking};

@@ -954,5 +954,5 @@ fn short_uuid() -> String {
 }
 
 fn truncate_preview(value: &str) -> String {
-    crate::text::truncate_by_chars(value, 60)
+    crate::channels::utils::text::truncate_by_chars(value, 60)
 }

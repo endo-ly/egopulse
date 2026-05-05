@@ -15,12 +15,12 @@ use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
     persist_phase_once, resolve_chat_id,
 };
+use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
-use crate::web::sse::AgentEvent;
 use futures_util::future::join_all;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -1025,7 +1025,7 @@ pub(crate) fn build_state(
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
     use crate::assets::AssetStore;
-    use crate::channel_adapter::ChannelRegistry;
+    use crate::channels::adapter::ChannelRegistry;
     use crate::skills::SkillManager;
     use crate::storage::Database;
     use crate::tools::ToolRegistry;
