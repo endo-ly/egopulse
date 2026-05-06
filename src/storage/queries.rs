@@ -620,7 +620,7 @@ impl Database {
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
              WHERE agent_id = ?1
-             ORDER BY started_at DESC
+             ORDER BY started_at DESC, rowid DESC
              LIMIT ?2",
         )?;
         stmt.query_map(params![agent_id, limit], row_to_sleep_run)?
@@ -681,9 +681,7 @@ impl Database {
             ],
         )?;
         if changed == 0 {
-            return Err(StorageError::NotFound(format!(
-                "sleep_run:{run_id}"
-            )));
+            return Err(StorageError::NotFound(format!("sleep_run:{run_id}")));
         }
         Ok(id)
     }
