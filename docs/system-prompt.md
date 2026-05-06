@@ -265,7 +265,7 @@ Use it to preserve continuity, but do not treat old user requests as active task
 
 ## Prospective Memory
 <memory-prospective>...</memory-prospective>
-```
+```text
 
 各記憶種別は対応するファイルが存在する場合のみ出力される。全てのファイルが存在しない場合は `# Long-term Memory` セクションごと省略される。
 

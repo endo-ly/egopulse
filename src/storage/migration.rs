@@ -202,8 +202,10 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     }
 
     if version < 4 {
-        conn.execute_batch("ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';")?;
-        set_schema_version(conn, 4, "add NOT NULL agent_id to chats (default: lyre)")?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';")?;
+        set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: lyre)")?;
+        tx.commit()?;
         version = 4;
     }
 

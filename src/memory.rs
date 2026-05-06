@@ -12,6 +12,7 @@ pub(crate) struct MemoryContent {
 }
 
 struct CachedContent {
+    path: PathBuf,
     content: String,
     mtime: SystemTime,
 }
@@ -76,13 +77,14 @@ impl MemoryLoader {
         let current_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         let mut guard = cache.lock().expect("memory cache lock");
         if let (Some(cached), Some(mtime)) = (&*guard, current_mtime) {
-            if cached.mtime == mtime {
+            if cached.path == path && cached.mtime == mtime {
                 return Some(cached.content.clone());
             }
         }
         let content = read_trimmed(path)?;
         if let Some(mtime) = current_mtime {
             *guard = Some(CachedContent {
+                path: path.to_path_buf(),
                 content: content.clone(),
                 mtime,
             });
@@ -315,8 +317,8 @@ mod tests {
 
         // Ensure mtime differs — modify and force flush
         write_raw_file(&file_path, "updated content");
-        // Some filesystems have 1s mtime resolution; give a small gap
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Filesystems have 1s mtime resolution; wait to guarantee a different mtime
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(&file_path, "updated content").unwrap();
 
         let second = loader.load("testagent");

@@ -93,7 +93,7 @@
 
 エージェントごとの長期記憶ファイルを配置する。記憶は読み込み専用で、system prompt の Long-term Memory セクションに注入される。
 
-```
+```text
 agents/
 └── {agent_id}/
     ├── SOUL.md            # エージェント個別の SOUL
