@@ -6,8 +6,8 @@ use crate::error::StorageError;
 
 use super::{
     AgentSessionInfo, ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot,
-    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger,
-    StoredMessage, ToolCall,
+    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage,
+    ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -1518,25 +1518,14 @@ mod tests {
     ) -> String {
         ensure_memory_snapshots_table(db);
         ensure_sleep_run_exists(db, run_id, agent_id);
-        db.create_memory_snapshot(
-            run_id,
-            agent_id,
-            file,
-            "before content",
-            "after content",
-        )
-        .expect("create snapshot")
+        db.create_memory_snapshot(run_id, agent_id, file, "before content", "after content")
+            .expect("create snapshot")
     }
 
     #[test]
     fn create_memory_snapshot_inserts_record() {
         let (db, _dir) = test_db();
-        let id = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
 
         let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
         assert_eq!(snapshots.len(), 1);
@@ -1551,12 +1540,7 @@ mod tests {
     #[test]
     fn create_memory_snapshot_generates_id_and_timestamp() {
         let (db, _dir) = test_db();
-        let id = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Semantic,
-        );
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
         assert!(id.contains('-'), "UUID v4 should contain hyphens");
 
         let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
@@ -1569,32 +1553,12 @@ mod tests {
     #[test]
     fn get_snapshots_for_run() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Semantic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Prospective,
-        );
-        create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-b",
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Prospective);
+        create_test_snapshot(&db, "run-2", "agent-b", MemoryFile::Episodic);
 
         let run1_snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
         assert_eq!(run1_snapshots.len(), 3);
@@ -1616,25 +1580,10 @@ mod tests {
     #[test]
     fn get_snapshots_for_agent() {
         let (db, _dir) = test_db();
-        let id_a1 = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        let id_a1 = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let id_a2 = create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-a",
-            MemoryFile::Semantic,
-        );
-        let _id_b = create_test_snapshot(
-            &db,
-            "run-3",
-            "agent-b",
-            MemoryFile::Episodic,
-        );
+        let id_a2 = create_test_snapshot(&db, "run-2", "agent-a", MemoryFile::Semantic);
+        let _id_b = create_test_snapshot(&db, "run-3", "agent-b", MemoryFile::Episodic);
 
         let agent_a_snapshots = db
             .get_snapshots_for_agent("agent-a", 10)
@@ -1647,19 +1596,9 @@ mod tests {
     #[test]
     fn get_snapshots_filters_by_file() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Semantic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
 
         let latest_episodic = db
             .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
@@ -1677,19 +1616,9 @@ mod tests {
     #[test]
     fn get_latest_snapshot_for_file() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let id2 = create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-a",
-            MemoryFile::Episodic,
-        );
+        let id2 = create_test_snapshot(&db, "run-2", "agent-a", MemoryFile::Episodic);
 
         let latest = db
             .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)

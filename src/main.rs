@@ -157,14 +157,8 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
             }
         }
         Some(Command::Sleep { agent }) => {
-            let state =
-                runtime::build_app_state_with_path(config, resolved_config_path).await?;
-            match egopulse::sleep_batch::run_sleep_batch(
-                &state,
-                agent.as_deref(),
-            )
-            .await
-            {
+            let state = runtime::build_app_state_with_path(config, resolved_config_path).await?;
+            match egopulse::sleep_batch::run_sleep_batch(&state, agent.as_deref()).await {
                 Ok(()) => Ok(()),
                 Err(egopulse::sleep_batch::SleepBatchError::AlreadyRunning { agent_id }) => {
                     eprintln!("sleep batch already running for agent '{agent_id}'");
@@ -175,9 +169,9 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
-        Some(Command::Gateway { .. })
-        | Some(Command::Update)
-        | Some(Command::Status { .. }) => unreachable!("handled without config"),
+        Some(Command::Gateway { .. }) | Some(Command::Update) | Some(Command::Status { .. }) => {
+            unreachable!("handled without config")
+        }
         None => runtime::run_tui(config, resolved_config_path).await,
     }
 }
@@ -190,8 +184,8 @@ mod tests {
 
     #[test]
     fn sleep_command_parses_with_agent_flag() {
-        let cli: Cli = Parser::try_parse_from(["egopulse", "sleep", "--agent", "lyre"])
-            .expect("parse");
+        let cli: Cli =
+            Parser::try_parse_from(["egopulse", "sleep", "--agent", "lyre"]).expect("parse");
         match cli.command {
             Some(Command::Sleep { agent }) => {
                 assert_eq!(agent.as_deref(), Some("lyre"));

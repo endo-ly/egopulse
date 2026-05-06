@@ -43,9 +43,10 @@ pub async fn run_sleep_batch(
     let db = Arc::clone(&state.db);
 
     let agent_for_collect = resolved_agent.clone();
-    let decision =
-        call_blocking(Arc::clone(&db), move |db| collect_sleep_input(db, &agent_for_collect))
-            .await?;
+    let decision = call_blocking(Arc::clone(&db), move |db| {
+        collect_sleep_input(db, &agent_for_collect)
+    })
+    .await?;
 
     match decision {
         crate::memory::InputDecision::Skip {
@@ -62,9 +63,7 @@ pub async fn run_sleep_batch(
         }
         crate::memory::InputDecision::Proceed {
             source_chats_json, ..
-        } => {
-            execute_batch(state, db, &resolved_agent, &source_chats_json).await
-        }
+        } => execute_batch(state, db, &resolved_agent, &source_chats_json).await,
     }
 }
 
@@ -200,9 +199,7 @@ mod tests {
             skills: Arc::clone(&skills),
             tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
             mcp_manager: None,
-            assets: Arc::new(
-                crate::assets::AssetStore::new(&config.assets_dir()).expect("assets"),
-            ),
+            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
             soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
             memory_loader: Arc::new(crate::memory::MemoryLoader::new(
                 std::path::PathBuf::from(&config.state_root).join("agents"),
@@ -272,14 +269,15 @@ mod tests {
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         let run_id = &runs[0].id;
 
-        let snapshots = state
-            .db
-            .get_snapshots_for_run(run_id)
-            .expect("snapshots");
+        let snapshots = state.db.get_snapshots_for_run(run_id).expect("snapshots");
         assert_eq!(snapshots.len(), 2);
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Episodic));
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Semantic));
-        assert!(snapshots.iter().all(|s| s.content_before == s.content_after));
+        assert!(
+            snapshots
+                .iter()
+                .all(|s| s.content_before == s.content_after)
+        );
     }
 
     #[tokio::test]
