@@ -1,9 +1,13 @@
+use std::str::FromStr;
+
 use rusqlite::{OptionalExtension, params};
 
 use crate::error::StorageError;
 
 use super::{
-    ChatInfo, Database, LlmUsageLogEntry, SessionSnapshot, SessionSummary, StoredMessage, ToolCall,
+    ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot, SessionSnapshot,
+    SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, SnapshotPhase, StoredMessage,
+    ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -17,8 +21,76 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
     })
 }
 
+fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
+    let status_str: String = row.get(2)?;
+    let status = SleepRunStatus::from_str(&status_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
+    let trigger_str: String = row.get(3)?;
+    let trigger = SleepRunTrigger::from_str(&trigger_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
+    Ok(SleepRun {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        status,
+        trigger,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        source_chats_json: row.get(6)?,
+        source_digest_md: row.get(7)?,
+        phases_json: row.get(8)?,
+        summary_md: row.get(9)?,
+        input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?,
+        total_tokens: row.get(12)?,
+        error_message: row.get(13)?,
+    })
+}
+
+fn row_to_memory_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySnapshot> {
+    let phase_str: String = row.get(3)?;
+    let phase = SnapshotPhase::from_str(&phase_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
+    let file_str: String = row.get(4)?;
+    let file = MemoryFile::from_str(&file_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
+    Ok(MemorySnapshot {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        phase,
+        file,
+        content_before: row.get(5)?,
+        content_after: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Chats
+// Sleep runs
 // ---------------------------------------------------------------------------
 
 impl Database {
@@ -409,6 +481,267 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 2 DB audit queries; exercised by unit tests below, wired into runtime in Phase 3+"
+    )
+)]
+impl Database {
+    pub(crate) fn create_sleep_run(
+        &self,
+        agent_id: &str,
+        trigger: SleepRunTrigger,
+    ) -> Result<String, StorageError> {
+        let conn = self.lock_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let status = SleepRunStatus::Running.to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO sleep_runs
+                 (id, agent_id, status, trigger_type, started_at, finished_at,
+                  source_chats_json, source_digest_md, phases_json, summary_md,
+                  input_tokens, output_tokens, total_tokens, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, '[]', NULL, 0, 0, 0, NULL)",
+            params![id, agent_id, status, trigger.to_string(), started_at],
+        )?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_sleep_run_success(
+        &self,
+        id: &str,
+        source_chats_json: &str,
+        source_digest_md: Option<&str>,
+        phases_json: &str,
+        summary_md: Option<&str>,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let total_tokens = input_tokens.saturating_add(output_tokens);
+        let status = SleepRunStatus::Success.to_string();
+        let running = SleepRunStatus::Running.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_runs
+             SET status = ?1, finished_at = ?2, source_chats_json = ?3,
+                 source_digest_md = ?4, phases_json = ?5, summary_md = ?6,
+                 input_tokens = ?7, output_tokens = ?8, total_tokens = ?9
+             WHERE id = ?10 AND status = ?11",
+            params![
+                status,
+                finished_at,
+                source_chats_json,
+                source_digest_md,
+                phases_json,
+                summary_md,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                id,
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_sleep_run_failed(
+        &self,
+        id: &str,
+        error_message: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let status = SleepRunStatus::Failed.to_string();
+        let running = SleepRunStatus::Running.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_runs SET status = ?1, finished_at = ?2, error_message = ?3
+             WHERE id = ?4 AND status = ?5",
+            params![status, finished_at, error_message, id, running],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_sleep_run_skipped(&self, id: &str) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let status = SleepRunStatus::Skipped.to_string();
+        let running = SleepRunStatus::Running.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_runs SET status = ?1, finished_at = ?2 WHERE id = ?3 AND status = ?4",
+            params![status, finished_at, id, running],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_sleep_run(&self, id: &str) -> Result<Option<SleepRun>, StorageError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs WHERE id = ?1",
+            params![id],
+            row_to_sleep_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn list_sleep_runs(
+        &self,
+        agent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SleepRun>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             WHERE agent_id = ?1
+             ORDER BY started_at DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+        stmt.query_map(params![agent_id, limit], row_to_sleep_run)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn get_latest_successful_run(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<SleepRun>, StorageError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             WHERE agent_id = ?1 AND status = 'success'
+             ORDER BY finished_at DESC
+             LIMIT 1",
+            params![agent_id],
+            row_to_sleep_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Memory snapshots
+    // ---------------------------------------------------------------------------
+
+    pub(crate) fn create_memory_snapshot(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        phase: SnapshotPhase,
+        file: MemoryFile,
+        content_before: &str,
+        content_after: &str,
+    ) -> Result<String, StorageError> {
+        let conn = self.lock_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let changed = conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, phase, file, content_before, content_after, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE EXISTS (SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3)",
+            params![
+                id,
+                run_id,
+                agent_id,
+                phase.to_string(),
+                file.to_string(),
+                content_before,
+                content_after,
+                created_at,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("sleep_run:{run_id}")));
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn get_snapshots_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<MemorySnapshot>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+             FROM memory_snapshots
+             WHERE run_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        stmt.query_map(params![run_id], row_to_memory_snapshot)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn get_snapshots_for_agent(
+        &self,
+        agent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MemorySnapshot>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+             FROM memory_snapshots
+             WHERE agent_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        stmt.query_map(params![agent_id, limit], row_to_memory_snapshot)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn get_latest_snapshot_for_file(
+        &self,
+        agent_id: &str,
+        file: MemoryFile,
+    ) -> Result<Option<MemorySnapshot>, StorageError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+             FROM memory_snapshots
+             WHERE agent_id = ?1 AND file = ?2
+             ORDER BY created_at DESC
+             LIMIT 1",
+            params![agent_id, file.to_string()],
+            row_to_memory_snapshot,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 }
 
@@ -897,5 +1230,450 @@ mod tests {
         let sessions = db.list_sessions().expect("list sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent_id, "list-agent");
+    }
+
+    fn ensure_sleep_runs_table(db: &Database) {
+        let conn = db.conn.lock().expect("lock");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sleep_runs (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                trigger_type TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                source_chats_json TEXT NOT NULL DEFAULT '[]',
+                source_digest_md TEXT,
+                phases_json TEXT NOT NULL DEFAULT '[]',
+                summary_md TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT
+            )",
+        )
+        .expect("create sleep_runs table");
+    }
+
+    fn create_test_sleep_run(db: &Database, agent_id: &str) -> String {
+        ensure_sleep_runs_table(db);
+        db.create_sleep_run(agent_id, SleepRunTrigger::Manual)
+            .expect("create sleep run")
+    }
+
+    #[test]
+    fn create_sleep_run_inserts_with_running_status() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Running);
+    }
+
+    #[test]
+    fn create_sleep_run_generates_id_and_timestamp() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        assert!(id.contains('-'), "UUID v4 should contain hyphens");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert!(
+            run.started_at.contains('T'),
+            "RFC3339 timestamp should contain 'T'"
+        );
+    }
+
+    #[test]
+    fn update_sleep_run_to_success() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        db.update_sleep_run_success(
+            &id,
+            r#"[1, 2, 3]"#,
+            Some("digest-abc"),
+            r#"[{"phase":"pruning"}]"#,
+            Some("# Summary"),
+            100,
+            50,
+        )
+        .expect("update success");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Success);
+        assert!(run.finished_at.is_some());
+        assert_eq!(run.total_tokens, 150);
+        assert_eq!(run.source_chats_json, r#"[1, 2, 3]"#);
+        assert_eq!(run.source_digest_md.as_deref(), Some("digest-abc"));
+        assert_eq!(run.phases_json, r#"[{"phase":"pruning"}]"#);
+        assert_eq!(run.summary_md.as_deref(), Some("# Summary"));
+    }
+
+    #[test]
+    fn update_sleep_run_to_failed() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        db.update_sleep_run_failed(&id, "LLM timeout")
+            .expect("update failed");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Failed);
+        assert_eq!(run.error_message.as_deref(), Some("LLM timeout"));
+    }
+
+    #[test]
+    fn update_sleep_run_to_skipped() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        db.update_sleep_run_skipped(&id).expect("update skipped");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Skipped);
+    }
+
+    #[test]
+    fn get_sleep_run_by_id() {
+        let (db, _dir) = test_db();
+        let id = create_test_sleep_run(&db, "agent-a");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.id, id);
+        assert_eq!(run.agent_id, "agent-a");
+        assert_eq!(run.trigger, SleepRunTrigger::Manual);
+        assert_eq!(run.source_chats_json, "[]");
+        assert_eq!(run.phases_json, "[]");
+        assert_eq!(run.input_tokens, 0);
+        assert_eq!(run.output_tokens, 0);
+        assert_eq!(run.total_tokens, 0);
+    }
+
+    #[test]
+    fn get_sleep_run_returns_none_for_missing() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let result = db.get_sleep_run("nonexistent-id").expect("get");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_sleep_runs_by_agent() {
+        let (db, _dir) = test_db();
+
+        let _id_a1 = create_test_sleep_run(&db, "agent-a");
+        let id_a2 = create_test_sleep_run(&db, "agent-a");
+        let id_a3 = create_test_sleep_run(&db, "agent-a");
+        let _id_b1 = create_test_sleep_run(&db, "agent-b");
+
+        let runs = db.list_sleep_runs("agent-a", 2).expect("list");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, id_a3);
+        assert_eq!(runs[1].id, id_a2);
+    }
+
+    #[test]
+    fn list_sleep_runs_empty() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let runs = db.list_sleep_runs("nobody", 10).expect("list");
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn get_latest_successful_run() {
+        let (db, _dir) = test_db();
+
+        let id_1 = create_test_sleep_run(&db, "agent-a");
+        db.update_sleep_run_success(&id_1, "[]", None, "[]", None, 10, 5)
+            .expect("success 1");
+
+        let id_2 = create_test_sleep_run(&db, "agent-a");
+        db.update_sleep_run_success(&id_2, "[]", None, "[]", None, 20, 10)
+            .expect("success 2");
+
+        let latest = db
+            .get_latest_successful_run("agent-a")
+            .expect("get latest")
+            .expect("should exist");
+        assert_eq!(latest.id, id_2);
+    }
+
+    #[test]
+    fn get_latest_successful_run_returns_none() {
+        let (db, _dir) = test_db();
+        let _id = create_test_sleep_run(&db, "agent-a");
+
+        let latest = db.get_latest_successful_run("agent-a").expect("get latest");
+        assert!(latest.is_none());
+    }
+
+    fn ensure_memory_snapshots_table(db: &Database) {
+        let conn = db.conn.lock().expect("lock");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_snapshots (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                file TEXT NOT NULL,
+                content_before TEXT NOT NULL,
+                content_after TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .expect("create memory_snapshots table");
+    }
+
+    fn ensure_sleep_run_exists(db: &Database, run_id: &str, agent_id: &str) {
+        ensure_sleep_runs_table(db);
+        let conn = db.conn.lock().expect("lock");
+        conn.execute(
+            "INSERT OR IGNORE INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+             VALUES (?1, ?2, 'running', 'manual', ?3)",
+            rusqlite::params![run_id, agent_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("create sleep run for test snapshot");
+    }
+
+    fn create_test_snapshot(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        phase: SnapshotPhase,
+        file: MemoryFile,
+    ) -> String {
+        ensure_memory_snapshots_table(db);
+        ensure_sleep_run_exists(db, run_id, agent_id);
+        db.create_memory_snapshot(
+            run_id,
+            agent_id,
+            phase,
+            file,
+            "before content",
+            "after content",
+        )
+        .expect("create snapshot")
+    }
+
+    #[test]
+    fn create_memory_snapshot_inserts_record() {
+        let (db, _dir) = test_db();
+        let id = create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, id);
+        assert_eq!(snapshots[0].run_id, "run-1");
+        assert_eq!(snapshots[0].agent_id, "agent-a");
+        assert_eq!(snapshots[0].phase, SnapshotPhase::Pruning);
+        assert_eq!(snapshots[0].file, MemoryFile::Episodic);
+        assert_eq!(snapshots[0].content_before, "before content");
+        assert_eq!(snapshots[0].content_after, "after content");
+    }
+
+    #[test]
+    fn create_memory_snapshot_generates_id_and_timestamp() {
+        let (db, _dir) = test_db();
+        let id = create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Semantic,
+        );
+        assert!(id.contains('-'), "UUID v4 should contain hyphens");
+
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert!(
+            snapshots[0].created_at.contains('T'),
+            "RFC3339 timestamp should contain 'T'"
+        );
+    }
+
+    #[test]
+    fn get_snapshots_for_run() {
+        let (db, _dir) = test_db();
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Semantic,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Compression,
+            MemoryFile::Prospective,
+        );
+        create_test_snapshot(
+            &db,
+            "run-2",
+            "agent-b",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+
+        let run1_snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(run1_snapshots.len(), 3);
+        assert_eq!(run1_snapshots[0].phase, SnapshotPhase::Pruning);
+        assert_eq!(run1_snapshots[1].phase, SnapshotPhase::Consolidation);
+        assert_eq!(run1_snapshots[2].phase, SnapshotPhase::Compression);
+    }
+
+    #[test]
+    fn get_snapshots_for_run_empty() {
+        let (db, _dir) = test_db();
+        ensure_memory_snapshots_table(&db);
+        let snapshots = db
+            .get_snapshots_for_run("nonexistent")
+            .expect("get snapshots");
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn get_snapshots_for_agent() {
+        let (db, _dir) = test_db();
+        let id_a1 = create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id_a2 = create_test_snapshot(
+            &db,
+            "run-2",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Semantic,
+        );
+        let _id_b = create_test_snapshot(
+            &db,
+            "run-3",
+            "agent-b",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+
+        let agent_a_snapshots = db
+            .get_snapshots_for_agent("agent-a", 10)
+            .expect("get snapshots");
+        assert_eq!(agent_a_snapshots.len(), 2);
+        assert_eq!(agent_a_snapshots[0].id, id_a2);
+        assert_eq!(agent_a_snapshots[1].id, id_a1);
+    }
+
+    #[test]
+    fn get_snapshots_filters_by_phase() {
+        let (db, _dir) = test_db();
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Episodic,
+        );
+
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].phase, SnapshotPhase::Pruning);
+        assert_eq!(snapshots[1].phase, SnapshotPhase::Consolidation);
+    }
+
+    #[test]
+    fn get_snapshots_filters_by_file() {
+        let (db, _dir) = test_db();
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Semantic,
+        );
+
+        let latest_episodic = db
+            .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
+            .expect("get latest")
+            .expect("should exist");
+        assert_eq!(latest_episodic.file, MemoryFile::Episodic);
+
+        let latest_semantic = db
+            .get_latest_snapshot_for_file("agent-a", MemoryFile::Semantic)
+            .expect("get latest")
+            .expect("should exist");
+        assert_eq!(latest_semantic.file, MemoryFile::Semantic);
+    }
+
+    #[test]
+    fn get_latest_snapshot_for_file() {
+        let (db, _dir) = test_db();
+        create_test_snapshot(
+            &db,
+            "run-1",
+            "agent-a",
+            SnapshotPhase::Pruning,
+            MemoryFile::Episodic,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = create_test_snapshot(
+            &db,
+            "run-2",
+            "agent-a",
+            SnapshotPhase::Consolidation,
+            MemoryFile::Episodic,
+        );
+
+        let latest = db
+            .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
+            .expect("get latest")
+            .expect("should exist");
+        assert_eq!(latest.id, id2);
+    }
+
+    #[test]
+    fn get_latest_snapshot_returns_none() {
+        let (db, _dir) = test_db();
+        ensure_memory_snapshots_table(&db);
+        let result = db
+            .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
+            .expect("get latest");
+        assert!(result.is_none());
     }
 }

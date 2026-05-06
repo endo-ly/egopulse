@@ -1364,7 +1364,8 @@ agents:
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("egopulse.config.yaml");
         std::fs::write(&path, yaml).expect("write config");
-        let config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        let mut config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        config.state_root = dir.path().to_string_lossy().into_owned();
         let mut state = build_state(config, Box::new(NoOpProvider));
         state.config_path = Some(path.clone());
         (state, dir, path)
