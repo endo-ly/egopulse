@@ -290,3 +290,33 @@ pub trait ChannelAdapter: Send + Sync {
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
+| **Sleep Batch** | `sleep_batch.rs` | 手動 sleep batch の排他実行と監査記録 |
+
+### Sleep Batch（手動長期記憶処理）
+
+`egopulse sleep --agent <AGENT>` で手動実行する長期記憶のバッチ処理骨格。
+
+```text
+1. agent_id 解決（--agent 省略時は default_agent）
+       │
+2. collect_sleep_input()
+       │
+       ├─ Skip: 新規メッセージ ≤ 4 → ログ出力して終了（run レコードなし）
+       │
+       └─ Proceed: ソースセッション一覧を取得
+              │
+       3. has_running_sleep_run() で排他チェック
+              │
+              ├─ 既に running → AlreadyRunning エラー
+              │
+              └─ 未実行 → create_sleep_run()
+                     │
+              4. memory_loader.load() で記憶ファイルを読み込み
+                     │
+              5. 各ファイル（episodic/semantic/prospective）について
+                 aggregate snapshot（before == after）を保存
+                     │
+              6. update_sleep_run_success() で run を完了
+```
+
+監査スキーマは1回 LLM 呼び出し前提に整理されており、`phases_json` / `summary_md` / `memory_snapshots.phase` は持たない。

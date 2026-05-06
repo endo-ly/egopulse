@@ -31,7 +31,7 @@ egopulse.db (SQLite / WAL mode)
 | テーブル数 | 9（データテーブル 7 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 10 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v5） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v6） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -98,13 +98,11 @@ egopulse.db (SQLite / WAL mode)
         │ id (PK)          │       │ id (PK)          │
         │ agent_id         │       │ run_id           │
         │ status           │       │ agent_id         │
-        │ trigger_type     │       │ phase            │
-        │ started_at       │       │ file             │
-        │ finished_at      │       │ content_before   │
-        │ source_chats_json│       │ content_after    │
-        │ source_digest_md │       │ created_at       │
-        │ phases_json      │       └──────────────────┘
-        │ summary_md       │
+        │ trigger_type     │       │ file             │
+        │ started_at       │       │ content_before   │
+        │ finished_at      │       │ content_after    │
+        │ source_chats_json│       │ created_at       │
+        │ source_digest_md │       └──────────────────┘
         │ input_tokens     │
         │ output_tokens    │
         │ total_tokens     │
@@ -324,7 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_created
 スリープバッチ（記憶整理処理）の実行履歴。
 
 ```sql
-CREATE TABLE IF NOT EXISTS sleep_runs (
+CREATE TABLE sleep_runs (
     id                  TEXT PRIMARY KEY,
     agent_id            TEXT NOT NULL,
     status              TEXT NOT NULL,
@@ -333,18 +331,16 @@ CREATE TABLE IF NOT EXISTS sleep_runs (
     finished_at         TEXT,
     source_chats_json   TEXT NOT NULL DEFAULT '[]',
     source_digest_md    TEXT,
-    phases_json         TEXT NOT NULL DEFAULT '[]',
-    summary_md          TEXT,
     input_tokens        INTEGER NOT NULL DEFAULT 0,
     output_tokens       INTEGER NOT NULL DEFAULT 0,
     total_tokens        INTEGER NOT NULL DEFAULT 0,
     error_message       TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_started
+CREATE INDEX idx_sleep_runs_agent_started
     ON sleep_runs(agent_id, started_at);
 
-CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
+CREATE INDEX idx_sleep_runs_agent_status
     ON sleep_runs(agent_id, status);
 ```
 
@@ -358,8 +354,6 @@ CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
 | source_chats_json | TEXT | NOT NULL DEFAULT '[]' | 対象チャットID一覧（JSON配列） |
 | source_digest_md | TEXT | nullable | ソースダイジェスト（Markdown） |
-| phases_json | TEXT | NOT NULL DEFAULT '[]' | 実行フェーズ一覧（JSON配列） |
-| summary_md | TEXT | nullable | 実行サマリー（Markdown） |
 | input_tokens | INTEGER | NOT NULL DEFAULT 0 | 入力トークン数 |
 | output_tokens | INTEGER | NOT NULL DEFAULT 0 | 出力トークン数 |
 | total_tokens | INTEGER | NOT NULL DEFAULT 0 | 合計トークン数 |
@@ -367,39 +361,40 @@ CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
 
 **操作**:
 - `create_sleep_run(agent_id, trigger)` — INSERT（status=running, id/started_at 自動生成）
-- `update_sleep_run_success(id, ...)` — status=success 更新
+- `has_running_sleep_run(agent_id)` — 同一 agent で running の run が存在するか確認（排他制御用）
+- `update_sleep_run_success(id, source_chats_json, source_digest_md, input_tokens, output_tokens)` — status=success 更新
 - `update_sleep_run_failed(id, error_message)` — status=failed 更新
 - `update_sleep_run_skipped(id)` — status=skipped 更新
 - `get_sleep_run(id)` — id で取得
 - `list_sleep_runs(agent_id, limit)` — agent_id 絞り込み + started_at 降順
-- `get_latest_successful_run(agent_id)` — success の最新1件。スリープ入力収集（Phase 3）のカットオフタイムスタンプ決定にも使用
+- `get_latest_successful_run(agent_id)` — success の最新1件。スリープ入力収集のカットオフタイムスタンプ決定に使用
 
 **設計ポイント**:
 - `trigger` は SQLite 予約語のため `trigger_type` にリネーム
 - 外部キー制約なし（アプリケーション層で整合性担保）
+- 1回 LLM 呼び出し前提の監査スキーマ：`phases_json` / `summary_md` は持たない
 
 ---
 
 ### memory_snapshots
 
-スリープ実行中のメモリファイル更新履歴。各フェーズにおけるファイルの before/after を記録。
+スリープ実行中のメモリファイル更新履歴。各 run についてファイル単位の aggregate snapshot（before/after）を記録する。
 
 ```sql
-CREATE TABLE IF NOT EXISTS memory_snapshots (
+CREATE TABLE memory_snapshots (
     id              TEXT PRIMARY KEY,
     run_id          TEXT NOT NULL,
     agent_id        TEXT NOT NULL,
-    phase           TEXT NOT NULL,
     file            TEXT NOT NULL,
     content_before  TEXT NOT NULL,
     content_after   TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
+CREATE INDEX idx_memory_snapshots_run_id
     ON memory_snapshots(run_id);
 
-CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
+CREATE INDEX idx_memory_snapshots_agent_created
     ON memory_snapshots(agent_id, created_at);
 ```
 
@@ -408,17 +403,20 @@ CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
 | id | TEXT | PK | UUID v4 |
 | run_id | TEXT | NOT NULL | sleep_runs.id への参照 |
 | agent_id | TEXT | NOT NULL | エージェント識別子 |
-| phase | TEXT | NOT NULL | 実行フェーズ（pruning/consolidation/compression） |
 | file | TEXT | NOT NULL | 対象ファイル（episodic/semantic/prospective） |
 | content_before | TEXT | NOT NULL | 更新前のファイル内容 |
 | content_after | TEXT | NOT NULL | 更新後のファイル内容 |
 | created_at | TEXT | NOT NULL | 作成時刻（RFC3339） |
 
 **操作**:
-- `create_memory_snapshot(run_id, agent_id, phase, file, content_before, content_after)` — INSERT
+- `create_memory_snapshot(run_id, agent_id, file, content_before, content_after)` — INSERT
 - `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
 - `get_snapshots_for_agent(agent_id, limit)` — agent_id 絞り込み + created_at 降順
 - `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
+
+**設計ポイント**:
+- **Aggregate snapshot 方針**: 1回 LLM 呼び出し前提のため、phase ごとではなく run 単位で1ファイルにつき1件の snapshot を保存する。Phase 4 骨格実装では content_before == content_after（no-op）の snapshot を記録し、Phase 5 以降で LLM による書き換え後に差分が発生する
+- `phase` カラムは Phase 4 で削除。1回 LLM 呼び出し設計では phase ごとの中間状態が不要なため
 
 ---
 
@@ -480,8 +478,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
 | `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |
 | `LlmModelUsageSummary` | llm_usage_logs（モデル別集計） | model, requests, input_tokens, output_tokens, total_tokens |
-| `SleepRun` | sleep_runs | id, agent_id, status, trigger, started_at, finished_at, source_chats_json, source_digest_md, phases_json, summary_md, input_tokens, output_tokens, total_tokens, error_message |
-| `MemorySnapshot` | memory_snapshots | id, run_id, agent_id, phase, file, content_before, content_after, created_at |
+| `SleepRun` | sleep_runs | id, agent_id, status, trigger, started_at, finished_at, source_chats_json, source_digest_md, input_tokens, output_tokens, total_tokens, error_message |
+| `MemorySnapshot` | memory_snapshots | id, run_id, agent_id, file, content_before, content_after, created_at |
 
 ---
 
@@ -496,7 +494,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `5`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `6`）に到達したら完了。`debug_assert_eq!` で検証
 
 **新規マイグレーションの追加手順**:
 1. `SCHEMA_VERSION` 定数をインクリメント（例: `5` → `6`）
