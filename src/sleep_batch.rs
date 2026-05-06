@@ -8,7 +8,7 @@ use crate::runtime::AppState;
 use crate::storage::{Database, MemoryFile, SleepRunTrigger, call_blocking};
 
 #[derive(Debug, Error)]
-pub(crate) enum SleepBatchError {
+pub enum SleepBatchError {
     #[error("already running for agent '{agent_id}'")]
     AlreadyRunning { agent_id: String },
     #[error(transparent)]
@@ -31,7 +31,7 @@ pub(crate) enum SleepBatchError {
 ///
 /// Returns [`SleepBatchError::AlreadyRunning`] if a run is already in progress
 /// for the same agent, or [`SleepBatchError::Storage`] on database errors.
-pub(crate) async fn run_sleep_batch(
+pub async fn run_sleep_batch(
     state: &AppState,
     agent_id: Option<&str>,
 ) -> Result<(), SleepBatchError> {

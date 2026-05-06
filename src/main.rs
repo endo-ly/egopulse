@@ -1,7 +1,8 @@
 //! EgoPulse CLI エントリーポイント。
 //!
 //! `run` で有効チャネルを一括起動し、`ask` と `chat` でローカル対話を実行する。
-//! `setup` は初期設定ウィザード、`gateway` は systemd 管理、`update` は自己更新を担当する。
+//! `setup` は初期設定ウィザード、`gateway` は systemd 管理、`update` は自己更新、
+//! `sleep` は手動 sleep batch 実行を担当する。
 
 use std::path::PathBuf;
 
@@ -50,6 +51,12 @@ enum Command {
         action: Option<GatewayAction>,
     },
     Update,
+    /// Run a manual sleep batch for long-term memory processing.
+    Sleep {
+        /// Agent to run the sleep batch for (defaults to config's default_agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Show last startup status (MCP, channels, provider).
     Status {
         /// Output raw JSON instead of formatted text
@@ -149,11 +156,64 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                 Err(error) => Err(error),
             }
         }
+        Some(Command::Sleep { agent }) => {
+            let state =
+                runtime::build_app_state_with_path(config, resolved_config_path).await?;
+            match egopulse::sleep_batch::run_sleep_batch(
+                &state,
+                agent.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(egopulse::sleep_batch::SleepBatchError::AlreadyRunning { agent_id }) => {
+                    eprintln!("sleep batch already running for agent '{agent_id}'");
+                    std::process::exit(1);
+                }
+                Err(error) => Err(EgoPulseError::Internal(error.to_string())),
+            }
+        }
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
-        Some(Command::Gateway { .. }) | Some(Command::Update) | Some(Command::Status { .. }) => {
-            unreachable!("handled without config")
-        }
+        Some(Command::Gateway { .. })
+        | Some(Command::Update)
+        | Some(Command::Status { .. }) => unreachable!("handled without config"),
         None => runtime::run_tui(config, resolved_config_path).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn sleep_command_parses_with_agent_flag() {
+        let cli: Cli = Parser::try_parse_from(["egopulse", "sleep", "--agent", "lyre"])
+            .expect("parse");
+        match cli.command {
+            Some(Command::Sleep { agent }) => {
+                assert_eq!(agent.as_deref(), Some("lyre"));
+            }
+            other => panic!("expected Sleep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sleep_command_parses_without_agent_flag() {
+        let cli: Cli = Parser::try_parse_from(["egopulse", "sleep"]).expect("parse");
+        match cli.command {
+            Some(Command::Sleep { agent }) => {
+                assert!(agent.is_none());
+            }
+            other => panic!("expected Sleep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sleep_command_rejects_invalid_flags() {
+        let result = Cli::try_parse_from(["egopulse", "sleep", "--invalid"]);
+        assert!(result.is_err(), "should reject --invalid flag");
     }
 }
