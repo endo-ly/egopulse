@@ -5,9 +5,9 @@ use rusqlite::{OptionalExtension, params};
 use crate::error::StorageError;
 
 use super::{
-    ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot, SessionSnapshot,
-    SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, SnapshotPhase, StoredMessage,
-    ToolCall,
+    AgentSessionInfo, ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot,
+    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, SnapshotPhase,
+    StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -651,6 +651,99 @@ impl Database {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub(crate) fn count_agent_messages_since(
+        &self,
+        agent_id: &str,
+        since: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let conn = self.lock_conn()?;
+        if let Some(cutoff) = since {
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM messages m
+                 JOIN chats c ON m.chat_id = c.chat_id
+                 WHERE c.agent_id = ?1 AND m.timestamp > ?2",
+                params![agent_id, cutoff],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM messages m
+                 JOIN chats c ON m.chat_id = c.chat_id
+                 WHERE c.agent_id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        }
+    }
+
+    pub(crate) fn get_agent_sessions_since(
+        &self,
+        agent_id: &str,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AgentSessionInfo>, StorageError> {
+        let conn = self.lock_conn()?;
+        if let Some(cutoff) = since {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    c.chat_id,
+                    c.channel,
+                    c.external_chat_id,
+                    s.updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
+                    LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
+                 FROM chats c
+                 JOIN sessions s ON c.chat_id = s.chat_id
+                 WHERE c.agent_id = ?1 AND s.updated_at > ?2
+                 ORDER BY s.updated_at DESC
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![agent_id, cutoff, limit as i64], |row| {
+                Ok(AgentSessionInfo {
+                    chat_id: row.get(0)?,
+                    channel: row.get(1)?,
+                    external_chat_id: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    message_count: row.get(4)?,
+                    estimated_tokens: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    c.chat_id,
+                    c.channel,
+                    c.external_chat_id,
+                    s.updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
+                    LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
+                 FROM chats c
+                 JOIN sessions s ON c.chat_id = s.chat_id
+                 WHERE c.agent_id = ?1
+                 ORDER BY s.updated_at DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![agent_id, limit as i64], |row| {
+                Ok(AgentSessionInfo {
+                    chat_id: row.get(0)?,
+                    channel: row.get(1)?,
+                    external_chat_id: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    message_count: row.get(4)?,
+                    estimated_tokens: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1675,5 +1768,214 @@ mod tests {
             .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
             .expect("get latest");
         assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Agent session enumeration tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn count_agent_messages_since_counts_correctly() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:msgs-a", None, "cli", "agent-a")
+            .expect("create chat");
+
+        store_msg(&db, "msg-1", chat_id, "old", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "old2", "2024-01-01T00:00:01Z");
+        store_msg(&db, "msg-3", chat_id, "new", "2024-01-01T00:00:02Z");
+        store_msg(&db, "msg-4", chat_id, "new2", "2024-01-01T00:00:03Z");
+
+        let count = db
+            .count_agent_messages_since("agent-a", Some("2024-01-01T00:00:01Z"))
+            .expect("count");
+        assert_eq!(count, 2, "should count only messages after the cutoff");
+    }
+
+    #[test]
+    fn count_agent_messages_since_with_no_cutoff() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:no-cutoff", None, "cli", "agent-a")
+            .expect("create chat");
+
+        store_msg(&db, "msg-1", chat_id, "a", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "b", "2024-01-01T00:00:01Z");
+        store_msg(&db, "msg-3", chat_id, "c", "2024-01-01T00:00:02Z");
+
+        let count = db
+            .count_agent_messages_since("agent-a", None)
+            .expect("count");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn count_agent_messages_since_returns_zero_for_unknown_agent() {
+        let (db, _dir) = test_db();
+
+        let count = db
+            .count_agent_messages_since("nonexistent-agent", None)
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_agent_messages_since_excludes_other_agents() {
+        let (db, _dir) = test_db();
+
+        let chat_a = db
+            .resolve_or_create_chat_id("cli", "cli:chat-a", None, "cli", "agent-a")
+            .expect("create chat a");
+        let chat_b = db
+            .resolve_or_create_chat_id("cli", "cli:chat-b", None, "cli", "agent-b")
+            .expect("create chat b");
+
+        store_msg(&db, "msg-a1", chat_a, "hello", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-a2", chat_a, "world", "2024-01-01T00:00:01Z");
+        store_msg(&db, "msg-b1", chat_b, "secret", "2024-01-01T00:00:02Z");
+
+        let count = db
+            .count_agent_messages_since("agent-a", None)
+            .expect("count");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_agent_sessions_since_returns_sessions() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:sess-a", Some("sess-a"), "web", "agent-a")
+            .expect("create chat");
+
+        db.save_session(chat_id, r#"{"msgs":[]}"#)
+            .expect("save session");
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 10)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].chat_id, chat_id);
+        assert_eq!(sessions[0].channel, "web");
+        assert_eq!(sessions[0].external_chat_id, "web:sess-a");
+    }
+
+    #[test]
+    fn get_agent_sessions_since_ordered_by_updated_at_desc() {
+        let (db, _dir) = test_db();
+
+        let chat_1 = db
+            .resolve_or_create_chat_id("cli", "cli:chat-1", None, "cli", "agent-a")
+            .expect("create chat 1");
+        let chat_2 = db
+            .resolve_or_create_chat_id("cli", "cli:chat-2", None, "cli", "agent-a")
+            .expect("create chat 2");
+
+        // Create sessions with small delay so updated_at differs
+        db.save_session(chat_1, r#"{}"#).expect("save session 1");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.save_session(chat_2, r#"{}"#).expect("save session 2");
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 10)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].chat_id, chat_2, "newest first");
+        assert_eq!(sessions[1].chat_id, chat_1, "oldest second");
+    }
+
+    #[test]
+    fn get_agent_sessions_since_respects_limit() {
+        let (db, _dir) = test_db();
+
+        for i in 0..5 {
+            let chat_id = db
+                .resolve_or_create_chat_id("cli", &format!("cli:limit-{i}"), None, "cli", "agent-a")
+                .expect("create chat");
+            db.save_session(chat_id, r#"{}"#).expect("save session");
+        }
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 3)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn get_agent_sessions_since_with_no_cutoff() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:nocut", None, "cli", "agent-a")
+            .expect("create chat");
+        db.save_session(chat_id, r#"{}"#).expect("save session");
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 10)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn get_agent_sessions_since_returns_empty_for_unknown_agent() {
+        let (db, _dir) = test_db();
+
+        let sessions = db
+            .get_agent_sessions_since("nonexistent-agent", None, 10)
+            .expect("get sessions");
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn get_agent_sessions_includes_message_count() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:msgcount", None, "cli", "agent-a")
+            .expect("create chat");
+
+        store_msg(&db, "m1", chat_id, "msg 1", "2024-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "msg 2", "2024-01-01T00:00:01Z");
+        store_msg(&db, "m3", chat_id, "msg 3", "2024-01-01T00:00:02Z");
+
+        db.save_session(chat_id, r#"{}"#).expect("save session");
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 10)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].message_count, 3);
+    }
+
+    #[test]
+    fn get_agent_sessions_includes_estimated_tokens() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:tokcount", None, "cli", "agent-a")
+            .expect("create chat");
+
+        // Use a known-length session JSON: 30 chars → estimated_tokens = 30/3 = 10
+        let session_json = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 30 'A' chars
+        assert_eq!(
+            session_json.len(),
+            30,
+            "test fixture should be exactly 30 chars"
+        );
+
+        db.save_session(chat_id, session_json)
+            .expect("save session");
+
+        let sessions = db
+            .get_agent_sessions_since("agent-a", None, 10)
+            .expect("get sessions");
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].estimated_tokens > 0);
+        assert_eq!(
+            sessions[0].estimated_tokens,
+            (session_json.len() as i64) / 3
+        );
     }
 }
