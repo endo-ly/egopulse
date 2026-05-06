@@ -157,6 +157,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
 - `resolve_or_create_chat_id(channel, external_chat_id, chat_title, chat_type)` — Upsert（`ON CONFLICT DO UPDATE`）
 - `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
+- `count_agent_messages_since(agent_id, since: Option<&str>)` — agent の新規メッセージ数をカウント（JOIN messages + chats）
+- `get_agent_sessions_since(agent_id, since: Option<&str>, limit)` — agent のセッション一覧を updated_at 降順で取得（JOIN chats + sessions）。message_count と estimated_tokens（chars/3 近似）を含む
 
 ---
 
@@ -370,7 +372,7 @@ CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
 - `update_sleep_run_skipped(id)` — status=skipped 更新
 - `get_sleep_run(id)` — id で取得
 - `list_sleep_runs(agent_id, limit)` — agent_id 絞り込み + started_at 降順
-- `get_latest_successful_run(agent_id)` — success の最新1件
+- `get_latest_successful_run(agent_id)` — success の最新1件。スリープ入力収集（Phase 3）のカットオフタイムスタンプ決定にも使用
 
 **設計ポイント**:
 - `trigger` は SQLite 予約語のため `trigger_type` にリネーム
@@ -474,6 +476,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
 | `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
+| `AgentSessionInfo` | chats + sessions（JOIN） | chat_id, channel, external_chat_id, updated_at, message_count, estimated_tokens |
 | `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
 | `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |
 | `LlmModelUsageSummary` | llm_usage_logs（モデル別集計） | model, requests, input_tokens, output_tokens, total_tokens |
