@@ -95,6 +95,7 @@ impl MemoryLoader {
 
 #[allow(dead_code)]
 fn safe_agent_id(id: &str) -> bool {
+    let id = id.trim();
     !id.is_empty()
         && !id.contains("..")
         && !id.contains('/')
