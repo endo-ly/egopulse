@@ -21,7 +21,6 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
     })
 }
 
-#[allow(dead_code)]
 fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
     let status_str: String = row.get(2)?;
     let status = SleepRunStatus::from_str(&status_str).map_err(|e| {
@@ -485,7 +484,13 @@ impl Database {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 2 DB audit queries; exercised by unit tests below, wired into runtime in Phase 3+"
+    )
+)]
 impl Database {
     pub(crate) fn create_sleep_run(
         &self,
