@@ -24,6 +24,7 @@ struct CachedContent {
 #[allow(dead_code)]
 pub(crate) struct MemoryLoader {
     agents_dir: PathBuf,
+    // TODO: Phase 2 で HashMap<PathBuf, CachedContent> に移行（マルチエージェント時にスラッシュ防止）
     episodic_cache: Mutex<Option<CachedContent>>,
     semantic_cache: Mutex<Option<CachedContent>>,
     prospective_cache: Mutex<Option<CachedContent>>,
@@ -45,6 +46,7 @@ impl MemoryLoader {
     /// Reads `agents/{agent_id}/memory/{episodic,semantic,prospective}.md`.
     /// Returns `None` if all files are missing or empty.
     pub(crate) fn load(&self, agent_id: &str) -> Option<MemoryContent> {
+        let agent_id = agent_id.trim();
         if !safe_agent_id(agent_id) {
             return None;
         }
