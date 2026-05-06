@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 4;
+pub(super) const SCHEMA_VERSION: i64 = 5;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -209,6 +209,56 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 4;
     }
 
+    if version < 5 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sleep_runs (
+                id                  TEXT PRIMARY KEY,
+                agent_id            TEXT NOT NULL,
+                status              TEXT NOT NULL,
+                trigger_type        TEXT NOT NULL,
+                started_at          TEXT NOT NULL,
+                finished_at         TEXT,
+                source_chats_json   TEXT NOT NULL DEFAULT '[]',
+                source_digest_md    TEXT,
+                phases_json         TEXT NOT NULL DEFAULT '[]',
+                summary_md          TEXT,
+                input_tokens        INTEGER NOT NULL DEFAULT 0,
+                output_tokens       INTEGER NOT NULL DEFAULT 0,
+                total_tokens        INTEGER NOT NULL DEFAULT 0,
+                error_message       TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_started
+                ON sleep_runs(agent_id, started_at);
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
+                ON sleep_runs(agent_id, status);
+
+            CREATE TABLE IF NOT EXISTS memory_snapshots (
+                id              TEXT PRIMARY KEY,
+                run_id          TEXT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                phase           TEXT NOT NULL,
+                file            TEXT NOT NULL,
+                content_before  TEXT NOT NULL,
+                content_after   TEXT NOT NULL,
+                created_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
+                ON memory_snapshots(run_id);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
+                ON memory_snapshots(agent_id, created_at);",
+        )?;
+        set_schema_version(
+            conn,
+            5,
+            "add sleep_runs and memory_snapshots tables for long-term memory audit",
+        )?;
+        version = 5;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -237,7 +287,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
@@ -246,6 +296,8 @@ mod tests {
         assert!(rows[2].1.contains("tool call"));
         assert_eq!(rows[3].0, 4);
         assert!(rows[3].1.contains("agent_id"));
+        assert_eq!(rows[4].0, 5);
+        assert!(rows[4].1.contains("sleep_runs"));
     }
 
     #[test]
@@ -454,5 +506,218 @@ mod tests {
             )
             .expect("check table");
         assert!(table_exists);
+    }
+
+    #[test]
+    fn migration_v5_creates_sleep_runs_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn migration_v5_creates_memory_snapshots_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn migration_v5_creates_four_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+
+        let expected_indexes = [
+            "idx_sleep_runs_agent_started",
+            "idx_sleep_runs_agent_status",
+            "idx_memory_snapshots_run_id",
+            "idx_memory_snapshots_agent_created",
+        ];
+
+        for index_name in &expected_indexes {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [index_name],
+                    |row| row.get(0),
+                )
+                .expect("check index");
+            assert!(exists, "expected index {index_name} to exist");
+        }
+    }
+
+    #[test]
+    fn migration_v5_history_is_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let has_v5: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 5",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v5 record");
+        assert!(has_v5);
+    }
+
+    #[test]
+    fn migration_v5_from_v4_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // Create a full v4 DB with known data
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '4');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (4, '2025-01-01T00:00:00Z', 'test v4');
+                 CREATE TABLE IF NOT EXISTS chats (
+                     chat_id INTEGER PRIMARY KEY,
+                     chat_title TEXT,
+                     chat_type TEXT NOT NULL DEFAULT 'private',
+                     last_message_time TEXT NOT NULL,
+                     channel TEXT,
+                     external_chat_id TEXT,
+                     agent_id TEXT NOT NULL DEFAULT 'lyre'
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     is_from_bot INTEGER NOT NULL DEFAULT 0,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     chat_id INTEGER PRIMARY KEY,
+                     messages_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     tool_input TEXT NOT NULL,
+                     tool_output TEXT,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id, message_id),
+                     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     chat_id INTEGER NOT NULL,
+                     caller_channel TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL,
+                     total_tokens INTEGER NOT NULL,
+                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                     created_at TEXT NOT NULL
+                 );
+                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
+                 VALUES (42, 'v4 chat', 'group', '2025-06-15T12:00:00Z');",
+            )
+            .expect("create v4 schema");
+        }
+
+        // Open with Database::new() which runs migrations including v5
+        let db = super::super::Database::new(&db_path).expect("reopen");
+        let conn = db.conn.lock().expect("lock");
+
+        // Verify sleep_runs table exists
+        let sleep_runs_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check sleep_runs table");
+        assert!(sleep_runs_exists);
+
+        // Verify memory_snapshots table exists
+        let memory_snapshots_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check memory_snapshots table");
+        assert!(memory_snapshots_exists);
+
+        // Verify schema_migrations has version 5 record
+        let has_v5: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 5",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v5 record");
+        assert!(has_v5);
+    }
+
+    #[test]
+    fn migration_v5_from_fresh_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+
+        // Verify all tables from v1-v5 exist
+        let expected_tables = [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+            "sleep_runs",
+            "memory_snapshots",
+        ];
+
+        for table_name in &expected_tables {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table_name],
+                    |row| row.get(0),
+                )
+                .expect("check table");
+            assert!(exists, "expected table {table_name} to exist");
+        }
     }
 }
