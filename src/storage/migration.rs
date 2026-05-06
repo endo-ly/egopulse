@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 5;
+pub(super) const SCHEMA_VERSION: i64 = 6;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -259,6 +259,56 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 5;
     }
 
+    if version < 6 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS memory_snapshots;
+             DROP TABLE IF EXISTS sleep_runs;
+
+             CREATE TABLE sleep_runs (
+                 id                  TEXT PRIMARY KEY,
+                 agent_id            TEXT NOT NULL,
+                 status              TEXT NOT NULL,
+                 trigger_type        TEXT NOT NULL,
+                 started_at          TEXT NOT NULL,
+                 finished_at         TEXT,
+                 source_chats_json   TEXT NOT NULL DEFAULT '[]',
+                 source_digest_md    TEXT,
+                 input_tokens        INTEGER NOT NULL DEFAULT 0,
+                 output_tokens       INTEGER NOT NULL DEFAULT 0,
+                 total_tokens        INTEGER NOT NULL DEFAULT 0,
+                 error_message       TEXT
+             );
+
+             CREATE INDEX idx_sleep_runs_agent_started
+                 ON sleep_runs(agent_id, started_at);
+
+             CREATE INDEX idx_sleep_runs_agent_status
+                 ON sleep_runs(agent_id, status);
+
+             CREATE TABLE memory_snapshots (
+                 id              TEXT PRIMARY KEY,
+                 run_id          TEXT NOT NULL,
+                 agent_id        TEXT NOT NULL,
+                 file            TEXT NOT NULL,
+                 content_before  TEXT NOT NULL,
+                 content_after   TEXT NOT NULL,
+                 created_at      TEXT NOT NULL
+             );
+
+             CREATE INDEX idx_memory_snapshots_run_id
+                 ON memory_snapshots(run_id);
+
+             CREATE INDEX idx_memory_snapshots_agent_created
+                 ON memory_snapshots(agent_id, created_at);",
+        )?;
+        set_schema_version(
+            conn,
+            6,
+            "simplify sleep batch audit schema: remove phases_json, summary_md, phase",
+        )?;
+        version = 6;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -287,7 +337,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
@@ -298,6 +348,8 @@ mod tests {
         assert!(rows[3].1.contains("agent_id"));
         assert_eq!(rows[4].0, 5);
         assert!(rows[4].1.contains("sleep_runs"));
+        assert_eq!(rows[5].0, 6);
+        assert!(rows[5].1.contains("simplify"));
     }
 
     #[test]
@@ -698,7 +750,7 @@ mod tests {
 
         let conn = db.conn.lock().expect("lock");
 
-        // Verify all tables from v1-v5 exist
+        // Verify all tables from v1-v6 exist
         let expected_tables = [
             "chats",
             "messages",
@@ -719,5 +771,73 @@ mod tests {
                 .expect("check table");
             assert!(exists, "expected table {table_name} to exist");
         }
+    }
+
+    #[test]
+    fn migration_sleep_runs_has_no_phases_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sleep_runs') WHERE name = 'phases_json'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check column");
+        assert!(!has_column, "sleep_runs should not have phases_json column");
+    }
+
+    #[test]
+    fn migration_sleep_runs_has_no_summary_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sleep_runs') WHERE name = 'summary_md'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check column");
+        assert!(!has_column, "sleep_runs should not have summary_md column");
+    }
+
+    #[test]
+    fn migration_memory_snapshots_has_no_phase() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('memory_snapshots') WHERE name = 'phase'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check column");
+        assert!(!has_column, "memory_snapshots should not have phase column");
+    }
+
+    #[test]
+    fn migration_v6_history_is_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+        let has_v6: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 6",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v6 record");
+        assert!(has_v6);
     }
 }
