@@ -194,6 +194,8 @@ pub enum StorageError {
     SessionSnapshotConflict,
     #[error("storage_not_found: {0}")]
     NotFound(String),
+    #[error("storage_conflict: {0}")]
+    Conflict(String),
 }
 
 /// Channel (Web / Discord / Telegram) operational errors.

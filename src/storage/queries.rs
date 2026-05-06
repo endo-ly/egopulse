@@ -523,13 +523,14 @@ impl Database {
         let finished_at = chrono::Utc::now().to_rfc3339();
         let total_tokens = input_tokens.saturating_add(output_tokens);
         let status = SleepRunStatus::Success.to_string();
+        let running = SleepRunStatus::Running.to_string();
 
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE sleep_runs
              SET status = ?1, finished_at = ?2, source_chats_json = ?3,
                  source_digest_md = ?4, phases_json = ?5, summary_md = ?6,
                  input_tokens = ?7, output_tokens = ?8, total_tokens = ?9
-             WHERE id = ?10",
+             WHERE id = ?10 AND status = ?11",
             params![
                 status,
                 finished_at,
@@ -541,8 +542,14 @@ impl Database {
                 output_tokens,
                 total_tokens,
                 id,
+                running,
             ],
         )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
         Ok(())
     }
 
@@ -554,12 +561,18 @@ impl Database {
         let conn = self.lock_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = SleepRunStatus::Failed.to_string();
+        let running = SleepRunStatus::Running.to_string();
 
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE sleep_runs SET status = ?1, finished_at = ?2, error_message = ?3
-             WHERE id = ?4",
-            params![status, finished_at, error_message, id],
+             WHERE id = ?4 AND status = ?5",
+            params![status, finished_at, error_message, id, running],
         )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
         Ok(())
     }
 
@@ -567,11 +580,17 @@ impl Database {
         let conn = self.lock_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = SleepRunStatus::Skipped.to_string();
+        let running = SleepRunStatus::Running.to_string();
 
-        conn.execute(
-            "UPDATE sleep_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
-            params![status, finished_at, id],
+        let changed = conn.execute(
+            "UPDATE sleep_runs SET status = ?1, finished_at = ?2 WHERE id = ?3 AND status = ?4",
+            params![status, finished_at, id, running],
         )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{id} is not running"
+            )));
+        }
         Ok(())
     }
 
@@ -620,7 +639,7 @@ impl Database {
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
              WHERE agent_id = ?1 AND status = 'success'
-             ORDER BY started_at DESC
+             ORDER BY finished_at DESC
              LIMIT 1",
             params![agent_id],
             row_to_sleep_run,
@@ -646,9 +665,10 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
 
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO memory_snapshots (id, run_id, agent_id, phase, file, content_before, content_after, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE EXISTS (SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3)",
             params![
                 id,
                 run_id,
@@ -660,6 +680,11 @@ impl Database {
                 created_at,
             ],
         )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!(
+                "sleep_run:{run_id}"
+            )));
+        }
         Ok(id)
     }
 
@@ -1400,6 +1425,17 @@ mod tests {
         .expect("create memory_snapshots table");
     }
 
+    fn ensure_sleep_run_exists(db: &Database, run_id: &str, agent_id: &str) {
+        ensure_sleep_runs_table(db);
+        let conn = db.conn.lock().expect("lock");
+        conn.execute(
+            "INSERT OR IGNORE INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+             VALUES (?1, ?2, 'running', 'manual', ?3)",
+            rusqlite::params![run_id, agent_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("create sleep run for test snapshot");
+    }
+
     fn create_test_snapshot(
         db: &Database,
         run_id: &str,
@@ -1408,6 +1444,7 @@ mod tests {
         file: MemoryFile,
     ) -> String {
         ensure_memory_snapshots_table(db);
+        ensure_sleep_run_exists(db, run_id, agent_id);
         db.create_memory_snapshot(
             run_id,
             agent_id,
