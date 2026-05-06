@@ -53,6 +53,16 @@ pub(crate) struct SessionSnapshot {
     pub recent_messages: Vec<StoredMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct AgentSessionInfo {
+    pub chat_id: i64,
+    pub channel: String,
+    pub external_chat_id: String,
+    pub updated_at: String,
+    pub message_count: i64,
+    pub estimated_tokens: i64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCall {
     pub id: String,
