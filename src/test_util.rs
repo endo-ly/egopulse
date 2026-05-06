@@ -10,6 +10,7 @@ use crate::config::{
     AgentConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId,
     secret_ref::ResolvedValue,
 };
+use crate::memory::MemoryLoader;
 use crate::runtime::AppState;
 use crate::skills::SkillManager;
 use crate::storage::Database;
@@ -84,6 +85,9 @@ pub(crate) fn build_state_with_provider(
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
+        memory_loader: Arc::new(MemoryLoader::new(
+            std::path::PathBuf::from(&config.state_root).join("agents"),
+        )),
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }

@@ -42,7 +42,7 @@ impl Database {
     pub(crate) fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
         let conn = self.lock_conn()?;
         match conn.query_row(
-            "SELECT channel, external_chat_id, chat_type FROM chats WHERE chat_id = ?1 LIMIT 1",
+            "SELECT channel, external_chat_id, chat_type, agent_id FROM chats WHERE chat_id = ?1 LIMIT 1",
             params![chat_id],
             |row| {
                 Ok(ChatInfo {
@@ -50,6 +50,7 @@ impl Database {
                     channel: row.get(0)?,
                     external_chat_id: row.get(1)?,
                     chat_type: row.get(2)?,
+                    agent_id: row.get(3)?,
                 })
             },
         ) {
@@ -65,6 +66,7 @@ impl Database {
         external_chat_id: &str,
         chat_title: Option<&str>,
         chat_type: &str,
+        agent_id: &str,
     ) -> Result<i64, StorageError> {
         let conn = self.lock_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -79,9 +81,10 @@ impl Database {
                     "UPDATE chats
                      SET chat_title = COALESCE(?2, chat_title),
                          chat_type = ?3,
-                         last_message_time = ?4
+                         last_message_time = ?4,
+                         agent_id = COALESCE(agent_id, ?5)
                      WHERE chat_id = ?1",
-                    params![chat_id, chat_title, chat_type, now],
+                    params![chat_id, chat_title, chat_type, now, agent_id],
                 )?;
                 return Ok(chat_id);
             }
@@ -90,13 +93,14 @@ impl Database {
         }
 
         conn.execute(
-            "INSERT INTO chats(chat_title, chat_type, last_message_time, channel, external_chat_id)
-             VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO chats(chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(channel, external_chat_id) DO UPDATE SET
                 chat_title = COALESCE(excluded.chat_title, chats.chat_title),
                 chat_type = excluded.chat_type,
-                last_message_time = excluded.last_message_time",
-            params![chat_title, chat_type, now, channel, external_chat_id],
+                last_message_time = excluded.last_message_time,
+                agent_id = COALESCE(chats.agent_id, excluded.agent_id)",
+            params![chat_title, chat_type, now, channel, external_chat_id, agent_id],
         )?;
         conn.query_row(
             "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
@@ -121,7 +125,8 @@ impl Database {
                     WHERE m.chat_id = c.chat_id
                     ORDER BY m.timestamp DESC
                     LIMIT 1
-                ) AS last_message_preview
+                ) AS last_message_preview,
+                c.agent_id
              FROM chats c
              ORDER BY c.last_message_time DESC, c.chat_id DESC",
         )?;
@@ -140,6 +145,7 @@ impl Database {
                 chat_title,
                 last_message_time: row.get(4)?,
                 last_message_preview: row.get(5)?,
+                agent_id: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -626,10 +632,10 @@ mod tests {
         let (db, _dir) = test_db();
 
         let first = db
-            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("local-dev"), "cli")
+            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("local-dev"), "cli", "default")
             .expect("create chat");
         let second = db
-            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("renamed"), "cli")
+            .resolve_or_create_chat_id("cli", "cli:local-dev", Some("renamed"), "cli", "default")
             .expect("reuse chat");
 
         assert_eq!(first, second);
@@ -641,7 +647,7 @@ mod tests {
         let (db, _dir) = test_db();
 
         let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:demo", Some("demo"), "cli")
+            .resolve_or_create_chat_id("cli", "cli:demo", Some("demo"), "cli", "default")
             .expect("create chat");
         store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
         db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
@@ -659,6 +665,7 @@ mod tests {
                 &format!("cli:{}", sessions[0].surface_thread),
                 sessions[0].chat_title.as_deref(),
                 "cli",
+                "default",
             )
             .expect("reopen chat");
         assert_eq!(reopened_chat_id, chat_id);
@@ -668,7 +675,7 @@ mod tests {
     fn update_tool_call_output_fails_when_tool_call_is_missing() {
         let (db, _dir) = test_db();
         let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
             .expect("create chat");
 
         let error = db
@@ -687,7 +694,7 @@ mod tests {
     fn update_tool_call_output_updates_existing_record() {
         let (db, _dir) = test_db();
         let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
             .expect("create chat");
         let tool_call = ToolCall {
             id: "tool-1".to_string(),
@@ -718,7 +725,7 @@ mod tests {
     fn tool_call_ids_are_scoped_by_message() {
         let (db, _dir) = test_db();
         let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web")
+            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
             .expect("create chat");
         let first = ToolCall {
             id: "tool-1".to_string(),
@@ -797,5 +804,98 @@ mod tests {
             .expect("log usage");
 
         assert!(row_id > 0);
+    }
+
+    #[test]
+    fn resolve_or_create_chat_id_sets_agent_id() {
+        let (db, _dir) = test_db();
+
+        db.resolve_or_create_chat_id("cli", "cli:mybot", Some("mybot"), "cli", "mybot")
+            .expect("create chat");
+
+        let info = db
+            .get_chat_by_id(
+                db.resolve_or_create_chat_id("cli", "cli:mybot", Some("mybot"), "cli", "mybot")
+                    .expect("chat id"),
+            )
+            .expect("chat info")
+            .expect("chat should exist");
+
+        assert_eq!(info.agent_id, "mybot");
+    }
+
+    #[test]
+    fn resolve_or_create_chat_id_preserves_agent_id_on_update() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id(
+                "cli",
+                "cli:persist-agent",
+                Some("persist-agent"),
+                "cli",
+                "agent_a",
+            )
+            .expect("create with agent_a");
+
+        let second_id = db
+            .resolve_or_create_chat_id(
+                "cli",
+                "cli:persist-agent",
+                Some("persist-agent"),
+                "cli",
+                "agent_b",
+            )
+            .expect("reuse chat");
+
+        assert_eq!(second_id, chat_id);
+
+        let info = db
+            .get_chat_by_id(chat_id)
+            .expect("chat info")
+            .expect("chat should exist");
+
+        assert_eq!(info.agent_id, "agent_a");
+    }
+
+    #[test]
+    fn get_chat_by_id_returns_agent_id() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:agent-test",
+                Some("agent-test"),
+                "web",
+                "custom-agent",
+            )
+            .expect("create chat");
+
+        let info = db
+            .get_chat_by_id(chat_id)
+            .expect("get chat")
+            .expect("chat should exist");
+
+        assert_eq!(info.agent_id, "custom-agent");
+    }
+
+    #[test]
+    fn list_sessions_includes_agent_id() {
+        let (db, _dir) = test_db();
+
+        db.resolve_or_create_chat_id(
+            "cli",
+            "cli:session-agent",
+            Some("session-agent"),
+            "cli",
+            "list-agent",
+        )
+        .expect("create chat");
+        store_msg(&db, "msg-1", 1, "hello", "2024-01-01T00:00:00Z");
+
+        let sessions = db.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent_id, "list-agent");
     }
 }

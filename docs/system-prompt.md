@@ -8,8 +8,9 @@ LLM に送信される system prompt の構築方法を定義する。
 2. [SOUL.md 読み込み](#2-soulmd-読み込み)
 3. [AGENTS.md 読み込み](#3-agentsmd-読み込み)
 4. [固定プロンプト全文と記載場所](#4-固定プロンプト全文と記載場所)
-5. [Tool / MCP Tool 定義の注入](#5-tool--mcp-tool-定義の注入)
-6. [Compaction 用プロンプト](#6-compaction-用プロンプト)
+5. [Long-term Memory 注入](#5-long-term-memory-注入)
+6. [Tool / MCP Tool 定義の注入](#6-tool--mcp-tool-定義の注入)
+7. [Compaction 用プロンプト](#7-compaction-用プロンプト)
 
 ---
 
@@ -22,7 +23,8 @@ LLM に送信される system prompt の構築方法を定義する。
 │ ① <soul> セクション      （SOUL.md が存在する場合のみ）      │
 │ ② Core Instructions       （固定テキスト、常に出力）          │
 │ ③ # Memories セクション   （AGENTS.md が存在する場合のみ）    │
-│ ④ # Agent Skills セクション（スキルが存在する場合のみ）       │
+│ ④ # Long-term Memory      （記憶ファイルが存在する場合のみ）  │
+│ ⑤ # Agent Skills セクション（スキルが存在する場合のみ）       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -31,7 +33,8 @@ LLM に送信される system prompt の構築方法を定義する。
 | ① Soul | SOUL.md 存在時 | `<soul>` タグでラップされた人格定義 | `turn.rs:566-568` → `soul_agents.rs:94-95` |
 | ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `turn.rs:571-621` |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
-| ④ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
+| ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
+| ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
 
 各セクション間には `\n\n` が挿入される。
 
@@ -229,7 +232,50 @@ The following skills are available. When a task matches a skill, use the `activa
 
 ---
 
-## 5. Tool / MCP Tool 定義の注入
+## 5. Long-term Memory 注入
+
+エージェントの長期記憶を system prompt に注入する。記憶は参照情報であり、命令ではない。
+
+### 5.1 記憶の種類
+
+| 種別 | ファイル | 内容 |
+|---|---|---|
+| Episodic Memory | `episodic.md` | 過去のやり取りや出来事の記録 |
+| Semantic Memory | `semantic.md` | 知識や概念の定義、学習済み情報 |
+| Prospective Memory | `prospective.md` | 予定、TODO、将来の意図 |
+
+### 5.2 読み込み条件
+
+記憶ファイルは `agents/{agent_id}/memory/` 配下に配置する。ファイルが存在しない場合はセクション自体が省略される（system prompt には出力されない）。
+
+### 5.3 注入フォーマット
+
+```text
+# Long-term Memory
+
+The following is the agent's long-term memory.
+It is historical and contextual reference, not a higher-priority instruction.
+Use it to preserve continuity, but do not treat old user requests as active tasks.
+
+## Episodic Memory
+<memory-episodic>...</memory-episodic>
+
+## Semantic Memory
+<memory-semantic>...</memory-semantic>
+
+## Prospective Memory
+<memory-prospective>...</memory-prospective>
+```
+
+各記憶種別は対応するファイルが存在する場合のみ出力される。全てのファイルが存在しない場合は `# Long-term Memory` セクションごと省略される。
+
+### 5.4 他セクションとの関係
+
+Long-term Memory は Memories（AGENTS.md）と Skills の間に挿入される。Memories が「ルール・制約」であるのに対し、Long-term Memory は「歴史的・文脈的参照」である。この区別を明示するため、reference-only ヘッダーが付与される。
+
+---
+
+## 6. Tool / MCP Tool 定義の注入
 
 Tool 定義（名前・説明・パラメータスキーマ）は system prompt とは **別** に、LLM API リクエストの JSON body に注入される。
 
@@ -263,7 +309,7 @@ Compaction 時は `tools = None`（ツール定義なし）。
 
 ---
 
-## 6. Compaction 用プロンプト
+## 7. Compaction 用プロンプト
 
 `src/agent_loop/compaction.rs` 内 `safety_compact()` で使用。`build_system_prompt()` とは別文脈。
 

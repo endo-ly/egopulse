@@ -155,6 +155,7 @@ mod tests {
                 "cli:declarative-guard",
                 Some("declarative-guard"),
                 "cli",
+                "default",
             )
         })
         .await

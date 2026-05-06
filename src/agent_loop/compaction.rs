@@ -945,6 +945,7 @@ mod tests {
                 "cli:compaction-success",
                 Some("compaction-success"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1043,6 +1044,7 @@ mod tests {
                 "cli:compaction-fallback",
                 Some("compaction-fallback"),
                 "cli",
+                "default",
             )
         })
         .await
@@ -1251,6 +1253,7 @@ mod tests {
                 "cli:compaction-usage",
                 Some("compaction-usage"),
                 "cli",
+                "default",
             )
         })
         .await

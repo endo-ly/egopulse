@@ -30,7 +30,11 @@
 │   │   └── SOUL.md
 │   └── alice/
 │       ├── SOUL.md
-│       └── AGENTS.md
+│       ├── AGENTS.md
+│       └── memory/
+│           ├── episodic.md
+│           ├── semantic.md
+│           └── prospective.md
 │
 ├── skills/
 │   └── pdf/SKILL.md
@@ -81,9 +85,30 @@
 | `SOUL.md` | デフォルト人格定義。system prompt の先頭に注入される |
 | `souls/` | 複数人格定義。チャネルやチャットに人格を紐付ける場合に使用 |
 | `AGENTS.md` | グローバルルール。全チャットで共有 |
-| `agents/` | エージェント別設定。各 `agents/{agent_id}/` 配下に SOUL.md / AGENTS.md を配置 |
+| `agents/` | エージェント別設定。各 `agents/{agent_id}/` 配下に SOUL.md / AGENTS.md / memory/ を配置 |
 | `mcp.json` | MCP サーバー定義 |
 | `mcp.d/` | MCP 追加設定ファイル群 |
+
+#### agents/{agent_id}/memory/ — 長期記憶（Phase 1）
+
+エージェントごとの長期記憶ファイルを配置する。記憶は読み込み専用で、system prompt の Long-term Memory セクションに注入される。
+
+```text
+agents/
+└── {agent_id}/
+    ├── SOUL.md            # エージェント個別の SOUL
+    ├── AGENTS.md          # エージェント個別の Memories
+    └── memory/            # 長期記憶（Phase 1）
+        ├── episodic.md    # エピソード記憶
+        ├── semantic.md    # 意味記憶
+        └── prospective.md # 展望記憶
+```
+
+| ファイル | 内容 | 備考 |
+|---|---|---|
+| `episodic.md` | 過去のやり取りや出来事の記録 | 存在しない場合はセクションごと省略 |
+| `semantic.md` | 知識や概念の定義、学習済み情報 | 存在しない場合はセクションごと省略 |
+| `prospective.md` | 予定、TODO、将来の意図 | 存在しない場合はセクションごと省略 |
 
 ### 2.2 skills/ — 組み込みスキル
 

@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -201,6 +201,14 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 3;
     }
 
+    if version < 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';")?;
+        set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: lyre)")?;
+        tx.commit()?;
+        version = 4;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -229,13 +237,15 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
         assert!(rows[1].1.contains("llm_usage_logs"));
         assert_eq!(rows[2].0, 3);
         assert!(rows[2].1.contains("tool call"));
+        assert_eq!(rows[3].0, 4);
+        assert!(rows[3].1.contains("agent_id"));
     }
 
     #[test]
@@ -264,6 +274,143 @@ mod tests {
             .expect("check indexes");
 
         assert_eq!(index_count, 2);
+    }
+
+    #[test]
+    fn migration_v4_adds_agent_id_to_chats() {
+        let db = test_db();
+
+        let conn = db.conn.lock().expect("lock");
+        let has_agent_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('chats') WHERE name = 'agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check column");
+        assert!(has_agent_id);
+    }
+
+    #[test]
+    fn migration_v4_agent_id_is_not_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // Create a v3 DB with a chats row (no agent_id column)
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '3');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (3, '2025-01-01T00:00:00Z', 'test v3');
+                 CREATE TABLE IF NOT EXISTS chats (
+                     chat_id INTEGER PRIMARY KEY,
+                     chat_title TEXT,
+                     chat_type TEXT NOT NULL DEFAULT 'private',
+                     last_message_time TEXT NOT NULL,
+                     channel TEXT,
+                     external_chat_id TEXT
+                 );
+                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
+                 VALUES (1, 'test chat', 'private', '2025-01-01T00:00:00Z');",
+            )
+            .expect("create v3 schema");
+        }
+
+        // Open with Database::new() which runs all migrations
+        let db = super::super::Database::new(&db_path).expect("reopen");
+        let conn = db.conn.lock().expect("lock");
+
+        let agent_id: String = conn
+            .query_row("SELECT agent_id FROM chats WHERE chat_id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("query agent_id");
+        assert_eq!(agent_id, "lyre");
+    }
+
+    #[test]
+    fn migration_v4_history_is_recorded() {
+        let db = test_db();
+
+        let conn = db.conn.lock().expect("lock");
+        let has_v4: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v4 record");
+        assert!(has_v4);
+    }
+
+    #[test]
+    fn migration_v4_from_v3_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // Create a full v3 DB with known data
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '3');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (3, '2025-01-01T00:00:00Z', 'test v3');
+                 CREATE TABLE IF NOT EXISTS chats (
+                     chat_id INTEGER PRIMARY KEY,
+                     chat_title TEXT,
+                     chat_type TEXT NOT NULL DEFAULT 'private',
+                     last_message_time TEXT NOT NULL,
+                     channel TEXT,
+                     external_chat_id TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     is_from_bot INTEGER NOT NULL DEFAULT 0,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     chat_id INTEGER PRIMARY KEY,
+                     messages_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     tool_input TEXT NOT NULL,
+                     tool_output TEXT,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id, message_id),
+                     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+                 );
+                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
+                 VALUES (42, 'v3 chat', 'group', '2025-06-15T12:00:00Z');",
+            )
+            .expect("create v3 schema");
+        }
+
+        // Open with Database::new() which runs all migrations including v4
+        let db = super::super::Database::new(&db_path).expect("reopen");
+        let conn = db.conn.lock().expect("lock");
+
+        let agent_id: String = conn
+            .query_row("SELECT agent_id FROM chats WHERE chat_id = 42", [], |row| {
+                row.get(0)
+            })
+            .expect("query agent_id");
+        assert_eq!(agent_id, "lyre");
     }
 
     #[test]
