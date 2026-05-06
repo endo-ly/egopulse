@@ -203,8 +203,8 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 
     if version < 4 {
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch("ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default';")?;
-        set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: default)")?;
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';")?;
+        set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: lyre)")?;
         tx.commit()?;
         version = 4;
     }
@@ -329,7 +329,7 @@ mod tests {
                 row.get(0)
             })
             .expect("query agent_id");
-        assert_eq!(agent_id, "default");
+        assert_eq!(agent_id, "lyre");
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
                 row.get(0)
             })
             .expect("query agent_id");
-        assert_eq!(agent_id, "default");
+        assert_eq!(agent_id, "lyre");
     }
 
     #[test]
