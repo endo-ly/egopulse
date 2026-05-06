@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod setup;
 pub mod skills;
 pub mod slash_commands;
+pub mod sleep_batch;
 pub mod soul_agents;
 pub mod storage;
 pub mod tools;

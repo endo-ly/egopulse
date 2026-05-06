@@ -501,6 +501,17 @@ impl Database {
         Ok(id)
     }
 
+    pub(crate) fn has_running_sleep_run(&self, agent_id: &str) -> Result<bool, StorageError> {
+        let conn = self.lock_conn()?;
+        let running = SleepRunStatus::Running.to_string();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sleep_runs WHERE agent_id = ?1 AND status = ?2",
+            params![agent_id, running],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub(crate) fn update_sleep_run_success(
         &self,
         id: &str,
