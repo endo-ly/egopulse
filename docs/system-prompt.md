@@ -33,7 +33,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | ① Soul | SOUL.md 存在時 | `<soul>` タグでラップされた人格定義 | `turn.rs:566-568` → `soul_agents.rs:94-95` |
 | ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `turn.rs:571-621` |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
-| ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・予定記憶のXMLブロック | `turn.rs` |
+| ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
 | ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
 
 各セクション間には `\n\n` が挿入される。

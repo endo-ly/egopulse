@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS chats (
     last_message_time TEXT NOT NULL,
     channel TEXT,
     external_chat_id TEXT,
-    agent_id TEXT NOT NULL DEFAULT 'lyre'
+agent_id TEXT NOT NULL DEFAULT 'default'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
@@ -130,7 +130,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 | last_message_time | TEXT | NOT NULL | 最終メッセージ時刻（RFC3339） |
 | channel | TEXT | nullable | チャンネル識別子（`cli`, `web`, `discord`, `telegram`） |
 | external_chat_id | TEXT | nullable | 外部プラットフォームのチャットID |
-| agent_id | TEXT | NOT NULL DEFAULT 'lyre' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紐付けに使用 |
+| agent_id | TEXT | NOT NULL DEFAULT 'default' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紐付けに使用 |
 
 **操作**:
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
@@ -425,9 +425,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 // // v3 -> v4: agent_id カラム追加
 // if version < 4 {
 //     conn.execute_batch(
-//         "ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'lyre';",
+//         "ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default';",
 //     )?;
-//     set_schema_version(conn, 4, "add NOT NULL agent_id column to chats (default: 'lyre')")?;
+//     set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: default)")?;
 //     version = 4;
 // }
 ```

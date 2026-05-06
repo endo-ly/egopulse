@@ -101,7 +101,7 @@ agents/
     └── memory/            # 長期記憶（Phase 1）
         ├── episodic.md    # エピソード記憶
         ├── semantic.md    # 意味記憶
-        └── prospective.md # 予定記憶
+        └── prospective.md # 展望記憶
 ```
 
 | ファイル | 内容 | 備考 |
