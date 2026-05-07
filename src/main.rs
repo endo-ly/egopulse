@@ -157,7 +157,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
             }
         }
         Some(Command::Sleep { agent }) => {
-            let state = runtime::build_app_state_with_path(config, resolved_config_path).await?;
+            let state = runtime::build_sleep_app_state_with_path(config, resolved_config_path)?;
             match egopulse::sleep_batch::run_sleep_batch(&state, agent.as_deref()).await {
                 Ok(()) => Ok(()),
                 Err(egopulse::sleep_batch::SleepBatchError::AlreadyRunning { agent_id }) => {

@@ -189,6 +189,43 @@ pub async fn build_app_state_with_path(
     })
 }
 
+/// Builds the minimal application state needed for manual sleep batch execution.
+///
+/// Sleep batch does not execute agent tools or channels, so this intentionally
+/// avoids MCP initialization and the reconnect loop.
+pub fn build_sleep_app_state_with_path(
+    config: Config,
+    config_path: Option<PathBuf>,
+) -> Result<AppState, EgoPulseError> {
+    let db = Arc::new(Database::new(&config.db_path())?);
+    let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
+    let skills = Arc::new(SkillManager::from_dirs(
+        config.user_skills_dir()?,
+        config.skills_dir()?,
+    ));
+    let channels = Arc::new(ChannelRegistry::new());
+    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&skills)));
+    let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
+    let memory_loader = Arc::new(MemoryLoader::new(
+        PathBuf::from(&config.state_root).join("agents"),
+    ));
+
+    Ok(AppState {
+        db,
+        config,
+        config_path,
+        llm_override: None,
+        channels,
+        skills,
+        tools,
+        mcp_manager: None,
+        assets,
+        soul_agents,
+        memory_loader,
+        llm_cache: Mutex::new(HashMap::new()),
+    })
+}
+
 fn spawn_mcp_reconnect_loop(
     mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
     workspace_dir: PathBuf,
@@ -500,6 +537,23 @@ mod tests {
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
         let _ = &*state.soul_agents;
+    }
+
+    #[test]
+    fn build_sleep_app_state_skips_mcp_initialization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let config_path = dir.path().join("egopulse.config.yaml");
+
+        let state = build_sleep_app_state_with_path(config, Some(config_path.clone()))
+            .expect("build sleep state");
+
+        assert!(
+            state.mcp_manager.is_none(),
+            "sleep state must not connect MCP servers"
+        );
+        assert_eq!(state.config_path.as_deref(), Some(config_path.as_path()));
+        let _ = &*state.memory_loader;
     }
 
     #[tokio::test]
