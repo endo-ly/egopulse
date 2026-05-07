@@ -9,9 +9,6 @@ use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, call_blocking};
 
-/// Default context window token limit for sleep batch processing.
-const DEFAULT_CONTEXT_WINDOW_TOKENS: i64 = 200_000;
-
 #[derive(Debug, Error)]
 pub enum SleepBatchError {
     #[error("already running for agent '{agent_id}'")]
@@ -117,6 +114,7 @@ pub(crate) fn build_sleep_input(
     agent_id: &str,
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
+    context_window_tokens: usize,
 ) -> Result<SleepPromptInput, SleepBatchError> {
     // Reject unsafe agent_id (same logic as memory::safe_agent_id)
     let trimmed = agent_id.trim();
@@ -131,9 +129,10 @@ pub(crate) fn build_sleep_input(
         )));
     }
 
-    // Check context overflow
+    // Check context overflow (80% threshold)
     let total_tokens: i64 = sessions.iter().map(|s| s.estimated_tokens).sum();
-    if total_tokens > DEFAULT_CONTEXT_WINDOW_TOKENS {
+    let threshold = (context_window_tokens as f64 * 0.80) as i64;
+    if total_tokens > threshold {
         return Err(SleepBatchError::ContextOverflow {
             agent_id: agent_id.to_string(),
         });
@@ -348,12 +347,17 @@ async fn execute_batch(
             };
 
         // 3. Build sleep input (synchronous DB call, safe in async context for sleep batch)
+        let context_tokens = state.config.resolve_context_window_tokens(
+            &crate::config::ProviderId::new(&resolved.provider),
+            &resolved.model,
+        );
         let input = build_sleep_input(
             &db,
             &state.memory_loader,
             agent_id,
             sessions,
             source_chats_json,
+            context_tokens,
         )?;
 
         // 4. Save BEFORE snapshots
@@ -1116,7 +1120,7 @@ mod tests {
 
         let loader = make_memory_loader(dir.path());
         let sessions = vec![];
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
+        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 200_000);
         let input = result.expect("should succeed");
         assert_eq!(
             input.memory.episodic,
@@ -1137,7 +1141,7 @@ mod tests {
 
         let loader = make_memory_loader(dir.path());
         let sessions = vec![make_session_info(chat_id, "test", "test:chat1", 100)];
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
+        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 200_000);
         let input = result.expect("should succeed");
         assert!(input.sessions_text.contains("hello world"));
         assert!(input.sessions_text.contains("hi there"));
@@ -1153,7 +1157,7 @@ mod tests {
         let loader = make_memory_loader(dir.path());
         let sessions = vec![];
         let source_json = r#"[{"chat_id":1}]"#;
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, source_json);
+        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, source_json, 200_000);
         let input = result.expect("should succeed");
         assert_eq!(input.source_chats_json, source_json);
     }
@@ -1163,7 +1167,7 @@ mod tests {
         let (db, dir) = test_db();
         let loader = make_memory_loader(dir.path());
         let sessions = vec![];
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
+        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 200_000);
         let input = result.expect("should succeed");
         assert_eq!(input.memory.episodic, None);
         assert_eq!(input.memory.semantic, None);
@@ -1176,15 +1180,15 @@ mod tests {
         let loader = make_memory_loader(dir.path());
         let sessions = vec![];
 
-        let err = build_sleep_input(&db, &loader, "../etc", &sessions, "[]")
+        let err = build_sleep_input(&db, &loader, "../etc", &sessions, "[]", 200_000)
             .expect_err("should reject path traversal");
         assert!(matches!(err, SleepBatchError::Internal(_)));
 
-        let err =
-            build_sleep_input(&db, &loader, "", &sessions, "[]").expect_err("should reject empty");
+        let err = build_sleep_input(&db, &loader, "", &sessions, "[]", 200_000)
+            .expect_err("should reject empty");
         assert!(matches!(err, SleepBatchError::Internal(_)));
 
-        let err = build_sleep_input(&db, &loader, "a/b", &sessions, "[]")
+        let err = build_sleep_input(&db, &loader, "a/b", &sessions, "[]", 200_000)
             .expect_err("should reject slash");
         assert!(matches!(err, SleepBatchError::Internal(_)));
     }
@@ -1208,7 +1212,7 @@ mod tests {
             ));
         }
 
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
+        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 200_000);
         let input = result.expect("should succeed");
         // Verify 20 session blocks in sessions_text
         assert_eq!(input.sessions_text.matches("<session").count(), 20);
@@ -1219,15 +1223,12 @@ mod tests {
         let (db, dir) = test_db();
         let loader = make_memory_loader(dir.path());
 
-        // Create sessions that exceed the context window
-        let sessions = vec![make_session_info(
-            1,
-            "test",
-            "test:chat1",
-            DEFAULT_CONTEXT_WINDOW_TOKENS + 1,
-        )];
+        // Use 80% threshold: context_window=1000 -> threshold=800
+        // estimated_tokens=900 exceeds threshold (800) but is below full window (1000)
+        let context_window = 1000_usize;
+        let sessions = vec![make_session_info(1, "test", "test:chat1", 900)];
 
-        let err = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]")
+        let err = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", context_window)
             .expect_err("should reject context overflow");
         assert!(
             matches!(err, SleepBatchError::ContextOverflow { .. }),
