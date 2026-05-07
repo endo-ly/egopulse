@@ -296,9 +296,10 @@ impl From<&Config> for SerializableConfig {
                         enabled: sb.enabled,
                         schedule: sb.schedule.clone(),
                         timezone: sb.timezone.clone(),
-                        agents: sb.agents.as_ref().map(|list| {
-                            list.iter().map(|a| a.to_string()).collect()
-                        }),
+                        agents: sb
+                            .agents
+                            .as_ref()
+                            .map(|list| list.iter().map(|a| a.to_string()).collect()),
                         retry: if sb.retry_max_attempts != 3 || sb.retry_interval_minutes != 5 {
                             Some(SerializableRetry {
                                 max_attempts: sb.retry_max_attempts,

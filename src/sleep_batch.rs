@@ -337,7 +337,17 @@ pub async fn run_sleep_batch(
         crate::memory::InputDecision::Proceed {
             sessions,
             source_chats_json,
-        } => execute_batch(state, db, &resolved_agent, &sessions, &source_chats_json, trigger).await,
+        } => {
+            execute_batch(
+                state,
+                db,
+                &resolved_agent,
+                &sessions,
+                &source_chats_json,
+                trigger,
+            )
+            .await
+        }
     }
 }
 
@@ -1139,7 +1149,10 @@ mod tests {
             .expect("batch");
 
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        let snapshots = state.db.get_snapshots_for_run(&runs[0].id).expect("snapshots");
+        let snapshots = state
+            .db
+            .get_snapshots_for_run(&runs[0].id)
+            .expect("snapshots");
         assert_eq!(snapshots.len(), 3);
     }
 
@@ -1165,7 +1178,9 @@ mod tests {
         let state = build_test_state_with_llm(
             db,
             dir.path(),
-            Arc::new(MockLlmProvider::with_response(serde_json::json!("not json"))),
+            Arc::new(MockLlmProvider::with_response(serde_json::json!(
+                "not json"
+            ))),
         );
 
         let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled).await;

@@ -550,12 +550,16 @@ fn validate_schedule(schedule: &str) -> Result<(), ConfigError> {
             schedule: schedule.to_string(),
         });
     }
-    let hour: u32 = parts[0].parse().map_err(|_| ConfigError::SleepBatchInvalidSchedule {
-        schedule: schedule.to_string(),
-    })?;
-    let minute: u32 = parts[1].parse().map_err(|_| ConfigError::SleepBatchInvalidSchedule {
-        schedule: schedule.to_string(),
-    })?;
+    let hour: u32 = parts[0]
+        .parse()
+        .map_err(|_| ConfigError::SleepBatchInvalidSchedule {
+            schedule: schedule.to_string(),
+        })?;
+    let minute: u32 = parts[1]
+        .parse()
+        .map_err(|_| ConfigError::SleepBatchInvalidSchedule {
+            schedule: schedule.to_string(),
+        })?;
     if hour > 23 || minute > 59 {
         return Err(ConfigError::SleepBatchInvalidSchedule {
             schedule: schedule.to_string(),
@@ -565,11 +569,10 @@ fn validate_schedule(schedule: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_timezone(tz: &str) -> Result<(), ConfigError> {
-    tz.parse::<chrono_tz::Tz>().map_err(|_| {
-        ConfigError::SleepBatchInvalidTimezone {
+    tz.parse::<chrono_tz::Tz>()
+        .map_err(|_| ConfigError::SleepBatchInvalidTimezone {
             timezone: tz.to_string(),
-        }
-    })?;
+        })?;
     Ok(())
 }
 

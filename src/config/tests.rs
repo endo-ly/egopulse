@@ -2251,10 +2251,7 @@ fn sleep_batch_enabled_requires_timezone() {
 fn sleep_batch_disabled_allows_missing_schedule_timezone() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(r#"  enabled: false"#),
-    );
+    let file_path = write_config(&temp_dir, &sleep_batch_scheduler_yml(r#"  enabled: false"#));
 
     let config = Config::load(Some(&file_path)).expect("load config");
     assert!(!config.sleep_batch.enabled);
@@ -2451,9 +2448,9 @@ fn persist_preserves_sleep_batch_scheduler_config() {
         super::ProviderConfig {
             label: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(
-                super::secret_ref::ResolvedValue::Literal("sk-test".to_string()),
-            ),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-test".to_string(),
+            )),
             default_model: "gpt-4o-mini".to_string(),
             models: HashMap::new(),
         },

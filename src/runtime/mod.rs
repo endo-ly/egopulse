@@ -756,10 +756,16 @@ mod tests {
         assert!(tracker.is_active("agent-a"));
 
         tracker.end_turn("agent-a");
-        assert!(tracker.is_active("agent-a"), "still active after one turn ends");
+        assert!(
+            tracker.is_active("agent-a"),
+            "still active after one turn ends"
+        );
 
         tracker.end_turn("agent-a");
-        assert!(!tracker.is_active("agent-a"), "inactive after all turns end");
+        assert!(
+            !tracker.is_active("agent-a"),
+            "inactive after all turns end"
+        );
     }
 
     #[test]

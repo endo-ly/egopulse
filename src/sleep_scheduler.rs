@@ -86,20 +86,14 @@ pub(crate) async fn run_scheduled_cycle(state: &AppState) {
     }
 }
 
-async fn run_agent_with_retry(
-    state: &AppState,
-    agent_id: &AgentId,
-) -> Result<(), SleepBatchError> {
+async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<(), SleepBatchError> {
     let max_attempts = state.config.sleep_batch.retry_max_attempts;
     let interval = state.config.sleep_batch.retry_interval_minutes;
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                (interval as u64) * 60,
-            ))
-            .await;
+            tokio::time::sleep(std::time::Duration::from_secs((interval as u64) * 60)).await;
         }
 
         match sleep_batch::run_sleep_batch(
@@ -110,11 +104,13 @@ async fn run_agent_with_retry(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(SleepBatchError::AlreadyRunning { .. }) => return Err(last_error.unwrap_or_else(|| {
-                SleepBatchError::AlreadyRunning {
-                    agent_id: agent_id.to_string(),
-                }
-            })),
+            Err(SleepBatchError::AlreadyRunning { .. }) => {
+                return Err(
+                    last_error.unwrap_or_else(|| SleepBatchError::AlreadyRunning {
+                        agent_id: agent_id.to_string(),
+                    }),
+                );
+            }
             Err(e) => {
                 warn!(
                     agent_id = %agent_id,
@@ -147,7 +143,7 @@ pub(crate) async fn run_scheduler_loop(state: AppState) -> Result<(), crate::err
             }
         };
 
-        let delay = (next - now).to_std().unwrap_or_else(|_| std::time::Duration::ZERO);
+        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
         info!(
             next_run = %next.to_rfc3339(),
             delay_secs = delay.as_secs(),
@@ -175,11 +171,7 @@ fn parse_hhmm(schedule: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-fn next_run_for_time(
-    tz: Tz,
-    time: NaiveTime,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+fn next_run_for_time(tz: Tz, time: NaiveTime, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let local_now = now.with_timezone(&tz);
     let today_date = local_now.date_naive();
 
@@ -224,7 +216,7 @@ fn resolve_gap(
 ) -> Option<DateTime<Utc>> {
     let mut candidate = start;
     for _ in 0..120 {
-        candidate = candidate + Duration::minutes(1);
+        candidate += Duration::minutes(1);
         if let LocalResult::Single(dt) = tz.from_local_datetime(&candidate) {
             if dt > *local_now {
                 return Some(dt.with_timezone(&Utc));
@@ -256,7 +248,10 @@ mod tests {
         let now = "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
         // Expected: 2026-01-15 14:00 JST = 2026-01-15 05:00 UTC
-        assert_eq!(result, "2026-01-15T05:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-01-15T05:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -266,7 +261,10 @@ mod tests {
         let now = "2026-01-15T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
         // Expected: 2026-01-16 14:00 JST = 2026-01-16 05:00 UTC
-        assert_eq!(result, "2026-01-16T05:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-01-16T05:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -276,7 +274,10 @@ mod tests {
         let now = "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
         // Expected: 2026-01-15 09:00 EST = 2026-01-15 14:00 UTC
-        assert_eq!(result, "2026-01-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-01-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -284,7 +285,10 @@ mod tests {
         let config = enabled_config("04:00", "UTC");
         let now = "2026-01-15T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
-        assert_eq!(result, "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -296,7 +300,10 @@ mod tests {
         let now = "2026-03-08T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
         // Expected: 2026-03-08 03:00 EDT = 07:00 UTC
-        assert_eq!(result, "2026-03-08T07:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-03-08T07:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -308,7 +315,10 @@ mod tests {
         let now = "2026-11-01T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let result = next_scheduled_run(&config, now).unwrap();
         // Expected: 2026-11-01 01:30 EDT = 05:30 UTC (earliest instant)
-        assert_eq!(result, "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            result,
+            "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -426,11 +436,8 @@ mod tests {
             ..Default::default()
         };
 
-        let agents = resolve_target_agents(
-            &config,
-            &state.config.agents,
-            &state.config.default_agent,
-        );
+        let agents =
+            resolve_target_agents(&config, &state.config.agents, &state.config.default_agent);
         assert!(agents.is_empty() || !config.scheduler_enabled());
     }
 
@@ -448,11 +455,8 @@ mod tests {
             },
         );
 
-        let agents = resolve_target_agents(
-            &config.sleep_batch,
-            &config.agents,
-            &config.default_agent,
-        );
+        let agents =
+            resolve_target_agents(&config.sleep_batch, &config.agents, &config.default_agent);
 
         assert_eq!(agents, vec![AgentId::new("default")]);
     }
@@ -471,11 +475,8 @@ mod tests {
             },
         );
 
-        let agents = resolve_target_agents(
-            &config.sleep_batch,
-            &config.agents,
-            &config.default_agent,
-        );
+        let agents =
+            resolve_target_agents(&config.sleep_batch, &config.agents, &config.default_agent);
 
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0], AgentId::new("default"));
@@ -507,10 +508,12 @@ mod tests {
             Box::new(MockLlm::new()),
         );
 
-        let _guard = state.active_turns.begin_turn("default");
+        state.active_turns.begin_turn("default");
         assert!(state.active_turns.is_active("default"));
 
         run_scheduled_cycle(&state).await;
+
+        state.active_turns.end_turn("default");
 
         let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
         assert!(runs.is_empty());
@@ -550,7 +553,10 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, SleepRunTrigger::Manual);
 
-        state.db.update_sleep_run_success(&run_id, "", None, 0, 0).expect("complete");
+        state
+            .db
+            .update_sleep_run_success(&run_id, "", None, 0, 0)
+            .expect("complete");
     }
 
     #[tokio::test]
