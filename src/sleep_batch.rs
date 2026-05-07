@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::info;
 
+use crate::llm::{LlmProvider, Message};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, call_blocking};
@@ -27,6 +28,8 @@ pub enum SleepBatchError {
     Io(String),
     #[error("unsafe agent_id: {0}")]
     UnsafeAgentId(String),
+    #[error("LLM error: {0}")]
+    Llm(String),
 }
 
 /// Output from parsing the sleep batch LLM response.
@@ -301,8 +304,18 @@ pub async fn run_sleep_batch(
             Ok(())
         }
         crate::memory::InputDecision::Proceed {
-            source_chats_json, ..
-        } => execute_batch(state, db, &resolved_agent, &source_chats_json).await,
+            sessions,
+            source_chats_json,
+        } => {
+            execute_batch(
+                state,
+                db,
+                &resolved_agent,
+                &sessions,
+                &source_chats_json,
+            )
+            .await
+        }
     }
 }
 
@@ -310,6 +323,7 @@ async fn execute_batch(
     state: &AppState,
     db: Arc<Database>,
     agent_id: &str,
+    sessions: &[AgentSessionInfo],
     source_chats_json: &str,
 ) -> Result<(), SleepBatchError> {
     let agent_for_run = agent_id.to_string();
@@ -328,13 +342,71 @@ async fn execute_batch(
     };
 
     let result = async {
-        let memory = state.memory_loader.load(agent_id);
-        save_aggregate_snapshots(&db, &run_id, agent_id, memory.as_ref()).await?;
+        // 1. Resolve LLM config
+        let resolved = state
+            .config
+            .resolve_sleep_batch_llm()
+            .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
+        // 2. Get provider (use llm_override if set, otherwise cached_provider)
+        let provider: Arc<dyn LlmProvider> = if let Some(override_provider) = state.llm_override.clone() {
+            override_provider
+        } else {
+            state
+                .cached_provider(&resolved)
+                .map_err(|e| SleepBatchError::Llm(e.to_string()))?
+        };
+
+        // 3. Build sleep input (synchronous DB call, safe in async context for sleep batch)
+        let input = build_sleep_input(
+            &db,
+            &state.memory_loader,
+            agent_id,
+            sessions,
+            source_chats_json,
+        )?;
+
+        // 4. Save BEFORE snapshots
+        let memory_before = state.memory_loader.load(agent_id);
+        save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
+
+        // 5. Build system prompt
+        let system_prompt = build_sleep_system_prompt(&input);
+
+        // 6. Call LLM
+        let response = provider
+            .send_message(
+                &system_prompt,
+                vec![Message::text("user", "Please process the memory update.")],
+                None,
+            )
+            .await
+            .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+        // 7. Parse response
+        let output = parse_sleep_response(&response.content)?;
+
+        // 8. Write memory files
+        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
+        write_memory_files(&agents_dir, agent_id, &output)?;
+
+        // 9. Reload memory for AFTER snapshots
+        let memory_after = state.memory_loader.load(agent_id);
+        save_aggregate_snapshots(&db, &run_id, agent_id, memory_after.as_ref(), Some(true)).await?;
+
+        // 10. Update run success with token usage
         let run_id_owned = run_id.clone();
         let source_chats = source_chats_json.to_string();
+        let input_tokens = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+        let output_tokens = response.usage.as_ref().map_or(0, |u| u.output_tokens);
         call_blocking(Arc::clone(&db), move |db| {
-            db.update_sleep_run_success(&run_id_owned, &source_chats, None, 0, 0)
+            db.update_sleep_run_success(
+                &run_id_owned,
+                &source_chats,
+                None,
+                input_tokens,
+                output_tokens,
+            )
         })
         .await?;
 
@@ -352,7 +424,7 @@ async fn execute_batch(
         return Err(error);
     }
 
-    info!(agent_id = %agent_id, run_id = %run_id, "sleep batch completed (no-op skeleton)");
+    info!(agent_id = %agent_id, run_id = %run_id, "sleep batch completed");
     Ok(())
 }
 
@@ -361,6 +433,7 @@ async fn save_aggregate_snapshots(
     run_id: &str,
     agent_id: &str,
     memory: Option<&MemoryContent>,
+    is_after: Option<bool>,
 ) -> Result<(), SleepBatchError> {
     let Some(content) = memory else {
         return Ok(());
@@ -375,11 +448,21 @@ async fn save_aggregate_snapshots(
     .filter_map(|(file, maybe)| maybe.as_ref().map(|c| (file, c.clone())))
     .collect();
 
+    // If this is the BEFORE call, content_before == content_after (same value).
+    // If this is the AFTER call, we need to update the after field.
+    // For simplicity, we always create a new snapshot entry.
+    // The before/after are stored as (before_content, after_content).
+    // Before snapshots: before == after == memory content at that time.
+    // After snapshots:  before == "" (placeholder), after == new memory content.
     for (file, file_content) in entries {
         let run = run_id.to_string();
         let agent = agent_id.to_string();
+        let (before, after) = match is_after {
+            Some(true) => (String::new(), file_content.clone()),
+            _ => (file_content.clone(), file_content.clone()),
+        };
         call_blocking(Arc::clone(db), move |db| {
-            db.create_memory_snapshot(&run, &agent, file, &file_content, &file_content)
+            db.create_memory_snapshot(&run, &agent, file, &before, &after)
         })
         .await?;
     }
@@ -549,7 +632,44 @@ pub(crate) fn write_memory_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolDefinition};
     use crate::storage::{Database, SleepRunStatus};
+    use async_trait::async_trait;
+
+    struct MockLlmProvider {
+        response: String,
+    }
+
+    impl MockLlmProvider {
+        fn new() -> Self {
+            Self {
+                response: serde_json::json!({
+                    "episodic": "",
+                    "semantic": "",
+                    "prospective": ""
+                })
+                .to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockLlmProvider {
+        fn provider_name(&self) -> &str { "mock" }
+        fn model_name(&self) -> &str { "mock-model" }
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            Ok(MessagesResponse {
+                content: self.response.clone(),
+                tool_calls: vec![],
+                usage: Some(LlmUsage { input_tokens: 0, output_tokens: 0 }),
+            })
+        }
+    }
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -604,7 +724,7 @@ mod tests {
             db: Arc::new(db),
             config: config.clone(),
             config_path: None,
-            llm_override: None,
+            llm_override: Some(Arc::new(MockLlmProvider::new())),
             channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
@@ -1448,5 +1568,51 @@ mod tests {
                 "no stale backup dirs should remain: {name}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7: Documentation content tests
+    // -----------------------------------------------------------------------
+
+    fn read_doc(filename: &str) -> String {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(&manifest_dir)
+            .join("docs")
+            .join(filename);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_model() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.model"),
+            "docs/config.md should document sleep_batch.model"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_provider() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.provider"),
+            "docs/config.md should document sleep_batch.provider"
+        );
+    }
+
+    #[test]
+    fn docs_architecture_mentions_one_call_sleep_batch() {
+        let content = read_doc("architecture.md");
+        let has_one_call = content.contains("1 回の LLM")
+            || content.contains("1-call")
+            || content.contains("one call")
+            || content.contains("single call")
+            || content.contains("1 回")
+            || content.contains("1-call LLM");
+        assert!(
+            has_one_call,
+            "docs/architecture.md should mention one-call/single-call sleep batch approach"
+        );
     }
 }
