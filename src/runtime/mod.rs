@@ -432,6 +432,15 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         ));
     }
 
+    if state.config.sleep_batch.scheduler_enabled() {
+        let scheduler_state = state.clone();
+        info!("Starting sleep batch scheduler");
+        let handle = tokio::spawn(async move {
+            crate::sleep_scheduler::run_scheduler_loop(scheduler_state).await
+        });
+        handles.push(("sleep-scheduler".to_string(), handle));
+    }
+
     info!("Runtime active; waiting for Ctrl-C or channel failure");
 
     // spawn したタスクの即時終了 (起動失敗) を検知

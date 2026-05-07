@@ -56,9 +56,7 @@ pub(crate) fn resolve_target_agents(
     }
 }
 
-/// Runs one scheduled cycle — iterates over target agents and executes sleep
-/// batch for each, handling active-agent deferral and retry.
-pub async fn run_scheduled_cycle(state: &AppState) {
+pub(crate) async fn run_scheduled_cycle(state: &AppState) {
     let config = &state.config.sleep_batch;
     if !config.scheduler_enabled() {
         return;
@@ -131,6 +129,35 @@ async fn run_agent_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| SleepBatchError::Internal("no attempts made".to_string())))
+}
+
+/// Runs the scheduler loop until the process is shut down.
+///
+/// Each iteration calculates the next scheduled run, sleeps until then,
+/// and executes [`run_scheduled_cycle`]. Returns `Ok(())` on normal exit
+/// (e.g. if the scheduler becomes disabled at runtime).
+pub(crate) async fn run_scheduler_loop(state: AppState) -> Result<(), crate::error::EgoPulseError> {
+    loop {
+        let now = Utc::now();
+        let next = match next_scheduled_run(&state.config.sleep_batch, now) {
+            Some(t) => t,
+            None => {
+                info!("sleep scheduler: disabled or no schedule configured, exiting loop");
+                return Ok(());
+            }
+        };
+
+        let delay = (next - now).to_std().unwrap_or_else(|_| std::time::Duration::ZERO);
+        info!(
+            next_run = %next.to_rfc3339(),
+            delay_secs = delay.as_secs(),
+            "sleep scheduler: waiting for next scheduled run"
+        );
+
+        tokio::time::sleep(delay).await;
+
+        run_scheduled_cycle(&state).await;
+    }
 }
 
 fn parse_schedule_time(schedule: &str) -> Option<NaiveTime> {
@@ -582,5 +609,17 @@ mod tests {
                 }),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn scheduler_loop_exits_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_util::build_state_with_provider(
+            dir.path().to_str().unwrap(),
+            Box::new(MockLlm::new()),
+        );
+
+        let result = run_scheduler_loop(state).await;
+        assert!(result.is_ok());
     }
 }
