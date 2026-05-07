@@ -294,7 +294,52 @@ pub trait ChannelAdapter: Send + Sync {
 
 ### Sleep Batch（手動長期記憶処理）
 
-`egopulse sleep --agent <AGENT>` で手動実行する長期記憶のバッチ処理骨格。
+`egopulse sleep --agent <AGENT>` で手動実行する長期記憶のバッチ処理。
+
+#### アーキテクチャ
+
+Sleep Batch は **1 回の LLM 呼び出し** で Pruning・Consolidation・Compression を一括実行する。複数回の LLM 呼び出しや段階的パイプラインは使用しない。
+
+```text
+LLM への入力
+    ├ 現在の記憶ファイル（episodic / semantic / prospective）
+    └ ソースセッションのメッセージ履歴
+         │
+    ┌────▼────┐
+    │ 1-call  │  Pruning + Consolidation + Compression を1回で実行
+    │   LLM   │
+    └────┬────┘
+         │
+    JSON 出力（3キー固定）
+    ├ episodic:     更新後のエピソード記憶（Markdown）
+    ├ semantic:     更新後の意味記憶（Markdown）
+    └ prospective: 更新後の展望記憶（Markdown）
+```
+
+LLM は厳密に `episodic`・`semantic`・`prospective` の 3 キーのみを持つ JSON オブジェクトを返す必要がある。`summary_md`・`phases`・`summary` などの追加キーはパーサーで拒否される。
+
+#### 記憶ファイルの原子的書き込み
+
+記憶ファイルの書き込みは backup-and-rename 戦略で原子性を保証する:
+
+1. 一時ディレクトリ `memory.tmp-{uuid}` に全ファイルを書き出し
+2. 既存 `memory` ディレクトリを `memory.backup-{uuid}` にリネーム
+3. `memory.tmp-{uuid}` を `memory` にリネーム
+4. 成功時、`memory.backup-{uuid}` を削除
+5. ステップ 3 で失敗した場合、バックアップから復元
+
+前回失敗時の残存ディレクトリは次回実行時に `recover_memory_write()` が自動クリーンアップする。
+
+#### Sleep Batch 固有の LLM 設定
+
+Sleep Batch のプロバイダーとモデルは、デフォルト設定から独立して設定可能。詳細は [config.md](./config.md) の `sleep_batch` セクションを参照。
+
+```text
+sleep_batch.provider → 指定時はそのプロバイダー、未指定時は default_provider
+sleep_batch.model    → 指定時はそのモデル、未指定時は default_model → provider.default_model
+```
+
+#### 実行フロー
 
 ```text
 1. agent_id 解決（--agent 省略時は default_agent）

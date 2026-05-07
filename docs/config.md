@@ -49,7 +49,38 @@
 | `compaction_target_ratio` | `f64` | 任意 | `0.40` | compaction 後の目標 token 量を usable context に対する割合で指定。threshold 未満 `(0, threshold)` |
 | `compact_keep_recent` | `usize` | 任意 | `20` | compaction 時に Tail としてそのまま保持する直近メッセージ数の下限 |
 
-### 2.2 プロバイダー定義（`providers.<id>`）
+### 2.2 Sleep Batch 設定（`sleep_batch`）
+
+Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバイダーとモデルを、デフォルト設定から独立して指定できる。
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `sleep_batch.provider` | `string \| null` | 任意 | `null` | Sleep Batch 用プロバイダー ID。`providers` マップ内のキーを参照。`null` の場合は `default_provider` にフォールバック |
+| `sleep_batch.model` | `string \| null` | 任意 | `null` | Sleep Batch 用モデル名。`null` の場合は `default_model`、さらにプロバイダーの `default_model` にフォールバック |
+
+#### モデル解決チェーン
+
+```text
+sleep_batch.provider（指定時）
+    ↓ null の場合
+default_provider
+
+sleep_batch.model（指定時）
+    ↓ null の場合
+default_model
+    ↓ null の場合
+provider.default_model
+```
+
+#### 記述例
+
+```yaml
+sleep_batch:
+  provider: deepseek
+  model: deepseek-chat-v3
+```
+
+### 2.3 プロバイダー定義（`providers.<id>`）
 
 `providers` はキーがプロバイダー ID のマップ。複数定義可能。
 
@@ -67,7 +98,7 @@
 |---|---|---|---|---|
 | `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
 
-### 2.3 Web チャネル（`channels.web`）
+### 2.4 Web チャネル（`channels.web`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -79,7 +110,7 @@
 | `provider` | `string \| null` | 任意 | `null` | このチャネル専用のプロバイダーオーバーライド |
 | `model` | `string \| null` | 任意 | `null` | このチャネル専用のモデルオーバーライド |
 
-### 2.4 Discord チャネル（`channels.discord`）
+### 2.5 Discord チャネル（`channels.discord`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -103,7 +134,7 @@
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agent` | `string \| null` | `null` | チャンネル固有のエージェント。`null` なら `default_agent` |
 
-### 2.5 Telegram チャネル（`channels.telegram`）
+### 2.6 Telegram チャネル（`channels.telegram`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -120,7 +151,7 @@
 |---|---|---|---|
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 
-### 2.6 完全 YAML 例
+### 2.7 完全 YAML 例
 
 ```yaml
 # グローバル LLM 設定
@@ -141,6 +172,11 @@ agents:
 
 # システム設定
 log_level: info
+
+# Sleep Batch 設定（任意）
+sleep_batch:
+  provider: deepseek
+  model: deepseek-chat-v3
 compaction_timeout_secs: 180
 max_history_messages: 50
 default_context_window_tokens: 32768
@@ -207,7 +243,7 @@ channels:
         require_mention: true
 ```
 
-### 2.7 環境変数オーバーライド
+### 2.8 環境変数オーバーライド
 
 Config YAML の値を環境変数で上書き可能。環境変数が設定されている場合、YAML の値より優先される。
 
@@ -445,6 +481,7 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `channels.*.model` | チャネルオーバーライドは都度参照 |
 | `compaction_*` | 次回圧縮時に参照 |
 | `max_*` | 次回セッション操作時に参照 |
+| `sleep_batch.*` | Sleep Batch 実行時に参照 |
 
 ### 9.3 秘匿フィールド
 
