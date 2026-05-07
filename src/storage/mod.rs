@@ -144,42 +144,10 @@ pub(crate) struct SleepRun {
     pub finished_at: Option<String>,
     pub source_chats_json: String,
     pub source_digest_md: Option<String>,
-    pub phases_json: String,
-    pub summary_md: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SnapshotPhase {
-    Pruning,
-    Consolidation,
-    Compression,
-}
-
-impl fmt::Display for SnapshotPhase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pruning => write!(f, "pruning"),
-            Self::Consolidation => write!(f, "consolidation"),
-            Self::Compression => write!(f, "compression"),
-        }
-    }
-}
-
-impl FromStr for SnapshotPhase {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pruning" => Ok(Self::Pruning),
-            "consolidation" => Ok(Self::Consolidation),
-            "compression" => Ok(Self::Compression),
-            other => Err(format!("invalid snapshot phase: {other}")),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +185,6 @@ pub(crate) struct MemorySnapshot {
     pub id: String,
     pub run_id: String,
     pub agent_id: String,
-    pub phase: SnapshotPhase,
     pub file: MemoryFile,
     pub content_before: String,
     pub content_after: String,
@@ -240,11 +207,9 @@ const _: () = {
 
     assert_display::<SleepRunStatus>();
     assert_display::<SleepRunTrigger>();
-    assert_display::<SnapshotPhase>();
     assert_display::<MemoryFile>();
     assert_from_str::<SleepRunStatus>();
     assert_from_str::<SleepRunTrigger>();
-    assert_from_str::<SnapshotPhase>();
     assert_from_str::<MemoryFile>();
 
     assert_display::<SleepRun>();
@@ -259,7 +224,7 @@ impl fmt::Display for SleepRun {
 
 impl fmt::Display for MemorySnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "memory_snapshot({}, {})", self.id, self.phase)
+        write!(f, "memory_snapshot({}, {})", self.id, self.file)
     }
 }
 
@@ -333,13 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_phase_display() {
-        assert_eq!(SnapshotPhase::Pruning.to_string(), "pruning");
-        assert_eq!(SnapshotPhase::Consolidation.to_string(), "consolidation");
-        assert_eq!(SnapshotPhase::Compression.to_string(), "compression");
-    }
-
-    #[test]
     fn memory_file_display() {
         assert_eq!(MemoryFile::Episodic.to_string(), "episodic");
         assert_eq!(MemoryFile::Semantic.to_string(), "semantic");
@@ -378,23 +336,6 @@ mod tests {
             SleepRunTrigger::Scheduled
         );
         assert!(SleepRunTrigger::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn snapshot_phase_from_str() {
-        assert_eq!(
-            SnapshotPhase::from_str("pruning").unwrap(),
-            SnapshotPhase::Pruning
-        );
-        assert_eq!(
-            SnapshotPhase::from_str("consolidation").unwrap(),
-            SnapshotPhase::Consolidation
-        );
-        assert_eq!(
-            SnapshotPhase::from_str("compression").unwrap(),
-            SnapshotPhase::Compression
-        );
-        assert!(SnapshotPhase::from_str("invalid").is_err());
     }
 
     #[test]

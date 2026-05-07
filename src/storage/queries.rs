@@ -1,13 +1,13 @@
 use std::str::FromStr;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
 
 use super::{
     AgentSessionInfo, ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot,
-    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, SnapshotPhase,
-    StoredMessage, ToolCall,
+    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage,
+    ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -49,29 +49,18 @@ fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
         finished_at: row.get(5)?,
         source_chats_json: row.get(6)?,
         source_digest_md: row.get(7)?,
-        phases_json: row.get(8)?,
-        summary_md: row.get(9)?,
-        input_tokens: row.get(10)?,
-        output_tokens: row.get(11)?,
-        total_tokens: row.get(12)?,
-        error_message: row.get(13)?,
+        input_tokens: row.get(8)?,
+        output_tokens: row.get(9)?,
+        total_tokens: row.get(10)?,
+        error_message: row.get(11)?,
     })
 }
 
 fn row_to_memory_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySnapshot> {
-    let phase_str: String = row.get(3)?;
-    let phase = SnapshotPhase::from_str(&phase_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-
-    let file_str: String = row.get(4)?;
+    let file_str: String = row.get(3)?;
     let file = MemoryFile::from_str(&file_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
-            4,
+            3,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         )
@@ -81,11 +70,10 @@ fn row_to_memory_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySna
         id: row.get(0)?,
         run_id: row.get(1)?,
         agent_id: row.get(2)?,
-        phase,
         file,
-        content_before: row.get(5)?,
-        content_after: row.get(6)?,
-        created_at: row.get(7)?,
+        content_before: row.get(4)?,
+        content_after: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -505,22 +493,60 @@ impl Database {
         conn.execute(
             "INSERT INTO sleep_runs
                  (id, agent_id, status, trigger_type, started_at, finished_at,
-                  source_chats_json, source_digest_md, phases_json, summary_md,
+                  source_chats_json, source_digest_md,
                   input_tokens, output_tokens, total_tokens, error_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, '[]', NULL, 0, 0, 0, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
             params![id, agent_id, status, trigger.to_string(), started_at],
         )?;
         Ok(id)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Atomically checks for a running sleep run and creates one if none exists.
+    ///
+    /// This prevents a race condition where two concurrent callers could both
+    /// observe "no running run" and each insert a duplicate.
+    ///
+    /// Returns `Ok(Some(id))` if a new run was created, or `Ok(None)` if a
+    /// running run already exists for the given agent.
+    pub(crate) fn try_create_sleep_run(
+        &self,
+        agent_id: &str,
+        trigger: SleepRunTrigger,
+    ) -> Result<Option<String>, StorageError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let running = SleepRunStatus::Running.to_string();
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sleep_runs WHERE agent_id = ?1 AND status = ?2",
+            params![agent_id, running],
+            |row| row.get(0),
+        )?;
+
+        if count > 0 {
+            return Ok(None);
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let status = SleepRunStatus::Running.to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        tx.execute(
+            "INSERT INTO sleep_runs
+                 (id, agent_id, status, trigger_type, started_at, finished_at,
+                  source_chats_json, source_digest_md,
+                  input_tokens, output_tokens, total_tokens, error_message)
+            VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
+            params![id, agent_id, status, trigger.to_string(), started_at],
+        )?;
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
     pub(crate) fn update_sleep_run_success(
         &self,
         id: &str,
         source_chats_json: &str,
         source_digest_md: Option<&str>,
-        phases_json: &str,
-        summary_md: Option<&str>,
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<(), StorageError> {
@@ -533,16 +559,14 @@ impl Database {
         let changed = conn.execute(
             "UPDATE sleep_runs
              SET status = ?1, finished_at = ?2, source_chats_json = ?3,
-                 source_digest_md = ?4, phases_json = ?5, summary_md = ?6,
-                 input_tokens = ?7, output_tokens = ?8, total_tokens = ?9
-             WHERE id = ?10 AND status = ?11",
+                 source_digest_md = ?4,
+                 input_tokens = ?5, output_tokens = ?6, total_tokens = ?7
+             WHERE id = ?8 AND status = ?9",
             params![
                 status,
                 finished_at,
                 source_chats_json,
                 source_digest_md,
-                phases_json,
-                summary_md,
                 input_tokens,
                 output_tokens,
                 total_tokens,
@@ -603,7 +627,7 @@ impl Database {
         let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs WHERE id = ?1",
             params![id],
@@ -621,7 +645,7 @@ impl Database {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
              WHERE agent_id = ?1
@@ -640,7 +664,7 @@ impl Database {
         let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md, phases_json, summary_md,
+                    source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
              WHERE agent_id = ?1 AND status = 'success'
@@ -754,7 +778,6 @@ impl Database {
         &self,
         run_id: &str,
         agent_id: &str,
-        phase: SnapshotPhase,
         file: MemoryFile,
         content_before: &str,
         content_after: &str,
@@ -764,14 +787,13 @@ impl Database {
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let changed = conn.execute(
-            "INSERT INTO memory_snapshots (id, run_id, agent_id, phase, file, content_before, content_after, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
              WHERE EXISTS (SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3)",
             params![
                 id,
                 run_id,
                 agent_id,
-                phase.to_string(),
                 file.to_string(),
                 content_before,
                 content_after,
@@ -790,7 +812,7 @@ impl Database {
     ) -> Result<Vec<MemorySnapshot>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+            "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
              WHERE run_id = ?1
              ORDER BY created_at ASC",
@@ -807,7 +829,7 @@ impl Database {
     ) -> Result<Vec<MemorySnapshot>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+            "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
              WHERE agent_id = ?1
              ORDER BY created_at DESC
@@ -825,7 +847,7 @@ impl Database {
     ) -> Result<Option<MemorySnapshot>, StorageError> {
         let conn = self.lock_conn()?;
         conn.query_row(
-            "SELECT id, run_id, agent_id, phase, file, content_before, content_after, created_at
+            "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
              WHERE agent_id = ?1 AND file = ?2
              ORDER BY created_at DESC
@@ -1337,8 +1359,6 @@ mod tests {
                 finished_at TEXT,
                 source_chats_json TEXT NOT NULL DEFAULT '[]',
                 source_digest_md TEXT,
-                phases_json TEXT NOT NULL DEFAULT '[]',
-                summary_md TEXT,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1378,20 +1398,61 @@ mod tests {
     }
 
     #[test]
+    fn try_create_sleep_run_inserts_when_no_running() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Running);
+        assert_eq!(run.agent_id, "agent-a");
+    }
+
+    #[test]
+    fn try_create_sleep_run_returns_none_when_running_exists() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let _first = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create first")
+            .expect("should insert");
+
+        let second = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create second");
+
+        assert!(second.is_none(), "should not insert duplicate running run");
+    }
+
+    #[test]
+    fn try_create_sleep_run_allows_different_agents() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let id_a = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create a")
+            .expect("should insert");
+        let id_b = db
+            .try_create_sleep_run("agent-b", SleepRunTrigger::Manual)
+            .expect("try create b")
+            .expect("should insert");
+
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
     fn update_sleep_run_to_success() {
         let (db, _dir) = test_db();
         let id = create_test_sleep_run(&db, "agent-a");
 
-        db.update_sleep_run_success(
-            &id,
-            r#"[1, 2, 3]"#,
-            Some("digest-abc"),
-            r#"[{"phase":"pruning"}]"#,
-            Some("# Summary"),
-            100,
-            50,
-        )
-        .expect("update success");
+        db.update_sleep_run_success(&id, r#"[1, 2, 3]"#, Some("digest-abc"), 100, 50)
+            .expect("update success");
 
         let run = db.get_sleep_run(&id).expect("get").expect("run exists");
         assert_eq!(run.status, SleepRunStatus::Success);
@@ -1399,8 +1460,6 @@ mod tests {
         assert_eq!(run.total_tokens, 150);
         assert_eq!(run.source_chats_json, r#"[1, 2, 3]"#);
         assert_eq!(run.source_digest_md.as_deref(), Some("digest-abc"));
-        assert_eq!(run.phases_json, r#"[{"phase":"pruning"}]"#);
-        assert_eq!(run.summary_md.as_deref(), Some("# Summary"));
     }
 
     #[test]
@@ -1437,7 +1496,6 @@ mod tests {
         assert_eq!(run.agent_id, "agent-a");
         assert_eq!(run.trigger, SleepRunTrigger::Manual);
         assert_eq!(run.source_chats_json, "[]");
-        assert_eq!(run.phases_json, "[]");
         assert_eq!(run.input_tokens, 0);
         assert_eq!(run.output_tokens, 0);
         assert_eq!(run.total_tokens, 0);
@@ -1481,11 +1539,11 @@ mod tests {
         let (db, _dir) = test_db();
 
         let id_1 = create_test_sleep_run(&db, "agent-a");
-        db.update_sleep_run_success(&id_1, "[]", None, "[]", None, 10, 5)
+        db.update_sleep_run_success(&id_1, "[]", None, 10, 5)
             .expect("success 1");
 
         let id_2 = create_test_sleep_run(&db, "agent-a");
-        db.update_sleep_run_success(&id_2, "[]", None, "[]", None, 20, 10)
+        db.update_sleep_run_success(&id_2, "[]", None, 20, 10)
             .expect("success 2");
 
         let latest = db
@@ -1511,7 +1569,6 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
-                phase TEXT NOT NULL,
                 file TEXT NOT NULL,
                 content_before TEXT NOT NULL,
                 content_after TEXT NOT NULL,
@@ -1536,39 +1593,24 @@ mod tests {
         db: &Database,
         run_id: &str,
         agent_id: &str,
-        phase: SnapshotPhase,
         file: MemoryFile,
     ) -> String {
         ensure_memory_snapshots_table(db);
         ensure_sleep_run_exists(db, run_id, agent_id);
-        db.create_memory_snapshot(
-            run_id,
-            agent_id,
-            phase,
-            file,
-            "before content",
-            "after content",
-        )
-        .expect("create snapshot")
+        db.create_memory_snapshot(run_id, agent_id, file, "before content", "after content")
+            .expect("create snapshot")
     }
 
     #[test]
     fn create_memory_snapshot_inserts_record() {
         let (db, _dir) = test_db();
-        let id = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
 
         let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, id);
         assert_eq!(snapshots[0].run_id, "run-1");
         assert_eq!(snapshots[0].agent_id, "agent-a");
-        assert_eq!(snapshots[0].phase, SnapshotPhase::Pruning);
         assert_eq!(snapshots[0].file, MemoryFile::Episodic);
         assert_eq!(snapshots[0].content_before, "before content");
         assert_eq!(snapshots[0].content_after, "after content");
@@ -1577,13 +1619,7 @@ mod tests {
     #[test]
     fn create_memory_snapshot_generates_id_and_timestamp() {
         let (db, _dir) = test_db();
-        let id = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Semantic,
-        );
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
         assert!(id.contains('-'), "UUID v4 should contain hyphens");
 
         let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
@@ -1596,42 +1632,18 @@ mod tests {
     #[test]
     fn get_snapshots_for_run() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Semantic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Compression,
-            MemoryFile::Prospective,
-        );
-        create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-b",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Prospective);
+        create_test_snapshot(&db, "run-2", "agent-b", MemoryFile::Episodic);
 
         let run1_snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
         assert_eq!(run1_snapshots.len(), 3);
-        assert_eq!(run1_snapshots[0].phase, SnapshotPhase::Pruning);
-        assert_eq!(run1_snapshots[1].phase, SnapshotPhase::Consolidation);
-        assert_eq!(run1_snapshots[2].phase, SnapshotPhase::Compression);
+        assert_eq!(run1_snapshots[0].file, MemoryFile::Episodic);
+        assert_eq!(run1_snapshots[1].file, MemoryFile::Semantic);
+        assert_eq!(run1_snapshots[2].file, MemoryFile::Prospective);
     }
 
     #[test]
@@ -1647,28 +1659,10 @@ mod tests {
     #[test]
     fn get_snapshots_for_agent() {
         let (db, _dir) = test_db();
-        let id_a1 = create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        let id_a1 = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let id_a2 = create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Semantic,
-        );
-        let _id_b = create_test_snapshot(
-            &db,
-            "run-3",
-            "agent-b",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        let id_a2 = create_test_snapshot(&db, "run-2", "agent-a", MemoryFile::Semantic);
+        let _id_b = create_test_snapshot(&db, "run-3", "agent-b", MemoryFile::Episodic);
 
         let agent_a_snapshots = db
             .get_snapshots_for_agent("agent-a", 10)
@@ -1679,47 +1673,11 @@ mod tests {
     }
 
     #[test]
-    fn get_snapshots_filters_by_phase() {
-        let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Episodic,
-        );
-
-        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
-        assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0].phase, SnapshotPhase::Pruning);
-        assert_eq!(snapshots[1].phase, SnapshotPhase::Consolidation);
-    }
-
-    #[test]
     fn get_snapshots_filters_by_file() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Semantic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Semantic);
 
         let latest_episodic = db
             .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
@@ -1737,21 +1695,9 @@ mod tests {
     #[test]
     fn get_latest_snapshot_for_file() {
         let (db, _dir) = test_db();
-        create_test_snapshot(
-            &db,
-            "run-1",
-            "agent-a",
-            SnapshotPhase::Pruning,
-            MemoryFile::Episodic,
-        );
+        create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let id2 = create_test_snapshot(
-            &db,
-            "run-2",
-            "agent-a",
-            SnapshotPhase::Consolidation,
-            MemoryFile::Episodic,
-        );
+        let id2 = create_test_snapshot(&db, "run-2", "agent-a", MemoryFile::Episodic);
 
         let latest = db
             .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)

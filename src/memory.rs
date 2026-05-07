@@ -418,8 +418,6 @@ mod tests {
                 finished_at TEXT,
                 source_chats_json TEXT NOT NULL DEFAULT '[]',
                 source_digest_md TEXT,
-                phases_json TEXT NOT NULL DEFAULT '[]',
-                summary_md TEXT,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -456,7 +454,7 @@ mod tests {
         let run_id = db
             .create_sleep_run(agent_id, SleepRunTrigger::Manual)
             .expect("create sleep run");
-        db.update_sleep_run_success(&run_id, "[]", None, "[]", None, 10, 5)
+        db.update_sleep_run_success(&run_id, "[]", None, 10, 5)
             .expect("complete sleep run");
         run_id
     }
