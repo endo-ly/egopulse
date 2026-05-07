@@ -306,6 +306,7 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
 pub async fn run_sleep_batch(
     state: &AppState,
     agent_id: Option<&str>,
+    trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
     let resolved_agent = match agent_id {
         Some(id) => id.to_string(),
@@ -336,7 +337,7 @@ pub async fn run_sleep_batch(
         crate::memory::InputDecision::Proceed {
             sessions,
             source_chats_json,
-        } => execute_batch(state, db, &resolved_agent, &sessions, &source_chats_json).await,
+        } => execute_batch(state, db, &resolved_agent, &sessions, &source_chats_json, trigger).await,
     }
 }
 
@@ -346,10 +347,11 @@ async fn execute_batch(
     agent_id: &str,
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
+    trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
     let agent_for_run = agent_id.to_string();
     let run_id = call_blocking(Arc::clone(&db), move |db| {
-        db.try_create_sleep_run(&agent_for_run, SleepRunTrigger::Manual)
+        db.try_create_sleep_run(&agent_for_run, trigger)
     })
     .await?;
 
@@ -850,7 +852,7 @@ mod tests {
     async fn run_sleep_batch_skips_when_input_below_threshold() {
         let (db, dir) = test_db();
         let state = build_test_state(db, dir.path());
-        let result = run_sleep_batch(&state, Some("test-agent")).await;
+        let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
         assert!(result.is_ok());
     }
 
@@ -860,7 +862,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -880,7 +882,7 @@ mod tests {
             .create_sleep_run("test-agent", SleepRunTrigger::Manual)
             .expect("create running");
 
-        let err = run_sleep_batch(&state, Some("test-agent"))
+        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect_err("should fail with AlreadyRunning");
         assert!(
@@ -900,7 +902,7 @@ mod tests {
         std::fs::write(memory_dir.join("semantic.md"), "semantic content").expect("write");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -943,7 +945,7 @@ mod tests {
         })));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -966,7 +968,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -981,7 +983,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -996,7 +998,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1036,7 +1038,7 @@ mod tests {
 
         let state = build_test_state(db, dir.path());
 
-        let err = run_sleep_batch(&state, Some("test-agent"))
+        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect_err("should fail after run creation");
         assert!(matches!(err, SleepBatchError::Storage(_)));
@@ -1061,7 +1063,7 @@ mod tests {
         std::fs::create_dir_all(&memory_dir).expect("create memory dir");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1081,7 +1083,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1101,7 +1103,7 @@ mod tests {
         let state = build_test_state(db, dir.path());
 
         let default = state.config.default_agent.as_str().to_string();
-        let result = run_sleep_batch(&state, None).await;
+        let result = run_sleep_batch(&state, None, SleepRunTrigger::Manual).await;
         assert!(result.is_ok());
         let _ = default;
     }
