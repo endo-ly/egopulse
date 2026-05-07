@@ -2101,6 +2101,7 @@ fn persist_preserves_sleep_batch_config() {
         sleep_batch: super::SleepBatchConfig {
             provider: Some(super::ProviderId::new("deepseek")),
             model: Some("deepseek-chat-v3".to_string()),
+            ..Default::default()
         },
     };
 
@@ -2110,4 +2111,398 @@ fn persist_preserves_sleep_batch_config() {
     assert!(yaml.contains("sleep_batch:"));
     assert!(yaml.contains("provider: deepseek"));
     assert!(yaml.contains("model: deepseek-chat-v3"));
+}
+
+// --- Step 2: Sleep Batch Scheduler Config tests ---
+
+fn sleep_batch_scheduler_yml(sleep_batch_section: &str) -> String {
+    format!(
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob
+  carol:
+    label: Carol
+sleep_batch:
+{sleep_batch_section}"#
+    )
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_enabled() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(config.sleep_batch.enabled);
+}
+
+#[test]
+#[serial]
+fn sleep_batch_enabled_defaults_to_false() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(!config.sleep_batch.enabled);
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_schedule() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(config.sleep_batch.schedule.as_deref(), Some("04:00"));
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_timezone() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(config.sleep_batch.timezone.as_deref(), Some("Asia/Tokyo"));
+}
+
+#[test]
+#[serial]
+fn sleep_batch_enabled_requires_schedule() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::SleepBatchEnabledRequiresSchedule),
+        "expected SleepBatchEnabledRequiresSchedule, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn sleep_batch_enabled_requires_timezone() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00""#,
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::SleepBatchEnabledRequiresTimezone),
+        "expected SleepBatchEnabledRequiresTimezone, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn sleep_batch_disabled_allows_missing_schedule_timezone() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(r#"  enabled: false"#),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(!config.sleep_batch.enabled);
+    assert!(config.sleep_batch.schedule.is_none());
+    assert!(config.sleep_batch.timezone.is_none());
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_agents() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  agents:
+    - alice
+    - bob"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let agents = config.sleep_batch.agents.expect("agents");
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0].as_str(), "alice");
+    assert_eq!(agents[1].as_str(), "bob");
+}
+
+#[test]
+#[serial]
+fn sleep_batch_agents_defaults_to_none_when_unset() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(config.sleep_batch.agents.is_none());
+}
+
+#[test]
+#[serial]
+fn sleep_batch_agents_empty_means_no_agents() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  agents: []"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let agents = config.sleep_batch.agents.expect("agents");
+    assert!(agents.is_empty());
+}
+
+#[test]
+#[serial]
+fn sleep_batch_agent_order_puts_default_first() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  agents:
+    - carol
+    - alice
+    - bob"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let agents = config.sleep_batch.agents.expect("agents");
+    assert_eq!(agents[0].as_str(), "alice");
+    assert_eq!(agents[1].as_str(), "bob");
+    assert_eq!(agents[2].as_str(), "carol");
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_retry_config() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  retry:
+    max_attempts: 5
+    interval_minutes: 10"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(config.sleep_batch.retry_max_attempts, 5);
+    assert_eq!(config.sleep_batch.retry_interval_minutes, 10);
+}
+
+#[test]
+#[serial]
+fn rejects_unknown_sleep_batch_agent() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  agents:
+    - nonexistent"#,
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::SleepBatchUnknownAgent { ref agent_id } if agent_id == "nonexistent"),
+        "expected SleepBatchUnknownAgent, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn rejects_invalid_sleep_batch_schedule() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "25:00"
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::SleepBatchInvalidSchedule { ref schedule } if schedule == "25:00"),
+        "expected SleepBatchInvalidSchedule, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn rejects_invalid_sleep_batch_timezone() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Invalid/Zone""#,
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::SleepBatchInvalidTimezone { ref timezone } if timezone == "Invalid/Zone"),
+        "expected SleepBatchInvalidTimezone, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn persist_preserves_sleep_batch_scheduler_config() {
+    use crate::config::persist::save_config_with_secrets;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let path = temp_dir.path().join("egopulse.config.yaml");
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig {
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: Some(
+                super::secret_ref::ResolvedValue::Literal("sk-test".to_string()),
+            ),
+            default_model: "gpt-4o-mini".to_string(),
+            models: HashMap::new(),
+        },
+    );
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let config = Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers,
+        state_root: temp_dir.path().to_str().expect("path").to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels: HashMap::new(),
+        default_agent: super::AgentId::new("alice"),
+        agents,
+        sleep_batch: super::SleepBatchConfig {
+            enabled: true,
+            schedule: Some("04:00".to_string()),
+            timezone: Some("Asia/Tokyo".to_string()),
+            agents: Some(vec![super::AgentId::new("alice")]),
+            retry_max_attempts: 5,
+            retry_interval_minutes: 10,
+            ..Default::default()
+        },
+    };
+
+    save_config_with_secrets(&config, &path).expect("save config");
+
+    let yaml = std::fs::read_to_string(&path).expect("yaml");
+    assert!(yaml.contains("enabled: true"));
+    assert!(yaml.contains("schedule:"));
+    assert!(yaml.contains("04:00"));
+    assert!(yaml.contains("timezone:"));
+    assert!(yaml.contains("Asia/Tokyo"));
+    assert!(yaml.contains("- alice"));
+    assert!(yaml.contains("max_attempts: 5"));
+    assert!(yaml.contains("interval_minutes: 10"));
 }

@@ -89,6 +89,17 @@ struct FileAgentConfig {
 struct FileSleepBatchConfig {
     provider: Option<String>,
     model: Option<String>,
+    enabled: Option<bool>,
+    schedule: Option<String>,
+    timezone: Option<String>,
+    agents: Option<Vec<String>>,
+    retry: Option<FileRetryConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileRetryConfig {
+    max_attempts: Option<u32>,
+    interval_minutes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -182,8 +193,6 @@ pub(super) fn build_config(
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
     validate_agent_provider_references(&providers, &agents)?;
 
-    let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers)?;
-
     let default_agent =
         normalize_string(file_default_agent).unwrap_or_else(|| "default".to_string());
     let default_agent = AgentId::new(&default_agent);
@@ -193,6 +202,8 @@ pub(super) fn build_config(
             agent_id: default_agent.to_string(),
         });
     }
+
+    let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers, &agents, &default_agent)?;
 
     let config = Config {
         default_provider,
@@ -472,6 +483,8 @@ fn normalize_agents(
 fn normalize_sleep_batch(
     file: Option<FileSleepBatchConfig>,
     providers: &HashMap<ProviderId, ProviderConfig>,
+    agents: &HashMap<AgentId, AgentConfig>,
+    default_agent: &AgentId,
 ) -> Result<SleepBatchConfig, ConfigError> {
     let Some(fb) = file else {
         return Ok(SleepBatchConfig::default());
@@ -486,10 +499,106 @@ fn normalize_sleep_batch(
         }
     }
 
+    let enabled = fb.enabled.unwrap_or(false);
+    let schedule = normalize_string(fb.schedule);
+    let timezone = normalize_string(fb.timezone);
+
+    if enabled && schedule.is_none() {
+        return Err(ConfigError::SleepBatchEnabledRequiresSchedule);
+    }
+    if enabled && timezone.is_none() {
+        return Err(ConfigError::SleepBatchEnabledRequiresTimezone);
+    }
+
+    if let Some(ref sched) = schedule {
+        validate_schedule(sched)?;
+    }
+    if let Some(ref tz) = timezone {
+        validate_timezone(tz)?;
+    }
+
+    let mut resolved_agents = normalize_agent_list(fb.agents, agents)?;
+    if let Some(ref mut list) = resolved_agents {
+        sort_agent_list(list, default_agent);
+    }
+
+    let retry = fb.retry.unwrap_or_default();
+    let retry_max_attempts = retry.max_attempts.unwrap_or(3);
+    let retry_interval_minutes = retry.interval_minutes.unwrap_or(5);
+    if retry_max_attempts == 0 {
+        return Err(ConfigError::SleepBatchInvalidRetry {
+            detail: "max_attempts must be at least 1".to_string(),
+        });
+    }
+
     Ok(SleepBatchConfig {
         provider,
         model: normalize_string(fb.model),
+        enabled,
+        schedule,
+        timezone,
+        agents: resolved_agents,
+        retry_max_attempts,
+        retry_interval_minutes,
     })
+}
+
+fn validate_schedule(schedule: &str) -> Result<(), ConfigError> {
+    let parts: Vec<&str> = schedule.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ConfigError::SleepBatchInvalidSchedule {
+            schedule: schedule.to_string(),
+        });
+    }
+    let hour: u32 = parts[0].parse().map_err(|_| ConfigError::SleepBatchInvalidSchedule {
+        schedule: schedule.to_string(),
+    })?;
+    let minute: u32 = parts[1].parse().map_err(|_| ConfigError::SleepBatchInvalidSchedule {
+        schedule: schedule.to_string(),
+    })?;
+    if hour > 23 || minute > 59 {
+        return Err(ConfigError::SleepBatchInvalidSchedule {
+            schedule: schedule.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_timezone(tz: &str) -> Result<(), ConfigError> {
+    tz.parse::<chrono_tz::Tz>().map_err(|_| {
+        ConfigError::SleepBatchInvalidTimezone {
+            timezone: tz.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+fn normalize_agent_list(
+    raw: Option<Vec<String>>,
+    agents: &HashMap<AgentId, AgentConfig>,
+) -> Result<Option<Vec<AgentId>>, ConfigError> {
+    let Some(names) = raw else {
+        return Ok(None);
+    };
+    let mut resolved = Vec::with_capacity(names.len());
+    for name in &names {
+        let id = AgentId::new(name);
+        if !agents.contains_key(&id) {
+            return Err(ConfigError::SleepBatchUnknownAgent {
+                agent_id: id.to_string(),
+            });
+        }
+        resolved.push(id);
+    }
+    Ok(Some(resolved))
+}
+
+fn sort_agent_list(agents: &mut [AgentId], default_agent: &AgentId) {
+    agents.sort_by(|a, b| {
+        let a_is_default = a == default_agent;
+        let b_is_default = b == default_agent;
+        b_is_default.cmp(&a_is_default).then_with(|| a.cmp(b))
+    });
 }
 
 fn normalize_provider_map(

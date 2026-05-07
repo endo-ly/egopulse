@@ -137,6 +137,18 @@ pub enum ConfigError {
     /// SecretRef の exec コマンド実行に失敗した。
     #[error("secret_ref_exec_failed: {command}: {detail}")]
     SecretRefExecFailed { command: String, detail: String },
+    #[error("sleep_batch_enabled_requires_schedule")]
+    SleepBatchEnabledRequiresSchedule,
+    #[error("sleep_batch_enabled_requires_timezone")]
+    SleepBatchEnabledRequiresTimezone,
+    #[error("sleep_batch_unknown_agent: {agent_id}")]
+    SleepBatchUnknownAgent { agent_id: String },
+    #[error("sleep_batch_invalid_schedule: {schedule}")]
+    SleepBatchInvalidSchedule { schedule: String },
+    #[error("sleep_batch_invalid_timezone: {timezone}")]
+    SleepBatchInvalidTimezone { timezone: String },
+    #[error("sleep_batch_invalid_retry: {detail}")]
+    SleepBatchInvalidRetry { detail: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

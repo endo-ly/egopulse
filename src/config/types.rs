@@ -235,10 +235,37 @@ impl ResolvedLlmConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct SleepBatchConfig {
     pub provider: Option<ProviderId>,
     pub model: Option<String>,
+    pub enabled: bool,
+    pub schedule: Option<String>,
+    pub timezone: Option<String>,
+    pub agents: Option<Vec<AgentId>>,
+    pub retry_max_attempts: u32,
+    pub retry_interval_minutes: u32,
+}
+
+impl Default for SleepBatchConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            enabled: false,
+            schedule: None,
+            timezone: None,
+            agents: None,
+            retry_max_attempts: 3,
+            retry_interval_minutes: 5,
+        }
+    }
+}
+
+impl SleepBatchConfig {
+    pub(crate) fn scheduler_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 #[derive(Clone, Default)]
