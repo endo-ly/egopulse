@@ -822,7 +822,13 @@ impl Database {
              WHERE run_id = ?2 AND agent_id = ?3 AND file = ?4",
             params![content_after, run_id, agent_id, file.to_string()],
         )?;
-        Ok(changed > 0)
+        match changed {
+            0 => Ok(false),
+            1 => Ok(true),
+            n => Err(StorageError::Conflict(format!(
+                "expected at most 1 memory_snapshot row for run={run_id} agent={agent_id} file={file}, but {n} were updated"
+            ))),
+        }
     }
 
     pub(crate) fn get_snapshots_for_run(
