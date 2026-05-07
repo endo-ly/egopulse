@@ -97,7 +97,7 @@ impl AppState {
         self.cached_provider(&resolved)
     }
 
-    fn cached_provider(
+    pub(crate) fn cached_provider(
         &self,
         resolved: &crate::config::ResolvedLlmConfig,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {

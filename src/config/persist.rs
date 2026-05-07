@@ -48,6 +48,14 @@ struct SerializableAgent {
 }
 
 #[derive(Serialize)]
+struct SerializableSleepBatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
 struct SerializableConfig {
     default_provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +74,8 @@ struct SerializableConfig {
     default_agent: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     agents: HashMap<String, SerializableAgent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sleep_batch: Option<SerializableSleepBatch>,
 }
 
 #[derive(Serialize)]
@@ -251,6 +261,17 @@ impl From<&Config> for SerializableConfig {
             channels,
             default_agent: Some(config.default_agent.to_string()),
             agents,
+            sleep_batch: {
+                let sb = &config.sleep_batch;
+                if sb.provider.is_none() && sb.model.is_none() {
+                    None
+                } else {
+                    Some(SerializableSleepBatch {
+                        provider: sb.provider.as_ref().map(|p| p.to_string()),
+                        model: sb.model.clone(),
+                    })
+                }
+            },
         }
     }
 }
@@ -472,6 +493,7 @@ mod tests {
             channels,
             default_agent: AgentId::new("default"),
             agents,
+            sleep_batch: crate::config::SleepBatchConfig::default(),
         }
     }
 

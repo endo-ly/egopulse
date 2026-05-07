@@ -598,6 +598,7 @@ fn persists_agents_without_discord_config_surface() {
         channels: std::collections::HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
+        sleep_batch: super::SleepBatchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -1008,6 +1009,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         channels,
         default_agent: super::AgentId::new("assistant"),
         agents,
+        sleep_batch: super::SleepBatchConfig::default(),
     };
 
     // Act
@@ -1836,6 +1838,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                 ..Default::default()
             },
         )]),
+        sleep_batch: super::SleepBatchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -1848,4 +1851,263 @@ fn persists_provider_model_contexts_without_secret_leak() {
     // SecretRef should be used instead
     assert!(yaml.contains("source: env"));
     assert!(yaml.contains("OPENAI_API_KEY"));
+}
+
+// --- Sleep Batch config tests ---
+
+#[test]
+#[serial]
+fn loads_sleep_batch_model() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  model: deepseek-chat-v3"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(
+        config.sleep_batch.model.as_deref(),
+        Some("deepseek-chat-v3")
+    );
+}
+
+#[test]
+#[serial]
+fn loads_sleep_batch_provider() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  deepseek:
+    label: DeepSeek
+    base_url: https://api.deepseek.com/v1
+    api_key: sk-deepseek
+    default_model: deepseek-chat
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  provider: deepseek"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(
+        config.sleep_batch.provider.as_ref().map(|p| p.as_str()),
+        Some("deepseek")
+    );
+}
+
+#[test]
+#[serial]
+fn sleep_batch_model_defaults_to_none() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(config.sleep_batch.model.is_none());
+}
+
+#[test]
+#[serial]
+fn sleep_batch_provider_defaults_to_none() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert!(config.sleep_batch.provider.is_none());
+}
+
+#[test]
+#[serial]
+fn resolve_sleep_batch_llm_uses_provider_when_set() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  deepseek:
+    label: DeepSeek
+    base_url: https://api.deepseek.com/v1
+    api_key: sk-deepseek
+    default_model: deepseek-chat
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  provider: deepseek"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let resolved = config.resolve_sleep_batch_llm().expect("resolve");
+    assert_eq!(resolved.provider, "deepseek");
+    assert_eq!(resolved.model, "deepseek-chat");
+}
+
+#[test]
+#[serial]
+fn resolve_sleep_batch_llm_uses_model_when_set() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+default_model: gpt-5
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  model: gpt-4o"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let resolved = config.resolve_sleep_batch_llm().expect("resolve");
+    assert_eq!(resolved.provider, "openai");
+    assert_eq!(resolved.model, "gpt-4o");
+}
+
+#[test]
+#[serial]
+fn resolve_sleep_batch_llm_falls_back_to_global_default_model() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let resolved = config.resolve_sleep_batch_llm().expect("resolve");
+    assert_eq!(resolved.provider, "openai");
+    // sample_config has no default_model, so falls back to provider.default_model
+    assert_eq!(resolved.model, "gpt-4o-mini");
+}
+
+#[test]
+#[serial]
+fn rejects_unknown_sleep_batch_provider() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  provider: nonexistent"#,
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+    assert!(
+        matches!(error, ConfigError::InvalidProviderReference { ref provider } if provider == "nonexistent"),
+        "expected InvalidProviderReference, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn persist_preserves_sleep_batch_config() {
+    use crate::config::persist::save_config_with_secrets;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let path = temp_dir.path().join("egopulse.config.yaml");
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig {
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-test".to_string(),
+            )),
+            default_model: "gpt-4o-mini".to_string(),
+            models: HashMap::new(),
+        },
+    );
+    providers.insert(
+        super::ProviderId::new("deepseek"),
+        super::ProviderConfig {
+            label: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-ds".to_string(),
+            )),
+            default_model: "deepseek-chat".to_string(),
+            models: HashMap::new(),
+        },
+    );
+
+    let config = Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers,
+        state_root: temp_dir.path().to_str().expect("path").to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels: HashMap::new(),
+        default_agent: super::AgentId::new("default"),
+        agents: HashMap::from([(
+            super::AgentId::new("default"),
+            super::AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        )]),
+        sleep_batch: super::SleepBatchConfig {
+            provider: Some(super::ProviderId::new("deepseek")),
+            model: Some("deepseek-chat-v3".to_string()),
+        },
+    };
+
+    save_config_with_secrets(&config, &path).expect("save config");
+
+    let yaml = std::fs::read_to_string(&path).expect("yaml");
+    assert!(yaml.contains("sleep_batch:"));
+    assert!(yaml.contains("provider: deepseek"));
+    assert!(yaml.contains("model: deepseek-chat-v3"));
 }

@@ -119,6 +119,47 @@ impl Config {
         self.resolve_llm_for_agent_channel(&self.default_agent, channel)
     }
 
+    /// Resolves the provider/model pair for sleep batch LLM processing.
+    ///
+    /// Resolution chain:
+    /// 1. `sleep_batch.provider` → that provider, else `default_provider`
+    /// 2. `sleep_batch.model` → that model, else `default_model`,
+    ///    else the resolved provider's `default_model`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidProviderReference`] if `sleep_batch.provider`
+    /// does not reference an existing provider.
+    pub(crate) fn resolve_sleep_batch_llm(&self) -> Result<ResolvedLlmConfig, ConfigError> {
+        let provider_id = self
+            .sleep_batch
+            .provider
+            .as_ref()
+            .unwrap_or(&self.default_provider);
+
+        let provider = self.providers.get(provider_id).ok_or_else(|| {
+            ConfigError::InvalidProviderReference {
+                provider: provider_id.to_string(),
+            }
+        })?;
+
+        let model = self
+            .sleep_batch
+            .model
+            .as_deref()
+            .map(String::from)
+            .or_else(|| self.default_model.clone())
+            .unwrap_or_else(|| provider.default_model.clone());
+
+        Ok(ResolvedLlmConfig {
+            provider: provider_id.to_string(),
+            label: provider.label.clone(),
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
+            model,
+        })
+    }
+
     /// Returns `true` if the web channel is enabled.
     pub(crate) fn web_enabled(&self) -> bool {
         self.channels

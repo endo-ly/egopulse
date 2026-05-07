@@ -806,6 +806,50 @@ impl Database {
         Ok(id)
     }
 
+    /// Updates `content_after` for an existing memory snapshot, or creates an
+    /// after-only snapshot when the file did not exist before the run.
+    pub(crate) fn update_memory_snapshot_after(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        file: MemoryFile,
+        content_after: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let changed = conn.execute(
+            "UPDATE memory_snapshots SET content_after = ?1
+             WHERE run_id = ?2 AND agent_id = ?3 AND file = ?4",
+            params![content_after, run_id, agent_id, file.to_string()],
+        )?;
+        match changed {
+            0 => {
+                let id = uuid::Uuid::new_v4().to_string();
+                let created_at = chrono::Utc::now().to_rfc3339();
+                let inserted = conn.execute(
+                    "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+                     SELECT ?1, ?2, ?3, ?4, '', ?5, ?6
+                     WHERE EXISTS (SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3)",
+                    params![
+                        id,
+                        run_id,
+                        agent_id,
+                        file.to_string(),
+                        content_after,
+                        created_at,
+                    ],
+                )?;
+                if inserted == 0 {
+                    return Err(StorageError::NotFound(format!("sleep_run:{run_id}")));
+                }
+                Ok(())
+            }
+            1 => Ok(()),
+            n => Err(StorageError::Conflict(format!(
+                "expected at most 1 memory_snapshot row for run={run_id} agent={agent_id} file={file}, but {n} were updated"
+            ))),
+        }
+    }
+
     pub(crate) fn get_snapshots_for_run(
         &self,
         run_id: &str,
@@ -1704,6 +1748,45 @@ mod tests {
             .expect("get latest")
             .expect("should exist");
         assert_eq!(latest.id, id2);
+    }
+
+    #[test]
+    fn update_memory_snapshot_after_updates_existing_row() {
+        let (db, _dir) = test_db();
+
+        // Create a BEFORE snapshot (content_after is initially same as content_before)
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
+
+        // Update the after field
+        db.update_memory_snapshot_after(
+            "run-1",
+            "agent-a",
+            MemoryFile::Episodic,
+            "new after content",
+        )
+        .expect("update after");
+
+        // Verify row count stays at 1 and after field changed
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(snapshots.len(), 1, "row count should stay at 1");
+        assert_eq!(snapshots[0].id, id);
+        assert_eq!(snapshots[0].content_before, "before content");
+        assert_eq!(snapshots[0].content_after, "new after content");
+    }
+
+    #[test]
+    fn update_memory_snapshot_after_creates_after_only_row_when_file_is_new() {
+        let (db, _dir) = test_db();
+        ensure_sleep_run_exists(&db, "run-1", "agent-a");
+
+        db.update_memory_snapshot_after("run-1", "agent-a", MemoryFile::Prospective, "after")
+            .expect("update after");
+
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].file, MemoryFile::Prospective);
+        assert_eq!(snapshots[0].content_before, "");
+        assert_eq!(snapshots[0].content_after, "after");
     }
 
     #[test]

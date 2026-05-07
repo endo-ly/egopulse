@@ -13,7 +13,7 @@ use super::secret_ref::{
 };
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
-    DiscordChannelConfig, ProviderConfig, ProviderId, TelegramChatConfig,
+    DiscordChannelConfig, ProviderConfig, ProviderId, SleepBatchConfig, TelegramChatConfig,
 };
 use crate::error::ConfigError;
 
@@ -86,6 +86,12 @@ struct FileAgentConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FileSleepBatchConfig {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
     default_model: Option<String>,
@@ -100,6 +106,7 @@ struct FileConfig {
     channels: Option<HashMap<String, FileChannelConfig>>,
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
+    sleep_batch: Option<FileSleepBatchConfig>,
 }
 
 pub(super) fn build_config(
@@ -127,6 +134,7 @@ pub(super) fn build_config(
         channels: file_channels,
         default_agent: file_default_agent,
         agents: file_agents,
+        sleep_batch: file_sleep_batch,
     } = read_file_config(resolved_config_path.as_deref())?;
 
     let default_provider =
@@ -173,6 +181,9 @@ pub(super) fn build_config(
 
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
     validate_agent_provider_references(&providers, &agents)?;
+
+    let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers)?;
+
     let default_agent =
         normalize_string(file_default_agent).unwrap_or_else(|| "default".to_string());
     let default_agent = AgentId::new(&default_agent);
@@ -198,6 +209,7 @@ pub(super) fn build_config(
         channels,
         default_agent,
         agents,
+        sleep_batch,
     };
 
     validate_compaction_config(&config)?;
@@ -455,6 +467,29 @@ fn normalize_agents(
     }
 
     Ok(normalized)
+}
+
+fn normalize_sleep_batch(
+    file: Option<FileSleepBatchConfig>,
+    providers: &HashMap<ProviderId, ProviderConfig>,
+) -> Result<SleepBatchConfig, ConfigError> {
+    let Some(fb) = file else {
+        return Ok(SleepBatchConfig::default());
+    };
+
+    let provider = normalize_string(fb.provider).map(|p| ProviderId::new(&p));
+    if let Some(ref pid) = provider {
+        if !providers.contains_key(pid) {
+            return Err(ConfigError::InvalidProviderReference {
+                provider: pid.to_string(),
+            });
+        }
+    }
+
+    Ok(SleepBatchConfig {
+        provider,
+        model: normalize_string(fb.model),
+    })
 }
 
 fn normalize_provider_map(
