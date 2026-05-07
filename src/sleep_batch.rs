@@ -11,6 +11,8 @@ use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, ca
 
 /// Ratio of context window used as overflow threshold for sleep batch input.
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
+/// Approximate chars-per-token ratio used by the existing session token estimate.
+const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum SleepBatchError {
@@ -132,17 +134,21 @@ pub(crate) fn build_sleep_input(
         )));
     }
 
-    // Check context overflow (80% threshold)
-    let total_tokens: i64 = sessions.iter().map(|s| s.estimated_tokens).sum();
-    let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as i64;
-    if total_tokens > threshold {
+    // Load memory, defaulting to empty if not found
+    let memory = memory_loader.load(agent_id).unwrap_or_default();
+
+    // Check context overflow (80% threshold), including existing memory text.
+    let session_tokens: usize = sessions
+        .iter()
+        .map(|s| s.estimated_tokens.max(0) as usize)
+        .sum();
+    let memory_tokens = estimate_memory_tokens(&memory);
+    let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as usize;
+    if session_tokens.saturating_add(memory_tokens) > threshold {
         return Err(SleepBatchError::ContextOverflow {
             agent_id: agent_id.to_string(),
         });
     }
-
-    // Load memory, defaulting to empty if not found
-    let memory = memory_loader.load(agent_id).unwrap_or_default();
 
     // Build sessions_text from each session
     let mut sessions_text = String::new();
@@ -161,6 +167,22 @@ pub(crate) fn build_sleep_input(
         sessions_text,
         source_chats_json: source_chats_json.to_string(),
     })
+}
+
+fn estimate_memory_tokens(memory: &MemoryContent) -> usize {
+    [
+        memory.episodic.as_deref(),
+        memory.semantic.as_deref(),
+        memory.prospective.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(estimate_text_tokens)
+    .sum()
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    text.len().div_ceil(ESTIMATED_CHARS_PER_TOKEN)
 }
 
 /// Extracts message content from a JSON array of `{"role":"...","content":"..."}` objects.
@@ -341,6 +363,9 @@ async fn execute_batch(
     };
 
     let result = async {
+        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
+        recover_memory_write(&agents_dir, agent_id)?;
+
         // 1. Resolve LLM config
         let resolved = state
             .config
@@ -392,12 +417,10 @@ async fn execute_batch(
         let output = parse_sleep_response(&response.content)?;
 
         // 8. Write memory files
-        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
         write_memory_files(&agents_dir, agent_id, &output)?;
 
-        // 9. Reload memory for AFTER snapshots
-        let memory_after = state.memory_loader.load(agent_id);
-        save_aggregate_snapshots(&db, &run_id, agent_id, memory_after.as_ref(), Some(true)).await?;
+        // 9. Save AFTER snapshots from parsed output, preserving empty files too.
+        save_output_snapshots(&db, &run_id, agent_id, &output).await?;
 
         // 10. Update run success with token usage
         let run_id_owned = run_id.clone();
@@ -431,6 +454,14 @@ async fn execute_batch(
 
     info!(agent_id = %agent_id, run_id = %run_id, "sleep batch completed");
     Ok(())
+}
+
+fn memory_content_from_output(output: &SleepBatchOutput) -> MemoryContent {
+    MemoryContent {
+        episodic: Some(output.episodic.clone()),
+        semantic: Some(output.semantic.clone()),
+        prospective: Some(output.prospective.clone()),
+    }
 }
 
 async fn save_aggregate_snapshots(
@@ -479,6 +510,16 @@ async fn save_aggregate_snapshots(
     }
 
     Ok(())
+}
+
+async fn save_output_snapshots(
+    db: &Arc<Database>,
+    run_id: &str,
+    agent_id: &str,
+    output: &SleepBatchOutput,
+) -> Result<(), SleepBatchError> {
+    let content = memory_content_from_output(output);
+    save_aggregate_snapshots(db, run_id, agent_id, Some(&content), Some(true)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +737,12 @@ mod tests {
                 .to_string(),
             }
         }
+
+        fn with_response(response: serde_json::Value) -> Self {
+            Self {
+                response: response.to_string(),
+            }
+        }
     }
 
     #[async_trait]
@@ -767,6 +814,14 @@ mod tests {
     }
 
     fn build_test_state(db: Database, dir: &std::path::Path) -> AppState {
+        build_test_state_with_llm(db, dir, Arc::new(MockLlmProvider::new()))
+    }
+
+    fn build_test_state_with_llm(
+        db: Database,
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmProvider>,
+    ) -> AppState {
         let config = crate::test_util::test_config(&dir.to_string_lossy());
         let skills = Arc::new(crate::skills::SkillManager::from_dirs(
             config.user_skills_dir().expect("user_skills_dir"),
@@ -776,7 +831,7 @@ mod tests {
             db: Arc::new(db),
             config: config.clone(),
             config_path: None,
-            llm_override: Some(Arc::new(MockLlmProvider::new())),
+            llm_override: Some(llm),
             channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
             skills: Arc::clone(&skills),
             tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
@@ -852,14 +907,56 @@ mod tests {
         let run_id = &runs[0].id;
 
         let snapshots = state.db.get_snapshots_for_run(run_id).expect("snapshots");
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 3);
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Episodic));
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Semantic));
-        assert!(
-            snapshots
-                .iter()
-                .all(|s| s.content_before == s.content_after)
-        );
+        assert!(snapshots.iter().any(|s| s.file == MemoryFile::Prospective));
+        let episodic = snapshots
+            .iter()
+            .find(|s| s.file == MemoryFile::Episodic)
+            .expect("episodic snapshot");
+        assert_eq!(episodic.content_before, "episodic content");
+        assert_eq!(episodic.content_after, "");
+        let prospective = snapshots
+            .iter()
+            .find(|s| s.file == MemoryFile::Prospective)
+            .expect("prospective snapshot");
+        assert_eq!(prospective.content_before, "");
+        assert_eq!(prospective.content_after, "");
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_recovers_backup_before_building_input() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let agent_dir = dir.path().join("agents").join("test-agent");
+        let backup_dir = agent_dir.join("memory.backup-stale");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        std::fs::write(backup_dir.join("episodic.md"), "restored episodic").expect("write");
+
+        let llm = Arc::new(MockLlmProvider::with_response(serde_json::json!({
+            "episodic": "updated episodic",
+            "semantic": "",
+            "prospective": ""
+        })));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"))
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let snapshots = state
+            .db
+            .get_snapshots_for_run(&runs[0].id)
+            .expect("snapshots");
+        let episodic = snapshots
+            .iter()
+            .find(|s| s.file == MemoryFile::Episodic)
+            .expect("episodic snapshot");
+        assert_eq!(episodic.content_before, "restored episodic");
+        assert_eq!(episodic.content_after, "updated episodic");
     }
 
     #[tokio::test]
@@ -1258,6 +1355,18 @@ mod tests {
             matches!(err, SleepBatchError::ContextOverflow { .. }),
             "expected ContextOverflow, got {err:?}"
         );
+    }
+
+    #[test]
+    fn build_sleep_input_counts_existing_memory_for_context_overflow() {
+        let (db, dir) = test_db();
+        write_memory_file(dir.path(), "test-agent", "semantic.md", &"A".repeat(2_700));
+        let loader = make_memory_loader(dir.path());
+        let sessions = vec![];
+
+        let err = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 1_000)
+            .expect_err("memory alone should exceed 80% context threshold");
+        assert!(matches!(err, SleepBatchError::ContextOverflow { .. }));
     }
 
     // --- build_sleep_system_prompt tests ---
