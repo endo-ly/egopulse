@@ -591,7 +591,9 @@ fn normalize_agent_list(
                 agent_id: id.to_string(),
             });
         }
-        resolved.push(id);
+        if !resolved.contains(&id) {
+            resolved.push(id);
+        }
     }
     Ok(Some(resolved))
 }

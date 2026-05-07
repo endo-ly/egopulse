@@ -292,7 +292,7 @@ pub trait ChannelAdapter: Send + Sync {
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
 | **Sleep Batch** | `sleep_batch.rs` | 手動 sleep batch の排他実行と監査記録 |
 | **Sleep Scheduler** | `sleep_scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
-| **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追踪（scheduler defer 用） |
+| **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
 
 ### Sleep Batch（手動長期記憶処理）
 

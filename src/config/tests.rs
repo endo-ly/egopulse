@@ -2348,6 +2348,31 @@ fn sleep_batch_agent_order_puts_default_first() {
 
 #[test]
 #[serial]
+fn sleep_batch_agents_deduplicates_duplicates() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &sleep_batch_scheduler_yml(
+            r#"  enabled: true
+  schedule: "04:00"
+  timezone: "Asia/Tokyo"
+  agents:
+    - alice
+    - bob
+    - alice"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let agents = config.sleep_batch.agents.expect("agents");
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0].as_str(), "alice");
+    assert_eq!(agents[1].as_str(), "bob");
+}
+
+#[test]
+#[serial]
 fn loads_sleep_batch_retry_config() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());

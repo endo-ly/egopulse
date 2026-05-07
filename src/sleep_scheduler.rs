@@ -198,9 +198,11 @@ fn try_date(
                 None
             }
         }
-        LocalResult::Ambiguous(earliest, _latest) => {
+        LocalResult::Ambiguous(earliest, latest) => {
             if earliest > *local_now {
                 Some(earliest.with_timezone(&Utc))
+            } else if latest > *local_now {
+                Some(latest.with_timezone(&Utc))
             } else {
                 None
             }
@@ -318,6 +320,21 @@ mod tests {
         assert_eq!(
             result,
             "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn next_run_falls_back_to_latest_instant_in_dst_fold() {
+        // America/New_York: DST ends 2026-11-01 at 02:00 EDT → clocks fall back to 01:00 EST.
+        // Local time 01:30 exists twice: 05:30 UTC (EDT) and 06:30 UTC (EST).
+        // If now is between them (05:45 UTC), earliest is past but latest is still future.
+        let config = enabled_config("01:30", "America/New_York");
+        let now = "2026-11-01T05:45:00Z".parse::<DateTime<Utc>>().unwrap();
+        let result = next_scheduled_run(&config, now).unwrap();
+        // Expected: 2026-11-01 01:30 EST = 06:30 UTC (latest instant)
+        assert_eq!(
+            result,
+            "2026-11-01T06:30:00Z".parse::<DateTime<Utc>>().unwrap()
         );
     }
 
