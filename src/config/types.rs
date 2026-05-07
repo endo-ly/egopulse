@@ -235,6 +235,12 @@ impl ResolvedLlmConfig {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SleepBatchConfig {
+    pub provider: Option<ProviderId>,
+    pub model: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct AgentConfig {
     pub label: String,
@@ -269,6 +275,7 @@ pub struct Config {
     pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
+    pub(crate) sleep_batch: SleepBatchConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -294,6 +301,7 @@ impl std::fmt::Debug for Config {
             .field("channels", &self.channels)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)
+            .field("sleep_batch", &self.sleep_batch)
             .finish()
     }
 }

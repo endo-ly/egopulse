@@ -61,6 +61,7 @@ pub(crate) fn test_config(state_root: &str) -> Config {
                 ..Default::default()
             },
         )]),
+        sleep_batch: crate::config::SleepBatchConfig::default(),
     }
 }
 

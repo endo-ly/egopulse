@@ -501,6 +501,7 @@ mod tests {
             channels: HashMap::new(),
             default_agent: crate::config::AgentId::new("default"),
             agents: HashMap::new(),
+            sleep_batch: crate::config::SleepBatchConfig::default(),
         };
         let updates = HashMap::from([(
             "openai".to_string(),
