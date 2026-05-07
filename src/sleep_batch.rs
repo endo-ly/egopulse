@@ -47,9 +47,7 @@ pub(crate) struct SleepBatchOutput {
 /// `episodic`, `semantic`, `prospective`.
 /// Any extra keys like `summary_md`, `phases`, or `summary` are rejected.
 #[allow(dead_code)]
-pub(crate) fn parse_sleep_response(
-    response: &str,
-) -> Result<SleepBatchOutput, SleepBatchError> {
+pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, SleepBatchError> {
     let value: serde_json::Value = serde_json::from_str(response)
         .map_err(|e| SleepBatchError::ParseFailed(format!("invalid JSON: {e}")))?;
 
@@ -142,9 +140,7 @@ pub(crate) fn build_sleep_input(
     }
 
     // Load memory, defaulting to empty if not found
-    let memory = memory_loader
-        .load(agent_id)
-        .unwrap_or_default();
+    let memory = memory_loader.load(agent_id).unwrap_or_default();
 
     // Build sessions_text from each session
     let mut sessions_text = String::new();
@@ -203,7 +199,9 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
     // Consolidation
     prompt.push_str("### Consolidation\n");
     prompt.push_str("- Merge related facts into unified entries.\n");
-    prompt.push_str("- Resolve contradictions by keeping the most recent or most reliable version.\n");
+    prompt.push_str(
+        "- Resolve contradictions by keeping the most recent or most reliable version.\n",
+    );
     prompt.push_str("- Strengthen important patterns and recurring themes.\n\n");
 
     // Compression
@@ -306,16 +304,7 @@ pub async fn run_sleep_batch(
         crate::memory::InputDecision::Proceed {
             sessions,
             source_chats_json,
-        } => {
-            execute_batch(
-                state,
-                db,
-                &resolved_agent,
-                &sessions,
-                &source_chats_json,
-            )
-            .await
-        }
+        } => execute_batch(state, db, &resolved_agent, &sessions, &source_chats_json).await,
     }
 }
 
@@ -349,13 +338,14 @@ async fn execute_batch(
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
         // 2. Get provider (use llm_override if set, otherwise cached_provider)
-        let provider: Arc<dyn LlmProvider> = if let Some(override_provider) = state.llm_override.clone() {
-            override_provider
-        } else {
-            state
-                .cached_provider(&resolved)
-                .map_err(|e| SleepBatchError::Llm(e.to_string()))?
-        };
+        let provider: Arc<dyn LlmProvider> =
+            if let Some(override_provider) = state.llm_override.clone() {
+                override_provider
+            } else {
+                state
+                    .cached_provider(&resolved)
+                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?
+            };
 
         // 3. Build sleep input (synchronous DB call, safe in async context for sleep batch)
         let input = build_sleep_input(
@@ -505,14 +495,12 @@ pub(crate) fn recover_memory_write(
         return Ok(());
     }
 
-    let entries = std::fs::read_dir(&agent_dir).map_err(|e| {
-        SleepBatchError::Io(format!("failed to read agent dir: {e}"))
-    })?;
+    let entries = std::fs::read_dir(&agent_dir)
+        .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            SleepBatchError::Io(format!("failed to read dir entry: {e}"))
-        })?;
+        let entry =
+            entry.map_err(|e| SleepBatchError::Io(format!("failed to read dir entry: {e}")))?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
@@ -563,9 +551,8 @@ pub(crate) fn write_memory_files(
     recover_memory_write(agents_dir, agent_id)?;
 
     let agent_dir = agents_dir.join(agent_id);
-    std::fs::create_dir_all(&agent_dir).map_err(|e| {
-        SleepBatchError::Io(format!("failed to create agent dir: {e}"))
-    })?;
+    std::fs::create_dir_all(&agent_dir)
+        .map_err(|e| SleepBatchError::Io(format!("failed to create agent dir: {e}")))?;
 
     let uuid = uuid::Uuid::new_v4();
     let tmp_dir = agent_dir.join(format!("memory.tmp-{uuid}"));
@@ -573,9 +560,8 @@ pub(crate) fn write_memory_files(
     let backup_dir = agent_dir.join(format!("memory.backup-{uuid}"));
 
     // Step 1: Create tmp dir and write all files
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| {
-        SleepBatchError::Io(format!("failed to create tmp dir: {e}"))
-    })?;
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| SleepBatchError::Io(format!("failed to create tmp dir: {e}")))?;
 
     let write_result = (|| -> Result<(), SleepBatchError> {
         std::fs::write(tmp_dir.join("episodic.md"), &output.episodic)
@@ -655,8 +641,12 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for MockLlmProvider {
-        fn provider_name(&self) -> &str { "mock" }
-        fn model_name(&self) -> &str { "mock-model" }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
         async fn send_message(
             &self,
             _system: &str,
@@ -666,7 +656,10 @@ mod tests {
             Ok(MessagesResponse {
                 content: self.response.clone(),
                 tool_calls: vec![],
-                usage: Some(LlmUsage { input_tokens: 0, output_tokens: 0 }),
+                usage: Some(LlmUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
             })
         }
     }
@@ -1002,7 +995,8 @@ mod tests {
 
     #[test]
     fn parse_sleep_response_rejects_summary_or_phases_keys() {
-        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","summary_md":"summary"}"#;
+        let response =
+            r#"{"episodic":"e","semantic":"s","prospective":"p","summary_md":"summary"}"#;
         let err = parse_sleep_response(response).expect_err("should fail for summary_md");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
 
@@ -1017,7 +1011,8 @@ mod tests {
 
     #[test]
     fn parse_sleep_response_preserves_markdown() {
-        let markdown = "# Title\n\n- item 1\n- item 2\n\n## Subsection\n\n> quote\n\n**bold** and *italic*\n";
+        let markdown =
+            "# Title\n\n- item 1\n- item 2\n\n## Subsection\n\n> quote\n\n**bold** and *italic*\n";
         let response = serde_json::json!({
             "episodic": markdown,
             "semantic": "# Semantic\n",
@@ -1056,7 +1051,12 @@ mod tests {
         std::fs::write(path, content).expect("write memory file");
     }
 
-    fn make_session_info(chat_id: i64, channel: &str, external_chat_id: &str, estimated_tokens: i64) -> AgentSessionInfo {
+    fn make_session_info(
+        chat_id: i64,
+        channel: &str,
+        external_chat_id: &str,
+        estimated_tokens: i64,
+    ) -> AgentSessionInfo {
         AgentSessionInfo {
             chat_id,
             channel: channel.to_string(),
@@ -1070,15 +1070,31 @@ mod tests {
     #[test]
     fn build_sleep_input_includes_existing_memory() {
         let (db, dir) = test_db();
-        write_memory_file(dir.path(), "test-agent", "episodic.md", "episodic memory content");
-        write_memory_file(dir.path(), "test-agent", "semantic.md", "semantic memory content");
+        write_memory_file(
+            dir.path(),
+            "test-agent",
+            "episodic.md",
+            "episodic memory content",
+        );
+        write_memory_file(
+            dir.path(),
+            "test-agent",
+            "semantic.md",
+            "semantic memory content",
+        );
 
         let loader = make_memory_loader(dir.path());
         let sessions = vec![];
         let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
         let input = result.expect("should succeed");
-        assert_eq!(input.memory.episodic, Some("episodic memory content".to_string()));
-        assert_eq!(input.memory.semantic, Some("semantic memory content".to_string()));
+        assert_eq!(
+            input.memory.episodic,
+            Some("episodic memory content".to_string())
+        );
+        assert_eq!(
+            input.memory.semantic,
+            Some("semantic memory content".to_string())
+        );
     }
 
     #[test]
@@ -1133,8 +1149,8 @@ mod tests {
             .expect_err("should reject path traversal");
         assert!(matches!(err, SleepBatchError::Internal(_)));
 
-        let err = build_sleep_input(&db, &loader, "", &sessions, "[]")
-            .expect_err("should reject empty");
+        let err =
+            build_sleep_input(&db, &loader, "", &sessions, "[]").expect_err("should reject empty");
         assert!(matches!(err, SleepBatchError::Internal(_)));
 
         let err = build_sleep_input(&db, &loader, "a/b", &sessions, "[]")
@@ -1153,7 +1169,12 @@ mod tests {
             let chat_id = create_chat(&db, "test-agent", &format!("-{i}"));
             db.save_session(chat_id, r#"[{"role":"user","content":"msg"}]"#)
                 .expect("save session");
-            sessions.push(make_session_info(chat_id, "test", &format!("test:chat{i}"), 10));
+            sessions.push(make_session_info(
+                chat_id,
+                "test",
+                &format!("test:chat{i}"),
+                10,
+            ));
         }
 
         let result = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]");
@@ -1168,7 +1189,12 @@ mod tests {
         let loader = make_memory_loader(dir.path());
 
         // Create sessions that exceed the context window
-        let sessions = vec![make_session_info(1, "test", "test:chat1", DEFAULT_CONTEXT_WINDOW_TOKENS + 1)];
+        let sessions = vec![make_session_info(
+            1,
+            "test",
+            "test:chat1",
+            DEFAULT_CONTEXT_WINDOW_TOKENS + 1,
+        )];
 
         let err = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]")
             .expect_err("should reject context overflow");
@@ -1287,12 +1313,30 @@ mod tests {
             source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("<memory-episodic>"), "should have <memory-episodic> tag");
-        assert!(prompt.contains("</memory-episodic>"), "should have closing tag");
-        assert!(prompt.contains("<memory-semantic>"), "should have <memory-semantic> tag");
-        assert!(prompt.contains("</memory-semantic>"), "should have closing tag");
-        assert!(prompt.contains("<memory-prospective>"), "should have <memory-prospective> tag");
-        assert!(prompt.contains("</memory-prospective>"), "should have closing tag");
+        assert!(
+            prompt.contains("<memory-episodic>"),
+            "should have <memory-episodic> tag"
+        );
+        assert!(
+            prompt.contains("</memory-episodic>"),
+            "should have closing tag"
+        );
+        assert!(
+            prompt.contains("<memory-semantic>"),
+            "should have <memory-semantic> tag"
+        );
+        assert!(
+            prompt.contains("</memory-semantic>"),
+            "should have closing tag"
+        );
+        assert!(
+            prompt.contains("<memory-prospective>"),
+            "should have <memory-prospective> tag"
+        );
+        assert!(
+            prompt.contains("</memory-prospective>"),
+            "should have closing tag"
+        );
         assert!(prompt.contains("<sessions>"), "should have <sessions> tag");
         assert!(prompt.contains("</sessions>"), "should have closing tag");
     }
@@ -1306,10 +1350,7 @@ mod tests {
             source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
-        assert!(
-            prompt.contains("JSON"),
-            "prompt should require JSON output"
-        );
+        assert!(prompt.contains("JSON"), "prompt should require JSON output");
     }
 
     #[test]
@@ -1408,7 +1449,10 @@ mod tests {
         write_memory_files(&agents_dir, "fresh-agent", &output).expect("write");
 
         let memory_dir = agents_dir.join("fresh-agent").join("memory");
-        assert!(memory_dir.is_dir(), "memory directory should be auto-created");
+        assert!(
+            memory_dir.is_dir(),
+            "memory directory should be auto-created"
+        );
 
         let content =
             std::fs::read_to_string(memory_dir.join("episodic.md")).expect("read episodic");
@@ -1504,8 +1548,7 @@ mod tests {
 
         // The new files should be written correctly
         let memory_dir = agent_dir.join("memory");
-        let content =
-            std::fs::read_to_string(memory_dir.join("episodic.md")).expect("read");
+        let content = std::fs::read_to_string(memory_dir.join("episodic.md")).expect("read");
         assert_eq!(content, "fresh");
     }
 

@@ -1878,7 +1878,10 @@ sleep_batch:
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.sleep_batch.model.as_deref(), Some("deepseek-chat-v3"));
+    assert_eq!(
+        config.sleep_batch.model.as_deref(),
+        Some("deepseek-chat-v3")
+    );
 }
 
 #[test]
@@ -2054,7 +2057,9 @@ fn persist_preserves_sleep_batch_config() {
         super::ProviderConfig {
             label: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal("sk-test".to_string())),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-test".to_string(),
+            )),
             default_model: "gpt-4o-mini".to_string(),
             models: HashMap::new(),
         },
@@ -2064,7 +2069,9 @@ fn persist_preserves_sleep_batch_config() {
         super::ProviderConfig {
             label: "DeepSeek".to_string(),
             base_url: "https://api.deepseek.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal("sk-ds".to_string())),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-ds".to_string(),
+            )),
             default_model: "deepseek-chat".to_string(),
             models: HashMap::new(),
         },
