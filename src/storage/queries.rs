@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
 
@@ -513,9 +513,10 @@ impl Database {
         agent_id: &str,
         trigger: SleepRunTrigger,
     ) -> Result<Option<String>, StorageError> {
-        let conn = self.lock_conn()?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let running = SleepRunStatus::Running.to_string();
-        let count: i64 = conn.query_row(
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM sleep_runs WHERE agent_id = ?1 AND status = ?2",
             params![agent_id, running],
             |row| row.get(0),
@@ -529,14 +530,15 @@ impl Database {
         let status = SleepRunStatus::Running.to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO sleep_runs
                  (id, agent_id, status, trigger_type, started_at, finished_at,
                   source_chats_json, source_digest_md,
                   input_tokens, output_tokens, total_tokens, error_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
+            VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
             params![id, agent_id, status, trigger.to_string(), started_at],
         )?;
+        tx.commit()?;
         Ok(Some(id))
     }
 

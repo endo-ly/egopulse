@@ -88,15 +88,30 @@ async fn execute_batch(
         }
     };
 
-    let memory = state.memory_loader.load(agent_id);
-    save_aggregate_snapshots(&db, &run_id, agent_id, memory.as_ref()).await?;
+    let result = async {
+        let memory = state.memory_loader.load(agent_id);
+        save_aggregate_snapshots(&db, &run_id, agent_id, memory.as_ref()).await?;
 
-    let run_id_owned = run_id.clone();
-    let source_chats = source_chats_json.to_string();
-    call_blocking(db, move |db| {
-        db.update_sleep_run_success(&run_id_owned, &source_chats, None, 0, 0)
-    })
-    .await?;
+        let run_id_owned = run_id.clone();
+        let source_chats = source_chats_json.to_string();
+        call_blocking(Arc::clone(&db), move |db| {
+            db.update_sleep_run_success(&run_id_owned, &source_chats, None, 0, 0)
+        })
+        .await?;
+
+        Ok::<(), SleepBatchError>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        let run_id_owned = run_id.clone();
+        let error_message = error.to_string();
+        call_blocking(db, move |db| {
+            db.update_sleep_run_failed(&run_id_owned, &error_message)
+        })
+        .await?;
+        return Err(error);
+    }
 
     info!(agent_id = %agent_id, run_id = %run_id, "sleep batch completed (no-op skeleton)");
     Ok(())
@@ -335,17 +350,38 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let state = build_test_state(db, dir.path());
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("episodic.md"), "episodic content").expect("write");
 
-        state
-            .db
-            .create_sleep_run("test-agent", SleepRunTrigger::Manual)
-            .expect("create running");
+        {
+            let conn = db.conn.lock().expect("lock");
+            conn.execute_batch(
+                "CREATE TRIGGER fail_memory_snapshot_insert
+                 BEFORE INSERT ON memory_snapshots
+                 BEGIN
+                    SELECT RAISE(ABORT, 'snapshot boom');
+                 END;",
+            )
+            .expect("create trigger");
+        }
+
+        let state = build_test_state(db, dir.path());
 
         let err = run_sleep_batch(&state, Some("test-agent"))
             .await
-            .expect_err("should fail");
-        assert!(matches!(err, SleepBatchError::AlreadyRunning { .. }));
+            .expect_err("should fail after run creation");
+        assert!(matches!(err, SleepBatchError::Storage(_)));
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SleepRunStatus::Failed);
+        assert!(
+            runs[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("snapshot boom"))
+        );
     }
 
     #[tokio::test]

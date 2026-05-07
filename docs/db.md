@@ -361,7 +361,7 @@ CREATE INDEX idx_sleep_runs_agent_status
 
 **操作**:
 - `create_sleep_run(agent_id, trigger)` — INSERT（status=running, id/started_at 自動生成）
-- `has_running_sleep_run(agent_id)` — 同一 agent で running の run が存在するか確認（排他制御用）
+- `try_create_sleep_run(agent_id, trigger)` — 同一 agent の running run を transaction 内で確認し、存在しなければ INSERT
 - `update_sleep_run_success(id, source_chats_json, source_digest_md, input_tokens, output_tokens)` — status=success 更新
 - `update_sleep_run_failed(id, error_message)` — status=failed 更新
 - `update_sleep_run_skipped(id)` — status=skipped 更新

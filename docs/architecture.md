@@ -305,11 +305,11 @@ pub trait ChannelAdapter: Send + Sync {
        │
        └─ Proceed: ソースセッション一覧を取得
               │
-       3. has_running_sleep_run() で排他チェック
+       3. try_create_sleep_run() で排他チェック + run 作成
               │
               ├─ 既に running → AlreadyRunning エラー
               │
-              └─ 未実行 → create_sleep_run()
+              └─ 未実行 → running run を作成
                      │
               4. memory_loader.load() で記憶ファイルを読み込み
                      │
