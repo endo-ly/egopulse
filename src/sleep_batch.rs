@@ -15,6 +15,71 @@ pub enum SleepBatchError {
     Storage(#[from] crate::error::StorageError),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("parse failed: {0}")]
+    ParseFailed(String),
+}
+
+/// Output from parsing the sleep batch LLM response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct SleepBatchOutput {
+    pub episodic: String,
+    pub semantic: String,
+    pub prospective: String,
+}
+
+/// Parses the LLM response into structured memory file contents.
+///
+/// The response must be valid JSON with exactly three keys:
+/// `episodic`, `semantic`, `prospective`.
+/// Any extra keys like `summary_md`, `phases`, or `summary` are rejected.
+#[allow(dead_code)]
+pub(crate) fn parse_sleep_response(
+    response: &str,
+) -> Result<SleepBatchOutput, SleepBatchError> {
+    let value: serde_json::Value = serde_json::from_str(response)
+        .map_err(|e| SleepBatchError::ParseFailed(format!("invalid JSON: {e}")))?;
+
+    let map = value.as_object().ok_or_else(|| {
+        SleepBatchError::ParseFailed("response must be a JSON object".to_string())
+    })?;
+
+    if map.len() != 3 {
+        return Err(SleepBatchError::ParseFailed(format!(
+            "expected exactly 3 keys, got {}",
+            map.len()
+        )));
+    }
+
+    let expected_keys = ["episodic", "semantic", "prospective"];
+    for key in &expected_keys {
+        if !map.contains_key(*key) {
+            return Err(SleepBatchError::ParseFailed(format!(
+                "missing required key: {key}"
+            )));
+        }
+    }
+
+    let episodic = map["episodic"]
+        .as_str()
+        .ok_or_else(|| SleepBatchError::ParseFailed("episodic must be a string".to_string()))?
+        .to_string();
+
+    let semantic = map["semantic"]
+        .as_str()
+        .ok_or_else(|| SleepBatchError::ParseFailed("semantic must be a string".to_string()))?
+        .to_string();
+
+    let prospective = map["prospective"]
+        .as_str()
+        .ok_or_else(|| SleepBatchError::ParseFailed("prospective must be a string".to_string()))?
+        .to_string();
+
+    Ok(SleepBatchOutput {
+        episodic,
+        semantic,
+        prospective,
+    })
 }
 
 /// Runs a manual sleep batch for the given agent.
@@ -436,5 +501,88 @@ mod tests {
         let result = run_sleep_batch(&state, None).await;
         assert!(result.is_ok());
         let _ = default;
+    }
+
+    // --- parse_sleep_response tests ---
+
+    #[test]
+    fn parse_sleep_response_extracts_three_memory_files() {
+        let response = serde_json::json!({
+            "episodic": "# Episodic\n\n- event",
+            "semantic": "# Semantic\n\n- fact",
+            "prospective": "# Prospective\n\n- todo"
+        })
+        .to_string();
+        let output = parse_sleep_response(&response).expect("should parse");
+        assert_eq!(output.episodic, "# Episodic\n\n- event");
+        assert_eq!(output.semantic, "# Semantic\n\n- fact");
+        assert_eq!(output.prospective, "# Prospective\n\n- todo");
+    }
+
+    #[test]
+    fn parse_sleep_response_rejects_non_json() {
+        let response = "this is not json at all";
+        let err = parse_sleep_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_sleep_response_rejects_missing_episodic() {
+        let response = r#"{"semantic":"s","prospective":"p"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_sleep_response_rejects_missing_semantic() {
+        let response = r#"{"episodic":"e","prospective":"p"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_sleep_response_rejects_missing_prospective() {
+        let response = r#"{"episodic":"e","semantic":"s"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_sleep_response_rejects_summary_or_phases_keys() {
+        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","summary_md":"summary"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail for summary_md");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+
+        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","phases":[]}"#;
+        let err = parse_sleep_response(response).expect_err("should fail for phases");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+
+        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","summary":"sum"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail for summary");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_sleep_response_preserves_markdown() {
+        let markdown = "# Title\n\n- item 1\n- item 2\n\n## Subsection\n\n> quote\n\n**bold** and *italic*\n";
+        let response = serde_json::json!({
+            "episodic": markdown,
+            "semantic": "# Semantic\n",
+            "prospective": "# Prospective\n"
+        })
+        .to_string();
+        let output = parse_sleep_response(&response).expect("should parse");
+        assert_eq!(output.episodic, markdown);
+        assert!(output.episodic.contains("**bold** and *italic*"));
+        assert!(output.episodic.contains("> quote"));
+    }
+
+    #[test]
+    fn parse_sleep_response_allows_empty_file_content() {
+        let response = r#"{"episodic":"","semantic":"","prospective":""}"#;
+        let output = parse_sleep_response(response).expect("should parse");
+        assert_eq!(output.episodic, "");
+        assert_eq!(output.semantic, "");
+        assert_eq!(output.prospective, "");
     }
 }
