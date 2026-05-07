@@ -33,6 +33,40 @@ use crate::soul_agents::SoulAgentsLoader;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
+/// In-flight turn tracker used by the sleep scheduler to defer scheduled
+/// batches while an agent is actively processing a conversation turn.
+#[derive(Debug, Default)]
+pub(crate) struct ActiveTurnTracker {
+    turns: Mutex<HashMap<String, u32>>,
+}
+
+impl ActiveTurnTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn begin_turn(&self, agent_id: &str) {
+        let mut turns = self.turns.lock().expect("active_turns lock");
+        *turns.entry(agent_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Removes the entry when the count reaches zero so `is_active` stays O(1).
+    pub(crate) fn end_turn(&self, agent_id: &str) {
+        let mut turns = self.turns.lock().expect("active_turns lock");
+        if let Some(count) = turns.get_mut(agent_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                turns.remove(agent_id);
+            }
+        }
+    }
+
+    pub(crate) fn is_active(&self, agent_id: &str) -> bool {
+        let turns = self.turns.lock().expect("active_turns lock");
+        turns.get(agent_id).is_some_and(|&c| c > 0)
+    }
+}
+
 /// Holds the shared runtime dependencies used across all channels.
 pub struct AppState {
     pub(crate) db: Arc<Database>,
@@ -47,6 +81,8 @@ pub struct AppState {
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
+    /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
+    pub(crate) active_turns: Arc<ActiveTurnTracker>,
 }
 
 impl Clone for AppState {
@@ -64,6 +100,7 @@ impl Clone for AppState {
             soul_agents: Arc::clone(&self.soul_agents),
             memory_loader: Arc::clone(&self.memory_loader),
             llm_cache: Mutex::new(HashMap::new()),
+            active_turns: Arc::clone(&self.active_turns),
         }
     }
 }
@@ -186,6 +223,7 @@ pub async fn build_app_state_with_path(
         soul_agents,
         memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
+        active_turns: Arc::new(ActiveTurnTracker::new()),
     })
 }
 
@@ -223,6 +261,7 @@ pub fn build_sleep_app_state_with_path(
         soul_agents,
         memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
+        active_turns: Arc::new(ActiveTurnTracker::new()),
     })
 }
 
@@ -658,5 +697,52 @@ mod tests {
 
         let cache = state.llm_cache.lock().expect("lock");
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn active_turn_tracker_marks_agent_running_during_turn() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        assert!(tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_clears_agent_after_success() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_clears_agent_after_error() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        // Simulate error path: end_turn is called regardless
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_counts_parallel_turns_per_agent() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        tracker.begin_turn("agent-a");
+        assert!(tracker.is_active("agent-a"));
+
+        tracker.end_turn("agent-a");
+        assert!(tracker.is_active("agent-a"), "still active after one turn ends");
+
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"), "inactive after all turns end");
+    }
+
+    #[test]
+    fn active_turn_tracker_is_agent_scoped() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        assert!(!tracker.is_active("agent-b"), "other agent unaffected");
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
     }
 }

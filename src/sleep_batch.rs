@@ -842,6 +842,7 @@ mod tests {
                 std::path::PathBuf::from(&config.state_root).join("agents"),
             )),
             llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
         }
     }
 
