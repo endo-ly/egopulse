@@ -1938,4 +1938,58 @@ mod tests {
             "docs/architecture.md should mention one-call/single-call sleep batch approach"
         );
     }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_enabled() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.enabled"),
+            "docs/config.md should document sleep_batch.enabled"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_schedule() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.schedule"),
+            "docs/config.md should document sleep_batch.schedule"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_timezone() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.timezone"),
+            "docs/config.md should document sleep_batch.timezone"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_agents() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.agents"),
+            "docs/config.md should document sleep_batch.agents"
+        );
+    }
+
+    #[test]
+    fn docs_architecture_mentions_sleep_scheduler() {
+        let content = read_doc("architecture.md");
+        assert!(
+            content.contains("scheduler") || content.contains("Scheduler"),
+            "docs/architecture.md should mention sleep batch scheduler"
+        );
+    }
+
+    #[test]
+    fn docs_db_mentions_sleep_run_scheduled_trigger() {
+        let content = read_doc("db.md");
+        assert!(
+            content.contains("scheduled"),
+            "docs/db.md should mention scheduled trigger type"
+        );
+    }
 }

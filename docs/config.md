@@ -52,11 +52,18 @@
 ### 2.2 Sleep Batch 設定（`sleep_batch`）
 
 Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバイダーとモデルを、デフォルト設定から独立して指定できる。
+また、自動スケジューラにより指定時刻に定期実行できる。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
+| `sleep_batch.enabled` | `bool` | 任意 | `false` | Sleep Batch 機能の有効/無効 |
 | `sleep_batch.provider` | `string \| null` | 任意 | `null` | Sleep Batch 用プロバイダー ID。`providers` マップ内のキーを参照。`null` の場合は `default_provider` にフォールバック |
 | `sleep_batch.model` | `string \| null` | 任意 | `null` | Sleep Batch 用モデル名。`null` の場合は `default_model`、さらにプロバイダーの `default_model` にフォールバック |
+| `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
+| `sleep_batch.timezone` | `string \| null` | 任意 | `null` | IANA タイムゾーン（例: `Asia/Tokyo`、`UTC`）。`enabled: true` 時は必須 |
+| `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
+| `sleep_batch.retry_max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
+| `sleep_batch.retry_interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
 
 #### モデル解決チェーン
 
@@ -76,8 +83,14 @@ provider.default_model
 
 ```yaml
 sleep_batch:
+  enabled: true
   provider: openrouter
   model: openai/gpt-4o-mini
+  schedule: "04:00"
+  timezone: Asia/Tokyo
+  agents: [default, sub-agent]
+  retry_max_attempts: 3
+  retry_interval_minutes: 5
 ```
 
 ### 2.3 プロバイダー定義（`providers.<id>`）
