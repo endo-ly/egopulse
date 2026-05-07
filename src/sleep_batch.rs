@@ -1108,6 +1108,75 @@ mod tests {
         let _ = default;
     }
 
+    #[tokio::test]
+    async fn scheduled_run_records_success_status() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state(db, dir.path());
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_memory_snapshots() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("episodic.md"), "episodic content").expect("write");
+
+        let state = build_test_state(db, dir.path());
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let snapshots = state.db.get_snapshots_for_run(&runs[0].id).expect("snapshots");
+        assert_eq!(snapshots.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_source_chats_json() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state(db, dir.path());
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].source_chats_json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_failed_status() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state_with_llm(
+            db,
+            dir.path(),
+            Arc::new(MockLlmProvider::with_response(serde_json::json!("not json"))),
+        );
+
+        let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled).await;
+        assert!(result.is_err());
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(runs[0].status, SleepRunStatus::Failed);
+    }
+
     // --- parse_sleep_response tests ---
 
     #[test]

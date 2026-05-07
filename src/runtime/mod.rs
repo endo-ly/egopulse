@@ -542,6 +542,21 @@ async fn write_startup_status(state: &AppState) {
             agent_count: None,
         });
 
+    let sleep_scheduler = if state.config.sleep_batch.scheduler_enabled() {
+        Some(status_mod::SleepSchedulerStatus {
+            enabled: true,
+            next_run: crate::sleep_scheduler::next_scheduled_run(
+                &state.config.sleep_batch,
+                Utc::now(),
+            )
+            .map(|dt| dt.to_rfc3339()),
+            schedule: state.config.sleep_batch.schedule.clone(),
+            timezone: state.config.sleep_batch.timezone.clone(),
+        })
+    } else {
+        None
+    };
+
     let snapshot = StatusSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -561,6 +576,7 @@ async fn write_startup_status(state: &AppState) {
             default: resolved_llm.provider.clone(),
             model: resolved_llm.model.clone(),
         },
+        sleep_scheduler,
     };
 
     let state_root = PathBuf::from(&state.config.state_root);
