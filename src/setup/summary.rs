@@ -274,7 +274,10 @@ pub(crate) fn save_config(
         channels,
         default_agent: crate::config::AgentId::new("default"),
         agents,
-        sleep_batch: crate::config::SleepBatchConfig::default(),
+        sleep_batch: existing_config
+            .as_ref()
+            .map(|c| c.sleep_batch.clone())
+            .unwrap_or_default(),
     };
 
     config

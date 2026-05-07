@@ -479,8 +479,10 @@ fn safe_agent_id_for_write(id: &str) -> bool {
 /// Cleans up stale temporary and backup directories left from a previous
 /// failed write attempt.
 ///
-/// Looks for `memory.tmp-*` and `memory.backup-*` directories under
-/// `agents_dir/agent_id/` and removes them.
+/// If the `memory` directory does not exist but a `memory.backup-*` directory
+/// does (crash between Step 2 and Step 3 of `write_memory_files`), the backup
+/// is restored first. Then any remaining stale `memory.tmp-*` and
+/// `memory.backup-*` directories are removed.
 #[allow(dead_code)]
 pub(crate) fn recover_memory_write(
     agents_dir: &Path,
@@ -495,6 +497,35 @@ pub(crate) fn recover_memory_write(
         return Ok(());
     }
 
+    let memory_dir = agent_dir.join("memory");
+
+    // If memory dir doesn't exist, look for a backup to restore
+    if !memory_dir.exists() {
+        let entries = std::fs::read_dir(&agent_dir)
+            .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
+
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| SleepBatchError::Io(format!("failed to read dir entry: {e}")))?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if name_str.starts_with("memory.backup-") {
+                let backup_path = entry.path();
+                info!(
+                    agent_id = %agent_id,
+                    path = %backup_path.display(),
+                    "restoring memory from backup"
+                );
+                std::fs::rename(&backup_path, &memory_dir)
+                    .map_err(|e| SleepBatchError::Io(format!("failed to restore backup: {e}")))?;
+                // Restored one backup; stop looking for more
+                break;
+            }
+        }
+    }
+
+    // Now clean up any remaining stale tmp/backup directories
     let entries = std::fs::read_dir(&agent_dir)
         .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
 
@@ -1529,27 +1560,31 @@ mod tests {
         let agents_dir = dir.path().join("agents");
         let agent_dir = agents_dir.join("testagent");
 
-        // Create a stale backup directory from a prior failed write
+        // Create a stale backup directory with content, but NO memory dir
         let backup_dir = agent_dir.join("memory.backup-stale-uuid");
         std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        std::fs::write(backup_dir.join("episodic.md"), "stale content").expect("write");
-        assert!(backup_dir.exists(), "backup dir should exist before write");
+        std::fs::write(backup_dir.join("episodic.md"), "backed up content").expect("write");
+        assert!(
+            backup_dir.exists(),
+            "backup dir should exist before recovery"
+        );
 
-        let output = SleepBatchOutput {
-            episodic: "fresh".to_string(),
-            semantic: "fresh".to_string(),
-            prospective: "fresh".to_string(),
-        };
+        // Recovery should restore backup to memory dir
+        recover_memory_write(&agents_dir, "testagent").expect("recover");
 
-        write_memory_files(&agents_dir, "testagent", &output).expect("write");
-
-        // The stale backup should have been cleaned up
-        assert!(!backup_dir.exists(), "stale backup should be removed");
-
-        // The new files should be written correctly
+        // The backup should be restored as the memory dir
         let memory_dir = agent_dir.join("memory");
+        assert!(
+            memory_dir.exists(),
+            "memory dir should be restored from backup"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "backup should have been renamed to memory"
+        );
+
         let content = std::fs::read_to_string(memory_dir.join("episodic.md")).expect("read");
-        assert_eq!(content, "fresh");
+        assert_eq!(content, "backed up content");
     }
 
     #[test]

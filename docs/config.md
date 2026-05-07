@@ -76,8 +76,8 @@ provider.default_model
 
 ```yaml
 sleep_batch:
-  provider: deepseek
-  model: deepseek-chat-v3
+  provider: openrouter
+  model: openai/gpt-4o-mini
 ```
 
 ### 2.3 プロバイダー定義（`providers.<id>`）
@@ -175,8 +175,8 @@ log_level: info
 
 # Sleep Batch 設定（任意）
 sleep_batch:
-  provider: deepseek
-  model: deepseek-chat-v3
+  provider: openrouter
+  model: openai/gpt-4o-mini
 compaction_timeout_secs: 180
 max_history_messages: 50
 default_context_window_tokens: 32768
