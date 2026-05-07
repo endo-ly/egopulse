@@ -806,6 +806,25 @@ impl Database {
         Ok(id)
     }
 
+    /// Updates the `content_after` field of an existing memory snapshot.
+    ///
+    /// Returns `true` if a row was updated, `false` if no matching row was found.
+    pub(crate) fn update_memory_snapshot_after(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        file: MemoryFile,
+        content_after: &str,
+    ) -> Result<bool, StorageError> {
+        let conn = self.lock_conn()?;
+        let changed = conn.execute(
+            "UPDATE memory_snapshots SET content_after = ?1
+             WHERE run_id = ?2 AND agent_id = ?3 AND file = ?4",
+            params![content_after, run_id, agent_id, file.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub(crate) fn get_snapshots_for_run(
         &self,
         run_id: &str,
@@ -1704,6 +1723,43 @@ mod tests {
             .expect("get latest")
             .expect("should exist");
         assert_eq!(latest.id, id2);
+    }
+
+    #[test]
+    fn update_memory_snapshot_after_updates_existing_row() {
+        let (db, _dir) = test_db();
+
+        // Create a BEFORE snapshot (content_after is initially same as content_before)
+        let id = create_test_snapshot(&db, "run-1", "agent-a", MemoryFile::Episodic);
+
+        // Update the after field
+        let updated = db
+            .update_memory_snapshot_after(
+                "run-1",
+                "agent-a",
+                MemoryFile::Episodic,
+                "new after content",
+            )
+            .expect("update after");
+        assert!(updated, "should have updated an existing row");
+
+        // Verify row count stays at 1 and after field changed
+        let snapshots = db.get_snapshots_for_run("run-1").expect("get snapshots");
+        assert_eq!(snapshots.len(), 1, "row count should stay at 1");
+        assert_eq!(snapshots[0].id, id);
+        assert_eq!(snapshots[0].content_before, "before content");
+        assert_eq!(snapshots[0].content_after, "new after content");
+    }
+
+    #[test]
+    fn update_memory_snapshot_after_returns_false_when_no_match() {
+        let (db, _dir) = test_db();
+        ensure_memory_snapshots_table(&db);
+
+        let updated = db
+            .update_memory_snapshot_after("nonexistent", "agent-a", MemoryFile::Episodic, "after")
+            .expect("update after");
+        assert!(!updated, "should return false when no matching row");
     }
 
     #[test]

@@ -9,6 +9,9 @@ use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, call_blocking};
 
+/// Ratio of context window used as overflow threshold for sleep batch input.
+const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
+
 #[derive(Debug, Error)]
 pub enum SleepBatchError {
     #[error("already running for agent '{agent_id}'")]
@@ -131,7 +134,7 @@ pub(crate) fn build_sleep_input(
 
     // Check context overflow (80% threshold)
     let total_tokens: i64 = sessions.iter().map(|s| s.estimated_tokens).sum();
-    let threshold = (context_window_tokens as f64 * 0.80) as i64;
+    let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as i64;
     if total_tokens > threshold {
         return Err(SleepBatchError::ContextOverflow {
             agent_id: agent_id.to_string(),
@@ -173,6 +176,14 @@ fn extract_messages_text(messages_json: &Option<String>) -> String {
         .filter_map(|v| v.get("content").and_then(|c| c.as_str()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Escapes XML special characters in content to prevent tag boundary injection.
+fn escape_xml_content(content: &str) -> String {
+    content
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Builds the system prompt for the sleep batch LLM call.
@@ -231,25 +242,25 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
 
     if let Some(ref episodic) = input.memory.episodic {
         prompt.push_str("<memory-episodic>\n");
-        prompt.push_str(episodic);
+        prompt.push_str(&escape_xml_content(episodic));
         prompt.push_str("\n</memory-episodic>\n\n");
     }
 
     if let Some(ref semantic) = input.memory.semantic {
         prompt.push_str("<memory-semantic>\n");
-        prompt.push_str(semantic);
+        prompt.push_str(&escape_xml_content(semantic));
         prompt.push_str("\n</memory-semantic>\n\n");
     }
 
     if let Some(ref prospective) = input.memory.prospective {
         prompt.push_str("<memory-prospective>\n");
-        prompt.push_str(prospective);
+        prompt.push_str(&escape_xml_content(prospective));
         prompt.push_str("\n</memory-prospective>\n\n");
     }
 
     if !input.sessions_text.is_empty() {
         prompt.push_str("<sessions>\n");
-        prompt.push_str(&input.sessions_text);
+        prompt.push_str(&escape_xml_content(&input.sessions_text));
         prompt.push_str("</sessions>\n\n");
     }
 
@@ -443,22 +454,28 @@ async fn save_aggregate_snapshots(
     .collect();
 
     // If this is the BEFORE call, content_before == content_after (same value).
-    // If this is the AFTER call, we need to update the after field.
-    // For simplicity, we always create a new snapshot entry.
-    // The before/after are stored as (before_content, after_content).
-    // Before snapshots: before == after == memory content at that time.
-    // After snapshots:  before == "" (placeholder), after == new memory content.
+    // If this is the AFTER call, update the existing BEFORE row's after field.
     for (file, file_content) in entries {
-        let run = run_id.to_string();
-        let agent = agent_id.to_string();
-        let (before, after) = match is_after {
-            Some(true) => (String::new(), file_content.clone()),
-            _ => (file_content.clone(), file_content.clone()),
-        };
-        call_blocking(Arc::clone(db), move |db| {
-            db.create_memory_snapshot(&run, &agent, file, &before, &after)
-        })
-        .await?;
+        match is_after {
+            Some(true) => {
+                let run = run_id.to_string();
+                let agent = agent_id.to_string();
+                call_blocking(Arc::clone(db), move |db| {
+                    db.update_memory_snapshot_after(&run, &agent, file, &file_content)
+                })
+                .await?;
+            }
+            _ => {
+                let run = run_id.to_string();
+                let agent = agent_id.to_string();
+                let before = file_content.clone();
+                let after = file_content.clone();
+                call_blocking(Arc::clone(db), move |db| {
+                    db.create_memory_snapshot(&run, &agent, file, &before, &after)
+                })
+                .await?;
+            }
+        }
     }
 
     Ok(())
@@ -508,24 +525,31 @@ pub(crate) fn recover_memory_write(
         let entries = std::fs::read_dir(&agent_dir)
             .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
 
-        for entry in entries {
-            let entry =
-                entry.map_err(|e| SleepBatchError::Io(format!("failed to read dir entry: {e}")))?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+        let mut backups: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("memory.backup-")
+            })
+            .collect();
 
-            if name_str.starts_with("memory.backup-") {
-                let backup_path = entry.path();
-                info!(
-                    agent_id = %agent_id,
-                    path = %backup_path.display(),
-                    "restoring memory from backup"
-                );
-                std::fs::rename(&backup_path, &memory_dir)
-                    .map_err(|e| SleepBatchError::Io(format!("failed to restore backup: {e}")))?;
-                // Restored one backup; stop looking for more
-                break;
-            }
+        // Sort by mtime descending (newest first)
+        backups.sort_by(|a, b| {
+            let mtime_a = a.metadata().and_then(|m| m.modified()).ok();
+            let mtime_b = b.metadata().and_then(|m| m.modified()).ok();
+            mtime_b.cmp(&mtime_a)
+        });
+
+        if let Some(newest) = backups.into_iter().next() {
+            let backup_path = newest.path();
+            info!(
+                agent_id = %agent_id,
+                path = %backup_path.display(),
+                "restoring memory from backup"
+            );
+            std::fs::rename(&backup_path, &memory_dir)
+                .map_err(|e| SleepBatchError::Io(format!("failed to restore backup: {e}")))?;
         }
     }
 
@@ -1341,7 +1365,7 @@ mod tests {
                 semantic: Some("sem data".to_string()),
                 prospective: Some("pro data".to_string()),
             },
-            sessions_text: "<session>session data</session>".to_string(),
+            sessions_text: "session data".to_string(),
             source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -1371,6 +1395,45 @@ mod tests {
         );
         assert!(prompt.contains("<sessions>"), "should have <sessions> tag");
         assert!(prompt.contains("</sessions>"), "should have closing tag");
+    }
+
+    #[test]
+    fn build_sleep_prompt_escapes_xml_special_chars_in_content() {
+        let input = SleepPromptInput {
+            agent_id: "test".to_string(),
+            memory: MemoryContent {
+                episodic: Some("has <angle> & amp".to_string()),
+                semantic: Some("also <tag> chars".to_string()),
+                prospective: None,
+            },
+            sessions_text: "<script>alert(1)</script>".to_string(),
+            source_chats_json: "[]".to_string(),
+        };
+        let prompt = build_sleep_system_prompt(&input);
+
+        // Content should be escaped, not raw
+        assert!(
+            !prompt.contains("has <angle> & amp"),
+            "raw content should not appear unescaped"
+        );
+        assert!(
+            prompt.contains("has &lt;angle&gt; &amp; amp"),
+            "content should be XML-escaped"
+        );
+        assert!(
+            prompt.contains("also &lt;tag&gt; chars"),
+            "semantic content should be XML-escaped"
+        );
+        assert!(
+            prompt.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "sessions_text should be XML-escaped"
+        );
+
+        // But the outer tags should still be intact
+        assert!(prompt.contains("<memory-episodic>"));
+        assert!(prompt.contains("</memory-episodic>"));
+        assert!(prompt.contains("<sessions>"));
+        assert!(prompt.contains("</sessions>"));
     }
 
     #[test]
