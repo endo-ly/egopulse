@@ -73,23 +73,20 @@ async fn execute_batch(
     agent_id: &str,
     source_chats_json: &str,
 ) -> Result<(), SleepBatchError> {
-    let agent_owned = agent_id.to_string();
-    let running = call_blocking(Arc::clone(&db), move |db| {
-        db.has_running_sleep_run(&agent_owned)
-    })
-    .await?;
-
-    if running {
-        return Err(SleepBatchError::AlreadyRunning {
-            agent_id: agent_id.to_string(),
-        });
-    }
-
     let agent_for_run = agent_id.to_string();
     let run_id = call_blocking(Arc::clone(&db), move |db| {
-        db.create_sleep_run(&agent_for_run, SleepRunTrigger::Manual)
+        db.try_create_sleep_run(&agent_for_run, SleepRunTrigger::Manual)
     })
     .await?;
+
+    let run_id = match run_id {
+        Some(id) => id,
+        None => {
+            return Err(SleepBatchError::AlreadyRunning {
+                agent_id: agent_id.to_string(),
+            });
+        }
+    };
 
     let memory = state.memory_loader.load(agent_id);
     save_aggregate_snapshots(&db, &run_id, agent_id, memory.as_ref()).await?;

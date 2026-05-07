@@ -501,7 +501,18 @@ impl Database {
         Ok(id)
     }
 
-    pub(crate) fn has_running_sleep_run(&self, agent_id: &str) -> Result<bool, StorageError> {
+    /// Atomically checks for a running sleep run and creates one if none exists.
+    ///
+    /// This prevents a race condition where two concurrent callers could both
+    /// observe "no running run" and each insert a duplicate.
+    ///
+    /// Returns `Ok(Some(id))` if a new run was created, or `Ok(None)` if a
+    /// running run already exists for the given agent.
+    pub(crate) fn try_create_sleep_run(
+        &self,
+        agent_id: &str,
+        trigger: SleepRunTrigger,
+    ) -> Result<Option<String>, StorageError> {
         let conn = self.lock_conn()?;
         let running = SleepRunStatus::Running.to_string();
         let count: i64 = conn.query_row(
@@ -509,7 +520,24 @@ impl Database {
             params![agent_id, running],
             |row| row.get(0),
         )?;
-        Ok(count > 0)
+
+        if count > 0 {
+            return Ok(None);
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let status = SleepRunStatus::Running.to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO sleep_runs
+                 (id, agent_id, status, trigger_type, started_at, finished_at,
+                  source_chats_json, source_digest_md,
+                  input_tokens, output_tokens, total_tokens, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
+            params![id, agent_id, status, trigger.to_string(), started_at],
+        )?;
+        Ok(Some(id))
     }
 
     pub(crate) fn update_sleep_run_success(
@@ -1365,6 +1393,55 @@ mod tests {
             run.started_at.contains('T'),
             "RFC3339 timestamp should contain 'T'"
         );
+    }
+
+    #[test]
+    fn try_create_sleep_run_inserts_when_no_running() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Running);
+        assert_eq!(run.agent_id, "agent-a");
+    }
+
+    #[test]
+    fn try_create_sleep_run_returns_none_when_running_exists() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let _first = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create first")
+            .expect("should insert");
+
+        let second = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create second");
+
+        assert!(second.is_none(), "should not insert duplicate running run");
+    }
+
+    #[test]
+    fn try_create_sleep_run_allows_different_agents() {
+        let (db, _dir) = test_db();
+        ensure_sleep_runs_table(&db);
+
+        let id_a = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create a")
+            .expect("should insert");
+        let id_b = db
+            .try_create_sleep_run("agent-b", SleepRunTrigger::Manual)
+            .expect("try create b")
+            .expect("should insert");
+
+        assert_ne!(id_a, id_b);
     }
 
     #[test]
