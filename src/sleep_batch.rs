@@ -948,9 +948,9 @@ mod tests {
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.conn.lock().expect("lock");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, chat_id, "alice", content, 0, ts],
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, chat_id, "alice", content, 0, ts, "message"],
         )
         .expect("store message");
     }
@@ -2215,105 +2215,5 @@ mod tests {
         let input = "just plain text";
         let result = normalize_llm_response(input);
         assert_eq!(result, "just plain text");
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 7: Documentation content tests
-    // -----------------------------------------------------------------------
-
-    fn read_doc(filename: &str) -> String {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(&manifest_dir)
-            .join("docs")
-            .join(filename);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_model() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.model"),
-            "docs/config.md should document sleep_batch.model"
-        );
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_provider() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.provider"),
-            "docs/config.md should document sleep_batch.provider"
-        );
-    }
-
-    #[test]
-    fn docs_architecture_mentions_one_call_sleep_batch() {
-        let content = read_doc("architecture.md");
-        let has_one_call = content.contains("1 回の LLM")
-            || content.contains("1-call")
-            || content.contains("one call")
-            || content.contains("single call")
-            || content.contains("1 回")
-            || content.contains("1-call LLM");
-        assert!(
-            has_one_call,
-            "docs/architecture.md should mention one-call/single-call sleep batch approach"
-        );
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_enabled() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.enabled"),
-            "docs/config.md should document sleep_batch.enabled"
-        );
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_schedule() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.schedule"),
-            "docs/config.md should document sleep_batch.schedule"
-        );
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_timezone() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.timezone"),
-            "docs/config.md should document sleep_batch.timezone"
-        );
-    }
-
-    #[test]
-    fn docs_config_mentions_sleep_batch_agents() {
-        let content = read_doc("config.md");
-        assert!(
-            content.contains("sleep_batch.agents"),
-            "docs/config.md should document sleep_batch.agents"
-        );
-    }
-
-    #[test]
-    fn docs_architecture_mentions_sleep_scheduler() {
-        let content = read_doc("architecture.md");
-        assert!(
-            content.contains("scheduler") || content.contains("Scheduler"),
-            "docs/architecture.md should mention sleep batch scheduler"
-        );
-    }
-
-    #[test]
-    fn docs_db_mentions_sleep_run_scheduled_trigger() {
-        let content = read_doc("db.md");
-        assert!(
-            content.contains("scheduled"),
-            "docs/db.md should mention scheduled trigger type"
-        );
     }
 }

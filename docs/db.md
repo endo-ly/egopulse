@@ -31,7 +31,7 @@ egopulse.db (SQLite / WAL mode)
 | テーブル数 | 9（データテーブル 7 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 10 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v6） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v7） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -172,6 +172,9 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     is_from_bot INTEGER NOT NULL DEFAULT 0,
     timestamp TEXT NOT NULL,
+    message_kind TEXT NOT NULL DEFAULT 'message',
+    sender_agent_id TEXT,
+    recipient_agent_id TEXT,
     PRIMARY KEY (id, chat_id)
 );
 
@@ -187,6 +190,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 | content | TEXT | NOT NULL | メッセージ本文 |
 | is_from_bot | INTEGER | NOT NULL DEFAULT 0 | ボット発言フラグ（0/1） |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
+| message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`） |
+| sender_agent_id | TEXT | nullable | 送信エージェント ID。Multi-Agent Room で使用 |
+| recipient_agent_id | TEXT | nullable | 受信エージェント ID。Multi-Agent Room で使用 |
 
 **操作**:
 - `store_message(msg)` — `INSERT OR REPLACE`
@@ -470,7 +476,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 | 構造体 | テーブル | フィールド |
 |--------|----------|-----------|
-| `StoredMessage` | messages | id, chat_id, sender_name, content, is_from_bot, timestamp |
+| `StoredMessage` | messages | id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id |
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
 | `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
@@ -494,7 +500,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `6`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `7`）に到達したら完了。`debug_assert_eq!` で検証
 
 **新規マイグレーションの追加手順**:
 1. `SCHEMA_VERSION` 定数をインクリメント（例: `5` → `6`）

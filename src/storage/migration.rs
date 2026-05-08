@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 6;
+pub(super) const SCHEMA_VERSION: i64 = 7;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -309,6 +309,22 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 6;
     }
 
+    if version < 7 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'message';
+             ALTER TABLE messages ADD COLUMN sender_agent_id TEXT;
+             ALTER TABLE messages ADD COLUMN recipient_agent_id TEXT;",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            7,
+            "add message_kind, sender_agent_id, recipient_agent_id to messages",
+        )?;
+        tx.commit()?;
+        version = 7;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -337,7 +353,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
@@ -417,6 +433,30 @@ mod tests {
                      last_message_time TEXT NOT NULL,
                      channel TEXT,
                      external_chat_id TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     is_from_bot INTEGER NOT NULL DEFAULT 0,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     chat_id INTEGER PRIMARY KEY,
+                     messages_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     tool_input TEXT NOT NULL,
+                     tool_output TEXT,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id, message_id)
                  );
                  INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
                  VALUES (1, 'test chat', 'private', '2025-01-01T00:00:00Z');",
@@ -839,5 +879,270 @@ mod tests {
             )
             .expect("check v6 record");
         assert!(has_v6);
+    }
+
+    #[test]
+    fn migration_v7_adds_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+
+        let conn = db.conn.lock().expect("lock");
+
+        let has_message_kind: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'message_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check message_kind");
+        assert!(has_message_kind);
+
+        let has_sender_agent_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'sender_agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check sender_agent_id");
+        assert!(has_sender_agent_id);
+
+        let has_recipient_agent_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'recipient_agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check recipient_agent_id");
+        assert!(has_recipient_agent_id);
+    }
+
+    #[test]
+    fn migration_v7_default_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // Create a v6 DB with an existing message
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '6');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (6, '2025-01-01T00:00:00Z', 'test v6');
+                 CREATE TABLE IF NOT EXISTS chats (
+                     chat_id INTEGER PRIMARY KEY,
+                     chat_title TEXT,
+                     chat_type TEXT NOT NULL DEFAULT 'private',
+                     last_message_time TEXT NOT NULL,
+                     channel TEXT,
+                     external_chat_id TEXT,
+                     agent_id TEXT NOT NULL DEFAULT 'lyre'
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     is_from_bot INTEGER NOT NULL DEFAULT 0,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     chat_id INTEGER PRIMARY KEY,
+                     messages_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     tool_input TEXT NOT NULL,
+                     tool_output TEXT,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id, message_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     chat_id INTEGER NOT NULL,
+                     caller_channel TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL,
+                     total_tokens INTEGER NOT NULL,
+                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS sleep_runs (
+                     id TEXT PRIMARY KEY,
+                     agent_id TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     trigger_type TEXT NOT NULL,
+                     started_at TEXT NOT NULL,
+                     finished_at TEXT,
+                     source_chats_json TEXT NOT NULL DEFAULT '[]',
+                     source_digest_md TEXT,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                     error_message TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS memory_snapshots (
+                     id TEXT PRIMARY KEY,
+                     run_id TEXT NOT NULL,
+                     agent_id TEXT NOT NULL,
+                     file TEXT NOT NULL,
+                     content_before TEXT NOT NULL,
+                     content_after TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 );
+                 INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
+                 VALUES ('msg-1', 1, 'alice', 'hello', 0, '2024-01-01T00:00:00Z');",
+            )
+            .expect("create v6 schema");
+        }
+
+        let db = super::super::Database::new(&db_path).expect("reopen");
+        let conn = db.conn.lock().expect("lock");
+
+        let message_kind: String = conn
+            .query_row(
+                "SELECT message_kind FROM messages WHERE id = 'msg-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query message_kind");
+        assert_eq!(message_kind, "message");
+
+        let sender_agent_id: Option<String> = conn
+            .query_row(
+                "SELECT sender_agent_id FROM messages WHERE id = 'msg-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sender_agent_id");
+        assert!(sender_agent_id.is_none());
+
+        let recipient_agent_id: Option<String> = conn
+            .query_row(
+                "SELECT recipient_agent_id FROM messages WHERE id = 'msg-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query recipient_agent_id");
+        assert!(recipient_agent_id.is_none());
+    }
+
+    #[test]
+    fn migration_v7_from_v6_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+
+        // Create a minimal v6 DB
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '6');
+                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (6, '2025-01-01T00:00:00Z', 'test v6');
+                 CREATE TABLE IF NOT EXISTS chats (
+                     chat_id INTEGER PRIMARY KEY,
+                     chat_title TEXT,
+                     chat_type TEXT NOT NULL DEFAULT 'private',
+                     last_message_time TEXT NOT NULL,
+                     channel TEXT,
+                     external_chat_id TEXT,
+                     agent_id TEXT NOT NULL DEFAULT 'lyre'
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     is_from_bot INTEGER NOT NULL DEFAULT 0,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     chat_id INTEGER PRIMARY KEY,
+                     messages_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tool_calls (
+                     id TEXT NOT NULL,
+                     chat_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     tool_input TEXT NOT NULL,
+                     tool_output TEXT,
+                     timestamp TEXT NOT NULL,
+                     PRIMARY KEY (id, chat_id, message_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     chat_id INTEGER NOT NULL,
+                     caller_channel TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL,
+                     total_tokens INTEGER NOT NULL,
+                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS sleep_runs (
+                     id TEXT PRIMARY KEY,
+                     agent_id TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     trigger_type TEXT NOT NULL,
+                     started_at TEXT NOT NULL,
+                     finished_at TEXT,
+                     source_chats_json TEXT NOT NULL DEFAULT '[]',
+                     source_digest_md TEXT,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                     error_message TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS memory_snapshots (
+                     id TEXT PRIMARY KEY,
+                     run_id TEXT NOT NULL,
+                     agent_id TEXT NOT NULL,
+                     file TEXT NOT NULL,
+                     content_before TEXT NOT NULL,
+                     content_after TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 );",
+            )
+            .expect("create v6 schema");
+        }
+
+        let db = super::super::Database::new(&db_path).expect("migrate");
+        let conn = db.conn.lock().expect("lock");
+
+        let has_v7: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v7 record");
+        assert!(has_v7);
+
+        let has_message_kind: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'message_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check column");
+        assert!(has_message_kind);
     }
 }

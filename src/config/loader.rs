@@ -69,7 +69,10 @@ struct FileDiscordBotConfig {
 struct FileDiscordChannelConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     require_mention: bool,
-    agent: Option<String>,
+    #[serde(default)]
+    agents: Option<Vec<String>>,
+    #[serde(default)]
+    multi_agent: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -83,6 +86,7 @@ struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    discord_bot: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -420,15 +424,25 @@ fn normalize_discord_bots(
                                 bot_id: bot_id.to_string(),
                                 key: k,
                             })?;
-                    let agent = v
-                        .agent
-                        .and_then(|s| normalize_string(Some(s)))
-                        .map(|s| AgentId::new(&s));
+                    let agents: Vec<AgentId> = v
+                        .agents
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|s| normalize_string(Some(s)))
+                        .map(|s| AgentId::new(&s))
+                        .collect();
+                    let agents = if agents.is_empty() {
+                        vec![default_agent.clone()]
+                    } else {
+                        agents
+                    };
+                    let multi_agent = v.multi_agent.unwrap_or(false);
                     result.insert(
                         channel_id,
                         DiscordChannelConfig {
                             require_mention: v.require_mention,
-                            agent,
+                            agents,
+                            multi_agent,
                         },
                     );
                 }
@@ -463,6 +477,7 @@ fn normalize_agents(
             label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
+            discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
         };
         normalized.insert(key, config);
     }
@@ -742,12 +757,12 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
 }
 
 fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
-    let Some(discord) = config.channels.get("discord") else {
-        return Ok(());
-    };
-    let Some(bots) = &discord.discord_bots else {
-        return Ok(());
-    };
+    let empty_bots = HashMap::new();
+    let bots = config
+        .channels
+        .get("discord")
+        .and_then(|ch| ch.discord_bots.as_ref())
+        .unwrap_or(&empty_bots);
 
     for (bot_id, bot) in bots {
         if !config.agents.contains_key(&bot.default_agent) {
@@ -758,7 +773,7 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         }
         if let Some(channels) = &bot.channels {
             for (channel_id, channel_config) in channels {
-                if let Some(agent_id) = &channel_config.agent {
+                for agent_id in &channel_config.agents {
                     if !config.agents.contains_key(agent_id) {
                         return Err(ConfigError::DiscordBotChannelAgentNotFound {
                             bot_id: bot_id.to_string(),
@@ -767,9 +782,37 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
                         });
                     }
                 }
+                let agent_count = channel_config.agents.len();
+                let multi = channel_config.multi_agent;
+                if multi && agent_count == 1 {
+                    return Err(ConfigError::DiscordBotChannelMultiAgentMismatch {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                        reason: "multi_agent is true but only 1 agent specified".to_string(),
+                    });
+                }
+                if !multi && agent_count > 1 {
+                    return Err(ConfigError::DiscordBotChannelMultiAgentMismatch {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                        reason: "multi_agent is false but multiple agents specified".to_string(),
+                    });
+                }
             }
         }
     }
+
+    for (agent_id, agent_config) in &config.agents {
+        if let Some(ref bot_id) = agent_config.discord_bot {
+            if !bots.contains_key(bot_id) {
+                return Err(ConfigError::AgentDiscordBotNotFound {
+                    agent_id: agent_id.to_string(),
+                    bot_id: bot_id.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
