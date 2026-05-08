@@ -2216,5 +2216,4 @@ mod tests {
         let result = normalize_llm_response(input);
         assert_eq!(result, "just plain text");
     }
-
 }
