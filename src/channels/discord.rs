@@ -1137,6 +1137,25 @@ mod tests {
     }
 
     #[test]
+    fn select_agent_returns_first_agent_in_multi_agent_channel() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            789,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![
+                    crate::config::AgentId::new("lyre"),
+                    crate::config::AgentId::new("vega"),
+                ],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler(channels);
+
+        assert_eq!(handler.select_agent(789, false), "lyre");
+    }
+
+    #[test]
     fn is_bot_mentioned_returns_false_when_no_bot_user_id() {
         // Arrange
         let handler = test_handler(HashMap::new());
