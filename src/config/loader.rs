@@ -757,12 +757,12 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
 }
 
 fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
-    let Some(discord) = config.channels.get("discord") else {
-        return Ok(());
-    };
-    let Some(bots) = &discord.discord_bots else {
-        return Ok(());
-    };
+    let empty_bots = HashMap::new();
+    let bots = config
+        .channels
+        .get("discord")
+        .and_then(|ch| ch.discord_bots.as_ref())
+        .unwrap_or(&empty_bots);
 
     for (bot_id, bot) in bots {
         if !config.agents.contains_key(&bot.default_agent) {

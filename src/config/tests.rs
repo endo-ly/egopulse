@@ -1306,6 +1306,40 @@ fn validation_discord_bot_null_is_ok() {
 
 #[test]
 #[serial]
+fn validation_agent_discord_bot_checked_even_without_discord_channel() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: assistant
+agents:
+  assistant:
+    label: Assistant
+    discord_bot: nonexistent_bot"#,
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+    assert!(
+        matches!(
+            error,
+            ConfigError::AgentDiscordBotNotFound { ref agent_id, ref bot_id }
+                if agent_id == "assistant" && bot_id == "nonexistent_bot"
+        ),
+        "expected AgentDiscordBotNotFound, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
 fn discord_bots_preserve_secret_refs_on_save() {
     use crate::config::persist::save_config_with_secrets;
 

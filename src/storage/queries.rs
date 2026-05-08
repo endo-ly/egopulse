@@ -354,8 +354,8 @@ impl Database {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.id,
                 message.chat_id,
@@ -363,6 +363,9 @@ impl Database {
                 message.content,
                 message.is_from_bot as i32,
                 message.timestamp,
+                message.message_kind.to_string(),
+                message.sender_agent_id.as_deref(),
+                message.recipient_agent_id.as_deref(),
             ],
         )?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -1006,9 +1009,9 @@ mod tests {
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.conn.lock().expect("lock");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, chat_id, "alice", content, 0, ts],
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, chat_id, "alice", content, 0, ts, "message"],
         )
         .expect("store message");
     }
