@@ -765,6 +765,12 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         }
         if let Some(channels) = &bot.channels {
             for (channel_id, channel_config) in channels {
+                if channel_config.agents.is_empty() {
+                    return Err(ConfigError::DiscordBotChannelEmptyAgents {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                    });
+                }
                 for agent_id in &channel_config.agents {
                     if !config.agents.contains_key(agent_id) {
                         return Err(ConfigError::DiscordBotChannelAgentNotFound {
@@ -773,6 +779,22 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
                             agent_id: agent_id.to_string(),
                         });
                     }
+                }
+                let agent_count = channel_config.agents.len();
+                let multi = channel_config.multi_agent;
+                if multi && agent_count == 1 {
+                    return Err(ConfigError::DiscordBotChannelMultiAgentMismatch {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                        reason: "multi_agent is true but only 1 agent specified".to_string(),
+                    });
+                }
+                if !multi && agent_count > 1 {
+                    return Err(ConfigError::DiscordBotChannelMultiAgentMismatch {
+                        bot_id: bot_id.to_string(),
+                        channel_id: *channel_id,
+                        reason: "multi_agent is false but multiple agents specified".to_string(),
+                    });
                 }
             }
         }
