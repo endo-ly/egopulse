@@ -750,7 +750,7 @@ mod tests {
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
-    use crate::storage::{StoredMessage, call_blocking};
+    use crate::storage::{MessageKind, StoredMessage, call_blocking};
 
     use super::{
         SlashCommandOutcome, all_commands, handle_slash_command, is_slash_command,
@@ -888,6 +888,9 @@ mod tests {
                         content: "hello".to_string(),
                         is_from_bot: false,
                         timestamp: "2024-01-01T00:00:00Z".to_string(),
+                        message_kind: MessageKind::Message,
+                        sender_agent_id: None,
+                        recipient_agent_id: None,
                     },
                     r#"[{"role":"user","content":"hello"}]"#,
                     None,

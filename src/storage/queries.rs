@@ -6,11 +6,20 @@ use crate::error::StorageError;
 
 use super::{
     AgentSessionInfo, ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot,
-    SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage,
-    ToolCall,
+    MessageKind, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger,
+    StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    let message_kind_str: String = row.get(6)?;
+    let message_kind = MessageKind::from_str(&message_kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
     Ok(StoredMessage {
         id: row.get(0)?,
         chat_id: row.get(1)?,
@@ -18,6 +27,9 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
         content: row.get(3)?,
         is_from_bot: row.get::<_, i32>(4)? != 0,
         timestamp: row.get(5)?,
+        message_kind,
+        sender_agent_id: row.get(7)?,
+        recipient_agent_id: row.get(8)?,
     })
 }
 
@@ -245,7 +257,8 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
+                    message_kind, sender_agent_id, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
              ORDER BY timestamp DESC
@@ -265,7 +278,8 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
+                    message_kind, sender_agent_id, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
              ORDER BY timestamp ASC",
@@ -399,7 +413,8 @@ impl Database {
 
         let recent_messages = {
             let mut stmt = tx.prepare(
-                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
+                        message_kind, sender_agent_id, recipient_agent_id
                  FROM messages
                  WHERE chat_id = ?1
                  ORDER BY timestamp DESC
@@ -1169,6 +1184,9 @@ mod tests {
             content: "hello".to_string(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         };
 
         db.store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
@@ -1182,6 +1200,9 @@ mod tests {
                 content: "hello again".to_string(),
                 is_from_bot: false,
                 timestamp: "2024-01-01T00:00:01Z".to_string(),
+                message_kind: MessageKind::Message,
+                sender_agent_id: None,
+                recipient_agent_id: None,
             },
             r#"[{"role":"user","content":"hello again"}]"#,
             None,

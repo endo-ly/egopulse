@@ -10,7 +10,7 @@ use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, MessageContentPart};
 use crate::runtime::AppState;
-use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
+use crate::storage::{MessageKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.
@@ -434,7 +434,7 @@ mod tests {
         LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
     };
     use crate::runtime::AppState;
-    use crate::storage::{StoredMessage, call_blocking};
+    use crate::storage::{MessageKind, StoredMessage, call_blocking};
 
     struct FakeProvider {
         response: String,
@@ -519,6 +519,9 @@ mod tests {
             content: "hello".to_string(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = seed_message.clone();
@@ -548,6 +551,9 @@ mod tests {
             content: "hi".to_string(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:01Z".to_string(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
@@ -573,6 +579,9 @@ mod tests {
                 content: "next".to_string(),
                 is_from_bot: false,
                 timestamp: "2024-01-01T00:00:02Z".to_string(),
+                message_kind: MessageKind::Message,
+                sender_agent_id: None,
+                recipient_agent_id: None,
             },
             Message::text("user", "next"),
             &[Message::text("user", "hello")],
@@ -626,6 +635,9 @@ mod tests {
                 content: "Read image file [image/png]".to_string(),
                 is_from_bot: true,
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
+                message_kind: MessageKind::Message,
+                sender_agent_id: None,
+                recipient_agent_id: None,
             },
             messages[0].clone(),
             &messages,
@@ -835,6 +847,9 @@ mod tests {
             content: "concurrent".to_string(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:52Z".to_string(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         };
         let mut latest_messages = seed_messages.clone();
         latest_messages.push(Message::text("assistant", "concurrent"));
@@ -863,6 +878,9 @@ mod tests {
                 content: "next".to_string(),
                 is_from_bot: false,
                 timestamp: "2024-01-01T00:00:53Z".to_string(),
+                message_kind: MessageKind::Message,
+                sender_agent_id: None,
+                recipient_agent_id: None,
             },
             Message::text("user", "next"),
             &stale_messages,

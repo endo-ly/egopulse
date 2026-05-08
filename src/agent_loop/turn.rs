@@ -19,7 +19,7 @@ use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{MessageKind, StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use futures_util::future::join_all;
 use std::ops::ControlFlow;
@@ -499,6 +499,9 @@ where
             content: final_content.clone(),
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         },
         assistant_message,
         messages,
@@ -592,6 +595,9 @@ async fn persist_tool_call_assistant_message(
             content: assistant_preview,
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         },
         assistant_message,
         &messages,
@@ -626,6 +632,9 @@ async fn persist_tool_result_messages(
             content: preview,
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
         },
         tool_messages,
         &messages_with_tools,
@@ -844,6 +853,9 @@ async fn persist_user_turn_with_compaction(
         content: user_input.to_string(),
         is_from_bot: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        message_kind: MessageKind::Message,
+        sender_agent_id: None,
+        recipient_agent_id: None,
     };
 
     for attempt in 0..2 {

@@ -24,6 +24,9 @@ pub(crate) struct StoredMessage {
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+    pub message_kind: MessageKind,
+    pub sender_agent_id: Option<String>,
+    pub recipient_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
