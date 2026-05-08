@@ -75,6 +75,36 @@ pub(crate) struct ToolCall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageKind {
+    Message,
+    AgentSend,
+    SystemEvent,
+}
+
+impl fmt::Display for MessageKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message => write!(f, "message"),
+            Self::AgentSend => write!(f, "agent_send"),
+            Self::SystemEvent => write!(f, "system_event"),
+        }
+    }
+}
+
+impl FromStr for MessageKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "message" => Ok(Self::Message),
+            "agent_send" => Ok(Self::AgentSend),
+            "system_event" => Ok(Self::SystemEvent),
+            other => Err(format!("invalid message kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SleepRunStatus {
     Running,
     Success,
@@ -211,9 +241,11 @@ const _: () = {
     assert_display::<SleepRunStatus>();
     assert_display::<SleepRunTrigger>();
     assert_display::<MemoryFile>();
+    assert_display::<MessageKind>();
     assert_from_str::<SleepRunStatus>();
     assert_from_str::<SleepRunTrigger>();
     assert_from_str::<MemoryFile>();
+    assert_from_str::<MessageKind>();
 
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
@@ -292,6 +324,33 @@ mod tests {
         assert_eq!(SleepRunStatus::Success.to_string(), "success");
         assert_eq!(SleepRunStatus::Failed.to_string(), "failed");
         assert_eq!(SleepRunStatus::Skipped.to_string(), "skipped");
+    }
+
+    #[test]
+    fn message_kind_display_message() {
+        assert_eq!(MessageKind::Message.to_string(), "message");
+    }
+
+    #[test]
+    fn message_kind_display_agent_send() {
+        assert_eq!(MessageKind::AgentSend.to_string(), "agent_send");
+    }
+
+    #[test]
+    fn message_kind_display_system_event() {
+        assert_eq!(MessageKind::SystemEvent.to_string(), "system_event");
+    }
+
+    #[test]
+    fn message_kind_from_str_valid() {
+        assert_eq!(MessageKind::from_str("message").unwrap(), MessageKind::Message);
+        assert_eq!(MessageKind::from_str("agent_send").unwrap(), MessageKind::AgentSend);
+        assert_eq!(MessageKind::from_str("system_event").unwrap(), MessageKind::SystemEvent);
+    }
+
+    #[test]
+    fn message_kind_from_str_unknown() {
+        assert!(MessageKind::from_str("unknown").is_err());
     }
 
     #[test]
