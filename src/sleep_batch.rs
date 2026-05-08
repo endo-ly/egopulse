@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::llm::{LlmProvider, Message};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
@@ -13,6 +13,16 @@ use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, ca
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
 /// Approximate chars-per-token ratio used by the existing session token estimate.
 const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
+/// Maximum characters of raw LLM response to include in error messages and logs.
+const RAW_RESPONSE_PREVIEW_CHARS: usize = 300;
+
+/// Guard message injected on retry when the first LLM response is not valid JSON.
+const JSON_RETRY_GUARD: &str = "\
+Your previous response was not valid JSON. \
+You must respond with ONLY a JSON object containing exactly these three keys: \
+\"episodic\", \"semantic\", \"prospective\". \
+Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
+Output the raw JSON object and nothing else.";
 
 #[derive(Debug, Error)]
 pub enum SleepBatchError {
@@ -45,12 +55,14 @@ pub(crate) struct SleepBatchOutput {
 
 /// Parses the LLM response into structured memory file contents.
 ///
-/// The response must be valid JSON with exactly three keys:
-/// `episodic`, `semantic`, `prospective`.
+/// Applies normalization (thinking-tag stripping, markdown code-block extraction,
+/// outermost `{…}` span extraction) before JSON parsing. The response must contain
+/// a JSON object with exactly three keys: `episodic`, `semantic`, `prospective`.
 /// Any extra keys like `summary_md`, `phases`, or `summary` are rejected.
 #[allow(dead_code)]
 pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, SleepBatchError> {
-    let value: serde_json::Value = serde_json::from_str(response)
+    let normalized = normalize_llm_response(response);
+    let value: serde_json::Value = serde_json::from_str(&normalized)
         .map_err(|e| SleepBatchError::ParseFailed(format!("invalid JSON: {e}")))?;
 
     let map = value.as_object().ok_or_else(|| {
@@ -206,6 +218,49 @@ fn escape_xml_content(content: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Normalizes a raw LLM response into a string that is more likely to parse as JSON.
+///
+/// Applies in order:
+/// 1. Strips `<thinking>` / `<thought>` / `<reasoning>` tag blocks.
+/// 2. Extracts JSON from markdown code blocks (```` ```json ... ``` ````).
+/// 3. Extracts the outermost `{ … }` span to remove preamble text.
+fn normalize_llm_response(raw: &str) -> String {
+    let stripped = crate::agent_loop::formatting::strip_thinking(raw);
+
+    if let Some(json) = extract_json_from_code_block(&stripped) {
+        return json;
+    }
+
+    extract_json_object_span(&stripped).unwrap_or(stripped)
+}
+
+fn extract_json_from_code_block(text: &str) -> Option<String> {
+    let marker = "```json";
+    let start = text.find(marker)?;
+    let content_start = start + marker.len();
+    let end = text[content_start..].find("```")?;
+    Some(text[content_start..content_start + end].trim().to_string())
+}
+
+fn extract_json_object_span(text: &str) -> Option<String> {
+    let first = text.find('{')?;
+    let last = text.rfind('}')?;
+    if first < last {
+        Some(text[first..=last].to_string())
+    } else {
+        None
+    }
+}
+
+fn preview_raw_response(raw: &str) -> String {
+    let truncated: String = raw.chars().take(RAW_RESPONSE_PREVIEW_CHARS).collect();
+    if raw.chars().count() > RAW_RESPONSE_PREVIEW_CHARS {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 /// Builds the system prompt for the sleep batch LLM call.
@@ -404,17 +459,47 @@ async fn execute_batch(
         let system_prompt = build_sleep_system_prompt(&input);
 
         // 6. Call LLM
+        let user_message = Message::text("user", "Please process the memory update.");
         let response = provider
-            .send_message(
-                &system_prompt,
-                vec![Message::text("user", "Please process the memory update.")],
-                None,
-            )
+            .send_message(&system_prompt, vec![user_message.clone()], None)
             .await
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
-        // 7. Parse response
-        let output = parse_sleep_response(&response.content)?;
+        // 7. Parse response (with retry on failure)
+        let (output, response) = match parse_sleep_response(&response.content) {
+            Ok(output) => (output, response),
+            Err(first_error) => {
+                warn!(
+                    agent_id = %agent_id,
+                    error = %first_error,
+                    raw_preview = %preview_raw_response(&response.content),
+                    "sleep batch parse failed; retrying once with JSON guard"
+                );
+
+                let retry_messages = vec![
+                    user_message,
+                    Message::text("assistant", &response.content),
+                    Message::text("user", JSON_RETRY_GUARD),
+                ];
+                let retry_response = provider
+                    .send_message(&system_prompt, retry_messages, None)
+                    .await
+                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+                match parse_sleep_response(&retry_response.content) {
+                    Ok(output) => (output, retry_response),
+                    Err(retry_error) => {
+                        warn!(
+                            agent_id = %agent_id,
+                            error = %retry_error,
+                            raw_preview = %preview_raw_response(&retry_response.content),
+                            "sleep batch retry also failed"
+                        );
+                        return Err(retry_error);
+                    }
+                }
+            }
+        };
 
         // 8. Write memory files
         write_memory_files(&agents_dir, agent_id, &output)?;
@@ -1819,6 +1904,158 @@ mod tests {
                 "no stale backup dirs should remain: {name}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Response normalization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_sleep_response_extracts_json_from_code_block() {
+        let response = "Here is the updated memory:\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```\nLet me know if you need anything else.";
+        let output = parse_sleep_response(response).expect("should parse from code block");
+        assert_eq!(output.episodic, "e");
+        assert_eq!(output.semantic, "s");
+        assert_eq!(output.prospective, "p");
+    }
+
+    #[test]
+    fn parse_sleep_response_strips_thinking_tags() {
+        let response = "<thinking>let me analyze this</thinking>{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}";
+        let output = parse_sleep_response(response).expect("should parse after stripping thinking");
+        assert_eq!(output.episodic, "e");
+    }
+
+    #[test]
+    fn parse_sleep_response_extracts_json_from_preamble() {
+        let response = "I have processed the memory update.\n\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}";
+        let output = parse_sleep_response(response).expect("should parse by extracting {…} span");
+        assert_eq!(output.episodic, "e");
+    }
+
+    #[test]
+    fn parse_sleep_response_handles_code_block_with_thinking() {
+        let response = "<thinking>analyzing...</thinking>\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
+        let output =
+            parse_sleep_response(response).expect("should handle both thinking and code block");
+        assert_eq!(output.semantic, "s");
+    }
+
+    #[test]
+    fn parse_sleep_response_still_rejects_truly_invalid_json() {
+        let response = "This is just plain text with no JSON at all.";
+        let err = parse_sleep_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry + sequential mock tests
+    // -----------------------------------------------------------------------
+
+    struct SequentialMockProvider {
+        responses: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SequentialMockProvider {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockProvider {
+        fn provider_name(&self) -> &str {
+            "sequential-mock"
+        }
+        fn model_name(&self) -> &str {
+            "sequential-model"
+        }
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let mut locked = self.responses.lock().expect("responses lock");
+            let content = locked.remove(0);
+            Ok(MessagesResponse {
+                content,
+                tool_calls: vec![],
+                usage: Some(LlmUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_retries_on_invalid_json_then_succeeds() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let first = "Here is the result:\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
+        let second = "This is not JSON at all, just plain text.";
+        let third = r#"{"episodic":"retry-e","semantic":"retry-s","prospective":"retry-p"}"#;
+
+        let provider = SequentialMockProvider::new(vec![
+            first.to_string(),
+            second.to_string(),
+            third.to_string(),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"))
+            .await
+            .expect("batch should succeed on retry");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_fails_when_retry_also_invalid() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let first = "Not JSON";
+        let second = "Also not JSON";
+
+        let provider = SequentialMockProvider::new(vec![first.to_string(), second.to_string()]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        let err = run_sleep_batch(&state, Some("test-agent"))
+            .await
+            .expect_err("should fail after retry");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SleepRunStatus::Failed);
+    }
+
+    #[test]
+    fn normalize_llm_response_extracts_from_json_code_block() {
+        let input = "```json\n{\"key\": \"value\"}\n```";
+        let result = normalize_llm_response(input);
+        assert_eq!(result, "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn normalize_llm_response_extracts_brace_span_when_no_code_block() {
+        let input = "Some preamble {\"key\": \"value\"} trailing text";
+        let result = normalize_llm_response(input);
+        assert_eq!(result, "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn normalize_llm_response_returns_as_is_when_no_json_structure() {
+        let input = "just plain text";
+        let result = normalize_llm_response(input);
+        assert_eq!(result, "just plain text");
     }
 
     // -----------------------------------------------------------------------

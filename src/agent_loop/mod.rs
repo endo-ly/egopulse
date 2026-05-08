@@ -4,7 +4,7 @@
 //! エージェントの 1 ターン処理へ橋渡しする。
 
 pub(crate) mod compaction;
-mod formatting;
+pub(crate) mod formatting;
 pub(crate) mod guards;
 pub(crate) mod prompt_builder;
 pub(crate) mod session;
