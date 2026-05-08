@@ -625,6 +625,7 @@ mod tests {
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             Ok(crate::llm::MessagesResponse {
                 content: self.response.clone(),
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 0,
