@@ -90,6 +90,7 @@ pub(crate) fn build_state_with_provider(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
     }
 }
 

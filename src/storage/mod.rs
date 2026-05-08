@@ -107,9 +107,12 @@ impl FromStr for SleepRunStatus {
     }
 }
 
+/// How a sleep batch run was initiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SleepRunTrigger {
+pub enum SleepRunTrigger {
+    /// User-triggered via CLI or WebUI.
     Manual,
+    /// Triggered by the automatic scheduler.
     Scheduled,
 }
 

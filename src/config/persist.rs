@@ -53,6 +53,22 @@ struct SerializableSleepBatch {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timezone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry: Option<SerializableRetry>,
+}
+
+#[derive(Serialize)]
+struct SerializableRetry {
+    max_attempts: u32,
+    interval_minutes: u32,
 }
 
 #[derive(Serialize)]
@@ -263,12 +279,35 @@ impl From<&Config> for SerializableConfig {
             agents,
             sleep_batch: {
                 let sb = &config.sleep_batch;
-                if sb.provider.is_none() && sb.model.is_none() {
+                let has_content = sb.provider.is_some()
+                    || sb.model.is_some()
+                    || sb.enabled
+                    || sb.schedule.is_some()
+                    || sb.timezone.is_some()
+                    || sb.agents.is_some()
+                    || sb.retry_max_attempts != 3
+                    || sb.retry_interval_minutes != 5;
+                if !has_content {
                     None
                 } else {
                     Some(SerializableSleepBatch {
                         provider: sb.provider.as_ref().map(|p| p.to_string()),
                         model: sb.model.clone(),
+                        enabled: sb.enabled,
+                        schedule: sb.schedule.clone(),
+                        timezone: sb.timezone.clone(),
+                        agents: sb
+                            .agents
+                            .as_ref()
+                            .map(|list| list.iter().map(|a| a.to_string()).collect()),
+                        retry: if sb.retry_max_attempts != 3 || sb.retry_interval_minutes != 5 {
+                            Some(SerializableRetry {
+                                max_attempts: sb.retry_max_attempts,
+                                interval_minutes: sb.retry_interval_minutes,
+                            })
+                        } else {
+                            None
+                        },
                     })
                 }
             },

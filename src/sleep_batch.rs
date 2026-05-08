@@ -361,6 +361,7 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
 pub async fn run_sleep_batch(
     state: &AppState,
     agent_id: Option<&str>,
+    trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
     let resolved_agent = match agent_id {
         Some(id) => id.to_string(),
@@ -391,7 +392,17 @@ pub async fn run_sleep_batch(
         crate::memory::InputDecision::Proceed {
             sessions,
             source_chats_json,
-        } => execute_batch(state, db, &resolved_agent, &sessions, &source_chats_json).await,
+        } => {
+            execute_batch(
+                state,
+                db,
+                &resolved_agent,
+                &sessions,
+                &source_chats_json,
+                trigger,
+            )
+            .await
+        }
     }
 }
 
@@ -401,10 +412,11 @@ async fn execute_batch(
     agent_id: &str,
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
+    trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
     let agent_for_run = agent_id.to_string();
     let run_id = call_blocking(Arc::clone(&db), move |db| {
-        db.try_create_sleep_run(&agent_for_run, SleepRunTrigger::Manual)
+        db.try_create_sleep_run(&agent_for_run, trigger)
     })
     .await?;
 
@@ -928,6 +940,7 @@ mod tests {
                 std::path::PathBuf::from(&config.state_root).join("agents"),
             )),
             llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
         }
     }
 
@@ -935,7 +948,7 @@ mod tests {
     async fn run_sleep_batch_skips_when_input_below_threshold() {
         let (db, dir) = test_db();
         let state = build_test_state(db, dir.path());
-        let result = run_sleep_batch(&state, Some("test-agent")).await;
+        let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
         assert!(result.is_ok());
     }
 
@@ -945,7 +958,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -965,7 +978,7 @@ mod tests {
             .create_sleep_run("test-agent", SleepRunTrigger::Manual)
             .expect("create running");
 
-        let err = run_sleep_batch(&state, Some("test-agent"))
+        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect_err("should fail with AlreadyRunning");
         assert!(
@@ -985,7 +998,7 @@ mod tests {
         std::fs::write(memory_dir.join("semantic.md"), "semantic content").expect("write");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1028,7 +1041,7 @@ mod tests {
         })));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1051,7 +1064,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1066,7 +1079,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1081,7 +1094,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
         let state = build_test_state(db, dir.path());
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1121,7 +1134,7 @@ mod tests {
 
         let state = build_test_state(db, dir.path());
 
-        let err = run_sleep_batch(&state, Some("test-agent"))
+        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect_err("should fail after run creation");
         assert!(matches!(err, SleepBatchError::Storage(_)));
@@ -1146,7 +1159,7 @@ mod tests {
         std::fs::create_dir_all(&memory_dir).expect("create memory dir");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1166,7 +1179,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let state = build_test_state(db, dir.path());
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch");
 
@@ -1186,9 +1199,83 @@ mod tests {
         let state = build_test_state(db, dir.path());
 
         let default = state.config.default_agent.as_str().to_string();
-        let result = run_sleep_batch(&state, None).await;
+        let result = run_sleep_batch(&state, None, SleepRunTrigger::Manual).await;
         assert!(result.is_ok());
         let _ = default;
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_success_status() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state(db, dir.path());
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_memory_snapshots() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("episodic.md"), "episodic content").expect("write");
+
+        let state = build_test_state(db, dir.path());
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let snapshots = state
+            .db
+            .get_snapshots_for_run(&runs[0].id)
+            .expect("snapshots");
+        assert_eq!(snapshots.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_source_chats_json() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state(db, dir.path());
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].source_chats_json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_records_failed_status() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let state = build_test_state_with_llm(
+            db,
+            dir.path(),
+            Arc::new(MockLlmProvider::with_response(serde_json::json!(
+                "not json"
+            ))),
+        );
+
+        let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled).await;
+        assert!(result.is_err());
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(runs[0].status, SleepRunStatus::Failed);
     }
 
     // --- parse_sleep_response tests ---
@@ -2103,6 +2190,60 @@ mod tests {
         assert!(
             has_one_call,
             "docs/architecture.md should mention one-call/single-call sleep batch approach"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_enabled() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.enabled"),
+            "docs/config.md should document sleep_batch.enabled"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_schedule() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.schedule"),
+            "docs/config.md should document sleep_batch.schedule"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_timezone() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.timezone"),
+            "docs/config.md should document sleep_batch.timezone"
+        );
+    }
+
+    #[test]
+    fn docs_config_mentions_sleep_batch_agents() {
+        let content = read_doc("config.md");
+        assert!(
+            content.contains("sleep_batch.agents"),
+            "docs/config.md should document sleep_batch.agents"
+        );
+    }
+
+    #[test]
+    fn docs_architecture_mentions_sleep_scheduler() {
+        let content = read_doc("architecture.md");
+        assert!(
+            content.contains("scheduler") || content.contains("Scheduler"),
+            "docs/architecture.md should mention sleep batch scheduler"
+        );
+    }
+
+    #[test]
+    fn docs_db_mentions_sleep_run_scheduled_trigger() {
+        let content = read_doc("db.md");
+        assert!(
+            content.contains("scheduled"),
+            "docs/db.md should mention scheduled trigger type"
         );
     }
 }

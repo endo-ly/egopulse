@@ -21,6 +21,8 @@ pub(crate) struct StatusSnapshot {
     pub mcp: McpStatus,
     pub channels: ChannelsStatus,
     pub provider: ProviderStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep_scheduler: Option<SleepSchedulerStatus>,
 }
 
 /// MCP サーバーの接続結果。
@@ -98,6 +100,18 @@ pub(crate) struct WebChannelStatus {
 pub(crate) struct ProviderStatus {
     pub default: String,
     pub model: String,
+}
+
+/// Sleep batch scheduler status.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SleepSchedulerStatus {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// `status.json` にスナップショットを書き出す。
@@ -259,6 +273,7 @@ mod tests {
                 default: "openrouter".to_string(),
                 model: "gpt-5".to_string(),
             },
+            sleep_scheduler: None,
         }
     }
 
@@ -475,5 +490,30 @@ mod tests {
 
         let parsed: TransportType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, TransportType::Stdio);
+    }
+
+    #[test]
+    fn status_includes_sleep_scheduler_state() {
+        let mut snapshot = sample_snapshot();
+        snapshot.sleep_scheduler = Some(SleepSchedulerStatus {
+            enabled: true,
+            next_run: Some("2026-05-08T03:00:00Z".to_string()),
+            schedule: Some("03:00".to_string()),
+            timezone: Some("UTC".to_string()),
+        });
+
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        assert!(json.contains("\"sleep_scheduler\""));
+        assert!(json.contains("\"enabled\": true"));
+        assert!(json.contains("\"next_run\""));
+        assert!(json.contains("\"03:00\""));
+    }
+
+    #[test]
+    fn status_omits_sleep_scheduler_when_none() {
+        let snapshot = sample_snapshot();
+
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        assert!(!json.contains("sleep_scheduler"));
     }
 }

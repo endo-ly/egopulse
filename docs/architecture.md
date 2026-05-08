@@ -291,6 +291,8 @@ pub trait ChannelAdapter: Send + Sync {
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
 | **Sleep Batch** | `sleep_batch.rs` | 手動 sleep batch の排他実行と監査記録 |
+| **Sleep Scheduler** | `sleep_scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
+| **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
 
 ### Sleep Batch（手動長期記憶処理）
 
@@ -365,3 +367,24 @@ sleep_batch.model    → 指定時はそのモデル、未指定時は default_m
 ```
 
 監査スキーマは1回 LLM 呼び出し前提に整理されており、`phases_json` / `summary_md` / `memory_snapshots.phase` は持たない。
+
+### Sleep Scheduler（自動定期実行）
+
+`sleep_batch.enabled: true` 時に、設定時刻に自動で sleep batch を実行する scheduler。
+
+#### 動作概要
+
+1. `start_channels` 起動時、scheduler enabled なら scheduler task を spawn する
+2. scheduler は `next_scheduled_run()` で次回実行時刻を計算し、`tokio::time::sleep` で待機
+3. 時刻到達時に `run_scheduled_cycle()` を実行
+4. 各 agent について `active_turns.is_active()` を確認し、アクティブなら defer
+5. `run_agent_with_retry()` でリトライ設定に基づき再試行
+
+#### Active Turn Tracking
+
+`ActiveTurnTracker` は agent ごとに現在の対話 turn 数を管理する。scheduler は active な agent の sleep batch を defer し、ユーザーとの対話が終了してから実行する。
+
+#### Scheduler と channel の関係
+
+- scheduler 単独では runtime active condition を満たさない（channel が0個なら `NoActiveChannels` エラー）
+- Ctrl-C / channel failure 時に scheduler も既存 task shutdown 経路で停止する

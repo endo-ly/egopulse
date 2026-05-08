@@ -28,6 +28,18 @@ use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
 
+/// RAII guard that decrements the active turn counter on drop.
+struct ActiveTurnGuard<'a> {
+    state: &'a AppState,
+    agent_id: &'a str,
+}
+
+impl Drop for ActiveTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.state.active_turns.end_turn(self.agent_id);
+    }
+}
+
 enum TurnAction {
     Retry(Option<Vec<Message>>),
     Done {
@@ -106,6 +118,12 @@ async fn process_turn_inner<F>(
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
+    state.active_turns.begin_turn(&context.agent_id);
+    let _guard = ActiveTurnGuard {
+        state,
+        agent_id: &context.agent_id,
+    };
+
     let chat_id = resolve_chat_id(state, context).await.inspect_err(|e| {
         warn!(
             error_kind = e.error_kind(),
@@ -1084,6 +1102,7 @@ pub(crate) fn build_state(
         soul_agents,
         memory_loader,
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
     }
 }
 
