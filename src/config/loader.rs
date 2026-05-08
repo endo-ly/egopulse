@@ -30,7 +30,7 @@ where
 #[serde(untagged)]
 enum FileModels {
     List(Vec<String>),
-    Map(HashMap<String, ModelConfig>),
+    Map(HashMap<String, Option<ModelConfig>>),
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -634,7 +634,13 @@ fn normalize_provider_map(
         })?;
 
         let models = match file_provider.models {
-            Some(FileModels::Map(map)) => map,
+            Some(FileModels::Map(map)) => map
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let model = normalize_string(Some(k))?;
+                    Some((model, v.unwrap_or_default()))
+                })
+                .collect(),
             Some(FileModels::List(list)) => list
                 .into_iter()
                 .filter_map(|model| normalize_string(Some(model)))
