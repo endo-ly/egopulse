@@ -159,6 +159,8 @@ pub enum ConfigError {
     },
     #[error("discord_bot_channel_empty_agents: bot={bot_id} channel={channel_id}")]
     DiscordBotChannelEmptyAgents { bot_id: String, channel_id: u64 },
+    #[error("agent_discord_bot_not_found: agent={agent_id} bot={bot_id}")]
+    AgentDiscordBotNotFound { agent_id: String, bot_id: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

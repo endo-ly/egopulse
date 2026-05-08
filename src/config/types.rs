@@ -269,6 +269,7 @@ pub(crate) struct AgentConfig {
     pub label: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub discord_bot: Option<BotId>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -277,6 +278,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("label", &self.label)
             .field("provider", &self.provider)
             .field("model", &self.model)
+            .field("discord_bot", &self.discord_bot)
             .finish()
     }
 }

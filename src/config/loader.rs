@@ -86,6 +86,7 @@ struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    discord_bot: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -476,6 +477,7 @@ fn normalize_agents(
             label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
+            discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
         };
         normalized.insert(key, config);
     }
@@ -799,6 +801,18 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
             }
         }
     }
+
+    for (agent_id, agent_config) in &config.agents {
+        if let Some(ref bot_id) = agent_config.discord_bot {
+            if !bots.contains_key(bot_id) {
+                return Err(ConfigError::AgentDiscordBotNotFound {
+                    agent_id: agent_id.to_string(),
+                    bot_id: bot_id.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

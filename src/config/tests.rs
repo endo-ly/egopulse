@@ -564,6 +564,7 @@ fn persists_agents_without_discord_config_surface() {
             label: "Alice".to_string(),
             provider: Some("openai".to_string()),
             model: Some("gpt-5".to_string()),
+            ..Default::default()
         },
     );
     agents.insert(
@@ -1156,6 +1157,112 @@ fn validation_empty_agents_after_normalization() {
     let bot = bots.get(&super::BotId::new("main")).expect("main bot");
     let ch = bot.channels.as_ref().expect("channels").get(&600).expect("ch 600");
     assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
+}
+
+// ---------------------------------------------------------------------------
+// Step 6: AgentConfig.discord_bot
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn parse_agent_config_with_discord_bot() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant"#,
+        )
+        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: main\n  reviewer:"),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("should succeed");
+    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    assert_eq!(agent.discord_bot.as_ref(), Some(&super::BotId::new("main")));
+}
+
+#[test]
+#[serial]
+fn parse_agent_config_without_discord_bot() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant"#,
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("should succeed");
+    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    assert!(agent.discord_bot.is_none());
+}
+
+#[test]
+#[serial]
+fn validation_discord_bot_must_exist() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant"#,
+        )
+        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: nonexistent_bot\n  reviewer:"),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+    assert!(
+        matches!(
+            error,
+            ConfigError::AgentDiscordBotNotFound { ref agent_id, ref bot_id }
+                if agent_id == "assistant" && bot_id == "nonexistent_bot"
+        ),
+        "expected AgentDiscordBotNotFound, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn validation_discord_bot_null_is_ok() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant"#,
+        )
+        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: null\n  reviewer:"),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("should succeed");
+    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    assert!(agent.discord_bot.is_none());
 }
 
 #[test]

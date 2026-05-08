@@ -47,6 +47,8 @@ struct SerializableAgent {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discord_bot: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -261,6 +263,7 @@ impl From<&Config> for SerializableConfig {
                         label: a.label.clone(),
                         provider: a.provider.clone(),
                         model: a.model.clone(),
+                        discord_bot: a.discord_bot.as_ref().map(|b| b.to_string()),
                     },
                 )
             })
