@@ -773,12 +773,6 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         }
         if let Some(channels) = &bot.channels {
             for (channel_id, channel_config) in channels {
-                if channel_config.agents.is_empty() {
-                    return Err(ConfigError::DiscordBotChannelEmptyAgents {
-                        bot_id: bot_id.to_string(),
-                        channel_id: *channel_id,
-                    });
-                }
                 for agent_id in &channel_config.agents {
                     if !config.agents.contains_key(agent_id) {
                         return Err(ConfigError::DiscordBotChannelAgentNotFound {
