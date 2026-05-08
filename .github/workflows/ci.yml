@@ -42,3 +42,24 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Print coverage summary
+        run: cargo llvm-cov --summary-only
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Check vulnerabilities
+        run: cargo audit --ignore RUSTSEC-2026-0049 --ignore RUSTSEC-2026-0098 --ignore RUSTSEC-2026-0099 --ignore RUSTSEC-2026-0104 --ignore RUSTSEC-2026-0009
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check licenses, bans, advisories
+        run: cargo deny check
+
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
