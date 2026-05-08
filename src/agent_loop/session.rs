@@ -10,7 +10,7 @@ use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, MessageContentPart};
 use crate::runtime::AppState;
-use crate::storage::{MessageKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
+use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.

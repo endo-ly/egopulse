@@ -346,9 +346,18 @@ mod tests {
 
     #[test]
     fn message_kind_from_str_valid() {
-        assert_eq!(MessageKind::from_str("message").unwrap(), MessageKind::Message);
-        assert_eq!(MessageKind::from_str("agent_send").unwrap(), MessageKind::AgentSend);
-        assert_eq!(MessageKind::from_str("system_event").unwrap(), MessageKind::SystemEvent);
+        assert_eq!(
+            MessageKind::from_str("message").unwrap(),
+            MessageKind::Message
+        );
+        assert_eq!(
+            MessageKind::from_str("agent_send").unwrap(),
+            MessageKind::AgentSend
+        );
+        assert_eq!(
+            MessageKind::from_str("system_event").unwrap(),
+            MessageKind::SystemEvent
+        );
     }
 
     #[test]

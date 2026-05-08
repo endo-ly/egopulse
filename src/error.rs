@@ -149,9 +149,7 @@ pub enum ConfigError {
     SleepBatchInvalidTimezone { timezone: String },
     #[error("sleep_batch_invalid_retry: {detail}")]
     SleepBatchInvalidRetry { detail: String },
-    #[error(
-        "discord_bot_channel_multi_agent_mismatch: bot={bot_id} channel={channel_id} {reason}"
-    )]
+    #[error("discord_bot_channel_multi_agent_mismatch: bot={bot_id} channel={channel_id} {reason}")]
     DiscordBotChannelMultiAgentMismatch {
         bot_id: String,
         channel_id: u64,

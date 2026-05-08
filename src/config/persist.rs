@@ -726,7 +726,10 @@ channels:
         save_config_with_secrets(&config, &path).expect("save");
         let yaml = fs::read_to_string(&path).expect("yaml");
 
-        assert!(yaml.contains("- default"), "agents field should be serialized: {yaml}");
+        assert!(
+            yaml.contains("- default"),
+            "agents field should be serialized: {yaml}"
+        );
     }
 
     #[test]
@@ -780,7 +783,10 @@ channels:
         save_config_with_secrets(&config, &path).expect("save");
         let yaml = fs::read_to_string(&path).expect("yaml");
 
-        assert!(yaml.contains("multi_agent: true"), "multi_agent field should be serialized: {yaml}");
+        assert!(
+            yaml.contains("multi_agent: true"),
+            "multi_agent field should be serialized: {yaml}"
+        );
     }
 
     #[test]
@@ -821,7 +827,10 @@ channels:
         save_config_with_secrets(&config, &path).expect("save");
         let yaml = fs::read_to_string(&path).expect("yaml");
 
-        assert!(yaml.contains("discord_bot: main"), "discord_bot field should be serialized: {yaml}");
+        assert!(
+            yaml.contains("discord_bot: main"),
+            "discord_bot field should be serialized: {yaml}"
+        );
     }
 
     #[test]
@@ -879,14 +888,20 @@ channels:
         let bots = loaded.discord_bots();
         assert_eq!(bots.len(), 1);
         let ch = bots[0].channels.get(&111).expect("channel 111");
-        assert_eq!(ch.agents, vec![
-            crate::config::AgentId::new("default"),
-            crate::config::AgentId::new("reviewer"),
-        ]);
+        assert_eq!(
+            ch.agents,
+            vec![
+                crate::config::AgentId::new("default"),
+                crate::config::AgentId::new("reviewer"),
+            ]
+        );
         assert!(ch.multi_agent);
         assert!(ch.require_mention);
 
-        let agent = loaded.agents.get(&crate::config::AgentId::new("reviewer")).expect("reviewer agent");
+        let agent = loaded
+            .agents
+            .get(&crate::config::AgentId::new("reviewer"))
+            .expect("reviewer agent");
         assert_eq!(agent.discord_bot.as_ref(), Some(&BotId::new("main")));
     }
 }

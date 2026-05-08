@@ -1046,7 +1046,12 @@ fn validation_accepts_single_agent() {
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
     let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot.channels.as_ref().expect("channels").get(&300).expect("ch 300");
+    let ch = bot
+        .channels
+        .as_ref()
+        .expect("channels")
+        .get(&300)
+        .expect("ch 300");
     assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
     assert!(!ch.multi_agent);
 }
@@ -1078,8 +1083,19 @@ fn validation_accepts_multi_agent() {
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
     let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot.channels.as_ref().expect("channels").get(&400).expect("ch 400");
-    assert_eq!(ch.agents, vec![super::AgentId::new("assistant"), super::AgentId::new("reviewer")]);
+    let ch = bot
+        .channels
+        .as_ref()
+        .expect("channels")
+        .get(&400)
+        .expect("ch 400");
+    assert_eq!(
+        ch.agents,
+        vec![
+            super::AgentId::new("assistant"),
+            super::AgentId::new("reviewer")
+        ]
+    );
     assert!(ch.multi_agent);
 }
 
@@ -1155,7 +1171,12 @@ fn validation_empty_agents_after_normalization() {
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
     let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot.channels.as_ref().expect("channels").get(&600).expect("ch 600");
+    let ch = bot
+        .channels
+        .as_ref()
+        .expect("channels")
+        .get(&600)
+        .expect("ch 600");
     assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
 }
 
@@ -1179,11 +1200,17 @@ fn parse_agent_config_with_discord_bot() {
           id: MY_DISCORD_TOKEN
         default_agent: assistant"#,
         )
-        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: main\n  reviewer:"),
+        .replace(
+            "agents:\n  assistant:",
+            "agents:\n  assistant:\n    discord_bot: main\n  reviewer:",
+        ),
     );
 
     let config = Config::load(Some(&file_path)).expect("should succeed");
-    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    let agent = config
+        .agents
+        .get(&super::AgentId::new("assistant"))
+        .expect("assistant agent");
     assert_eq!(agent.discord_bot.as_ref(), Some(&super::BotId::new("main")));
 }
 
@@ -1206,7 +1233,10 @@ fn parse_agent_config_without_discord_bot() {
     );
 
     let config = Config::load(Some(&file_path)).expect("should succeed");
-    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    let agent = config
+        .agents
+        .get(&super::AgentId::new("assistant"))
+        .expect("assistant agent");
     assert!(agent.discord_bot.is_none());
 }
 
@@ -1226,7 +1256,10 @@ fn validation_discord_bot_must_exist() {
           id: MY_DISCORD_TOKEN
         default_agent: assistant"#,
         )
-        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: nonexistent_bot\n  reviewer:"),
+        .replace(
+            "agents:\n  assistant:",
+            "agents:\n  assistant:\n    discord_bot: nonexistent_bot\n  reviewer:",
+        ),
     );
 
     let error = Config::load(Some(&file_path)).expect_err("should fail");
@@ -1257,11 +1290,17 @@ fn validation_discord_bot_null_is_ok() {
           id: MY_DISCORD_TOKEN
         default_agent: assistant"#,
         )
-        .replace("agents:\n  assistant:", "agents:\n  assistant:\n    discord_bot: null\n  reviewer:"),
+        .replace(
+            "agents:\n  assistant:",
+            "agents:\n  assistant:\n    discord_bot: null\n  reviewer:",
+        ),
     );
 
     let config = Config::load(Some(&file_path)).expect("should succeed");
-    let agent = config.agents.get(&super::AgentId::new("assistant")).expect("assistant agent");
+    let agent = config
+        .agents
+        .get(&super::AgentId::new("assistant"))
+        .expect("assistant agent");
     assert!(agent.discord_bot.is_none());
 }
 
