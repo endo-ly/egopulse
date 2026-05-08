@@ -200,7 +200,7 @@ fn restored_messages_or_recent(
         return None;
     };
     if messages.is_empty() {
-        return None;
+        return Some(messages);
     }
 
     Some(messages)
@@ -974,6 +974,30 @@ mod tests {
 
         assert_eq!(web_ctx.session_key(), "web:s1");
         assert_eq!(telegram_ctx.session_key(), "telegram:s2");
+    }
+
+    #[test]
+    fn restored_messages_or_recent_empty_is_some() {
+        let result = super::restored_messages_or_recent(Ok(vec![]));
+        assert_eq!(result, Some(vec![]));
+
+        let msg = Message {
+            role: "user".into(),
+            content: MessageContent::Text("hello".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let result = super::restored_messages_or_recent(Ok(vec![msg.clone()]));
+        assert_eq!(result, Some(vec![msg]));
+
+        let err: Result<Vec<Message>, crate::error::StorageError> =
+            Err(crate::error::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test",
+            )));
+        let result = super::restored_messages_or_recent(err);
+        assert_eq!(result, None);
     }
 
     #[tokio::test]

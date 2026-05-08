@@ -308,6 +308,29 @@ impl Database {
         Ok(())
     }
 
+    /// Clears session message history by setting `messages_json` to an empty
+    /// JSON array.  The session row itself and `messages` / `tool_calls`
+    /// records are preserved.
+    ///
+    /// Uses optimistic concurrency: the update only succeeds when
+    /// `expected_updated_at` matches the current row.  Returns `Ok(true)` if
+    /// the row was updated, `Ok(false)` if the row was not found or the
+    /// timestamp did not match (concurrent modification).
+    pub(crate) fn clear_session_messages(
+        &self,
+        chat_id: i64,
+        expected_updated_at: &str,
+    ) -> Result<bool, StorageError> {
+        let conn = self.lock_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE sessions SET messages_json = '[]', updated_at = ?1 \
+             WHERE chat_id = ?2 AND updated_at = ?3",
+            params![now, chat_id, expected_updated_at],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub(crate) fn store_message_with_session(
         &self,
         message: &StoredMessage,
@@ -1083,6 +1106,57 @@ mod tests {
         let (db, _dir) = test_db();
 
         db.clear_session(999).expect("clear missing session");
+    }
+
+    #[test]
+    fn clear_session_messages_empties_json_only() {
+        let (db, _dir) = test_db();
+        let chat_id = 100;
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        let updated_at = snapshot.updated_at.as_deref().expect("has updated_at");
+
+        let cleared = db
+            .clear_session_messages(chat_id, updated_at)
+            .expect("clear session messages");
+        assert!(cleared, "should have updated the row");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        assert_eq!(
+            snapshot.messages_json.as_deref(),
+            Some(r#"[]"#),
+            "messages_json should be empty array"
+        );
+
+        let messages = db
+            .get_recent_messages(chat_id, 10)
+            .expect("load recent messages");
+        assert_eq!(messages.len(), 2, "messages records should be preserved");
+    }
+
+    #[test]
+    fn clear_session_messages_returns_false_on_stale_timestamp() {
+        let (db, _dir) = test_db();
+        let chat_id = 200;
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let cleared = db
+            .clear_session_messages(chat_id, "stale-timestamp")
+            .expect("clear session messages");
+        assert!(!cleared, "should not have updated the row");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        assert!(
+            snapshot.messages_json.as_deref() != Some(r#"[]"#),
+            "messages_json should not be cleared"
+        );
     }
 
     #[test]

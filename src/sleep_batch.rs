@@ -4,6 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::agent_loop::compaction::archive_conversation_blocking;
 use crate::llm::{LlmProvider, Message};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
@@ -516,10 +517,23 @@ async fn execute_batch(
         // 8. Write memory files
         write_memory_files(&agents_dir, agent_id, &output)?;
 
-        // 9. Save AFTER snapshots from parsed output, preserving empty files too.
+        // 9. Archive sessions and clear session messages
+        let groups_dir = state.config.groups_dir();
+        for session in sessions {
+            if let Err(e) = archive_and_clear_session(&db, &groups_dir, session) {
+                warn!(
+                    agent_id = %agent_id,
+                    chat_id = session.chat_id,
+                    error = %e,
+                    "failed to archive/clear session (continuing)"
+                );
+            }
+        }
+
+        // 10. Save AFTER snapshots from parsed output, preserving empty files too.
         save_output_snapshots(&db, &run_id, agent_id, &output).await?;
 
-        // 10. Update run success with token usage
+        // 11. Update run success with token usage
         let run_id_owned = run_id.clone();
         let source_chats = source_chats_json.to_string();
         let input_tokens = response.usage.as_ref().map_or(0, |u| u.input_tokens);
@@ -810,6 +824,62 @@ pub(crate) fn write_memory_files(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session archiving + message clearing (Step 9)
+// ---------------------------------------------------------------------------
+
+/// Archives the given session's messages to a Markdown file and clears the
+/// session's `messages_json` so the next turn starts with an empty LLM context.
+///
+/// Archiving is best-effort (failures are not propagated).  Clearing uses
+/// optimistic concurrency on `updated_at` — if a concurrent turn has modified
+/// the session since the batch started, the clear is silently skipped.
+fn archive_and_clear_session(
+    db: &Database,
+    groups_dir: &Path,
+    session: &AgentSessionInfo,
+) -> Result<(), SleepBatchError> {
+    let snapshot = db
+        .load_session_snapshot(session.chat_id, 100)
+        .map_err(SleepBatchError::Storage)?;
+
+    // Archive to Markdown (best-effort)
+    if let Some(json) = &snapshot.messages_json {
+        let messages = parse_messages_json(json);
+        if !messages.is_empty() {
+            archive_conversation_blocking(groups_dir, &session.channel, session.chat_id, &messages);
+        } else {
+            info!(
+                chat_id = session.chat_id,
+                "skipping archive: messages_json parsed as empty"
+            );
+        }
+    }
+
+    // Clear session messages_json to "[]" (optimistic concurrency)
+    if let Some(updated_at) = &snapshot.updated_at {
+        let cleared = db
+            .clear_session_messages(session.chat_id, updated_at)
+            .map_err(SleepBatchError::Storage)?;
+        if !cleared {
+            warn!(
+                chat_id = session.chat_id,
+                "skipping session clear: concurrent modification detected"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Parses a JSON array of message objects into [`Message`] structs.
+///
+/// Uses serde deserialization to handle both text-only and multimodal content
+/// correctly.
+fn parse_messages_json(json: &str) -> Vec<Message> {
+    serde_json::from_str::<Vec<Message>>(json).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2096,7 +2166,7 @@ mod tests {
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
-        run_sleep_batch(&state, Some("test-agent"))
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect("batch should succeed on retry");
 
@@ -2116,7 +2186,7 @@ mod tests {
         let provider = SequentialMockProvider::new(vec![first.to_string(), second.to_string()]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
-        let err = run_sleep_batch(&state, Some("test-agent"))
+        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
             .expect_err("should fail after retry");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
