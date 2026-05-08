@@ -248,6 +248,7 @@ fn orphan_tool_output_message(tool_call_id: String) -> Message {
         content: MessageContent::text(
             r#"{"status":"error","error":"tool output was missing from the restored session snapshot"}"#,
         ),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call_id),
     }
@@ -297,6 +298,7 @@ fn persist_messages(
             Ok(Message {
                 role: message.role.clone(),
                 content: persist_content(assets, &message.content)?,
+                reasoning_content: message.reasoning_content.clone(),
                 tool_calls: message.tool_calls.clone(),
                 tool_call_id: message.tool_call_id.clone(),
             })
@@ -461,6 +463,7 @@ mod tests {
                 .join("|");
             Ok(MessagesResponse {
                 content: format!("{} [{prompt}]", self.response),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })
@@ -609,6 +612,7 @@ mod tests {
                     detail: Some("auto".to_string()),
                 },
             ]),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".to_string()),
         }];
@@ -713,6 +717,7 @@ mod tests {
             Message {
                 role: "assistant".to_string(),
                 content: MessageContent::text("I will inspect."),
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id: "call-missing".to_string(),
                     name: "read".to_string(),

@@ -846,6 +846,7 @@ mod tests {
         ) -> Result<MessagesResponse, crate::error::LlmError> {
             Ok(MessagesResponse {
                 content: self.response.clone(),
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: Some(LlmUsage {
                     input_tokens: 0,
@@ -1982,6 +1983,7 @@ mod tests {
             let content = locked.remove(0);
             Ok(MessagesResponse {
                 content,
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: Some(LlmUsage {
                     input_tokens: 0,

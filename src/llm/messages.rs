@@ -7,6 +7,7 @@ pub(crate) fn build_request_body(
     messages: &[Message],
     tools: Option<&[ToolDefinition]>,
     stream: Option<bool>,
+    include_reasoning_content: bool,
 ) -> serde_json::Value {
     let mut translated = Vec::new();
     if !system.trim().is_empty() {
@@ -15,7 +16,11 @@ pub(crate) fn build_request_body(
             "content": system,
         }));
     }
-    translated.extend(messages.iter().map(translate_message_to_openai));
+    translated.extend(
+        messages
+            .iter()
+            .map(|message| translate_message_to_openai(message, include_reasoning_content)),
+    );
 
     let mut body = serde_json::json!({
         "model": model,
@@ -103,8 +108,11 @@ fn orphan_tool_output_to_responses_context(message: &Message) -> Vec<serde_json:
     items
 }
 
-pub(crate) fn translate_message_to_openai(message: &Message) -> serde_json::Value {
-    match message.role.as_str() {
+pub(crate) fn translate_message_to_openai(
+    message: &Message,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
+    let mut translated = match message.role.as_str() {
         "assistant" if !message.tool_calls.is_empty() => serde_json::json!({
             "role": "assistant",
             "content": if message.content.is_empty_textual() {
@@ -132,7 +140,16 @@ pub(crate) fn translate_message_to_openai(message: &Message) -> serde_json::Valu
             "role": message.role,
             "content": translate_content_to_chat_completions(&message.content),
         }),
+    };
+
+    if include_reasoning_content
+        && message.role == "assistant"
+        && let Some(reasoning_content) = message.reasoning_content.as_deref()
+    {
+        translated["reasoning_content"] = serde_json::Value::String(reasoning_content.to_string());
     }
+
+    translated
 }
 
 pub(crate) fn translate_content_to_chat_completions(content: &MessageContent) -> serde_json::Value {
@@ -354,6 +371,7 @@ mod tests {
                         detail: Some("auto".to_string()),
                     },
                 ]),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }],
@@ -383,6 +401,28 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_request_omits_reasoning_content_by_default() {
+        let mut message = Message::text("assistant", "visible");
+        message.reasoning_content = Some("hidden reasoning".to_string());
+
+        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, false);
+
+        assert_eq!(body["messages"][0]["content"], "visible");
+        assert!(body["messages"][0]["reasoning_content"].is_null());
+    }
+
+    #[test]
+    fn chat_completions_request_preserves_reasoning_content_when_enabled() {
+        let mut message = Message::text("assistant", "visible");
+        message.reasoning_content = Some("hidden reasoning".to_string());
+
+        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, true);
+
+        assert_eq!(body["messages"][0]["content"], "visible");
+        assert_eq!(body["messages"][0]["reasoning_content"], "hidden reasoning");
+    }
+
+    #[test]
     fn responses_request_keeps_matched_tool_output_as_function_call_output() {
         let body = build_responses_request_body(
             "gpt-5.3-codex",
@@ -391,6 +431,7 @@ mod tests {
                 Message {
                     role: "assistant".to_string(),
                     content: MessageContent::text(""),
+                    reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
@@ -401,6 +442,7 @@ mod tests {
                 Message {
                     role: "tool".to_string(),
                     content: MessageContent::text("read result"),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     tool_call_id: Some("call_1".to_string()),
                 },
@@ -421,6 +463,7 @@ mod tests {
             &[Message {
                 role: "tool".to_string(),
                 content: MessageContent::text("orphan result"),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_missing".to_string()),
             }],

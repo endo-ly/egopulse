@@ -21,6 +21,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
             .content
             .unwrap_or(OpenAiMessageContent::Text(String::new())),
     );
+    let reasoning_content = choice.message.reasoning_content;
 
     if tool_calls.is_empty()
         && let Some((rescued_calls, stripped_content)) = rescue_raw_tool_calls(&content)
@@ -37,6 +38,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
 
     Ok(MessagesResponse {
         content,
+        reasoning_content,
         tool_calls,
         usage: usage.and_then(|u| {
             u.prompt_tokens
@@ -100,6 +102,7 @@ pub(crate) fn parse_responses_response(
 
     Ok(MessagesResponse {
         content,
+        reasoning_content: None,
         tool_calls,
         usage: body.usage.and_then(|u| {
             u.input_tokens
@@ -609,6 +612,8 @@ pub(crate) struct Choice {
 pub(crate) struct AssistantMessage {
     #[serde(default)]
     pub(crate) content: Option<OpenAiMessageContent>,
+    #[serde(default)]
+    pub(crate) reasoning_content: Option<String>,
     #[serde(default)]
     pub(crate) tool_calls: Option<Vec<OaiToolCall>>,
 }

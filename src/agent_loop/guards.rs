@@ -5,10 +5,13 @@ use crate::llm::Message;
 pub(crate) fn runtime_guard_messages(
     messages: &[Message],
     assistant_text: &str,
+    assistant_reasoning_content: Option<&str>,
     guard_text: &str,
 ) -> Vec<Message> {
     let mut retry_messages = messages.to_vec();
-    retry_messages.push(Message::text("assistant", assistant_text.to_string()));
+    let mut assistant_message = Message::text("assistant", assistant_text.to_string());
+    assistant_message.reasoning_content = assistant_reasoning_content.map(ToString::to_string);
+    retry_messages.push(assistant_message);
     retry_messages.push(Message::text("user", guard_text.to_string()));
     retry_messages
 }
@@ -104,11 +107,13 @@ mod tests {
                 responses: std::sync::Mutex::new(vec![
                     MessagesResponse {
                         content: String::new(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
                     MessagesResponse {
                         content: String::new(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
@@ -132,11 +137,13 @@ mod tests {
                 responses: std::sync::Mutex::new(vec![
                     MessagesResponse {
                         content: "Sure, I'll help you with that.".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
                     MessagesResponse {
                         content: "Here is the answer you need.".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
@@ -181,6 +188,7 @@ mod tests {
                 responses: std::sync::Mutex::new(vec![
                     MessagesResponse {
                         content: "了解しました。実行します。".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             id: "call-malformed".to_string(),
                             name: String::new(),
@@ -190,6 +198,7 @@ mod tests {
                     },
                     MessagesResponse {
                         content: "実行結果です。".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },

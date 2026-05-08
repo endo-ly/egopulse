@@ -228,6 +228,7 @@ impl LlmProvider for OpenAiProvider {
                 &messages,
                 tools.as_deref(),
                 None,
+                should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
             ))
             .send()
             .await?;
@@ -243,4 +244,21 @@ impl LlmProvider for OpenAiProvider {
         let body: OpenAiResponse = response.json().await?;
         parse_openai_response(body)
     }
+}
+
+pub(crate) fn should_preserve_reasoning_content(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    provider.contains("deepseek") || model.contains("deepseek") || is_deepseek_base_url(base_url)
+}
+
+fn is_deepseek_base_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
 }

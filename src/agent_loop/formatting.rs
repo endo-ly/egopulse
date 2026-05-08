@@ -343,6 +343,7 @@ mod tests {
                     detail: None,
                 },
             ]),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         };
@@ -357,6 +358,7 @@ mod tests {
             content: MessageContent::parts(vec![MessageContentPart::InputText {
                 text: "prefix <think>secret</think> suffix".to_string(),
             }]),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-1".to_string()),
         };
@@ -369,6 +371,7 @@ mod tests {
         let message = Message {
             role: "assistant".to_string(),
             content: MessageContent::text(""),
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "search".to_string(),
@@ -438,6 +441,7 @@ mod tests {
                     detail: Some("high".to_string()),
                 },
             ]),
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "search".to_string(),
@@ -467,6 +471,7 @@ mod tests {
         let message = Message {
             role: "tool".to_string(),
             content: MessageContent::text(r#"{"tool":"read","status":"success"}"#),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-1".to_string()),
         };

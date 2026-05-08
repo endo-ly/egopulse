@@ -812,6 +812,7 @@ mod tests {
                 Box::new(crate::agent_loop::turn::FakeProvider {
                     responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                         content: "ok".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![],
                         usage: None,
                     }]),
@@ -843,6 +844,7 @@ mod tests {
                 Box::new(crate::agent_loop::turn::FakeProvider {
                     responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                         content: "ok".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![],
                         usage: None,
                     }]),
@@ -875,6 +877,7 @@ mod tests {
                 Box::new(crate::agent_loop::turn::FakeProvider {
                     responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                         content: "ok".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![],
                         usage: None,
                     }]),

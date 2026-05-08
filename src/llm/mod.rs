@@ -43,6 +43,8 @@ pub(crate) struct ToolDefinition {
 pub(crate) struct Message {
     pub role: String,
     pub content: MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,7 @@ impl Message {
         Self {
             role: role.into(),
             content: MessageContent::text(content),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -152,6 +155,7 @@ pub(crate) struct LlmUsage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MessagesResponse {
     pub content: String,
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<LlmUsage>,
 }
@@ -238,6 +242,35 @@ mod tests {
 
         assert_eq!(response.content, "hello back");
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn preserves_reasoning_content_only_for_deepseek_compatible_targets() {
+        assert!(super::should_preserve_reasoning_content(
+            "deepseek",
+            "https://api.example.com/v1",
+            "deepseek-v4-pro"
+        ));
+        assert!(super::should_preserve_reasoning_content(
+            "openai-compatible",
+            "https://api.deepseek.com/v1",
+            "v4-pro"
+        ));
+        assert!(super::should_preserve_reasoning_content(
+            "opencode-go",
+            "https://api.example.com/v1",
+            "deepseek-v4-pro"
+        ));
+        assert!(!super::should_preserve_reasoning_content(
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-5.5"
+        ));
+        assert!(!super::should_preserve_reasoning_content(
+            "openai-compatible",
+            "https://proxy.example.com/deepseek/v1",
+            "v4-pro"
+        ));
     }
 
     #[tokio::test]
@@ -390,6 +423,7 @@ mod tests {
                     Message {
                         role: "assistant".to_string(),
                         content: MessageContent::text(""),
+                        reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             id: "call_1".to_string(),
                             name: "read".to_string(),
@@ -408,6 +442,7 @@ mod tests {
                                 detail: Some("auto".to_string()),
                             },
                         ]),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some("call_1".to_string()),
                     },
@@ -527,6 +562,27 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 20,
             })
+        );
+    }
+
+    #[test]
+    fn parse_openai_response_preserves_reasoning_content() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "visible answer",
+                    "reasoning_content": "hidden reasoning"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+
+        assert_eq!(response.content, "visible answer");
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("hidden reasoning")
         );
     }
 

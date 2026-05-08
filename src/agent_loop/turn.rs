@@ -30,7 +30,16 @@ const MAX_TOOL_ITERATIONS: usize = 50;
 
 enum TurnAction {
     Retry(Option<Vec<Message>>),
-    Done(String),
+    Done {
+        final_content: String,
+        reasoning_content: Option<String>,
+    },
+}
+
+struct ToolAssistantDraft {
+    content: String,
+    reasoning_content: Option<String>,
+    valid_tool_calls: Vec<ToolCall>,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -188,6 +197,7 @@ where
             if let Some(final_content) = run_turn_action(
                 evaluate_end_turn(
                     &response.content,
+                    response.reasoning_content.as_deref(),
                     &mut empty_reply_retry_attempted,
                     &mut declarative_retry_attempted,
                     &messages,
@@ -213,6 +223,7 @@ where
             if let Some(final_content) = run_turn_action(
                 evaluate_malformed_response(
                     &response.content,
+                    response.reasoning_content.as_deref(),
                     &mut declarative_retry_attempted,
                     &messages,
                 )?,
@@ -237,8 +248,11 @@ where
             &tool_context,
             messages,
             session_updated_at,
-            &response.content,
-            valid_tool_calls,
+            ToolAssistantDraft {
+                content: response.content,
+                reasoning_content: response.reasoning_content,
+                valid_tool_calls,
+            },
         )
         .await?;
         messages = updated_messages;
@@ -306,6 +320,7 @@ fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
 
 fn evaluate_end_turn(
     raw_content: &str,
+    reasoning_content: Option<&str>,
     empty_reply_retry_attempted: &mut bool,
     declarative_retry_attempted: &mut bool,
     messages: &[Message],
@@ -319,6 +334,7 @@ fn evaluate_end_turn(
         return Ok(TurnAction::Retry(Some(runtime_guard_messages(
             messages,
             raw_content,
+            reasoning_content,
             "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
         ))));
     }
@@ -332,6 +348,7 @@ fn evaluate_end_turn(
         return Ok(TurnAction::Retry(Some(runtime_guard_messages(
             messages,
             raw_content,
+            reasoning_content,
             "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
         ))));
     }
@@ -342,11 +359,15 @@ fn evaluate_end_turn(
         )));
     }
 
-    Ok(TurnAction::Done(visible_text.trim().to_string()))
+    Ok(TurnAction::Done {
+        final_content: visible_text.trim().to_string(),
+        reasoning_content: reasoning_content.map(ToString::to_string),
+    })
 }
 
 fn evaluate_malformed_response(
     raw_content: &str,
+    reasoning_content: Option<&str>,
     declarative_retry_attempted: &mut bool,
     messages: &[Message],
 ) -> Result<TurnAction, EgoPulseError> {
@@ -364,11 +385,15 @@ fn evaluate_malformed_response(
         return Ok(TurnAction::Retry(Some(runtime_guard_messages(
             messages,
             raw_content,
+            reasoning_content,
             "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
         ))));
     }
 
-    Ok(TurnAction::Done(visible_text.trim().to_string()))
+    Ok(TurnAction::Done {
+        final_content: visible_text.trim().to_string(),
+        reasoning_content: reasoning_content.map(ToString::to_string),
+    })
 }
 
 async fn run_turn_action<F>(
@@ -414,13 +439,17 @@ where
 {
     match action {
         TurnAction::Retry(messages) => Ok(ControlFlow::Continue(messages)),
-        TurnAction::Done(final_content) => persist_and_finalize(
+        TurnAction::Done {
+            final_content,
+            reasoning_content,
+        } => persist_and_finalize(
             state,
             chat_id,
             messages,
             session_updated_at,
             on_event,
             final_content,
+            reasoning_content,
         )
         .await
         .map(ControlFlow::Break),
@@ -434,11 +463,13 @@ async fn persist_and_finalize<F>(
     session_updated_at: Option<String>,
     on_event: &Option<F>,
     final_content: String,
+    reasoning_content: Option<String>,
 ) -> Result<String, EgoPulseError>
 where
     F: Fn(AgentEvent) + Send + Sync,
 {
-    let assistant_message = Message::text("assistant", final_content.clone());
+    let mut assistant_message = Message::text("assistant", final_content.clone());
+    assistant_message.reasoning_content = reasoning_content;
     messages.push(assistant_message.clone());
 
     let _persisted = persist_phase(
@@ -472,8 +503,7 @@ async fn execute_and_persist_tools<F>(
     tool_context: &ToolExecutionContext,
     messages: Vec<Message>,
     session_updated_at: Option<String>,
-    response_content: &str,
-    valid_tool_calls: Vec<ToolCall>,
+    assistant_draft: ToolAssistantDraft,
 ) -> Result<(Vec<Message>, Option<String>), EgoPulseError>
 where
     F: Fn(AgentEvent) + Send + Sync,
@@ -484,8 +514,7 @@ where
         state,
         tool_context.chat_id,
         &assistant_message_id,
-        response_content,
-        &valid_tool_calls,
+        &assistant_draft,
         messages,
         session_updated_at,
     )
@@ -498,7 +527,7 @@ where
         on_event,
         tool_context,
         &assistant_message_id,
-        valid_tool_calls,
+        assistant_draft.valid_tool_calls,
     )
     .await?;
     let persisted = persist_tool_result_messages(
@@ -519,17 +548,18 @@ async fn persist_tool_call_assistant_message(
     state: &AppState,
     chat_id: i64,
     assistant_message_id: &str,
-    response_content: &str,
-    valid_tool_calls: &[ToolCall],
+    assistant_draft: &ToolAssistantDraft,
     mut messages: Vec<Message>,
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    let assistant_text = sanitize_assistant_response_text(response_content);
-    let assistant_preview = summarize_tool_calls_with_content(&assistant_text, valid_tool_calls);
+    let assistant_text = sanitize_assistant_response_text(&assistant_draft.content);
+    let assistant_preview =
+        summarize_tool_calls_with_content(&assistant_text, &assistant_draft.valid_tool_calls);
     let assistant_message = Message {
         role: "assistant".to_string(),
         content: crate::llm::MessageContent::text(assistant_text),
-        tool_calls: valid_tool_calls.to_vec(),
+        reasoning_content: assistant_draft.reasoning_content.clone(),
+        tool_calls: assistant_draft.valid_tool_calls.clone(),
         tool_call_id: None,
     };
 
@@ -736,6 +766,7 @@ where
     Ok(Message {
         role: "tool".to_string(),
         content: tool_message_content(&tool_payload, &result),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call.id),
     })
@@ -1014,6 +1045,7 @@ pub(crate) fn tool_result_message(status: &str, result: &str) -> Message {
             })
             .to_string(),
         ),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some("call-1".to_string()),
     }
@@ -1086,6 +1118,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "Let me check this. <thinking>internal</thinking>".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         id: "call-1".to_string(),
                         name: "read".to_string(),
@@ -1095,6 +1128,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "All set".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
@@ -1186,6 +1220,7 @@ mod tests {
                 responses: std::sync::Mutex::new(vec![
                     MessagesResponse {
                         content: "Let me read that file.".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             id: "call-1".to_string(),
                             name: "read".to_string(),
@@ -1195,6 +1230,7 @@ mod tests {
                     },
                     MessagesResponse {
                         content: "Done reading. Final answer.".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
@@ -1227,6 +1263,7 @@ mod tests {
                 responses: std::sync::Mutex::new(vec![
                     MessagesResponse {
                         content: "Reading once.".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             id: "call-repeat".to_string(),
                             name: "read".to_string(),
@@ -1236,11 +1273,13 @@ mod tests {
                     },
                     MessagesResponse {
                         content: "First done.".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
                     MessagesResponse {
                         content: "Reading again.".to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             id: "call-repeat".to_string(),
                             name: "read".to_string(),
@@ -1250,6 +1289,7 @@ mod tests {
                     },
                     MessagesResponse {
                         content: "Second done.".to_string(),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         usage: None,
                     },
@@ -1301,6 +1341,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "Reading.".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![
                         ToolCall {
                             id: "call-duplicate".to_string(),
@@ -1317,6 +1358,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "Done.".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
@@ -1384,6 +1426,7 @@ mod tests {
             Box::new(FakeProvider {
                 responses: std::sync::Mutex::new(vec![MessagesResponse {
                     content: String::new(),
+                    reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         id: "call-malformed".to_string(),
                         name: String::new(),
@@ -1638,6 +1681,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "hello world".to_string(),
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 10,
@@ -1697,6 +1741,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "checking".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         id: "call-iter-1".to_string(),
                         name: "read".to_string(),
@@ -1709,6 +1754,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "done".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![],
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 30,
@@ -1773,6 +1819,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "no usage info".to_string(),
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: None,
             })],
@@ -1811,6 +1858,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "agent reply".to_string(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })],
@@ -1842,6 +1890,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "Reading.".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![
                         ToolCall {
                             id: "call-1".to_string(),
@@ -1858,6 +1907,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "Done.".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
@@ -1909,6 +1959,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "Mixed.".to_string(),
+                    reasoning_content: None,
                     tool_calls: vec![
                         ToolCall {
                             id: "call-1".to_string(),
@@ -1925,6 +1976,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "Done.".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),

@@ -836,6 +836,7 @@ mod tests {
         ) -> Result<MessagesResponse, LlmError> {
             Ok(MessagesResponse {
                 content: "summary".to_string(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })

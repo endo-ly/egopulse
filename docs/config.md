@@ -22,6 +22,7 @@
 
 - **単一ファイル管理**: すべての設定を `~/.egopulse/egopulse.config.yaml` に集約する。環境変数による部分的オーバーライドは可能だが、ファイルが真実の情報源（Single Source of Truth）。
 - **OpenAI 互換前提**: すべてのプロバイダーは OpenAI 互換 API エンドポイントとして扱う。ベンダー固有 SDK は使わず、`base_url` の切り替えで対応する。
+- **DeepSeek thinking 履歴**: DeepSeek 系プロバイダー（`provider` または `model` に `deepseek` を含む、または `base_url` のホストが `deepseek.com` 配下の場合）は、assistant 応答の `reasoning_content` をセッション内に保持し、次回 Chat Completions 履歴へ戻す。他プロバイダーにはこの追加フィールドを送信しない。
 - **階層的オーバーライド**: グローバル設定 → チャネル設定の順で優先度が高くなり、チャネルごとにプロバイダーやモデルを個別指定できる。
 - **エージェントファースト**: API キーなどの秘匿値は、YAML では SecretRef として保持し、実値は `~/.egopulse/.env` に保存する。外部 API レスポンスでは `has_api_key` の真偽値のみ返却し、値そのものはマスクする。
 

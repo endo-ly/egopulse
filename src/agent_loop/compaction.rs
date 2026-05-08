@@ -679,6 +679,8 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
     left.role == right.role
         && left.tool_calls.is_empty()
         && right.tool_calls.is_empty()
+        && left.reasoning_content.is_none()
+        && right.reasoning_content.is_none()
         && left.tool_call_id.is_none()
         && right.tool_call_id.is_none()
         && matches!(left.content, crate::llm::MessageContent::Text(_))
@@ -861,6 +863,7 @@ mod tests {
             Message {
                 role: "assistant".to_string(),
                 content: crate::llm::MessageContent::text(""),
+                reasoning_content: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call_a".to_string(),
@@ -898,6 +901,7 @@ mod tests {
         Message {
             role: "assistant".to_string(),
             content: crate::llm::MessageContent::text(""),
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: id.to_string(),
                 name: "read".to_string(),
@@ -911,6 +915,7 @@ mod tests {
         Message {
             role: "tool".to_string(),
             content: crate::llm::MessageContent::text("result"),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(id.to_string()),
         }
@@ -924,11 +929,13 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "summary text".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
                 Ok(MessagesResponse {
                     content: "final answer".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
@@ -1028,6 +1035,7 @@ mod tests {
                 Err(LlmError::InvalidResponse("summary failed".to_string())),
                 Ok(MessagesResponse {
                     content: "final answer".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
@@ -1113,6 +1121,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })],
@@ -1149,6 +1158,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })],
@@ -1186,6 +1196,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
                 content: "summary text".to_string(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 usage: None,
             })],
@@ -1229,6 +1240,7 @@ mod tests {
             vec![
                 Ok(MessagesResponse {
                     content: "summary text".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 100,
@@ -1237,6 +1249,7 @@ mod tests {
                 }),
                 Ok(MessagesResponse {
                     content: "final answer".to_string(),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
                 }),
