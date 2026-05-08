@@ -684,4 +684,209 @@ channels:
         let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
         assert!(dotenv.contains("MY_DISCORD_BOT_TOKEN=bot-secret-123"));
     }
+
+    #[test]
+    #[serial]
+    fn persist_writes_agents_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "MY_DISCORD_BOT_TOKEN=tok\n").expect("write dotenv");
+
+        let mut config = sample_config();
+        let discord_channel = config
+            .channels
+            .get_mut(&ChannelName::new("discord"))
+            .expect("discord channel");
+        discord_channel.discord_bots = Some({
+            let mut bots = HashMap::new();
+            bots.insert(
+                BotId::new("main"),
+                DiscordBotConfig {
+                    token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
+                    file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
+                    default_agent: crate::config::AgentId::new("default"),
+                    channels: Some(
+                        [(
+                            111u64,
+                            crate::config::DiscordChannelConfig {
+                                require_mention: false,
+                                agents: vec![crate::config::AgentId::new("default")],
+                                multi_agent: false,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                },
+            );
+            bots
+        });
+
+        save_config_with_secrets(&config, &path).expect("save");
+        let yaml = fs::read_to_string(&path).expect("yaml");
+
+        assert!(yaml.contains("- default"), "agents field should be serialized: {yaml}");
+    }
+
+    #[test]
+    #[serial]
+    fn persist_writes_multi_agent_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "MY_DISCORD_BOT_TOKEN=tok\n").expect("write dotenv");
+
+        let mut config = sample_config();
+        config.agents.insert(
+            crate::config::AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                ..Default::default()
+            },
+        );
+        let discord_channel = config
+            .channels
+            .get_mut(&ChannelName::new("discord"))
+            .expect("discord channel");
+        discord_channel.discord_bots = Some({
+            let mut bots = HashMap::new();
+            bots.insert(
+                BotId::new("main"),
+                DiscordBotConfig {
+                    token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
+                    file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
+                    default_agent: crate::config::AgentId::new("default"),
+                    channels: Some(
+                        [(
+                            111u64,
+                            crate::config::DiscordChannelConfig {
+                                require_mention: false,
+                                agents: vec![
+                                    crate::config::AgentId::new("default"),
+                                    crate::config::AgentId::new("reviewer"),
+                                ],
+                                multi_agent: true,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                },
+            );
+            bots
+        });
+
+        save_config_with_secrets(&config, &path).expect("save");
+        let yaml = fs::read_to_string(&path).expect("yaml");
+
+        assert!(yaml.contains("multi_agent: true"), "multi_agent field should be serialized: {yaml}");
+    }
+
+    #[test]
+    #[serial]
+    fn persist_writes_discord_bot_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "MY_DISCORD_BOT_TOKEN=tok\n").expect("write dotenv");
+
+        let mut config = sample_config();
+        config.agents.insert(
+            crate::config::AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                discord_bot: Some(BotId::new("main")),
+                ..Default::default()
+            },
+        );
+        let discord_channel = config
+            .channels
+            .get_mut(&ChannelName::new("discord"))
+            .expect("discord channel");
+        discord_channel.discord_bots = Some({
+            let mut bots = HashMap::new();
+            bots.insert(
+                BotId::new("main"),
+                DiscordBotConfig {
+                    token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
+                    file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
+                    default_agent: crate::config::AgentId::new("default"),
+                    channels: None,
+                },
+            );
+            bots
+        });
+
+        save_config_with_secrets(&config, &path).expect("save");
+        let yaml = fs::read_to_string(&path).expect("yaml");
+
+        assert!(yaml.contains("discord_bot: main"), "discord_bot field should be serialized: {yaml}");
+    }
+
+    #[test]
+    #[serial]
+    fn persist_round_trip_preserves_multi_agent_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "MY_DISCORD_BOT_TOKEN=tok\n").expect("write dotenv");
+
+        let mut config = sample_config();
+        config.agents.insert(
+            crate::config::AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                discord_bot: Some(BotId::new("main")),
+                ..Default::default()
+            },
+        );
+        let discord_channel = config
+            .channels
+            .get_mut(&ChannelName::new("discord"))
+            .expect("discord channel");
+        discord_channel.discord_bots = Some({
+            let mut bots = HashMap::new();
+            bots.insert(
+                BotId::new("main"),
+                DiscordBotConfig {
+                    token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
+                    file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
+                    default_agent: crate::config::AgentId::new("default"),
+                    channels: Some(
+                        [(
+                            111u64,
+                            crate::config::DiscordChannelConfig {
+                                require_mention: true,
+                                agents: vec![
+                                    crate::config::AgentId::new("default"),
+                                    crate::config::AgentId::new("reviewer"),
+                                ],
+                                multi_agent: true,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                },
+            );
+            bots
+        });
+
+        save_config_with_secrets(&config, &path).expect("save");
+        let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load");
+
+        let bots = loaded.discord_bots();
+        assert_eq!(bots.len(), 1);
+        let ch = bots[0].channels.get(&111).expect("channel 111");
+        assert_eq!(ch.agents, vec![
+            crate::config::AgentId::new("default"),
+            crate::config::AgentId::new("reviewer"),
+        ]);
+        assert!(ch.multi_agent);
+        assert!(ch.require_mention);
+
+        let agent = loaded.agents.get(&crate::config::AgentId::new("reviewer")).expect("reviewer agent");
+        assert_eq!(agent.discord_bot.as_ref(), Some(&BotId::new("main")));
+    }
 }
