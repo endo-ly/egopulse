@@ -8,31 +8,38 @@
 2. [保存モデル](#2-保存モデル)
 3. [Turn 開始時の復元](#3-turn-開始時の復元)
 4. [Turn 中の保存](#4-turn-中の保存)
-5. [Compaction](#5-compaction)
+5. [Safety Compaction](#5-safety-compaction)
 6. [Fallback](#6-fallback)
 7. [Archive](#7-archive)
 8. [Conflict Retry](#8-conflict-retry)
-9. [Config](#9-config)
+9. [Sleep Batch（長期記憶処理）](#9-sleep-batch長期記憶処理)
+10. [Sleep Scheduler（自動定期実行）](#10-sleep-scheduler自動定期実行)
 
 ---
 
 ## 1. Session Identity
 
-session は `(channel, surface_thread)` から安定的に決まる。
+session は `(channel, surface_thread)` から安定的に決まる。この surface identity から `chat_id` を解決し、以後の履歴保存・復元は `chat_id` 単位で扱う。
 
-- CLI: `cli:<session_name>`
-- Web: `web:<session_key>`
-- その他の channel も同じ考え方で surface ごとの thread identity を使う
+### 1.1 チャネルごとの ID 形式
 
-この surface identity から `chat_id` を解決し、以後の履歴保存・復元は `chat_id` 単位で扱う。
+| チャネル | session_key 形式 | チャット粒度 | chat_id の例 |
+|---|---|---|---|
+| CLI | `cli:<session_name>` | セッション毎 | `cli:mybot` |
+| Web | `web:<session_key>` | セッション毎 | UUID ベース |
+| Discord | `discord:<channel_id>:bot:<bot_id>:agent:<agent_id>` | テキストチャンネル毎 | `1234567890` |
+| Telegram | `telegram:<chat_id>` | DM: ユーザー毎 / グループ: グループ毎 | `987654321` / `-1001234567890` |
+| TUI | `tui:<thread>` | セッション毎 | `tui:default` |
 
-### 1.1 エージェント対応セッションアイデンティティ
+### 1.2 エージェント対応セッションアイデンティティ
 
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
 - `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
-- **Discord マルチボット**: `discord_surface_thread(channel_id, bot_id, agent_id)` ヘルパーが `{channel_id}:bot:{bot_id}:agent:{agent_id}` 形式の `surface_thread` を生成する。保存される session key / `external_chat_id` は `discord:{channel_id}:bot:{bot_id}:agent:{agent_id}` になる
+- **Discord マルチボット**: `discord_surface_thread(channel_id, bot_id, agent_id)` ヘルパーが `{channel_id}:bot:{bot_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
 - **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
+
+---
 
 ## 2. 保存モデル
 
@@ -41,46 +48,26 @@ session は `(channel, surface_thread)` から安定的に決まる。
 ### `chats`
 
 - 役割: chat の論理 ID と surface との対応付け
-- 主な列:
-  - `chat_id`
-  - `channel`
-  - `external_chat_id`
-  - `chat_title`
-  - `chat_type`
-  - `last_message_time`
+- 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`
 
 ### `messages`
 
 - 役割: 表示用・一覧用の message レコード
-- 主な列:
-  - `id`
-  - `chat_id`
-  - `sender_name`
-  - `content`
-  - `is_from_bot`
-  - `timestamp`
+- 主な列: `id`, `chat_id`, `sender_name`, `content`, `is_from_bot`, `timestamp`
 
 ### `sessions`
 
 - 役割: 次ターン再開用の session snapshot
-- 主な列:
-  - `chat_id`
-  - `messages_json`
-  - `updated_at`
+- 主な列: `chat_id`, `messages_json`, `updated_at`
 
 `messages_json` には LLM 入力に近い `Message` 配列が入る。tool call、tool result、multimodal image ref もここに含まれる。
 
 ### `tool_calls`
 
 - 役割: assistant が要求した tool call と output の追跡
-- 主な列:
-  - `id`
-  - `chat_id`
-  - `message_id`
-  - `tool_name`
-  - `tool_input`
-  - `tool_output`
-  - `timestamp`
+- 主な列: `id`, `chat_id`, `message_id`, `tool_name`, `tool_input`, `tool_output`, `timestamp`
+
+---
 
 ## 3. Turn 開始時の復元
 
@@ -93,12 +80,14 @@ turn 開始時は次の順で session を復元する。
 5. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う
 6. snapshot が無い（`messages_json = None`）、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
 
-原則:
+### 原則
 
 - 真の次ターン入力は `sessions.messages_json`
 - `messages` は fallback 用
 - `messages_json = "[]"` は Sleep Batch による長期記憶昇格後のクリア状態であり、フォールバックの対象外
 - LLM API に再送する履歴では、assistant の tool call と tool output の対応関係を必ず保つ
+
+---
 
 ## 4. Turn 中の保存
 
@@ -111,6 +100,8 @@ turn 中の保存は phase ごとに進む。
 5. 各 phase の結果を通常の persistence に流す
 
 compaction は保存の別系統ではなく、「保存前に session を整形する段」として扱う。
+
+---
 
 ## 5. Safety Compaction
 
@@ -134,8 +125,10 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 **分割**: `tool_safe_split_at` で message list を old / recent の 2 領域に分ける。境界は tool call/result block を不可分として保護。
 
-- **old**: 古いメッセージ。summary 対象
-- **recent**: `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護
+| 領域 | 説明 |
+|---|---|
+| **old** | 古いメッセージ。summary 対象 |
+| **recent** | `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護 |
 
 **要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も target を超える場合は、recent を保護したまま summary 本文をさらに縮める。
 
@@ -149,13 +142,19 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 **Role 補正**: 同じ role の plain-text message で `tool_calls` 空かつ `tool_call_id` が `None` の場合のみ merge。末尾が assistant なら除去。
 
+---
+
 ## 6. Fallback
 
 要約は best effort。失敗時は session を壊さないことを優先する。
 
-- **Summarizer Error**: 要約失敗 → 元の messages をすべてそのまま保持する
-- **Summarizer Timeout**: `compaction_timeout_secs` 超 → 元の messages をすべてそのまま保持する
-- **Empty Summary**: 要約結果が空 → 元の messages をすべてそのまま保持する
+| 障害パターン | 動作 |
+|---|---|
+| Summarizer Error | 元の messages をすべてそのまま保持 |
+| Summarizer Timeout | `compaction_timeout_secs` 超過 → 元の messages をすべてそのまま保持 |
+| Empty Summary | 要約結果が空 → 元の messages をすべてそのまま保持 |
+
+---
 
 ## 7. Archive
 
@@ -188,6 +187,12 @@ archive はローカル監査用の sensitive artifact であり、secret redact
 ---
 ```
 
+### Sleep Batch での Archive
+
+Sleep Batch も session クリア前に `archive_conversation_blocking`（compaction モジュールの共有関数）を呼び出し、同一形式でアーカイブする。
+
+---
+
 ## 8. Conflict Retry
 
 session snapshot 保存には楽観ロックを使う。
@@ -207,12 +212,126 @@ stale snapshot に単純 append だけを再試行すると、compaction 前の 
 
 ### 適用範囲
 
-- 最初の user-phase retry
-  - compaction-aware
-- 以降の assistant / tool phase retry
-  - compaction はすでに終わっている前提で通常 persist
+| フェーズ | 動作 |
+|---|---|
+| 最初の user-phase retry | compaction-aware |
+| 以降の assistant / tool phase retry | compaction はすでに終わっている前提で通常 persist |
 
-## 9. Config
+---
+
+## 9. Sleep Batch（長期記憶処理）
+
+`egopulse sleep --agent <AGENT>` で手動実行する、セッションの長期記憶昇格処理。
+
+### 概要
+
+Sleep Batch は **1 回の LLM 呼び出し** で Pruning・Consolidation・Compression を一括実行する。複数回の LLM 呼び出しや段階的パイプラインは使用しない。
+
+```text
+LLM への入力
+    ├ 現在の記憶ファイル（episodic / semantic / prospective）
+    └ ソースセッションのメッセージ履歴
+         │
+    ┌────▼────┐
+    │ 1-call  │  Pruning + Consolidation + Compression を1回で実行
+    │   LLM   │
+    └────┬────┘
+         │
+    JSON 出力（3キー固定）
+    ├ episodic:     更新後のエピソード記憶（Markdown）
+    ├ semantic:     更新後の意味記憶（Markdown）
+    └ prospective: 更新後の展望記憶（Markdown）
+```
+
+LLM は厳密に `episodic`・`semantic`・`prospective` の 3 キーのみを持つ JSON オブジェクトを返す必要がある。`summary_md`・`phases`・`summary` などの追加キーはパーサーで拒否される。
+
+### 実行フロー
+
+```text
+1. agent_id 解決（--agent 省略時は default_agent）
+       │
+2. collect_sleep_input()
+       │
+       ├─ Skip: 新規メッセージ ≤ 4 → ログ出力して終了（run レコードなし）
+       │
+       └─ Proceed: ソースセッション一覧を取得
+              │
+       3. try_create_sleep_run() で排他チェック + run 作成
+              │
+              ├─ 既に running → AlreadyRunning エラー
+              │
+              └─ 未実行 → running run を作成
+                     │
+              4. build_sleep_input() でメモリ + セッションデータを構築
+                     │
+              5. aggregate snapshot（before）を保存
+                     │
+              6. build_sleep_system_prompt() でシステムプロンプト構築
+                     │
+              7. LLM 呼び出し → JSON パース（失敗時 1回リトライ）
+                     │
+              8. write_memory_files() でメモリファイル書き込み
+                     │
+              9. 対象セッションのアーカイブ + messages_json クリア
+                     │
+             10. aggregate snapshot（after）を保存
+                     │
+             11. update_sleep_run_success() で run を完了
+```
+
+ステップ 9 では、処理対象セッションの `messages_json` を Markdown としてアーカイブ（[§7 Archive](#7-archive) と同じ形式）した後、`"[]"` に更新する。これにより次ターン開始時に LLM コンテキストが空（= 長期記憶のみ）でスタートする。`messages` レコードと `tool_calls` レコードは保持される。
+
+監査スキーマは1回 LLM 呼び出し前提に整理されており、`phases_json` / `summary_md` / `memory_snapshots.phase` は持たない。
+
+### 記憶ファイルの原子的書き込み
+
+記憶ファイルの書き込みは backup-and-rename 戦略で原子性を保証する:
+
+1. 一時ディレクトリ `memory.tmp-{uuid}` に全ファイルを書き出し
+2. 既存 `memory` ディレクトリを `memory.backup-{uuid}` にリネーム
+3. `memory.tmp-{uuid}` を `memory` にリネーム
+4. 成功時、`memory.backup-{uuid}` を削除
+5. ステップ 3 で失敗した場合、バックアップから復元
+
+前回失敗時の残存ディレクトリは次回実行時に `recover_memory_write()` が自動クリーンアップする。
+
+### Sleep Batch 固有の LLM 設定
+
+Sleep Batch のプロバイダーとモデルは、デフォルト設定から独立して設定可能。詳細は [config.md §2.6](./config.md#26-sleep-batch-設定sleep_batch) を参照。
+
+```text
+sleep_batch.provider → 指定時はそのプロバイダー、未指定時は default_provider
+sleep_batch.model    → 指定時はそのモデル、未指定時は default_model → provider.default_model
+```
+
+---
+
+## 10. Sleep Scheduler（自動定期実行）
+
+`sleep_batch.enabled: true` 時に、設定時刻に自動で sleep batch を実行する scheduler。
+
+### 動作概要
+
+1. `start_channels` 起動時、scheduler enabled なら scheduler task を spawn する
+2. scheduler は `next_scheduled_run()` で次回実行時刻を計算し、`tokio::time::sleep` で待機
+3. 時刻到達時に `run_scheduled_cycle()` を実行
+4. 各 agent について `active_turns.is_active()` を確認し、アクティブなら defer
+5. `run_agent_with_retry()` でリトライ設定に基づき再試行
+
+### Active Turn Tracking
+
+`ActiveTurnTracker` は agent ごとに現在の対話 turn 数を管理する。scheduler は active な agent の sleep batch を defer し、ユーザーとの対話が終了してから実行する。
+
+### Scheduler と channel の関係
+
+- scheduler 単独では runtime active condition を満たさない（channel が0個なら `NoActiveChannels` エラー）
+- Ctrl-C / channel failure 時に scheduler も既存 task shutdown 経路で停止する
+
+---
+
+## 設定リファレンス
+
+Session Lifecycle に関連する設定フィールドは [config.md §2.1](./config.md#21-グローバル設定) を参照。
 
 | 設定 | デフォルト | 役割 |
 |------|-----------:|------|

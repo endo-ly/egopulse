@@ -85,6 +85,8 @@ coderabbit --prompt-only -t committed --base main
 
 #### ドキュメント一覧
 
+ほぼすべての内容をドキュメントにまとめている。コードベースExploreする際はまず最初に読むとよい。
+
 | トピック | ファイル |
 |---|---|
 | アーキテクチャ概要 | [architecture.md](./docs/architecture.md) |
@@ -134,3 +136,6 @@ codex exec -m gpt-5.4 "このプランをレビューして。致命的な点だ
 ```bash
 codex exec resume --last -m gpt-5.4 "プランを更新したからレビューして。致命的な点だけ指摘して: {plan_path}"
 ```
+
+## 禁止事項
+- トークンの無駄なので、「Exploreタスクを委譲中に自分でもコードベースを探索すること」は禁止

@@ -112,10 +112,14 @@ nano "$HOME/.egopulse/egopulse.config.yaml"
 最小限の設定例:
 
 ```yaml
-model: "gpt-4o-mini"
-api_key: "sk-..."
-base_url: "https://api.openai.com/v1"
-log_level: "info"
+default_provider: openai
+default_model: gpt-4o-mini
+
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-...
+    default_model: gpt-4o-mini
 
 channels:
   web:

@@ -6,6 +6,14 @@
 
 1. [Config YAML 設計思想](#1-config-yaml-設計思想)
 2. [完全フィールドリファレンス](#2-完全フィールドリファレンス)
+   - [2.1 グローバル設定](#21-グローバル設定)
+   - [2.2 プロバイダー定義](#22-プロバイダー定義providersid)
+   - [2.3 Web チャネル](#23-web-チャネルchannelsweb)
+   - [2.4 Discord チャネル](#24-discord-チャネルchannelsdiscord)
+   - [2.5 Telegram チャネル](#25-telegram-チャネルchannelstelegram)
+   - [2.6 Sleep Batch 設定](#26-sleep-batch-設定sleep_batch)
+   - [2.7 完全 YAML 例](#27-完全-yaml-例)
+   - [2.8 環境変数オーバーライド](#28-環境変数オーバーライド)
 3. [モデル解決チェーン](#3-モデル解決チェーン)
 4. [SecretRef（シークレット参照）](#4-secretrefシークレット参照)
 5. [プロバイダープリセット](#5-プロバイダープリセット)
@@ -42,6 +50,7 @@
 |---|---|---|---|---|
 | `default_provider` | `string` | **必須** | なし | `providers` マップ内のキーを参照。起動時に使用するプロバイダーを決定 |
 | `default_model` | `string \| null` | 任意 | `null` | プロバイダーの `default_model` をグローバルに上書き。`null` の場合プロバイダー定義に従う |
+| `default_agent` | `string` | 任意 | `"default"` | 使用するエージェントの ID。`agents` マップ内のキーを参照 |
 | `log_level` | `"info" \| "debug" \| "warn" \| "error"` | 任意 | `"info"` | ログ出力レベル |
 | `compaction_timeout_secs` | `u64` | 任意 | `180` | 履歴圧縮（compaction）時の LLM 呼び出しタイムアウト秒数 |
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
@@ -50,51 +59,7 @@
 | `compaction_target_ratio` | `f64` | 任意 | `0.40` | compaction 後の目標 token 量を usable context に対する割合で指定。threshold 未満 `(0, threshold)` |
 | `compact_keep_recent` | `usize` | 任意 | `20` | compaction 時に Tail としてそのまま保持する直近メッセージ数の下限 |
 
-### 2.2 Sleep Batch 設定（`sleep_batch`）
-
-Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバイダーとモデルを、デフォルト設定から独立して指定できる。
-また、自動スケジューラにより指定時刻に定期実行できる。
-
-| フィールド | 型 | 必須 | デフォルト | 説明 |
-|---|---|---|---|---|
-| `sleep_batch.enabled` | `bool` | 任意 | `false` | Sleep Batch 機能の有効/無効 |
-| `sleep_batch.provider` | `string \| null` | 任意 | `null` | Sleep Batch 用プロバイダー ID。`providers` マップ内のキーを参照。`null` の場合は `default_provider` にフォールバック |
-| `sleep_batch.model` | `string \| null` | 任意 | `null` | Sleep Batch 用モデル名。`null` の場合は `default_model`、さらにプロバイダーの `default_model` にフォールバック |
-| `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
-| `sleep_batch.timezone` | `string \| null` | 任意 | `null` | IANA タイムゾーン（例: `Asia/Tokyo`、`UTC`）。`enabled: true` 時は必須 |
-| `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
-| `sleep_batch.retry_max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
-| `sleep_batch.retry_interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
-
-#### モデル解決チェーン
-
-```text
-sleep_batch.provider（指定時）
-    ↓ null の場合
-default_provider
-
-sleep_batch.model（指定時）
-    ↓ null の場合
-default_model
-    ↓ null の場合
-provider.default_model
-```
-
-#### 記述例
-
-```yaml
-sleep_batch:
-  enabled: true
-  provider: openrouter
-  model: openai/gpt-4o-mini
-  schedule: "04:00"
-  timezone: Asia/Tokyo
-  agents: [default, sub-agent]
-  retry_max_attempts: 3
-  retry_interval_minutes: 5
-```
-
-### 2.3 プロバイダー定義（`providers.<id>`）
+### 2.2 プロバイダー定義（`providers.<id>`）
 
 `providers` はキーがプロバイダー ID のマップ。複数定義可能。
 
@@ -112,7 +77,7 @@ sleep_batch:
 |---|---|---|---|---|
 | `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
 
-### 2.4 Web チャネル（`channels.web`）
+### 2.3 Web チャネル（`channels.web`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -124,7 +89,7 @@ sleep_batch:
 | `provider` | `string \| null` | 任意 | `null` | このチャネル専用のプロバイダーオーバーライド |
 | `model` | `string \| null` | 任意 | `null` | このチャネル専用のモデルオーバーライド |
 
-### 2.5 Discord チャネル（`channels.discord`）
+### 2.4 Discord チャネル（`channels.discord`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -148,7 +113,7 @@ sleep_batch:
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agent` | `string \| null` | `null` | チャンネル固有のエージェント。`null` なら `default_agent` |
 
-### 2.6 Telegram チャネル（`channels.telegram`）
+### 2.5 Telegram チャネル（`channels.telegram`）
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -165,32 +130,49 @@ sleep_batch:
 |---|---|---|---|
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 
+### 2.6 Sleep Batch 設定（`sleep_batch`）
+
+Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバイダーとモデルを、デフォルト設定から独立して指定できる。
+また、自動スケジューラにより指定時刻に定期実行できる。
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `sleep_batch.enabled` | `bool` | 任意 | `false` | Sleep Batch 機能の有効/無効 |
+| `sleep_batch.provider` | `string \| null` | 任意 | `null` | Sleep Batch 用プロバイダー ID。`providers` マップ内のキーを参照。`null` の場合は `default_provider` にフォールバック |
+| `sleep_batch.model` | `string \| null` | 任意 | `null` | Sleep Batch 用モデル名。`null` の場合は `default_model`、さらにプロバイダーの `default_model` にフォールバック |
+| `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
+| `sleep_batch.timezone` | `string \| null` | 任意 | `null` | IANA タイムゾーン（例: `Asia/Tokyo`、`UTC`）。`enabled: true` 時は必須 |
+| `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
+| `sleep_batch.retry_max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
+| `sleep_batch.retry_interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
+
 ### 2.7 完全 YAML 例
 
 ```yaml
+# ========================================
 # グローバル LLM 設定
+# ========================================
 default_provider: openrouter
 default_model: null
-
-# エージェント定義
 default_agent: default
+
+# ========================================
+# エージェント定義
+# ========================================
 agents:
   default:
     label: Default Agent
-    model: null
     provider: null
+    model: null
   alice:
     label: Alice
-    model: anthropic/claude-sonnet-4
     provider: openrouter
+    model: anthropic/claude-sonnet-4
 
+# ========================================
 # システム設定
+# ========================================
 log_level: info
-
-# Sleep Batch 設定（任意）
-sleep_batch:
-  provider: openrouter
-  model: openai/gpt-4o-mini
 compaction_timeout_secs: 180
 max_history_messages: 50
 default_context_window_tokens: 32768
@@ -198,7 +180,9 @@ compaction_threshold_ratio: 0.80
 compaction_target_ratio: 0.40
 compact_keep_recent: 20
 
+# ========================================
 # プロバイダー定義
+# ========================================
 providers:
   openrouter:
     label: OpenRouter
@@ -221,7 +205,9 @@ providers:
       - llama3
       - codellama
 
+# ========================================
 # チャネル設定
+# ========================================
 channels:
   web:
     enabled: true
@@ -232,6 +218,7 @@ channels:
       - http://localhost:3000
     provider: null
     model: null
+
   discord:
     enabled: true
     bots:
@@ -247,6 +234,7 @@ channels:
             agent: reviewer
     provider: openrouter
     model: anthropic/claude-sonnet-4
+
   telegram:
     enabled: false
     bot_token: TELEGRAM_BOT_TOKEN_HERE
@@ -255,6 +243,21 @@ channels:
       "-1001234567890":
       "-1009876543210":
         require_mention: true
+
+# ========================================
+# Sleep Batch 設定（任意）
+# ========================================
+sleep_batch:
+  enabled: true
+  provider: openrouter
+  model: openai/gpt-4o-mini
+  schedule: "04:00"
+  timezone: Asia/Tokyo
+  agents:
+    - default
+    - sub-agent
+  retry_max_attempts: 3
+  retry_interval_minutes: 5
 ```
 
 ### 2.8 環境変数オーバーライド

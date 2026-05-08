@@ -208,20 +208,7 @@ Available skills:
 
 ## 3. コマンド共通ルール
 
-### 3.1 設定変更の即時性
-
-| 変更対象 | 即時反映 | 再起動要 |
-|---|:---:|:---:|
-| `default_provider` / `default_model` | ✓ | |
-| `channels.*.provider` / `channels.*.model` | ✓ | |
-| `providers` の内容 | ✓ | |
-| `compaction_*` / `max_*` | ✓ | |
-| `channels.*.enabled` | | ✓ |
-| `channels.*.bot_token` | | ✓ |
-| `channels.web.host` / `channels.web.port` | | ✓ |
-| `log_level` | | ✓ |
-
-### 3.2 秘匿情報の取り扱い
+### 3.1 秘匿情報の取り扱い
 
 スラッシュコマンドの応答では、API キーや Bot トークンの値を表示しない。
 
