@@ -88,14 +88,16 @@ turn 開始時は次の順で session を復元する。
 
 1. `sessions.messages_json` があればそれを使う
 2. JSON を `Message` 配列へ戻す
-3. image は `input_image_ref` から asset store 経由で hydrate する
-4. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う
-5. snapshot が無い、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
+3. **空配列 `[]` は「意図的クリア」として扱い、フォールバックせず空のまま返す**
+4. image は `input_image_ref` から asset store 経由で hydrate する
+5. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う
+6. snapshot が無い（`messages_json = None`）、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
 
 原則:
 
 - 真の次ターン入力は `sessions.messages_json`
 - `messages` は fallback 用
+- `messages_json = "[]"` は Sleep Batch による長期記憶昇格後のクリア状態であり、フォールバックの対象外
 - LLM API に再送する履歴では、assistant の tool call と tool output の対応関係を必ず保つ
 
 ## 4. Turn 中の保存

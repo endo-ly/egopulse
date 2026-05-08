@@ -358,13 +358,24 @@ sleep_batch.model    → 指定時はそのモデル、未指定時は default_m
               │
               └─ 未実行 → running run を作成
                      │
-              4. memory_loader.load() で記憶ファイルを読み込み
+              4. build_sleep_input() でメモリ + セッションデータを構築
                      │
-              5. 各ファイル（episodic/semantic/prospective）について
-                 aggregate snapshot（before == after）を保存
+              5. aggregate snapshot（before）を保存
                      │
-              6. update_sleep_run_success() で run を完了
+              6. build_sleep_system_prompt() でシステムプロンプト構築
+                     │
+              7. LLM 呼び出し → JSON パース（失敗時 1回リトライ）
+                     │
+              8. write_memory_files() でメモリファイル書き込み
+                     │
+              9. 対象セッションのアーカイブ + messages_json クリア
+                     │
+             10. aggregate snapshot（after）を保存
+                     │
+             11. update_sleep_run_success() で run を完了
 ```
+
+ステップ 9 では、処理対象セッションの `messages_json` を Markdown としてアーカイブ（Compaction と同じ形式）した後、`"[]"` に更新する。これにより次ターン開始時に LLM コンテキストが空（= 長期記憶のみ）でスタートする。`messages` レコードと `tool_calls` レコードは保持される。
 
 監査スキーマは1回 LLM 呼び出し前提に整理されており、`phases_json` / `summary_md` / `memory_snapshots.phase` は持たない。
 
