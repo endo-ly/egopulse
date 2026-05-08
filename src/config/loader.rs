@@ -69,7 +69,10 @@ struct FileDiscordBotConfig {
 struct FileDiscordChannelConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     require_mention: bool,
-    agent: Option<String>,
+    #[serde(default)]
+    agents: Option<Vec<String>>,
+    #[serde(default)]
+    multi_agent: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -420,15 +423,25 @@ fn normalize_discord_bots(
                                 bot_id: bot_id.to_string(),
                                 key: k,
                             })?;
-                    let agent = v
-                        .agent
-                        .and_then(|s| normalize_string(Some(s)))
-                        .map(|s| AgentId::new(&s));
+                    let agents: Vec<AgentId> = v
+                        .agents
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|s| normalize_string(Some(s)))
+                        .map(|s| AgentId::new(&s))
+                        .collect();
+                    let agents = if agents.is_empty() {
+                        vec![default_agent.clone()]
+                    } else {
+                        agents
+                    };
+                    let multi_agent = v.multi_agent.unwrap_or(false);
                     result.insert(
                         channel_id,
                         DiscordChannelConfig {
                             require_mention: v.require_mention,
-                            agent,
+                            agents,
+                            multi_agent,
                         },
                     );
                 }
@@ -752,7 +765,7 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         }
         if let Some(channels) = &bot.channels {
             for (channel_id, channel_config) in channels {
-                if let Some(agent_id) = &channel_config.agent {
+                for agent_id in &channel_config.agents {
                     if !config.agents.contains_key(agent_id) {
                         return Err(ConfigError::DiscordBotChannelAgentNotFound {
                             bot_id: bot_id.to_string(),

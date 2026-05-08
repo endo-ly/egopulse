@@ -296,7 +296,7 @@ impl Handler {
         }
         self.channels
             .get(&channel_id)
-            .and_then(|c| c.agent.as_ref())
+            .and_then(|c| c.agents.first())
             .map(|a| a.as_str())
             .unwrap_or(&self.default_agent)
     }
@@ -1079,7 +1079,8 @@ mod tests {
             123,
             DiscordChannelConfig {
                 require_mention: false,
-                agent: Some(crate::config::AgentId::new("reviewer")),
+                agents: vec![crate::config::AgentId::new("reviewer")],
+                multi_agent: false,
             },
         );
         let handler = test_handler(channels);
@@ -1096,7 +1097,8 @@ mod tests {
             123,
             DiscordChannelConfig {
                 require_mention: false,
-                agent: Some(crate::config::AgentId::new("reviewer")),
+                agents: vec![crate::config::AgentId::new("reviewer")],
+                multi_agent: false,
             },
         );
         let handler = test_handler(channels);
@@ -1113,7 +1115,8 @@ mod tests {
             123,
             DiscordChannelConfig {
                 require_mention: false,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler(channels);
@@ -1150,14 +1153,16 @@ mod tests {
             123,
             DiscordChannelConfig {
                 require_mention: true,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         channels.insert(
             456,
             DiscordChannelConfig {
                 require_mention: false,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler(channels);
@@ -1290,7 +1295,8 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: false,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler_with_bot_id(channels, 9999);
@@ -1308,7 +1314,8 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: true,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler_with_bot_id(channels, 9999);
@@ -1326,7 +1333,8 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: true,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler_with_bot_id(channels, 9999);
@@ -1344,7 +1352,8 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: true,
-                agent: None,
+                agents: vec![],
+                multi_agent: false,
             },
         );
         let handler = test_handler_with_bot_id(channels, 9999);

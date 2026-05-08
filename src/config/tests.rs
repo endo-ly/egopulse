@@ -824,7 +824,7 @@ fn loads_discord_bots_with_default_agent() {
         channels:
           "111222333": {}
           "444555666":
-            agent: reviewer"#,
+            agents: [reviewer]"#,
         ),
     );
 
@@ -845,8 +845,8 @@ fn loads_discord_bots_with_default_agent() {
     assert!(channels.contains_key(&111222333u64));
     assert!(channels.contains_key(&444555666u64));
     assert_eq!(
-        channels.get(&444555666u64).and_then(|c| c.agent.as_ref()),
-        Some(&super::AgentId::new("reviewer"))
+        channels.get(&444555666u64).map(|c| &c.agents),
+        Some(&vec![super::AgentId::new("reviewer")])
     );
 }
 
@@ -897,7 +897,7 @@ fn discord_bots_validate_channel_agents_exist() {
         default_agent: assistant
         channels:
           "999":
-            agent: ghost_agent"#,
+            agents: [ghost_agent]"#,
         ),
     );
 
@@ -1165,7 +1165,7 @@ fn discord_bot_channel_agents_are_preserved() {
         default_agent: assistant
         channels:
           "42":
-            agent: reviewer"#,
+            agents: [reviewer]"#,
         ),
     );
 
@@ -1175,8 +1175,8 @@ fn discord_bot_channel_agents_are_preserved() {
     assert_eq!(bots.len(), 1);
     let channels = &bots[0].channels;
     assert_eq!(
-        channels.get(&42).and_then(|c| c.agent.as_ref()),
-        Some(&super::AgentId::new("reviewer"))
+        channels.get(&42).map(|c| &c.agents),
+        Some(&vec![super::AgentId::new("reviewer")])
     );
 }
 
@@ -1287,7 +1287,8 @@ fn discord_channels_parses_null_value() {
     let channels = bot.channels.as_ref().expect("channels");
     let ch = channels.get(&123u64).expect("channel 123");
     assert!(!ch.require_mention);
-    assert!(ch.agent.is_none());
+    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
+    assert!(!ch.multi_agent);
 }
 
 #[test]
@@ -1345,7 +1346,7 @@ fn discord_channels_parses_agent_override() {
         default_agent: assistant
         channels:
           "123":
-            agent: reviewer"#,
+            agents: [reviewer]"#,
         ),
     );
 
@@ -1363,7 +1364,7 @@ fn discord_channels_parses_agent_override() {
         .expect("channels")
         .get(&123u64)
         .expect("channel");
-    assert_eq!(ch.agent.as_ref(), Some(&super::AgentId::new("reviewer")));
+    assert_eq!(ch.agents, vec![super::AgentId::new("reviewer")]);
 }
 
 #[test]

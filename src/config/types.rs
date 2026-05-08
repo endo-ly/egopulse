@@ -73,15 +73,11 @@ define_lowercase_id! {
     pub(crate) struct BotId
 }
 
-/// Per-channel Discord configuration stored inside `DiscordBotConfig.channels`.
-///
-/// When `agent` is `None`, the bot's `default_agent` is used.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DiscordChannelConfig {
-    /// Whether this channel requires an explicit @mention to trigger the bot.
     pub require_mention: bool,
-    /// Agent override for this channel. `None` = use `default_agent`.
-    pub agent: Option<AgentId>,
+    pub agents: Vec<AgentId>,
+    pub multi_agent: bool,
 }
 
 /// Per-chat Telegram configuration stored inside `ChannelConfig.chats`.

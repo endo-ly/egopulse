@@ -30,8 +30,10 @@ struct SerializableDiscordBot {
 struct SerializableDiscordChannel {
     #[serde(skip_serializing_if = "is_default")]
     require_mention: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    multi_agent: bool,
 }
 
 fn is_default(b: &bool) -> bool {
@@ -228,10 +230,12 @@ impl From<&Config> for SerializableConfig {
                                                             SerializableDiscordChannel {
                                                                 require_mention: ch_config
                                                                     .require_mention,
-                                                                agent: ch_config
-                                                                    .agent
-                                                                    .as_ref()
-                                                                    .map(|a| a.to_string()),
+                                                                agents: ch_config
+                                                                    .agents
+                                                                    .iter()
+                                                                    .map(|a| a.to_string())
+                                                                    .collect(),
+                                                                multi_agent: ch_config.multi_agent,
                                                             },
                                                         )
                                                     })
