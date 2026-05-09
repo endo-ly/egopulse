@@ -262,6 +262,7 @@ impl ToolRegistry {
 }
 
 pub(crate) use activate_skill::ActivateSkillTool;
+pub(crate) use agent_send::AgentSendTool;
 
 fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
     json!({

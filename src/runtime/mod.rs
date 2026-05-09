@@ -202,6 +202,18 @@ pub async fn build_app_state_with_path(
         Arc::clone(&db),
     )));
 
+    let (turn_sender, turn_receiver) =
+        tokio::sync::mpsc::channel::<crate::agent_loop::PendingAgentTurn>(16);
+
+    #[cfg(feature = "channel-discord")]
+    if !config.discord_bots().is_empty() {
+        tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
+            config.agents.clone(),
+            Arc::clone(&db),
+            Arc::clone(&channels),
+        )));
+    }
+
     let tools = Arc::new(tools);
 
     let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
@@ -213,7 +225,7 @@ pub async fn build_app_state_with_path(
         PathBuf::from(&config.state_root).join("agents"),
     ));
 
-    Ok(AppState {
+    let state = AppState {
         db,
         config,
         config_path,
@@ -227,8 +239,12 @@ pub async fn build_app_state_with_path(
         memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
         active_turns: Arc::new(ActiveTurnTracker::new()),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
-    })
+        turn_sender,
+    };
+
+    spawn_agent_turn_worker(state.clone(), turn_receiver);
+
+    Ok(state)
 }
 
 /// Builds the minimal application state needed for manual sleep batch execution.
@@ -268,6 +284,47 @@ pub fn build_sleep_app_state_with_path(
         active_turns: Arc::new(ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
     })
+}
+
+fn spawn_agent_turn_worker(
+    state: AppState,
+    mut receiver: tokio::sync::mpsc::Receiver<crate::agent_loop::PendingAgentTurn>,
+) {
+    tokio::spawn(async move {
+        while let Some(turn) = receiver.recv().await {
+            if turn.chain_depth >= crate::agent_loop::MAX_AGENT_CHAIN_DEPTH {
+                tracing::warn!(
+                    agent_id = %turn.context.agent_id,
+                    chain_depth = turn.chain_depth,
+                    "agent_send chain depth exceeded limit; dropping turn"
+                );
+                continue;
+            }
+
+            match crate::agent_loop::process_turn(&state, &turn.context, &turn.input).await {
+                Ok(response) => {
+                    if let Some(adapter) = state.channels.get(&turn.context.channel) {
+                        if let Err(error) =
+                            adapter.send_text(&turn.external_chat_id, &response).await
+                        {
+                            tracing::warn!(
+                                agent_id = %turn.context.agent_id,
+                                error = %error,
+                                "background turn: failed to send response to channel"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = %turn.context.agent_id,
+                        error = %error,
+                        "background turn: process_turn failed"
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn spawn_mcp_reconnect_loop(
