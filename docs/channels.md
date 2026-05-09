@@ -152,6 +152,18 @@ Agent Session の LLM 呼び出し時に、Channel Log の直近 30 件を一時
 | ボット応答 | 保存 | 保存 |
 | Single-Agent チャネル | — | 保存（従来通り） |
 
+#### `agent_send` メッセージ表示
+
+`agent_send` ツールによるエージェント間メッセージは、チャネルに次の形式で表示される:
+
+```
+[Lyre → Vega] この仕様、セッション設計としてどう見ますか？
+```
+
+- 送信元エージェントのラベル (`config.agents.<id>.label`) を使用、未設定時はエージェント ID をフォールバック
+- Channel Log に `MessageKind::AgentSend` で保存される
+- 宛先エージェントの応答はバックグラウンドで非同期実行され、完了後に同じチャネルに送信される
+
 ### Bot 作成手順
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーション作成
