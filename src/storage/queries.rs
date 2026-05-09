@@ -455,18 +455,9 @@ impl Database {
     /// `external_chat_id = "discord:{channel_id}:multi-room-log"`,
     /// `chat_type = "channel_log"`, `agent_id = ""`.
     /// It has **no session row** — only messages.
-    pub(crate) fn resolve_channel_log_chat_id(
-        &self,
-        channel_id: u64,
-    ) -> Result<i64, StorageError> {
+    pub(crate) fn resolve_channel_log_chat_id(&self, channel_id: u64) -> Result<i64, StorageError> {
         let external_id = format!("discord:{channel_id}:multi-room-log");
-        self.resolve_or_create_chat_id(
-            "discord",
-            &external_id,
-            None,
-            "channel_log",
-            "",
-        )
+        self.resolve_or_create_chat_id("discord", &external_id, None, "channel_log", "")
     }
 
     /// Returns the most recent messages from a Channel Log, ordered oldest-first.

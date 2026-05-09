@@ -310,12 +310,7 @@ impl Handler {
     ///
     /// Returns `Some(agent_id)` when an agent should respond, or `None` when
     /// the message should be silently observed (multi-agent room, no mention).
-    fn resolve_agent(
-        &self,
-        channel_id: u64,
-        is_dm: bool,
-        mentions_bot: bool,
-    ) -> Option<String> {
+    fn resolve_agent(&self, channel_id: u64, is_dm: bool, mentions_bot: bool) -> Option<String> {
         if is_dm {
             return Some(self.default_agent.clone());
         }
@@ -505,13 +500,10 @@ impl EventHandler for Handler {
 
         // Multi-Agent Room: save human message to Channel Log
         let channel_log_chat_id = if is_multi_agent && !is_dm {
-            match crate::storage::call_blocking(
-                std::sync::Arc::clone(&self.app_state.db),
-                {
-                    let db = std::sync::Arc::clone(&self.app_state.db);
-                    move |_| db.resolve_channel_log_chat_id(channel_id)
-                },
-            )
+            match crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
+                let db = std::sync::Arc::clone(&self.app_state.db);
+                move |_| db.resolve_channel_log_chat_id(channel_id)
+            })
             .await
             {
                 Ok(chat_id) => {
@@ -1737,7 +1729,10 @@ mod tests {
 
     // --- resolve_agent tests ---
 
-    fn agent_cfg(label: &str, discord_bot: Option<&str>) -> (crate::config::AgentId, crate::config::AgentConfig) {
+    fn agent_cfg(
+        label: &str,
+        discord_bot: Option<&str>,
+    ) -> (crate::config::AgentId, crate::config::AgentConfig) {
         let id = crate::config::AgentId::new(label);
         let cfg = crate::config::AgentConfig {
             label: label.to_string(),
@@ -1755,7 +1750,10 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: false,
-                agents: vec![crate::config::AgentId::new("lyre"), crate::config::AgentId::new("vega")],
+                agents: vec![
+                    crate::config::AgentId::new("lyre"),
+                    crate::config::AgentId::new("vega"),
+                ],
                 multi_agent: true,
             },
         );
@@ -1781,7 +1779,10 @@ mod tests {
             100,
             DiscordChannelConfig {
                 require_mention: false,
-                agents: vec![crate::config::AgentId::new("lyre"), crate::config::AgentId::new("vega")],
+                agents: vec![
+                    crate::config::AgentId::new("lyre"),
+                    crate::config::AgentId::new("vega"),
+                ],
                 multi_agent: true,
             },
         );
