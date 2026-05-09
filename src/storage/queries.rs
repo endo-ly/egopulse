@@ -468,6 +468,28 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, StorageError> {
         self.get_recent_messages(chat_id, limit)
     }
+
+    /// Stores a message without touching the session snapshot.
+    /// Used for Channel Log entries (agent_send, system events) that have no session.
+    pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                message.id,
+                message.chat_id,
+                message.sender_name,
+                message.content,
+                message.is_from_bot as i32,
+                message.timestamp,
+                message.message_kind.to_string(),
+                message.sender_agent_id.as_deref(),
+                message.recipient_agent_id.as_deref(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 //! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
 
 mod activate_skill;
+mod agent_send;
 mod command_guard;
 mod files;
 pub(crate) mod mcp;
