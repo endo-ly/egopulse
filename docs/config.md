@@ -108,7 +108,7 @@
 
 #### `channels.discord.channels.<channel_id>` のフィールド
 
-`channels.discord.channels` は Bot ごとではなく Discord チャネル全体で共有される。各エージェントの `discord_bot` が、どの Bot に紐づくかを決める。
+`channels.discord.channels` は Bot ごとではなく Discord チャネル全体で共有される。各エージェントの `discord_bot` が、どの Bot に紐づくかを決める。Single-Agent チャネルでは `agents[0]` に紐づく Bot だけが受信し、`agents[1..]` に紐づく Bot や別 Bot は同じチャンネルに参加していても応答しない。
 
 #### `DiscordChannelConfig` のフィールド
 
