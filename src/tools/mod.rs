@@ -45,12 +45,19 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ToolExecutionContext {
     pub chat_id: i64,
     pub channel: String,
     pub surface_thread: String,
     pub chat_type: String,
+    /// Agent ID of the currently executing agent.
+    pub agent_id: String,
+    /// Channel Log chat ID for multi-agent rooms (`None` for single-agent channels).
+    pub channel_log_chat_id: Option<i64>,
+    /// Sender half of the pending-agent-turn channel.
+    /// Tools like `agent_send` use this to enqueue turns for target agents.
+    pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
 }
 
 /// Uniform result type returned by all tool implementations.

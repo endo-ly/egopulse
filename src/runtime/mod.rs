@@ -83,6 +83,8 @@ pub struct AppState {
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
+    /// Sender half of the pending-agent-turn channel for `agent_send` turn queuing.
+    pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
 }
 
 impl Clone for AppState {
@@ -101,6 +103,7 @@ impl Clone for AppState {
             memory_loader: Arc::clone(&self.memory_loader),
             llm_cache: Mutex::new(HashMap::new()),
             active_turns: Arc::clone(&self.active_turns),
+            turn_sender: self.turn_sender.clone(),
         }
     }
 }
@@ -224,6 +227,7 @@ pub async fn build_app_state_with_path(
         memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
         active_turns: Arc::new(ActiveTurnTracker::new()),
+        turn_sender: tokio::sync::mpsc::channel(16).0,
     })
 }
 
@@ -262,6 +266,7 @@ pub fn build_sleep_app_state_with_path(
         memory_loader,
         llm_cache: Mutex::new(HashMap::new()),
         active_turns: Arc::new(ActiveTurnTracker::new()),
+        turn_sender: tokio::sync::mpsc::channel(16).0,
     })
 }
 
