@@ -169,7 +169,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum ./* > SHA256SUMS.txt
+          sha256sum *.tar.gz > SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
@@ -180,4 +180,4 @@ jobs:
             -t "${RELEASE_TAG}" \
             --generate-notes \
             --target "${{ github.sha }}" \
-            dist/*
+            dist/*.tar.gz dist/SHA256SUMS.txt

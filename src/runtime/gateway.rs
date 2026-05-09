@@ -670,10 +670,7 @@ async fn download_and_extract(
                 last_reported_percent = percent;
             }
         } else {
-            eprint!(
-                "\r  {} downloaded  ",
-                format_bytes(downloaded)
-            );
+            eprint!("\r  {} downloaded  ", format_bytes(downloaded));
             let _ = std::io::Write::flush(&mut std::io::stderr());
         }
     }
