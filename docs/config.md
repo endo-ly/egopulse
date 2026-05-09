@@ -104,7 +104,6 @@
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `token` | `string \| SecretRef` | 必須 | なし | Discord Bot トークン。SecretRef 使用可能。秘匿フィールド |
-| `default_agent` | `string` | 必須 | なし | この Bot のデフォルト応答エージェント |
 | `channels` | `map<u64, DiscordChannelConfig>` | 任意 | なし | チャンネルごとの設定。キーがチャンネル ID。キー存在 = 許可 |
 
 #### `DiscordChannelConfig` のフィールド
@@ -112,7 +111,7 @@
 | フィールド | 型 | デフォルト | 説明 |
 |---|---|---|---|
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
-| `agents` | `list<string>` | `[]`（正規化後は `[default_agent]`） | チャンネルで使用するエージェント ID のリスト。空の場合は Bot の `default_agent` が設定される |
+| `agents` | `list<string>` | `[]`（正規化後は `[default_agent]`） | チャンネルで使用するエージェント ID のリスト。空の場合はグローバル `default_agent` が設定される |
 | `multi_agent` | `bool` | `false` | `true` の場合複数エージェントで応答。`agents` に 2 つ以上指定が必要 |
 
 ### 2.5 Telegram チャネル（`channels.telegram`）
@@ -242,7 +241,6 @@ channels:
         token:
           source: env
           id: DISCORD_BOT_TOKEN
-        default_agent: alice
         channels:
           "1234567890123456789":
           "9876547890123456789":
@@ -493,7 +491,7 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `channels.web.port` | バインドポートの変更 |
 | `channels.discord.enabled` | Discord Bot の接続/切断 |
 | `channels.discord.bots.<bot_id>.token` | Bot 認証の再確立 |
-| `channels.discord.bots.<bot_id>.channels` | チャンネルアクセス制御・メンション要件の変更 |
+| `channels.discord.channels` | チャンネルアクセス制御・メンション要件の変更 |
 | `channels.telegram.enabled` | Telegram Bot の接続/切断 |
 | `channels.telegram.bot_token` | Bot 認証の再確立 |
 | `channels.telegram.chats` | チャットアクセス制御・メンション要件の変更 |

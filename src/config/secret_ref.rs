@@ -75,32 +75,32 @@ impl ResolvedValue {
         SecretString::new(self.value().to_string().into_boxed_str())
     }
 
-    pub(crate) fn to_yaml_value(&self) -> serde_yml::Value {
+    pub(crate) fn to_yaml_value(&self) -> yaml_serde::Value {
         match self {
-            Self::Literal(v) => serde_yml::Value::String(v.clone()),
+            Self::Literal(v) => yaml_serde::Value::String(v.clone()),
             Self::EnvRef { id, .. } => {
-                let mut mapping = serde_yml::Mapping::new();
+                let mut mapping = yaml_serde::Mapping::new();
                 mapping.insert(
-                    serde_yml::Value::String("source".into()),
-                    serde_yml::Value::String("env".into()),
+                    yaml_serde::Value::String("source".into()),
+                    yaml_serde::Value::String("env".into()),
                 );
                 mapping.insert(
-                    serde_yml::Value::String("id".into()),
-                    serde_yml::Value::String(id.clone()),
+                    yaml_serde::Value::String("id".into()),
+                    yaml_serde::Value::String(id.clone()),
                 );
-                serde_yml::Value::Mapping(mapping)
+                yaml_serde::Value::Mapping(mapping)
             }
             Self::ExecRef { command, .. } => {
-                let mut mapping = serde_yml::Mapping::new();
+                let mut mapping = yaml_serde::Mapping::new();
                 mapping.insert(
-                    serde_yml::Value::String("source".into()),
-                    serde_yml::Value::String("exec".into()),
+                    yaml_serde::Value::String("source".into()),
+                    yaml_serde::Value::String("exec".into()),
                 );
                 mapping.insert(
-                    serde_yml::Value::String("command".into()),
-                    serde_yml::Value::String(command.clone()),
+                    yaml_serde::Value::String("command".into()),
+                    yaml_serde::Value::String(command.clone()),
                 );
-                serde_yml::Value::Mapping(mapping)
+                yaml_serde::Value::Mapping(mapping)
             }
         }
     }
@@ -113,7 +113,7 @@ pub(crate) fn env_resolved_value(id: impl Into<String>, value: impl Into<String>
     }
 }
 
-pub(crate) fn env_yaml_value(id: impl Into<String>) -> serde_yml::Value {
+pub(crate) fn env_yaml_value(id: impl Into<String>) -> yaml_serde::Value {
     env_resolved_value(id, String::new()).to_yaml_value()
 }
 
@@ -537,12 +537,12 @@ mod tests {
 
         let mapping = yaml_val.as_mapping().expect("mapping");
         assert_eq!(
-            mapping.get(serde_yml::Value::String("source".into())),
-            Some(&serde_yml::Value::String("env".into()))
+            mapping.get(yaml_serde::Value::String("source".into())),
+            Some(&yaml_serde::Value::String("env".into()))
         );
         assert_eq!(
-            mapping.get(serde_yml::Value::String("id".into())),
-            Some(&serde_yml::Value::String("OPENAI_API_KEY".into()))
+            mapping.get(yaml_serde::Value::String("id".into())),
+            Some(&yaml_serde::Value::String("OPENAI_API_KEY".into()))
         );
     }
 
@@ -556,12 +556,12 @@ mod tests {
 
         let mapping = yaml_val.as_mapping().expect("mapping");
         assert_eq!(
-            mapping.get(serde_yml::Value::String("source".into())),
-            Some(&serde_yml::Value::String("exec".into()))
+            mapping.get(yaml_serde::Value::String("source".into())),
+            Some(&yaml_serde::Value::String("exec".into()))
         );
         assert_eq!(
-            mapping.get(serde_yml::Value::String("command".into())),
-            Some(&serde_yml::Value::String("pass show discord/token".into()))
+            mapping.get(yaml_serde::Value::String("command".into())),
+            Some(&yaml_serde::Value::String("pass show discord/token".into()))
         );
     }
 

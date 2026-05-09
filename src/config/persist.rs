@@ -20,8 +20,7 @@ struct SerializableDiscordBot {
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
     )]
-    token: Option<serde_yml::Value>,
-    default_agent: String,
+    token: Option<yaml_serde::Value>,
 }
 
 #[derive(Serialize)]
@@ -104,7 +103,7 @@ struct SerializableProvider {
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
     )]
-    api_key: Option<serde_yml::Value>,
+    api_key: Option<yaml_serde::Value>,
     default_model: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     models: HashMap<String, ModelConfig>,
@@ -126,14 +125,14 @@ struct SerializableChannel {
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
     )]
-    auth_token: Option<serde_yml::Value>,
+    auth_token: Option<yaml_serde::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_origins: Option<Vec<String>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
     )]
-    bot_token: Option<serde_yml::Value>,
+    bot_token: Option<yaml_serde::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bot_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,14 +152,14 @@ struct SerializableTelegramChat {
 }
 
 fn serialize_optional_yaml_value<S>(
-    value: &Option<serde_yml::Value>,
+    value: &Option<yaml_serde::Value>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
     match value {
-        Some(v) => serde_yml::Value::serialize(v, serializer),
+        Some(v) => yaml_serde::Value::serialize(v, serializer),
         None => serializer.serialize_none(),
     }
 }
@@ -222,7 +221,6 @@ impl From<&Config> for SerializableConfig {
                                         bot_id.to_string(),
                                         SerializableDiscordBot {
                                             token: bot.file_token.clone(),
-                                            default_agent: bot.default_agent.to_string(),
                                         },
                                     )
                                 })
@@ -332,7 +330,7 @@ pub(crate) fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseErro
         .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
     let _lock_file = acquire_config_lock(path)?;
 
-    let yaml = serde_yml::to_string(&SerializableConfig::from(config))
+    let yaml = yaml_serde::to_string(&SerializableConfig::from(config))
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     write_atomically(path, &yaml)
 }
@@ -650,7 +648,6 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
                 },
             );
             bots
@@ -672,11 +669,6 @@ channels:
         let bots = loaded.discord_bots();
         assert_eq!(bots.len(), 1);
         assert_eq!(*bots[0].bot_id, BotId::new("main"));
-        assert_eq!(
-            *bots[0].default_agent,
-            crate::config::AgentId::new("default")
-        );
-        // Shared channels are preserved
         let channels = loaded.discord_channels();
         assert_eq!(channels.len(), 2);
         assert!(channels.contains_key(&111));
@@ -706,7 +698,6 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
                 },
             );
             bots
@@ -760,7 +751,6 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
                 },
             );
             bots
@@ -818,7 +808,6 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
                 },
             );
             bots
@@ -861,7 +850,6 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
                 },
             );
             bots

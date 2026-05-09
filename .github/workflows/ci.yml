@@ -53,6 +53,8 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Check vulnerabilities
+        # rustls-webpki 0.102.x (serenity transitive dep) has unfixable advisories.
+        # serenity 0.12.x pins tokio-tungstenite 0.21 -> rustls 0.22 -> rustls-webpki 0.102.
         run: cargo audit --ignore RUSTSEC-2026-0049 --ignore RUSTSEC-2026-0098 --ignore RUSTSEC-2026-0099 --ignore RUSTSEC-2026-0104 --ignore RUSTSEC-2026-0009
 
       - name: Install cargo-deny

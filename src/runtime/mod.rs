@@ -350,17 +350,12 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     #[cfg(feature = "channel-discord")]
     {
         let shared_channels = state.config.discord_channels();
+        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .discord_bots()
             .into_iter()
-            .map(|b| {
-                (
-                    b.bot_id.clone(),
-                    b.token.to_string(),
-                    b.default_agent.clone(),
-                )
-            })
+            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
             .collect();
 
         if !bot_configs.is_empty() {

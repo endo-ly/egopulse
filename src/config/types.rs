@@ -90,20 +90,18 @@ pub(crate) struct TelegramChatConfig {
 /// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
 ///
 /// Each bot connects to Discord with its own token and routes messages to agents
-/// based on shared channel config or falls back to `default_agent`.
+/// based on shared channel config or falls back to the global `default_agent`.
 /// Channel-to-agent mappings live at the Discord level (`channels.discord.channels`).
 #[derive(Clone)]
 pub(crate) struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
-    pub file_token: Option<serde_yml::Value>,
-    pub default_agent: AgentId,
+    pub file_token: Option<yaml_serde::Value>,
 }
 
 impl std::fmt::Debug for DiscordBotConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscordBotConfig")
             .field("token", &debug_secret(self.token.as_ref()))
-            .field("default_agent", &self.default_agent)
             .finish()
     }
 }
@@ -116,10 +114,10 @@ pub(crate) struct ChannelConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub auth_token: Option<ResolvedValue>,
-    pub file_auth_token: Option<serde_yml::Value>,
+    pub file_auth_token: Option<yaml_serde::Value>,
     pub allowed_origins: Option<Vec<String>>,
     pub bot_token: Option<ResolvedValue>,
-    pub file_bot_token: Option<serde_yml::Value>,
+    pub file_bot_token: Option<yaml_serde::Value>,
     pub bot_username: Option<String>,
     pub soul_path: Option<String>,
     /// Per-chat Telegram configuration keyed by chat ID.

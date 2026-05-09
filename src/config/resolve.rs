@@ -341,7 +341,6 @@ impl Config {
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
-                    default_agent: &bot.default_agent,
                 })
             })
             .collect();
@@ -365,7 +364,6 @@ impl Config {
 pub(crate) struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
-    pub default_agent: &'a AgentId,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.

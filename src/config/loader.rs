@@ -62,7 +62,6 @@ struct FileChannelConfig {
 #[derive(Debug, Deserialize, Default)]
 struct FileDiscordBotConfig {
     token: Option<StringOrRef>,
-    default_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -188,12 +187,6 @@ pub(super) fn build_config(
     let compaction_target_ratio =
         file_compaction_target_ratio.unwrap_or(super::resolve::default_compaction_target_ratio());
 
-    let mut channels = normalize_channels(file_channels.unwrap_or_default(), &dotenv)?;
-    apply_web_channel_env_overrides(&mut channels);
-    apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
-
-    validate_channel_provider_references(&providers, &channels)?;
-
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
     validate_agent_provider_references(&providers, &agents)?;
 
@@ -206,6 +199,13 @@ pub(super) fn build_config(
             agent_id: default_agent.to_string(),
         });
     }
+
+    let mut channels =
+        normalize_channels(file_channels.unwrap_or_default(), &dotenv, &default_agent)?;
+    apply_web_channel_env_overrides(&mut channels);
+    apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
+
+    validate_channel_provider_references(&providers, &channels)?;
 
     let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers, &agents, &default_agent)?;
 
@@ -263,7 +263,7 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: PathBuf::from(path),
         source,
     })?;
-    serde_yml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+    yaml_serde::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
         path: PathBuf::from(path),
         detail: source.to_string(),
     })
@@ -272,6 +272,7 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
 fn normalize_channels(
     channels: HashMap<String, FileChannelConfig>,
     dotenv: &HashMap<String, String>,
+    default_agent: &AgentId,
 ) -> Result<HashMap<ChannelName, ChannelConfig>, ConfigError> {
     let mut normalized = HashMap::new();
     for (name, fc) in channels {
@@ -285,14 +286,14 @@ fn normalize_channels(
 
         let file_auth_token = resolved_auth.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }
         });
         let file_bot_token = resolved_bot.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }
@@ -340,7 +341,7 @@ fn normalize_channels(
 
         if was_discord {
             if let Some(file_bots) = fc.bots {
-                let bots = normalize_discord_bots(file_bots, dotenv)?;
+                let bots = normalize_discord_bots(file_bots, dotenv, default_agent)?;
                 let discord_channel = normalized.get_mut("discord").expect("just inserted");
                 discord_channel.discord_bots = Some(bots);
             }
@@ -387,6 +388,7 @@ fn validate_bot_id(id: &BotId) -> Result<(), ConfigError> {
 fn normalize_discord_bots(
     file_bots: HashMap<String, FileDiscordBotConfig>,
     dotenv: &HashMap<String, String>,
+    _default_agent: &AgentId,
 ) -> Result<HashMap<BotId, DiscordBotConfig>, ConfigError> {
     let mut bots = HashMap::new();
     for (name, fb) in file_bots {
@@ -403,26 +405,17 @@ fn normalize_discord_bots(
         let resolved_token = resolve_string_or_ref(fb.token, dotenv)?;
         let file_token = resolved_token.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }
         });
-
-        let default_agent = fb
-            .default_agent
-            .and_then(|s| normalize_string(Some(s)))
-            .map(|s| AgentId::new(&s))
-            .ok_or_else(|| ConfigError::MissingDiscordBotDefaultAgent {
-                bot_id: bot_id.to_string(),
-            })?;
 
         bots.insert(
             bot_id,
             DiscordBotConfig {
                 token: resolved_token,
                 file_token,
-                default_agent,
             },
         );
     }
@@ -760,13 +753,8 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         .and_then(|ch| ch.discord_bots.as_ref())
         .unwrap_or(&empty_bots);
 
-    for (bot_id, bot) in bots {
-        if !config.agents.contains_key(&bot.default_agent) {
-            return Err(ConfigError::DiscordBotDefaultAgentNotFound {
-                bot_id: bot_id.to_string(),
-                agent_id: bot.default_agent.to_string(),
-            });
-        }
+    for bot_id in bots.keys() {
+        validate_bot_id(bot_id)?;
     }
 
     let discord = config.channels.get("discord");

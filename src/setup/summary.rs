@@ -97,7 +97,7 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
 
 pub(crate) fn save_config(
     fields: &[Field],
-    original_yaml: &Option<serde_yml::Value>,
+    original_yaml: &Option<yaml_serde::Value>,
     config_path: &Path,
 ) -> Result<(Option<String>, Vec<String>), String> {
     validate_fields(fields)?;
@@ -202,7 +202,6 @@ pub(crate) fn save_config(
                     discord_bot_token,
                 )),
                 file_token: Some(yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
-                default_agent: crate::config::AgentId::new("default"),
             },
         );
         Some(bots)
@@ -323,7 +322,7 @@ pub(crate) fn save_config(
     let existing_non_default = original_yaml
         .as_ref()
         .and_then(|yaml| yaml.as_mapping())
-        .and_then(|m| m.get(serde_yml::Value::String("agents".into())))
+        .and_then(|m| m.get(yaml_serde::Value::String("agents".into())))
         .and_then(|a| a.as_mapping())
         .map(|m| {
             m.keys()
