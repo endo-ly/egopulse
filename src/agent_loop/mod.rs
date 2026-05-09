@@ -22,6 +22,9 @@ pub(crate) struct SurfaceContext {
     pub surface_thread: String,
     pub chat_type: String,
     pub agent_id: String,
+    /// For multi-agent rooms: the Channel Log chat ID used for Channel Context injection.
+    /// `None` for single-agent channels and DMs.
+    pub channel_log_chat_id: Option<i64>,
 }
 
 impl SurfaceContext {
@@ -39,6 +42,7 @@ impl SurfaceContext {
             surface_thread,
             chat_type,
             agent_id,
+            channel_log_chat_id: None,
         }
     }
 

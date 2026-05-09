@@ -862,12 +862,13 @@ mod tests {
 
     fn test_context() -> SurfaceContext {
         SurfaceContext {
-            channel: "cli".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: "test".to_string(),
-            chat_type: "cli".to_string(),
-            agent_id: "default".to_string(),
-        }
+                    channel: "cli".to_string(),
+                    surface_user: "local_user".to_string(),
+                    surface_thread: "test".to_string(),
+                    chat_type: "cli".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                }
     }
 
     // -- handle_slash_command tests -----------------------------------------------
@@ -1175,12 +1176,13 @@ mod tests {
         let chat_id = create_test_chat(&state, "test-status-surface").await;
 
         let context = SurfaceContext {
-            channel: "cli".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: "test".to_string(),
-            chat_type: "cli".to_string(),
-            agent_id: "default".to_string(),
-        };
+                    channel: "cli".to_string(),
+                    surface_user: "local_user".to_string(),
+                    surface_thread: "test".to_string(),
+                    chat_type: "cli".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
         let response = result.expect("response");
@@ -1211,12 +1213,13 @@ mod tests {
         .expect("save session");
 
         let context = SurfaceContext {
-            channel: "cli".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: "test".to_string(),
-            chat_type: "cli".to_string(),
-            agent_id: "default".to_string(),
-        };
+                    channel: "cli".to_string(),
+                    surface_user: "local_user".to_string(),
+                    surface_thread: "test".to_string(),
+                    chat_type: "cli".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
         let response = result.expect("response");
@@ -1287,12 +1290,13 @@ agents:
     label: Bob"#,
         );
         let context = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "thread".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "bob".to_string(),
-        };
+                    channel: "discord".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "thread".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "bob".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
         let response = result.expect("response");
@@ -1336,12 +1340,13 @@ agents:
     label: Bob"#,
         );
         let context = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "thread".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "bob".to_string(),
-        };
+                    channel: "discord".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "thread".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "bob".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
         let response = result.expect("response");

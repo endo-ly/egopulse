@@ -470,6 +470,13 @@ impl Database {
     }
 
     /// Returns the most recent messages from a Channel Log, ordered oldest-first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by Channel Context injection in agent_loop::turn"
+        )
+    )]
     pub(crate) fn get_channel_log_messages(
         &self,
         chat_id: i64,

@@ -62,12 +62,13 @@ pub async fn ask_in_session(
 ) -> Result<String, EgoPulseError> {
     let state = build_app_state(config).await?;
     let context = SurfaceContext {
-        channel: "cli".to_string(),
-        surface_user: "local_user".to_string(),
-        surface_thread: session.to_string(),
-        chat_type: "cli".to_string(),
-        agent_id: state.config.default_agent.to_string(),
-    };
+                channel: "cli".to_string(),
+                surface_user: "local_user".to_string(),
+                surface_thread: session.to_string(),
+                chat_type: "cli".to_string(),
+                agent_id: state.config.default_agent.to_string(),
+                channel_log_chat_id: None,
+            };
 
     tokio::select! {
         response = process_turn(&state, &context, prompt) => response,
@@ -1476,12 +1477,13 @@ mod tests {
 
     fn web_context(session: &str) -> SurfaceContext {
         SurfaceContext {
-            channel: "web".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: session.to_string(),
-            chat_type: "web".to_string(),
-            agent_id: "default".to_string(),
-        }
+                    channel: "web".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: session.to_string(),
+                    chat_type: "web".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                }
     }
 
     fn write_file(path: &std::path::Path, content: &str) {

@@ -901,12 +901,13 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8").to_string());
 
         let context = SurfaceContext {
-            channel: "cli".to_string(),
-            surface_user: "local_user".to_string(),
-            surface_thread: "s1".to_string(),
-            chat_type: "cli".to_string(),
-            agent_id: config.default_agent.to_string(),
-        };
+                    channel: "cli".to_string(),
+                    surface_user: "local_user".to_string(),
+                    surface_thread: "s1".to_string(),
+                    chat_type: "cli".to_string(),
+                    agent_id: config.default_agent.to_string(),
+                    channel_log_chat_id: None,
+                };
 
         assert_eq!(context.agent_id, "default");
     }
@@ -922,19 +923,21 @@ mod tests {
         );
 
         let ctx_a = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "ch999:bot:bot1:agent:agent_a".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "agent_a".to_string(),
-        };
+                    channel: "discord".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "ch999:bot:bot1:agent:agent_a".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "agent_a".to_string(),
+                    channel_log_chat_id: None,
+                };
         let ctx_b = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "ch999:bot:bot1:agent:agent_b".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "agent_b".to_string(),
-        };
+                    channel: "discord".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "ch999:bot:bot1:agent:agent_b".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "agent_b".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let chat_a = super::resolve_chat_id(&state, &ctx_a)
             .await
@@ -960,12 +963,13 @@ mod tests {
         );
 
         let ctx = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "ch555:bot:bot1:agent:agent_a".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "agent_a".to_string(),
-        };
+                    channel: "discord".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "ch555:bot:bot1:agent:agent_a".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "agent_a".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
         let chat_second = super::resolve_chat_id(&state, &ctx).await.expect("second");
@@ -976,19 +980,21 @@ mod tests {
     #[test]
     fn web_and_telegram_keep_existing_identity_with_default_agent() {
         let web_ctx = SurfaceContext {
-            channel: "web".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "s1".to_string(),
-            chat_type: "web".to_string(),
-            agent_id: "default".to_string(),
-        };
+                    channel: "web".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "s1".to_string(),
+                    chat_type: "web".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                };
         let telegram_ctx = SurfaceContext {
-            channel: "telegram".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "s2".to_string(),
-            chat_type: "telegram".to_string(),
-            agent_id: "default".to_string(),
-        };
+                    channel: "telegram".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "s2".to_string(),
+                    chat_type: "telegram".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         assert_eq!(web_ctx.session_key(), "web:s1");
         assert_eq!(telegram_ctx.session_key(), "telegram:s2");
@@ -1029,12 +1035,13 @@ mod tests {
         );
 
         let ctx = SurfaceContext {
-            channel: "web".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: "chat:abc123".to_string(),
-            chat_type: "web".to_string(),
-            agent_id: "default".to_string(),
-        };
+                    channel: "web".to_string(),
+                    surface_user: "user".to_string(),
+                    surface_thread: "chat:abc123".to_string(),
+                    chat_type: "web".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                };
 
         let first = super::resolve_chat_id(&state, &ctx).await.expect("first");
         let second = super::resolve_chat_id(&state, &ctx).await.expect("second");
