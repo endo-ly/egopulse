@@ -84,7 +84,7 @@ mod tests {
         let ctx = SurfaceContext::new(
             "discord".to_string(),
             "bob".to_string(),
-            "123:bot:main:agent:dev".to_string(),
+            "123:agent:dev".to_string(),
             "discord".to_string(),
             "dev".to_string(),
         );
@@ -93,6 +93,6 @@ mod tests {
         let key = ctx.session_key();
 
         // Assert
-        assert_eq!(key, "discord:123:bot:main:agent:dev");
+        assert_eq!(key, "discord:123:agent:dev");
     }
 }

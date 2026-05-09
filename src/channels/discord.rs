@@ -144,9 +144,14 @@ impl DiscordAdapter {
                         "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
                     )
                 }),
-            None => Err(format!(
-                "no bot suffix in external_chat_id '{external_chat_id}'"
-            )),
+            None => self
+                .bot_token_map
+                .values()
+                .next()
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    "no Discord bot tokens configured".to_string()
+                }),
         }
     }
 }
@@ -302,7 +307,7 @@ impl Handler {
     }
 
     fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
-        format!("{thread}:bot:{}:agent:{agent_id}", self.bot_id)
+        format!("{thread}:agent:{agent_id}")
     }
 
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
@@ -696,8 +701,9 @@ fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
-    // Strip bot+agent suffix: "123:bot:main:agent:developer" → "123"
-    let bare = if let Some(pos) = external_chat_id.find(":bot:") {
+    let bare = if let Some(pos) = external_chat_id.find(":agent:") {
+        &external_chat_id[..pos]
+    } else if let Some(pos) = external_chat_id.find(":multi-room-log") {
         &external_chat_id[..pos]
     } else {
         external_chat_id
@@ -921,7 +927,21 @@ mod tests {
             parse_discord_chat_id("discord:12345").expect("prefixed chat id"),
             12345
         );
+        assert_eq!(
+            parse_discord_chat_id("discord:123:agent:lyre").expect("new format"),
+            123
+        );
+        assert_eq!(
+            parse_discord_chat_id("discord:456:multi-room-log").expect("multi-room-log"),
+            456
+        );
         assert!(parse_discord_chat_id("discord:not-a-number").is_err());
+    }
+
+    #[test]
+    fn agent_thread_new_format_omits_bot_id() {
+        let handler = test_handler(HashMap::new());
+        assert_eq!(handler.agent_thread("123", "lyre"), "123:agent:lyre");
     }
 
     #[test]
@@ -999,13 +1019,13 @@ mod tests {
 
         assert_eq!(
             handler.agent_thread("123", "developer"),
-            "123:bot:main:agent:developer"
+            "123:agent:developer"
         );
         assert_eq!(
             handler
                 .make_context("user", "123", "developer")
                 .surface_thread,
-            "123:bot:main:agent:developer"
+            "123:agent:developer"
         );
     }
 
