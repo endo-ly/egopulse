@@ -380,8 +380,7 @@ impl Handler {
         let Some(channel_config) = self.channels.get(&channel_id) else {
             return false;
         };
-        // Empty agents means channel is not explicitly routed; allow any bot.
-        if channel_config.agents.is_empty() {
+        if !channel_config.multi_agent {
             return true;
         }
         let bot_id = crate::config::BotId::new(&self.bot_id);
@@ -431,7 +430,7 @@ impl Handler {
 
         if !is_dm {
             if let Some(config) = self.channels.get(&channel_id) {
-                if config.require_mention && !mentions_bot {
+                if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
                 }
             }
@@ -1212,6 +1211,50 @@ mod tests {
     }
 
     #[test]
+    fn guild_allowed_accepts_single_agent_channel_without_bot_binding() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("developer")],
+                multi_agent: false,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("developer", None)]),
+        );
+
+        assert!(handler.guild_allowed(123));
+    }
+
+    #[test]
+    fn guild_allowed_rejects_multi_agent_channel_without_bot_binding() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            123,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("developer")],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("developer", None)]),
+        );
+
+        assert!(!handler.guild_allowed(123));
+    }
+
+    #[test]
     fn interaction_chat_id_uses_agent_scoped_thread() {
         let mut channels = HashMap::new();
         channels.insert(123, DiscordChannelConfig::default());
@@ -1562,6 +1605,28 @@ mod tests {
         assert_eq!(
             handler.should_process_message(1000, false, false, 100, false),
             ReceiveDecision::Reject
+        );
+    }
+
+    #[test]
+    fn human_message_in_multi_agent_room_bypasses_require_mention_for_channel_log() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: true,
+                agents: vec![
+                    crate::config::AgentId::new("lyre"),
+                    crate::config::AgentId::new("vega"),
+                ],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler_with_bot_id(channels, 9999);
+
+        assert_eq!(
+            handler.should_process_message(1000, false, false, 100, false),
+            ReceiveDecision::Accept { reset_chain: true }
         );
     }
 
