@@ -349,30 +349,25 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
     #[cfg(feature = "channel-discord")]
     {
+        let shared_channels = state.config.discord_channels();
         let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .discord_bots()
             .into_iter()
-            .map(|b| {
-                (
-                    b.bot_id.clone(),
-                    b.token.to_string(),
-                    default_agent.clone(),
-                    b.channels.clone(),
-                )
-            })
+            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
             .collect();
 
         if !bot_configs.is_empty() {
             has_active_channels = true;
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
-            for (bot_id, token, default_agent, channels) in bot_configs {
+            for (bot_id, token, default_agent) in bot_configs {
                 let discord_state = Arc::new(state.clone());
                 let handle_name = format!("discord[{bot_id}]");
                 info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
+                let channels = shared_channels.clone();
                 let handle = tokio::spawn(async move {
                     crate::channels::discord::start_discord_bot_for_bot(
                         discord_state,

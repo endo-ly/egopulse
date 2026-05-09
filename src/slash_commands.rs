@@ -867,6 +867,7 @@ mod tests {
             surface_thread: "test".to_string(),
             chat_type: "cli".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         }
     }
 
@@ -1180,6 +1181,7 @@ mod tests {
             surface_thread: "test".to_string(),
             chat_type: "cli".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1216,6 +1218,7 @@ mod tests {
             surface_thread: "test".to_string(),
             chat_type: "cli".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1292,6 +1295,7 @@ agents:
             surface_thread: "thread".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "bob".to_string(),
+            channel_log_chat_id: None,
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1341,6 +1345,7 @@ agents:
             surface_thread: "thread".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "bob".to_string(),
+            channel_log_chat_id: None,
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;

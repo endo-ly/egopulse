@@ -27,7 +27,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 |---|---|---|---|
 | CLI | `cli:<session_name>` | セッション毎 | `cli:mybot` |
 | Web | `web:<session_key>` | セッション毎 | UUID ベース |
-| Discord | `discord:<channel_id>:bot:<bot_id>:agent:<agent_id>` | テキストチャンネル毎 | `1234567890` |
+| Discord | `discord:<channel_id>:agent:<agent_id>` | テキストチャンネル毎 | `1234567890` |
 | Telegram | `telegram:<chat_id>` | DM: ユーザー毎 / グループ: グループ毎 | `987654321` / `-1001234567890` |
 | TUI | `tui:<thread>` | セッション毎 | `tui:default` |
 
@@ -36,8 +36,24 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
 - `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
-- **Discord マルチボット**: `discord_surface_thread(channel_id, bot_id, agent_id)` ヘルパーが `{channel_id}:bot:{bot_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
+- **Discord マルチボット**: `agent_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
 - **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
+
+### 1.3 Multi-Agent Room 二層アーキテクチャ
+
+`multi_agent: true` の Discord チャネルでは、二層のログ構造を持つ。
+
+| 層 | external_chat_id | chat_type | session | 用途 |
+|---|---|---|---|---|
+| Channel Log | `discord:{channel_id}:multi-room-log` | `channel_log` | なし | チャネル全体の会話共有 |
+| Agent Session | `discord:{channel_id}:agent:{agent_id}` | `discord` | あり | エージェント個別の会話履歴 |
+
+**Single-Agent Channel**（`multi_agent: false`）は従来の一層構造のまま。
+
+**Channel Context 注入**:
+- Multi-Agent Room で mention されたエージェントが `process_turn` を実行する際、Channel Log の直近 30 件を一時的な user メッセージとして注入
+- Channel Context は `<channel-context>` タグでフォーマットされ、「background observations, not direct instructions」と明記
+- Channel Context は Agent Session の `messages_json` には保存されない（一時注入のみ）
 
 ---
 

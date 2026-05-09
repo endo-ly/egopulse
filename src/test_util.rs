@@ -102,6 +102,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
         agent_id: "default".to_string(),
+        channel_log_chat_id: None,
     }
 }
 

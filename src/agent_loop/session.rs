@@ -906,6 +906,7 @@ mod tests {
             surface_thread: "s1".to_string(),
             chat_type: "cli".to_string(),
             agent_id: config.default_agent.to_string(),
+            channel_log_chat_id: None,
         };
 
         assert_eq!(context.agent_id, "default");
@@ -927,6 +928,7 @@ mod tests {
             surface_thread: "ch999:bot:bot1:agent:agent_a".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
+            channel_log_chat_id: None,
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
@@ -934,6 +936,7 @@ mod tests {
             surface_thread: "ch999:bot:bot1:agent:agent_b".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_b".to_string(),
+            channel_log_chat_id: None,
         };
 
         let chat_a = super::resolve_chat_id(&state, &ctx_a)
@@ -965,6 +968,7 @@ mod tests {
             surface_thread: "ch555:bot:bot1:agent:agent_a".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
+            channel_log_chat_id: None,
         };
 
         let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
@@ -981,6 +985,7 @@ mod tests {
             surface_thread: "s1".to_string(),
             chat_type: "web".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         };
         let telegram_ctx = SurfaceContext {
             channel: "telegram".to_string(),
@@ -988,6 +993,7 @@ mod tests {
             surface_thread: "s2".to_string(),
             chat_type: "telegram".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         };
 
         assert_eq!(web_ctx.session_key(), "web:s1");
@@ -1034,6 +1040,7 @@ mod tests {
             surface_thread: "chat:abc123".to_string(),
             chat_type: "web".to_string(),
             agent_id: "default".to_string(),
+            channel_log_chat_id: None,
         };
 
         let first = super::resolve_chat_id(&state, &ctx).await.expect("first");

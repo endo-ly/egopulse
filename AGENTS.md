@@ -34,6 +34,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo llvm-cov --summary-only   # カバレッジ計測
 cargo audit                     # 脆弱性スキャン
+cargo deny check                # ライセンス・重複・脆弱性
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps  # ドキュメント lint
 
 # === WebUI ===

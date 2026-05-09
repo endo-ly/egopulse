@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 7;
+pub(super) const SCHEMA_VERSION: i64 = 8;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -60,6 +60,15 @@ pub(super) fn set_schema_version_in_tx(
     note: &str,
 ) -> Result<(), StorageError> {
     set_schema_version(tx, version, note)
+}
+
+fn strip_bot_segment(external_chat_id: &str) -> Option<String> {
+    let bot_start = external_chat_id.find(":bot:")?;
+    let after_bot = &external_chat_id[bot_start + ":bot:".len()..];
+    let agent_start = after_bot.find(":agent:")?;
+    let before = &external_chat_id[..bot_start];
+    let after = &after_bot[agent_start..];
+    Some(format!("{before}{after}"))
 }
 
 /// 未適用のマイグレーションを逐次実行する。
@@ -325,6 +334,48 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 7;
     }
 
+    if version < 8 {
+        let tx = conn.unchecked_transaction()?;
+        // ":bot:<bot_id>" → strip (e.g. "discord:123:bot:main:agent:lyre" → "discord:123:agent:lyre")
+        {
+            let has_external_id: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('chats') WHERE name = 'external_chat_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if has_external_id {
+                let mut stmt = tx.prepare(
+                    "SELECT rowid, external_chat_id FROM chats
+                     WHERE channel = 'discord'
+                       AND external_chat_id LIKE '%:bot:%:agent:%'",
+                )?;
+                let rows: Vec<(i64, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+
+                for (rowid, old_id) in &rows {
+                    if let Some(new_id) = strip_bot_segment(old_id) {
+                        tx.execute(
+                            "UPDATE chats SET external_chat_id = ?1 WHERE rowid = ?2",
+                            params![new_id, rowid],
+                        )?;
+                    }
+                }
+            }
+        }
+        set_schema_version_in_tx(
+            &tx,
+            8,
+            "remove bot_id from Discord session external_chat_id",
+        )?;
+        tx.commit()?;
+        version = 8;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -353,7 +404,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 8, "v1 through v8");
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
@@ -1144,5 +1195,239 @@ mod tests {
             )
             .expect("check column");
         assert!(has_message_kind);
+    }
+
+    fn create_v7_db(db_path: &std::path::Path) {
+        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
+        let conn = Connection::open(db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
+             INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '7');
+             INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (7, '2025-01-01T00:00:00Z', 'test v7');
+             CREATE TABLE IF NOT EXISTS chats (
+                 chat_id INTEGER PRIMARY KEY,
+                 chat_title TEXT,
+                 chat_type TEXT NOT NULL DEFAULT 'private',
+                 last_message_time TEXT NOT NULL,
+                 channel TEXT,
+                 external_chat_id TEXT,
+                 agent_id TEXT NOT NULL DEFAULT 'lyre'
+             );
+             CREATE TABLE IF NOT EXISTS messages (
+                 id TEXT NOT NULL,
+                 chat_id INTEGER NOT NULL,
+                 sender_name TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 is_from_bot INTEGER NOT NULL DEFAULT 0,
+                 timestamp TEXT NOT NULL,
+                 message_kind TEXT NOT NULL DEFAULT 'message',
+                 sender_agent_id TEXT,
+                 recipient_agent_id TEXT,
+                 PRIMARY KEY (id, chat_id)
+             );
+             CREATE TABLE IF NOT EXISTS sessions (
+                 chat_id INTEGER PRIMARY KEY,
+                 messages_json TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS tool_calls (
+                 id TEXT NOT NULL,
+                 chat_id INTEGER NOT NULL,
+                 message_id TEXT NOT NULL,
+                 tool_name TEXT NOT NULL,
+                 tool_input TEXT NOT NULL,
+                 tool_output TEXT,
+                 timestamp TEXT NOT NULL,
+                 PRIMARY KEY (id, chat_id, message_id)
+             );
+             CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 chat_id INTEGER NOT NULL,
+                 caller_channel TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 input_tokens INTEGER NOT NULL,
+                 output_tokens INTEGER NOT NULL,
+                 total_tokens INTEGER NOT NULL,
+                 request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS sleep_runs (
+                 id TEXT PRIMARY KEY,
+                 agent_id TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 trigger_type TEXT NOT NULL,
+                 started_at TEXT NOT NULL,
+                 finished_at TEXT,
+                 source_chats_json TEXT NOT NULL DEFAULT '[]',
+                 source_digest_md TEXT,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 total_tokens INTEGER NOT NULL DEFAULT 0,
+                 error_message TEXT
+             );
+             CREATE TABLE IF NOT EXISTS memory_snapshots (
+                 id TEXT PRIMARY KEY,
+                 run_id TEXT NOT NULL,
+                 agent_id TEXT NOT NULL,
+                 file TEXT NOT NULL,
+                 content_before TEXT NOT NULL,
+                 content_after TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );",
+        )
+        .expect("create v7 schema");
+    }
+
+    #[test]
+    fn migration_v8_removes_bot_id_from_external_chat_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        create_v7_db(&db_path);
+
+        // Insert old-format Discord rows
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+                 VALUES (100, 'test', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:123:bot:main:agent:lyre', 'lyre')",
+                [],
+            )
+            .expect("insert old discord");
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+                 VALUES (101, 'test2', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:456:bot:bot_a:agent:vega', 'vega')",
+                [],
+            )
+            .expect("insert old discord 2");
+        }
+
+        let db = super::super::Database::new(&db_path).expect("migrate to v8");
+        let conn = db.conn.lock().expect("lock");
+
+        let id1: String = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE chat_id = 100",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(id1, "discord:123:agent:lyre");
+
+        let id2: String = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE chat_id = 101",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(id2, "discord:456:agent:vega");
+    }
+
+    #[test]
+    fn migration_v8_preserves_non_discord_chats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        create_v7_db(&db_path);
+
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+                 VALUES (200, 'web chat', 'web', '2025-01-01T00:00:00Z', 'web', 'web:message-1', 'default')",
+                [],
+            )
+            .expect("insert web");
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+                 VALUES (201, 'cli chat', 'cli', '2025-01-01T00:00:00Z', 'cli', 'cli:local-dev', 'default')",
+                [],
+            )
+            .expect("insert cli");
+        }
+
+        let db = super::super::Database::new(&db_path).expect("migrate to v8");
+        let conn = db.conn.lock().expect("lock");
+
+        let web_id: String = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE chat_id = 200",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(web_id, "web:message-1");
+
+        let cli_id: String = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE chat_id = 201",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(cli_id, "cli:local-dev");
+    }
+
+    #[test]
+    fn migration_v8_handles_no_bot_id_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        create_v7_db(&db_path);
+
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+                 VALUES (300, 'already new', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:789:agent:lyre', 'lyre')",
+                [],
+            )
+            .expect("insert new format");
+        }
+
+        let db = super::super::Database::new(&db_path).expect("migrate to v8");
+        let conn = db.conn.lock().expect("lock");
+
+        let id: String = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE chat_id = 300",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(id, "discord:789:agent:lyre");
+    }
+
+    #[test]
+    fn migration_v8_history_is_recorded() {
+        let db = test_db();
+        let conn = db.conn.lock().expect("lock");
+        let has_v8: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 8",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check v8 record");
+        assert!(has_v8);
+    }
+
+    #[test]
+    fn migration_history_count_includes_v8() {
+        let db = test_db();
+        let conn = db.conn.lock().expect("lock");
+        let mut stmt = conn
+            .prepare("SELECT version, note FROM schema_migrations ORDER BY version")
+            .expect("prepare");
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[7].0, 8);
+        assert!(rows[7].1.contains("bot_id"));
     }
 }
