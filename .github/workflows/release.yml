@@ -54,39 +54,9 @@ jobs:
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "Created tag: ${RELEASE_TAG}"
 
-  build-assets:
-    name: Build ${{ matrix.target.label }}
-    runs-on: ${{ matrix.target.os }}
-    needs: create-tag
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - label: linux-x86_64
-            os: ubuntu-latest
-            bin: egopulse
-            target_triple: x86_64-unknown-linux-gnu
-            asset_triple: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - label: linux-arm64
-            os: ubuntu-24.04-arm
-            bin: egopulse
-            target_triple: aarch64-unknown-linux-gnu
-            asset_triple: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - label: macos-x86_64
-            os: macos-15-intel
-            bin: egopulse
-            target_triple: x86_64-apple-darwin
-            asset_triple: x86_64-apple-darwin
-            archive_ext: tar.gz
-          - label: macos-arm64
-            os: macos-14
-            bin: egopulse
-            target_triple: aarch64-apple-darwin
-            asset_triple: aarch64-apple-darwin
-            archive_ext: tar.gz
-
+  build-web:
+    name: Build Web Assets
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -103,8 +73,57 @@ jobs:
           npm --prefix web ci
           npm --prefix web run build
 
+      - name: Upload web assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: web/dist
+          if-no-files-found: error
+
+  build-assets:
+    name: Build ${{ matrix.target.label }}
+    runs-on: ${{ matrix.target.os }}
+    needs: [create-tag, build-web]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            bin: egopulse
+            target_triple: x86_64-unknown-linux-gnu
+            asset_triple: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            bin: egopulse
+            target_triple: aarch64-unknown-linux-gnu
+            asset_triple: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - label: macos-arm64
+            os: macos-14
+            bin: egopulse
+            target_triple: aarch64-apple-darwin
+            asset_triple: aarch64-apple-darwin
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: web/dist
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.target_triple }}
 
       - name: Build release binary
         shell: bash
