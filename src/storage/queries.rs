@@ -445,6 +445,41 @@ impl Database {
 }
 
 // ---------------------------------------------------------------------------
+// Channel Log (multi-agent room shared log)
+// ---------------------------------------------------------------------------
+
+impl Database {
+    /// Resolves or creates the Channel Log chat for a Discord multi-agent room.
+    ///
+    /// The Channel Log uses `channel = "discord"`,
+    /// `external_chat_id = "discord:{channel_id}:multi-room-log"`,
+    /// `chat_type = "channel_log"`, `agent_id = ""`.
+    /// It has **no session row** — only messages.
+    pub(crate) fn resolve_channel_log_chat_id(
+        &self,
+        channel_id: u64,
+    ) -> Result<i64, StorageError> {
+        let external_id = format!("discord:{channel_id}:multi-room-log");
+        self.resolve_or_create_chat_id(
+            "discord",
+            &external_id,
+            None,
+            "channel_log",
+            "",
+        )
+    }
+
+    /// Returns the most recent messages from a Channel Log, ordered oldest-first.
+    pub(crate) fn get_channel_log_messages(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        self.get_recent_messages(chat_id, limit)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool calls & LLM usage
 // ---------------------------------------------------------------------------
 
@@ -2104,5 +2139,75 @@ mod tests {
             sessions[0].estimated_tokens,
             (session_json.len() as i64) / 3
         );
+    }
+
+    // --- Channel Log tests ---
+
+    #[test]
+    fn resolve_channel_log_creates_new() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(12345).expect("create");
+        assert!(chat_id > 0);
+    }
+
+    #[test]
+    fn resolve_channel_log_returns_existing() {
+        let (db, _dir) = test_db();
+
+        let first = db.resolve_channel_log_chat_id(12345).expect("create");
+        let second = db.resolve_channel_log_chat_id(12345).expect("reuse");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn channel_log_external_chat_id_format() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(99).expect("create");
+        let info = db.get_chat_by_id(chat_id).expect("info").expect("present");
+        assert_eq!(info.external_chat_id, "discord:99:multi-room-log");
+    }
+
+    #[test]
+    fn channel_log_chat_type() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(99).expect("create");
+        let info = db.get_chat_by_id(chat_id).expect("info").expect("present");
+        assert_eq!(info.chat_type, "channel_log");
+    }
+
+    #[test]
+    fn store_message_to_channel_log() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(100).expect("create");
+        store_msg(&db, "cl-1", chat_id, "hello", "2025-01-01T00:00:00Z");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn get_recent_channel_log_messages() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(200).expect("create");
+        for i in 0..5 {
+            store_msg(
+                &db,
+                &format!("cl-{i}"),
+                chat_id,
+                &format!("msg {i}"),
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+
+        let msgs = db.get_channel_log_messages(chat_id, 3).expect("messages");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "msg 2");
+        assert_eq!(msgs[2].content, "msg 4");
     }
 }
