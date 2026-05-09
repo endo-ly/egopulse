@@ -338,22 +338,32 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         let tx = conn.unchecked_transaction()?;
         // ":bot:<bot_id>" → strip (e.g. "discord:123:bot:main:agent:lyre" → "discord:123:agent:lyre")
         {
-            let mut stmt = tx.prepare(
-                "SELECT rowid, external_chat_id FROM chats
-                 WHERE channel = 'discord'
-                   AND external_chat_id LIKE '%:bot:%:agent:%'",
-            )?;
-            let rows: Vec<(i64, String)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
+            let has_external_id: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('chats') WHERE name = 'external_chat_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
 
-            for (rowid, old_id) in &rows {
-                if let Some(new_id) = strip_bot_segment(old_id) {
-                    tx.execute(
-                        "UPDATE chats SET external_chat_id = ?1 WHERE rowid = ?2",
-                        params![new_id, rowid],
-                    )?;
+            if has_external_id {
+                let mut stmt = tx.prepare(
+                    "SELECT rowid, external_chat_id FROM chats
+                     WHERE channel = 'discord'
+                       AND external_chat_id LIKE '%:bot:%:agent:%'",
+                )?;
+                let rows: Vec<(i64, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+
+                for (rowid, old_id) in &rows {
+                    if let Some(new_id) = strip_bot_segment(old_id) {
+                        tx.execute(
+                            "UPDATE chats SET external_chat_id = ?1 WHERE rowid = ?2",
+                            params![new_id, rowid],
+                        )?;
+                    }
                 }
             }
         }
@@ -394,7 +404,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
 
-        assert_eq!(rows.len(), 7, "v1 through v7");
+        assert_eq!(rows.len(), 8, "v1 through v8");
         assert_eq!(rows[0].0, 1);
         assert!(rows[0].1.contains("initial schema"));
         assert_eq!(rows[1].0, 2);
