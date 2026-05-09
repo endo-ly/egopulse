@@ -96,6 +96,7 @@
 |---|---|---|---|---|
 | `enabled` | `bool` | 任意 | `false` | Discord Bot の有効化 |
 | `bots` | `map<BotId, DiscordBot>` | 条件付き | なし | Bot 定義。有効時は少なくとも 1 つの Bot が必要 |
+| `channels` | `map<u64, DiscordChannelConfig>` | 任意 | なし | 共有チャンネル設定。キーがチャンネル ID。キー存在 = 許可 |
 | `provider` | `string \| null` | 任意 | `null` | このチャネル専用のプロバイダーオーバーライド |
 | `model` | `string \| null` | 任意 | `null` | このチャネル専用のモデルオーバーライド |
 
@@ -104,7 +105,10 @@
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `token` | `string \| SecretRef` | 必須 | なし | Discord Bot トークン。SecretRef 使用可能。秘匿フィールド |
-| `channels` | `map<u64, DiscordChannelConfig>` | 任意 | なし | チャンネルごとの設定。キーがチャンネル ID。キー存在 = 許可 |
+
+#### `channels.discord.channels.<channel_id>` のフィールド
+
+`channels.discord.channels` は Bot ごとではなく Discord チャネル全体で共有される。各エージェントの `discord_bot` が、どの Bot に紐づくかを決める。
 
 #### `DiscordChannelConfig` のフィールド
 
@@ -241,11 +245,12 @@ channels:
         token:
           source: env
           id: DISCORD_BOT_TOKEN
-        channels:
-          "1234567890123456789":
-          "9876547890123456789":
-            require_mention: true
-            agents: [reviewer]
+    channels:
+      "1234567890123456789":
+      "9876547890123456789":
+        require_mention: true
+        agents: [alice, reviewer]
+        multi_agent: true
     provider: openrouter
     model: anthropic/claude-sonnet-4
 

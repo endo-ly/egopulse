@@ -345,7 +345,7 @@ fn normalize_channels(
                 let discord_channel = normalized.get_mut("discord").expect("just inserted");
                 discord_channel.discord_bots = Some(bots);
             }
-            let shared_channels = normalize_discord_channels(fc.channels)?;
+            let shared_channels = normalize_discord_channels(fc.channels, default_agent)?;
             let discord_channel = normalized.get_mut("discord").expect("just inserted");
             discord_channel.discord_channels = shared_channels;
         }
@@ -424,6 +424,7 @@ fn normalize_discord_bots(
 
 fn normalize_discord_channels(
     file_channels: Option<HashMap<String, FileDiscordChannelConfig>>,
+    default_agent: &AgentId,
 ) -> Result<Option<HashMap<u64, DiscordChannelConfig>>, ConfigError> {
     let Some(map) = file_channels else {
         return Ok(None);
@@ -433,13 +434,16 @@ fn normalize_discord_channels(
         let channel_id: u64 = k
             .parse::<u64>()
             .map_err(|_| ConfigError::InvalidChannelsKey { key: k })?;
-        let agents: Vec<AgentId> = v
+        let mut agents: Vec<AgentId> = v
             .agents
             .unwrap_or_default()
             .into_iter()
             .filter_map(|s| normalize_string(Some(s)))
             .map(|s| AgentId::new(&s))
             .collect();
+        if agents.is_empty() {
+            agents.push(default_agent.clone());
+        }
         let multi_agent = v.multi_agent.unwrap_or(false);
         result.insert(
             channel_id,
@@ -771,11 +775,11 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
             }
             let agent_count = channel_config.agents.len();
             let multi = channel_config.multi_agent;
-            if multi && agent_count == 1 {
+            if multi && agent_count < 2 {
                 return Err(ConfigError::DiscordBotChannelMultiAgentMismatch {
                     bot_id: "discord".to_string(),
                     channel_id: *channel_id,
-                    reason: "multi_agent is true but only 1 agent specified".to_string(),
+                    reason: "multi_agent is true but fewer than 2 agents specified".to_string(),
                 });
             }
             if !multi && agent_count > 1 {

@@ -1121,7 +1121,45 @@ fn validation_empty_agents_after_normalization() {
         .expect("channels")
         .get(&600)
         .expect("ch 600");
-    assert_eq!(ch.agents, vec![]);
+    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
+}
+
+#[test]
+#[serial]
+fn validation_rejects_multi_agent_with_empty_agents_after_defaulting() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+      main:
+        token:
+          source: env
+          id: MY_DISCORD_TOKEN
+        default_agent: assistant"#,
+            Some(
+                r#"      "700":
+            agents: []
+            multi_agent: true"#,
+            ),
+        ),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+    assert!(
+        matches!(
+            error,
+            ConfigError::DiscordBotChannelMultiAgentMismatch {
+                ref bot_id,
+                channel_id: 700,
+                ..
+            } if bot_id == "discord"
+        ),
+        "expected DiscordBotChannelMultiAgentMismatch, got {error:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,7 +1669,7 @@ fn discord_channels_parses_null_value() {
     let channels = discord.discord_channels.as_ref().expect("channels");
     let ch = channels.get(&123u64).expect("channel 123");
     assert!(!ch.require_mention);
-    assert_eq!(ch.agents, vec![]);
+    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
     assert!(!ch.multi_agent);
 }
 
