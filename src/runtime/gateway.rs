@@ -297,7 +297,7 @@ fn restart_service() -> Result<(), EgoPulseError> {
         return Ok(());
     }
 
-    let runtime_dir = ensure_user_session()?;
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
     let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
     if output.status.success() {
         println!("egopulse service restarted");
@@ -462,21 +462,22 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     if let Some(release_tag) = RELEASE_TAG {
         println!("Current release: {release_tag}");
     }
-    println!("Updating EgoPulse from latest release...");
 
     let client = reqwest::Client::builder()
         .user_agent(format!("egopulse/{VERSION}"))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| EgoPulseError::Internal(format!("failed to create HTTP client: {e}")))?;
 
     ensure_user_updatable_install()?;
 
+    print!("Checking for updates... ");
     let (tag_name, assets) = fetch_latest_release(&client).await?;
     if RELEASE_TAG == Some(tag_name.as_str()) {
-        println!("Already up to date.");
+        println!("already up to date.");
         return Ok(());
     }
+    println!("found {tag_name}");
 
     let target = detect_target_triple();
     let asset_url = resolve_asset_url(&assets, &target).ok_or_else(|| {
@@ -493,8 +494,9 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     let new_binary = download_and_extract(&client, &asset_url, &checksum_url).await?;
     replace_binary(&new_binary.path)?;
 
-    println!("Update completed ({VERSION} -> {tag_name}). Restarting service...");
+    println!("Restarting service...");
     restart_service()?;
+    println!("Update completed: {VERSION} -> {tag_name}");
     Ok(())
 }
 
@@ -634,7 +636,7 @@ async fn download_and_extract(
     url: &str,
     checksum_url: &str,
 ) -> Result<ExtractedBinary, EgoPulseError> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
@@ -642,14 +644,47 @@ async fn download_and_extract(
         .error_for_status()
         .map_err(|e| EgoPulseError::Internal(format!("download error: {e}")))?;
 
-    let bytes = resp
-        .bytes()
+    let total_size = resp.content_length();
+    let mut bytes = Vec::new();
+    let mut downloaded: u64 = 0;
+    let mut last_reported_percent: u8 = 0;
+
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| EgoPulseError::Internal(format!("failed to read response body: {e}")))?;
+        .map_err(|e| EgoPulseError::Internal(format!("download error: {e}")))?
+    {
+        bytes.extend_from_slice(&chunk);
+        downloaded += chunk.len() as u64;
 
+        if let Some(total) = total_size {
+            let percent = (downloaded as f64 / total as f64 * 100.0) as u8;
+            if percent >= last_reported_percent + 5 || percent >= 100 {
+                eprint!(
+                    "\r  {} / {} ({}%)  ",
+                    format_bytes(downloaded),
+                    format_bytes(total),
+                    percent
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                last_reported_percent = percent;
+            }
+        } else {
+            eprint!(
+                "\r  {} downloaded  ",
+                format_bytes(downloaded)
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+    }
+    eprintln!();
+
+    eprint!("  Verifying checksum... ");
     verify_archive_checksum(client, url, checksum_url, bytes.as_ref()).await?;
+    eprintln!("ok");
 
-    let gz = flate2::read::GzDecoder::new(bytes.as_ref());
+    eprint!("  Extracting binary... ");
+    let gz = flate2::read::GzDecoder::new(bytes.as_slice());
     let mut archive = tar::Archive::new(gz);
 
     let tmp_dir = tempfile::tempdir()
@@ -701,12 +736,14 @@ async fn download_and_extract(
                     "could not find 'egopulse' binary in downloaded archive".into(),
                 )
             })?;
+        eprintln!("done");
         return Ok(ExtractedBinary {
             _tmp_dir: tmp_dir,
             path: bin_path,
         });
     }
 
+    eprintln!("done");
     Ok(ExtractedBinary {
         _tmp_dir: tmp_dir,
         path: bin_path,
@@ -811,6 +848,18 @@ fn replace_binary(new_binary: &Path) -> Result<(), EgoPulseError> {
     }
 
     Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[cfg(test)]
