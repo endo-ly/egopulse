@@ -419,3 +419,189 @@ mod tests {
         assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::agent_loop::{PendingAgentTurn, SurfaceContext};
+    use crate::config::{AgentConfig, AgentId};
+    use crate::storage::{MessageKind, call_blocking};
+    use crate::test_util::test_config;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn multi_agent_config(state_root: &str) -> crate::config::Config {
+        let mut config = test_config(state_root);
+        config.agents = HashMap::from([
+            (
+                AgentId::new("lyre"),
+                AgentConfig {
+                    label: "Lyre".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                AgentId::new("vega"),
+                AgentConfig {
+                    label: "Vega".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                AgentId::new("nova"),
+                AgentConfig {
+                    label: "Nova".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config
+    }
+
+    fn multi_agent_tool(
+        config: &crate::config::Config,
+    ) -> (AgentSendTool, Arc<crate::storage::Database>) {
+        let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
+        let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
+        let tool = AgentSendTool::new(config.agents.clone(), Arc::clone(&db), channels);
+        (tool, db)
+    }
+
+    #[tokio::test]
+    async fn agent_send_in_single_agent_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let (tool, _db) = multi_agent_tool(&config);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ctx = ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "discord:123:agent:lyre".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "lyre".to_string(),
+            channel_log_chat_id: None,
+            turn_sender: tx,
+        };
+
+        let result = tool
+            .execute(json!({"to": "vega", "message": "hey vega"}), &ctx)
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let turn = rx.try_recv().expect("turn queued");
+        assert_eq!(turn.context.agent_id, "vega");
+        assert_eq!(turn.context.channel, "discord");
+    }
+
+    #[tokio::test]
+    async fn agent_send_to_non_existent_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let (tool, _db) = multi_agent_tool(&config);
+
+        let (tx, _) = tokio::sync::mpsc::channel(16);
+        let ctx = ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "discord:123:agent:lyre".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "lyre".to_string(),
+            channel_log_chat_id: None,
+            turn_sender: tx,
+        };
+
+        let result = tool
+            .execute(json!({"to": "unknown", "message": "hello?"}), &ctx)
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_channel_log_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let (tool, db) = multi_agent_tool(&config);
+
+        let log_chat_id = call_blocking(Arc::clone(&db), |db| {
+            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", None, "channel_log", "")
+        })
+        .await
+        .expect("log chat");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let ctx = ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "discord:123:agent:lyre".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "lyre".to_string(),
+            channel_log_chat_id: Some(log_chat_id),
+            turn_sender: tx,
+        };
+
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "check this design"}), &ctx)
+            .await;
+
+        let messages = call_blocking(Arc::clone(&db), move |db| {
+            db.get_channel_log_messages(log_chat_id, 10)
+        })
+        .await
+        .expect("messages");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_kind, MessageKind::AgentSend);
+        assert_eq!(messages[0].sender_agent_id.as_deref(), Some("lyre"));
+        assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
+        assert!(messages[0].content.contains("[Lyre → Vega]"));
+        assert!(messages[0].content.contains("check this design"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_target_session_independent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let (tool, _db) = multi_agent_tool(&config);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ctx = ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "discord:123:agent:lyre".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "lyre".to_string(),
+            channel_log_chat_id: None,
+            turn_sender: tx,
+        };
+
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "hello"}), &ctx)
+            .await;
+
+        let turn = rx.try_recv().expect("turn");
+        assert_ne!(
+            turn.context.surface_thread, ctx.surface_thread,
+            "target session should be independent from sender"
+        );
+        assert!(turn.context.surface_thread.contains("vega"));
+    }
+
+    #[tokio::test]
+    async fn existing_tools_not_affected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
+            config.user_skills_dir().expect("user_skills_dir"),
+            config.skills_dir().expect("skills_dir"),
+        ));
+        let registry = crate::tools::ToolRegistry::new(&config, skills);
+
+        assert!(registry.is_read_only("read"));
+        assert!(registry.is_read_only("grep"));
+        assert!(!registry.is_read_only("bash"));
+        assert!(!registry.is_read_only("write"));
+    }
+}
