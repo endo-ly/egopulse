@@ -41,19 +41,22 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
 
-/// Bot-to-bot chain maximum depth per channel/thread.
+/// Bot-to-bot 連鎖の最大深さ（チャンネル/スレッド単位）。
 const BOT_CHAIN_MAX_DEPTH: u32 = 5;
 
-/// Bot-to-bot chain state TTL in seconds.
+/// Bot-to-bot 連鎖状態の TTL（秒）。
 const BOT_CHAIN_TTL_SECS: u64 = 300;
 
+/// Discord `allowed_mentions` で指定可能な最大ユーザー数。
 const DISCORD_ALLOWED_MENTIONS_MAX_USERS: usize = 100;
 
+/// 連鎖の現在の深さと最終更新時刻。
 struct ChainEntry {
     depth: u32,
     last_updated: Instant,
 }
 
+/// Bot-to-bot 連鎖の深さをチャンネル単位で追跡し、制限を超えたメッセージを拒否する。
 pub(crate) struct BotChainState {
     ttl: Duration,
     chains: Mutex<HashMap<u64, ChainEntry>>,
@@ -71,6 +74,8 @@ impl BotChainState {
         }
     }
 
+    /// 連鎖深さをインクリメントし、制限内なら `true` を返す。
+    /// TTL を超過したエントリは併せて削除する。
     pub(crate) fn check_and_increment(&self, channel_id: u64) -> bool {
         let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
         let now = Instant::now();
@@ -101,26 +106,35 @@ impl BotChainState {
         }
     }
 
+    /// チャンネルの連鎖状態をリセットする（人間のメッセージ受信時に呼ぶ）。
     pub(crate) fn reset(&self, channel_id: u64) {
         let mut chains = self.chains.lock().expect("bot chain state lock poisoned");
         chains.remove(&channel_id);
     }
 }
 
+/// メッセージ受信可否の判定結果。
 #[derive(Debug, PartialEq)]
 enum ReceiveDecision {
+    /// 受理。`reset_chain` が true の場合は bot chain をリセットする。
     Accept { reset_chain: bool },
+    /// 拒否。
     Reject,
 }
 
+/// メッセージのルーティング判定結果。
 #[derive(Debug, PartialEq)]
 enum RouteDecision {
+    /// チャンネル外などの理由で拒否。
     Reject,
+    /// Channel Log にのみ保存し、応答はしない（multi-agent room で非 mention 時）。
     ObserveOnly { agent_id: String },
+    /// エージェントが応答する。
     Respond { agent_id: String },
 }
 
 impl RouteDecision {
+    /// ObserveOnly / Respond を問わず、紐づく agent_id を返す。
     fn agent_id(&self) -> Option<&str> {
         match self {
             Self::Reject => None,
@@ -128,6 +142,7 @@ impl RouteDecision {
         }
     }
 
+    /// 応答対象の agent_id のみを返す（ObserveOnly / Reject は `None`）。
     fn response_agent_id(&self) -> Option<&str> {
         match self {
             Self::Respond { agent_id } => Some(agent_id),
@@ -140,10 +155,11 @@ impl RouteDecision {
     }
 }
 
-/// Sends outbound messages to Discord via the REST API.
+/// Discord REST API 経由でアウトバウンドメッセージを送信するアダプター。
 pub(crate) struct DiscordAdapter {
-    /// Token map: bot_id → token, built from [`Config::discord_bots`].
+    /// `bot_id → token` のマップ（[`Config::discord_bots`] から構築）。
     bot_token_map: std::collections::HashMap<String, String>,
+    /// `agent_id → bot_id` のマップ。
     agent_bot_map: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
 }
@@ -170,6 +186,9 @@ impl DiscordAdapter {
         }
     }
 
+    /// `external_chat_id` から該当する bot token を解決する。
+    /// 明示的な `:bot:` セグメントがあればそちらを優先し、
+    /// なければ agent バインディング経由で解決する。
     fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
         if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
             return self.token_for_bot(bot_id, external_chat_id);
@@ -288,7 +307,7 @@ impl ChannelAdapter for DiscordAdapter {
     }
 }
 
-/// Send a Discord API request with automatic 429 retry handling.
+/// Discord API リクエストを送信し、429 レート制限を自動リトライする。
 async fn send_discord_api<F>(client: &reqwest::Client, build_request: F) -> Result<(), String>
 where
     F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
@@ -325,7 +344,7 @@ where
     }
 }
 
-/// serenity EventHandler。インバウンドメッセージを処理する。
+/// serenity の [`EventHandler`] 実装。インバウンドメッセージを受信してエージェントに振り分ける。
 struct Handler {
     app_state: Arc<AppState>,
     bot_id: String,
@@ -343,6 +362,7 @@ impl Handler {
         }
     }
 
+    /// 指定エージェントがこの bot にバインドされているかを返す。
     fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
         let bot_id = crate::config::BotId::new(&self.bot_id);
         self.app_state
@@ -352,6 +372,7 @@ impl Handler {
             .is_some_and(|agent| agent.discord_bot.as_ref() == Some(&bot_id))
     }
 
+    /// チャンネル設定内で、この bot にバインドされた最初のエージェントを返す。
     fn first_agent_for_this_bot(&self, channel_config: &DiscordChannelConfig) -> Option<String> {
         channel_config
             .agents
@@ -360,12 +381,14 @@ impl Handler {
             .map(ToString::to_string)
     }
 
+    /// チャンネルの先頭エージェントがこの bot にバインドされていれば返す（single-agent channel 用）。
     fn primary_agent_for_this_bot(&self, channel_config: &DiscordChannelConfig) -> Option<String> {
         let agent_id = channel_config.agents.first()?;
         self.agent_uses_this_bot(agent_id)
             .then(|| agent_id.to_string())
     }
 
+    /// Single-agent チャンネルのルーティングを解決する。
     fn resolve_single_agent_channel(&self, channel_config: &DiscordChannelConfig) -> RouteDecision {
         match self.primary_agent_for_this_bot(channel_config) {
             Some(agent_id) => RouteDecision::Respond { agent_id },
@@ -373,6 +396,8 @@ impl Handler {
         }
     }
 
+    /// Multi-agent room のルーティングを解決する。
+    /// mention がなければ ObserveOnly、あればこの bot にバインドされたエージェントが応答する。
     fn resolve_multi_agent_room(
         &self,
         channel_config: &DiscordChannelConfig,
@@ -393,6 +418,8 @@ impl Handler {
         }
     }
 
+    /// メッセージの送信先エージェントを決定するルーティング処理。
+    /// DM → デフォルトエージェント、ギルド → チャンネル設定に基づく振り分け。
     fn route_message(&self, channel_id: u64, is_dm: bool, mentions_bot: bool) -> RouteDecision {
         if is_dm {
             return self.default_agent_response();
@@ -409,10 +436,12 @@ impl Handler {
         }
     }
 
+    /// スレッド ID にエージェントスコープを付与した識別子を生成する。
     fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
         format!("{thread}:agent:{agent_id}")
     }
 
+    /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
         SurfaceContext::new(
             "discord".to_string(),
@@ -423,6 +452,7 @@ impl Handler {
         )
     }
 
+    /// メッセージの mention にこの bot が含まれているかを判定する。
     fn is_bot_mentioned(&self, msg: &DiscordMessage) -> bool {
         let Some(bot_id) = self.bot_user_id.get() else {
             return false;
@@ -430,12 +460,18 @@ impl Handler {
         msg.mentions.iter().any(|u| u.id == *bot_id)
     }
 
+    /// 自身（この bot）のメッセージかどうかを判定する。
     fn is_self_message(&self, author_id: u64) -> bool {
         self.bot_user_id
             .get()
             .is_some_and(|id| id.get() == author_id)
     }
 
+    /// メッセージを処理すべきかを判定する。
+    ///
+    /// - 自身のメッセージ → 拒否
+    /// - Bot メッセージ → mention がある場合のみ連鎖深さ制限内で受理
+    /// - 人間のメッセージ → `require_mention` 設定に従う
     fn should_process_message(
         &self,
         author_id: u64,
@@ -469,6 +505,7 @@ impl Handler {
         ReceiveDecision::Accept { reset_chain: true }
     }
 
+    /// テキスト内のスラッシュコマンドを処理する。コマンドが処理されたら `true` を返す。
     async fn process_text_slash_command(
         &self,
         ctx: &Context,
@@ -497,6 +534,7 @@ impl Handler {
         }
     }
 
+    /// Channel Log 用のチャット ID を解決し、人間のメッセージを保存する。
     async fn store_human_channel_log_message(
         &self,
         channel_id: u64,
@@ -556,6 +594,7 @@ impl Handler {
         }
     }
 
+    /// メッセージの添付ファイルをダウンロードしてローカルに保存する。
     async fn save_attachments(&self, workspace_dir: &Path, msg: &DiscordMessage) -> Vec<PathBuf> {
         let mut saved_paths = Vec::new();
         for attachment in &msg.attachments {
@@ -604,6 +643,7 @@ impl Handler {
         saved_paths
     }
 
+    /// Bot の応答メッセージを Channel Log に保存する。
     async fn store_bot_channel_log_message(
         &self,
         channel_id: u64,
@@ -884,7 +924,7 @@ impl EventHandler for Handler {
     }
 }
 
-/// Discord にメッセージを送信 (2000文字制限で自動分割)。
+/// Discord にメッセージを送信する（2000文字制限で自動分割）。
 async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
     let http = &ctx.http;
     if let Err(error) =
@@ -912,6 +952,8 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
     }
 }
 
+/// テキストから `<@ID>` / `<@!ID>` 形式のユーザーメンションを抽出する。
+/// 重複は除外し、最大 [`DISCORD_ALLOWED_MENTIONS_MAX_USERS`] 件まで返す。
 fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
     let mut ids = Vec::new();
     let mut rest = text;
@@ -948,6 +990,8 @@ fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
     ids
 }
 
+/// `external_chat_id` から Discord チャンネル ID（数値）を抽出する。
+/// `:bot:`, `:agent:`, `:multi-room-log` などのサフィックスは除去される。
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
     let bare = if let Some(pos) = external_chat_id.find(":bot:") {
         &external_chat_id[..pos]
@@ -964,8 +1008,9 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
 }
 
+/// `external_chat_id` から明示的な `:bot:<bot_id>` セグメントを抽出する。
+/// パターン: `"...:bot:<bot_id>:agent:<agent_id>"`
 fn parse_explicit_discord_bot_id(external_chat_id: &str) -> Option<&str> {
-    // Pattern: "...:bot:<bot_id>:agent:<agent_id>" → extract bot_id
     let bot_start = external_chat_id.find(":bot:")?;
     let after_bot = &external_chat_id[bot_start + ":bot:".len()..];
     let bot_end = after_bot.find(":agent:")?;
@@ -977,6 +1022,7 @@ fn parse_explicit_discord_bot_id(external_chat_id: &str) -> Option<&str> {
     }
 }
 
+/// `external_chat_id` から `:agent:<agent_id>` セグメントを抽出する。
 fn parse_discord_agent_id(external_chat_id: &str) -> Option<&str> {
     let agent_start = external_chat_id.find(":agent:")?;
     let agent_id = &external_chat_id[agent_start + ":agent:".len()..];
@@ -1003,7 +1049,7 @@ fn interaction_to_command_text(
     text
 }
 
-/// Starts a Discord bot with shared channel config and agent routing.
+/// Discord bot を起動し、共有チャンネル設定とエージェントルーティングを適用する。
 #[allow(private_interfaces)]
 pub(crate) async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
