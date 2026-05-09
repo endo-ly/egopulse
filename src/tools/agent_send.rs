@@ -44,16 +44,15 @@ impl AgentSendTool {
     }
 }
 
-fn agent_label<'a>(agents: &'a std::collections::HashMap<AgentId, AgentConfig>, id: &'a str) -> &'a str {
+fn agent_label<'a>(
+    agents: &'a std::collections::HashMap<AgentId, AgentConfig>,
+    id: &'a str,
+) -> &'a str {
     agents
         .get(&AgentId::new(id))
         .and_then(|c| {
             let label = c.label.trim();
-            if label.is_empty() {
-                None
-            } else {
-                Some(label)
-            }
+            if label.is_empty() { None } else { Some(label) }
         })
         .unwrap_or(id)
 }
@@ -143,7 +142,9 @@ impl Tool for AgentSendTool {
         let chat_info = lookup_chat_info(Arc::clone(&self.db), chat_id).await;
         if let Ok(Some(info)) = chat_info {
             if let Some(adapter) = self.channels.get(&info.channel) {
-                if let Err(error) = adapter.send_text(&info.external_chat_id, &display_text).await
+                if let Err(error) = adapter
+                    .send_text(&info.external_chat_id, &display_text)
+                    .await
                 {
                     tracing::warn!(error = %error, "agent_send: failed to display in channel");
                 }
@@ -174,15 +175,19 @@ impl Tool for AgentSendTool {
 
         if let Err(error) = context.turn_sender.send(turn).await {
             tracing::warn!(error = %error, "agent_send: failed to queue target turn");
-            return ToolResult::error(format!("failed to queue turn for agent '{target_id}': {error}"));
+            return ToolResult::error(format!(
+                "failed to queue turn for agent '{target_id}': {error}"
+            ));
         }
 
         sanitize_tool_result(
-            ToolResult::success(serde_json::to_string(&json!({
-                "delivered": true,
-                "to": target_id
-            }))
-            .expect("json")),
+            ToolResult::success(
+                serde_json::to_string(&json!({
+                    "delivered": true,
+                    "to": target_id
+                }))
+                .expect("json"),
+            ),
             &[],
         )
     }
@@ -191,12 +196,10 @@ impl Tool for AgentSendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, AgentId, ChannelName, ChannelConfig, Config};
+    use crate::config::{AgentConfig, AgentId};
     use crate::storage::MessageKind;
-    use crate::test_env::EnvVarGuard;
     use crate::test_util::test_config;
     use crate::tools::ToolExecutionContext;
-    use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -228,7 +231,10 @@ mod tests {
         AgentSendTool::new(agents, db, channels)
     }
 
-    fn test_context_with_agent(agent_id: &str, turn_sender: tokio::sync::mpsc::Sender<PendingAgentTurn>) -> ToolExecutionContext {
+    fn test_context_with_agent(
+        agent_id: &str,
+        turn_sender: tokio::sync::mpsc::Sender<PendingAgentTurn>,
+    ) -> ToolExecutionContext {
         ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -253,8 +259,15 @@ mod tests {
         let params = &def.parameters;
         let props = params.get("properties").expect("properties");
         assert!(props.get("to").is_some(), "should have 'to' parameter");
-        assert!(props.get("message").is_some(), "should have 'message' parameter");
-        let required = params.get("required").expect("required").as_array().expect("array");
+        assert!(
+            props.get("message").is_some(),
+            "should have 'message' parameter"
+        );
+        let required = params
+            .get("required")
+            .expect("required")
+            .as_array()
+            .expect("array");
         assert!(required.iter().any(|r| r.as_str() == Some("to")));
         assert!(required.iter().any(|r| r.as_str() == Some("message")));
     }
@@ -348,7 +361,13 @@ mod tests {
 
         // Create the channel_log_chat so messages can be stored
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", None, "channel_log", "")
+            db.resolve_or_create_chat_id(
+                "discord",
+                "discord:123:multi-room-log",
+                None,
+                "channel_log",
+                "",
+            )
         })
         .await
         .expect("create log chat");
@@ -388,7 +407,13 @@ mod tests {
         let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
 
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", None, "channel_log", "")
+            db.resolve_or_create_chat_id(
+                "discord",
+                "discord:123:multi-room-log",
+                None,
+                "channel_log",
+                "",
+            )
         })
         .await
         .expect("create log chat");
@@ -423,7 +448,6 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::agent_loop::{PendingAgentTurn, SurfaceContext};
     use crate::config::{AgentConfig, AgentId};
     use crate::storage::{MessageKind, call_blocking};
     use crate::test_util::test_config;
@@ -526,7 +550,13 @@ mod integration_tests {
         let (tool, db) = multi_agent_tool(&config);
 
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", None, "channel_log", "")
+            db.resolve_or_create_chat_id(
+                "discord",
+                "discord:123:multi-room-log",
+                None,
+                "channel_log",
+                "",
+            )
         })
         .await
         .expect("log chat");
