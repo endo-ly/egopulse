@@ -306,6 +306,67 @@ impl Handler {
             .unwrap_or(&self.default_agent)
     }
 
+    /// Resolves which agent should respond based on channel type and mention state.
+    ///
+    /// Returns `Some(agent_id)` when an agent should respond, or `None` when
+    /// the message should be silently observed (multi-agent room, no mention).
+    fn resolve_agent(
+        &self,
+        channel_id: u64,
+        is_dm: bool,
+        mentions_bot: bool,
+    ) -> Option<String> {
+        if is_dm {
+            return Some(self.default_agent.clone());
+        }
+
+        let Some(channel_config) = self.channels.get(&channel_id) else {
+            return Some(self.default_agent.clone());
+        };
+
+        if !channel_config.multi_agent {
+            return Some(
+                channel_config
+                    .agents
+                    .first()
+                    .map(|a| a.as_str())
+                    .unwrap_or(&self.default_agent)
+                    .to_string(),
+            );
+        }
+
+        // Multi-Agent Room: only respond when this bot is mentioned.
+        if !mentions_bot {
+            return None;
+        }
+
+        // Find agents bound to this bot via config.agents[].discord_bot
+        let bot_id = crate::config::BotId::new(&self.bot_id);
+        let matching: Vec<_> = channel_config
+            .agents
+            .iter()
+            .filter(|agent_id| {
+                self.app_state
+                    .config
+                    .agents
+                    .get(*agent_id)
+                    .is_some_and(|ac| ac.discord_bot.as_ref() == Some(&bot_id))
+            })
+            .collect();
+
+        match matching.as_slice() {
+            [] => Some(
+                channel_config
+                    .agents
+                    .first()
+                    .map(|a| a.to_string())
+                    .unwrap_or(self.default_agent.clone()),
+            ),
+            [agent] => Some(agent.to_string()),
+            [first, ..] => Some(first.to_string()),
+        }
+    }
+
     fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
         format!("{thread}:agent:{agent_id}")
     }
@@ -901,6 +962,45 @@ mod tests {
     fn test_adapter() -> DiscordAdapter {
         DiscordAdapter {
             bot_token_map: HashMap::new(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    fn test_handler_with_agents(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        bot_user_id: u64,
+        bot_id: &str,
+        default_agent: &str,
+        agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig>,
+    ) -> Handler {
+        let lock = OnceLock::new();
+        lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
+        let mut config = crate::test_util::test_config(
+            tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .to_str()
+                .expect("utf8"),
+        );
+        config.agents = agents;
+        let state = crate::agent_loop::turn::build_state(
+            config,
+            Box::new(crate::agent_loop::turn::FakeProvider {
+                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                }]),
+            }),
+        );
+        Handler {
+            app_state: Arc::new(state),
+            bot_id: bot_id.to_string(),
+            default_agent: default_agent.to_string(),
+            channels,
+            bot_user_id: lock,
+            chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
         }
     }
@@ -1539,5 +1639,130 @@ mod tests {
             ReceiveDecision::Accept { reset_chain: false },
             "channel 200 should be independent and start at depth 1"
         );
+    }
+
+    // --- resolve_agent tests ---
+
+    fn agent_cfg(label: &str, discord_bot: Option<&str>) -> (crate::config::AgentId, crate::config::AgentConfig) {
+        let id = crate::config::AgentId::new(label);
+        let cfg = crate::config::AgentConfig {
+            label: label.to_string(),
+            provider: None,
+            model: None,
+            discord_bot: discord_bot.map(crate::config::BotId::new),
+        };
+        (id, cfg)
+    }
+
+    #[test]
+    fn resolve_agent_mentioned_returns_matching_agent() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("lyre"), crate::config::AgentId::new("vega")],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([
+                agent_cfg("lyre", Some("main")),
+                agent_cfg("vega", Some("other")),
+            ]),
+        );
+
+        let result = handler.resolve_agent(100, false, true);
+        assert_eq!(result, Some("lyre".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_multi_mention_returns_first() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("lyre"), crate::config::AgentId::new("vega")],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([
+                agent_cfg("lyre", Some("main")),
+                agent_cfg("vega", Some("main")),
+            ]),
+        );
+
+        let result = handler.resolve_agent(100, false, true);
+        assert_eq!(result, Some("lyre".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_no_mention_multi_room_returns_none() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("lyre")],
+                multi_agent: true,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("lyre", Some("main"))]),
+        );
+
+        let result = handler.resolve_agent(100, false, false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_agent_no_mention_single_channel_returns_default() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            100,
+            DiscordChannelConfig {
+                require_mention: false,
+                agents: vec![crate::config::AgentId::new("lyre")],
+                multi_agent: false,
+            },
+        );
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("lyre", None)]),
+        );
+
+        let result = handler.resolve_agent(100, false, false);
+        assert_eq!(result, Some("lyre".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_dm_returns_default() {
+        let handler = test_handler_with_agents(
+            HashMap::new(),
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("lyre", Some("main"))]),
+        );
+
+        let result = handler.resolve_agent(999, true, false);
+        assert_eq!(result, Some("developer".to_string()));
     }
 }
