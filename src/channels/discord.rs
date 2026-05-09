@@ -113,10 +113,38 @@ enum ReceiveDecision {
     Reject,
 }
 
+#[derive(Debug, PartialEq)]
+enum RouteDecision {
+    Reject,
+    ObserveOnly { agent_id: String },
+    Respond { agent_id: String },
+}
+
+impl RouteDecision {
+    fn agent_id(&self) -> Option<&str> {
+        match self {
+            Self::Reject => None,
+            Self::ObserveOnly { agent_id } | Self::Respond { agent_id } => Some(agent_id),
+        }
+    }
+
+    fn response_agent_id(&self) -> Option<&str> {
+        match self {
+            Self::Respond { agent_id } => Some(agent_id),
+            Self::Reject | Self::ObserveOnly { .. } => None,
+        }
+    }
+
+    fn is_rejected(&self) -> bool {
+        matches!(self, Self::Reject)
+    }
+}
+
 /// Sends outbound messages to Discord via the REST API.
 pub(crate) struct DiscordAdapter {
     /// Token map: bot_id → token, built from [`Config::discord_bots`].
     bot_token_map: std::collections::HashMap<String, String>,
+    agent_bot_map: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
 }
 
@@ -127,32 +155,46 @@ impl DiscordAdapter {
             .into_iter()
             .map(|b| (b.bot_id.to_string(), b.token.to_string()))
             .collect();
+        let agent_bots = config
+            .agents
+            .iter()
+            .filter_map(|(agent_id, agent)| {
+                let bot_id = agent.discord_bot.as_ref()?;
+                Some((agent_id.to_string(), bot_id.to_string()))
+            })
+            .collect();
         Self {
             bot_token_map: bot_tokens,
+            agent_bot_map: agent_bots,
             http_client: reqwest::Client::new(),
         }
     }
 
     fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
-        match parse_discord_bot_id(external_chat_id) {
-            Some(bot_id) => self
-                .bot_token_map
-                .get(bot_id)
-                .map(String::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
-                    )
-                }),
-            None => self
-                .bot_token_map
-                .values()
-                .next()
-                .map(String::as_str)
-                .ok_or_else(|| {
-                    "no Discord bot tokens configured".to_string()
-                }),
+        if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
+            return self.token_for_bot(bot_id, external_chat_id);
         }
+
+        let agent_id = parse_discord_agent_id(external_chat_id).ok_or_else(|| {
+            format!(
+                "Discord external_chat_id '{external_chat_id}' does not identify a bot or agent"
+            )
+        })?;
+        let bot_id = self.agent_bot_map.get(agent_id).ok_or_else(|| {
+            format!("no Discord bot binding found for agent '{agent_id}' in external_chat_id '{external_chat_id}'")
+        })?;
+        self.token_for_bot(bot_id, external_chat_id)
+    }
+
+    fn token_for_bot(&self, bot_id: &str, external_chat_id: &str) -> Result<&str, String> {
+        self.bot_token_map
+            .get(bot_id)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
+                )
+            })
     }
 }
 
@@ -295,15 +337,10 @@ struct Handler {
 }
 
 impl Handler {
-    fn select_agent(&self, channel_id: u64, is_dm: bool) -> &str {
-        if is_dm {
-            return &self.default_agent;
+    fn default_agent_response(&self) -> RouteDecision {
+        RouteDecision::Respond {
+            agent_id: self.default_agent.clone(),
         }
-        self.channels
-            .get(&channel_id)
-            .and_then(|c| c.agents.first())
-            .map(|a| a.as_str())
-            .unwrap_or(&self.default_agent)
     }
 
     fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
@@ -329,29 +366,47 @@ impl Handler {
             .then(|| agent_id.to_string())
     }
 
-    /// Resolves which agent should respond based on channel type and mention state.
-    ///
-    /// Returns `Some(agent_id)` when an agent should respond, or `None` when
-    /// the message should be silently observed (multi-agent room, no mention).
-    fn resolve_agent(&self, channel_id: u64, is_dm: bool, mentions_bot: bool) -> Option<String> {
+    fn resolve_single_agent_channel(&self, channel_config: &DiscordChannelConfig) -> RouteDecision {
+        match self.primary_agent_for_this_bot(channel_config) {
+            Some(agent_id) => RouteDecision::Respond { agent_id },
+            None => RouteDecision::Reject,
+        }
+    }
+
+    fn resolve_multi_agent_room(
+        &self,
+        channel_config: &DiscordChannelConfig,
+        mentions_bot: bool,
+    ) -> RouteDecision {
+        if !mentions_bot {
+            return match channel_config.agents.first() {
+                Some(agent_id) => RouteDecision::ObserveOnly {
+                    agent_id: agent_id.to_string(),
+                },
+                None => RouteDecision::Reject,
+            };
+        }
+
+        match self.first_agent_for_this_bot(channel_config) {
+            Some(agent_id) => RouteDecision::Respond { agent_id },
+            None => RouteDecision::Reject,
+        }
+    }
+
+    fn route_message(&self, channel_id: u64, is_dm: bool, mentions_bot: bool) -> RouteDecision {
         if is_dm {
-            return Some(self.default_agent.clone());
+            return self.default_agent_response();
         }
 
         let Some(channel_config) = self.channels.get(&channel_id) else {
-            return Some(self.default_agent.clone());
+            return RouteDecision::Reject;
         };
 
-        if !channel_config.multi_agent {
-            return self.primary_agent_for_this_bot(channel_config);
+        if channel_config.multi_agent {
+            self.resolve_multi_agent_room(channel_config, mentions_bot)
+        } else {
+            self.resolve_single_agent_channel(channel_config)
         }
-
-        // Multi-Agent Room: only respond when this bot is mentioned.
-        if !mentions_bot {
-            return None;
-        }
-
-        self.first_agent_for_this_bot(channel_config)
     }
 
     fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
@@ -366,16 +421,6 @@ impl Handler {
             "discord".to_string(),
             agent_id.to_string(),
         )
-    }
-
-    fn guild_allowed(&self, channel_id: u64) -> bool {
-        let Some(channel_config) = self.channels.get(&channel_id) else {
-            return false;
-        };
-        if !channel_config.multi_agent {
-            return self.primary_agent_for_this_bot(channel_config).is_some();
-        }
-        self.first_agent_for_this_bot(channel_config).is_some()
     }
 
     fn is_bot_mentioned(&self, msg: &DiscordMessage) -> bool {
@@ -431,28 +476,24 @@ impl EventHandler for Handler {
         let channel_id = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
 
-        if !is_dm && !self.guild_allowed(channel_id) {
-            return;
-        }
-
         if self.is_self_message(msg.author.id.get()) {
             return;
         }
 
         let text = msg.content.clone();
         let mentions_bot = self.is_bot_mentioned(&msg);
-
-        // Determine agent using resolve_agent (handles multi-agent mention logic)
-        let resolved_agent = self.resolve_agent(channel_id, is_dm, mentions_bot);
+        let route = self.route_message(channel_id, is_dm, mentions_bot);
+        if route.is_rejected() {
+            return;
+        }
 
         let thread = channel_id.to_string();
-        let agent_id = resolved_agent
-            .as_deref()
-            .unwrap_or_else(|| self.select_agent(channel_id, is_dm))
-            .to_string();
+        let Some(route_agent_id) = route.agent_id().map(ToString::to_string) else {
+            return;
+        };
 
         {
-            let slash_context = self.make_context(&msg.author.name, &thread, &agent_id);
+            let slash_context = self.make_context(&msg.author.name, &thread, &route_agent_id);
             let sender_id = msg.author.id.get().to_string();
             let outcome = crate::slash_commands::process_slash_command(
                 &self.app_state,
@@ -519,7 +560,7 @@ impl EventHandler for Handler {
                         recipient_agent_id: None,
                     };
                     let db = std::sync::Arc::clone(&self.app_state.db);
-                    let _ = crate::storage::call_blocking(db, move |db| {
+                    if let Err(e) = crate::storage::call_blocking(db, move |db| {
                         let conn = db.lock_conn()?;
                         conn.execute(
                             "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
@@ -531,7 +572,15 @@ impl EventHandler for Handler {
                             ],
                         )?;
                         Ok::<_, crate::error::StorageError>(())
-                    }).await;
+                    })
+                    .await
+                    {
+                        warn!(
+                            channel_id = channel_id,
+                            error = %e,
+                            "failed to store Discord message in Channel Log"
+                        );
+                    }
                     Some(chat_id)
                 }
                 Err(e) => {
@@ -544,9 +593,9 @@ impl EventHandler for Handler {
         };
 
         // Multi-Agent Room with no agent resolved: save to Channel Log only, do not respond
-        if resolved_agent.is_none() && is_multi_agent && !is_dm {
+        let Some(agent_id) = route.response_agent_id().map(ToString::to_string) else {
             return;
-        }
+        };
 
         let workspace_dir = match self.app_state.config.workspace_dir() {
             Ok(d) => d,
@@ -635,7 +684,7 @@ impl EventHandler for Handler {
                         let agent_id_clone = agent_id.clone();
                         let resp_clone = response.clone();
                         let ts = msg.timestamp.to_string();
-                        let _ = crate::storage::call_blocking(db, move |db| {
+                        if let Err(e) = crate::storage::call_blocking(db, move |db| {
                             let conn = db.lock_conn()?;
                             conn.execute(
                                 "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id)
@@ -652,7 +701,17 @@ impl EventHandler for Handler {
                                 ],
                             )?;
                             Ok::<_, crate::error::StorageError>(())
-                        }).await;
+                        })
+                        .await
+                        {
+                            warn!(
+                                channel_id = channel_id,
+                                chat_id = log_chat_id,
+                                agent = %agent_id,
+                                error = %e,
+                                "failed to store Discord bot response in Channel Log"
+                            );
+                        }
                     }
                     send_discord_response(&ctx, msg.channel_id, &response).await;
                 }
@@ -718,7 +777,8 @@ impl EventHandler for Handler {
 
         let channel_id = cmd.channel_id.get();
         let is_dm_int = cmd.guild_id.is_none();
-        if !is_dm_int && !self.guild_allowed(channel_id) {
+        let route = self.route_message(channel_id, is_dm_int, true);
+        if route.is_rejected() {
             let _ = cmd
                 .create_response(
                     &ctx.http,
@@ -746,9 +806,9 @@ impl EventHandler for Handler {
         }
 
         let command_text = interaction_to_command_text(&cmd.data.name, &cmd.data.options);
-        let channel_id = cmd.channel_id.get();
-        let is_dm_int = cmd.guild_id.is_none();
-        let interaction_agent = self.select_agent(channel_id, is_dm_int).to_string();
+        let Some(interaction_agent) = route.agent_id().map(ToString::to_string) else {
+            return;
+        };
         let thread = channel_id.to_string();
 
         let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
@@ -846,7 +906,9 @@ fn extract_user_mention_ids(text: &str) -> Vec<UserId> {
 }
 
 fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
-    let bare = if let Some(pos) = external_chat_id.find(":agent:") {
+    let bare = if let Some(pos) = external_chat_id.find(":bot:") {
+        &external_chat_id[..pos]
+    } else if let Some(pos) = external_chat_id.find(":agent:") {
         &external_chat_id[..pos]
     } else if let Some(pos) = external_chat_id.find(":multi-room-log") {
         &external_chat_id[..pos]
@@ -859,7 +921,7 @@ fn parse_discord_chat_id(external_chat_id: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid Discord external_chat_id: '{external_chat_id}'"))
 }
 
-fn parse_discord_bot_id(external_chat_id: &str) -> Option<&str> {
+fn parse_explicit_discord_bot_id(external_chat_id: &str) -> Option<&str> {
     // Pattern: "...:bot:<bot_id>:agent:<agent_id>" → extract bot_id
     let bot_start = external_chat_id.find(":bot:")?;
     let after_bot = &external_chat_id[bot_start + ":bot:".len()..];
@@ -869,6 +931,16 @@ fn parse_discord_bot_id(external_chat_id: &str) -> Option<&str> {
         None
     } else {
         Some(bot_id)
+    }
+}
+
+fn parse_discord_agent_id(external_chat_id: &str) -> Option<&str> {
+    let agent_start = external_chat_id.find(":agent:")?;
+    let agent_id = &external_chat_id[agent_start + ":agent:".len()..];
+    if agent_id.is_empty() {
+        None
+    } else {
+        Some(agent_id)
     }
 }
 
@@ -907,6 +979,14 @@ pub(crate) async fn start_discord_bot_for_bot(
         bot_id.as_str(),
     );
 
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| {
+            error!("failed to build Discord HTTP client: {e}");
+            e
+        })?;
+
     let handler = Handler {
         app_state: state,
         bot_id: bot_id.to_string(),
@@ -914,10 +994,7 @@ pub(crate) async fn start_discord_bot_for_bot(
         channels: channels.clone(),
         bot_user_id: OnceLock::new(),
         chain_state,
-        http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_default(),
+        http_client,
     };
 
     let mut client = Client::builder(token, intents)
@@ -1046,6 +1123,7 @@ mod tests {
     fn test_adapter() -> DiscordAdapter {
         DiscordAdapter {
             bot_token_map: HashMap::new(),
+            agent_bot_map: HashMap::new(),
             http_client: reqwest::Client::new(),
         }
     }
@@ -1112,7 +1190,11 @@ mod tests {
             12345
         );
         assert_eq!(
-            parse_discord_chat_id("discord:123:agent:lyre").expect("new format"),
+            parse_discord_chat_id("discord:123:agent:lyre").expect("agent-scoped chat id"),
+            123
+        );
+        assert_eq!(
+            parse_discord_chat_id("discord:123:bot:main:agent:lyre").expect("explicit bot chat id"),
             123
         );
         assert_eq!(
@@ -1123,19 +1205,113 @@ mod tests {
     }
 
     #[test]
-    fn agent_thread_new_format_omits_bot_id() {
+    fn agent_thread_is_agent_scoped() {
         let handler = test_handler(HashMap::new());
         assert_eq!(handler.agent_thread("123", "lyre"), "123:agent:lyre");
     }
 
     #[test]
-    fn parse_discord_bot_id_from_external_chat_id() {
+    fn parse_explicit_discord_bot_id_from_external_chat_id() {
         assert_eq!(
-            parse_discord_bot_id("123:bot:main:agent:developer"),
+            parse_explicit_discord_bot_id("123:bot:main:agent:developer"),
             Some("main")
         );
-        assert_eq!(parse_discord_bot_id("12345"), None);
-        assert_eq!(parse_discord_bot_id("discord:123"), None);
+        assert_eq!(parse_explicit_discord_bot_id("12345"), None);
+        assert_eq!(parse_explicit_discord_bot_id("discord:123"), None);
+    }
+
+    #[test]
+    fn parse_discord_agent_id_from_external_chat_id() {
+        assert_eq!(
+            parse_discord_agent_id("discord:123:agent:developer"),
+            Some("developer")
+        );
+        assert_eq!(
+            parse_discord_agent_id("discord:123:bot:main:agent:developer"),
+            Some("developer")
+        );
+        assert_eq!(parse_discord_agent_id("discord:123"), None);
+        assert_eq!(parse_discord_agent_id("discord:123:agent:"), None);
+    }
+
+    #[test]
+    fn select_token_uses_explicit_bot_id() {
+        let adapter = DiscordAdapter {
+            bot_token_map: HashMap::from([
+                ("main".to_string(), "token-main".to_string()),
+                ("other".to_string(), "token-other".to_string()),
+            ]),
+            agent_bot_map: HashMap::from([("developer".to_string(), "other".to_string())]),
+            http_client: reqwest::Client::new(),
+        };
+
+        assert_eq!(
+            adapter
+                .select_token("discord:123:bot:main:agent:developer")
+                .expect("token"),
+            "token-main"
+        );
+    }
+
+    #[test]
+    fn select_token_resolves_agent_binding_without_bot_segment() {
+        let adapter = DiscordAdapter {
+            bot_token_map: HashMap::from([
+                ("main".to_string(), "token-main".to_string()),
+                ("other".to_string(), "token-other".to_string()),
+            ]),
+            agent_bot_map: HashMap::from([("developer".to_string(), "other".to_string())]),
+            http_client: reqwest::Client::new(),
+        };
+
+        assert_eq!(
+            adapter
+                .select_token("discord:123:agent:developer")
+                .expect("token"),
+            "token-other"
+        );
+    }
+
+    #[test]
+    fn select_token_rejects_chat_id_without_bot_or_agent() {
+        let adapter = DiscordAdapter {
+            bot_token_map: HashMap::from([("main".to_string(), "token-main".to_string())]),
+            agent_bot_map: HashMap::from([("developer".to_string(), "main".to_string())]),
+            http_client: reqwest::Client::new(),
+        };
+
+        assert!(
+            adapter.select_token("discord:123").is_err(),
+            "raw channel IDs must not fall back to an arbitrary bot token"
+        );
+    }
+
+    #[test]
+    fn select_token_rejects_agent_without_bot_binding() {
+        let adapter = DiscordAdapter {
+            bot_token_map: HashMap::from([("main".to_string(), "token-main".to_string())]),
+            agent_bot_map: HashMap::new(),
+            http_client: reqwest::Client::new(),
+        };
+
+        assert!(
+            adapter.select_token("discord:123:agent:developer").is_err(),
+            "agent-scoped Discord sends require an explicit agent.discord_bot binding"
+        );
+    }
+
+    #[test]
+    fn select_token_rejects_bound_bot_without_token() {
+        let adapter = DiscordAdapter {
+            bot_token_map: HashMap::from([("main".to_string(), "token-main".to_string())]),
+            agent_bot_map: HashMap::from([("developer".to_string(), "missing".to_string())]),
+            http_client: reqwest::Client::new(),
+        };
+
+        assert!(
+            adapter.select_token("discord:123:agent:developer").is_err(),
+            "agent bindings must not fall back when their bot token is absent"
+        );
     }
 
     #[test]
@@ -1175,17 +1351,17 @@ mod tests {
     }
 
     #[test]
-    fn guild_allowed_rejects_when_channels_empty() {
+    fn route_rejects_when_channels_empty() {
         let handler = test_handler(HashMap::new());
 
         assert!(
-            !handler.guild_allowed(123),
+            !route_accepts_channel(&handler, 123),
             "empty channels should reject guild messages"
         );
     }
 
     #[test]
-    fn guild_allowed_accepts_listed_channel_only_when_bot_is_bound() {
+    fn route_accepts_listed_channel_only_when_bot_is_bound() {
         let mut channels = HashMap::new();
         channels.insert(
             123,
@@ -1214,13 +1390,13 @@ mod tests {
             ]),
         );
 
-        assert!(handler.guild_allowed(123));
-        assert!(!handler.guild_allowed(456));
-        assert!(!handler.guild_allowed(789));
+        assert!(route_accepts_channel(&handler, 123));
+        assert!(!route_accepts_channel(&handler, 456));
+        assert!(!route_accepts_channel(&handler, 789));
     }
 
     #[test]
-    fn guild_allowed_rejects_single_agent_channel_without_bot_binding() {
+    fn route_rejects_single_agent_channel_without_bot_binding() {
         let mut channels = HashMap::new();
         channels.insert(
             123,
@@ -1238,11 +1414,11 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("developer", None)]),
         );
 
-        assert!(!handler.guild_allowed(123));
+        assert!(!route_accepts_channel(&handler, 123));
     }
 
     #[test]
-    fn guild_allowed_accepts_single_agent_channel_with_bot_binding() {
+    fn route_accepts_single_agent_channel_with_bot_binding() {
         let mut channels = HashMap::new();
         channels.insert(
             123,
@@ -1260,11 +1436,11 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("developer", Some("main"))]),
         );
 
-        assert!(handler.guild_allowed(123));
+        assert!(route_accepts_channel(&handler, 123));
     }
 
     #[test]
-    fn guild_allowed_rejects_single_agent_channel_when_only_secondary_agent_matches_bot() {
+    fn route_rejects_single_agent_channel_when_only_secondary_agent_matches_bot() {
         let mut channels = HashMap::new();
         channels.insert(
             123,
@@ -1288,11 +1464,11 @@ mod tests {
             ]),
         );
 
-        assert!(!handler.guild_allowed(123));
+        assert!(!route_accepts_channel(&handler, 123));
     }
 
     #[test]
-    fn guild_allowed_rejects_multi_agent_channel_without_bot_binding() {
+    fn route_rejects_multi_agent_channel_without_bot_binding() {
         let mut channels = HashMap::new();
         channels.insert(
             123,
@@ -1310,7 +1486,7 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("developer", None)]),
         );
 
-        assert!(!handler.guild_allowed(123));
+        assert!(!route_accepts_channel(&handler, 123));
     }
 
     #[test]
@@ -1404,10 +1580,10 @@ mod tests {
         assert!(!combined.contains("[attachment:"));
     }
 
-    // --- New tests for require_mention and select_agent ---
+    // --- Route command-agent tests ---
 
     #[test]
-    fn select_agent_returns_default_for_dm() {
+    fn route_message_returns_default_agent_for_dm() {
         // Arrange
         let mut channels = HashMap::new();
         channels.insert(
@@ -1421,11 +1597,14 @@ mod tests {
         let handler = test_handler(channels);
 
         // Act & Assert: DM always uses default agent regardless of channel config
-        assert_eq!(handler.select_agent(999, true), "developer");
+        assert_eq!(
+            route_agent_id(&handler, 999, true, true).as_deref(),
+            Some("developer")
+        );
     }
 
     #[test]
-    fn select_agent_uses_channel_agent_when_set() {
+    fn route_message_uses_bound_primary_agent_in_single_channel() {
         // Arrange
         let mut channels = HashMap::new();
         channels.insert(
@@ -1436,14 +1615,23 @@ mod tests {
                 multi_agent: false,
             },
         );
-        let handler = test_handler(channels);
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([agent_cfg("reviewer", Some("main"))]),
+        );
 
         // Act & Assert
-        assert_eq!(handler.select_agent(123, false), "reviewer");
+        assert_eq!(
+            route_agent_id(&handler, 123, false, true).as_deref(),
+            Some("reviewer")
+        );
     }
 
     #[test]
-    fn select_agent_falls_back_to_default_when_no_channel_agent() {
+    fn route_message_rejects_single_channel_without_primary_agent() {
         // Arrange
         let mut channels = HashMap::new();
         channels.insert(
@@ -1457,22 +1645,22 @@ mod tests {
         let handler = test_handler(channels);
 
         // Act & Assert
-        assert_eq!(handler.select_agent(123, false), "developer");
+        assert_eq!(route_agent_id(&handler, 123, false, true), None);
     }
 
     #[test]
-    fn select_agent_falls_back_to_default_for_unknown_channel() {
+    fn route_message_rejects_unknown_channel() {
         // Arrange
         let mut channels = HashMap::new();
         channels.insert(123, DiscordChannelConfig::default());
         let handler = test_handler(channels);
 
-        // Act & Assert: channel 456 not in map, falls back to default
-        assert_eq!(handler.select_agent(456, false), "developer");
+        // Act & Assert: channel 456 not in map
+        assert_eq!(route_agent_id(&handler, 456, false, true), None);
     }
 
     #[test]
-    fn select_agent_returns_first_agent_in_multi_agent_channel() {
+    fn route_message_returns_first_matching_agent_in_multi_agent_channel() {
         let mut channels = HashMap::new();
         channels.insert(
             789,
@@ -1485,9 +1673,21 @@ mod tests {
                 multi_agent: true,
             },
         );
-        let handler = test_handler(channels);
+        let handler = test_handler_with_agents(
+            channels,
+            9999,
+            "main",
+            "developer",
+            std::collections::HashMap::from([
+                agent_cfg("lyre", Some("main")),
+                agent_cfg("vega", Some("other")),
+            ]),
+        );
 
-        assert_eq!(handler.select_agent(789, false), "lyre");
+        assert_eq!(
+            route_agent_id(&handler, 789, false, true).as_deref(),
+            Some("lyre")
+        );
     }
 
     #[test]
@@ -1527,9 +1727,9 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("developer", Some("main"))]),
         );
 
-        // Act & Assert: guild_allowed works for both
-        assert!(handler.guild_allowed(123));
-        assert!(handler.guild_allowed(456));
+        // Act & Assert: route accepts channels for both
+        assert!(route_accepts_channel(&handler, 123));
+        assert!(route_accepts_channel(&handler, 456));
 
         // Verify config is readable
         assert!(handler.channels.get(&123).expect("config").require_mention);
@@ -1541,11 +1741,13 @@ mod tests {
         // Arrange: empty channels (no guild allowed)
         let handler = test_handler(HashMap::new());
 
-        // Act & Assert: DM (is_dm=true) bypasses guild_allowed entirely
-        // The select_agent for DM always returns default
-        assert_eq!(handler.select_agent(999, true), "developer");
+        // Act & Assert: DM (is_dm=true) bypasses guild channel restrictions.
+        assert_eq!(
+            route_agent_id(&handler, 999, true, true).as_deref(),
+            Some("developer")
+        );
         // But guild is rejected
-        assert!(!handler.guild_allowed(123));
+        assert!(!route_accepts_channel(&handler, 123));
     }
 
     #[test]
@@ -1569,8 +1771,8 @@ mod tests {
         );
 
         // Act & Assert
-        assert!(!handler.guild_allowed(999));
-        assert!(handler.guild_allowed(100));
+        assert!(!route_accepts_channel(&handler, 999));
+        assert!(route_accepts_channel(&handler, 100));
     }
 
     // --- BotChainState tests ---
@@ -1897,7 +2099,7 @@ mod tests {
         );
     }
 
-    // --- resolve_agent tests ---
+    // --- route_message tests ---
 
     fn agent_cfg(
         label: &str,
@@ -1913,8 +2115,36 @@ mod tests {
         (id, cfg)
     }
 
+    fn route_accepts_channel(handler: &Handler, channel_id: u64) -> bool {
+        !handler.route_message(channel_id, false, true).is_rejected()
+    }
+
+    fn route_agent_id(
+        handler: &Handler,
+        channel_id: u64,
+        is_dm: bool,
+        mentions_bot: bool,
+    ) -> Option<String> {
+        handler
+            .route_message(channel_id, is_dm, mentions_bot)
+            .agent_id()
+            .map(ToString::to_string)
+    }
+
+    fn route_responder_agent_id(
+        handler: &Handler,
+        channel_id: u64,
+        is_dm: bool,
+        mentions_bot: bool,
+    ) -> Option<String> {
+        handler
+            .route_message(channel_id, is_dm, mentions_bot)
+            .response_agent_id()
+            .map(ToString::to_string)
+    }
+
     #[test]
-    fn resolve_agent_mentioned_returns_matching_agent() {
+    fn route_message_responds_with_matching_mentioned_agent() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -1938,12 +2168,12 @@ mod tests {
             ]),
         );
 
-        let result = handler.resolve_agent(100, false, true);
+        let result = route_responder_agent_id(&handler, 100, false, true);
         assert_eq!(result, Some("lyre".to_string()));
     }
 
     #[test]
-    fn resolve_agent_multi_mention_returns_first() {
+    fn route_message_responds_with_first_matching_agent() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -1967,12 +2197,12 @@ mod tests {
             ]),
         );
 
-        let result = handler.resolve_agent(100, false, true);
+        let result = route_responder_agent_id(&handler, 100, false, true);
         assert_eq!(result, Some("lyre".to_string()));
     }
 
     #[test]
-    fn resolve_agent_mentioned_rejects_when_bot_has_no_channel_agent() {
+    fn route_message_rejects_mention_when_bot_has_no_channel_agent() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -1996,12 +2226,12 @@ mod tests {
             ]),
         );
 
-        let result = handler.resolve_agent(100, false, true);
+        let result = route_responder_agent_id(&handler, 100, false, true);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn resolve_agent_no_mention_multi_room_returns_none() {
+    fn route_message_observes_multi_room_without_mention() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -2019,12 +2249,12 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("lyre", Some("main"))]),
         );
 
-        let result = handler.resolve_agent(100, false, false);
+        let result = route_responder_agent_id(&handler, 100, false, false);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn resolve_agent_no_mention_single_channel_returns_bound_agent() {
+    fn route_message_responds_in_single_channel_without_mention() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -2042,12 +2272,12 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("lyre", Some("main"))]),
         );
 
-        let result = handler.resolve_agent(100, false, false);
+        let result = route_responder_agent_id(&handler, 100, false, false);
         assert_eq!(result, Some("lyre".to_string()));
     }
 
     #[test]
-    fn resolve_agent_no_mention_single_channel_rejects_unbound_bot() {
+    fn route_message_rejects_single_channel_for_unbound_bot() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -2065,12 +2295,12 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("lyre", Some("lyre"))]),
         );
 
-        let result = handler.resolve_agent(100, false, false);
+        let result = route_responder_agent_id(&handler, 100, false, false);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn resolve_agent_single_channel_uses_only_primary_agent() {
+    fn route_message_single_channel_uses_only_primary_agent() {
         let mut channels = HashMap::new();
         channels.insert(
             100,
@@ -2094,12 +2324,12 @@ mod tests {
             ]),
         );
 
-        let result = handler.resolve_agent(100, false, false);
+        let result = route_responder_agent_id(&handler, 100, false, false);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn resolve_agent_dm_returns_default() {
+    fn route_message_dm_responds_with_default_agent() {
         let handler = test_handler_with_agents(
             HashMap::new(),
             9999,
@@ -2108,7 +2338,7 @@ mod tests {
             std::collections::HashMap::from([agent_cfg("lyre", Some("main"))]),
         );
 
-        let result = handler.resolve_agent(999, true, false);
+        let result = route_responder_agent_id(&handler, 999, true, false);
         assert_eq!(result, Some("developer".to_string()));
     }
 }
