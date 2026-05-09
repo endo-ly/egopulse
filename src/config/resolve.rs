@@ -338,18 +338,25 @@ impl Config {
             .iter()
             .filter_map(|(bot_id, bot)| {
                 let token = bot.token.as_ref()?;
-                let channels: HashMap<u64, DiscordChannelConfig> =
-                    bot.channels.clone().unwrap_or_default();
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
                     default_agent: &bot.default_agent,
-                    channels,
                 })
             })
             .collect();
         runtime_bots.sort_by_key(|b| b.bot_id.as_str());
         runtime_bots
+    }
+    /// Returns the shared Discord channel config, or an empty map when none is configured.
+    /// Channel membership for each bot is determined by agent bindings
+    /// (`config.agents[].discord_bot == bot_id`), not by explicit per-bot listing.
+    pub(crate) fn discord_channels(&self) -> HashMap<u64, DiscordChannelConfig> {
+        self.channels
+            .get("discord")
+            .and_then(|ch| ch.discord_channels.as_ref())
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -359,8 +366,6 @@ pub(crate) struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
     pub default_agent: &'a AgentId,
-    /// Per-channel configuration. Empty map means no guild messages are allowed (DM-only).
-    pub channels: HashMap<u64, DiscordChannelConfig>,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.

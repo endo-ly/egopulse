@@ -22,8 +22,6 @@ struct SerializableDiscordBot {
     )]
     token: Option<serde_yml::Value>,
     default_agent: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channels: Option<HashMap<String, SerializableDiscordChannel>>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +142,8 @@ struct SerializableChannel {
     soul_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channels: Option<HashMap<String, SerializableDiscordChannel>>,
 }
 
 #[derive(Serialize)]
@@ -223,26 +223,25 @@ impl From<&Config> for SerializableConfig {
                                         SerializableDiscordBot {
                                             token: bot.file_token.clone(),
                                             default_agent: bot.default_agent.to_string(),
-                                            channels: bot.channels.as_ref().map(|ch_map| {
-                                                ch_map
-                                                    .iter()
-                                                    .map(|(ch_id, ch_config)| {
-                                                        (
-                                                            ch_id.to_string(),
-                                                            SerializableDiscordChannel {
-                                                                require_mention: ch_config
-                                                                    .require_mention,
-                                                                agents: ch_config
-                                                                    .agents
-                                                                    .iter()
-                                                                    .map(|a| a.to_string())
-                                                                    .collect(),
-                                                                multi_agent: ch_config.multi_agent,
-                                                            },
-                                                        )
-                                                    })
-                                                    .collect()
-                                            }),
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
+                        channels: c.discord_channels.as_ref().map(|ch_map| {
+                            ch_map
+                                .iter()
+                                .map(|(ch_id, ch_config)| {
+                                    (
+                                        ch_id.to_string(),
+                                        SerializableDiscordChannel {
+                                            require_mention: ch_config.require_mention,
+                                            agents: ch_config
+                                                .agents
+                                                .iter()
+                                                .map(|a| a.to_string())
+                                                .collect(),
+                                            multi_agent: ch_config.multi_agent,
                                         },
                                     )
                                 })
@@ -638,7 +637,7 @@ channels:
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("egopulse.config.yaml");
 
-        // Arrange: config with discord bots
+        // Arrange: config with discord bots and shared channels
         let mut config = sample_config();
         let discord_channel = config
             .channels
@@ -652,18 +651,18 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    channels: Some(
-                        [
-                            (111u64, crate::config::DiscordChannelConfig::default()),
-                            (222u64, crate::config::DiscordChannelConfig::default()),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
                 },
             );
             bots
         });
+        discord_channel.discord_channels = Some(
+            [
+                (111u64, crate::config::DiscordChannelConfig::default()),
+                (222u64, crate::config::DiscordChannelConfig::default()),
+            ]
+            .into_iter()
+            .collect(),
+        );
 
         // Act: save → load
         save_config_with_secrets(&config, &path).expect("save");
@@ -677,9 +676,11 @@ channels:
             *bots[0].default_agent,
             crate::config::AgentId::new("default")
         );
-        assert_eq!(bots[0].channels.len(), 2);
-        assert!(bots[0].channels.contains_key(&111));
-        assert!(bots[0].channels.contains_key(&222));
+        // Shared channels are preserved
+        let channels = loaded.discord_channels();
+        assert_eq!(channels.len(), 2);
+        assert!(channels.contains_key(&111));
+        assert!(channels.contains_key(&222));
 
         let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
         assert!(dotenv.contains("MY_DISCORD_BOT_TOKEN=bot-secret-123"));
@@ -706,22 +707,22 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    channels: Some(
-                        [(
-                            111u64,
-                            crate::config::DiscordChannelConfig {
-                                require_mention: false,
-                                agents: vec![crate::config::AgentId::new("default")],
-                                multi_agent: false,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
                 },
             );
             bots
         });
+        discord_channel.discord_channels = Some(
+            [(
+                111u64,
+                crate::config::DiscordChannelConfig {
+                    require_mention: false,
+                    agents: vec![crate::config::AgentId::new("default")],
+                    multi_agent: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
 
         save_config_with_secrets(&config, &path).expect("save");
         let yaml = fs::read_to_string(&path).expect("yaml");
@@ -760,25 +761,25 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    channels: Some(
-                        [(
-                            111u64,
-                            crate::config::DiscordChannelConfig {
-                                require_mention: false,
-                                agents: vec![
-                                    crate::config::AgentId::new("default"),
-                                    crate::config::AgentId::new("reviewer"),
-                                ],
-                                multi_agent: true,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
                 },
             );
             bots
         });
+        discord_channel.discord_channels = Some(
+            [(
+                111u64,
+                crate::config::DiscordChannelConfig {
+                    require_mention: false,
+                    agents: vec![
+                        crate::config::AgentId::new("default"),
+                        crate::config::AgentId::new("reviewer"),
+                    ],
+                    multi_agent: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
 
         save_config_with_secrets(&config, &path).expect("save");
         let yaml = fs::read_to_string(&path).expect("yaml");
@@ -818,7 +819,6 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    channels: None,
                 },
             );
             bots
@@ -862,32 +862,33 @@ channels:
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
                     default_agent: crate::config::AgentId::new("default"),
-                    channels: Some(
-                        [(
-                            111u64,
-                            crate::config::DiscordChannelConfig {
-                                require_mention: true,
-                                agents: vec![
-                                    crate::config::AgentId::new("default"),
-                                    crate::config::AgentId::new("reviewer"),
-                                ],
-                                multi_agent: true,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
                 },
             );
             bots
         });
+        discord_channel.discord_channels = Some(
+            [(
+                111u64,
+                crate::config::DiscordChannelConfig {
+                    require_mention: true,
+                    agents: vec![
+                        crate::config::AgentId::new("default"),
+                        crate::config::AgentId::new("reviewer"),
+                    ],
+                    multi_agent: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
 
         save_config_with_secrets(&config, &path).expect("save");
         let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load");
 
         let bots = loaded.discord_bots();
         assert_eq!(bots.len(), 1);
-        let ch = bots[0].channels.get(&111).expect("channel 111");
+        let channels = loaded.discord_channels();
+        let ch = channels.get(&111).expect("channel 111");
         assert_eq!(
             ch.agents,
             vec![

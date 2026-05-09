@@ -377,7 +377,21 @@ impl Handler {
     }
 
     fn guild_allowed(&self, channel_id: u64) -> bool {
-        self.channels.contains_key(&channel_id)
+        let Some(channel_config) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        // Empty agents means channel is not explicitly routed; allow any bot.
+        if channel_config.agents.is_empty() {
+            return true;
+        }
+        let bot_id = crate::config::BotId::new(&self.bot_id);
+        channel_config.agents.iter().any(|agent_id| {
+            self.app_state
+                .config
+                .agents
+                .get(agent_id)
+                .is_some_and(|ac| ac.discord_bot.as_ref() == Some(&bot_id))
+        })
     }
 
     fn is_bot_mentioned(&self, msg: &DiscordMessage) -> bool {
@@ -890,7 +904,7 @@ fn interaction_to_command_text(
     text
 }
 
-/// Starts a Discord bot with agent routing configured.
+/// Starts a Discord bot with shared channel config and agent routing.
 #[allow(private_interfaces)]
 pub(crate) async fn start_discord_bot_for_bot(
     state: Arc<AppState>,

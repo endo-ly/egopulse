@@ -90,15 +90,13 @@ pub(crate) struct TelegramChatConfig {
 /// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
 ///
 /// Each bot connects to Discord with its own token and routes messages to agents
-/// based on per-channel config or falls back to `default_agent`.
+/// based on shared channel config or falls back to `default_agent`.
+/// Channel-to-agent mappings live at the Discord level (`channels.discord.channels`).
 #[derive(Clone)]
 pub(crate) struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<serde_yml::Value>,
     pub default_agent: AgentId,
-    /// Per-channel configuration keyed by Discord channel ID.
-    /// `None` means no channels are explicitly configured.
-    pub channels: Option<HashMap<u64, DiscordChannelConfig>>,
 }
 
 impl std::fmt::Debug for DiscordBotConfig {
@@ -106,7 +104,6 @@ impl std::fmt::Debug for DiscordBotConfig {
         f.debug_struct("DiscordBotConfig")
             .field("token", &debug_secret(self.token.as_ref()))
             .field("default_agent", &self.default_agent)
-            .field("channels", &self.channels)
             .finish()
     }
 }
@@ -128,6 +125,10 @@ pub(crate) struct ChannelConfig {
     /// Per-chat Telegram configuration keyed by chat ID.
     pub chats: Option<HashMap<i64, TelegramChatConfig>>,
     pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
+    /// Shared Discord channel configs at the channel level (`channels.discord.channels`).
+    /// Each bot determines channel membership by checking which agents in each
+    /// channel's `agents` list have `discord_bot` set to the bot's ID.
+    pub discord_channels: Option<HashMap<u64, DiscordChannelConfig>>,
 }
 
 impl std::fmt::Debug for ChannelConfig {
@@ -145,6 +146,7 @@ impl std::fmt::Debug for ChannelConfig {
             .field("chats", &self.chats)
             .field("soul_path", &self.soul_path)
             .field("discord_bots", &self.discord_bots)
+            .field("discord_channels", &self.discord_channels)
             .finish()
     }
 }

@@ -785,7 +785,10 @@ fn write_env(temp_dir: &tempfile::TempDir, contents: &str) {
     write!(f, "{contents}").expect("write .env");
 }
 
-fn bot_config_yml(bot_section: &str) -> String {
+fn bot_config_yml(bot_section: &str, discord_channels: Option<&str>) -> String {
+    let channels_section = discord_channels
+        .map(|s| format!("    channels:\n{s}\n"))
+        .unwrap_or_default();
     format!(
         r#"default_provider: openai
 providers:
@@ -803,7 +806,8 @@ agents:
 channels:
   discord:
     enabled: true
-{bot_section}"#
+{bot_section}
+{channels_section}"#
     )
 }
 
@@ -821,11 +825,12 @@ fn loads_discord_bots_with_default_agent() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "111222333": {}
-          "444555666":
-            agents: [reviewer]"#,
+        default_agent: assistant"#,
+            Some(
+                r#"      "111222333": {}
+      "444555666":
+        agents: [reviewer]"#,
+            ),
         ),
     );
 
@@ -841,7 +846,7 @@ fn loads_discord_bots_with_default_agent() {
         main_bot.token.as_ref().expect("token").value(),
         "discord-bot-token-123"
     );
-    let channels = main_bot.channels.as_ref().expect("channels");
+    let channels = discord.discord_channels.as_ref().expect("channels");
     assert_eq!(channels.len(), 2);
     assert!(channels.contains_key(&111222333u64));
     assert!(channels.contains_key(&444555666u64));
@@ -866,6 +871,7 @@ fn discord_bots_validate_default_agent_exists() {
           source: env
           id: MY_DISCORD_TOKEN
         default_agent: nonexistent_agent"#,
+            None,
         ),
     );
 
@@ -895,10 +901,11 @@ fn discord_bots_validate_channel_agents_exist() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "999":
+        default_agent: assistant"#,
+            Some(
+                r#"      "999":
             agents: [ghost_agent]"#,
+            ),
         ),
     );
 
@@ -908,7 +915,7 @@ fn discord_bots_validate_channel_agents_exist() {
         matches!(
             error,
             ConfigError::DiscordBotChannelAgentNotFound { ref bot_id, channel_id: 999, ref agent_id }
-                if bot_id == "main" && agent_id == "ghost_agent"
+                if bot_id == "discord" && agent_id == "ghost_agent"
         ),
         "expected DiscordBotChannelAgentNotFound, got {error:?}"
     );
@@ -924,10 +931,11 @@ fn discord_bots_require_default_agent() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN"#,
+              main:
+                token:
+                  source: env
+                  id: MY_DISCORD_TOKEN"#,
+            None,
         ),
     );
 
@@ -960,11 +968,12 @@ fn validation_rejects_multi_agent_with_single_agent() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "100":
+        default_agent: assistant"#,
+            Some(
+                r#"      "100":
             agents: [assistant]
             multi_agent: true"#,
+            ),
         ),
     );
 
@@ -977,7 +986,7 @@ fn validation_rejects_multi_agent_with_single_agent() {
                 ref bot_id,
                 channel_id: 100,
                 ..
-            } if bot_id == "main"
+            } if bot_id == "discord"
         ),
         "expected DiscordBotChannelMultiAgentMismatch, got {error:?}"
     );
@@ -997,11 +1006,12 @@ fn validation_rejects_single_mode_with_multiple_agents() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "200":
+        default_agent: assistant"#,
+            Some(
+                r#"      "200":
             agents: [assistant, reviewer]
             multi_agent: false"#,
+            ),
         ),
     );
 
@@ -1014,7 +1024,7 @@ fn validation_rejects_single_mode_with_multiple_agents() {
                 ref bot_id,
                 channel_id: 200,
                 ..
-            } if bot_id == "main"
+            } if bot_id == "discord"
         ),
         "expected DiscordBotChannelMultiAgentMismatch, got {error:?}"
     );
@@ -1034,10 +1044,11 @@ fn validation_accepts_single_agent() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "300":
+        default_agent: assistant"#,
+            Some(
+                r#"      "300":
             agents: [assistant]"#,
+            ),
         ),
     );
 
@@ -1045,9 +1056,9 @@ fn validation_accepts_single_agent() {
 
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
-    let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot
-        .channels
+    let _bot = bots.get(&super::BotId::new("main")).expect("main bot");
+    let ch = discord
+        .discord_channels
         .as_ref()
         .expect("channels")
         .get(&300)
@@ -1070,11 +1081,12 @@ fn validation_accepts_multi_agent() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "400":
+        default_agent: assistant"#,
+            Some(
+                r#"      "400":
             agents: [assistant, reviewer]
             multi_agent: true"#,
+            ),
         ),
     );
 
@@ -1082,9 +1094,9 @@ fn validation_accepts_multi_agent() {
 
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
-    let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot
-        .channels
+    let _bot = bots.get(&super::BotId::new("main")).expect("main bot");
+    let ch = discord
+        .discord_channels
         .as_ref()
         .expect("channels")
         .get(&400)
@@ -1113,10 +1125,11 @@ fn validation_agents_reference_must_exist() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "500":
+        default_agent: assistant"#,
+            Some(
+                r#"      "500":
             agents: [unknown_agent]"#,
+            ),
         ),
     );
 
@@ -1129,7 +1142,7 @@ fn validation_agents_reference_must_exist() {
                 ref bot_id,
                 channel_id: 500,
                 ref agent_id,
-            } if bot_id == "main" && agent_id == "unknown_agent"
+            } if bot_id == "discord" && agent_id == "unknown_agent"
         ),
         "expected DiscordBotChannelAgentNotFound, got {error:?}"
     );
@@ -1138,14 +1151,6 @@ fn validation_agents_reference_must_exist() {
 #[test]
 #[serial]
 fn validation_empty_agents_after_normalization() {
-    // When agents is explicitly empty AND there is no default agent to fill,
-    // the normalization should still produce an error.
-    // However, normalization fills empty agents with bot.default_agent,
-    // so this tests the edge case where normalization keeps it empty somehow.
-    // In practice, this is a defensive test — if default_agent exists and
-    // normalization works, empty agents should never reach validation.
-    // We test it by directly constructing a Config and calling validation.
-
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
@@ -1157,27 +1162,27 @@ fn validation_empty_agents_after_normalization() {
         token:
           source: env
           id: MY_DISCORD_TOKEN
-        default_agent: assistant
-        channels:
-          "600":
+        default_agent: assistant"#,
+            Some(
+                r#"      "600":
             agents: []
             multi_agent: false"#,
+            ),
         ),
     );
 
-    // Empty agents get normalized to [default_agent], so this should succeed.
     let config = Config::load(Some(&file_path)).expect("should succeed after normalization");
 
     let discord = config.channels.get("discord").expect("discord channel");
     let bots = discord.discord_bots.as_ref().expect("bots");
-    let bot = bots.get(&super::BotId::new("main")).expect("main bot");
-    let ch = bot
-        .channels
+    let _bot = bots.get(&super::BotId::new("main")).expect("main bot");
+    let ch = discord
+        .discord_channels
         .as_ref()
         .expect("channels")
         .get(&600)
         .expect("ch 600");
-    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
+    assert_eq!(ch.agents, vec![]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,11 +1199,12 @@ fn parse_agent_config_with_discord_bot() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_DISCORD_TOKEN
+                default_agent: assistant"#,
+            None,
         )
         .replace(
             "agents:\n  assistant:",
@@ -1224,11 +1230,12 @@ fn parse_agent_config_without_discord_bot() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_DISCORD_TOKEN
+                default_agent: assistant"#,
+            None,
         ),
     );
 
@@ -1250,11 +1257,12 @@ fn validation_discord_bot_must_exist() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_DISCORD_TOKEN
+                default_agent: assistant"#,
+            None,
         )
         .replace(
             "agents:\n  assistant:",
@@ -1284,11 +1292,12 @@ fn validation_discord_bot_null_is_ok() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_DISCORD_TOKEN
+                default_agent: assistant"#,
+            None,
         )
         .replace(
             "agents:\n  assistant:",
@@ -1364,11 +1373,6 @@ fn discord_bots_preserve_secret_refs_on_save() {
             token: Some(lit_val("DISCORD_BOT_TOKEN", "secret-bot-token")),
             file_token: Some(lit_yaml("DISCORD_BOT_TOKEN")),
             default_agent: super::AgentId::new("assistant"),
-            channels: Some(
-                [(123456u64, super::DiscordChannelConfig::default())]
-                    .into_iter()
-                    .collect(),
-            ),
         },
     );
 
@@ -1378,6 +1382,11 @@ fn discord_bots_preserve_secret_refs_on_save() {
         super::ChannelConfig {
             enabled: Some(true),
             discord_bots: Some(discord_bots),
+            discord_channels: Some(
+                [(123456u64, super::DiscordChannelConfig::default())]
+                    .into_iter()
+                    .collect(),
+            ),
             ..Default::default()
         },
     );
@@ -1435,13 +1444,14 @@ fn discord_bots_returns_only_channel_bots_with_token() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-      no_token_bot:
-        default_agent: reviewer"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant
+              no_token_bot:
+                default_agent: reviewer"#,
+            None,
         ),
     );
 
@@ -1463,16 +1473,17 @@ fn discord_bots_sort_by_bot_id() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      zeta:
-        token:
-          source: env
-          id: T1
-        default_agent: assistant
-      alpha:
-        token:
-          source: env
-          id: T2
-        default_agent: assistant"#,
+              zeta:
+                token:
+                  source: env
+                  id: T1
+                default_agent: assistant
+              alpha:
+                token:
+                  source: env
+                  id: T2
+                default_agent: assistant"#,
+            None,
         ),
     );
 
@@ -1530,11 +1541,12 @@ fn discord_bot_channels_defaults_to_none() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            None,
         ),
     );
 
@@ -1542,7 +1554,7 @@ fn discord_bot_channels_defaults_to_none() {
     let bots = config.discord_bots();
 
     assert_eq!(bots.len(), 1);
-    assert!(bots[0].channels.is_empty());
+    assert!(config.discord_channels().is_empty());
 }
 
 #[test]
@@ -1555,14 +1567,15 @@ fn discord_bot_channel_agents_are_preserved() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-        channels:
-          "42":
-            agents: [reviewer]"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            Some(
+                r#"      "42":
+          agents: [reviewer]"#,
+            ),
         ),
     );
 
@@ -1570,7 +1583,7 @@ fn discord_bot_channel_agents_are_preserved() {
     let bots = config.discord_bots();
 
     assert_eq!(bots.len(), 1);
-    let channels = &bots[0].channels;
+    let channels = config.discord_channels();
     assert_eq!(
         channels.get(&42).map(|c| &c.agents),
         Some(&vec![super::AgentId::new("reviewer")])
@@ -1663,28 +1676,24 @@ fn discord_channels_parses_null_value() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-        channels:
-          "123":"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            Some(
+                r#"      "123":
+"#,
+            ),
         ),
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
     let discord = config.channels.get("discord").expect("discord");
-    let bot = discord
-        .discord_bots
-        .as_ref()
-        .expect("bots")
-        .get("main")
-        .expect("main");
-    let channels = bot.channels.as_ref().expect("channels");
+    let channels = discord.discord_channels.as_ref().expect("channels");
     let ch = channels.get(&123u64).expect("channel 123");
     assert!(!ch.require_mention);
-    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
+    assert_eq!(ch.agents, vec![]);
     assert!(!ch.multi_agent);
 }
 
@@ -1698,27 +1707,22 @@ fn discord_channels_parses_require_mention() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-        channels:
-          "123":
-            require_mention: true"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            Some(
+                r#"      "123":
+          require_mention: true"#,
+            ),
         ),
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
     let discord = config.channels.get("discord").expect("discord");
-    let bot = discord
-        .discord_bots
-        .as_ref()
-        .expect("bots")
-        .get("main")
-        .expect("main");
-    let ch = bot
-        .channels
+    let ch = discord
+        .discord_channels
         .as_ref()
         .expect("channels")
         .get(&123u64)
@@ -1736,27 +1740,22 @@ fn discord_channels_parses_agent_override() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-        channels:
-          "123":
-            agents: [reviewer]"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            Some(
+                r#"      "123":
+          agents: [reviewer]"#,
+            ),
         ),
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
     let discord = config.channels.get("discord").expect("discord");
-    let bot = discord
-        .discord_bots
-        .as_ref()
-        .expect("bots")
-        .get("main")
-        .expect("main");
-    let ch = bot
-        .channels
+    let ch = discord
+        .discord_channels
         .as_ref()
         .expect("channels")
         .get(&123u64)
@@ -1774,28 +1773,23 @@ fn discord_channels_empty_means_no_guild_allowed() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            None,
         ),
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
 
     let discord = config.channels.get("discord").expect("discord");
-    let bot = discord
-        .discord_bots
-        .as_ref()
-        .expect("bots")
-        .get("main")
-        .expect("main");
-    assert!(bot.channels.is_none());
+    assert!(discord.discord_channels.is_none());
 
     let bots = config.discord_bots();
     assert_eq!(bots.len(), 1);
-    assert!(bots[0].channels.is_empty());
+    assert!(config.discord_channels().is_empty());
 }
 
 #[test]
@@ -1879,13 +1873,12 @@ fn discord_channels_invalid_key_not_u64() {
         &temp_dir,
         &bot_config_yml(
             r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-        default_agent: assistant
-        channels:
-          "not_a_number": {}"#,
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN
+                default_agent: assistant"#,
+            Some(r#"      "not_a_number": {}"#),
         ),
     );
 
@@ -1893,8 +1886,8 @@ fn discord_channels_invalid_key_not_u64() {
     assert!(
         matches!(
             error,
-            ConfigError::InvalidChannelsKey { ref bot_id, ref key }
-                if bot_id == "main" && key == "not_a_number"
+            ConfigError::InvalidChannelsKey { ref key }
+                if key == "not_a_number"
         ),
         "expected InvalidChannelsKey, got {error:?}"
     );
