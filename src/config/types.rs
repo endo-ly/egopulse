@@ -90,12 +90,11 @@ pub(crate) struct TelegramChatConfig {
 /// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
 ///
 /// Each bot connects to Discord with its own token and routes messages to agents
-/// based on per-channel config or falls back to `default_agent`.
+/// based on per-channel config or falls back to the global `default_agent`.
 #[derive(Clone)]
 pub(crate) struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<yaml_serde::Value>,
-    pub default_agent: AgentId,
     /// Per-channel configuration keyed by Discord channel ID.
     /// `None` means no channels are explicitly configured.
     pub channels: Option<HashMap<u64, DiscordChannelConfig>>,
@@ -105,7 +104,6 @@ impl std::fmt::Debug for DiscordBotConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscordBotConfig")
             .field("token", &debug_secret(self.token.as_ref()))
-            .field("default_agent", &self.default_agent)
             .field("channels", &self.channels)
             .finish()
     }

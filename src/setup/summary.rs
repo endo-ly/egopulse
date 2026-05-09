@@ -202,7 +202,6 @@ pub(crate) fn save_config(
                     discord_bot_token,
                 )),
                 file_token: Some(yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
-                default_agent: crate::config::AgentId::new("default"),
                 channels: None,
             },
         );

@@ -349,6 +349,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
     #[cfg(feature = "channel-discord")]
     {
+        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .discord_bots()
@@ -357,7 +358,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                 (
                     b.bot_id.clone(),
                     b.token.to_string(),
-                    b.default_agent.clone(),
+                    default_agent.clone(),
                     b.channels.clone(),
                 )
             })

@@ -343,7 +343,6 @@ impl Config {
                 Some(DiscordBotRuntime {
                     bot_id,
                     token: token.value(),
-                    default_agent: &bot.default_agent,
                     channels,
                 })
             })
@@ -358,7 +357,6 @@ impl Config {
 pub(crate) struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
-    pub default_agent: &'a AgentId,
     /// Per-channel configuration. Empty map means no guild messages are allowed (DM-only).
     pub channels: HashMap<u64, DiscordChannelConfig>,
 }

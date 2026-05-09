@@ -21,7 +21,6 @@ struct SerializableDiscordBot {
         serialize_with = "serialize_optional_yaml_value"
     )]
     token: Option<yaml_serde::Value>,
-    default_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     channels: Option<HashMap<String, SerializableDiscordChannel>>,
 }
@@ -222,7 +221,6 @@ impl From<&Config> for SerializableConfig {
                                         bot_id.to_string(),
                                         SerializableDiscordBot {
                                             token: bot.file_token.clone(),
-                                            default_agent: bot.default_agent.to_string(),
                                             channels: bot.channels.as_ref().map(|ch_map| {
                                                 ch_map
                                                     .iter()
@@ -651,7 +649,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "bot-secret-123")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
+
                     channels: Some(
                         [
                             (111u64, crate::config::DiscordChannelConfig::default()),
@@ -673,10 +671,6 @@ channels:
         let bots = loaded.discord_bots();
         assert_eq!(bots.len(), 1);
         assert_eq!(*bots[0].bot_id, BotId::new("main"));
-        assert_eq!(
-            *bots[0].default_agent,
-            crate::config::AgentId::new("default")
-        );
         assert_eq!(bots[0].channels.len(), 2);
         assert!(bots[0].channels.contains_key(&111));
         assert!(bots[0].channels.contains_key(&222));
@@ -705,7 +699,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
+
                     channels: Some(
                         [(
                             111u64,
@@ -759,7 +753,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
+
                     channels: Some(
                         [(
                             111u64,
@@ -817,7 +811,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
+
                     channels: None,
                 },
             );
@@ -861,7 +855,7 @@ channels:
                 DiscordBotConfig {
                     token: Some(env_resolved_value("MY_DISCORD_BOT_TOKEN", "tok")),
                     file_token: Some(env_yaml_value("MY_DISCORD_BOT_TOKEN")),
-                    default_agent: crate::config::AgentId::new("default"),
+
                     channels: Some(
                         [(
                             111u64,

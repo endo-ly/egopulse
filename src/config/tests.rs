@@ -836,7 +836,6 @@ fn loads_discord_bots_with_default_agent() {
     assert_eq!(bots.len(), 1);
 
     let main_bot = bots.get("main").expect("main bot");
-    assert_eq!(main_bot.default_agent.as_str(), "assistant");
     assert_eq!(
         main_bot.token.as_ref().expect("token").value(),
         "discord-bot-token-123"
@@ -848,36 +847,6 @@ fn loads_discord_bots_with_default_agent() {
     assert_eq!(
         channels.get(&444555666u64).map(|c| &c.agents),
         Some(&vec![super::AgentId::new("reviewer")])
-    );
-}
-
-#[test]
-#[serial]
-fn discord_bots_validate_default_agent_exists() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: nonexistent_agent"#,
-        ),
-    );
-
-    let error = Config::load(Some(&file_path)).expect_err("should fail");
-
-    assert!(
-        matches!(
-            error,
-            ConfigError::DiscordBotDefaultAgentNotFound { ref bot_id, ref agent_id }
-                if bot_id == "main" && agent_id == "nonexistent_agent"
-        ),
-        "expected DiscordBotDefaultAgentNotFound, got {error:?}"
     );
 }
 
@@ -911,34 +880,6 @@ fn discord_bots_validate_channel_agents_exist() {
                 if bot_id == "main" && agent_id == "ghost_agent"
         ),
         "expected DiscordBotChannelAgentNotFound, got {error:?}"
-    );
-}
-
-#[test]
-#[serial]
-fn discord_bots_require_default_agent() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_DISCORD_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-      main:
-        token:
-          source: env
-          id: MY_DISCORD_TOKEN"#,
-        ),
-    );
-
-    let error = Config::load(Some(&file_path)).expect_err("should fail");
-
-    assert!(
-        matches!(
-            error,
-            ConfigError::MissingDiscordBotDefaultAgent { ref bot_id } if bot_id == "main"
-        ),
-        "expected MissingDiscordBotDefaultAgent, got {error:?}"
     );
 }
 
@@ -1363,7 +1304,6 @@ fn discord_bots_preserve_secret_refs_on_save() {
         super::DiscordBotConfig {
             token: Some(lit_val("DISCORD_BOT_TOKEN", "secret-bot-token")),
             file_token: Some(lit_yaml("DISCORD_BOT_TOKEN")),
-            default_agent: super::AgentId::new("assistant"),
             channels: Some(
                 [(123456u64, super::DiscordChannelConfig::default())]
                     .into_iter()
