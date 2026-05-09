@@ -94,7 +94,7 @@ pub(crate) struct TelegramChatConfig {
 #[derive(Clone)]
 pub(crate) struct DiscordBotConfig {
     pub token: Option<ResolvedValue>,
-    pub file_token: Option<serde_yml::Value>,
+    pub file_token: Option<yaml_serde::Value>,
     pub default_agent: AgentId,
     /// Per-channel configuration keyed by Discord channel ID.
     /// `None` means no channels are explicitly configured.
@@ -119,10 +119,10 @@ pub(crate) struct ChannelConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub auth_token: Option<ResolvedValue>,
-    pub file_auth_token: Option<serde_yml::Value>,
+    pub file_auth_token: Option<yaml_serde::Value>,
     pub allowed_origins: Option<Vec<String>>,
     pub bot_token: Option<ResolvedValue>,
-    pub file_bot_token: Option<serde_yml::Value>,
+    pub file_bot_token: Option<yaml_serde::Value>,
     pub bot_username: Option<String>,
     pub soul_path: Option<String>,
     /// Per-chat Telegram configuration keyed by chat ID.

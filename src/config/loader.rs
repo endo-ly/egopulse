@@ -263,7 +263,7 @@ fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: PathBuf::from(path),
         source,
     })?;
-    serde_yml::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+    yaml_serde::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
         path: PathBuf::from(path),
         detail: source.to_string(),
     })
@@ -285,14 +285,14 @@ fn normalize_channels(
 
         let file_auth_token = resolved_auth.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }
         });
         let file_bot_token = resolved_bot.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }
@@ -399,7 +399,7 @@ fn normalize_discord_bots(
         let resolved_token = resolve_string_or_ref(fb.token, dotenv)?;
         let file_token = resolved_token.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
-                serde_yml::Value::String(rv.value().to_string())
+                yaml_serde::Value::String(rv.value().to_string())
             } else {
                 rv.to_yaml_value()
             }

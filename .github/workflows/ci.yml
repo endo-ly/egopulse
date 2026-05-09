@@ -42,3 +42,21 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Print coverage summary
+        run: cargo llvm-cov --summary-only
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Check vulnerabilities
+        # rustls-webpki 0.102.x (serenity transitive dep) has 4 unfixable advisories.
+        # serenity 0.12.x pins tokio-tungstenite 0.21 → rustls 0.22 → rustls-webpki 0.102.
+        # Fix requires serenity upstream update — tracked in serenity#XXXX.
+        run: cargo audit --ignore RUSTSEC-2026-0049 --ignore RUSTSEC-2026-0098 --ignore RUSTSEC-2026-0099 --ignore RUSTSEC-2026-0104
+
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps

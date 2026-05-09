@@ -615,7 +615,7 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                file_bot_token: Some(serde_yml::Value::String("sk-secret-token-123".to_string())),
+                file_bot_token: Some(yaml_serde::Value::String("sk-secret-token-123".to_string())),
                 ..Default::default()
             },
         );
@@ -720,7 +720,9 @@ mod tests {
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                file_auth_token: Some(serde_yml::Value::String("sk-multimodal-secret".to_string())),
+                file_auth_token: Some(yaml_serde::Value::String(
+                    "sk-multimodal-secret".to_string(),
+                )),
                 ..Default::default()
             },
         );

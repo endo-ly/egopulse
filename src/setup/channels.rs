@@ -34,7 +34,7 @@ pub(crate) fn update_field_visibility(fields: &mut [Field]) {
 }
 
 pub(crate) fn load_channel_fields(
-    channels: &serde_yml::Value,
+    channels: &yaml_serde::Value,
     result: &mut HashMap<String, String>,
 ) {
     let Some(ch_map) = channels.as_mapping() else {
@@ -74,12 +74,12 @@ pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<Strin
 }
 
 pub(crate) fn extract_existing_state_root(
-    original_yaml: &Option<serde_yml::Value>,
+    original_yaml: &Option<yaml_serde::Value>,
 ) -> Option<String> {
     original_yaml
         .as_ref()
         .and_then(|v| v.as_mapping())
-        .and_then(|m| m.get(serde_yml::Value::String("state_root".into())))
+        .and_then(|m| m.get(yaml_serde::Value::String("state_root".into())))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -145,19 +145,19 @@ pub(crate) fn generate_auth_token() -> String {
     STANDARD.encode(&bytes)
 }
 
-fn yaml_key(value: &str) -> serde_yml::Value {
-    serde_yml::Value::String(value.into())
+fn yaml_key(value: &str) -> yaml_serde::Value {
+    yaml_serde::Value::String(value.into())
 }
 
 fn channel_mapping<'a>(
-    channels: &'a serde_yml::Mapping,
+    channels: &'a yaml_serde::Mapping,
     channel: &str,
-) -> Option<&'a serde_yml::Mapping> {
+) -> Option<&'a yaml_serde::Mapping> {
     channels.get(yaml_key(channel))?.as_mapping()
 }
 
 fn insert_channel_bool(
-    channels: &serde_yml::Mapping,
+    channels: &yaml_serde::Mapping,
     channel: &str,
     key: &str,
     result: &mut HashMap<String, String>,
@@ -174,7 +174,7 @@ fn insert_channel_bool(
 }
 
 fn insert_channel_string(
-    channels: &serde_yml::Mapping,
+    channels: &yaml_serde::Mapping,
     channel: &str,
     key: &str,
     result: &mut HashMap<String, String>,
@@ -205,7 +205,7 @@ mod tests {
         );
 
         let web = channels.get("web").expect("web");
-        let web_file = serde_yml::to_string(web.file_auth_token.as_ref().expect("web file"))
+        let web_file = yaml_serde::to_string(web.file_auth_token.as_ref().expect("web file"))
             .expect("serialize web file");
         assert!(web_file.contains("source: env"));
         assert!(web_file.contains("id: WEB_AUTH_TOKEN"));
@@ -216,7 +216,7 @@ mod tests {
 
         let telegram = channels.get("telegram").expect("telegram");
         let telegram_file =
-            serde_yml::to_string(telegram.file_bot_token.as_ref().expect("telegram file"))
+            yaml_serde::to_string(telegram.file_bot_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");
         assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
     }

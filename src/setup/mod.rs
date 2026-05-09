@@ -80,7 +80,7 @@ pub(crate) struct SetupApp {
     pub backup_path: Option<String>,
     pub completion_summary: Vec<String>,
     pub config_path: PathBuf,
-    pub original_yaml: Option<serde_yml::Value>,
+    pub original_yaml: Option<yaml_serde::Value>,
 }
 
 impl SetupApp {
@@ -217,7 +217,7 @@ impl SetupApp {
 
     fn load_existing_config(
         config_path: &Path,
-    ) -> (HashMap<String, String>, Option<serde_yml::Value>) {
+    ) -> (HashMap<String, String>, Option<yaml_serde::Value>) {
         let mut result = HashMap::new();
 
         let contents = match fs::read_to_string(config_path) {
@@ -225,32 +225,32 @@ impl SetupApp {
             Err(_) => return (result, None),
         };
 
-        let parsed: serde_yml::Value = match serde_yml::from_str(&contents) {
+        let parsed: yaml_serde::Value = match yaml_serde::from_str(&contents) {
             Ok(v) => v,
             Err(_) => return (result, None),
         };
 
         if let Some(map) = parsed.as_mapping() {
             if let Some(default_provider) = map
-                .get(serde_yml::Value::String("default_provider".into()))
+                .get(yaml_serde::Value::String("default_provider".into()))
                 .and_then(|value| value.as_str())
             {
                 let provider_id = normalize_provider_id(default_provider);
                 result.insert("PROVIDER".into(), provider_id.clone());
                 if let Some(top_level_model) = map
-                    .get(serde_yml::Value::String("default_model".into()))
+                    .get(yaml_serde::Value::String("default_model".into()))
                     .and_then(|v| v.as_str())
                 {
                     result.insert("MODEL".into(), top_level_model.to_string());
                 } else if let Some(providers) = map
-                    .get(serde_yml::Value::String("providers".into()))
+                    .get(yaml_serde::Value::String("providers".into()))
                     .and_then(|value| value.as_mapping())
                     && let Some(provider) = providers
-                        .get(serde_yml::Value::String(default_provider.into()))
+                        .get(yaml_serde::Value::String(default_provider.into()))
                         .and_then(|value| value.as_mapping())
                 {
                     if let Some(model) = provider
-                        .get(serde_yml::Value::String("default_model".into()))
+                        .get(yaml_serde::Value::String("default_model".into()))
                         .and_then(|value| value.as_str())
                     {
                         result.insert("MODEL".into(), model.to_string());
@@ -258,7 +258,7 @@ impl SetupApp {
                         result.insert("MODEL".into(), model.to_string());
                     }
                     if let Some(base_url) = provider
-                        .get(serde_yml::Value::String("base_url".into()))
+                        .get(yaml_serde::Value::String("base_url".into()))
                         .and_then(|value| value.as_str())
                     {
                         result.insert("BASE_URL".into(), base_url.to_string());
@@ -266,7 +266,7 @@ impl SetupApp {
                         result.insert("BASE_URL".into(), base_url.to_string());
                     }
                     if let Some(api_key) = provider
-                        .get(serde_yml::Value::String("api_key".into()))
+                        .get(yaml_serde::Value::String("api_key".into()))
                         .and_then(|value| value.as_str())
                     {
                         result.insert("API_KEY".into(), api_key.to_string());
@@ -274,7 +274,7 @@ impl SetupApp {
                 }
             }
 
-            if let Some(channels) = map.get(serde_yml::Value::String("channels".into())) {
+            if let Some(channels) = map.get(yaml_serde::Value::String("channels".into())) {
                 load_channel_fields(channels, &mut result);
             }
 

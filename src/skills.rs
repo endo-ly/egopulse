@@ -279,7 +279,7 @@ fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, Stri
     let end = rest.find("\n---")?;
     let frontmatter = &rest[..end];
     let body = rest[end + 4..].trim().to_string();
-    let parsed: SkillFrontmatter = serde_yml::from_str(frontmatter).ok()?;
+    let parsed: SkillFrontmatter = yaml_serde::from_str(frontmatter).ok()?;
     let name = parsed.name?.trim().to_string();
     if name.is_empty() {
         return None;
