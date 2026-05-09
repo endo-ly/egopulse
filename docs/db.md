@@ -31,7 +31,7 @@ egopulse.db (SQLite / WAL mode)
 | テーブル数 | 9（データテーブル 7 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 10 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v7） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v8） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -157,6 +157,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 - `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
 - `count_agent_messages_since(agent_id, since: Option<&str>)` — agent の新規メッセージ数をカウント（JOIN messages + chats）
 - `get_agent_sessions_since(agent_id, since: Option<&str>, limit)` — agent のセッション一覧を updated_at 降順で取得（JOIN chats + sessions）。message_count と estimated_tokens（chars/3 近似）を含む
+
+#### Channel Log (Multi-Agent Room)
+
+Multi-Agent Room では共有の Channel Log チャットが作成される。
+
+- `external_chat_id`: `discord:{channel_id}:multi-room-log`
+- `chat_type`: `channel_log`
+- `agent_id`: `""`（空文字）
+- `session` 行は持たない（`messages` テーブルのみ使用）
+- `resolve_channel_log_chat_id(channel_id)` で作成・取得
+- `get_channel_log_messages(chat_id, limit)` で直近 N 件を取得
 
 ---
 
@@ -500,7 +511,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `7`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `8`）に到達したら完了。`debug_assert_eq!` で検証
 
 **新規マイグレーションの追加手順**:
 1. `SCHEMA_VERSION` 定数をインクリメント（例: `5` → `6`）
@@ -564,6 +575,21 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 //     version = 4;
 // }
 ```
+
+#### v8: remove bot_id from Discord session external_chat_id
+
+Discord Multi-Agent Room の二層セッションアーキテクチャ導入に伴い、`chats.external_chat_id` から `:bot:<bot_id>` セグメントを除去する。
+
+**変換例**: `discord:123:bot:main:agent:lyre` → `discord:123:agent:lyre`
+
+**対象**: `channel = 'discord'` かつ `external_chat_id LIKE '%:bot:%:agent:%'` のレコード
+
+**処理**:
+1. `pragma_table_info` で `external_chat_id` カラムの存在を確認（v1 DB からの段階的マイグレーション対応）
+2. 対象レコードをフェッチし、Rust 側で `:bot:<bot_id>` セグメントを除去
+3. `UPDATE chats SET external_chat_id = ? WHERE rowid = ?`
+
+**非対象**: `channel != 'discord'` のレコード、既に新形式のレコードは変更なし
 
 **特徴**:
 - 外部ファイル（SQL マイグレーションファイル）なし。DDL は Rust コードに直接埋め込み
