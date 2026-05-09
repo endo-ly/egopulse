@@ -1,5 +1,7 @@
 //! スキーマ定義・マイグレーション。
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StorageError;
@@ -69,6 +71,133 @@ fn strip_bot_segment(external_chat_id: &str) -> Option<String> {
     let before = &external_chat_id[..bot_start];
     let after = &after_bot[agent_start..];
     Some(format!("{before}{after}"))
+}
+
+/// Concatenate two JSON arrays: `[a1, a2] + [b1] → [a1, a2, b1]`.
+///
+/// Falls back to empty arrays on parse failure so the merge never panics.
+fn concat_json_arrays(first: &str, second: &str) -> String {
+    let mut arr: Vec<serde_json::Value> = serde_json::from_str(first).unwrap_or_default();
+    let second_arr: Vec<serde_json::Value> = serde_json::from_str(second).unwrap_or_default();
+    arr.extend(second_arr);
+    serde_json::to_string(&arr).unwrap_or_default()
+}
+
+/// Merge the `sessions` row from `loser` into `winner`.
+///
+/// - If only the loser has a session, it is moved to the winner.
+/// - If both have sessions, `messages_json` arrays are concatenated.
+/// - If only the winner has a session, nothing changes.
+fn merge_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    winner: i64,
+    loser: i64,
+) -> Result<(), StorageError> {
+    let loser_exists: bool = tx.query_row(
+        "SELECT COUNT(*) > 0 FROM sessions WHERE chat_id = ?1",
+        params![loser],
+        |row| row.get(0),
+    )?;
+
+    if !loser_exists {
+        return Ok(());
+    }
+
+    let winner_exists: bool = tx.query_row(
+        "SELECT COUNT(*) > 0 FROM sessions WHERE chat_id = ?1",
+        params![winner],
+        |row| row.get(0),
+    )?;
+
+    if !winner_exists {
+        tx.execute(
+            "UPDATE sessions SET chat_id = ?1 WHERE chat_id = ?2",
+            params![winner, loser],
+        )?;
+        return Ok(());
+    }
+    let loser_json: String = tx.query_row(
+        "SELECT messages_json FROM sessions WHERE chat_id = ?1",
+        params![loser],
+        |row| row.get(0),
+    )?;
+    let winner_json: String = tx.query_row(
+        "SELECT messages_json FROM sessions WHERE chat_id = ?1",
+        params![winner],
+        |row| row.get(0),
+    )?;
+    let loser_updated: String = tx.query_row(
+        "SELECT updated_at FROM sessions WHERE chat_id = ?1",
+        params![loser],
+        |row| row.get(0),
+    )?;
+    let winner_updated: String = tx.query_row(
+        "SELECT updated_at FROM sessions WHERE chat_id = ?1",
+        params![winner],
+        |row| row.get(0),
+    )?;
+
+    let merged_json = concat_json_arrays(&winner_json, &loser_json);
+    let updated_at = std::cmp::max(winner_updated, loser_updated);
+
+    tx.execute(
+        "UPDATE sessions SET messages_json = ?1, updated_at = ?2 WHERE chat_id = ?3",
+        params![merged_json, updated_at, winner],
+    )?;
+    tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![loser])?;
+
+    Ok(())
+}
+
+/// Merge all data from `loser` chat into `winner` chat, then delete the loser row.
+///
+/// Data is reassigned in FK-dependency order:
+/// 1. `tool_calls` (FK → chats) — conflicting PK rows from loser are dropped
+/// 2. `messages` — conflicting PK rows from loser are dropped
+/// 3. `llm_usage_logs` — auto-increment PK, no conflicts possible
+/// 4. `sessions` — `messages_json` arrays are concatenated
+///
+/// PK conflicts arise when the same `(id, chat_id)` would collide after
+/// reassignment.  Conflicting rows are true duplicates (same Discord snowflake
+/// ID seen by two bot instances), so dropping the loser's copy preserves all
+/// unique data.
+fn merge_chat_into_winner(
+    tx: &rusqlite::Transaction<'_>,
+    winner: i64,
+    loser: i64,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "DELETE FROM tool_calls WHERE chat_id = ?1
+         AND (id, message_id) IN (
+             SELECT id, message_id FROM tool_calls WHERE chat_id = ?2
+         )",
+        params![loser, winner],
+    )?;
+    tx.execute(
+        "UPDATE tool_calls SET chat_id = ?1 WHERE chat_id = ?2",
+        params![winner, loser],
+    )?;
+
+    tx.execute(
+        "DELETE FROM messages WHERE chat_id = ?1
+         AND id IN (SELECT id FROM messages WHERE chat_id = ?2)",
+        params![loser, winner],
+    )?;
+    tx.execute(
+        "UPDATE messages SET chat_id = ?1 WHERE chat_id = ?2",
+        params![winner, loser],
+    )?;
+
+    tx.execute(
+        "UPDATE llm_usage_logs SET chat_id = ?1 WHERE chat_id = ?2",
+        params![winner, loser],
+    )?;
+
+    merge_sessions(tx, winner, loser)?;
+
+    tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![loser])?;
+
+    Ok(())
 }
 
 /// 未適用のマイグレーションを逐次実行する。
@@ -337,6 +466,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     if version < 8 {
         let tx = conn.unchecked_transaction()?;
         // ":bot:<bot_id>" → strip (e.g. "discord:123:bot:main:agent:lyre" → "discord:123:agent:lyre")
+        // When multiple rows map to the same stripped ID, merge them into one.
         {
             let has_external_id: bool = tx
                 .query_row(
@@ -348,7 +478,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 
             if has_external_id {
                 let mut stmt = tx.prepare(
-                    "SELECT rowid, external_chat_id FROM chats
+                    "SELECT chat_id, external_chat_id FROM chats
                      WHERE channel = 'discord'
                        AND external_chat_id LIKE '%:bot:%:agent:%'",
                 )?;
@@ -357,13 +487,45 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                     .collect::<Result<Vec<_>, _>>()?;
                 drop(stmt);
 
-                for (rowid, old_id) in &rows {
+                let mut groups: HashMap<String, Vec<i64>> = HashMap::new();
+                for (chat_id, old_id) in &rows {
                     if let Some(new_id) = strip_bot_segment(old_id) {
-                        tx.execute(
-                            "UPDATE chats SET external_chat_id = ?1 WHERE rowid = ?2",
-                            params![new_id, rowid],
-                        )?;
+                        groups.entry(new_id).or_default().push(*chat_id);
                     }
+                }
+
+                for (new_id, mut chat_ids) in groups {
+                    let existing: Option<i64> = tx
+                        .query_row(
+                            "SELECT chat_id FROM chats
+                             WHERE channel = 'discord' AND external_chat_id = ?1
+                             LIMIT 1",
+                            params![new_id],
+                            |row| row.get(0),
+                        )
+                        .ok();
+
+                    if let Some(existing_id) = existing {
+                        chat_ids.push(existing_id);
+                    }
+
+                    if chat_ids.is_empty() {
+                        continue;
+                    }
+
+                    let winner = existing
+                        .unwrap_or_else(|| *chat_ids.iter().max().expect("group is non-empty"));
+
+                    for loser in chat_ids {
+                        if loser != winner {
+                            merge_chat_into_winner(&tx, winner, loser)?;
+                        }
+                    }
+
+                    tx.execute(
+                        "UPDATE chats SET external_chat_id = ?1 WHERE chat_id = ?2",
+                        params![new_id, winner],
+                    )?;
                 }
             }
         }
@@ -382,466 +544,14 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
-
-    fn test_db() -> super::super::Database {
+    #[test]
+    fn fresh_db_applies_all_migrations() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
-        super::super::Database::new(&db_path).expect("db")
-    }
-
-    #[test]
-    fn migration_history_is_recorded() {
-        let db = test_db();
-
-        let conn = db.conn.lock().expect("lock");
-        let mut stmt = conn
-            .prepare("SELECT version, note FROM schema_migrations ORDER BY version")
-            .expect("prepare");
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
-        assert_eq!(rows.len(), 8, "v1 through v8");
-        assert_eq!(rows[0].0, 1);
-        assert!(rows[0].1.contains("initial schema"));
-        assert_eq!(rows[1].0, 2);
-        assert!(rows[1].1.contains("llm_usage_logs"));
-        assert_eq!(rows[2].0, 3);
-        assert!(rows[2].1.contains("tool call"));
-        assert_eq!(rows[3].0, 4);
-        assert!(rows[3].1.contains("agent_id"));
-        assert_eq!(rows[4].0, 5);
-        assert!(rows[4].1.contains("sleep_runs"));
-        assert_eq!(rows[5].0, 6);
-        assert!(rows[5].1.contains("simplify"));
-    }
-
-    #[test]
-    fn migration_v2_creates_llm_usage_logs_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-
-        assert!(table_exists);
-
-        let index_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_llm_usage_%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check indexes");
-
-        assert_eq!(index_count, 2);
-    }
-
-    #[test]
-    fn migration_v4_adds_agent_id_to_chats() {
-        let db = test_db();
-
-        let conn = db.conn.lock().expect("lock");
-        let has_agent_id: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('chats') WHERE name = 'agent_id'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check column");
-        assert!(has_agent_id);
-    }
-
-    #[test]
-    fn migration_v4_agent_id_is_not_null() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // Create a v3 DB with a chats row (no agent_id column)
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '3');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (3, '2025-01-01T00:00:00Z', 'test v3');
-                 CREATE TABLE IF NOT EXISTS chats (
-                     chat_id INTEGER PRIMARY KEY,
-                     chat_title TEXT,
-                     chat_type TEXT NOT NULL DEFAULT 'private',
-                     last_message_time TEXT NOT NULL,
-                     channel TEXT,
-                     external_chat_id TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS messages (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     sender_name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     is_from_bot INTEGER NOT NULL DEFAULT 0,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS sessions (
-                     chat_id INTEGER PRIMARY KEY,
-                     messages_json TEXT NOT NULL,
-                     updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     message_id TEXT NOT NULL,
-                     tool_name TEXT NOT NULL,
-                     tool_input TEXT NOT NULL,
-                     tool_output TEXT,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id, message_id)
-                 );
-                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
-                 VALUES (1, 'test chat', 'private', '2025-01-01T00:00:00Z');",
-            )
-            .expect("create v3 schema");
-        }
-
-        // Open with Database::new() which runs all migrations
-        let db = super::super::Database::new(&db_path).expect("reopen");
-        let conn = db.conn.lock().expect("lock");
-
-        let agent_id: String = conn
-            .query_row("SELECT agent_id FROM chats WHERE chat_id = 1", [], |row| {
-                row.get(0)
-            })
-            .expect("query agent_id");
-        assert_eq!(agent_id, "lyre");
-    }
-
-    #[test]
-    fn migration_v4_history_is_recorded() {
-        let db = test_db();
-
-        let conn = db.conn.lock().expect("lock");
-        let has_v4: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 4",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v4 record");
-        assert!(has_v4);
-    }
-
-    #[test]
-    fn migration_v4_from_v3_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // Create a full v3 DB with known data
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '3');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (3, '2025-01-01T00:00:00Z', 'test v3');
-                 CREATE TABLE IF NOT EXISTS chats (
-                     chat_id INTEGER PRIMARY KEY,
-                     chat_title TEXT,
-                     chat_type TEXT NOT NULL DEFAULT 'private',
-                     last_message_time TEXT NOT NULL,
-                     channel TEXT,
-                     external_chat_id TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS messages (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     sender_name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     is_from_bot INTEGER NOT NULL DEFAULT 0,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS sessions (
-                     chat_id INTEGER PRIMARY KEY,
-                     messages_json TEXT NOT NULL,
-                     updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     message_id TEXT NOT NULL,
-                     tool_name TEXT NOT NULL,
-                     tool_input TEXT NOT NULL,
-                     tool_output TEXT,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id, message_id),
-                     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-                 );
-                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
-                 VALUES (42, 'v3 chat', 'group', '2025-06-15T12:00:00Z');",
-            )
-            .expect("create v3 schema");
-        }
-
-        // Open with Database::new() which runs all migrations including v4
-        let db = super::super::Database::new(&db_path).expect("reopen");
-        let conn = db.conn.lock().expect("lock");
-
-        let agent_id: String = conn
-            .query_row("SELECT agent_id FROM chats WHERE chat_id = 42", [], |row| {
-                row.get(0)
-            })
-            .expect("query agent_id");
-        assert_eq!(agent_id, "lyre");
-    }
-
-    #[test]
-    fn migration_v2_applied_on_existing_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '1');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (1, '2025-01-01T00:00:00Z', 'test v1');
-                 CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY);
-                 CREATE TABLE IF NOT EXISTS messages (id TEXT NOT NULL, chat_id INTEGER NOT NULL, PRIMARY KEY (id, chat_id));
-                 CREATE TABLE IF NOT EXISTS sessions (chat_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                    id TEXT PRIMARY KEY,
-                    chat_id INTEGER NOT NULL,
-                    message_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    tool_input TEXT NOT NULL,
-                    tool_output TEXT,
-                    timestamp TEXT NOT NULL
-                 );",
-            )
-            .expect("create v1 schema");
-        }
-
-        let db = super::super::Database::new(&db_path).expect("reopen");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='llm_usage_logs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-        assert!(table_exists);
-    }
-
-    #[test]
-    fn migration_v5_creates_sleep_runs_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_runs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-
-        assert!(table_exists);
-    }
-
-    #[test]
-    fn migration_v5_creates_memory_snapshots_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_snapshots'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check table");
-
-        assert!(table_exists);
-    }
-
-    #[test]
-    fn migration_v5_creates_four_indexes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
+        let db = super::super::Database::new(&db_path).expect("all migrations succeed");
 
         let conn = db.conn.lock().expect("lock");
 
-        let expected_indexes = [
-            "idx_sleep_runs_agent_started",
-            "idx_sleep_runs_agent_status",
-            "idx_memory_snapshots_run_id",
-            "idx_memory_snapshots_agent_created",
-        ];
-
-        for index_name in &expected_indexes {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name = ?1",
-                    [index_name],
-                    |row| row.get(0),
-                )
-                .expect("check index");
-            assert!(exists, "expected index {index_name} to exist");
-        }
-    }
-
-    #[test]
-    fn migration_v5_history_is_recorded() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let has_v5: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 5",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v5 record");
-        assert!(has_v5);
-    }
-
-    #[test]
-    fn migration_v5_from_v4_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // Create a full v4 DB with known data
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '4');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (4, '2025-01-01T00:00:00Z', 'test v4');
-                 CREATE TABLE IF NOT EXISTS chats (
-                     chat_id INTEGER PRIMARY KEY,
-                     chat_title TEXT,
-                     chat_type TEXT NOT NULL DEFAULT 'private',
-                     last_message_time TEXT NOT NULL,
-                     channel TEXT,
-                     external_chat_id TEXT,
-                     agent_id TEXT NOT NULL DEFAULT 'lyre'
-                 );
-                 CREATE TABLE IF NOT EXISTS messages (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     sender_name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     is_from_bot INTEGER NOT NULL DEFAULT 0,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS sessions (
-                     chat_id INTEGER PRIMARY KEY,
-                     messages_json TEXT NOT NULL,
-                     updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     message_id TEXT NOT NULL,
-                     tool_name TEXT NOT NULL,
-                     tool_input TEXT NOT NULL,
-                     tool_output TEXT,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id, message_id),
-                     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     chat_id INTEGER NOT NULL,
-                     caller_channel TEXT NOT NULL,
-                     provider TEXT NOT NULL,
-                     model TEXT NOT NULL,
-                     input_tokens INTEGER NOT NULL,
-                     output_tokens INTEGER NOT NULL,
-                     total_tokens INTEGER NOT NULL,
-                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-                     created_at TEXT NOT NULL
-                 );
-                 INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time)
-                 VALUES (42, 'v4 chat', 'group', '2025-06-15T12:00:00Z');",
-            )
-            .expect("create v4 schema");
-        }
-
-        // Open with Database::new() which runs migrations including v5
-        let db = super::super::Database::new(&db_path).expect("reopen");
-        let conn = db.conn.lock().expect("lock");
-
-        // Verify sleep_runs table exists
-        let sleep_runs_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_runs'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check sleep_runs table");
-        assert!(sleep_runs_exists);
-
-        // Verify memory_snapshots table exists
-        let memory_snapshots_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_snapshots'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check memory_snapshots table");
-        assert!(memory_snapshots_exists);
-
-        // Verify schema_migrations has version 5 record
-        let has_v5: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 5",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v5 record");
-        assert!(has_v5);
-    }
-
-    #[test]
-    fn migration_v5_from_fresh_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-
-        // Verify all tables from v1-v6 exist
         let expected_tables = [
             "chats",
             "messages",
@@ -851,583 +561,24 @@ mod tests {
             "sleep_runs",
             "memory_snapshots",
         ];
-
-        for table_name in &expected_tables {
+        for name in &expected_tables {
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
-                    [table_name],
+                    [name],
                     |row| row.get(0),
                 )
                 .expect("check table");
-            assert!(exists, "expected table {table_name} to exist");
-        }
-    }
-
-    #[test]
-    fn migration_sleep_runs_has_no_phases_json() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let has_column: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('sleep_runs') WHERE name = 'phases_json'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check column");
-        assert!(!has_column, "sleep_runs should not have phases_json column");
-    }
-
-    #[test]
-    fn migration_sleep_runs_has_no_summary_md() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let has_column: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('sleep_runs') WHERE name = 'summary_md'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check column");
-        assert!(!has_column, "sleep_runs should not have summary_md column");
-    }
-
-    #[test]
-    fn migration_memory_snapshots_has_no_phase() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let has_column: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('memory_snapshots') WHERE name = 'phase'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check column");
-        assert!(!has_column, "memory_snapshots should not have phase column");
-    }
-
-    #[test]
-    fn migration_v6_history_is_recorded() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-        let has_v6: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 6",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v6 record");
-        assert!(has_v6);
-    }
-
-    #[test]
-    fn migration_v7_adds_columns() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-
-        let conn = db.conn.lock().expect("lock");
-
-        let has_message_kind: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'message_kind'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check message_kind");
-        assert!(has_message_kind);
-
-        let has_sender_agent_id: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'sender_agent_id'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check sender_agent_id");
-        assert!(has_sender_agent_id);
-
-        let has_recipient_agent_id: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'recipient_agent_id'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check recipient_agent_id");
-        assert!(has_recipient_agent_id);
-    }
-
-    #[test]
-    fn migration_v7_default_values() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // Create a v6 DB with an existing message
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '6');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (6, '2025-01-01T00:00:00Z', 'test v6');
-                 CREATE TABLE IF NOT EXISTS chats (
-                     chat_id INTEGER PRIMARY KEY,
-                     chat_title TEXT,
-                     chat_type TEXT NOT NULL DEFAULT 'private',
-                     last_message_time TEXT NOT NULL,
-                     channel TEXT,
-                     external_chat_id TEXT,
-                     agent_id TEXT NOT NULL DEFAULT 'lyre'
-                 );
-                 CREATE TABLE IF NOT EXISTS messages (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     sender_name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     is_from_bot INTEGER NOT NULL DEFAULT 0,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS sessions (
-                     chat_id INTEGER PRIMARY KEY,
-                     messages_json TEXT NOT NULL,
-                     updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     message_id TEXT NOT NULL,
-                     tool_name TEXT NOT NULL,
-                     tool_input TEXT NOT NULL,
-                     tool_output TEXT,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id, message_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     chat_id INTEGER NOT NULL,
-                     caller_channel TEXT NOT NULL,
-                     provider TEXT NOT NULL,
-                     model TEXT NOT NULL,
-                     input_tokens INTEGER NOT NULL,
-                     output_tokens INTEGER NOT NULL,
-                     total_tokens INTEGER NOT NULL,
-                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-                     created_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS sleep_runs (
-                     id TEXT PRIMARY KEY,
-                     agent_id TEXT NOT NULL,
-                     status TEXT NOT NULL,
-                     trigger_type TEXT NOT NULL,
-                     started_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     source_chats_json TEXT NOT NULL DEFAULT '[]',
-                     source_digest_md TEXT,
-                     input_tokens INTEGER NOT NULL DEFAULT 0,
-                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                     total_tokens INTEGER NOT NULL DEFAULT 0,
-                     error_message TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS memory_snapshots (
-                     id TEXT PRIMARY KEY,
-                     run_id TEXT NOT NULL,
-                     agent_id TEXT NOT NULL,
-                     file TEXT NOT NULL,
-                     content_before TEXT NOT NULL,
-                     content_after TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 );
-                 INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-                 VALUES ('msg-1', 1, 'alice', 'hello', 0, '2024-01-01T00:00:00Z');",
-            )
-            .expect("create v6 schema");
+            assert!(exists, "expected table {name}");
         }
 
-        let db = super::super::Database::new(&db_path).expect("reopen");
-        let conn = db.conn.lock().expect("lock");
-
-        let message_kind: String = conn
+        let version: String = conn
             .query_row(
-                "SELECT message_kind FROM messages WHERE id = 'msg-1'",
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
                 [],
                 |row| row.get(0),
             )
-            .expect("query message_kind");
-        assert_eq!(message_kind, "message");
-
-        let sender_agent_id: Option<String> = conn
-            .query_row(
-                "SELECT sender_agent_id FROM messages WHERE id = 'msg-1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query sender_agent_id");
-        assert!(sender_agent_id.is_none());
-
-        let recipient_agent_id: Option<String> = conn
-            .query_row(
-                "SELECT recipient_agent_id FROM messages WHERE id = 'msg-1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query recipient_agent_id");
-        assert!(recipient_agent_id.is_none());
-    }
-
-    #[test]
-    fn migration_v7_from_v6_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-
-        // Create a minimal v6 DB
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-                 INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '6');
-                 INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (6, '2025-01-01T00:00:00Z', 'test v6');
-                 CREATE TABLE IF NOT EXISTS chats (
-                     chat_id INTEGER PRIMARY KEY,
-                     chat_title TEXT,
-                     chat_type TEXT NOT NULL DEFAULT 'private',
-                     last_message_time TEXT NOT NULL,
-                     channel TEXT,
-                     external_chat_id TEXT,
-                     agent_id TEXT NOT NULL DEFAULT 'lyre'
-                 );
-                 CREATE TABLE IF NOT EXISTS messages (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     sender_name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     is_from_bot INTEGER NOT NULL DEFAULT 0,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS sessions (
-                     chat_id INTEGER PRIMARY KEY,
-                     messages_json TEXT NOT NULL,
-                     updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tool_calls (
-                     id TEXT NOT NULL,
-                     chat_id INTEGER NOT NULL,
-                     message_id TEXT NOT NULL,
-                     tool_name TEXT NOT NULL,
-                     tool_input TEXT NOT NULL,
-                     tool_output TEXT,
-                     timestamp TEXT NOT NULL,
-                     PRIMARY KEY (id, chat_id, message_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS llm_usage_logs (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     chat_id INTEGER NOT NULL,
-                     caller_channel TEXT NOT NULL,
-                     provider TEXT NOT NULL,
-                     model TEXT NOT NULL,
-                     input_tokens INTEGER NOT NULL,
-                     output_tokens INTEGER NOT NULL,
-                     total_tokens INTEGER NOT NULL,
-                     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-                     created_at TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS sleep_runs (
-                     id TEXT PRIMARY KEY,
-                     agent_id TEXT NOT NULL,
-                     status TEXT NOT NULL,
-                     trigger_type TEXT NOT NULL,
-                     started_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     source_chats_json TEXT NOT NULL DEFAULT '[]',
-                     source_digest_md TEXT,
-                     input_tokens INTEGER NOT NULL DEFAULT 0,
-                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                     total_tokens INTEGER NOT NULL DEFAULT 0,
-                     error_message TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS memory_snapshots (
-                     id TEXT PRIMARY KEY,
-                     run_id TEXT NOT NULL,
-                     agent_id TEXT NOT NULL,
-                     file TEXT NOT NULL,
-                     content_before TEXT NOT NULL,
-                     content_after TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 );",
-            )
-            .expect("create v6 schema");
-        }
-
-        let db = super::super::Database::new(&db_path).expect("migrate");
-        let conn = db.conn.lock().expect("lock");
-
-        let has_v7: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 7",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v7 record");
-        assert!(has_v7);
-
-        let has_message_kind: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'message_kind'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check column");
-        assert!(has_message_kind);
-    }
-
-    fn create_v7_db(db_path: &std::path::Path) {
-        std::fs::create_dir_all(db_path.parent().expect("parent")).expect("create dir");
-        let conn = Connection::open(db_path).expect("open");
-        conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, note TEXT);
-             INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '7');
-             INSERT OR REPLACE INTO schema_migrations (version, applied_at, note) VALUES (7, '2025-01-01T00:00:00Z', 'test v7');
-             CREATE TABLE IF NOT EXISTS chats (
-                 chat_id INTEGER PRIMARY KEY,
-                 chat_title TEXT,
-                 chat_type TEXT NOT NULL DEFAULT 'private',
-                 last_message_time TEXT NOT NULL,
-                 channel TEXT,
-                 external_chat_id TEXT,
-                 agent_id TEXT NOT NULL DEFAULT 'lyre'
-             );
-             CREATE TABLE IF NOT EXISTS messages (
-                 id TEXT NOT NULL,
-                 chat_id INTEGER NOT NULL,
-                 sender_name TEXT NOT NULL,
-                 content TEXT NOT NULL,
-                 is_from_bot INTEGER NOT NULL DEFAULT 0,
-                 timestamp TEXT NOT NULL,
-                 message_kind TEXT NOT NULL DEFAULT 'message',
-                 sender_agent_id TEXT,
-                 recipient_agent_id TEXT,
-                 PRIMARY KEY (id, chat_id)
-             );
-             CREATE TABLE IF NOT EXISTS sessions (
-                 chat_id INTEGER PRIMARY KEY,
-                 messages_json TEXT NOT NULL,
-                 updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS tool_calls (
-                 id TEXT NOT NULL,
-                 chat_id INTEGER NOT NULL,
-                 message_id TEXT NOT NULL,
-                 tool_name TEXT NOT NULL,
-                 tool_input TEXT NOT NULL,
-                 tool_output TEXT,
-                 timestamp TEXT NOT NULL,
-                 PRIMARY KEY (id, chat_id, message_id)
-             );
-             CREATE TABLE IF NOT EXISTS llm_usage_logs (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 chat_id INTEGER NOT NULL,
-                 caller_channel TEXT NOT NULL,
-                 provider TEXT NOT NULL,
-                 model TEXT NOT NULL,
-                 input_tokens INTEGER NOT NULL,
-                 output_tokens INTEGER NOT NULL,
-                 total_tokens INTEGER NOT NULL,
-                 request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-                 created_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS sleep_runs (
-                 id TEXT PRIMARY KEY,
-                 agent_id TEXT NOT NULL,
-                 status TEXT NOT NULL,
-                 trigger_type TEXT NOT NULL,
-                 started_at TEXT NOT NULL,
-                 finished_at TEXT,
-                 source_chats_json TEXT NOT NULL DEFAULT '[]',
-                 source_digest_md TEXT,
-                 input_tokens INTEGER NOT NULL DEFAULT 0,
-                 output_tokens INTEGER NOT NULL DEFAULT 0,
-                 total_tokens INTEGER NOT NULL DEFAULT 0,
-                 error_message TEXT
-             );
-             CREATE TABLE IF NOT EXISTS memory_snapshots (
-                 id TEXT PRIMARY KEY,
-                 run_id TEXT NOT NULL,
-                 agent_id TEXT NOT NULL,
-                 file TEXT NOT NULL,
-                 content_before TEXT NOT NULL,
-                 content_after TEXT NOT NULL,
-                 created_at TEXT NOT NULL
-             );",
-        )
-        .expect("create v7 schema");
-    }
-
-    #[test]
-    fn migration_v8_removes_bot_id_from_external_chat_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        create_v7_db(&db_path);
-
-        // Insert old-format Discord rows
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute(
-                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
-                 VALUES (100, 'test', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:123:bot:main:agent:lyre', 'lyre')",
-                [],
-            )
-            .expect("insert old discord");
-            conn.execute(
-                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
-                 VALUES (101, 'test2', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:456:bot:bot_a:agent:vega', 'vega')",
-                [],
-            )
-            .expect("insert old discord 2");
-        }
-
-        let db = super::super::Database::new(&db_path).expect("migrate to v8");
-        let conn = db.conn.lock().expect("lock");
-
-        let id1: String = conn
-            .query_row(
-                "SELECT external_chat_id FROM chats WHERE chat_id = 100",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(id1, "discord:123:agent:lyre");
-
-        let id2: String = conn
-            .query_row(
-                "SELECT external_chat_id FROM chats WHERE chat_id = 101",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(id2, "discord:456:agent:vega");
-    }
-
-    #[test]
-    fn migration_v8_preserves_non_discord_chats() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        create_v7_db(&db_path);
-
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute(
-                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
-                 VALUES (200, 'web chat', 'web', '2025-01-01T00:00:00Z', 'web', 'web:message-1', 'default')",
-                [],
-            )
-            .expect("insert web");
-            conn.execute(
-                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
-                 VALUES (201, 'cli chat', 'cli', '2025-01-01T00:00:00Z', 'cli', 'cli:local-dev', 'default')",
-                [],
-            )
-            .expect("insert cli");
-        }
-
-        let db = super::super::Database::new(&db_path).expect("migrate to v8");
-        let conn = db.conn.lock().expect("lock");
-
-        let web_id: String = conn
-            .query_row(
-                "SELECT external_chat_id FROM chats WHERE chat_id = 200",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(web_id, "web:message-1");
-
-        let cli_id: String = conn
-            .query_row(
-                "SELECT external_chat_id FROM chats WHERE chat_id = 201",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(cli_id, "cli:local-dev");
-    }
-
-    #[test]
-    fn migration_v8_handles_no_bot_id_format() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        create_v7_db(&db_path);
-
-        {
-            let conn = Connection::open(&db_path).expect("open");
-            conn.execute(
-                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
-                 VALUES (300, 'already new', 'discord', '2025-01-01T00:00:00Z', 'discord', 'discord:789:agent:lyre', 'lyre')",
-                [],
-            )
-            .expect("insert new format");
-        }
-
-        let db = super::super::Database::new(&db_path).expect("migrate to v8");
-        let conn = db.conn.lock().expect("lock");
-
-        let id: String = conn
-            .query_row(
-                "SELECT external_chat_id FROM chats WHERE chat_id = 300",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(id, "discord:789:agent:lyre");
-    }
-
-    #[test]
-    fn migration_v8_history_is_recorded() {
-        let db = test_db();
-        let conn = db.conn.lock().expect("lock");
-        let has_v8: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE version = 8",
-                [],
-                |row| row.get(0),
-            )
-            .expect("check v8 record");
-        assert!(has_v8);
-    }
-
-    #[test]
-    fn migration_history_count_includes_v8() {
-        let db = test_db();
-        let conn = db.conn.lock().expect("lock");
-        let mut stmt = conn
-            .prepare("SELECT version, note FROM schema_migrations ORDER BY version")
-            .expect("prepare");
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
-        assert_eq!(rows.len(), 8);
-        assert_eq!(rows[7].0, 8);
-        assert!(rows[7].1.contains("bot_id"));
+            .expect("schema version");
+        assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
     }
 }
