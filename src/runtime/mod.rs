@@ -7,7 +7,7 @@ pub mod logging;
 pub mod status;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -164,6 +164,12 @@ pub async fn build_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.db_path())?);
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
+
+    if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
+    {
+        tracing::warn!("failed to expand built-in skills: {error}");
+    }
+
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir()?,
         config.skills_dir()?,
@@ -257,6 +263,12 @@ pub fn build_sleep_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     let db = Arc::new(Database::new(&config.db_path())?);
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
+
+    if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
+    {
+        tracing::warn!("failed to expand built-in skills: {error}");
+    }
+
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir()?,
         config.skills_dir()?,

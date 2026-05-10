@@ -198,10 +198,18 @@ impl SkillManager {
 
         // Then recursively scan workspace for SKILL.md files.
         let Some(workspace_root) = self.user_skills_dir.parent() else {
+            // Still scan builtin skills even when workspace has no parent
+            if self.builtin_skills_dir != self.user_skills_dir {
+                collect_skill_dirs_direct_children(&self.builtin_skills_dir, &mut candidates);
+            }
             return candidates;
         };
         let Ok(user_skills_dir_canonical) = std::fs::canonicalize(&self.user_skills_dir) else {
             collect_skill_dirs_recursive(workspace_root, &self.user_skills_dir, &mut candidates);
+            // Scan builtin skills even when user skills dir doesn't exist yet
+            if self.builtin_skills_dir != self.user_skills_dir {
+                collect_skill_dirs_direct_children(&self.builtin_skills_dir, &mut candidates);
+            }
             return candidates;
         };
 
@@ -542,5 +550,54 @@ mod tests {
         assert!(formatted.starts_with("Available skills:\n"));
         assert!(formatted.contains("- pdf (Description for pdf)"));
         assert!(formatted.contains("- docx (Description for docx)"));
+    }
+
+    #[test]
+    fn discovers_builtin_skill_after_expand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path();
+        crate::builtin_skills::expand_builtin_skills(state_root).expect("expand");
+
+        let user_skills_dir = state_root.join("workspace").join("skills");
+        let builtin_skills_dir = state_root.join("skills");
+        let manager = SkillManager::from_dirs(&user_skills_dir, builtin_skills_dir);
+
+        let skills = manager.discover_skills();
+        assert!(
+            skills.iter().any(|s| s.name == "egopulse"),
+            "builtin egopulse skill should be discoverable after expand"
+        );
+
+        let loaded = manager
+            .load_skill_checked("egopulse")
+            .expect("load egopulse");
+        assert!(
+            loaded.instructions.contains("EgoPulse"),
+            "loaded instructions should contain EgoPulse"
+        );
+    }
+
+    #[test]
+    fn user_skill_overrides_builtin_with_same_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path();
+        crate::builtin_skills::expand_builtin_skills(state_root).expect("expand");
+
+        let user_skills_dir = state_root.join("workspace").join("skills");
+        let builtin_skills_dir = state_root.join("skills");
+        create_skill(&user_skills_dir, "egopulse", "Custom user override.");
+
+        let manager = SkillManager::from_dirs(&user_skills_dir, builtin_skills_dir);
+
+        let loaded = manager.load_skill_checked("egopulse").expect("load");
+        assert!(
+            loaded.instructions.contains("Custom user override"),
+            "user skill should take priority over builtin"
+        );
+        assert_eq!(
+            loaded.metadata.dir_path,
+            user_skills_dir.join("egopulse"),
+            "loaded skill should come from user skills dir"
+        );
     }
 }

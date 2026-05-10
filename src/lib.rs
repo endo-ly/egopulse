@@ -5,6 +5,7 @@
 
 pub mod agent_loop;
 pub mod assets;
+pub mod builtin_skills;
 pub mod channels;
 pub mod config;
 pub mod error;

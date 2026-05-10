@@ -22,6 +22,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EGOPULSE_RELEASE_TAG");
     println!("cargo:rerun-if-env-changed=NPM");
     ensure_web_assets();
+    ensure_builtin_skills();
 }
 
 fn ensure_web_assets() {
@@ -209,4 +210,101 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_builtin_skills() {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let builtin_dir = out_dir.join("builtin-skills");
+    let target = builtin_dir.join("egopulse");
+
+    if target.exists() {
+        fs::remove_dir_all(&target).unwrap_or_else(|err| {
+            panic!(
+                "failed to clear generated builtin-skills directory {}: {err}",
+                target.display()
+            )
+        });
+    }
+
+    // Copy fixed sources (SKILL.md + references/overview.md)
+    let fixed_source = Path::new("src/assets/builtin-skills/egopulse");
+    copy_dir_all(fixed_source, &target).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy builtin-skills fixed sources from {} to {}: {err}",
+            fixed_source.display(),
+            target.display()
+        )
+    });
+
+    // Emit rerun-if-changed for fixed sources
+    emit_rerun_if_changed_recursive(fixed_source);
+
+    // Copy docs/ as references/ (only regular files, preserving relative paths)
+    let docs_dir = Path::new("docs");
+    let refs_target = target.join("references");
+    if docs_dir.is_dir() {
+        copy_docs_as_references(docs_dir, &refs_target);
+        emit_rerun_if_changed_recursive(docs_dir);
+    }
+
+    // Generate the Rust source for include_dir embedding
+    let builtin_skills_rs = out_dir.join("builtin_skills.rs");
+    let source = format!(
+        "static BUILTIN_SKILLS: include_dir::Dir<'_> = include_dir::include_dir!({:?});\n",
+        builtin_dir.to_string_lossy()
+    );
+    fs::write(&builtin_skills_rs, source).unwrap_or_else(|err| {
+        panic!(
+            "failed to write generated builtin-skills source {}: {err}",
+            builtin_skills_rs.display()
+        )
+    });
+}
+
+fn copy_docs_as_references(docs_dir: &Path, refs_target: &Path) {
+    let Ok(entries) = fs::read_dir(docs_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let file_type = entry.file_type().unwrap_or_else(|err| {
+            panic!("failed to get file type for {}: {err}", src_path.display())
+        });
+        if file_type.is_dir() {
+            copy_docs_as_references(&src_path, &refs_target.join(entry.file_name()));
+        } else if file_type.is_file() {
+            let dst_path = refs_target.join(entry.file_name());
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to create references directory {}: {err}",
+                        parent.display()
+                    )
+                });
+            }
+            fs::copy(&src_path, &dst_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to copy doc {} to references {}: {err}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            });
+        }
+    }
+}
+
+fn emit_rerun_if_changed_recursive(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if path.is_file() {
+        println!("cargo:rerun-if-changed={}", path.to_string_lossy());
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        emit_rerun_if_changed_recursive(&entry.path());
+    }
 }
