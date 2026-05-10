@@ -519,6 +519,29 @@ impl Database {
 
         self.store_message_only(&message)
     }
+
+    /// Persists a bot response to the Channel Log.
+    ///
+    /// Sender is the agent ID, `is_from_bot: true`, `MessageKind::Message`.
+    pub(crate) fn store_channel_log_bot_response(
+        &self,
+        channel_log_chat_id: i64,
+        agent_id: &str,
+        response: &str,
+    ) -> Result<(), StorageError> {
+        let message = StoredMessage {
+            id: format!("cl-bot-{}", uuid::Uuid::new_v4()),
+            chat_id: channel_log_chat_id,
+            sender_name: agent_id.to_string(),
+            content: response.to_string(),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: Some(agent_id.to_string()),
+            recipient_agent_id: None,
+        };
+        self.store_message_only(&message)
+    }
 }
 
 // ---------------------------------------------------------------------------

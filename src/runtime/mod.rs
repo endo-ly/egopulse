@@ -326,10 +326,13 @@ pub(crate) fn execute_scheduled_turn(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
         let session_key = turn.session_key();
+        let origin_id = if turn.origin_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            turn.origin_id.clone()
+        };
 
-        let origin_id = &turn.origin_id;
-
-        if let Some(reason) = state.turn_tracker.terminal_reason(origin_id) {
+        if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
             tracing::warn!(
                 agent_id = %turn.context.agent_id,
                 origin_id = %origin_id,
@@ -346,8 +349,8 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        state.turn_tracker.increment(origin_id);
-        let turn_count = state.turn_tracker.count(origin_id);
+        state.turn_tracker.increment(&origin_id);
+        let turn_count = state.turn_tracker.count(&origin_id);
 
         if let Some(reason) =
             turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)
@@ -361,7 +364,7 @@ pub(crate) fn execute_scheduled_turn(
             );
             state
                 .turn_tracker
-                .set_terminal_reason(origin_id, reason.clone());
+                .set_terminal_reason(&origin_id, reason.clone());
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -388,27 +391,15 @@ pub(crate) fn execute_scheduled_turn(
                     if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                         let db = std::sync::Arc::clone(&state.db);
                         let agent_id = turn.context.agent_id.clone();
-                        let bot_response = response.clone();
-                        if let Err(error) =
-                            crate::storage::call_blocking(db, move |db| {
-                                let conn = db.lock_conn()?;
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                                    rusqlite::params![
-                                        format!("cl-bot-{}", uuid::Uuid::new_v4()),
-                                        log_chat_id,
-                                        agent_id,
-                                        bot_response,
-                                        1i32,
-                                        chrono::Utc::now().to_rfc3339(),
-                                        "message",
-                                        agent_id,
-                                    ],
-                                )?;
-                                Ok::<_, crate::error::StorageError>(())
-                            })
-                            .await
+                        let response_owned = response.clone();
+                        if let Err(error) = crate::storage::call_blocking(db, move |db| {
+                            db.store_channel_log_bot_response(
+                                log_chat_id,
+                                &agent_id,
+                                &response_owned,
+                            )
+                        })
+                        .await
                         {
                             tracing::warn!(error = %error, "failed to store bot response in Channel Log");
                         }
@@ -423,7 +414,7 @@ pub(crate) fn execute_scheduled_turn(
                 );
                 state
                     .turn_tracker
-                    .set_terminal_reason(origin_id, turn_scheduler::StopReason::LlmFailure);
+                    .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
                         .db
@@ -432,6 +423,10 @@ pub(crate) fn execute_scheduled_turn(
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                     }
                 }
+                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                    execute_scheduled_turn(state, next).await;
+                }
+                return;
             }
         }
 
