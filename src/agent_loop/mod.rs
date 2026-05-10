@@ -29,6 +29,28 @@ pub(crate) struct PendingAgentTurn {
     pub external_chat_id: String,
 }
 
+/// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
+///
+/// Extends [`PendingAgentTurn`] with origin tracking for runaway prevention.
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledTurn {
+    /// Surface context identifying the agent session.
+    pub context: SurfaceContext,
+    /// The input text for this turn.
+    pub input: String,
+    /// External chat ID for sending responses back to the channel.
+    pub external_chat_id: String,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    pub origin_id: String,
+}
+
+impl ScheduledTurn {
+    /// Returns the stable session key for this turn's target session.
+    pub(crate) fn session_key(&self) -> String {
+        self.context.session_key()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Identifies the external conversation surface mapped to a persisted session.
 pub(crate) struct SurfaceContext {

@@ -5,6 +5,7 @@
 pub mod gateway;
 pub mod logging;
 pub mod status;
+pub(crate) mod turn_scheduler;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
