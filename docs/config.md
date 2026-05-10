@@ -538,7 +538,7 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 
 | 定数 | 値 | 定義場所 | 説明 |
 |---|---|---|---|
-| `MAX_AGENT_CHAIN_DEPTH` | 4 | `runtime/turn_scheduler.rs` | `agent_send` の最大チェーン深度。A→B→C→D まで許可し、5 段階目以降はドロップ |
-| `MAX_AGENT_TURNS_PER_INPUT` | 12 | `runtime/turn_scheduler.rs` | 同一 origin（ヒューマン入力）から派生するターンの上限。到達すると Channel Log に SystemEvent を記録して停止 |
+| `MAX_AGENT_CHAIN_DEPTH` | 4 | `src/runtime/turn_scheduler.rs` | `agent_send` の最大チェーン深度。A→B→C→D まで許可し、5 段階目以降はドロップ |
+| `MAX_AGENT_TURNS_PER_INPUT` | 12 | `src/runtime/turn_scheduler.rs` | 同一 origin（ヒューマン入力）から派生するターンの上限。到達すると Channel Log に SystemEvent を記録して停止 |
 
 制限に到達した場合でも、人間が新しくメッセージを送信すると新しい `origin_id` が発行され、エージェントは通常通り応答を再開する。

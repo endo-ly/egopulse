@@ -22,10 +22,11 @@ pub(crate) enum StopReason {
     SessionUnprocessable,
 }
 
-/// Per-origin turn counter for runaway prevention.
+/// Per-origin turn counter and terminal stop reason tracker for runaway prevention.
 #[derive(Debug, Default)]
 pub(crate) struct TurnTracker {
     counts: Mutex<HashMap<String, usize>>,
+    terminal_reasons: Mutex<HashMap<String, StopReason>>,
 }
 
 impl TurnTracker {
@@ -41,6 +42,28 @@ impl TurnTracker {
     pub(crate) fn count(&self, origin_id: &str) -> usize {
         let counts = self.counts.lock().expect("turn_tracker lock");
         counts.get(origin_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn set_terminal_reason(&self, origin_id: &str, reason: StopReason) {
+        let mut reasons = self.terminal_reasons.lock().expect("turn_tracker lock");
+        reasons.insert(origin_id.to_string(), reason);
+    }
+
+    pub(crate) fn terminal_reason(&self, origin_id: &str) -> Option<StopReason> {
+        let reasons = self.terminal_reasons.lock().expect("turn_tracker lock");
+        reasons.get(origin_id).cloned()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remove_origin(&self, origin_id: &str) {
+        {
+            let mut counts = self.counts.lock().expect("turn_tracker lock");
+            counts.remove(origin_id);
+        }
+        {
+            let mut reasons = self.terminal_reasons.lock().expect("turn_tracker lock");
+            reasons.remove(origin_id);
+        }
     }
 }
 
@@ -129,7 +152,7 @@ pub(crate) fn evaluate_stop_conditions(
     if chain_depth > MAX_AGENT_CHAIN_DEPTH {
         return Some(StopReason::ChainDepthExceeded);
     }
-    if turn_count >= MAX_AGENT_TURNS_PER_INPUT {
+    if turn_count > MAX_AGENT_TURNS_PER_INPUT {
         return Some(StopReason::TurnCountExceeded);
     }
     if !valid_agent_ids.contains(&agent_id) {
@@ -274,7 +297,7 @@ mod tests {
 
     #[test]
     fn stop_condition_turn_count_exceeded() {
-        let result = evaluate_stop_conditions(0, 12, "agent_a", &["agent_a"]);
+        let result = evaluate_stop_conditions(0, 13, "agent_a", &["agent_a"]);
         assert_eq!(result, Some(StopReason::TurnCountExceeded));
     }
 
@@ -315,5 +338,26 @@ mod tests {
     fn turn_tracker_count_returns_zero_for_unknown() {
         let tracker = TurnTracker::new();
         assert_eq!(tracker.count("nonexistent"), 0);
+    }
+
+    #[test]
+    fn turn_tracker_terminal_reason_blocks_future_turns() {
+        let tracker = TurnTracker::new();
+        assert!(tracker.terminal_reason("orig-1").is_none());
+        tracker.set_terminal_reason("orig-1", StopReason::ChainDepthExceeded);
+        assert_eq!(
+            tracker.terminal_reason("orig-1"),
+            Some(StopReason::ChainDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn turn_tracker_remove_origin_clears_all_state() {
+        let tracker = TurnTracker::new();
+        tracker.increment("orig-1");
+        tracker.set_terminal_reason("orig-1", StopReason::LlmFailure);
+        tracker.remove_origin("orig-1");
+        assert_eq!(tracker.count("orig-1"), 0);
+        assert!(tracker.terminal_reason("orig-1").is_none());
     }
 }

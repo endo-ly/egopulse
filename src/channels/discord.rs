@@ -745,9 +745,11 @@ impl EventHandler for Handler {
             origin_id: context.origin_id.clone(),
         };
 
-        let state = &self.app_state;
-        if let Some(turn) = state.turn_scheduler.submit(scheduled) {
-            crate::runtime::execute_scheduled_turn(state, turn).await;
+        if let Some(turn) = self.app_state.turn_scheduler.submit(scheduled) {
+            let state = Arc::clone(&self.app_state);
+            tokio::spawn(async move {
+                crate::runtime::execute_scheduled_turn(&state, turn).await;
+            });
         }
 
         drop(typing);

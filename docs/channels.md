@@ -177,8 +177,10 @@ Multi-Agent Room では、同一エージェントセッションへの同時タ
 | 停止理由 | 条件 |
 |---|---|
 | ChainDepthExceeded | チェーン深度 > 4 |
-| TurnCountExceeded | 同一 origin のターン数 ≥ 12 |
+| TurnCountExceeded | 同一 origin のターン数 > 12 |
 | LlmFailure | LLM 呼び出し失敗 |
+
+> **注意**: 「ボット間チェーンガード」の内部上限 (depth 5) は **Discord メッセージ受信側の防御**（ボット→ボット連鎖を制限）。TurnScheduler の `ChainDepthExceeded` (> 4) は **ターン実行側の暴走防止**（`agent_send` 連鎖深度を制限）。両者は独立した防御レイヤー。
 
 停止後に人間が新しくメッセージを送信すると、新しい origin_id が発行され、エージェントは通常通り応答を再開する。
 

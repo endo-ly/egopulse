@@ -311,7 +311,10 @@ fn spawn_agent_turn_worker(
             };
 
             if let Some(turn) = state.turn_scheduler.submit(scheduled) {
-                execute_scheduled_turn(&state, turn).await;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    execute_scheduled_turn(&state, turn).await;
+                });
             }
         }
     });
@@ -324,10 +327,24 @@ pub(crate) fn execute_scheduled_turn(
     Box::pin(async move {
         let session_key = turn.session_key();
 
+        let origin_id = &turn.origin_id;
+
+        if let Some(reason) = state.turn_tracker.terminal_reason(origin_id) {
+            tracing::warn!(
+                agent_id = %turn.context.agent_id,
+                origin_id = %origin_id,
+                reason = ?reason,
+                "dropping turn: origin already has terminal stop reason"
+            );
+            if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                execute_scheduled_turn(state, next).await;
+            }
+            return;
+        }
+
         let valid_ids: Vec<&str> = state.config.agents.keys().map(|id| id.as_str()).collect();
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
-        let origin_id = &turn.origin_id;
 
         state.turn_tracker.increment(origin_id);
         let turn_count = state.turn_tracker.count(origin_id);
@@ -342,6 +359,9 @@ pub(crate) fn execute_scheduled_turn(
                 reason = ?reason,
                 "scheduled turn rejected by stop condition evaluator"
             );
+            state
+                .turn_tracker
+                .set_terminal_reason(origin_id, reason.clone());
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -401,6 +421,9 @@ pub(crate) fn execute_scheduled_turn(
                     error = %error,
                     "scheduled turn: process_turn failed"
                 );
+                state
+                    .turn_tracker
+                    .set_terminal_reason(origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
                         .db
