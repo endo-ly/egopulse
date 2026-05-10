@@ -59,6 +59,8 @@ pub(crate) struct ToolExecutionContext {
     /// Current `agent_send` chain depth. Starts at 0 for user-initiated turns;
     /// incremented on each `agent_send` hop.
     pub chain_depth: usize,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    pub origin_id: String,
     /// Sender half of the pending-agent-turn channel.
     /// Tools like `agent_send` use this to enqueue turns for target agents.
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,

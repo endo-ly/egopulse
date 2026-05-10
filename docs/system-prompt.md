@@ -395,3 +395,7 @@ Only respond to the Direct Input below.
 ### 永続化
 
 Channel Context は `request_messages` にのみ追加され、Agent Session の `messages_json` には保存されない。
+
+### SystemEvent の扱い
+
+Channel Log に記録された `MessageKind::SystemEvent` メッセージは Channel Context 注入の対象外。SystemEvent は停止理由の記録用であり、LLM のコンテキストには含まれない。

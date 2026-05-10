@@ -66,9 +66,41 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 5. **宛先エージェント応答**: ワーカーが `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信
 
 **制約**:
-- チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (8) を超えるターンは破棄
+- チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは破棄
 - 自己送信 (`from == to`) は禁止
 - Discord チャネルが設定されている場合のみ利用可能
+
+### 1.5 TurnScheduler による同時実行制御 (Phase 4)
+
+Multi-Agent Room の Discord チャネルでは、`TurnScheduler` がセッション単位のターン実行を管理する。
+
+```text
+ヒューマンメッセージ受信 (Discord)
+  │
+  ├─ origin_id (UUID) 発行
+  ├─ ScheduledTurn 構築
+  └─ TurnScheduler.submit()
+       │
+       ├─ slot が idle → busy に設定し、execute_scheduled_turn() を即時実行
+       └─ slot が busy → キューに積んで待機
+
+execute_scheduled_turn():
+  │
+  ├─ evaluate_stop_conditions()
+  │    ├─ chain_depth > 4 → Channel Log に SystemEvent 記録 → 終了
+  │    ├─ turn_count ≥ 12 → Channel Log に SystemEvent 記録 → 終了
+  │    └─ OK → process_turn() 実行
+  │
+  ├─ process_turn() 成功 → チャネルに応答送信
+  └─ process_turn() 失敗 → Channel Log に SystemEvent (LlmFailure) 記録
+
+  ↓ 完了後
+  on_turn_completed()
+    ├─ キューに次のターンがあれば → execute_scheduled_turn() 再帰
+    └─ キューが空 → busy を解除
+```
+
+**SystemEvent**: 停止条件によりターンが拒否された場合、Channel Log に `MessageKind::SystemEvent` で JSON 形式の理由が記録される（`{"reason": "ChainDepthExceeded"}` 等）。
 
 ---
 

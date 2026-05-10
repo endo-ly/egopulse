@@ -308,11 +308,13 @@ MCP の詳細は以下を参照。
   - `message: string` 必須。送信するメッセージ内容
 - 挙動:
   - Discord チャネルが設定されている場合のみ登録される（CLI / Web ではツールが露出しない）
+  - 非Discordサーフェスからの実行時にもエラーを返す（ランタイムガード）
   - 自己送信 (`to == 自分自身`) は禁止
   - メッセージを Channel Log に `MessageKind::AgentSend` で保存
   - チャネルに `[From → To] message` 形式で表示
-  - 宛先エージェントの Turn を `PendingAgentTurn` としてバックグラウンドワーカーにキューイング
-  - チェーン深度 (chain depth) が `MAX_AGENT_CHAIN_DEPTH` (8) を超えるターンは破棄
+  - 宛先エージェントの Turn を `PendingAgentTurn` として `TurnScheduler` 経由でバックグラウンド実行
+  - チェーン深度 (chain depth) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは Channel Log に SystemEvent を記録して破棄
+  - 同一 origin のターン数が `MAX_AGENT_TURNS_PER_INPUT` (12) に達すると SystemEvent を記録して停止
 - 成功時:
   - `{"delivered": true, "to": "<agent_id>"}`
 - 主な失敗:

@@ -72,6 +72,7 @@ pub async fn ask_in_session(
         agent_id: state.config.default_agent.to_string(),
         channel_log_chat_id: None,
         chain_depth: 0,
+        origin_id: String::new(),
     };
 
     tokio::select! {
@@ -146,6 +147,7 @@ where
         agent_id: context.agent_id.clone(),
         channel_log_chat_id: context.channel_log_chat_id,
         chain_depth: context.chain_depth,
+        origin_id: context.origin_id.clone(),
         turn_sender: state.turn_sender.clone(),
     };
     let system_prompt = build_system_prompt(state, context);
@@ -1171,6 +1173,8 @@ pub(crate) fn build_state(
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        turn_scheduler: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
+        turn_tracker: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
     }
 }
 
@@ -1539,6 +1543,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         }
     }
 
@@ -2121,6 +2126,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: Some(channel_log_chat_id),
             chain_depth: 0,
+            origin_id: String::new(),
         }
     }
 
@@ -2725,6 +2731,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         };
 
         let _reply = process_turn(&state, &context, "unrelated message")

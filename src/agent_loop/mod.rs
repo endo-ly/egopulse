@@ -14,10 +14,6 @@ pub(crate) use session::{list_sessions, load_session_messages};
 pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 
-/// Maximum chain depth for `agent_send` cascading (A→B→A→B…).
-/// Turns exceeding this limit are silently dropped with a warning log.
-pub(crate) const MAX_AGENT_CHAIN_DEPTH: usize = 8;
-
 /// A pending turn to be executed for a target agent, enqueued by `agent_send`.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingAgentTurn {
@@ -27,6 +23,31 @@ pub(crate) struct PendingAgentTurn {
     pub input: String,
     /// The `external_chat_id` to send the target agent's response to.
     pub external_chat_id: String,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    /// Propagated from the originating human message through agent_send chains.
+    pub origin_id: String,
+}
+
+/// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
+///
+/// Extends [`PendingAgentTurn`] with origin tracking for runaway prevention.
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledTurn {
+    /// Surface context identifying the agent session.
+    pub context: SurfaceContext,
+    /// The input text for this turn.
+    pub input: String,
+    /// External chat ID for sending responses back to the channel.
+    pub external_chat_id: String,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    pub origin_id: String,
+}
+
+impl ScheduledTurn {
+    /// Returns the stable session key for this turn's target session.
+    pub(crate) fn session_key(&self) -> String {
+        self.context.session_key()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +63,9 @@ pub(crate) struct SurfaceContext {
     pub channel_log_chat_id: Option<i64>,
     /// Current `agent_send` chain depth (0 for user-initiated turns).
     pub chain_depth: usize,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    /// Empty string when origin tracking is not applicable (e.g. non-Discord channels).
+    pub origin_id: String,
 }
 
 impl SurfaceContext {
@@ -61,6 +85,7 @@ impl SurfaceContext {
             agent_id,
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         }
     }
 

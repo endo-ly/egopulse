@@ -172,12 +172,14 @@ impl Tool for AgentSendTool {
             agent_id: target_id.clone(),
             channel_log_chat_id: context.channel_log_chat_id,
             chain_depth: context.chain_depth + 1,
+            origin_id: context.origin_id.clone(),
         };
 
         let turn = PendingAgentTurn {
             context: target_context,
             input: display_text.clone(),
             external_chat_id,
+            origin_id: context.origin_id.clone(),
         };
 
         if let Err(error) = context.turn_sender.send(turn).await {
@@ -250,6 +252,7 @@ mod tests {
             agent_id: agent_id.to_string(),
             channel_log_chat_id: Some(99),
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender,
         }
     }
@@ -391,6 +394,7 @@ mod tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 
@@ -437,6 +441,7 @@ mod tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 
@@ -517,6 +522,7 @@ mod integration_tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 
@@ -545,6 +551,7 @@ mod integration_tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 
@@ -582,6 +589,7 @@ mod integration_tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 
@@ -618,6 +626,7 @@ mod integration_tests {
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
             turn_sender: tx,
         };
 

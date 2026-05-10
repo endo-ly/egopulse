@@ -869,6 +869,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         }
     }
 
@@ -1184,6 +1185,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1222,6 +1224,7 @@ mod tests {
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1300,6 +1303,7 @@ agents:
             agent_id: "bob".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1351,6 +1355,7 @@ agents:
             agent_id: "bob".to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
