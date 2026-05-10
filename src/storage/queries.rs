@@ -798,6 +798,30 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub(crate) fn list_distinct_agent_ids(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT agent_id FROM sleep_runs ORDER BY agent_id")?;
+        stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_all_sleep_runs(&self, limit: i64) -> Result<Vec<SleepRun>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             ORDER BY started_at DESC, rowid DESC
+             LIMIT ?1",
+        )?;
+        stmt.query_map(params![limit], row_to_sleep_run)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn get_latest_successful_run(
         &self,
         agent_id: &str,
@@ -2338,5 +2362,66 @@ mod tests {
 
         let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
         assert!(msgs[0].is_from_bot);
+    }
+
+    #[test]
+    fn list_distinct_agent_ids_returns_sorted_agents() {
+        let (db, _dir) = test_db();
+
+        create_test_sleep_run(&db, "charlie");
+        create_test_sleep_run(&db, "alpha");
+        create_test_sleep_run(&db, "bravo");
+
+        let agents = db.list_distinct_agent_ids().expect("list");
+        assert_eq!(agents, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn list_distinct_agent_ids_empty_when_no_runs() {
+        let (db, _dir) = test_db();
+
+        let agents = db.list_distinct_agent_ids().expect("list");
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn list_all_sleep_runs_returns_all_agents() {
+        let (db, _dir) = test_db();
+
+        let id_a = create_test_sleep_run(&db, "agent-a");
+        let id_b = create_test_sleep_run(&db, "agent-b");
+        let id_c = create_test_sleep_run(&db, "agent-c");
+
+        let runs = db.list_all_sleep_runs(10).expect("list all");
+        assert_eq!(runs.len(), 3);
+
+        assert_eq!(runs[0].id, id_c);
+        assert_eq!(runs[0].agent_id, "agent-c");
+        assert_eq!(runs[1].id, id_b);
+        assert_eq!(runs[1].agent_id, "agent-b");
+        assert_eq!(runs[2].id, id_a);
+        assert_eq!(runs[2].agent_id, "agent-a");
+    }
+
+    #[test]
+    fn list_all_sleep_runs_respects_limit() {
+        let (db, _dir) = test_db();
+
+        create_test_sleep_run(&db, "agent-a");
+        create_test_sleep_run(&db, "agent-b");
+        create_test_sleep_run(&db, "agent-c");
+        create_test_sleep_run(&db, "agent-d");
+        create_test_sleep_run(&db, "agent-e");
+
+        let runs = db.list_all_sleep_runs(3).expect("list all");
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn list_all_sleep_runs_empty() {
+        let (db, _dir) = test_db();
+
+        let runs = db.list_all_sleep_runs(10).expect("list all");
+        assert!(runs.is_empty());
     }
 }
