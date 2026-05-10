@@ -217,7 +217,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 |----|------|
 | `message` | 通常のチャットメッセージ（デフォルト） |
 | `agent_send` | エージェント間通信。`sender_agent_id` に送信元、`recipient_agent_id` に宛先エージェント ID が設定される |
-| `system_event` | システムイベント（Phase 4 で実装予定） |
+| `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_name` は `"system"`、`is_from_bot` は `true`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
 
 ---
 

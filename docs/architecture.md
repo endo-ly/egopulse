@@ -81,6 +81,7 @@ src/
 │
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, build_app_state(), start_channels()
+│   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
 │   └── status.rs        # ランタイムステータス
@@ -169,6 +170,9 @@ pub struct AppState {
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn LlmProvider>>>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
+    pub(crate) turn_sender: mpsc::Sender<PendingAgentTurn>,
+    pub(crate) turn_scheduler: Arc<TurnScheduler>,
+    pub(crate) turn_tracker: Arc<TurnTracker>,
 }
 ```
 
@@ -183,6 +187,9 @@ pub(crate) struct SurfaceContext {
     pub surface_thread: String,  // プラットフォームの会話スレッド ID
     pub chat_type: String,       // 永続化用チャット種別
     pub agent_id: String,        // 使用するエージェント定義のキー
+    pub channel_log_chat_id: Option<i64>, // Multi-Agent Room の Channel Log
+    pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
+    pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
 }
 ```
 
@@ -291,4 +298,7 @@ pub(crate) struct SurfaceContext {
 | **Sleep Batch** | `sleep_batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep_scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
+| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
+| **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
+| **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
 

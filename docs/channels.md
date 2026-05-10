@@ -164,6 +164,24 @@ Agent Session の LLM 呼び出し時に、Channel Log の直近 30 件を一時
 - Channel Log に `MessageKind::AgentSend` で保存される
 - 宛先エージェントの応答はバックグラウンドで非同期実行され、完了後に同じチャネルに送信される
 
+#### 同時実行制御 (Phase 4)
+
+Multi-Agent Room では、同一エージェントセッションへの同時ターンを直列化する `TurnScheduler` が動作する。
+
+- **Busy flag**: セッション単位で実行中のターンがある場合、後続ターンはキューに積まれる
+- **Queue drain**: 実行中ターンの完了後、キューから次のターンを取り出して自動実行する
+- **origin_id**: ヒューマンメッセージごとに UUID が発行され、`agent_send` 連鎖を跨いで同一 origin のターン数を追跡する
+
+**停止条件**: 以下のいずれかを満たすとターンは実行されず、Channel Log に SystemEvent が記録される。
+
+| 停止理由 | 条件 |
+|---|---|
+| ChainDepthExceeded | チェーン深度 > 4 |
+| TurnCountExceeded | 同一 origin のターン数 ≥ 12 |
+| LlmFailure | LLM 呼び出し失敗 |
+
+停止後に人間が新しくメッセージを送信すると、新しい origin_id が発行され、エージェントは通常通り応答を再開する。
+
 ### Bot 作成手順
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーション作成
