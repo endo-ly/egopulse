@@ -5,6 +5,7 @@
 //! 各ツールは出力を行数・バイト数で切り詰め、LLM のコンテキストウィンドウに収まるよう制御する。
 
 mod activate_skill;
+mod agent_send;
 mod command_guard;
 mod files;
 pub(crate) mod mcp;
@@ -45,12 +46,22 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ToolExecutionContext {
     pub chat_id: i64,
     pub channel: String,
     pub surface_thread: String,
     pub chat_type: String,
+    /// Agent ID of the currently executing agent.
+    pub agent_id: String,
+    /// Channel Log chat ID for multi-agent rooms (`None` for single-agent channels).
+    pub channel_log_chat_id: Option<i64>,
+    /// Current `agent_send` chain depth. Starts at 0 for user-initiated turns;
+    /// incremented on each `agent_send` hop.
+    pub chain_depth: usize,
+    /// Sender half of the pending-agent-turn channel.
+    /// Tools like `agent_send` use this to enqueue turns for target agents.
+    pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
 }
 
 /// Uniform result type returned by all tool implementations.
@@ -254,6 +265,7 @@ impl ToolRegistry {
 }
 
 pub(crate) use activate_skill::ActivateSkillTool;
+pub(crate) use agent_send::AgentSendTool;
 
 fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
     json!({

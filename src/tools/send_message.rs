@@ -160,7 +160,7 @@ impl Tool for SendMessageTool {
 }
 
 /// Look up [`ChatInfo`] by `chat_id` via the blocking thread pool.
-async fn lookup_chat_info(
+pub(crate) async fn lookup_chat_info(
     db: Arc<Database>,
     chat_id: i64,
 ) -> Result<Option<crate::storage::ChatInfo>, StorageError> {

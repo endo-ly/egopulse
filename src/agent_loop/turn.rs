@@ -71,6 +71,7 @@ pub async fn ask_in_session(
         chat_type: "cli".to_string(),
         agent_id: state.config.default_agent.to_string(),
         channel_log_chat_id: None,
+        chain_depth: 0,
     };
 
     tokio::select! {
@@ -142,6 +143,10 @@ where
         channel: context.channel.clone(),
         surface_thread: context.surface_thread.clone(),
         chat_type: context.chat_type.clone(),
+        agent_id: context.agent_id.clone(),
+        channel_log_chat_id: context.channel_log_chat_id,
+        chain_depth: context.chain_depth,
+        turn_sender: state.turn_sender.clone(),
     };
     let system_prompt = build_system_prompt(state, context);
     let channel_llm = state.llm_for_context(context).inspect_err(|e| {
@@ -1165,6 +1170,7 @@ pub(crate) fn build_state(
         memory_loader,
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
+        turn_sender: tokio::sync::mpsc::channel(16).0,
     }
 }
 
@@ -1532,6 +1538,7 @@ mod tests {
             chat_type: "web".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         }
     }
 
@@ -2113,6 +2120,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: Some(channel_log_chat_id),
+            chain_depth: 0,
         }
     }
 
@@ -2716,6 +2724,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         let _reply = process_turn(&state, &context, "unrelated message")

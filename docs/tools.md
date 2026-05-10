@@ -300,7 +300,28 @@ MCP の詳細は以下を参照。
 
 実装: [egopulse/src/tools/send_message.rs](../../egopulse/src/tools/send_message.rs)
 
-## 12. Skill Catalog
+## 12. `agent_send`
+
+- 目的: 同一チャネル内の別エージェントにメッセージを送信し、宛先エージェントの Turn を非同期にキューイングする
+- 入力:
+  - `to: string` 必須。宛先エージェント ID（`config.agents` に存在するエージェントのみ指定可能）
+  - `message: string` 必須。送信するメッセージ内容
+- 挙動:
+  - Discord チャネルが設定されている場合のみ登録される（CLI / Web ではツールが露出しない）
+  - 自己送信 (`to == 自分自身`) は禁止
+  - メッセージを Channel Log に `MessageKind::AgentSend` で保存
+  - チャネルに `[From → To] message` 形式で表示
+  - 宛先エージェントの Turn を `PendingAgentTurn` としてバックグラウンドワーカーにキューイング
+  - チェーン深度 (chain depth) が `MAX_AGENT_CHAIN_DEPTH` (8) を超えるターンは破棄
+- 成功時:
+  - `{"delivered": true, "to": "<agent_id>"}`
+- 主な失敗:
+  - `"agent '<id>' not found"` — 存在しないエージェント ID
+  - `"cannot send a message to yourself"` — 自己送信
+
+実装: [egopulse/src/tools/agent_send.rs](../../egopulse/src/tools/agent_send.rs)
+
+## 13. Skill Catalog
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
@@ -309,7 +330,7 @@ MCP の詳細は以下を参照。
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
-## 13. セキュリティガード
+## 14. セキュリティガード
 
 AI エージェントによるシークレット窃取を防ぐ多層防御。コマンド検閲・パス検閲・出力リダクションの 3 層で構成。
 

@@ -14,6 +14,21 @@ pub(crate) use session::{list_sessions, load_session_messages};
 pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 
+/// Maximum chain depth for `agent_send` cascading (A→B→A→B…).
+/// Turns exceeding this limit are silently dropped with a warning log.
+pub(crate) const MAX_AGENT_CHAIN_DEPTH: usize = 8;
+
+/// A pending turn to be executed for a target agent, enqueued by `agent_send`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAgentTurn {
+    /// The surface context for the target agent (same channel, target agent_id).
+    pub context: SurfaceContext,
+    /// The input text in `[From → To] message` format.
+    pub input: String,
+    /// The `external_chat_id` to send the target agent's response to.
+    pub external_chat_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Identifies the external conversation surface mapped to a persisted session.
 pub(crate) struct SurfaceContext {
@@ -25,6 +40,8 @@ pub(crate) struct SurfaceContext {
     /// For multi-agent rooms: the Channel Log chat ID used for Channel Context injection.
     /// `None` for single-agent channels and DMs.
     pub channel_log_chat_id: Option<i64>,
+    /// Current `agent_send` chain depth (0 for user-initiated turns).
+    pub chain_depth: usize,
 }
 
 impl SurfaceContext {
@@ -43,6 +60,7 @@ impl SurfaceContext {
             chat_type,
             agent_id,
             channel_log_chat_id: None,
+            chain_depth: 0,
         }
     }
 

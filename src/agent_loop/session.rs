@@ -907,6 +907,7 @@ mod tests {
             chat_type: "cli".to_string(),
             agent_id: config.default_agent.to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         assert_eq!(context.agent_id, "default");
@@ -929,6 +930,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
@@ -937,6 +939,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "agent_b".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         let chat_a = super::resolve_chat_id(&state, &ctx_a)
@@ -969,6 +972,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
@@ -986,6 +990,7 @@ mod tests {
             chat_type: "web".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
         let telegram_ctx = SurfaceContext {
             channel: "telegram".to_string(),
@@ -994,6 +999,7 @@ mod tests {
             chat_type: "telegram".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         assert_eq!(web_ctx.session_key(), "web:s1");
@@ -1041,6 +1047,7 @@ mod tests {
             chat_type: "web".to_string(),
             agent_id: "default".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
         };
 
         let first = super::resolve_chat_id(&state, &ctx).await.expect("first");

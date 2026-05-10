@@ -91,6 +91,7 @@ pub(crate) fn build_state_with_provider(
         )),
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
+        turn_sender: tokio::sync::mpsc::channel(16).0,
     }
 }
 
@@ -98,11 +99,12 @@ pub(crate) fn build_state_with_provider(
 pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
     crate::agent_loop::SurfaceContext {
         channel: "cli".to_string(),
-        surface_user: "local_user".to_string(),
+        surface_user: "user".to_string(),
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
         agent_id: "default".to_string(),
         channel_log_chat_id: None,
+        chain_depth: 0,
     }
 }
 
@@ -113,5 +115,9 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         channel: "cli".to_string(),
         surface_thread: "demo".to_string(),
         chat_type: "cli".to_string(),
+        agent_id: "default".to_string(),
+        channel_log_chat_id: None,
+        chain_depth: 0,
+        turn_sender: tokio::sync::mpsc::channel(16).0,
     }
 }

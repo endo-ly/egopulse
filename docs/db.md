@@ -207,8 +207,17 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 
 **操作**:
 - `store_message(msg)` — `INSERT OR REPLACE`
+- `store_message_only(msg)` — セッションを更新せずメッセージのみ保存。Channel Log (agent_send, system_event) 向け
 - `get_recent_messages(chat_id, limit)` — 最新N件（DESC→reverse）
 - `get_all_messages(chat_id)` — 全件（ASC）
+
+#### `message_kind` の種類
+
+| 値 | 説明 |
+|----|------|
+| `message` | 通常のチャットメッセージ（デフォルト） |
+| `agent_send` | エージェント間通信。`sender_agent_id` に送信元、`recipient_agent_id` に宛先エージェント ID が設定される |
+| `system_event` | システムイベント（Phase 4 で実装予定） |
 
 ---
 

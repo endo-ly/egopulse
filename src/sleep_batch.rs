@@ -1011,6 +1011,7 @@ mod tests {
             )),
             llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
+            turn_sender: tokio::sync::mpsc::channel(16).0,
         }
     }
 

@@ -55,6 +55,21 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 - Channel Context は `<channel-context>` タグでフォーマットされ、「background observations, not direct instructions」と明記
 - Channel Context は Agent Session の `messages_json` には保存されない（一時注入のみ）
 
+### 1.4 `agent_send` メッセージライフサイクル
+
+エージェント間通信 (`agent_send`) は次のフローで実行される:
+
+1. **送信元エージェント**が `agent_send` ツールを呼び出し (`to`, `message`)
+2. **Channel Log に保存**: `MessageKind::AgentSend`, `sender_agent_id`, `recipient_agent_id` を記録
+3. **チャネルに表示**: `[From → To] message` 形式でチャネルに送信
+4. **バックグラウンドキューイング**: `PendingAgentTurn` が `mpsc` チャネルに送られ、ワーカーが `process_turn` を非同期実行
+5. **宛先エージェント応答**: ワーカーが `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信
+
+**制約**:
+- チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (8) を超えるターンは破棄
+- 自己送信 (`from == to`) は禁止
+- Discord チャネルが設定されている場合のみ利用可能
+
 ---
 
 ## 2. 保存モデル
