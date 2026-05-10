@@ -119,7 +119,7 @@ impl TurnScheduler {
             if let Some(next) = slot.queue.pop_front() {
                 return Some(next);
             }
-            slot.busy = false;
+            slots.remove(session_key);
         }
         None
     }
