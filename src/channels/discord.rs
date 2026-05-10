@@ -769,6 +769,7 @@ impl EventHandler for Handler {
 
         let mut context = self.make_context(&msg.author.name, &thread, &agent_id);
         context.channel_log_chat_id = channel_log_chat_id;
+        context.origin_id = uuid::Uuid::new_v4().to_string();
 
         info!(
             channel_id = channel_id,
@@ -781,39 +782,19 @@ impl EventHandler for Handler {
 
         let typing = msg.channel_id.start_typing(&ctx.http);
 
-        match crate::agent_loop::process_turn(&self.app_state, &context, &combined_text).await {
-            Ok(response) => {
-                drop(typing);
-                if !response.is_empty() {
-                    if let Some(log_chat_id) = channel_log_chat_id {
-                        let response_timestamp = msg.timestamp.to_string();
-                        self.store_bot_channel_log_message(
-                            channel_id,
-                            log_chat_id,
-                            &agent_id,
-                            &response_timestamp,
-                            &response,
-                        )
-                        .await;
-                    }
-                    send_discord_response(&ctx, msg.channel_id, &response).await;
-                }
-            }
-            Err(e) => {
-                drop(typing);
-                error!(
-                    channel_id = channel_id,
-                    agent = %agent_id, bot = %self.bot_id,
-                    error_kind = e.error_kind(),
-                    error = %e,
-                    error_debug = ?e,
-                    "Discord: error processing message"
-                );
-                if !e.should_suppress_user_error() {
-                    send_discord_response(&ctx, msg.channel_id, &e.user_message()).await;
-                }
-            }
+        let scheduled = crate::agent_loop::ScheduledTurn {
+            context: context.clone(),
+            input: combined_text.clone(),
+            external_chat_id: msg.channel_id.to_string(),
+            origin_id: context.origin_id.clone(),
+        };
+
+        let state = &self.app_state;
+        if let Some(turn) = state.turn_scheduler.submit(scheduled) {
+            crate::runtime::execute_scheduled_turn(state, turn).await;
         }
+
+        drop(typing);
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {

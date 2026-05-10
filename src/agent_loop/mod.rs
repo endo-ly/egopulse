@@ -27,6 +27,9 @@ pub(crate) struct PendingAgentTurn {
     pub input: String,
     /// The `external_chat_id` to send the target agent's response to.
     pub external_chat_id: String,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    /// Propagated from the originating human message through agent_send chains.
+    pub origin_id: String,
 }
 
 /// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
@@ -64,6 +67,9 @@ pub(crate) struct SurfaceContext {
     pub channel_log_chat_id: Option<i64>,
     /// Current `agent_send` chain depth (0 for user-initiated turns).
     pub chain_depth: usize,
+    /// Origin ID: UUID tracking all turns caused by a single human input.
+    /// Empty string when origin tracking is not applicable (e.g. non-Discord channels).
+    pub origin_id: String,
 }
 
 impl SurfaceContext {
@@ -83,6 +89,7 @@ impl SurfaceContext {
             agent_id,
             channel_log_chat_id: None,
             chain_depth: 0,
+            origin_id: String::new(),
         }
     }
 

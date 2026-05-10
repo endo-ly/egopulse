@@ -92,6 +92,8 @@ pub(crate) fn build_state_with_provider(
         llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
+        turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
     }
 }
 
@@ -105,6 +107,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         agent_id: "default".to_string(),
         channel_log_chat_id: None,
         chain_depth: 0,
+        origin_id: String::new(),
     }
 }
 
@@ -118,6 +121,7 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         agent_id: "default".to_string(),
         channel_log_chat_id: None,
         chain_depth: 0,
+        origin_id: String::new(),
         turn_sender: tokio::sync::mpsc::channel(16).0,
     }
 }

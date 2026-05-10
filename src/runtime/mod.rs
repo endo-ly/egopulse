@@ -86,6 +86,10 @@ pub struct AppState {
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Sender half of the pending-agent-turn channel for `agent_send` turn queuing.
     pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
+    /// Per-session turn scheduler for concurrency control and ordered execution.
+    pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
+    /// Per-origin turn counter for runaway prevention.
+    pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
 }
 
 impl Clone for AppState {
@@ -105,6 +109,8 @@ impl Clone for AppState {
             llm_cache: Mutex::new(HashMap::new()),
             active_turns: Arc::clone(&self.active_turns),
             turn_sender: self.turn_sender.clone(),
+            turn_scheduler: Arc::clone(&self.turn_scheduler),
+            turn_tracker: Arc::clone(&self.turn_tracker),
         }
     }
 }
@@ -241,6 +247,8 @@ pub async fn build_app_state_with_path(
         llm_cache: Mutex::new(HashMap::new()),
         active_turns: Arc::new(ActiveTurnTracker::new()),
         turn_sender,
+        turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
+        turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
     };
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);
@@ -284,6 +292,8 @@ pub fn build_sleep_app_state_with_path(
         llm_cache: Mutex::new(HashMap::new()),
         active_turns: Arc::new(ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
+        turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
     })
 }
 
@@ -292,40 +302,90 @@ fn spawn_agent_turn_worker(
     mut receiver: tokio::sync::mpsc::Receiver<crate::agent_loop::PendingAgentTurn>,
 ) {
     tokio::spawn(async move {
-        while let Some(turn) = receiver.recv().await {
-            if turn.context.chain_depth >= crate::agent_loop::MAX_AGENT_CHAIN_DEPTH {
-                tracing::warn!(
-                    agent_id = %turn.context.agent_id,
-                    chain_depth = turn.context.chain_depth,
-                    "agent_send chain depth exceeded limit; dropping turn"
-                );
-                continue;
-            }
+        while let Some(pending) = receiver.recv().await {
+            let scheduled = crate::agent_loop::ScheduledTurn {
+                context: pending.context,
+                input: pending.input,
+                external_chat_id: pending.external_chat_id,
+                origin_id: pending.origin_id,
+            };
 
-            match crate::agent_loop::process_turn(&state, &turn.context, &turn.input).await {
-                Ok(response) => {
-                    if let Some(adapter) = state.channels.get(&turn.context.channel) {
-                        if let Err(error) =
-                            adapter.send_text(&turn.external_chat_id, &response).await
-                        {
-                            tracing::warn!(
-                                agent_id = %turn.context.agent_id,
-                                error = %error,
-                                "background turn: failed to send response to channel"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        agent_id = %turn.context.agent_id,
-                        error = %error,
-                        "background turn: process_turn failed"
-                    );
-                }
+            if let Some(turn) = state.turn_scheduler.submit(scheduled) {
+                execute_scheduled_turn(&state, turn).await;
             }
         }
     });
+}
+
+pub(crate) fn execute_scheduled_turn(
+    state: &AppState,
+    turn: crate::agent_loop::ScheduledTurn,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+        let session_key = turn.session_key();
+
+        let valid_ids: Vec<&str> = state.config.agents.keys().map(|id| id.as_str()).collect();
+        let chain_depth = turn.context.chain_depth;
+        let agent_id = &turn.context.agent_id;
+        let origin_id = &turn.origin_id;
+
+        state.turn_tracker.increment(origin_id);
+        let turn_count = state.turn_tracker.count(origin_id);
+
+        if let Some(reason) =
+            turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)
+        {
+            tracing::warn!(
+                agent_id = %agent_id,
+                chain_depth,
+                turn_count,
+                reason = ?reason,
+                "scheduled turn rejected by stop condition evaluator"
+            );
+            if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
+                    tracing::warn!(error = %error, "failed to store system event for stop condition");
+                }
+            }
+            if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                execute_scheduled_turn(state, next).await;
+            }
+            return;
+        }
+
+        match crate::agent_loop::process_turn(state, &turn.context, &turn.input).await {
+            Ok(response) => {
+                if let Some(adapter) = state.channels.get(&turn.context.channel) {
+                    if let Err(error) = adapter.send_text(&turn.external_chat_id, &response).await {
+                        tracing::warn!(
+                            agent_id = %turn.context.agent_id,
+                            error = %error,
+                            "scheduled turn: failed to send response to channel"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %turn.context.agent_id,
+                    error = %error,
+                    "scheduled turn: process_turn failed"
+                );
+                if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                    if let Err(db_err) = state
+                        .db
+                        .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
+                    {
+                        tracing::warn!(error = %db_err, "failed to store LLM failure system event");
+                    }
+                }
+            }
+        }
+
+        if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+            execute_scheduled_turn(state, next).await;
+        }
+    })
 }
 
 fn spawn_mcp_reconnect_loop(
