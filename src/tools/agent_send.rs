@@ -57,6 +57,16 @@ fn agent_label<'a>(
         .unwrap_or(id)
 }
 
+fn target_surface_thread(source_surface_thread: &str, target_id: &str) -> String {
+    let unprefixed = source_surface_thread
+        .strip_prefix("discord:")
+        .unwrap_or(source_surface_thread);
+    let room_thread = unprefixed
+        .split_once(":agent:")
+        .map_or(unprefixed, |(room_thread, _)| room_thread);
+    format!("{room_thread}:agent:{target_id}")
+}
+
 #[async_trait]
 impl Tool for AgentSendTool {
     fn name(&self) -> &str {
@@ -162,7 +172,7 @@ impl Tool for AgentSendTool {
         let target_context = SurfaceContext {
             channel: context.channel.clone(),
             surface_user: "agent_send".to_string(),
-            surface_thread: format!("{}:agent:{}", context.surface_thread, target_id),
+            surface_thread: target_surface_thread(&context.surface_thread, &target_id),
             chat_type: context.chat_type.clone(),
             agent_id: target_id.clone(),
             channel_log_chat_id: context.channel_log_chat_id,
@@ -241,7 +251,7 @@ mod tests {
         ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: agent_id.to_string(),
             channel_log_chat_id: Some(99),
@@ -358,6 +368,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_send_target_context_replaces_source_agent_scope() {
+        let tool = tool_with_agents(test_agents());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ctx = test_context_with_agent("lyre", tx);
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "hello"}), &ctx)
+            .await;
+
+        let turn = rx.try_recv().expect("turn");
+        assert_eq!(turn.context.surface_thread, "123:agent:vega");
+    }
+
+    #[test]
+    fn target_surface_thread_replaces_existing_agent_scope() {
+        assert_eq!(
+            target_surface_thread("123:agent:lyre", "vega"),
+            "123:agent:vega"
+        );
+        assert_eq!(
+            target_surface_thread("discord:123:agent:lyre", "vega"),
+            "123:agent:vega"
+        );
+        assert_eq!(target_surface_thread("123", "vega"), "123:agent:vega");
+    }
+
+    #[tokio::test]
     async fn agent_send_saves_to_channel_log() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
@@ -383,7 +419,7 @@ mod tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
@@ -430,7 +466,7 @@ mod tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
@@ -511,7 +547,7 @@ mod integration_tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
@@ -540,7 +576,7 @@ mod integration_tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
@@ -578,7 +614,7 @@ mod integration_tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
@@ -615,7 +651,7 @@ mod integration_tests {
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
-            surface_thread: "discord:123:agent:lyre".to_string(),
+            surface_thread: "123:agent:lyre".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
