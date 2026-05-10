@@ -490,6 +490,35 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Persists a stop-reason system event to the Channel Log.
+    ///
+    /// Content format: `{"reason": "StopReasonVariant"}`.
+    /// Sender: `"system"`, `is_from_bot: true`.
+    pub(crate) fn store_system_event(
+        &self,
+        channel_log_chat_id: i64,
+        reason: &crate::runtime::turn_scheduler::StopReason,
+    ) -> Result<(), StorageError> {
+        let content = serde_json::json!({
+            "reason": format!("{reason:?}")
+        })
+        .to_string();
+
+        let message = StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id: channel_log_chat_id,
+            sender_name: "system".to_string(),
+            content,
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::SystemEvent,
+            sender_agent_id: None,
+            recipient_agent_id: None,
+        };
+
+        self.store_message_only(&message)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,5 +2251,69 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 2");
         assert_eq!(msgs[2].content, "msg 4");
+    }
+
+    // ---- System Event tests ----
+
+    #[test]
+    fn store_system_event_saves_to_channel_log() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(300).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::ChainDepthExceeded,
+        )
+        .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_kind, MessageKind::SystemEvent);
+    }
+
+    #[test]
+    fn store_system_event_content_is_valid_json_with_reason() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(301).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::TurnCountExceeded,
+        )
+        .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let parsed: serde_json::Value = serde_json::from_str(&msgs[0].content).expect("valid json");
+        assert!(parsed.get("reason").is_some());
+    }
+
+    #[test]
+    fn store_system_event_sender_is_system() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(302).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::LlmFailure,
+        )
+        .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs[0].sender_name, "system");
+    }
+
+    #[test]
+    fn store_system_event_is_from_bot_true() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(303).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::SessionUnprocessable,
+        )
+        .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert!(msgs[0].is_from_bot);
     }
 }
