@@ -36,10 +36,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           DATE=$(date +%Y%m%d)
           RUN=${{ github.run_number }}
-          RELEASE_TAG="v${VERSION}-${DATE}.${RUN}"
+          RELEASE_TAG="${DATE}.${RUN}"
 
           # Avoid duplicate tags
           if git tag -l "${RELEASE_TAG}" | grep -q .; then
