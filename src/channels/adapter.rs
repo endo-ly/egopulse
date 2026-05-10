@@ -16,11 +16,27 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+/// Keeps a channel-specific turn activity indicator alive until dropped.
+pub(crate) trait TurnActivity: Send {}
+
+struct NoopTurnActivity;
+
+impl TurnActivity for NoopTurnActivity {}
+
 /// Trait that each channel (Web, Discord, Telegram) implements for outbound message delivery.
 #[async_trait]
 pub(crate) trait ChannelAdapter: Send + Sync {
     fn name(&self) -> &str;
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)>;
+
+    /// Starts a channel-specific activity indicator for a running turn.
+    async fn begin_turn_activity(
+        &self,
+        external_chat_id: &str,
+    ) -> Result<Box<dyn TurnActivity>, String> {
+        let _ = external_chat_id;
+        Ok(Box::new(NoopTurnActivity))
+    }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
 

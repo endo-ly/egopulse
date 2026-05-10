@@ -23,8 +23,8 @@ use serenity::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
-use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
+use crate::channels::adapter::{ChannelAdapter, TurnActivity};
 use crate::channels::utils::text::split_text;
 use crate::config::DiscordChannelConfig;
 use crate::runtime::AppState;
@@ -40,6 +40,9 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
+
+/// Discord typing indicator の更新間隔 (秒)。
+const DISCORD_TYPING_REFRESH_SECS: u64 = 8;
 
 /// Bot-to-bot 連鎖の最大深さ（チャンネル/スレッド単位）。
 const BOT_CHAIN_MAX_DEPTH: u32 = 5;
@@ -164,6 +167,18 @@ pub(crate) struct DiscordAdapter {
     http_client: reqwest::Client,
 }
 
+struct DiscordTypingActivity {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TurnActivity for DiscordTypingActivity {}
+
+impl Drop for DiscordTypingActivity {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl DiscordAdapter {
     pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
         let bot_tokens: std::collections::HashMap<String, String> = config
@@ -225,6 +240,31 @@ impl ChannelAdapter for DiscordAdapter {
 
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
         vec![("discord", ConversationKind::Private)]
+    }
+
+    async fn begin_turn_activity(
+        &self,
+        external_chat_id: &str,
+    ) -> Result<Box<dyn TurnActivity>, String> {
+        let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
+        let token = self.select_token(external_chat_id)?.to_string();
+        let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/typing");
+        let client = self.http_client.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                if let Err(error) = send_discord_typing(&client, &url, &token).await {
+                    warn!(
+                        channel_id = discord_chat_id,
+                        error = %error,
+                        "Discord: failed to refresh typing indicator"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(DISCORD_TYPING_REFRESH_SECS)).await;
+            }
+        });
+
+        Ok(Box::new(DiscordTypingActivity { handle }))
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
@@ -305,6 +345,20 @@ impl ChannelAdapter for DiscordAdapter {
         })
         .await
     }
+}
+
+async fn send_discord_typing(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<(), String> {
+    send_discord_api(client, |client| {
+        client
+            .post(url)
+            .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+            .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+    })
+    .await
 }
 
 /// Discord API リクエストを送信し、429 レート制限を自動リトライする。
@@ -736,8 +790,6 @@ impl EventHandler for Handler {
             "Discord message received"
         );
 
-        let typing = msg.channel_id.start_typing(&ctx.http);
-
         let scheduled = crate::agent_loop::ScheduledTurn {
             context: context.clone(),
             input: combined_text.clone(),
@@ -750,8 +802,6 @@ impl EventHandler for Handler {
                 crate::runtime::execute_scheduled_turn(&state, turn).await;
             });
         }
-
-        drop(typing);
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {

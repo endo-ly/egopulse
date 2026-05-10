@@ -387,10 +387,26 @@ pub(crate) fn execute_scheduled_turn(
             return;
         }
 
+        let adapter = state.channels.get(&turn.context.channel);
+        let external_chat_id = turn.context.session_key();
+        let _activity = match adapter {
+            Some(adapter) => match adapter.begin_turn_activity(&external_chat_id).await {
+                Ok(activity) => Some(activity),
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = %turn.context.agent_id,
+                        error = %error,
+                        "scheduled turn: failed to begin channel activity"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         match crate::agent_loop::process_turn(state, &turn.context, &turn.input).await {
             Ok(response) => {
-                if let Some(adapter) = state.channels.get(&turn.context.channel) {
-                    let external_chat_id = turn.context.session_key();
+                if let Some(adapter) = adapter {
                     if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                         tracing::warn!(
                             agent_id = %turn.context.agent_id,

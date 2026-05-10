@@ -89,7 +89,7 @@ execute_scheduled_turn():
   ├─ evaluate_stop_conditions()
   │    ├─ chain_depth > 4 → Channel Log に SystemEvent 記録 → 終了
   │    ├─ turn_count ≥ 12 → Channel Log に SystemEvent 記録 → 終了
-  │    └─ OK → process_turn() 実行
+  │    └─ OK → ChannelAdapter::begin_turn_activity() → process_turn() 実行
   │
   ├─ process_turn() 成功 → チャネルに応答送信
   └─ process_turn() 失敗 → Channel Log に SystemEvent (LlmFailure) 記録
