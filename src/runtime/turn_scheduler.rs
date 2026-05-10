@@ -180,7 +180,6 @@ mod tests {
         ScheduledTurn {
             context: test_context(agent_id),
             input: "hello".to_string(),
-            external_chat_id: "ext123".to_string(),
             origin_id: origin_id.to_string(),
         }
     }
@@ -192,7 +191,6 @@ mod tests {
         let turn = test_turn("agent_a", "orig-1");
         assert_eq!(turn.context.agent_id, "agent_a");
         assert_eq!(turn.input, "hello");
-        assert_eq!(turn.external_chat_id, "ext123");
         assert_eq!(turn.origin_id, "orig-1");
         assert_eq!(turn.context.chain_depth, 0);
     }

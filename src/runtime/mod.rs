@@ -318,7 +318,6 @@ fn spawn_agent_turn_worker(
             let scheduled = crate::agent_loop::ScheduledTurn {
                 context: pending.context,
                 input: pending.input,
-                external_chat_id: pending.external_chat_id,
                 origin_id: pending.origin_id,
             };
 
@@ -391,7 +390,8 @@ pub(crate) fn execute_scheduled_turn(
         match crate::agent_loop::process_turn(state, &turn.context, &turn.input).await {
             Ok(response) => {
                 if let Some(adapter) = state.channels.get(&turn.context.channel) {
-                    if let Err(error) = adapter.send_text(&turn.external_chat_id, &response).await {
+                    let external_chat_id = turn.context.session_key();
+                    if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                         tracing::warn!(
                             agent_id = %turn.context.agent_id,
                             error = %error,

@@ -21,8 +21,6 @@ pub(crate) struct PendingAgentTurn {
     pub context: SurfaceContext,
     /// The input text in `[From → To] message` format.
     pub input: String,
-    /// The `external_chat_id` to send the target agent's response to.
-    pub external_chat_id: String,
     /// Origin ID: UUID tracking all turns caused by a single human input.
     /// Propagated from the originating human message through agent_send chains.
     pub origin_id: String,
@@ -37,8 +35,6 @@ pub(crate) struct ScheduledTurn {
     pub context: SurfaceContext,
     /// The input text for this turn.
     pub input: String,
-    /// External chat ID for sending responses back to the channel.
-    pub external_chat_id: String,
     /// Origin ID: UUID tracking all turns caused by a single human input.
     pub origin_id: String,
 }

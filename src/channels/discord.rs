@@ -741,7 +741,6 @@ impl EventHandler for Handler {
         let scheduled = crate::agent_loop::ScheduledTurn {
             context: context.clone(),
             input: combined_text.clone(),
-            external_chat_id: msg.channel_id.to_string(),
             origin_id: context.origin_id.clone(),
         };
 
@@ -1519,6 +1518,20 @@ mod tests {
                 .surface_thread,
             "123:agent:developer"
         );
+    }
+
+    #[test]
+    fn scheduled_turn_context_preserves_agent_scope_for_token_selection() {
+        let handler = test_handler_with_agents(
+            channels(&[(123, &["developer"], false, false)]),
+            9999,
+            "main",
+            "developer",
+            agents(&[("developer", Some("main"))]),
+        );
+        let context = handler.make_context("user", "123", "developer");
+
+        assert_eq!(context.session_key(), "discord:123:agent:developer");
     }
 
     /// Interaction コマンド名 → "/command" 形式の正規化が正しいこと。

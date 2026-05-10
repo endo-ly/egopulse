@@ -159,11 +159,6 @@ impl Tool for AgentSendTool {
         }
 
         // 3. Queue target agent turn
-        let external_chat_id = match lookup_chat_info(Arc::clone(&self.db), chat_id).await {
-            Ok(Some(info)) => info.external_chat_id,
-            _ => context.surface_thread.clone(),
-        };
-
         let target_context = SurfaceContext {
             channel: context.channel.clone(),
             surface_user: "agent_send".to_string(),
@@ -178,7 +173,6 @@ impl Tool for AgentSendTool {
         let turn = PendingAgentTurn {
             context: target_context,
             input: display_text.clone(),
-            external_chat_id,
             origin_id: context.origin_id.clone(),
         };
 
