@@ -101,6 +101,13 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
+        // Validate: agent_send is only available on Discord channels
+        if context.channel != "discord" {
+            return ToolResult::error(
+                "agent_send is only available in Discord multi-agent rooms".to_string(),
+            );
+        }
+
         // Validate: agent must exist in config.agents
         if !self.agents.contains_key(&AgentId::new(&target_id)) {
             return ToolResult::error(format!("agent '{target_id}' not found"));
@@ -160,16 +167,16 @@ impl Tool for AgentSendTool {
         let target_context = SurfaceContext {
             channel: context.channel.clone(),
             surface_user: "agent_send".to_string(),
-            surface_thread: format!("{}:agent:{}", context.channel, target_id),
+            surface_thread: format!("{}:agent:{}", context.surface_thread, target_id),
             chat_type: context.chat_type.clone(),
             agent_id: target_id.clone(),
             channel_log_chat_id: context.channel_log_chat_id,
+            chain_depth: context.chain_depth + 1,
         };
 
         let turn = PendingAgentTurn {
             context: target_context,
             input: display_text.clone(),
-            chain_depth: 1,
             external_chat_id,
         };
 
@@ -242,6 +249,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: agent_id.to_string(),
             channel_log_chat_id: Some(99),
+            chain_depth: 0,
             turn_sender,
         }
     }
@@ -382,6 +390,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
+            chain_depth: 0,
             turn_sender: tx,
         };
 
@@ -427,6 +436,7 @@ mod tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
+            chain_depth: 0,
             turn_sender: tx,
         };
 
@@ -506,6 +516,7 @@ mod integration_tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
             turn_sender: tx,
         };
 
@@ -533,6 +544,7 @@ mod integration_tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
             turn_sender: tx,
         };
 
@@ -569,6 +581,7 @@ mod integration_tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: Some(log_chat_id),
+            chain_depth: 0,
             turn_sender: tx,
         };
 
@@ -604,6 +617,7 @@ mod integration_tests {
             chat_type: "discord".to_string(),
             agent_id: "lyre".to_string(),
             channel_log_chat_id: None,
+            chain_depth: 0,
             turn_sender: tx,
         };
 

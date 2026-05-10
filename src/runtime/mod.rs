@@ -292,10 +292,10 @@ fn spawn_agent_turn_worker(
 ) {
     tokio::spawn(async move {
         while let Some(turn) = receiver.recv().await {
-            if turn.chain_depth >= crate::agent_loop::MAX_AGENT_CHAIN_DEPTH {
+            if turn.context.chain_depth >= crate::agent_loop::MAX_AGENT_CHAIN_DEPTH {
                 tracing::warn!(
                     agent_id = %turn.context.agent_id,
-                    chain_depth = turn.chain_depth,
+                    chain_depth = turn.context.chain_depth,
                     "agent_send chain depth exceeded limit; dropping turn"
                 );
                 continue;

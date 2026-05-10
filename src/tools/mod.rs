@@ -56,6 +56,9 @@ pub(crate) struct ToolExecutionContext {
     pub agent_id: String,
     /// Channel Log chat ID for multi-agent rooms (`None` for single-agent channels).
     pub channel_log_chat_id: Option<i64>,
+    /// Current `agent_send` chain depth. Starts at 0 for user-initiated turns;
+    /// incremented on each `agent_send` hop.
+    pub chain_depth: usize,
     /// Sender half of the pending-agent-turn channel.
     /// Tools like `agent_send` use this to enqueue turns for target agents.
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,

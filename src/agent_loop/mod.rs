@@ -25,8 +25,6 @@ pub(crate) struct PendingAgentTurn {
     pub context: SurfaceContext,
     /// The input text in `[From → To] message` format.
     pub input: String,
-    /// Current chain depth (incremented on each `agent_send` hop).
-    pub chain_depth: usize,
     /// The `external_chat_id` to send the target agent's response to.
     pub external_chat_id: String,
 }
@@ -42,6 +40,8 @@ pub(crate) struct SurfaceContext {
     /// For multi-agent rooms: the Channel Log chat ID used for Channel Context injection.
     /// `None` for single-agent channels and DMs.
     pub channel_log_chat_id: Option<i64>,
+    /// Current `agent_send` chain depth (0 for user-initiated turns).
+    pub chain_depth: usize,
 }
 
 impl SurfaceContext {
@@ -60,6 +60,7 @@ impl SurfaceContext {
             chat_type,
             agent_id,
             channel_log_chat_id: None,
+            chain_depth: 0,
         }
     }
 
