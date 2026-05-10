@@ -4,7 +4,7 @@
 //! and all `docs/` files into `$OUT_DIR/builtin-skills/`, which is then embedded
 //! into the binary via `include_dir`.
 //!
-//! At runtime, [`expand_builtin_skills`] writes the embedded tree to
+//! At runtime, `expand_builtin_skills` writes the embedded tree to
 //! `state_root/skills/egopulse/`, overwriting matching files from the prior version.
 
 use std::fs;
