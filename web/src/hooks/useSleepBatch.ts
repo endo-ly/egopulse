@@ -31,6 +31,7 @@ export function useSleepBatch(
   );
 
   const refreshIdRef = useRef(0);
+  const selectIdRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,35 +106,31 @@ export function useSleepBatch(
 
   const selectRun = useCallback(
     (run: SleepRun) => {
-      let cancelled = false;
+      const id = ++selectIdRef.current;
 
       async function loadDetail() {
         setLoading(true);
         setError(null);
         try {
           const detail = await fetchRunDetail(authTokenRef.current, run.id);
-          if (!cancelled) {
+          if (id === selectIdRef.current) {
             setSelectedRun(detail.run);
             setSelectedSnapshots(detail.snapshots);
           }
         } catch (err) {
-          if (!cancelled) {
+          if (id === selectIdRef.current) {
             setError(
               err instanceof Error ? err.message : "Failed to fetch run detail",
             );
           }
         } finally {
-          if (!cancelled) {
+          if (id === selectIdRef.current) {
             setLoading(false);
           }
         }
       }
 
       void loadDetail();
-
-      return () => {
-        cancelled = true;
-      };
     },
     [authTokenRef],
   );

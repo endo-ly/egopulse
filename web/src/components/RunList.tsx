@@ -27,10 +27,6 @@ export function RunList({
   onSelectAgent,
   onSelectRun,
 }: RunListProps) {
-  if (runs.length === 0) {
-    return <p className="run-empty">No sleep batch runs yet</p>;
-  }
-
   return (
     <div className="run-list">
       <div className="run-filter">
@@ -48,27 +44,31 @@ export function RunList({
         </select>
       </div>
 
-      <div className="run-cards">
-        {runs.map((run) => (
-          <button
-            key={run.id}
-            type="button"
-            className="run-card"
-            onClick={() => onSelectRun(run)}
-          >
-            <span className="run-status-icon">{statusIcon(run.status)}</span>
-            <div className="run-card-meta">
-              <strong>{run.agent_id}</strong>
-              <span className="run-card-date">
-                {new Date(run.started_at).toLocaleString()}
-              </span>
-              <span className="run-card-tokens">
-                {formatTokens(run.total_tokens)} tokens
-              </span>
-            </div>
-          </button>
-        ))}
-      </div>
+      {runs.length === 0 ? (
+        <p className="run-empty">No sleep batch runs yet</p>
+      ) : (
+        <div className="run-cards">
+          {runs.map((run) => (
+            <button
+              key={run.id}
+              type="button"
+              className="run-card"
+              onClick={() => onSelectRun(run)}
+            >
+              <span className="run-status-icon">{statusIcon(run.status)}</span>
+              <div className="run-card-meta">
+                <strong>{run.agent_id}</strong>
+                <span className="run-card-date">
+                  {new Date(run.started_at).toLocaleString()}
+                </span>
+                <span className="run-card-tokens">
+                  {formatTokens(run.total_tokens)} tokens
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
