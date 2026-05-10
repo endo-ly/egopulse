@@ -642,50 +642,6 @@ impl Handler {
         }
         saved_paths
     }
-
-    /// Bot の応答メッセージを Channel Log に保存する。
-    async fn store_bot_channel_log_message(
-        &self,
-        channel_id: u64,
-        log_chat_id: i64,
-        agent_id: &str,
-        timestamp: &str,
-        response: &str,
-    ) {
-        let db = std::sync::Arc::clone(&self.app_state.db);
-        let bot_id = self.bot_id.clone();
-        let agent_id_owned = agent_id.to_string();
-        let timestamp = timestamp.to_string();
-        let response = response.to_string();
-        if let Err(e) = crate::storage::call_blocking(db, move |db| {
-            let conn = db.lock_conn()?;
-            conn.execute(
-                "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    format!("cl-bot-{}", uuid::Uuid::new_v4()),
-                    log_chat_id,
-                    bot_id,
-                    response,
-                    1i32,
-                    timestamp,
-                    "message",
-                    agent_id_owned,
-                ],
-            )?;
-            Ok::<_, crate::error::StorageError>(())
-        })
-        .await
-        {
-            warn!(
-                channel_id = channel_id,
-                chat_id = log_chat_id,
-                agent = %agent_id,
-                error = %e,
-                "failed to store Discord bot response in Channel Log"
-            );
-        }
-    }
 }
 
 #[serenity::async_trait]

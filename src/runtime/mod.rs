@@ -364,6 +364,36 @@ pub(crate) fn execute_scheduled_turn(
                         );
                     }
                 }
+                if !response.is_empty() {
+                    if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                        let db = std::sync::Arc::clone(&state.db);
+                        let agent_id = turn.context.agent_id.clone();
+                        let bot_response = response.clone();
+                        if let Err(error) =
+                            crate::storage::call_blocking(db, move |db| {
+                                let conn = db.lock_conn()?;
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    rusqlite::params![
+                                        format!("cl-bot-{}", uuid::Uuid::new_v4()),
+                                        log_chat_id,
+                                        agent_id,
+                                        bot_response,
+                                        1i32,
+                                        chrono::Utc::now().to_rfc3339(),
+                                        "message",
+                                        agent_id,
+                                    ],
+                                )?;
+                                Ok::<_, crate::error::StorageError>(())
+                            })
+                            .await
+                        {
+                            tracing::warn!(error = %error, "failed to store bot response in Channel Log");
+                        }
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(

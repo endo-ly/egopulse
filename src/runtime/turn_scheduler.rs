@@ -18,6 +18,7 @@ pub(crate) enum StopReason {
     TurnCountExceeded,
     AgentNotFound,
     LlmFailure,
+    #[allow(dead_code)]
     SessionUnprocessable,
 }
 

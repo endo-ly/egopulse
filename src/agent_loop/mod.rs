@@ -14,10 +14,6 @@ pub(crate) use session::{list_sessions, load_session_messages};
 pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 
-/// Maximum chain depth for `agent_send` cascading (A→B→A→B…).
-/// Turns exceeding this limit are silently dropped with a warning log.
-pub(crate) const MAX_AGENT_CHAIN_DEPTH: usize = 8;
-
 /// A pending turn to be executed for a target agent, enqueued by `agent_send`.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingAgentTurn {
