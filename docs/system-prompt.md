@@ -233,7 +233,7 @@ The following skills are available. When a task matches a skill, use the `activa
 
 ### 4.5 Sleep Batch 用プロンプト（通常 turn とは別文脈）
 
-Sleep Batch の LLM 呼び出しは通常 turn の `build_system_prompt()` ではなく、[`src/sleep_batch.rs`](../src/sleep_batch.rs) の `build_sleep_system_prompt()` で構築する。
+Sleep Batch の LLM 呼び出しは通常 turn の `build_system_prompt()` ではなく、[`src/sleep_batch.rs`](../src/sleep_batch.rs) の `build_sleep_system_prompt()` で構築する。入力が大きい場合は同一 run 内でチャンク分割し、各チャンクの出力 memory を次チャンクの入力 memory として引き継ぐ。
 
 | 用途 | パス |
 |---|---|

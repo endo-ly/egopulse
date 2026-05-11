@@ -5,7 +5,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
-use crate::llm::{LlmProvider, Message};
+use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, call_blocking};
@@ -14,6 +14,10 @@ use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, ca
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
 /// Approximate chars-per-token ratio used by the existing session token estimate.
 const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
+/// Maximum session payload sent in one sleep LLM request.
+const MAX_SLEEP_CHUNK_SESSION_TOKENS: usize = 12_000;
+/// Minimum chunk budget used for unusually small context windows.
+const MIN_SLEEP_CHUNK_SESSION_TOKENS: usize = 4_000;
 /// Maximum characters of raw LLM response to include in error messages and logs.
 const RAW_RESPONSE_PREVIEW_CHARS: usize = 300;
 
@@ -118,6 +122,12 @@ pub(crate) struct SleepPromptInput {
     pub source_chats_json: String,
 }
 
+struct SleepRequestResult {
+    output: SleepBatchOutput,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
 /// Builds the sleep prompt input by loading memory and session data.
 ///
 /// # Errors
@@ -149,12 +159,44 @@ pub(crate) fn build_sleep_input(
 
     // Load memory, defaulting to empty if not found
     let memory = memory_loader.load(agent_id).unwrap_or_default();
-
-    // Check context overflow (80% threshold), including existing memory text.
-    let session_tokens: usize = sessions
+    let sessions_text = build_sessions_text(db, sessions)?;
+    let estimated_session_tokens = sessions
         .iter()
         .map(|s| s.estimated_tokens.max(0) as usize)
         .sum();
+
+    build_sleep_input_from_parts(
+        agent_id,
+        memory,
+        sessions_text,
+        source_chats_json.to_string(),
+        context_window_tokens,
+        estimated_session_tokens,
+    )
+}
+
+fn build_sleep_input_from_parts(
+    agent_id: &str,
+    memory: MemoryContent,
+    sessions_text: String,
+    source_chats_json: String,
+    context_window_tokens: usize,
+    minimum_session_tokens: usize,
+) -> Result<SleepPromptInput, SleepBatchError> {
+    let trimmed = agent_id.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains(':')
+    {
+        return Err(SleepBatchError::Internal(format!(
+            "unsafe agent_id: {agent_id}"
+        )));
+    }
+
+    // Check context overflow (80% threshold), including existing memory text.
+    let session_tokens = estimate_text_tokens(&sessions_text).max(minimum_session_tokens);
     let memory_tokens = estimate_memory_tokens(&memory);
     let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as usize;
     if session_tokens.saturating_add(memory_tokens) > threshold {
@@ -163,7 +205,18 @@ pub(crate) fn build_sleep_input(
         });
     }
 
-    // Build sessions_text from each session
+    Ok(SleepPromptInput {
+        agent_id: agent_id.to_string(),
+        memory,
+        sessions_text,
+        source_chats_json,
+    })
+}
+
+fn build_sessions_text(
+    db: &Database,
+    sessions: &[AgentSessionInfo],
+) -> Result<String, SleepBatchError> {
     let mut sessions_text = String::new();
     for session in sessions {
         let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
@@ -173,13 +226,118 @@ pub(crate) fn build_sleep_input(
             session.channel, session.external_chat_id, messages
         ));
     }
+    Ok(sessions_text)
+}
 
-    Ok(SleepPromptInput {
-        agent_id: agent_id.to_string(),
-        memory,
-        sessions_text,
-        source_chats_json: source_chats_json.to_string(),
-    })
+fn build_session_text_chunks(
+    db: &Database,
+    sessions: &[AgentSessionInfo],
+    max_session_tokens: usize,
+) -> Result<Vec<String>, SleepBatchError> {
+    let max_chars = max_session_tokens.saturating_mul(ESTIMATED_CHARS_PER_TOKEN);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for session in sessions {
+        let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
+        let messages = extract_messages_text(&snapshot.messages_json);
+        let blocks = session_blocks(session, &messages, max_chars);
+
+        for block in blocks {
+            append_chunk_block(&mut chunks, &mut current, block, max_chars);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+
+    Ok(chunks)
+}
+
+fn session_blocks(session: &AgentSessionInfo, messages: &str, max_chars: usize) -> Vec<String> {
+    let open = format!(
+        "<session channel=\"{}\" chat=\"{}\">",
+        session.channel, session.external_chat_id
+    );
+    let close = "</session>";
+    let wrapper_chars = open.len() + close.len() + 3;
+    let body_max_chars = max_chars.saturating_sub(wrapper_chars).max(1);
+    let parts = split_text_by_chars(messages, body_max_chars);
+    let total = parts.len();
+
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            if total == 1 {
+                format!("{open}\n{part}\n{close}\n")
+            } else {
+                format!(
+                    "<session channel=\"{}\" chat=\"{}\" chunk=\"{}\" chunks=\"{}\">\n{}\n</session>\n",
+                    session.channel,
+                    session.external_chat_id,
+                    index + 1,
+                    total,
+                    part
+                )
+            }
+        })
+        .collect()
+}
+
+fn append_chunk_block(
+    chunks: &mut Vec<String>,
+    current: &mut String,
+    block: String,
+    max_chars: usize,
+) {
+    if !current.is_empty() && current.len().saturating_add(block.len()) > max_chars {
+        chunks.push(std::mem::take(current));
+    }
+    current.push_str(&block);
+}
+
+fn split_text_by_chars(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = nth_char_boundary(text, start, max_chars).unwrap_or(text.len());
+        if end < text.len()
+            && let Some(relative_newline) = text[start..end].rfind('\n')
+        {
+            let newline_end = start + relative_newline + 1;
+            if newline_end > start {
+                end = newline_end;
+            }
+        }
+        parts.push(text[start..end].trim().to_string());
+        start = end;
+    }
+
+    parts
+}
+
+fn nth_char_boundary(text: &str, start: usize, max_chars: usize) -> Option<usize> {
+    text[start..]
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| start + index)
+}
+
+fn sleep_chunk_session_tokens(context_window_tokens: usize) -> usize {
+    let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as usize;
+    threshold.saturating_div(3).clamp(
+        MIN_SLEEP_CHUNK_SESSION_TOKENS,
+        MAX_SLEEP_CHUNK_SESSION_TOKENS,
+    )
 }
 
 fn estimate_memory_tokens(memory: &MemoryContent) -> usize {
@@ -317,6 +475,74 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
     prompt
 }
 
+async fn send_sleep_request(
+    provider: &Arc<dyn LlmProvider>,
+    agent_id: &str,
+    system_prompt: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> Result<SleepRequestResult, SleepBatchError> {
+    let user_message = Message::text(
+        "user",
+        format!("Please process memory update chunk {chunk_index} of {total_chunks}."),
+    );
+    let response = provider
+        .send_message(system_prompt, vec![user_message.clone()], None)
+        .await
+        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+    let response = match parse_sleep_response(&response.content) {
+        Ok(output) => (output, response),
+        Err(first_error) => {
+            warn!(
+                agent_id = %agent_id,
+                chunk_index,
+                total_chunks,
+                error = %first_error,
+                raw_preview = %preview_raw_response(&response.content),
+                "sleep batch parse failed; retrying once with JSON guard"
+            );
+
+            let retry_messages = vec![
+                user_message,
+                Message::text("assistant", &response.content),
+                Message::text("user", JSON_RETRY_GUARD),
+            ];
+            let retry_response = provider
+                .send_message(system_prompt, retry_messages, None)
+                .await
+                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+            match parse_sleep_response(&retry_response.content) {
+                Ok(output) => (output, retry_response),
+                Err(retry_error) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        chunk_index,
+                        total_chunks,
+                        error = %retry_error,
+                        raw_preview = %preview_raw_response(&retry_response.content),
+                        "sleep batch retry also failed"
+                    );
+                    return Err(retry_error);
+                }
+            }
+        }
+    };
+
+    Ok(sleep_request_result(response))
+}
+
+fn sleep_request_result(
+    (output, response): (SleepBatchOutput, MessagesResponse),
+) -> SleepRequestResult {
+    SleepRequestResult {
+        output,
+        input_tokens: response.usage.as_ref().map_or(0, |u| u.input_tokens),
+        output_tokens: response.usage.as_ref().map_or(0, |u| u.output_tokens),
+    }
+}
+
 /// Runs a manual sleep batch for the given agent.
 ///
 /// When `agent_id` is `None`, the config's `default_agent` is used.
@@ -422,69 +648,48 @@ async fn execute_batch(
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
-        // 3. Build sleep input (synchronous DB call, safe in async context for sleep batch)
+        // 3. Build bounded sleep chunks. All chunks are processed in this run.
         let context_tokens = state.config.resolve_context_window_tokens(
             &crate::config::ProviderId::new(&resolved.provider),
             &resolved.model,
         );
-        let input = build_sleep_input(
-            &db,
-            &state.memory_loader,
-            agent_id,
-            sessions,
-            source_chats_json,
-            context_tokens,
-        )?;
+        let chunk_session_tokens = sleep_chunk_session_tokens(context_tokens);
+        let session_chunks = build_session_text_chunks(&db, sessions, chunk_session_tokens)?;
 
         // 4. Save BEFORE snapshots
         let memory_before = state.memory_loader.load(agent_id);
         save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
 
-        // 5. Build system prompt
-        let system_prompt = build_sleep_system_prompt(&input);
+        // 5-7. Process every chunk in order, feeding each output into the next.
+        let mut current_memory = memory_before.unwrap_or_default();
+        let mut final_output = None;
+        let mut input_tokens = 0_i64;
+        let mut output_tokens = 0_i64;
+        let total_chunks = session_chunks.len();
 
-        // 6. Call LLM
-        let user_message = Message::text("user", "Please process the memory update.");
-        let response = provider
-            .send_message(&system_prompt, vec![user_message.clone()], None)
-            .await
-            .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+        for (index, sessions_text) in session_chunks.into_iter().enumerate() {
+            let input = build_sleep_input_from_parts(
+                agent_id,
+                current_memory,
+                sessions_text,
+                source_chats_json.to_string(),
+                context_tokens,
+                0,
+            )?;
+            let system_prompt = build_sleep_system_prompt(&input);
+            let request_result =
+                send_sleep_request(&provider, agent_id, &system_prompt, index + 1, total_chunks)
+                    .await?;
 
-        // 7. Parse response (with retry on failure)
-        let (output, response) = match parse_sleep_response(&response.content) {
-            Ok(output) => (output, response),
-            Err(first_error) => {
-                warn!(
-                    agent_id = %agent_id,
-                    error = %first_error,
-                    raw_preview = %preview_raw_response(&response.content),
-                    "sleep batch parse failed; retrying once with JSON guard"
-                );
+            input_tokens = input_tokens.saturating_add(request_result.input_tokens);
+            output_tokens = output_tokens.saturating_add(request_result.output_tokens);
+            current_memory = memory_content_from_output(&request_result.output);
+            final_output = Some(request_result.output);
+        }
 
-                let retry_messages = vec![
-                    user_message,
-                    Message::text("assistant", &response.content),
-                    Message::text("user", JSON_RETRY_GUARD),
-                ];
-                let retry_response = provider
-                    .send_message(&system_prompt, retry_messages, None)
-                    .await
-                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
-
-                match parse_sleep_response(&retry_response.content) {
-                    Ok(output) => (output, retry_response),
-                    Err(retry_error) => {
-                        warn!(
-                            agent_id = %agent_id,
-                            error = %retry_error,
-                            raw_preview = %preview_raw_response(&retry_response.content),
-                            "sleep batch retry also failed"
-                        );
-                        return Err(retry_error);
-                    }
-                }
-            }
-        };
+        let output = final_output.ok_or_else(|| {
+            SleepBatchError::Internal("sleep batch produced no output".to_string())
+        })?;
 
         // 8. Write memory files
         write_memory_files(&agents_dir, agent_id, &output)?;
@@ -508,8 +713,6 @@ async fn execute_batch(
         // 11. Update run success with token usage
         let run_id_owned = run_id.clone();
         let source_chats = source_chats_json.to_string();
-        let input_tokens = response.usage.as_ref().map_or(0, |u| u.input_tokens);
-        let output_tokens = response.usage.as_ref().map_or(0, |u| u.output_tokens);
         call_blocking(Arc::clone(&db), move |db| {
             db.update_sleep_run_success(
                 &run_id_owned,
@@ -1587,6 +1790,58 @@ mod tests {
         let err = build_sleep_input(&db, &loader, "test-agent", &sessions, "[]", 1_000)
             .expect_err("memory alone should exceed 80% context threshold");
         assert!(matches!(err, SleepBatchError::ContextOverflow { .. }));
+    }
+
+    #[test]
+    fn build_session_text_chunks_splits_large_single_session_without_dropping_text() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "large");
+        let first = "A".repeat(120);
+        let second = "B".repeat(120);
+        let messages_json = serde_json::json!([
+            {"role": "user", "content": first},
+            {"role": "assistant", "content": second}
+        ])
+        .to_string();
+        db.save_session(chat_id, &messages_json)
+            .expect("save session");
+        let sessions = vec![make_session_info(chat_id, "test", "test:large", 100)];
+
+        let chunks = build_session_text_chunks(&db, &sessions, 60).expect("chunks");
+
+        assert!(chunks.len() > 1);
+        let combined = chunks.join("\n");
+        assert!(combined.contains(&"A".repeat(50)));
+        assert!(combined.contains(&"B".repeat(50)));
+        assert!(combined.contains("chunk=\"1\""));
+    }
+
+    #[test]
+    fn build_session_text_chunks_keeps_all_sessions_in_current_run() {
+        let (db, _dir) = test_db();
+        let mut sessions = Vec::new();
+        for i in 0..3 {
+            let chat_id = create_chat(&db, "test-agent", &format!("chunk-{i}"));
+            db.save_session(
+                chat_id,
+                &serde_json::json!([{"role": "user", "content": format!("message-{i}")}])
+                    .to_string(),
+            )
+            .expect("save session");
+            sessions.push(make_session_info(
+                chat_id,
+                "test",
+                &format!("test:chunk-{i}"),
+                10,
+            ));
+        }
+
+        let chunks = build_session_text_chunks(&db, &sessions, 100).expect("chunks");
+        let combined = chunks.join("\n");
+
+        assert!(combined.contains("message-0"));
+        assert!(combined.contains("message-1"));
+        assert!(combined.contains("message-2"));
     }
 
     // --- build_sleep_system_prompt tests ---
