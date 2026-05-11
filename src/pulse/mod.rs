@@ -11,4 +11,6 @@ pub(crate) mod gate;
 #[allow(dead_code)]
 pub(crate) mod home_surface;
 #[allow(dead_code)]
+pub(crate) mod output;
+#[allow(dead_code)]
 pub(crate) mod runner;
