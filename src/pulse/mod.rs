@@ -14,3 +14,5 @@ pub(crate) mod home_surface;
 pub(crate) mod output;
 #[allow(dead_code)]
 pub(crate) mod runner;
+#[allow(dead_code)]
+pub(crate) mod scheduler;

@@ -48,7 +48,9 @@ pub(crate) async fn handle_output(
     pulse_run_id: &str,
 ) -> Result<OutputResult, EgoPulseError> {
     match activation_result.output_kind {
-        PulseOutputKind::Silent => handle_silent(db, &activation_result.output_text, pulse_run_id).await,
+        PulseOutputKind::Silent => {
+            handle_silent(db, &activation_result.output_text, pulse_run_id).await
+        }
         PulseOutputKind::Notify => {
             handle_notify(
                 db,
