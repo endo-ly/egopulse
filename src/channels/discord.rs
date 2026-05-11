@@ -490,17 +490,12 @@ impl Handler {
         }
     }
 
-    /// スレッド ID にエージェントスコープを付与した識別子を生成する。
-    fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
-        crate::agent_loop::agent_scoped_surface_thread(thread, agent_id)
-    }
-
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
         SurfaceContext::new(
             "discord".to_string(),
             user.to_string(),
-            self.agent_thread(thread, agent_id),
+            thread.to_string(),
             "discord".to_string(),
             agent_id.to_string(),
         )
@@ -1350,12 +1345,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_thread_is_agent_scoped() {
-        let handler = test_handler(HashMap::new());
-        assert_eq!(handler.agent_thread("123", "lyre"), "123:agent:lyre");
-    }
-
-    #[test]
     fn parse_explicit_discord_bot_id_from_external_chat_id() {
         assert_eq!(
             parse_explicit_discord_bot_id("123:bot:main:agent:developer"),
@@ -1559,14 +1548,10 @@ mod tests {
         );
 
         assert_eq!(
-            handler.agent_thread("123", "developer"),
-            "123:agent:developer"
-        );
-        assert_eq!(
             handler
                 .make_context("user", "123", "developer")
                 .surface_thread,
-            "123:agent:developer"
+            "123"
         );
     }
 

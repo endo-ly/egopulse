@@ -170,7 +170,7 @@ mod tests {
         SurfaceContext::new(
             "discord".to_string(),
             "user".to_string(),
-            format!("ch1:agent:{agent_id}"),
+            "ch1".to_string(),
             "discord".to_string(),
             agent_id.to_string(),
         )

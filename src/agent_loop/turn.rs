@@ -2480,7 +2480,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "discord",
-                "discord:ctx-no-persist",
+                "discord:ctx-no-persist:agent:default",
                 Some("ctx-no-persist"),
                 "discord",
                 "default",
@@ -2589,7 +2589,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "discord",
-                "discord:int-full-flow",
+                "discord:int-full-flow:agent:default",
                 Some("int-full-flow"),
                 "discord",
                 "default",

@@ -34,7 +34,7 @@ pub(crate) async fn resolve_chat_id(
     call_blocking(Arc::clone(&state.db), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
-        let surface_thread = context.canonical_surface_thread();
+        let surface_thread = context.surface_thread.clone();
         let chat_type = context.chat_type.clone();
         let agent_id = context.agent_id.clone();
         move |db| {
@@ -927,7 +927,7 @@ mod tests {
         let ctx_a = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: "ch999:bot:bot1:agent:agent_a".to_string(),
+            surface_thread: "ch999:bot:bot1".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
             channel_log_chat_id: None,
@@ -937,7 +937,7 @@ mod tests {
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: "ch999:bot:bot1:agent:agent_b".to_string(),
+            surface_thread: "ch999:bot:bot1".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_b".to_string(),
             channel_log_chat_id: None,
@@ -971,7 +971,7 @@ mod tests {
         let ctx = SurfaceContext {
             channel: "discord".to_string(),
             surface_user: "user".to_string(),
-            surface_thread: "ch555:bot:bot1:agent:agent_a".to_string(),
+            surface_thread: "ch555:bot:bot1".to_string(),
             chat_type: "discord".to_string(),
             agent_id: "agent_a".to_string(),
             channel_log_chat_id: None,

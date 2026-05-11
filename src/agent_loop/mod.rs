@@ -85,34 +85,16 @@ impl SurfaceContext {
         }
     }
 
-    /// Returns the canonical surface thread for persistence and channel routing.
-    ///
-    /// Discord agent sessions must be scoped exactly once as
-    /// `<room-thread>:agent:<agent-id>`. This normalizes accidentally nested
-    /// values such as `123:agent:lyre:agent:vega` back to `123:agent:vega`.
-    pub(crate) fn canonical_surface_thread(&self) -> String {
-        if self.channel == "discord" && !self.agent_id.is_empty() {
-            agent_scoped_surface_thread(&self.surface_thread, &self.agent_id)
-        } else {
-            self.surface_thread.clone()
-        }
-    }
-
-    /// Returns the stable session key in `channel:surface_thread` format.
+    /// Returns the stable session key for the current surface and agent.
     pub(crate) fn session_key(&self) -> String {
-        format!("{}:{}", self.channel, self.canonical_surface_thread())
+        if self.channel == "discord" && !self.agent_id.is_empty() {
+            return format!(
+                "{}:{}:agent:{}",
+                self.channel, self.surface_thread, self.agent_id
+            );
+        }
+        format!("{}:{}", self.channel, self.surface_thread)
     }
-}
-
-/// Returns a Discord agent-scoped surface thread with exactly one `:agent:` segment.
-pub(crate) fn agent_scoped_surface_thread(source_surface_thread: &str, agent_id: &str) -> String {
-    let unprefixed = source_surface_thread
-        .strip_prefix("discord:")
-        .unwrap_or(source_surface_thread);
-    let room_thread = unprefixed
-        .split_once(":agent:")
-        .map_or(unprefixed, |(room_thread, _)| room_thread);
-    format!("{room_thread}:agent:{agent_id}")
 }
 
 #[cfg(test)]
@@ -147,36 +129,28 @@ mod tests {
 
     #[test]
     fn session_key_format_is_channel_colon_thread() {
-        // Arrange
         let ctx = SurfaceContext::new(
             "discord".to_string(),
             "bob".to_string(),
-            "123:agent:dev".to_string(),
+            "123".to_string(),
             "discord".to_string(),
             "dev".to_string(),
         );
 
-        // Act
-        let key = ctx.session_key();
-
-        // Assert
-        assert_eq!(key, "discord:123:agent:dev");
+        assert_eq!(ctx.surface_thread, "123");
+        assert_eq!(ctx.session_key(), "discord:123:agent:dev");
     }
 
     #[test]
-    fn session_key_canonicalizes_nested_discord_agent_scope() {
-        let ctx = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "dev".to_string(),
-            surface_thread: "123:agent:lyre:agent:vega".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "vega".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-        };
+    fn non_discord_session_key_is_not_agent_scoped() {
+        let ctx = SurfaceContext::new(
+            "web".to_string(),
+            "dev".to_string(),
+            "session-1".to_string(),
+            "web".to_string(),
+            "vega".to_string(),
+        );
 
-        assert_eq!(ctx.canonical_surface_thread(), "123:agent:vega");
-        assert_eq!(ctx.session_key(), "discord:123:agent:vega");
+        assert_eq!(ctx.session_key(), "web:session-1");
     }
 }
