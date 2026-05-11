@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent_loop::{PendingAgentTurn, SurfaceContext};
+use crate::agent_loop::{PendingAgentTurn, SurfaceContext, agent_scoped_surface_thread};
 use crate::config::{AgentConfig, AgentId};
 use crate::llm::ToolDefinition;
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
@@ -58,13 +58,7 @@ fn agent_label<'a>(
 }
 
 fn target_surface_thread(source_surface_thread: &str, target_id: &str) -> String {
-    let unprefixed = source_surface_thread
-        .strip_prefix("discord:")
-        .unwrap_or(source_surface_thread);
-    let room_thread = unprefixed
-        .split_once(":agent:")
-        .map_or(unprefixed, |(room_thread, _)| room_thread);
-    format!("{room_thread}:agent:{target_id}")
+    agent_scoped_surface_thread(source_surface_thread, target_id)
 }
 
 #[async_trait]

@@ -492,7 +492,7 @@ impl Handler {
 
     /// スレッド ID にエージェントスコープを付与した識別子を生成する。
     fn agent_thread(&self, thread: &str, agent_id: &str) -> String {
-        format!("{thread}:agent:{agent_id}")
+        crate::agent_loop::agent_scoped_surface_thread(thread, agent_id)
     }
 
     /// [`SurfaceContext`] を構築する。

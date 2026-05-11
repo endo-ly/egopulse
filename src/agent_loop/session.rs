@@ -34,7 +34,7 @@ pub(crate) async fn resolve_chat_id(
     call_blocking(Arc::clone(&state.db), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
-        let surface_thread = context.surface_thread.clone();
+        let surface_thread = context.canonical_surface_thread();
         let chat_type = context.chat_type.clone();
         let agent_id = context.agent_id.clone();
         move |db| {
