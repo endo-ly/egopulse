@@ -342,9 +342,7 @@ mod tests {
             skills: Arc::clone(&skills),
             tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
             mcp_manager: None,
-            assets: Arc::new(
-                crate::assets::AssetStore::new(&config.assets_dir()).expect("assets"),
-            ),
+            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
             soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
             memory_loader: Arc::new(crate::memory::MemoryLoader::new(
                 std::path::PathBuf::from(&config.state_root).join("agents"),
@@ -352,12 +350,8 @@ mod tests {
             llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
             turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: Arc::new(
-                crate::runtime::turn_scheduler::TurnScheduler::new(),
-            ),
-            turn_tracker: Arc::new(
-                crate::runtime::turn_scheduler::TurnTracker::new(),
-            ),
+            turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
+            turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
         }
     }
 
