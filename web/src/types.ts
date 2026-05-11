@@ -98,3 +98,25 @@ export type UiStatus = {
   tone: "idle" | "ok" | "error";
   text: string;
 };
+
+/** Sleep Batch 実行履歴 */
+export type SleepRun = {
+  id: string;
+  agent_id: string;
+  status: string;
+  trigger_type: string;
+  started_at: string;
+  finished_at: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  error_message: string | null;
+  session_count: number;
+};
+
+/** メモリスナップショット (before/after) */
+export type MemorySnapshot = {
+  file: string;
+  content_before: string;
+  content_after: string;
+};

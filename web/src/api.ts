@@ -1,4 +1,4 @@
-import type { StreamEvent, UiStatus } from "./types";
+import type { MemorySnapshot, SleepRun, StreamEvent, UiStatus } from "./types";
 
 /** localStorage に auth token を保存する際のキー */
 export const AUTH_TOKEN_STORAGE_KEY = "egopulse.webAuthToken";
@@ -188,3 +188,42 @@ export function webExternalChatId(sessionKey: string): string {
 
 /** デフォルト UI ステータス */
 export const defaultStatus: UiStatus = { tone: "idle", text: "Ready" };
+
+export async function fetchAgents(authToken: string): Promise<string[]> {
+  const data = await api<{ ok: boolean; agents: string[] }>(
+    "/api/agents",
+    authToken,
+  );
+  return data.agents;
+}
+
+export async function fetchSleepRuns(
+  authToken: string,
+  agentId?: string,
+  limit?: number,
+): Promise<SleepRun[]> {
+  const params = new URLSearchParams();
+  if (agentId) params.set("agent_id", agentId);
+  if (limit !== undefined) params.set("limit", String(limit));
+  const qs = params.toString();
+  const path = qs ? `/api/sleep/runs?${qs}` : "/api/sleep/runs";
+  const data = await api<{ ok: boolean; runs: SleepRun[] }>(path, authToken);
+  return data.runs;
+}
+
+export async function fetchRunDetail(
+  authToken: string,
+  runId: string,
+): Promise<{ run: SleepRun; snapshots: MemorySnapshot[] }> {
+  const data = await api<{
+    ok: boolean;
+    run: SleepRun;
+    snapshots: MemorySnapshot[];
+  }>(`/api/sleep/runs/${encodeURIComponent(runId)}`, authToken);
+  return { run: data.run, snapshots: data.snapshots };
+}
+
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  return `${(n / 1000).toFixed(1)}k`;
+}
