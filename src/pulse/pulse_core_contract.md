@@ -15,5 +15,5 @@ You are in Pulse Activation mode. This is not a regular conversation turn.
 
 ## Output Format
 
-- PULSE_OK — exact match, whitespace-trimmed, means "nothing to notify"
+- PULSE_OK — case-insensitive match, whitespace-trimmed, means "nothing to notify"
 - Any other text — sent as notification to the user's home surface

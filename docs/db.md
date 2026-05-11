@@ -460,7 +460,7 @@ CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
 | status | TEXT | NOT NULL | 実行状態（running/success/failed/skipped） |
 | started_at | TEXT | NOT NULL | 開始時刻（RFC3339） |
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
-| output_kind | TEXT | nullable | 出力種別（silent/notify/failed） |
+| output_kind | TEXT | nullable | 出力種別（silent/notify） |
 | output_text | TEXT | nullable | LLM 出力テキスト |
 | error_message | TEXT | nullable | エラーメッセージ |
 

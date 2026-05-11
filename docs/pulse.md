@@ -565,8 +565,8 @@ Phase 1 の出力は2種類だけ。
 | `PULSE_OK` | 通知不要 | silent として記録。通常 session には何も保存しない                        |
 | その他の本文     | 通知あり | Home Surface へ送信し、通常 session に assistant message として保存する |
 
-`PULSE_OK` は完全一致または前後空白のみ許可する。
-曖昧な判定は避ける。
+`PULSE_OK` は case-insensitive で前後空白を trim して判定する。
+LLM の出力揺れを許容しつつ、実質的な誤検知は避ける。
 
 ---
 
