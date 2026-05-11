@@ -600,6 +600,7 @@ fn persists_agents_without_discord_config_surface() {
         default_agent: super::AgentId::new("alice"),
         agents,
         sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -1392,6 +1393,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         default_agent: super::AgentId::new("assistant"),
         agents,
         sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
     };
 
     // Act
@@ -2206,6 +2208,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
             },
         )]),
         sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2470,6 +2473,7 @@ fn persist_preserves_sleep_batch_config() {
             model: Some("deepseek-chat-v3".to_string()),
             ..Default::default()
         },
+        pulse: super::PulseConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2881,6 +2885,7 @@ fn persist_preserves_sleep_batch_scheduler_config() {
             retry_interval_minutes: 10,
             ..Default::default()
         },
+        pulse: super::PulseConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2894,4 +2899,111 @@ fn persist_preserves_sleep_batch_scheduler_config() {
     assert!(yaml.contains("- alice"));
     assert!(yaml.contains("max_attempts: 5"));
     assert!(yaml.contains("interval_minutes: 10"));
+}
+
+// --- Pulse config tests ---
+
+fn pulse_config_yml(pulse_section: &str) -> String {
+    format!(
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+pulse:
+{pulse_section}"#
+    )
+}
+
+#[test]
+#[serial]
+fn pulse_config_defaults_disabled() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert
+    assert!(!config.pulse().enabled);
+}
+
+#[test]
+#[serial]
+fn pulse_config_loads_runtime_fields() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &pulse_config_yml(
+            r#"  enabled: true
+  tick_interval_secs: 120
+  timezone: "Asia/Tokyo""#,
+        ),
+    );
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert
+    assert!(config.pulse().enabled);
+    assert_eq!(config.pulse().tick_interval_secs, 120);
+    assert_eq!(config.pulse().timezone.as_deref(), Some("Asia/Tokyo"));
+}
+
+#[test]
+#[serial]
+fn pulse_config_rejects_invalid_timezone() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &pulse_config_yml(
+            r#"  enabled: true
+  timezone: "Invalid/Zone""#,
+        ),
+    );
+
+    // Act
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+    // Assert
+    assert!(
+        matches!(error, ConfigError::PulseInvalidTimezone { ref timezone } if timezone == "Invalid/Zone"),
+        "expected PulseInvalidTimezone, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn pulse_config_rejects_zero_tick_interval() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &pulse_config_yml(
+            r#"  enabled: true
+  tick_interval_secs: 0"#,
+        ),
+    );
+
+    // Act
+    let error = Config::load(Some(&file_path)).expect_err("should fail");
+
+    // Assert
+    assert!(
+        matches!(error, ConfigError::PulseInvalidTickInterval),
+        "expected PulseInvalidTickInterval, got {error:?}"
+    );
 }

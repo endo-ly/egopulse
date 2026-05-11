@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId,
-    ResolvedLlmConfig,
+    PulseConfig, ResolvedLlmConfig,
 };
 use crate::error::ConfigError;
 
@@ -166,6 +166,11 @@ impl Config {
             .get("web")
             .and_then(|c| c.enabled)
             .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pulse(&self) -> &PulseConfig {
+        &self.pulse
     }
 
     /// Returns the web channel host, defaulting to `127.0.0.1`.

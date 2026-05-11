@@ -13,7 +13,8 @@ use super::secret_ref::{
 };
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
-    DiscordChannelConfig, ProviderConfig, ProviderId, SleepBatchConfig, TelegramChatConfig,
+    DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig, SleepBatchConfig,
+    TelegramChatConfig,
 };
 use crate::error::ConfigError;
 
@@ -106,6 +107,13 @@ struct FileRetryConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FilePulseConfig {
+    enabled: Option<bool>,
+    tick_interval_secs: Option<u64>,
+    timezone: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
     default_model: Option<String>,
@@ -121,6 +129,7 @@ struct FileConfig {
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
     sleep_batch: Option<FileSleepBatchConfig>,
+    pulse: Option<FilePulseConfig>,
 }
 
 pub(super) fn build_config(
@@ -149,6 +158,7 @@ pub(super) fn build_config(
         default_agent: file_default_agent,
         agents: file_agents,
         sleep_batch: file_sleep_batch,
+        pulse: file_pulse,
     } = read_file_config(resolved_config_path.as_deref())?;
 
     let default_provider =
@@ -209,6 +219,8 @@ pub(super) fn build_config(
 
     let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers, &agents, &default_agent)?;
 
+    let pulse = normalize_pulse(file_pulse)?;
+
     let config = Config {
         default_provider,
         default_model,
@@ -225,6 +237,7 @@ pub(super) fn build_config(
         default_agent,
         agents,
         sleep_batch,
+        pulse,
     };
 
     validate_compaction_config(&config)?;
@@ -582,6 +595,31 @@ fn validate_timezone(tz: &str) -> Result<(), ConfigError> {
             timezone: tz.to_string(),
         })?;
     Ok(())
+}
+
+fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigError> {
+    let Some(fp) = file else {
+        return Ok(PulseConfig::default());
+    };
+
+    let timezone = normalize_string(fp.timezone);
+    if let Some(ref tz) = timezone {
+        tz.parse::<chrono_tz::Tz>()
+            .map_err(|_| ConfigError::PulseInvalidTimezone {
+                timezone: tz.clone(),
+            })?;
+    }
+
+    let tick_interval_secs = fp.tick_interval_secs.unwrap_or(60);
+    if tick_interval_secs == 0 {
+        return Err(ConfigError::PulseInvalidTickInterval);
+    }
+
+    Ok(PulseConfig {
+        enabled: fp.enabled.unwrap_or(false),
+        tick_interval_secs,
+        timezone,
+    })
 }
 
 fn normalize_agent_list(

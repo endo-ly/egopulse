@@ -264,6 +264,31 @@ impl SleepBatchConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct PulseConfig {
+    pub enabled: bool,
+    pub tick_interval_secs: u64,
+    pub timezone: Option<String>,
+}
+
+impl Default for PulseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_interval_secs: 60,
+            timezone: None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl PulseConfig {
+    pub(crate) fn scheduler_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct AgentConfig {
     pub label: String,
@@ -301,6 +326,7 @@ pub struct Config {
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
     pub(crate) sleep_batch: SleepBatchConfig,
+    pub(crate) pulse: PulseConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -327,6 +353,7 @@ impl std::fmt::Debug for Config {
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)
             .field("sleep_batch", &self.sleep_batch)
+            .field("pulse", &self.pulse)
             .finish()
     }
 }

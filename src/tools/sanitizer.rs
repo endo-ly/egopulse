@@ -473,6 +473,7 @@ mod tests {
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         };
 
         // Act
@@ -516,6 +517,7 @@ mod tests {
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         };
 
         // Act
@@ -566,6 +568,7 @@ mod tests {
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         };
 
         let secrets = collect_config_secrets(&config);
@@ -621,6 +624,7 @@ mod tests {
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         };
 
         // Act
@@ -674,6 +678,7 @@ mod tests {
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         };
 
         // Act

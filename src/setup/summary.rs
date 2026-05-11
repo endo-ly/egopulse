@@ -276,6 +276,10 @@ pub(crate) fn save_config(
             .as_ref()
             .map(|c| c.sleep_batch.clone())
             .unwrap_or_default(),
+        pulse: existing_config
+            .as_ref()
+            .map(|c| c.pulse.clone())
+            .unwrap_or_default(),
     };
 
     config

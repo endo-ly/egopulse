@@ -537,6 +537,7 @@ mod tests {
             default_agent: AgentId::new("default"),
             agents,
             sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
         }
     }
 

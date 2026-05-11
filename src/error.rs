@@ -24,6 +24,9 @@ pub enum EgoPulseError {
     Channel(#[from] ChannelError),
     #[error(transparent)]
     Mcp(#[from] McpError),
+    #[error(transparent)]
+    #[allow(private_interfaces)]
+    Pulse(#[from] crate::pulse::definition::PulseParseError),
     #[error("shutdown_requested")]
     ShutdownRequested,
     #[error("internal_error: {0}")]
@@ -41,6 +44,7 @@ impl EgoPulseError {
             Self::Storage(_) => "storage",
             Self::Channel(_) => "channel",
             Self::Mcp(_) => "mcp",
+            Self::Pulse(_) => "pulse",
             Self::ShutdownRequested => "shutdown",
             Self::Internal(_) => "internal",
         }
@@ -153,6 +157,10 @@ pub enum ConfigError {
     },
     #[error("agent_discord_bot_not_found: agent={agent_id} bot={bot_id}")]
     AgentDiscordBotNotFound { agent_id: String, bot_id: String },
+    #[error("pulse_invalid_timezone: {timezone}")]
+    PulseInvalidTimezone { timezone: String },
+    #[error("pulse_invalid_tick_interval: tick_interval_secs must be at least 1")]
+    PulseInvalidTickInterval,
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.
