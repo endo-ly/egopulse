@@ -1266,6 +1266,45 @@ impl Database {
         .optional()
         .map_err(Into::into)
     }
+
+    /// Get agent chats ordered by `updated_at` DESC, filtered to the given channels.
+    pub(crate) fn get_agent_chats_by_recent(
+        &self,
+        agent_id: &str,
+        channels: &[&str],
+    ) -> Result<Vec<ChatInfo>, StorageError> {
+        let conn = self.lock_conn()?;
+
+        let placeholders: Vec<&str> = channels.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT chat_id, channel, external_chat_id, chat_type, agent_id
+             FROM chats
+             WHERE agent_id = ? AND channel IN ({})
+             ORDER BY last_message_time DESC",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = {
+            let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(1 + channels.len());
+            p.push(&agent_id);
+            for ch in channels {
+                p.push(ch);
+            }
+            p
+        };
+        stmt.query_map(params.as_slice(), |row| {
+            Ok(ChatInfo {
+                chat_id: row.get(0)?,
+                channel: row.get(1)?,
+                external_chat_id: row.get(2)?,
+                chat_type: row.get(3)?,
+                agent_id: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
