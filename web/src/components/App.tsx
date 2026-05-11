@@ -12,13 +12,19 @@ import { useStream } from "../hooks/useStream";
 
 import { Sidebar } from "./Sidebar";
 import { ChatPanel } from "./ChatPanel";
+import { SleepBatchPanel } from "./SleepBatchPanel";
 import { AuthModal } from "./AuthModal";
 import { SettingsModal } from "./SettingsModal";
+
+type MainView =
+  | { type: "chat" }
+  | { type: "sleep-batch" };
 
 export function App() {
   const [health, setHealth] = useState<HealthPayload>({});
   const [showSettings, setShowSettings] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [mainView, setMainView] = useState<MainView>({ type: "chat" });
 
   const {
     authTokenRef,
@@ -129,28 +135,40 @@ export function App() {
           sessions.selectedSessionRef.current = key;
           sessions.setSelectedSession(key);
           void sessions.loadHistory(key);
+          setMainView({ type: "chat" });
           setIsSidebarOpen(false);
         }}
         onOpenSettings={() => {
           setShowSettings(true);
           setIsSidebarOpen(false);
         }}
+        onOpenSleepBatch={() => {
+          setMainView({ type: "sleep-batch" });
+          setIsSidebarOpen(false);
+        }}
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen(false)}
       />
 
-      <ChatPanel
-        selectedLabel={selectedLabel}
-        wsState={wsState}
-        authEnabled={config?.web_auth_enabled ?? false}
-        status={status}
-        messages={sessions.messages}
-        messageEndRef={sessions.messageEndRef}
-        draft={draft}
-        setDraft={setDraft}
-        onSend={handleSend}
-        onToggleSidebar={() => setIsSidebarOpen(true)}
-      />
+      {mainView.type === "chat" ? (
+        <ChatPanel
+          selectedLabel={selectedLabel}
+          wsState={wsState}
+          authEnabled={config?.web_auth_enabled ?? false}
+          status={status}
+          messages={sessions.messages}
+          messageEndRef={sessions.messageEndRef}
+          draft={draft}
+          setDraft={setDraft}
+          onSend={handleSend}
+          onToggleSidebar={() => setIsSidebarOpen(true)}
+        />
+      ) : (
+        <SleepBatchPanel
+          authTokenRef={authTokenRef}
+          onBack={() => setMainView({ type: "chat" })}
+        />
+      )}
 
       {showSettings && config ? (
         <SettingsModal

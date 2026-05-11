@@ -26,6 +26,7 @@ mod auth;
 mod config;
 mod health;
 mod sessions;
+mod sleep;
 pub(crate) mod sse;
 mod stream;
 mod ws;
@@ -312,6 +313,9 @@ pub(crate) async fn run_server(
         .route("/api/history", get(sessions::get_history))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))
+        .route("/api/agents", get(sleep::list_agents))
+        .route("/api/sleep/runs", get(sleep::list_sleep_runs))
+        .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
         .route_layer(middleware::from_fn_with_state(
             web_state.clone(),
             auth::require_http_auth,

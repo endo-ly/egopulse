@@ -7,6 +7,7 @@ type SidebarProps = {
   onNewSession: () => void;
   onSelectSession: (key: string) => void;
   onOpenSettings: () => void;
+  onOpenSleepBatch: () => void;
   isOpen: boolean;
   onToggle: () => void;
 };
@@ -18,6 +19,7 @@ export function Sidebar({
   onNewSession,
   onSelectSession,
   onOpenSettings,
+  onOpenSleepBatch,
   isOpen,
   onToggle,
 }: SidebarProps) {
@@ -44,6 +46,9 @@ export function Sidebar({
       </button>
       <button className="secondary-button" onClick={onOpenSettings}>
         Runtime Config
+      </button>
+      <button className="secondary-button" onClick={onOpenSleepBatch}>
+        Sleep Batch
       </button>
 
       <div className="flex flex-1 min-h-0 flex-col gap-2.5">
