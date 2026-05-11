@@ -3,6 +3,8 @@ use super::{messages::*, responses::*};
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
 
+const REQUEST_TIMEOUT_SECS: u64 = 300;
+
 /// OpenAI-compatible LLM provider using Chat Completions and Responses APIs.
 pub(crate) struct OpenAiProvider {
     http: reqwest::Client,
@@ -25,7 +27,7 @@ impl OpenAiProvider {
         let http = reqwest::Client::builder()
             .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
             .map_err(|error| LlmError::InitFailed(error.to_string()))?;
 
