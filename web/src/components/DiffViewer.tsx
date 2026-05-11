@@ -79,12 +79,16 @@ function DiffLineSplit({
     );
   }
 
-  const isRelevant =
+  const belongsToThisSide =
     (side === "before" && line.type === "remove") ||
     (side === "after" && line.type === "add");
 
+  if (!belongsToThisSide) {
+    return <div className="diff-line-placeholder" />;
+  }
+
   return (
-    <div className={isRelevant ? `diff-line-${line.type}` : "diff-line-unchanged"}>
+    <div className={`diff-line-${line.type}`}>
       {line.content}
     </div>
   );
