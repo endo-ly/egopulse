@@ -7,7 +7,7 @@ use crate::agent_loop::formatting::{
 use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, MessagesResponse, ToolCall};
-use crate::pulse::capsule::{PulseCapsule, core_contract_text};
+use crate::pulse::capsule::PulseCapsule;
 use crate::pulse::home_surface::HomeSurface;
 use crate::runtime::AppState;
 use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall};
@@ -99,8 +99,7 @@ pub(crate) async fn run_activation(
         turn_sender: state.turn_sender.clone(),
     };
 
-    let base_prompt = build_system_prompt(state, &context);
-    let system_prompt = format!("{}\n\n{}", core_contract_text(), base_prompt);
+    let system_prompt = build_system_prompt(state, &context);
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = vec![Message::text("user", &capsule.prompt)];
     let mut tool_phases = Vec::new();
@@ -351,7 +350,6 @@ mod tests {
             "lyre",
             &intention,
             "notes",
-            None,
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",

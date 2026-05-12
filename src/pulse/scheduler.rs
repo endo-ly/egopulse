@@ -171,10 +171,8 @@ async fn process_intention(
     };
 
     // 5. Build capsule
-    let prospective_memory = state
-        .memory_loader
-        .load(agent_id_str)
-        .and_then(|m| m.prospective);
+    // Prospective memory is already injected via build_system_prompt() in the
+    // system prompt; omitting it here avoids duplication.
     let recent_messages = load_recent_messages(&state.db, home_surface.chat_id).await;
     let now_rfc3339 = now.to_rfc3339();
 
@@ -182,7 +180,6 @@ async fn process_intention(
         agent_id_str,
         intention,
         pulse_body,
-        prospective_memory.as_deref(),
         &recent_messages,
         &home_surface,
         &now_rfc3339,

@@ -172,7 +172,6 @@ Pulse Capsule =
   binary embedded contract
   + due になった Temporal Intention
   + PULSE.md body
-  + prospective memory
   + Home Surface の軽量 recent context
 ```
 
@@ -186,7 +185,6 @@ Pulse Capsule =
 | binary embedded Pulse Contract |     入れる |
 | due intention                  |     入れる |
 | `PULSE.md` body                |  あれば入れる |
-| `memory/prospective.md`        |  あれば入れる |
 | Home Surface の直近メッセージ          | 少量だけ入れる |
 | 通常 session 全文                  |    入れない |
 | tool call 履歴全体                 |    入れない |
@@ -510,7 +508,10 @@ Pulse 通知を通常 session に保存すると、その chat の `last_message
 
 # 9. Pulse Capsule
 
-Phase 1 の LLM 入力は以下の形とする。
+Phase 1 の LLM 呼び出しは以下の2つから構成される。
+
+- **system prompt**: `build_system_prompt()` で構築（SOUL / AGENTS / Memory / Skills）+ Core Contract
+- **user message**: 以下の Pulse Capsule
 
 ```text
 # Pulse Activation
@@ -534,10 +535,6 @@ now: 2026-05-10T09:00:00+09:00
 ## Pulse Notes
 
 {PULSE.md body}
-
-## Prospective Memory
-
-{agents/{agent_id}/memory/prospective.md があれば入れる}
 
 ## Recent Visible Context
 
@@ -753,8 +750,29 @@ src/
 
 ### Capsule 構成
 - Core Contract: `include_str!` で `pulse_core_contract.md` を埋め込み
-- 入力: intention, body, prospective memory, recent messages (直近5件)
+- 入力: intention, body, recent messages (直近5件)
 - Home Surface 情報をメタデータとして含む
+
+### LLM 呼び出しの System Prompt 構成
+
+Pulse Activation の LLM 呼び出しは、通常セッションと**同じ `build_system_prompt()` をそのまま** system prompt として使用する。
+Pulse 固有の指示（Core Contract を含む）はすべて user message（Capsule）側に含まれる。
+
+```text
+system prompt = build_system_prompt() の出力
+  SOUL.md
+  + Core Instructions
+  + AGENTS.md
+  + Long-term Memory (episodic / semantic / prospective)
+  + Skills catalog
+```
+
+Capsule (user message) には prospective memory を含めない。
+理由: system prompt 経由で既に注入されているため、2重注入を避ける。
+
+この構成により:
+- 通常セッションと system prompt が完全一致 → prompt cache が最大効率で hit する
+- agent の人格・記憶・スキルが Pulse でも一貫して利用可能
 
 ---
 

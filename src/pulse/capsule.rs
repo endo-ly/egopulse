@@ -18,7 +18,6 @@ pub(crate) struct PulseCapsule {
 /// * `agent_id` - Agent identifier
 /// * `intention` - The due intention
 /// * `pulse_body` - The PULSE.md body (notes section)
-/// * `prospective_memory` - Optional prospective memory content
 /// * `recent_messages` - Recent user-visible messages from Home Surface (max 10)
 /// * `home_surface` - The resolved home surface
 /// * `now_rfc3339` - Current timestamp in RFC3339
@@ -26,7 +25,6 @@ pub(crate) fn build_capsule(
     agent_id: &str,
     intention: &TemporalIntention,
     pulse_body: &str,
-    prospective_memory: Option<&str>,
     recent_messages: &[String],
     home_surface: &HomeSurface,
     now_rfc3339: &str,
@@ -61,13 +59,6 @@ pub(crate) fn build_capsule(
     sections.push_str(pulse_body);
     sections.push_str("\n\n");
 
-    // Prospective Memory (optional)
-    if let Some(memory) = prospective_memory {
-        sections.push_str("## Prospective Memory\n\n");
-        sections.push_str(memory);
-        sections.push_str("\n\n");
-    }
-
     // Recent Visible Context
     sections.push_str("## Recent Visible Context\n\n");
     if recent_messages.is_empty() {
@@ -88,11 +79,6 @@ pub(crate) fn build_capsule(
     sections.push_str("- 破壊的操作はしない\n");
 
     PulseCapsule { prompt: sections }
-}
-
-/// Returns the embedded Core Contract text for use as system prompt.
-pub(crate) fn core_contract_text() -> &'static str {
-    CORE_CONTRACT
 }
 
 #[cfg(test)]
@@ -120,12 +106,11 @@ mod tests {
     }
 
     #[test]
-    fn capsule_includes_contract_intention_notes_memory_and_recent_context() {
+    fn capsule_includes_contract_intention_notes_and_recent_context() {
         // Arrange
         let intention = test_intention();
         let surface = test_home_surface();
         let pulse_body = "Don't notify for trivial changes.";
-        let memory = "Check the deployment status.";
         let recent = vec!["User said hello".to_string(), "Bot replied hi".to_string()];
 
         // Act
@@ -133,7 +118,6 @@ mod tests {
             "lyre",
             &intention,
             pulse_body,
-            Some(memory),
             &recent,
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -154,8 +138,6 @@ mod tests {
         assert!(prompt.contains("Check today's schedule and unresolved items."));
         assert!(prompt.contains("## Pulse Notes"));
         assert!(prompt.contains("Don't notify for trivial changes."));
-        assert!(prompt.contains("## Prospective Memory"));
-        assert!(prompt.contains("Check the deployment status."));
         assert!(prompt.contains("## Recent Visible Context"));
         assert!(prompt.contains("User said hello"));
         assert!(prompt.contains("Bot replied hi"));
@@ -177,7 +159,6 @@ mod tests {
             "lyre",
             &intention,
             "body",
-            None,
             &recent,
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -204,7 +185,6 @@ mod tests {
             "lyre",
             &intention,
             "notes",
-            None,
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -231,30 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn capsule_omits_prospective_memory_section_when_none() {
-        // Arrange
-        let intention = test_intention();
-        let surface = test_home_surface();
-
-        // Act
-        let capsule = build_capsule(
-            "lyre",
-            &intention,
-            "body",
-            None,
-            &[],
-            &surface,
-            "2026-05-10T09:00:00+09:00",
-        );
-
-        // Assert
-        assert!(
-            !capsule.prompt.contains("## Prospective Memory"),
-            "capsule should omit Prospective Memory section when no memory provided"
-        );
-    }
-
-    #[test]
     fn capsule_shows_no_recent_context_when_empty() {
         // Arrange
         let intention = test_intention();
@@ -265,7 +221,6 @@ mod tests {
             "lyre",
             &intention,
             "body",
-            None,
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",

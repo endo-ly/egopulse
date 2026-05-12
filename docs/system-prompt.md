@@ -231,9 +231,83 @@ The following skills are available. When a task matches a skill, use the `activa
 
 直後に `SkillManager::build_skills_catalog()`（[`src/skills.rs`](../src/skills.rs) 149 行目）が生成する `<available_skills>` XML ブロックが続く。スキル数が閾値を超えると compact mode（名前のみ）に切り替わる。
 
-### 4.5 Sleep Batch 用プロンプト（通常 turn とは別文脈）
+### 4.5 Pulse Activation 用プロンプト（通常 turn とは別文脈）
 
-Sleep Batch の LLM 呼び出しは通常 turn の `build_system_prompt()` ではなく、[`src/sleep_batch.rs`](../src/sleep_batch.rs) の `build_sleep_system_prompt()` で構築する。入力が大きい場合は同一 run 内でチャンク分割し、各チャンクの出力 memory を次チャンクの入力 memory として引き継ぐ。
+Pulse Activation の LLM 呼び出しは、通常 turn と**同じ `build_system_prompt()` をそのまま** system prompt として使用する。Pulse 固有の指示はすべて user message（Capsule）側に含まれる。
+
+**コード**: [`src/pulse/runner.rs`](../src/pulse/runner.rs) `run_activation()`
+
+```rust
+let system_prompt = build_system_prompt(state, &context);
+```
+
+通常 turn と system prompt が完全一致するため、prompt cache の hit 率が最大化される。
+
+#### system prompt
+
+`build_system_prompt()` の出力がそのまま使われる。§4.1〜4.4 の全セクションが対象。
+
+```text
+① <soul> セクション
+② Core Instructions
+③ # Memories セクション
+④ # Long-term Memory（prospective 含む）
+⑤ # Agent Skills セクション
+```
+
+#### user message（Pulse Capsule）
+
+Capsule には prospective memory を含めない。system prompt 経由で既に注入されているため。
+**コード**: [`src/pulse/capsule.rs`](../src/pulse/capsule.rs) `build_capsule()`
+
+```text
+# Pulse Activation
+
+agent_id: {agent_id}
+intention_id: {intention.id}
+trigger: temporal_due
+home_surface:
+  channel: {home_surface.channel}
+  external_chat_id: {home_surface.external_chat_id}
+now: {now_rfc3339}
+
+## Core Contract
+
+{Core Contract 全文 — pulse_core_contract.md を include_str! で埋め込み}
+
+## Temporal Intention
+
+{front matter の attention}
+
+## Pulse Notes
+
+{PULSE.md body}
+
+## Recent Visible Context
+
+{Home Surface の直近 user-visible messages}
+（メッセージがない場合は "No recent context."）
+
+## Output Contract
+
+- 何も通知すべきでなければ PULSE_OK
+- 通知すべき場合だけ、短いユーザー向け文を書く
+- 大きな作業は開始しない
+- 破壊的操作はしない
+```
+
+Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_core_contract.md) を参照。
+
+#### 通常 turn との違い
+
+| 項目 | 通常 turn | Pulse Activation |
+|---|---|---|
+| system prompt | `build_system_prompt()` のみ | 同じ（完全一致） |
+| user message | ユーザー発言 | Pulse Capsule |
+| Prospective Memory | system prompt に含む | 同じく system prompt に含む（Capsule には含めない） |
+| Tool 利用 | あり | あり（Core Contract が破壊的操作を禁止） |
+
+### 4.6 Sleep Batch 用プロンプト（通常 turn とは別文脈）
 
 | 用途 | パス |
 |---|---|
