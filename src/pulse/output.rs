@@ -99,7 +99,7 @@ async fn handle_silent(
     })
 }
 
-/// Notification path: persist synthetic turn with session snapshot, send to channel, update pulse run.
+/// Notification path: send to channel, persist synthetic turn with session snapshot, update pulse run.
 async fn handle_notify(
     state: &AppState,
     agent_id: &str,
@@ -131,37 +131,7 @@ async fn handle_notify(
         }
     };
 
-    let persist_result = persist_notification_with_session(
-        state,
-        agent_id,
-        intention_id,
-        chat_id,
-        activation_result,
-    )
-    .await;
-
-    let message_id = match persist_result {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(
-                error = %e,
-                agent_id,
-                intention_id,
-                "pulse notification persistence failed"
-            );
-            let error_msg = e.to_string();
-            let db = Arc::clone(&state.db);
-            let run_id = pulse_run_id.to_string();
-            tokio::spawn(async move {
-                let _ = crate::storage::call_blocking(db, move |db| {
-                    db.update_pulse_run_failed(&run_id, &error_msg)
-                })
-                .await;
-            });
-            return Err(e);
-        }
-    };
-
+    // Send first — if delivery fails, nothing is persisted to the session.
     if let Err(e) = adapter
         .send_text(&home_surface.external_chat_id, output_text)
         .await
@@ -183,6 +153,36 @@ async fn handle_notify(
             "pulse channel send failed: {e}"
         )));
     }
+
+    // Delivery succeeded — persist the notification to session.
+    let message_id = match persist_notification_with_session(
+        state,
+        agent_id,
+        intention_id,
+        chat_id,
+        activation_result,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                error = %e,
+                agent_id,
+                intention_id,
+                "pulse notification persistence failed (message was delivered)"
+            );
+            let db = Arc::clone(&state.db);
+            let run_id = pulse_run_id.to_string();
+            let error_msg = e.to_string();
+            crate::storage::call_blocking(db, move |db| {
+                db.update_pulse_run_failed(&run_id, &error_msg)
+            })
+            .await
+            .ok();
+            return Err(e);
+        }
+    };
 
     let msg_id_for_update = message_id.clone();
     let output_for_update = output_text.to_string();
