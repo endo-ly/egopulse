@@ -159,7 +159,7 @@ Pulse（注意活性化）のスケジューラ設定。
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `pulse.enabled` | `bool` | 任意 | `false` | Pulse 機能の有効/無効 |
-| `pulse.tick_interval_secs` | `u64` | 任意 | `60` | due scan の周期（秒） |
+| `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`） |
 | `pulse.timezone` | `string \| null` | 任意 | `null` | IANA タイムゾーン（例: `Asia/Tokyo`）。`null` の場合は UTC |
 
 ### 2.8 エージェント定義（`agents.<id>`）
@@ -294,7 +294,7 @@ sleep_batch:
 # ========================================
 pulse:
   enabled: true
-  tick_interval_secs: 60
+  tick_interval: "1h"
   timezone: Asia/Tokyo
 ```
 

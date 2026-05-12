@@ -109,7 +109,7 @@ struct FileRetryConfig {
 #[derive(Debug, Deserialize, Default)]
 struct FilePulseConfig {
     enabled: Option<bool>,
-    tick_interval_secs: Option<u64>,
+    tick_interval: Option<String>,
     timezone: Option<String>,
 }
 
@@ -610,10 +610,11 @@ fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigE
             })?;
     }
 
-    let tick_interval_secs = fp.tick_interval_secs.unwrap_or(60);
-    if tick_interval_secs == 0 {
-        return Err(ConfigError::PulseInvalidTickInterval);
-    }
+    let tick_interval_secs = match fp.tick_interval {
+        Some(ref s) => super::types::parse_duration(s)
+            .map_err(|e| ConfigError::PulseInvalidTickInterval { reason: e })?,
+        None => 60,
+    };
 
     Ok(PulseConfig {
         enabled: fp.enabled.unwrap_or(false),

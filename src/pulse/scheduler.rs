@@ -288,7 +288,7 @@ async fn load_recent_messages(db: &Arc<Database>, chat_id: i64) -> Vec<String> {
 
 /// Run the pulse scheduler tick loop.
 ///
-/// Sleeps for `tick_interval_secs` between scans.
+/// Sleeps for the configured tick interval between scans.
 /// Runs indefinitely until the task is cancelled (via tokio cancellation).
 pub(crate) async fn run_pulse_scheduler(state: AppState) {
     let tick_interval = state.config.pulse().tick_interval_secs;
