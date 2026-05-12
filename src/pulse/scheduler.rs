@@ -185,9 +185,7 @@ async fn process_intention(
 
     // 6. Run activation
     let activation_result =
-        match super::runner::run_activation(state, agent_id_str, &capsule, home_surface.chat_id)
-            .await
-        {
+        match super::runner::run_activation(state, agent_id_str, &capsule, &home_surface).await {
             Ok(result) => result,
             Err(e) => {
                 warn!(
@@ -209,7 +207,7 @@ async fn process_intention(
 
     // 7. Handle output
     if let Err(e) = super::output::handle_output(
-        &state.db,
+        state,
         agent_id_str,
         &intention.id,
         &home_surface,

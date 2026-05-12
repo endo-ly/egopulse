@@ -115,6 +115,7 @@ mod tests {
             chat_id: 42,
             channel: "discord".to_string(),
             external_chat_id: "1234567890123456789".to_string(),
+            chat_type: "dm".to_string(),
         }
     }
 

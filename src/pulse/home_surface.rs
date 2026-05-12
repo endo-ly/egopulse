@@ -10,6 +10,7 @@ pub(crate) struct HomeSurface {
     pub chat_id: i64,
     pub channel: String,
     pub external_chat_id: String,
+    pub chat_type: String,
 }
 
 const SENDABLE_CHANNELS: &[&str] = &["discord", "telegram"];
@@ -43,6 +44,7 @@ pub(crate) async fn resolve_home_surface(
         chat_id: first.chat_id,
         channel: first.channel,
         external_chat_id: first.external_chat_id,
+        chat_type: first.chat_type,
     }))
 }
 

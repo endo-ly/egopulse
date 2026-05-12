@@ -1,15 +1,30 @@
 //! Pulse Activation runner — executes the Pulse Capsule through the LLM with tool support.
 
 use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, MessagesResponse, ToolCall};
 use crate::pulse::capsule::{PulseCapsule, core_contract_text};
+use crate::pulse::home_surface::HomeSurface;
 use crate::runtime::AppState;
-use crate::storage::PulseOutputKind;
+use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
+use std::sync::Arc;
 use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
+
+/// RAII guard that decrements the active turn counter on drop.
+struct PulseTurnGuard<'a> {
+    tracker: &'a crate::runtime::ActiveTurnTracker,
+    agent_id: String,
+}
+
+impl Drop for PulseTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.end_turn(&self.agent_id);
+    }
+}
 
 /// Result of a Pulse Activation.
 #[derive(Clone, Debug)]
@@ -31,13 +46,19 @@ pub(crate) async fn run_activation(
     state: &AppState,
     agent_id: &str,
     capsule: &PulseCapsule,
-    chat_id: i64,
+    home_surface: &HomeSurface,
 ) -> Result<ActivationResult, EgoPulseError> {
+    state.active_turns.begin_turn(agent_id);
+    let _guard = PulseTurnGuard {
+        tracker: &state.active_turns,
+        agent_id: agent_id.to_string(),
+    };
+
     let context = SurfaceContext::new(
-        "pulse".to_string(),
+        home_surface.channel.clone(),
         agent_id.to_string(),
-        format!("pulse:{agent_id}"),
-        "pulse".to_string(),
+        home_surface.external_chat_id.clone(),
+        home_surface.chat_type.clone(),
         agent_id.to_string(),
     );
 
@@ -50,11 +71,12 @@ pub(crate) async fn run_activation(
         );
     })?;
 
+    let chat_id = home_surface.chat_id;
     let tool_context = ToolExecutionContext {
         chat_id,
-        channel: "pulse".to_string(),
-        surface_thread: format!("pulse:{agent_id}"),
-        chat_type: "pulse".to_string(),
+        channel: home_surface.channel.clone(),
+        surface_thread: home_surface.external_chat_id.clone(),
+        chat_type: home_surface.chat_type.clone(),
         agent_id: agent_id.to_string(),
         channel_log_chat_id: None,
         chain_depth: 0,
@@ -62,7 +84,8 @@ pub(crate) async fn run_activation(
         turn_sender: state.turn_sender.clone(),
     };
 
-    let system_prompt = core_contract_text().to_string();
+    let base_prompt = build_system_prompt(state, &context);
+    let system_prompt = format!("{}\n\n{}", core_contract_text(), base_prompt);
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = vec![Message::text("user", &capsule.prompt)];
 
@@ -84,8 +107,17 @@ pub(crate) async fn run_activation(
         }
 
         let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone());
-        let tool_messages =
-            execute_tool_calls(state, &tool_context, &response, &valid_tool_calls).await?;
+        let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
+
+        let tool_messages = execute_tool_calls(
+            state,
+            &tool_context,
+            &response,
+            &valid_tool_calls,
+            &assistant_message_id,
+            chat_id,
+        )
+        .await?;
 
         messages.push(Message {
             role: "assistant".to_string(),
@@ -143,10 +175,14 @@ async fn execute_tool_calls(
     tool_context: &ToolExecutionContext,
     response: &MessagesResponse,
     valid_tool_calls: &[ToolCall],
+    assistant_message_id: &str,
+    chat_id: i64,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let mut tool_messages = Vec::with_capacity(valid_tool_calls.len());
 
     for tool_call in valid_tool_calls {
+        store_pending_tool_call(state, chat_id, assistant_message_id, tool_call).await?;
+
         let result = state
             .tools
             .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
@@ -155,8 +191,17 @@ async fn execute_tool_calls(
         let content = if result.is_error {
             format!("Tool error ({}): {}", tool_call.name, result.content)
         } else {
-            result.content
+            result.content.clone()
         };
+
+        update_tool_call_output(
+            state,
+            chat_id,
+            assistant_message_id,
+            &tool_call.id,
+            &content,
+        )
+        .await?;
 
         tool_messages.push(Message {
             role: "tool".to_string(),
@@ -176,6 +221,43 @@ async fn execute_tool_calls(
     }
 
     Ok(tool_messages)
+}
+
+async fn store_pending_tool_call(
+    state: &AppState,
+    chat_id: i64,
+    message_id: &str,
+    tool_call: &ToolCall,
+) -> Result<(), EgoPulseError> {
+    let record = StoredToolCall {
+        id: tool_call.id.clone(),
+        chat_id,
+        message_id: message_id.to_string(),
+        tool_name: tool_call.name.clone(),
+        tool_input: tool_call.arguments.to_string(),
+        tool_output: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
+        .await
+        .map_err(EgoPulseError::from)
+}
+
+async fn update_tool_call_output(
+    state: &AppState,
+    chat_id: i64,
+    message_id: &str,
+    tool_call_id: &str,
+    output: &str,
+) -> Result<(), EgoPulseError> {
+    let message_id = message_id.to_string();
+    let tool_call_id = tool_call_id.to_string();
+    let output = output.to_string();
+    call_blocking(Arc::clone(&state.db), move |db| {
+        db.update_tool_call_output_for_message(chat_id, &message_id, &tool_call_id, &output)
+    })
+    .await
+    .map_err(EgoPulseError::from)
 }
 
 #[cfg(test)]
@@ -201,6 +283,7 @@ mod tests {
             chat_id: 1,
             channel: "discord".to_string(),
             external_chat_id: "123".to_string(),
+            chat_type: "dm".to_string(),
         }
     }
 
@@ -241,24 +324,24 @@ mod tests {
     }
 
     #[test]
-    fn activation_builds_surface_context_with_pulse_channel() {
+    fn activation_builds_surface_context_with_real_channel() {
         // Arrange
         let agent_id = "lyre";
-        let expected_channel = "pulse";
+        let surface = test_home_surface();
 
         // Act
         let context = SurfaceContext::new(
-            expected_channel.to_string(),
+            surface.channel.clone(),
             agent_id.to_string(),
-            format!("pulse:{agent_id}"),
-            "pulse".to_string(),
+            surface.external_chat_id.clone(),
+            surface.chat_type.clone(),
             agent_id.to_string(),
         );
 
         // Assert
-        assert_eq!(context.channel, "pulse");
+        assert_eq!(context.channel, "discord");
         assert_eq!(context.agent_id, "lyre");
-        assert_eq!(context.surface_thread, "pulse:lyre");
+        assert_eq!(context.chat_type, "dm");
     }
 
     #[test]
