@@ -10,7 +10,7 @@ use crate::error::StorageError;
 ///
 /// 新しいマイグレーションを追加する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 8;
+pub(super) const SCHEMA_VERSION: i64 = 9;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -538,6 +538,42 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 8;
     }
 
+    if version < 9 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pulse_runs (
+                id            TEXT PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                intention_id  TEXT NOT NULL,
+                due_key       TEXT NOT NULL,
+                chat_id       INTEGER,
+                message_id    TEXT,
+                status        TEXT NOT NULL,
+                started_at    TEXT NOT NULL,
+                finished_at   TEXT,
+                output_kind   TEXT,
+                output_text   TEXT,
+                error_message TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pulse_runs_due
+                ON pulse_runs(agent_id, intention_id, due_key);
+
+            CREATE INDEX IF NOT EXISTS idx_pulse_runs_agent_started
+                ON pulse_runs(agent_id, started_at);
+
+            CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
+                ON pulse_runs(chat_id);",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            9,
+            "add pulse_runs table for periodic pulse execution audit",
+        )?;
+        tx.commit()?;
+        version = 9;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -560,6 +596,7 @@ mod tests {
             "llm_usage_logs",
             "sleep_runs",
             "memory_snapshots",
+            "pulse_runs",
         ];
         for name in &expected_tables {
             let exists: bool = conn

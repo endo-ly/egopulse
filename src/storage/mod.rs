@@ -227,6 +227,84 @@ pub(crate) struct MemorySnapshot {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PulseRunStatus {
+    Running,
+    Success,
+    Failed,
+    Skipped,
+}
+
+impl fmt::Display for PulseRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::Success => write!(f, "success"),
+            Self::Failed => write!(f, "failed"),
+            Self::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl FromStr for PulseRunStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(Self::Running),
+            "success" => Ok(Self::Success),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(format!("invalid pulse run status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PulseOutputKind {
+    /// No notification sent (silent success).
+    Silent,
+    /// Notification sent to the home surface.
+    Notify,
+}
+
+impl fmt::Display for PulseOutputKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Silent => write!(f, "silent"),
+            Self::Notify => write!(f, "notify"),
+        }
+    }
+}
+
+impl FromStr for PulseOutputKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "silent" => Ok(Self::Silent),
+            "notify" => Ok(Self::Notify),
+            other => Err(format!("invalid pulse output kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PulseRun {
+    pub id: String,
+    pub agent_id: String,
+    pub intention_id: String,
+    pub due_key: String,
+    pub chat_id: Option<i64>,
+    pub message_id: Option<String>,
+    pub status: PulseRunStatus,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub output_kind: Option<PulseOutputKind>,
+    pub output_text: Option<String>,
+    pub error_message: Option<String>,
+}
+
 pub(crate) struct LlmUsageLogEntry<'a> {
     pub chat_id: i64,
     pub caller_channel: &'a str,
@@ -250,8 +328,14 @@ const _: () = {
     assert_from_str::<MemoryFile>();
     assert_from_str::<MessageKind>();
 
+    assert_display::<PulseRunStatus>();
+    assert_from_str::<PulseRunStatus>();
+    assert_display::<PulseOutputKind>();
+    assert_from_str::<PulseOutputKind>();
+
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
+    assert_display::<PulseRun>();
 };
 
 impl fmt::Display for SleepRun {
@@ -263,6 +347,12 @@ impl fmt::Display for SleepRun {
 impl fmt::Display for MemorySnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "memory_snapshot({}, {})", self.id, self.file)
+    }
+}
+
+impl fmt::Display for PulseRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pulse_run({})", self.id)
     }
 }
 

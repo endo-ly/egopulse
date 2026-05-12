@@ -289,6 +289,56 @@ impl PulseConfig {
     }
 }
 
+/// Parse a human-friendly duration string into seconds.
+///
+/// Supported formats: `30s`, `5m`, `1h`, or combinations like `1h30m`.
+///
+/// # Errors
+///
+/// Returns a descriptive error string if the format is invalid or the value is zero.
+pub(crate) fn parse_duration(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("empty duration".to_string());
+    }
+
+    let mut total_secs: u64 = 0;
+    let mut chars = input.chars().peekable();
+    let mut parsed_something = false;
+
+    while chars.peek().is_some() {
+        let mut num_buf = String::new();
+        while let Some(c) = chars.peek() {
+            if c.is_ascii_digit() {
+                num_buf.push(chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+        let value: u64 = num_buf
+            .parse()
+            .map_err(|_| format!("invalid number in duration: {input}"))?;
+
+        let unit = chars
+            .next()
+            .ok_or_else(|| format!("missing unit after {value} in duration: {input}"))?;
+
+        match unit {
+            's' => total_secs += value,
+            'm' => total_secs += value * 60,
+            'h' => total_secs += value * 3600,
+            _ => return Err(format!("unknown unit '{unit}' in duration: {input}")),
+        }
+        parsed_something = true;
+    }
+
+    if !parsed_something || total_secs == 0 {
+        return Err(format!("duration must be positive: {input}"));
+    }
+
+    Ok(total_secs)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct AgentConfig {
     pub label: String,
@@ -380,5 +430,50 @@ fn debug_secret<T>(opt: Option<&T>) -> &'static str {
     match opt {
         Some(_) => "<redacted>",
         None => "<none>",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_seconds() {
+        assert_eq!(parse_duration("30s").unwrap(), 30);
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        assert_eq!(parse_duration("5m").unwrap(), 300);
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        assert_eq!(parse_duration("1h").unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_duration_combination() {
+        assert_eq!(parse_duration("1h30m").unwrap(), 5400);
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty() {
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_zero() {
+        assert!(parse_duration("0s").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_unknown_unit() {
+        assert!(parse_duration("5d").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_bare_number() {
+        assert!(parse_duration("60").is_err());
     }
 }

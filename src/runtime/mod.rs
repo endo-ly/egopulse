@@ -636,6 +636,16 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         handles.push(("sleep-scheduler".to_string(), handle));
     }
 
+    if state.config.pulse().scheduler_enabled() {
+        let pulse_state = state.clone();
+        info!("Starting pulse scheduler");
+        let handle = tokio::spawn(async move {
+            crate::pulse::scheduler::run_pulse_scheduler(pulse_state).await;
+            Ok(())
+        });
+        handles.push(("pulse-scheduler".to_string(), handle));
+    }
+
     info!("Runtime active; waiting for Ctrl-C or channel failure");
 
     // spawn したタスクの即時終了 (起動失敗) を検知

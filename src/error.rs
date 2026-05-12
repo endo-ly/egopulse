@@ -159,8 +159,8 @@ pub enum ConfigError {
     AgentDiscordBotNotFound { agent_id: String, bot_id: String },
     #[error("pulse_invalid_timezone: {timezone}")]
     PulseInvalidTimezone { timezone: String },
-    #[error("pulse_invalid_tick_interval: tick_interval_secs must be at least 1")]
-    PulseInvalidTickInterval,
+    #[error("pulse_invalid_tick_interval: {reason}")]
+    PulseInvalidTickInterval { reason: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

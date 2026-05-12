@@ -90,6 +90,11 @@ impl ChannelRegistry {
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn ChannelAdapter>> {
         self.adapters.get(name)
     }
+
+    /// Returns registered channel names.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        self.adapters.keys().map(String::as_str).collect()
+    }
 }
 
 #[cfg(test)]

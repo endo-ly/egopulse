@@ -2946,7 +2946,7 @@ fn pulse_config_loads_runtime_fields() {
         &temp_dir,
         &pulse_config_yml(
             r#"  enabled: true
-  tick_interval_secs: 120
+  tick_interval: "2m"
   timezone: "Asia/Tokyo""#,
         ),
     );
@@ -2986,7 +2986,7 @@ fn pulse_config_rejects_invalid_timezone() {
 
 #[test]
 #[serial]
-fn pulse_config_rejects_zero_tick_interval() {
+fn pulse_config_rejects_invalid_tick_interval() {
     // Arrange
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -2994,7 +2994,7 @@ fn pulse_config_rejects_zero_tick_interval() {
         &temp_dir,
         &pulse_config_yml(
             r#"  enabled: true
-  tick_interval_secs: 0"#,
+  tick_interval: "0s""#,
         ),
     );
 
@@ -3003,7 +3003,7 @@ fn pulse_config_rejects_zero_tick_interval() {
 
     // Assert
     assert!(
-        matches!(error, ConfigError::PulseInvalidTickInterval),
+        matches!(error, ConfigError::PulseInvalidTickInterval { .. }),
         "expected PulseInvalidTickInterval, got {error:?}"
     );
 }
