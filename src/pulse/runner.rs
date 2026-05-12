@@ -1,15 +1,17 @@
 //! Pulse Activation runner — executes the Pulse Capsule through the LLM with tool support.
 
 use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::formatting::{
+    format_tool_result, summarize_tool_calls_with_content, tool_message_content,
+};
 use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, MessagesResponse, ToolCall};
 use crate::pulse::capsule::{PulseCapsule, core_contract_text};
 use crate::pulse::home_surface::HomeSurface;
 use crate::runtime::AppState;
-use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall};
 use crate::tools::ToolExecutionContext;
-use std::sync::Arc;
 use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
@@ -33,6 +35,19 @@ pub(crate) struct ActivationResult {
     pub output_text: String,
     /// Whether the output is PULSE_OK (silent) or a notification.
     pub output_kind: PulseOutputKind,
+    /// Tool call/result phases produced during activation. Persist only for Notify output.
+    pub tool_phases: Vec<ToolPhase>,
+}
+
+/// A tool-call assistant phase and its tool result messages.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolPhase {
+    pub assistant_message_id: String,
+    pub assistant_message: Message,
+    pub assistant_preview: String,
+    pub tool_messages: Vec<Message>,
+    pub tool_result_preview: String,
+    pub stored_tool_calls: Vec<StoredToolCall>,
 }
 
 /// Execute a Pulse Activation.
@@ -88,6 +103,7 @@ pub(crate) async fn run_activation(
     let system_prompt = format!("{}\n\n{}", core_contract_text(), base_prompt);
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = vec![Message::text("user", &capsule.prompt)];
+    let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let response = channel_llm
@@ -103,13 +119,14 @@ pub(crate) async fn run_activation(
             return Ok(ActivationResult {
                 output_text,
                 output_kind,
+                tool_phases,
             });
         }
 
         let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone());
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
-        let tool_messages = execute_tool_calls(
+        let (tool_messages, stored_tool_calls) = execute_tool_calls(
             state,
             &tool_context,
             &response,
@@ -119,14 +136,27 @@ pub(crate) async fn run_activation(
         )
         .await?;
 
-        messages.push(Message {
+        let assistant_message = Message {
             role: "assistant".to_string(),
             content: crate::llm::MessageContent::text(response.content.clone()),
             reasoning_content: response.reasoning_content.clone(),
-            tool_calls: valid_tool_calls,
+            tool_calls: valid_tool_calls.clone(),
             tool_call_id: None,
+        };
+        let assistant_preview =
+            summarize_tool_calls_with_content(&response.content, &valid_tool_calls);
+        let tool_result_preview = summarize_tool_result_messages(&tool_messages);
+
+        messages.push(assistant_message.clone());
+        messages.extend(tool_messages.clone());
+        tool_phases.push(ToolPhase {
+            assistant_message_id,
+            assistant_message,
+            assistant_preview,
+            tool_messages,
+            tool_result_preview,
+            stored_tool_calls,
         });
-        messages.extend(tool_messages);
     }
 
     Err(EgoPulseError::Internal(format!(
@@ -178,38 +208,33 @@ async fn execute_tool_calls(
     valid_tool_calls: &[ToolCall],
     assistant_message_id: &str,
     chat_id: i64,
-) -> Result<Vec<Message>, EgoPulseError> {
+) -> Result<(Vec<Message>, Vec<StoredToolCall>), EgoPulseError> {
     let mut tool_messages = Vec::with_capacity(valid_tool_calls.len());
+    let mut stored_tool_calls = Vec::with_capacity(valid_tool_calls.len());
 
     for tool_call in valid_tool_calls {
-        store_pending_tool_call(state, chat_id, assistant_message_id, tool_call).await?;
-
         let result = state
             .tools
             .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
             .await;
 
-        let content = if result.is_error {
-            format!("Tool error ({}): {}", tool_call.name, result.content)
-        } else {
-            result.content.clone()
-        };
-
-        update_tool_call_output(
-            state,
-            chat_id,
-            assistant_message_id,
-            &tool_call.id,
-            &content,
-        )
-        .await?;
+        let tool_payload = format_tool_result(tool_call, &result);
 
         tool_messages.push(Message {
             role: "tool".to_string(),
-            content: crate::llm::MessageContent::text(content),
+            content: tool_message_content(&tool_payload, &result),
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
+        });
+        stored_tool_calls.push(StoredToolCall {
+            id: tool_call.id.clone(),
+            chat_id,
+            message_id: assistant_message_id.to_string(),
+            tool_name: tool_call.name.clone(),
+            tool_input: tool_call.arguments.to_string(),
+            tool_output: Some(tool_payload),
+            timestamp: chrono::Utc::now().to_rfc3339(),
         });
 
         if !response.content.trim().is_empty() {
@@ -221,44 +246,16 @@ async fn execute_tool_calls(
         }
     }
 
-    Ok(tool_messages)
+    Ok((tool_messages, stored_tool_calls))
 }
 
-async fn store_pending_tool_call(
-    state: &AppState,
-    chat_id: i64,
-    message_id: &str,
-    tool_call: &ToolCall,
-) -> Result<(), EgoPulseError> {
-    let record = StoredToolCall {
-        id: tool_call.id.clone(),
-        chat_id,
-        message_id: message_id.to_string(),
-        tool_name: tool_call.name.clone(),
-        tool_input: tool_call.arguments.to_string(),
-        tool_output: None,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
-        .await
-        .map_err(EgoPulseError::from)
-}
-
-async fn update_tool_call_output(
-    state: &AppState,
-    chat_id: i64,
-    message_id: &str,
-    tool_call_id: &str,
-    output: &str,
-) -> Result<(), EgoPulseError> {
-    let message_id = message_id.to_string();
-    let tool_call_id = tool_call_id.to_string();
-    let output = output.to_string();
-    call_blocking(Arc::clone(&state.db), move |db| {
-        db.update_tool_call_output_for_message(chat_id, &message_id, &tool_call_id, &output)
-    })
-    .await
-    .map_err(EgoPulseError::from)
+fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
+    let joined = tool_messages
+        .iter()
+        .map(|message| message.content.as_text_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::agent_loop::formatting::preview_text(&joined, 160)
 }
 
 #[cfg(test)]

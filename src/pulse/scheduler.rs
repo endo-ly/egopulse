@@ -130,8 +130,13 @@ async fn process_intention(
     }
 
     // 4. Resolve home surface
-    let home_surface = match super::home_surface::resolve_home_surface(&state.db, agent_id_str, &[])
-        .await
+    let available_channels = state.channels.names();
+    let home_surface = match super::home_surface::resolve_home_surface(
+        &state.db,
+        agent_id_str,
+        &available_channels,
+    )
+    .await
     {
         Ok(Some(surface)) => surface,
         Ok(None) => {
@@ -331,12 +336,16 @@ mod tests {
             config.user_skills_dir().expect("user_skills_dir"),
             config.skills_dir().expect("skills_dir"),
         ));
+        let mut channels = crate::channels::adapter::ChannelRegistry::new();
+        channels.register(Arc::new(MockChannelAdapter("discord")));
+        channels.register(Arc::new(MockChannelAdapter("telegram")));
+
         AppState {
             db: Arc::new(Database::new(&config.db_path()).expect("db")),
             config: config.clone(),
             config_path: None,
             llm_override: Some(Arc::new(MockPulseLlm::new())),
-            channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
+            channels: Arc::new(channels),
             skills: Arc::clone(&skills),
             tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
             mcp_manager: None,
@@ -617,6 +626,23 @@ body
     }
 
     struct MockPulseLlm;
+
+    struct MockChannelAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::channels::adapter::ChannelAdapter for MockChannelAdapter {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn chat_type_routes(&self) -> Vec<(&str, crate::channels::adapter::ConversationKind)> {
+            vec![("dm", crate::channels::adapter::ConversationKind::Private)]
+        }
+
+        async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     impl MockPulseLlm {
         fn new() -> Self {

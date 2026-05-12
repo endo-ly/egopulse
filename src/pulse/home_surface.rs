@@ -27,12 +27,19 @@ pub(crate) async fn resolve_home_surface(
     agent_id: &str,
     available_channels: &[&str],
 ) -> Result<Option<HomeSurface>, crate::error::StorageError> {
-    let _ = available_channels;
+    let sendable_channels = SENDABLE_CHANNELS
+        .iter()
+        .copied()
+        .filter(|channel| available_channels.contains(channel))
+        .collect::<Vec<_>>();
+    if sendable_channels.is_empty() {
+        return Ok(None);
+    }
 
     let agent_id = agent_id.to_string();
 
     let chats = crate::storage::call_blocking(db.clone(), move |db| {
-        db.get_agent_chats_by_recent(&agent_id, SENDABLE_CHANNELS)
+        db.get_agent_chats_by_recent(&agent_id, &sendable_channels)
     })
     .await?;
 
@@ -103,7 +110,7 @@ mod tests {
         );
 
         // Act
-        let surface = resolve_home_surface(&db, "agent-a", &[])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
             .await
             .expect("resolve")
             .expect("should find surface");
@@ -137,7 +144,7 @@ mod tests {
         );
 
         // Act
-        let surface = resolve_home_surface(&db, "agent-a", &[])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"])
             .await
             .expect("resolve")
             .expect("should find surface");
@@ -162,7 +169,7 @@ mod tests {
         );
 
         // Act
-        let surface = resolve_home_surface(&db, "agent-a", &[])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
             .await
             .expect("resolve");
 
@@ -193,11 +200,33 @@ mod tests {
         );
 
         // Act
-        let surface = resolve_home_surface(&db, "agent-a", &[])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
             .await
             .expect("resolve");
 
         // Assert: returns None without any fallback
+        assert!(surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn home_surface_skips_sendable_db_chat_when_adapter_unavailable() {
+        // Arrange: DB has Discord, but runtime has no Discord adapter.
+        let (db, _dir) = test_db();
+        insert_chat(
+            &db,
+            "discord",
+            "discord:888",
+            "dm",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["telegram"])
+            .await
+            .expect("resolve");
+
+        // Assert
         assert!(surface.is_none());
     }
 }

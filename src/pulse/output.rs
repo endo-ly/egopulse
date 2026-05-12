@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::agent_loop::session::{PersistedTurn, persist_phase_once};
+use crate::agent_loop::formatting::preview_text;
+use crate::agent_loop::session::{
+    PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once,
+};
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::home_surface::HomeSurface;
@@ -60,7 +63,7 @@ pub(crate) async fn handle_output(
                 agent_id,
                 intention_id,
                 home_surface,
-                &activation_result.output_text,
+                activation_result,
                 pulse_run_id,
             )
             .await
@@ -102,14 +105,40 @@ async fn handle_notify(
     agent_id: &str,
     intention_id: &str,
     home_surface: &HomeSurface,
-    output_text: &str,
+    activation_result: &ActivationResult,
     pulse_run_id: &str,
 ) -> Result<OutputResult, EgoPulseError> {
     let chat_id = home_surface.chat_id;
+    let output_text = &activation_result.output_text;
 
-    let persist_result =
-        persist_notification_with_session(state, agent_id, intention_id, chat_id, output_text)
-            .await;
+    let adapter = match state.channels.get(&home_surface.channel) {
+        Some(a) => a,
+        None => {
+            warn!(
+                channel = %home_surface.channel,
+                "pulse channel adapter not found, marking run as failed"
+            );
+            let db = Arc::clone(&state.db);
+            let run_id = pulse_run_id.to_string();
+            let error_msg = format!("channel adapter not found: {}", home_surface.channel);
+            let error_for_return = error_msg.clone();
+            crate::storage::call_blocking(db, move |db| {
+                db.update_pulse_run_failed(&run_id, &error_msg)
+            })
+            .await
+            .ok();
+            return Err(EgoPulseError::Internal(error_for_return));
+        }
+    };
+
+    let persist_result = persist_notification_with_session(
+        state,
+        agent_id,
+        intention_id,
+        chat_id,
+        activation_result,
+    )
+    .await;
 
     let message_id = match persist_result {
         Ok(id) => id,
@@ -130,26 +159,6 @@ async fn handle_notify(
                 .await;
             });
             return Err(e);
-        }
-    };
-
-    let adapter = match state.channels.get(&home_surface.channel) {
-        Some(a) => a,
-        None => {
-            warn!(
-                channel = %home_surface.channel,
-                "pulse channel adapter not found, marking run as failed"
-            );
-            let db = Arc::clone(&state.db);
-            let run_id = pulse_run_id.to_string();
-            let error_msg = format!("channel adapter not found: {}", home_surface.channel);
-            let error_for_return = error_msg.clone();
-            crate::storage::call_blocking(db, move |db| {
-                db.update_pulse_run_failed(&run_id, &error_msg)
-            })
-            .await
-            .ok();
-            return Err(EgoPulseError::Internal(error_for_return));
         }
     };
 
@@ -203,9 +212,10 @@ async fn persist_notification_with_session(
     agent_id: &str,
     intention_id: &str,
     chat_id: i64,
-    output_text: &str,
+    activation_result: &ActivationResult,
 ) -> Result<String, EgoPulseError> {
     let now = chrono::Utc::now().to_rfc3339();
+    let output_text = &activation_result.output_text;
 
     let synthetic_input = StoredMessage {
         id: format!("pulse-in-{}", uuid::Uuid::new_v4()),
@@ -225,7 +235,7 @@ async fn persist_notification_with_session(
     session_messages.push(Message::text("user", &synthetic_input.content));
 
     let PersistedTurn {
-        updated_at,
+        mut updated_at,
         messages: mut session_messages,
     } = persist_phase_once(
         state,
@@ -234,6 +244,62 @@ async fn persist_notification_with_session(
         loaded.session_updated_at,
     )
     .await?;
+
+    for phase in &activation_result.tool_phases {
+        session_messages.push(phase.assistant_message.clone());
+        let PersistedTurn {
+            updated_at: next_updated_at,
+            messages: persisted_messages,
+        } = persist_phase(
+            state,
+            StoredMessage {
+                id: phase.assistant_message_id.clone(),
+                chat_id,
+                sender_name: agent_id.to_string(),
+                content: phase.assistant_preview.clone(),
+                is_from_bot: true,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                message_kind: MessageKind::Message,
+                sender_agent_id: Some(agent_id.to_string()),
+                recipient_agent_id: None,
+            },
+            phase.assistant_message.clone(),
+            &session_messages,
+            Some(updated_at),
+        )
+        .await?;
+        updated_at = next_updated_at;
+        session_messages = persisted_messages;
+
+        persist_tool_call_records(state, phase.stored_tool_calls.clone()).await?;
+
+        if !phase.tool_messages.is_empty() {
+            session_messages.extend(phase.tool_messages.iter().cloned());
+            let PersistedTurn {
+                updated_at: next_updated_at,
+                messages: persisted_messages,
+            } = persist_phase_messages(
+                state,
+                StoredMessage {
+                    id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
+                    chat_id,
+                    sender_name: agent_id.to_string(),
+                    content: preview_text(&phase.tool_result_preview, 160),
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    message_kind: MessageKind::Message,
+                    sender_agent_id: Some(agent_id.to_string()),
+                    recipient_agent_id: None,
+                },
+                phase.tool_messages.clone(),
+                &session_messages,
+                Some(updated_at),
+            )
+            .await?;
+            updated_at = next_updated_at;
+            session_messages = persisted_messages;
+        }
+    }
 
     let assistant_id = format!("pulse-out-{}", uuid::Uuid::new_v4());
     let assistant_msg = StoredMessage {
@@ -255,10 +321,22 @@ async fn persist_notification_with_session(
     Ok(assistant_id)
 }
 
+async fn persist_tool_call_records(
+    state: &AppState,
+    tool_calls: Vec<crate::storage::ToolCall>,
+) -> Result<(), EgoPulseError> {
+    for record in tool_calls {
+        crate::storage::call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channels::adapter::{ChannelAdapter, ChannelRegistry, ConversationKind};
+    use crate::pulse::runner::ToolPhase;
     use crate::skills::SkillManager;
     use crate::storage::Database;
     use crate::tools::ToolRegistry;
@@ -347,6 +425,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: "PULSE_OK".to_string(),
             output_kind: PulseOutputKind::Silent,
+            tool_phases: Vec::new(),
         };
 
         // Act
@@ -402,6 +481,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
             output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
         };
 
         // Act
@@ -450,6 +530,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
             output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
         };
 
         // Act
@@ -484,6 +565,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notify_persists_tool_phases_like_normal_conversation() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state(&dir);
+        let agent_id = "lyre";
+        let intention_id = "tool_phase_test";
+        let pulse_run_id = "run-tool-phase-001";
+        let notification_text = "I checked the file.";
+
+        let chat_id = insert_chat(&state.db, agent_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+
+        let home_surface = test_home_surface(chat_id);
+        let assistant_message = Message {
+            role: "assistant".to_string(),
+            content: crate::llm::MessageContent::text("I'll inspect it."),
+            reasoning_content: None,
+            tool_calls: vec![crate::llm::ToolCall {
+                id: "call-read".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "notes.md"}),
+            }],
+            tool_call_id: None,
+        };
+        let tool_message = Message {
+            role: "tool".to_string(),
+            content: crate::llm::MessageContent::text("{\"status\":\"success\",\"result\":\"ok\"}"),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-read".to_string()),
+        };
+        let activation = ActivationResult {
+            output_text: notification_text.to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: vec![ToolPhase {
+                assistant_message_id: "assistant-tool-1".to_string(),
+                assistant_message,
+                assistant_preview: "I'll inspect it. [tool_call] read".to_string(),
+                tool_messages: vec![tool_message],
+                tool_result_preview: "ok".to_string(),
+                stored_tool_calls: vec![crate::storage::ToolCall {
+                    id: "call-read".to_string(),
+                    chat_id,
+                    message_id: "assistant-tool-1".to_string(),
+                    tool_name: "read".to_string(),
+                    tool_input: "{\"path\":\"notes.md\"}".to_string(),
+                    tool_output: Some("{\"status\":\"success\",\"result\":\"ok\"}".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                }],
+            }],
+        };
+
+        // Act
+        handle_output(
+            &state,
+            agent_id,
+            intention_id,
+            &home_surface,
+            &activation,
+            pulse_run_id,
+        )
+        .await
+        .expect("handle_output");
+
+        // Assert
+        let messages = state.db.get_all_messages(chat_id).expect("messages");
+        assert_eq!(messages.len(), 4);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content == "[Pulse: tool_phase_test]")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("[tool_call] read"))
+        );
+        assert!(messages.iter().any(|message| message.content == "ok"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content == notification_text)
+        );
+
+        let snapshot = state
+            .db
+            .load_session_snapshot(chat_id, 10)
+            .expect("load snapshot");
+        let session_json = snapshot.messages_json.expect("session json");
+        assert!(session_json.contains("call-read"));
+        assert!(session_json.contains(notification_text));
+
+        let tool_calls = state
+            .db
+            .get_tool_calls_for_chat(chat_id)
+            .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].message_id, "assistant-tool-1");
+        assert!(tool_calls[0].tool_output.is_some());
+    }
+
+    #[tokio::test]
     async fn notify_does_not_store_pulse_capsule_body() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -501,6 +684,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
             output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
         };
 
         // Act
@@ -553,6 +737,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
             output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
         };
 
         // Act
@@ -597,6 +782,7 @@ mod tests {
         let activation = ActivationResult {
             output_text: "This should fail.".to_string(),
             output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
         };
 
         {
@@ -620,6 +806,46 @@ mod tests {
         assert!(
             result.is_err(),
             "handle_output should fail when persistence fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_missing_adapter_fails_without_persisting_session_messages() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_test_state(&dir);
+        state.channels = Arc::new(ChannelRegistry::new());
+        let agent_id = "lyre";
+        let intention_id = "missing_adapter";
+        let pulse_run_id = "run-missing-adapter-001";
+
+        let chat_id = insert_chat(&state.db, agent_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+
+        let home_surface = test_home_surface(chat_id);
+        let activation = ActivationResult {
+            output_text: "This should not be persisted.".to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
+        };
+
+        // Act
+        let result = handle_output(
+            &state,
+            agent_id,
+            intention_id,
+            &home_surface,
+            &activation,
+            pulse_run_id,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_err());
+        let messages = state.db.get_all_messages(chat_id).expect("messages");
+        assert!(
+            messages.is_empty(),
+            "missing adapter should fail before session persistence"
         );
     }
 }
