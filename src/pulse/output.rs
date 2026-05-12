@@ -133,28 +133,46 @@ async fn handle_notify(
         }
     };
 
-    if let Some(adapter) = state.channels.get(&home_surface.channel) {
-        if let Err(e) = adapter
-            .send_text(&home_surface.external_chat_id, output_text)
-            .await
-        {
+    let adapter = match state.channels.get(&home_surface.channel) {
+        Some(a) => a,
+        None => {
             warn!(
-                error = %e,
                 channel = %home_surface.channel,
-                "pulse send failed"
+                "pulse channel adapter not found, marking run as failed"
             );
             let db = Arc::clone(&state.db);
             let run_id = pulse_run_id.to_string();
-            let error_msg = format!("channel send failed: {e}");
+            let error_msg = format!("channel adapter not found: {}", home_surface.channel);
+            let error_for_return = error_msg.clone();
             crate::storage::call_blocking(db, move |db| {
                 db.update_pulse_run_failed(&run_id, &error_msg)
             })
             .await
             .ok();
-            return Err(EgoPulseError::Internal(format!(
-                "pulse channel send failed: {e}"
-            )));
+            return Err(EgoPulseError::Internal(error_for_return));
         }
+    };
+
+    if let Err(e) = adapter
+        .send_text(&home_surface.external_chat_id, output_text)
+        .await
+    {
+        warn!(
+            error = %e,
+            channel = %home_surface.channel,
+            "pulse send failed"
+        );
+        let db = Arc::clone(&state.db);
+        let run_id = pulse_run_id.to_string();
+        let error_msg = format!("channel send failed: {e}");
+        crate::storage::call_blocking(db, move |db| {
+            db.update_pulse_run_failed(&run_id, &error_msg)
+        })
+        .await
+        .ok();
+        return Err(EgoPulseError::Internal(format!(
+            "pulse channel send failed: {e}"
+        )));
     }
 
     let msg_id_for_update = message_id.clone();
@@ -240,11 +258,27 @@ async fn persist_notification_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::adapter::ChannelRegistry;
+    use crate::channels::adapter::{ChannelAdapter, ChannelRegistry, ConversationKind};
     use crate::skills::SkillManager;
     use crate::storage::Database;
     use crate::tools::ToolRegistry;
     use std::sync::Arc;
+
+    /// A no-op channel adapter for testing that records nothing but succeeds.
+    struct MockChannelAdapter;
+
+    #[async_trait::async_trait]
+    impl ChannelAdapter for MockChannelAdapter {
+        fn name(&self) -> &str {
+            "discord"
+        }
+        fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
+            vec![("discord", ConversationKind::Private)]
+        }
+        async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     fn build_test_state(dir: &tempfile::TempDir) -> AppState {
         let state_root = dir.path().to_str().expect("utf8").to_string();
@@ -254,12 +288,14 @@ mod tests {
             config.user_skills_dir().expect("user_skills_dir"),
             config.skills_dir().expect("skills_dir"),
         ));
+        let mut channels = ChannelRegistry::new();
+        channels.register(Arc::new(MockChannelAdapter));
         AppState {
             db,
             config: config.clone(),
             config_path: None,
             llm_override: None,
-            channels: Arc::new(ChannelRegistry::new()),
+            channels: Arc::new(channels),
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
             mcp_manager: None,

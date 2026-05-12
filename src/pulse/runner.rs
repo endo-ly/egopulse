@@ -135,7 +135,8 @@ pub(crate) async fn run_activation(
 }
 
 fn classify_output(text: &str) -> PulseOutputKind {
-    if text.trim().eq_ignore_ascii_case("PULSE_OK") {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("PULSE_OK") {
         PulseOutputKind::Silent
     } else {
         PulseOutputKind::Notify
@@ -440,7 +441,7 @@ mod tests {
             classify_output("Something happened!"),
             PulseOutputKind::Notify
         );
-        assert_eq!(classify_output(""), PulseOutputKind::Notify);
+        assert_eq!(classify_output(""), PulseOutputKind::Silent);
     }
 
     fn state_skills_ref(
