@@ -254,6 +254,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -432,6 +433,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let _ = tool
@@ -479,6 +481,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let _ = tool
@@ -560,6 +563,7 @@ mod integration_tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let result = tool
@@ -589,6 +593,7 @@ mod integration_tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let result = tool
@@ -627,6 +632,7 @@ mod integration_tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let _ = tool
@@ -664,6 +670,7 @@ mod integration_tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let _ = tool

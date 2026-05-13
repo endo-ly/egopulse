@@ -149,6 +149,7 @@ where
         chain_depth: context.chain_depth,
         origin_id: context.origin_id.clone(),
         turn_sender: state.turn_sender.clone(),
+        skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let system_prompt = build_system_prompt(state, context);
     let channel_llm = state.llm_for_context(context).inspect_err(|e| {

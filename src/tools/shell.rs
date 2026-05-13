@@ -1,5 +1,6 @@
 //! シェル実行ツール — bash。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,7 +33,11 @@ impl BashTool {
         self.workspace_dir.join(".tmp").join("bash")
     }
 
-    fn spawn_bash_command(&self, wrapped_command: &str) -> Result<tokio::process::Child, String> {
+    fn spawn_bash_command(
+        &self,
+        wrapped_command: &str,
+        skill_env: &HashMap<String, String>,
+    ) -> Result<tokio::process::Child, String> {
         let mut cmd = Command::new("bash");
         cmd.arg("-lc")
             .arg(wrapped_command)
@@ -41,6 +46,9 @@ impl BashTool {
             .stderr(Stdio::null())
             .process_group(0)
             .kill_on_drop(true);
+        if !skill_env.is_empty() {
+            cmd.envs(skill_env);
+        }
         cmd.spawn()
             .map_err(|error| format!("Failed to execute bash command: {error}"))
     }
@@ -75,7 +83,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolExecutionContext,
+        context: &ToolExecutionContext,
     ) -> ToolResult {
         #[derive(serde::Deserialize)]
         struct Params {
@@ -107,7 +115,8 @@ impl Tool for BashTool {
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
         let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
-        let mut child = match self.spawn_bash_command(&wrapped_command) {
+        let skill_env = context.skill_env.lock().expect("skill env lock").clone();
+        let mut child = match self.spawn_bash_command(&wrapped_command, &skill_env) {
             Ok(child) => child,
             Err(error) => return ToolResult::error(error),
         };

@@ -27,12 +27,15 @@ pub(crate) use send_message::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::config::Config;
+use crate::config::secret_ref::dotenv_path;
 use crate::llm::ToolDefinition;
 use crate::skills::SkillManager;
 
@@ -64,6 +67,14 @@ pub(crate) struct ToolExecutionContext {
     /// Sender half of the pending-agent-turn channel.
     /// Tools like `agent_send` use this to enqueue turns for target agents.
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
+    /// Turn-scoped skill environment variables.
+    ///
+    /// Each `activate_skill` call **replaces** the entire map with the newly
+    /// activated skill's resolved env — previous skill env is discarded.
+    /// Cleared when a skill with no `required_env` is activated.
+    /// Created fresh in `process_turn()`, so different turns / agents /
+    /// sessions never share this state.
+    pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 /// Uniform result type returned by all tool implementations.
@@ -162,8 +173,9 @@ impl ToolRegistry {
             Ok(dir) => dir,
             Err(error) => {
                 tracing::warn!("failed to resolve workspace dir: {error}");
+                let env_path = dotenv_path(Path::new(&config.state_root));
                 let tools: Vec<Box<dyn Tool>> =
-                    vec![Box::new(ActivateSkillTool::new(skill_manager))];
+                    vec![Box::new(ActivateSkillTool::new(skill_manager, env_path))];
                 return Self {
                     tool_index: build_tool_index(&tools),
                     tools,
@@ -179,6 +191,7 @@ impl ToolRegistry {
             );
         }
 
+        let env_path = dotenv_path(Path::new(&config.state_root));
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(ReadTool::new(workspace_dir.clone())),
             Box::new(BashTool::new(workspace_dir.clone())),
@@ -187,7 +200,7 @@ impl ToolRegistry {
             Box::new(GrepTool::new(workspace_dir.clone())),
             Box::new(FindTool::new(workspace_dir.clone())),
             Box::new(LsTool::new(workspace_dir)),
-            Box::new(ActivateSkillTool::new(skill_manager)),
+            Box::new(ActivateSkillTool::new(skill_manager, env_path)),
         ];
         Self {
             tool_index: build_tool_index(&tools),
@@ -225,6 +238,10 @@ impl ToolRegistry {
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
+    ///
+    /// Redaction secrets are assembled **after** tool execution so that env vars
+    /// resolved by `activate_skill` during the same call are already present in
+    /// `context.skill_env` and get masked in the tool result.
     pub(crate) async fn execute(
         &self,
         name: &str,
@@ -233,7 +250,7 @@ impl ToolRegistry {
     ) -> ToolResult {
         if let Some(&idx) = self.tool_index.get(name) {
             let result = self.tools[idx].execute(input, context).await;
-            return sanitize_tool_result(result, &self.config_secrets);
+            return sanitize_tool_result(result, &self.redaction_secrets(context));
         }
         if let Some(mcp_manager) = &self.mcp_manager {
             if name.starts_with("mcp_") {
@@ -247,15 +264,26 @@ impl ToolRegistry {
                             Ok(output) => ToolResult::success(output),
                             Err(error) => ToolResult::error(error.to_string()),
                         },
-                        &self.config_secrets,
+                        &self.redaction_secrets(context),
                     );
                 }
             }
         }
         sanitize_tool_result(
             ToolResult::error(format!("Unknown tool: {name}")),
-            &self.config_secrets,
+            &self.redaction_secrets(context),
         )
+    }
+
+    /// Build the full redaction secret list: static config secrets + current
+    /// turn-scoped skill env values.
+    fn redaction_secrets(&self, context: &ToolExecutionContext) -> Vec<(String, String)> {
+        let mut secrets = self.config_secrets.clone();
+        let env = context.skill_env.lock().expect("skill env lock");
+        for (k, v) in env.iter() {
+            secrets.push((format!("skill_env.{k}"), v.clone()));
+        }
+        secrets
     }
 
     /// Returns `true` if the named tool is a read-only tool safe for parallel execution.
@@ -869,5 +897,172 @@ mod tests {
         }));
 
         assert!(!registry.is_read_only("custom"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn skill_env_injected_into_bash_subprocess() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        let skill_dir = skills_dir.join("test-skill");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: Test\nrequired_env:\n  - EGOPULSE_TEST_BASH_VAR\n---\nDo stuff\n",
+        ).expect("write");
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_TEST_BASH_VAR=secret-value-12345\n").expect("env");
+
+        let registry = test_registry(&config);
+        let context = test_context();
+
+        // Activate the skill — env is stored in context.skill_env
+        let result = registry
+            .execute(
+                "activate_skill",
+                json!({"skill_name": "test-skill"}),
+                &context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("EGOPULSE_TEST_BASH_VAR"));
+        assert!(result.content.contains("✓"));
+        assert!(
+            !result.content.contains("secret-value-12345"),
+            "values must not appear in result"
+        );
+
+        // Bash uses same context → env is available
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_TEST_BASH_VAR"}),
+                &context,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !result.content.contains("secret-value-12345"),
+            "secret should be redacted"
+        );
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:skill_env.EGOPULSE_TEST_BASH_VAR]")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn skill_env_not_injected_with_fresh_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_FRESH_CTX_VAR=should-not-appear\n").expect("env");
+
+        // Fresh context (simulates a new turn)
+        let fresh_context = test_context();
+        let registry = test_registry(&config);
+
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_FRESH_CTX_VAR"}),
+                &fresh_context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("should-not-appear"),
+            "fresh context must not have env from other turns"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn different_contexts_have_isolated_skill_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        // Skill A
+        let skill_a_dir = skills_dir.join("skill-a");
+        std::fs::create_dir_all(&skill_a_dir).expect("dir");
+        std::fs::write(
+            skill_a_dir.join("SKILL.md"),
+            "---\nname: skill-a\ndescription: Skill A\nrequired_env:\n  - EGOPULSE_SKILL_A_KEY\n---\nA\n",
+        ).expect("write");
+
+        // Skill B
+        let skill_b_dir = skills_dir.join("skill-b");
+        std::fs::create_dir_all(&skill_b_dir).expect("dir");
+        std::fs::write(
+            skill_b_dir.join("SKILL.md"),
+            "---\nname: skill-b\ndescription: Skill B\nrequired_env:\n  - EGOPULSE_SKILL_B_KEY\n---\nB\n",
+        ).expect("write");
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "EGOPULSE_SKILL_A_KEY=value-a\nEGOPULSE_SKILL_B_KEY=value-b\n",
+        )
+        .expect("env");
+
+        let registry = test_registry(&config);
+
+        // Context 1 (turn A) — activates skill-a
+        let context_a = test_context();
+        let result = registry
+            .execute(
+                "activate_skill",
+                json!({"skill_name": "skill-a"}),
+                &context_a,
+            )
+            .await;
+        assert!(!result.is_error);
+
+        // Context 2 (turn B) — fresh, no activation
+        let context_b = test_context();
+
+        // Context A should have SKILL_A_KEY
+        let result_a = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_SKILL_A_KEY"}),
+                &context_a,
+            )
+            .await;
+        assert!(!result_a.is_error);
+        assert!(
+            result_a
+                .content
+                .contains("[REDACTED:skill_env.EGOPULSE_SKILL_A_KEY]"),
+            "context A should have skill-a env"
+        );
+
+        // Context B should NOT have any skill env (fresh turn)
+        let result_b = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_SKILL_A_KEY"}),
+                &context_b,
+            )
+            .await;
+        assert!(!result_b.is_error);
+        assert!(
+            !result_b.content.contains("value-a"),
+            "context B must not leak context A's env"
+        );
+        assert!(
+            !result_b.content.contains("[REDACTED"),
+            "context B should have no redaction (no env)"
+        );
     }
 }

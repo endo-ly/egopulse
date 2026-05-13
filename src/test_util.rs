@@ -124,5 +124,6 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         chain_depth: 0,
         origin_id: String::new(),
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }

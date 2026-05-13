@@ -5,7 +5,7 @@
 //! コンパクトモードでのカタログ出力も行う。
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Parsed skill metadata extracted from a SKILL.md frontmatter block.
@@ -16,6 +16,7 @@ pub struct SkillMetadata {
     pub dir_path: PathBuf,
     pub platforms: Vec<String>,
     pub deps: Vec<String>,
+    pub required_env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -27,6 +28,39 @@ struct SkillFrontmatter {
     platforms: Vec<String>,
     #[serde(default)]
     deps: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    required_env: Vec<String>,
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(vec![trimmed])
+            }
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 /// A fully loaded skill with both metadata and the instruction body.
@@ -300,6 +334,7 @@ fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, Stri
             dir_path: dir_path.to_path_buf(),
             platforms: parsed.platforms,
             deps: parsed.deps,
+            required_env: parsed.required_env,
         },
         body,
     ))
@@ -412,6 +447,39 @@ fn is_executable(path: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_path: &std::path::Path) -> bool {
     true
+}
+
+/// Resolve skill-required env vars from process env → dotenv.
+///
+/// Returns a map of successfully resolved key-value pairs.
+/// Logs warnings for missing keys but does NOT fail the skill activation.
+pub(crate) fn resolve_required_env(
+    keys: &[String],
+    dotenv: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    for key in keys {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim().to_string();
+            if !trimmed.is_empty() {
+                resolved.insert(key.to_string(), trimmed);
+                continue;
+            }
+        }
+        if let Some(val) = dotenv.get(key) {
+            let trimmed = val.trim().to_string();
+            if !trimmed.is_empty() {
+                resolved.insert(key.to_string(), trimmed);
+                continue;
+            }
+        }
+        tracing::warn!(key, "skill required_env not found in process env or .env");
+    }
+    resolved
 }
 
 #[cfg(test)]
@@ -599,5 +667,88 @@ mod tests {
             user_skills_dir.join("egopulse"),
             "loaded skill should come from user skills dir"
         );
+    }
+
+    #[test]
+    fn parses_required_env_from_frontmatter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("workspace").join("skills");
+        let skill_dir = skills_dir.join("agentmail");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: agentmail\ndescription: AgentMail skill\nrequired_env:\n  - AGENTMAIL_API_KEY\n  - AGENTMAIL_BASE_URL\n---\nInstructions here\n",
+        ).expect("write");
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let skills = manager.discover_skills();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].required_env,
+            vec!["AGENTMAIL_API_KEY", "AGENTMAIL_BASE_URL"]
+        );
+    }
+
+    #[test]
+    fn required_env_defaults_to_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("workspace").join("skills");
+        create_skill(&skills_dir, "basic", "No required_env field.");
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let skills = manager.discover_skills();
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].required_env.is_empty());
+    }
+
+    #[test]
+    fn required_env_accepts_scalar_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("workspace").join("skills");
+        let skill_dir = skills_dir.join("scalar-skill");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: scalar-skill\ndescription: Scalar test\nrequired_env: SINGLE_KEY\n---\nBody\n",
+        )
+        .expect("write");
+
+        let manager = SkillManager::from_skills_dir(skills_dir);
+        let skills = manager.discover_skills();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].required_env, vec!["SINGLE_KEY"]);
+    }
+
+    #[test]
+    fn resolve_required_env_finds_process_env() {
+        let _guard = crate::test_env::EnvVarGuard::set("EGOPULSE_TEST_SKILL_KEY", "test-value");
+        let dotenv = std::collections::HashMap::new();
+        let result = super::resolve_required_env(&["EGOPULSE_TEST_SKILL_KEY".to_string()], &dotenv);
+        assert_eq!(result.get("EGOPULSE_TEST_SKILL_KEY").unwrap(), "test-value");
+    }
+
+    #[test]
+    fn resolve_required_env_falls_back_to_dotenv() {
+        let _guard = crate::test_env::EnvVarGuard::set("EGOPULSE_TEST_DOTENV_KEY", "");
+        let mut dotenv = std::collections::HashMap::new();
+        dotenv.insert(
+            "EGOPULSE_TEST_DOTENV_KEY".to_string(),
+            "dotenv-value".to_string(),
+        );
+        let result =
+            super::resolve_required_env(&["EGOPULSE_TEST_DOTENV_KEY".to_string()], &dotenv);
+        assert_eq!(
+            result.get("EGOPULSE_TEST_DOTENV_KEY").unwrap(),
+            "dotenv-value"
+        );
+    }
+
+    #[test]
+    fn resolve_required_env_skips_missing_keys() {
+        let _guard = crate::test_env::EnvVarGuard::set("EGOPULSE_MISSING_KEY_XYZ", "");
+        let dotenv = std::collections::HashMap::new();
+        let result =
+            super::resolve_required_env(&["EGOPULSE_MISSING_KEY_XYZ".to_string()], &dotenv);
+        assert!(result.is_empty());
     }
 }
