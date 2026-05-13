@@ -18,6 +18,10 @@ use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_
 
 use super::sanitize_tool_result;
 
+const AGENT_SEND_SYSTEM_INSTRUCTION: &str = "\
+[System: This message was delivered from another agent via agent_send. \
+To reply, use the agent_send tool to respond to the sender.]";
+
 #[derive(serde::Deserialize)]
 struct AgentSendParams {
     to: String,
@@ -170,9 +174,11 @@ impl Tool for AgentSendTool {
             origin_id: context.origin_id.clone(),
         };
 
+        let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
+
         let turn = PendingAgentTurn {
             context: target_context,
-            input: display_text.clone(),
+            input: target_input,
             origin_id: context.origin_id.clone(),
         };
 
@@ -339,8 +345,30 @@ mod tests {
             .await;
 
         let turn = rx.try_recv().expect("turn");
-        assert!(turn.input.starts_with("[Lyre → Vega]"));
+        assert!(turn.input.starts_with("[System:"));
+        assert!(turn.input.contains("[Lyre → Vega]"));
         assert!(turn.input.contains("check this"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_target_input_includes_system_instruction() {
+        let tool = tool_with_agents(test_agents());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ctx = test_context_with_agent("lyre", tx);
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "hello"}), &ctx)
+            .await;
+
+        let turn = rx.try_recv().expect("turn");
+        let expected_prefix = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n");
+        assert!(
+            turn.input.starts_with(&expected_prefix),
+            "target input should start with system instruction followed by blank line"
+        );
+        assert!(
+            turn.input[expected_prefix.len()..].starts_with("[Lyre → Vega]"),
+            "display text should follow system instruction"
+        );
     }
 
     #[tokio::test]
