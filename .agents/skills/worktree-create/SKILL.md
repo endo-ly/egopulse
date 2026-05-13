@@ -1,3 +1,8 @@
+---
+name: "worktree-create"
+description: "Github worktreを安全に作成するためのSkill。Github worktree作って、WT作って、などの指示で起動"
+---
+
 Git worktree を作成してください。
 
 ## 実行手順
