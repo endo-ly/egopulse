@@ -211,7 +211,7 @@ async fn process_intention(
     if let Err(e) = super::output::handle_output(
         state,
         agent_id_str,
-        &intention.id,
+        intention,
         &home_surface,
         &activation_result,
         &pulse_run_id,

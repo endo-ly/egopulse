@@ -230,6 +230,20 @@ fn is_safe_agent_id(id: &str) -> bool {
         && !id.contains(':')
 }
 
+/// Format a [`TemporalSchedule`] as a human-readable English string.
+///
+/// # Examples
+/// - `Daily { at: "08:00" }` → `"daily 08:00"`
+/// - `Weekly { day: "sun", at: "21:00" }` → `"weekly sun 21:00"`
+/// - `Once { at: "2026-05-12T18:00:00+09:00" }` → `"once 2026-05-12T18:00:00+09:00"`
+pub(crate) fn format_schedule(schedule: &TemporalSchedule) -> String {
+    match schedule {
+        TemporalSchedule::Daily { at } => format!("daily {at}"),
+        TemporalSchedule::Weekly { day, at } => format!("weekly {day} {at}"),
+        TemporalSchedule::Once { at } => format!("once {at}"),
+    }
+}
+
 pub(crate) fn load_pulse_definition(
     state_root: &Path,
     agent_id: &str,
@@ -261,6 +275,31 @@ pub(crate) fn load_pulse_definition(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn format_schedule_daily() {
+        let schedule = TemporalSchedule::Daily {
+            at: "08:00".to_string(),
+        };
+        assert_eq!(format_schedule(&schedule), "daily 08:00");
+    }
+
+    #[test]
+    fn format_schedule_weekly() {
+        let schedule = TemporalSchedule::Weekly {
+            day: "sun".to_string(),
+            at: "21:00".to_string(),
+        };
+        assert_eq!(format_schedule(&schedule), "weekly sun 21:00");
+    }
+
+    #[test]
+    fn format_schedule_once() {
+        let schedule = TemporalSchedule::Once {
+            at: "2026-05-12T18:00:00+09:00".to_string(),
+        };
+        assert_eq!(format_schedule(&schedule), "once 2026-05-12T18:00:00+09:00");
+    }
 
     fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();

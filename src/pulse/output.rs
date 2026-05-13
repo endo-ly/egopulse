@@ -16,6 +16,7 @@ use crate::agent_loop::session::{
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
+use crate::pulse::definition::{TemporalIntention, format_schedule};
 use crate::pulse::home_surface::HomeSurface;
 use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
@@ -48,7 +49,7 @@ pub(crate) struct OutputResult {
 pub(crate) async fn handle_output(
     state: &AppState,
     agent_id: &str,
-    intention_id: &str,
+    intention: &TemporalIntention,
     home_surface: &HomeSurface,
     activation_result: &ActivationResult,
     pulse_run_id: &str,
@@ -61,7 +62,7 @@ pub(crate) async fn handle_output(
             handle_notify(
                 state,
                 agent_id,
-                intention_id,
+                intention,
                 home_surface,
                 activation_result,
                 pulse_run_id,
@@ -103,7 +104,7 @@ async fn handle_silent(
 async fn handle_notify(
     state: &AppState,
     agent_id: &str,
-    intention_id: &str,
+    intention: &TemporalIntention,
     home_surface: &HomeSurface,
     activation_result: &ActivationResult,
     pulse_run_id: &str,
@@ -158,7 +159,7 @@ async fn handle_notify(
     let message_id = match persist_notification_with_session(
         state,
         agent_id,
-        intention_id,
+        intention,
         chat_id,
         activation_result,
     )
@@ -169,7 +170,7 @@ async fn handle_notify(
             warn!(
                 error = %e,
                 agent_id,
-                intention_id,
+                intention_id = %intention.id,
                 "pulse notification persistence failed (message was delivered)"
             );
             let db = Arc::clone(&state.db);
@@ -207,21 +208,41 @@ async fn handle_notify(
     })
 }
 
+/// Build the synthetic user-visible content for a Pulse intention injection.
+///
+/// Format:
+/// ```text
+/// [Pulse: <intention_id>]
+/// Schedule: <schedule>
+/// Attention:
+/// <attention>
+/// ```
+fn format_synthetic_content(intention: &TemporalIntention) -> String {
+    let schedule_text = format_schedule(&intention.schedule);
+    format!(
+        "[Pulse: {}]\nSchedule: {}\nAttention:\n{}",
+        intention.id,
+        schedule_text,
+        intention.attention.trim()
+    )
+}
+
 async fn persist_notification_with_session(
     state: &AppState,
     agent_id: &str,
-    intention_id: &str,
+    intention: &TemporalIntention,
     chat_id: i64,
     activation_result: &ActivationResult,
 ) -> Result<String, EgoPulseError> {
     let now = chrono::Utc::now().to_rfc3339();
     let output_text = &activation_result.output_text;
 
+    let synthetic_content = format_synthetic_content(intention);
     let synthetic_input = StoredMessage {
         id: format!("pulse-in-{}", uuid::Uuid::new_v4()),
         chat_id,
         sender_name: "Pulse".to_string(),
-        content: format!("[Pulse: {intention_id}]"),
+        content: synthetic_content.clone(),
         is_from_bot: false,
         timestamp: now.clone(),
         message_kind: MessageKind::SystemEvent,
@@ -342,6 +363,51 @@ mod tests {
     use crate::tools::ToolRegistry;
     use std::sync::Arc;
 
+    #[test]
+    fn format_synthetic_content_daily() {
+        let intention = TemporalIntention {
+            id: "morning_review".to_string(),
+            schedule: crate::pulse::definition::TemporalSchedule::Daily {
+                at: "08:00".to_string(),
+            },
+            attention: "Check today's schedule.\n".to_string(),
+        };
+        let content = format_synthetic_content(&intention);
+        assert_eq!(
+            content,
+            "[Pulse: morning_review]\nSchedule: daily 08:00\nAttention:\nCheck today's schedule."
+        );
+    }
+
+    #[test]
+    fn format_synthetic_content_weekly() {
+        let intention = TemporalIntention {
+            id: "weekly_reflection".to_string(),
+            schedule: crate::pulse::definition::TemporalSchedule::Weekly {
+                day: "sun".to_string(),
+                at: "21:00".to_string(),
+            },
+            attention: "Reflect on the week.".to_string(),
+        };
+        let content = format_synthetic_content(&intention);
+        assert!(content.starts_with("[Pulse: weekly_reflection]"));
+        assert!(content.contains("Schedule: weekly sun 21:00"));
+        assert!(content.contains("Attention:\nReflect on the week."));
+    }
+
+    #[test]
+    fn format_synthetic_content_trims_attention_whitespace() {
+        let intention = TemporalIntention {
+            id: "test".to_string(),
+            schedule: crate::pulse::definition::TemporalSchedule::Daily {
+                at: "09:00".to_string(),
+            },
+            attention: "  hello world  \n\n".to_string(),
+        };
+        let content = format_synthetic_content(&intention);
+        assert!(content.contains("Attention:\nhello world"));
+    }
+
     /// A no-op channel adapter for testing that records nothing but succeeds.
     struct MockChannelAdapter;
 
@@ -390,6 +456,16 @@ mod tests {
         }
     }
 
+    fn test_intention(id: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: id.to_string(),
+            schedule: crate::pulse::definition::TemporalSchedule::Daily {
+                at: "09:00".to_string(),
+            },
+            attention: "Check today's schedule and unresolved items.".to_string(),
+        }
+    }
+
     fn test_home_surface(chat_id: i64) -> HomeSurface {
         HomeSurface {
             chat_id,
@@ -415,11 +491,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "morning_review";
+        let intention = test_intention("morning_review");
         let pulse_run_id = "run-001";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -432,7 +508,7 @@ mod tests {
         let result = handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -470,12 +546,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "morning_review";
+        let intention = test_intention("morning_review");
         let pulse_run_id = "run-003";
         let notification_text = "Good morning! You have 2 tasks today.";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -488,7 +564,7 @@ mod tests {
         handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -501,7 +577,14 @@ mod tests {
         assert_eq!(messages.len(), 2);
 
         let synthetic = &messages[0];
-        assert_eq!(synthetic.content, "[Pulse: morning_review]");
+        assert!(synthetic.content.starts_with("[Pulse: morning_review]"));
+        assert!(synthetic.content.contains("Schedule: daily 09:00"));
+        assert!(synthetic.content.contains("Attention:"));
+        assert!(
+            synthetic
+                .content
+                .contains("Check today's schedule and unresolved items.")
+        );
         assert!(!synthetic.is_from_bot);
         assert_eq!(synthetic.message_kind, MessageKind::SystemEvent);
         assert_eq!(synthetic.sender_name, "Pulse");
@@ -519,12 +602,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "snapshot_test";
+        let intention = test_intention("snapshot_test");
         let pulse_run_id = "run-snapshot-001";
         let notification_text = "Session snapshot should be updated.";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -537,7 +620,7 @@ mod tests {
         handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -570,12 +653,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "tool_phase_test";
+        let intention = test_intention("tool_phase_test");
         let pulse_run_id = "run-tool-phase-001";
         let notification_text = "I checked the file.";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let assistant_message = Message {
@@ -621,7 +704,7 @@ mod tests {
         handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -635,7 +718,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.content == "[Pulse: tool_phase_test]")
+                .any(|message| message.content.starts_with("[Pulse: tool_phase_test]"))
         );
         assert!(
             messages
@@ -672,13 +755,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "check_in";
+        let intention = test_intention("check_in");
         let pulse_run_id = "run-004";
         let capsule_prompt_text = "# Pulse Activation\n## Core Contract\nYou are an agent.";
         let notification_text = "All quiet. Nothing to report.";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -691,7 +774,7 @@ mod tests {
         handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -726,12 +809,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "weekly_report";
+        let intention = test_intention("weekly_report");
         let pulse_run_id = "run-005";
         let notification_text = "Weekly summary: 42 conversations processed.";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -744,7 +827,7 @@ mod tests {
         let result = handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -772,11 +855,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(&dir);
         let agent_id = "lyre";
-        let intention_id = "broken_intention";
+        let intention = test_intention("broken_intention");
         let pulse_run_id = "run-006";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -795,7 +878,7 @@ mod tests {
         let result = handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,
@@ -816,11 +899,11 @@ mod tests {
         let mut state = build_test_state(&dir);
         state.channels = Arc::new(ChannelRegistry::new());
         let agent_id = "lyre";
-        let intention_id = "missing_adapter";
+        let intention = test_intention("missing_adapter");
         let pulse_run_id = "run-missing-adapter-001";
 
         let chat_id = insert_chat(&state.db, agent_id);
-        create_pulse_run(&state.db, pulse_run_id, agent_id, intention_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
 
         let home_surface = test_home_surface(chat_id);
         let activation = ActivationResult {
@@ -833,7 +916,7 @@ mod tests {
         let result = handle_output(
             &state,
             agent_id,
-            intention_id,
+            &intention,
             &home_surface,
             &activation,
             pulse_run_id,

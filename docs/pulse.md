@@ -736,8 +736,18 @@ src/
 - 破壊的操作は Pulse Core Contract で禁止
 
 ### 通知本文ありの通常会話同等保存
-- 通知テキストは `[Pulse: {intention_id}]` を sender_name とした synthetic user message + assistant notification として通常 session に保存
-- ユーザーが Pulse 通知に返信すると、通常 turn が文脈を引き継げる
+- 通知テキストは構造化 synthetic user message として通常 session に保存
+- synthetic message のフォーマット:
+  ```
+  [Pulse: {intention_id}]
+  Schedule: {schedule}
+  Attention:
+  {attention}
+  ```
+  - `Schedule` は `daily 08:00`, `weekly sun 21:00`, `once 2026-05-12T18:00:00+09:00` の形式
+  - `Attention` は PULSE.md の intention 定義そのまま
+- sender_name は `Pulse`、message_kind は `SystemEvent`
+- ユーザーが Pulse 通知に返信すると、通常 turn が文脈（intention の目的・スケジュール・指示内容）を引き継げる
 
 ### `PULSE_OK` 非保存
 - `PULSE_OK` 判定時は通常 session に何も保存しない
