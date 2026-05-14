@@ -264,13 +264,13 @@ MCP の詳細は以下を参照。
 
 ## 10. `activate_skill`
 
-- 目的: 発見済み skill の本文をロードし、skill が宣言する環境変数を解決する
+- 目的: 発見済み skill の本文をロードし、環境変数の可用性を報告する
 - 入力:
   - `skill_name: string` 必須
 - 挙動:
   - `SkillManager::load_skill_checked()` を呼ぶ
   - 返り値には skill name、description、skill directory、instructions 本文を含む
-  - SKILL.md の `required_env` に基づき環境変数を解決（後述）
+  - SKILL.md の `required_env` に基づき環境変数の解決可否を確認し、結果（✓/✗）を返す。環境変数自体は `bash` 実行時に自動注入されるため、`activate_skill` の呼び出しは注入の前提条件ではない
 - 主な失敗:
   - `Missing required parameter: skill_name`
   - `Skill '<name>' not found. ...`
@@ -278,7 +278,7 @@ MCP の詳細は以下を参照。
 
 ### Skill 環境変数 (`required_env`)
 
-SKILL.md frontmatter に `required_env` を宣言すると、activate 時に指定した環境変数を解決し、同一ターン内の bash サブプロセスにのみ注入する。
+SKILL.md frontmatter に `required_env` を宣言すると、`activate_skill` でキーの可用性を確認でき、`bash` 実行時に自動注入される。
 
 **SKILL.md 記述例:**
 
@@ -300,14 +300,18 @@ required_env: API_KEY
 
 **解決順序:** プロセス環境変数 → `~/.egopulse/.env`（dotenv）
 
+**自動注入（Auto-hydration）:**
+
+インストール済み skill の `required_env` 宣言の和集合を allowlist として扱い、`bash` ツールのサブプロセス実行時に allowlist 内のキーのみを解決・注入する。`activate_skill` を呼ばなくても、required_env に宣言された環境変数は bash サブプロセスで利用可能。Allowlist は実行ごとに SkillManager から動的に計算されるため、ランタイム中に追加された skill も即座に反映される。
+
 **スコープとセキュリティ:**
 
 | 特性 | 内容 |
 |---|---|
-| スコープ | ターン単位。`process_turn()` 開始時に空のマップが作成され、ターン終了時に破棄される |
+| スコープ | 実行ごと。bash サブプロセス起動時に解決し、終了後に破棄。値はセッション・グローバル状態に一切保存しない |
 | 注入先 | `bash` ツールのサブプロセスのみ（`grep` / `find` / `ls` / MCP には注入しない） |
-| 置換セマンティクス | `activate_skill` 呼び出しごとに skill_env マップ全体を置き換える（追記ではない） |
-| 秘密値の取り扱い | 解決済みの値は LLM 出力・ログ・ツール結果に一切含まれない。redaction はキー名のみを使用 |
+| Allowlist | インストール済み全 skill の `required_env` の和集合のみ。dotenv 全体は注入しない |
+| 秘密値の取り扱い | 解決済みの値は LLM 出力・ログ・ツール結果に一切含まれない。注入された値と redaction 対象は完全に一致する |
 | 未解決キー | `tracing::warn!` で警告し、activate_skill の戻り値にキー名（✗ マーク）を表示 |
 
 **返り値の環境変数表示例:**
