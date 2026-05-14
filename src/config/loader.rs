@@ -14,7 +14,7 @@ use super::secret_ref::{
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
     DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig, SleepBatchConfig,
-    TelegramChatConfig,
+    TelegramChatConfig, web_fetch::WebFetchConfig,
 };
 use crate::error::ConfigError;
 
@@ -114,6 +114,41 @@ struct FilePulseConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FileWebFetchConfig {
+    allowed_schemes: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+    max_bytes: Option<usize>,
+    allow_private_ips: Option<bool>,
+    denylist: Option<Vec<String>>,
+    allowlist: Option<Vec<String>>,
+    content_validation: Option<FileWebFetchContentValidationConfig>,
+    feed_sync: Option<FileWebFetchFeedSyncConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileWebFetchContentValidationConfig {
+    enabled: Option<bool>,
+    strict_mode: Option<bool>,
+    max_scan_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileWebFetchFeedSyncConfig {
+    enabled: Option<bool>,
+    fail_open: Option<bool>,
+    sources: Option<Vec<FileWebFetchFeedSource>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileWebFetchFeedSource {
+    url: String,
+    mode: String,
+    format: Option<String>,
+    enabled: Option<bool>,
+    max_entries: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     default_provider: Option<String>,
     default_model: Option<String>,
@@ -130,6 +165,7 @@ struct FileConfig {
     agents: Option<HashMap<String, FileAgentConfig>>,
     sleep_batch: Option<FileSleepBatchConfig>,
     pulse: Option<FilePulseConfig>,
+    web_fetch: Option<FileWebFetchConfig>,
 }
 
 pub(super) fn build_config(
@@ -159,6 +195,7 @@ pub(super) fn build_config(
         agents: file_agents,
         sleep_batch: file_sleep_batch,
         pulse: file_pulse,
+        web_fetch: file_web_fetch,
     } = read_file_config(resolved_config_path.as_deref())?;
 
     let default_provider =
@@ -221,6 +258,8 @@ pub(super) fn build_config(
 
     let pulse = normalize_pulse(file_pulse)?;
 
+    let web_fetch = normalize_web_fetch(file_web_fetch);
+
     let config = Config {
         default_provider,
         default_model,
@@ -238,6 +277,7 @@ pub(super) fn build_config(
         agents,
         sleep_batch,
         pulse,
+        web_fetch,
     };
 
     validate_compaction_config(&config)?;
@@ -963,4 +1003,49 @@ fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
+    let Some(fw) = file else {
+        return WebFetchConfig::default();
+    };
+
+    WebFetchConfig {
+        allowed_schemes: fw
+            .allowed_schemes
+            .unwrap_or_else(|| vec!["https".to_string()]),
+        timeout_secs: fw.timeout_secs.unwrap_or(15),
+        max_bytes: fw.max_bytes.unwrap_or(20_000),
+        allow_private_ips: fw.allow_private_ips.unwrap_or(false),
+        denylist: fw.denylist.unwrap_or_default(),
+        allowlist: fw.allowlist.unwrap_or_default(),
+        content_validation: fw
+            .content_validation
+            .map(|cv| super::web_fetch::WebFetchContentValidationConfig {
+                enabled: cv.enabled.unwrap_or(true),
+                strict_mode: cv.strict_mode.unwrap_or(false),
+                max_scan_bytes: cv.max_scan_bytes.unwrap_or(50_000),
+            })
+            .unwrap_or_default(),
+        feed_sync: fw
+            .feed_sync
+            .map(|fs| super::web_fetch::WebFetchFeedSyncConfig {
+                enabled: fs.enabled.unwrap_or(false),
+                fail_open: fs.fail_open.unwrap_or(false),
+                sources: fs
+                    .sources
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| super::web_fetch::WebFetchFeedSource {
+                        url: s.url,
+                        mode: s.mode,
+                        format: s.format,
+                        enabled: s.enabled,
+                        max_entries: s.max_entries,
+                    })
+                    .collect(),
+            })
+            .unwrap_or_default(),
+    }
+    .normalize()
 }

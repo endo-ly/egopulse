@@ -503,6 +503,7 @@ mod tests {
             agents: HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
+            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
         };
         let updates = HashMap::from([(
             "openai".to_string(),

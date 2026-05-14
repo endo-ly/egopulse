@@ -280,6 +280,10 @@ pub(crate) fn save_config(
             .as_ref()
             .map(|c| c.pulse.clone())
             .unwrap_or_default(),
+        web_fetch: existing_config
+            .as_ref()
+            .map(|c| c.web_fetch.clone())
+            .unwrap_or_default(),
     };
 
     config

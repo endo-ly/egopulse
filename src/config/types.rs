@@ -377,6 +377,7 @@ pub struct Config {
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
     pub(crate) sleep_batch: SleepBatchConfig,
     pub(crate) pulse: PulseConfig,
+    pub(crate) web_fetch: super::web_fetch::WebFetchConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -404,6 +405,7 @@ impl std::fmt::Debug for Config {
             .field("agents", &self.agents)
             .field("sleep_batch", &self.sleep_batch)
             .field("pulse", &self.pulse)
+            .field("web_fetch", &self.web_fetch)
             .finish()
     }
 }
