@@ -163,6 +163,25 @@ impl SkillManager {
         }
     }
 
+    /// Returns the sorted, deduplicated union of all installed skills'
+    /// `required_env` keys.
+    ///
+    /// Used as an allowlist for auto-hydration of environment variables
+    /// into subprocess executions (e.g. `bash`), independent of whether
+    /// `activate_skill` has been called in the current turn.
+    pub fn all_required_env_keys(&self) -> Vec<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        for skill in self.discover_skills() {
+            for key in skill.required_env {
+                let trimmed = key.trim().to_string();
+                if !trimmed.is_empty() {
+                    keys.insert(trimmed);
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
+
     /// チャット表示用にプレーンテキストでスキル一覧を返す。
     pub fn list_skills_formatted(&self) -> String {
         let skills = self.discover_skills();

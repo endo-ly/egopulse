@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+use crate::config::secret_ref::read_dotenv;
 use crate::llm::ToolDefinition;
+use crate::skills::{SkillManager, resolve_required_env};
 
 use super::text::{format_size, shell_quote, truncate_tail};
 use super::{
@@ -22,11 +25,49 @@ use super::{
 /// Executes bash commands in the workspace with configurable timeout and output capture.
 pub(crate) struct BashTool {
     pub(super) workspace_dir: PathBuf,
+    /// SkillManager used to dynamically compute the union of all installed
+    /// skills' `required_env` keys on each execution. This keeps auto-hydration
+    /// consistent with dynamic skill discovery (skills added at runtime are
+    /// picked up without restart).
+    skill_manager: Arc<SkillManager>,
+    /// Path to the runtime dotenv file used for fallback resolution.
+    dotenv_path: PathBuf,
 }
 
 impl BashTool {
-    pub(crate) fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+    pub(crate) fn new(
+        workspace_dir: PathBuf,
+        skill_manager: Arc<SkillManager>,
+        dotenv_path: PathBuf,
+    ) -> Self {
+        Self {
+            workspace_dir,
+            skill_manager,
+            dotenv_path,
+        }
+    }
+
+    /// Resolve allowlisted skill keys fresh from process env → dotenv.
+    ///
+    /// The allowlist is computed dynamically from `SkillManager` so that
+    /// skills added at runtime are reflected immediately. The injected map
+    /// is exactly the fresh resolution — no stale values from previous
+    /// `activate_skill` calls are carried over.
+    ///
+    /// The map is always written back to `context.skill_env` (even if empty)
+    /// so that post-execution redaction covers exactly what was injected.
+    fn resolve_env_for_execution(&self, context: &ToolExecutionContext) -> HashMap<String, String> {
+        let keys = self.skill_manager.all_required_env_keys();
+        let resolved = if keys.is_empty() {
+            HashMap::new()
+        } else {
+            let dotenv = read_dotenv(&self.dotenv_path);
+            resolve_required_env(&keys, &dotenv)
+        };
+
+        *context.skill_env.lock().expect("skill env lock") = resolved.clone();
+
+        resolved
     }
 
     fn temp_dir(&self) -> PathBuf {
@@ -115,7 +156,7 @@ impl Tool for BashTool {
         let quoted_temp = shell_quote(&temp_path.to_string_lossy());
         let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
-        let skill_env = context.skill_env.lock().expect("skill env lock").clone();
+        let skill_env = self.resolve_env_for_execution(context);
         let mut child = match self.spawn_bash_command(&wrapped_command, &skill_env) {
             Ok(child) => child,
             Err(error) => return ToolResult::error(error),

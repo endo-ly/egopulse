@@ -69,11 +69,21 @@ pub(crate) struct ToolExecutionContext {
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
     /// Turn-scoped skill environment variables.
     ///
-    /// Each `activate_skill` call **replaces** the entire map with the newly
-    /// activated skill's resolved env — previous skill env is discarded.
-    /// Cleared when a skill with no `required_env` is activated.
+    /// Dual-purpose map written by two paths:
+    ///
+    /// 1. **`activate_skill`** — replaces the map with the activated skill's
+    ///    resolved env to report key availability (✓/✗). These values are
+    ///    transient and will be overwritten by the next bash execution.
+    /// 2. **`BashTool` auto-hydration** — on each execution, resolves the
+    ///    current allowlist of all installed skills' `required_env` keys
+    ///    fresh from process env → dotenv. The result is written back to
+    ///    this map (replacing any prior content) so that post-execution
+    ///    redaction covers exactly the injected values. No stale values
+    ///    from prior `activate_skill` calls are retained.
+    ///
     /// Created fresh in `process_turn()`, so different turns / agents /
-    /// sessions never share this state.
+    /// sessions never share this state. Secret values are never persisted
+    /// beyond the turn boundary.
     pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
@@ -194,7 +204,11 @@ impl ToolRegistry {
         let env_path = dotenv_path(Path::new(&config.state_root));
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(ReadTool::new(workspace_dir.clone())),
-            Box::new(BashTool::new(workspace_dir.clone())),
+            Box::new(BashTool::new(
+                workspace_dir.clone(),
+                Arc::clone(&skill_manager),
+                env_path.clone(),
+            )),
             Box::new(EditTool::new(workspace_dir.clone())),
             Box::new(WriteTool::new(workspace_dir.clone())),
             Box::new(GrepTool::new(workspace_dir.clone())),
@@ -899,9 +913,14 @@ mod tests {
         assert!(!registry.is_read_only("custom"));
     }
 
+    /// Backward-compatibility: activate_skill in the same turn still works.
+    ///
+    /// After auto-hydration, activate_skill is no longer the primary injection
+    /// path — bash resolves required_env keys independently. This test verifies
+    /// that calling activate_skill first does not break injection or redaction.
     #[tokio::test]
     #[serial]
-    async fn skill_env_injected_into_bash_subprocess() {
+    async fn activate_skill_same_turn_still_works() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
@@ -920,7 +939,7 @@ mod tests {
         let registry = test_registry(&config);
         let context = test_context();
 
-        // Activate the skill — env is stored in context.skill_env
+        // activate_skill reports key availability (✓/✗)
         let result = registry
             .execute(
                 "activate_skill",
@@ -936,7 +955,7 @@ mod tests {
             "values must not appear in result"
         );
 
-        // Bash uses same context → env is available
+        // bash in same context: auto-hydration + activate_skill env both available
         let result = registry
             .execute(
                 "bash",
@@ -956,113 +975,349 @@ mod tests {
         );
     }
 
+    /// Dynamic-discovery regression: a skill added AFTER ToolRegistry::new
+    /// must be picked up by bash auto-hydration without recreating the registry.
     #[tokio::test]
     #[serial]
-    async fn skill_env_not_injected_with_fresh_context() {
+    async fn skill_added_after_registry_creation_is_auto_hydrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        // No skills exist yet when registry is created
+        let registry = test_registry(&config);
+
+        // Now add a skill and its dotenv key
+        let skill_dir = skills_dir.join("late-skill");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: late-skill\ndescription: Added after registry\nrequired_env:\n  - EGOPULSE_LATE_SKILL_KEY\n---\nBody\n",
+        )
+        .expect("write");
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_LATE_SKILL_KEY=late-secret-value\n").expect("env");
+
+        // Bash should pick up the new skill's required_env without registry recreation
+        let fresh_context = test_context();
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_LATE_SKILL_KEY"}),
+                &fresh_context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("late-secret-value"),
+            "dynamically added skill's secret must be redacted"
+        );
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:skill_env.EGOPULSE_LATE_SKILL_KEY]"),
+            "dynamically added skill's key should be auto-hydrated"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_hydration_provides_keys_without_activate_skill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        let skill_dir = skills_dir.join("auto-env");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: auto-env\ndescription: Auto-env skill\nrequired_env:\n  - EGOPULSE_AUTO_HYDRATION_KEY\n---\nBody\n",
+        )
+        .expect("write");
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_AUTO_HYDRATION_KEY=secret-auto-value\n").expect("env");
+
+        let registry = test_registry(&config);
+
+        // Fresh context — no activate_skill call
+        let fresh_context = test_context();
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_AUTO_HYDRATION_KEY"}),
+                &fresh_context,
+            )
+            .await;
+        assert!(!result.is_error);
+        // Value should be redacted (auto-hydration injected it)
+        assert!(
+            !result.content.contains("secret-auto-value"),
+            "auto-hydrated secret must not appear in clear text"
+        );
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:skill_env.EGOPULSE_AUTO_HYDRATION_KEY]"),
+            "auto-hydrated secret should be redacted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_required_dotenv_keys_not_injected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
 
+        // No skills with required_env, so nothing should be injected
         let env_path = dir.path().join(".env");
-        std::fs::write(&env_path, "EGOPULSE_FRESH_CTX_VAR=should-not-appear\n").expect("env");
+        std::fs::write(&env_path, "TOTALLY_RANDOM_SECRET=should-not-appear\n").expect("env");
 
-        // Fresh context (simulates a new turn)
-        let fresh_context = test_context();
         let registry = test_registry(&config);
-
+        let fresh_context = test_context();
         let result = registry
             .execute(
                 "bash",
-                json!({"command": "echo $EGOPULSE_FRESH_CTX_VAR"}),
+                json!({"command": "echo $TOTALLY_RANDOM_SECRET"}),
                 &fresh_context,
             )
             .await;
         assert!(!result.is_error);
         assert!(
             !result.content.contains("should-not-appear"),
-            "fresh context must not have env from other turns"
+            "non-required dotenv keys must not be injected"
+        );
+        assert!(
+            !result.content.contains("[REDACTED"),
+            "non-required key should not trigger redaction"
         );
     }
 
     #[tokio::test]
     #[serial]
-    async fn different_contexts_have_isolated_skill_env() {
+    async fn auto_hydrated_secrets_redacted_from_output() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let skills_dir = config.skills_dir().expect("skills_dir");
 
-        // Skill A
-        let skill_a_dir = skills_dir.join("skill-a");
-        std::fs::create_dir_all(&skill_a_dir).expect("dir");
+        let skill_dir = skills_dir.join("redact-test");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
         std::fs::write(
-            skill_a_dir.join("SKILL.md"),
-            "---\nname: skill-a\ndescription: Skill A\nrequired_env:\n  - EGOPULSE_SKILL_A_KEY\n---\nA\n",
-        ).expect("write");
+            skill_dir.join("SKILL.md"),
+            "---\nname: redact-test\ndescription: Redaction test\nrequired_env:\n  - EGOPULSE_REDACT_TEST_KEY\n---\nBody\n",
+        )
+        .expect("write");
 
-        // Skill B
-        let skill_b_dir = skills_dir.join("skill-b");
-        std::fs::create_dir_all(&skill_b_dir).expect("dir");
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_REDACT_TEST_KEY=super-secret-999\n").expect("env");
+
+        let registry = test_registry(&config);
+        let fresh_context = test_context();
+
+        // Command prints the secret — must be redacted
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_REDACT_TEST_KEY"}),
+                &fresh_context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("super-secret-999"),
+            "secret value must be redacted from bash output"
+        );
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:skill_env.EGOPULSE_REDACT_TEST_KEY]"),
+            "redacted output should reference the key name"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_values_do_not_persist_across_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        let skill_dir = skills_dir.join("persist-test");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
         std::fs::write(
-            skill_b_dir.join("SKILL.md"),
-            "---\nname: skill-b\ndescription: Skill B\nrequired_env:\n  - EGOPULSE_SKILL_B_KEY\n---\nB\n",
-        ).expect("write");
+            skill_dir.join("SKILL.md"),
+            "---\nname: persist-test\ndescription: Persist test\nrequired_env:\n  - EGOPULSE_PERSIST_TEST_KEY\n---\nBody\n",
+        )
+        .expect("write");
 
         let env_path = dir.path().join(".env");
         std::fs::write(
             &env_path,
-            "EGOPULSE_SKILL_A_KEY=value-a\nEGOPULSE_SKILL_B_KEY=value-b\n",
+            "EGOPULSE_PERSIST_TEST_KEY=persist-secret-value\n",
         )
         .expect("env");
 
         let registry = test_registry(&config);
 
-        // Context 1 (turn A) — activates skill-a
-        let context_a = test_context();
+        // Turn 1: activate_skill populates skill_env
+        let context_turn1 = test_context();
         let result = registry
             .execute(
                 "activate_skill",
-                json!({"skill_name": "skill-a"}),
-                &context_a,
+                json!({"skill_name": "persist-test"}),
+                &context_turn1,
             )
             .await;
         assert!(!result.is_error);
 
-        // Context 2 (turn B) — fresh, no activation
-        let context_b = test_context();
-
-        // Context A should have SKILL_A_KEY
-        let result_a = registry
+        // Verify secret is redacted in turn 1 bash
+        let result = registry
             .execute(
                 "bash",
-                json!({"command": "echo $EGOPULSE_SKILL_A_KEY"}),
-                &context_a,
+                json!({"command": "echo $EGOPULSE_PERSIST_TEST_KEY"}),
+                &context_turn1,
             )
             .await;
-        assert!(!result_a.is_error);
+        assert!(!result.is_error);
+        assert!(!result.content.contains("persist-secret-value"));
+
+        // Turn 2: fresh context — activate_skill's skill_env should NOT carry over.
+        // However, auto-hydration still resolves from dotenv independently.
+        // The test verifies that the skill_env map itself is fresh (empty before auto-resolve).
+        let context_turn2 = test_context();
+        let env_before = context_turn2.skill_env.lock().expect("skill_env").clone();
         assert!(
-            result_a
+            env_before.is_empty(),
+            "fresh turn must start with empty skill_env (activate_skill values do not persist)"
+        );
+    }
+
+    /// Bash injection is always a fresh resolution from the current allowlist
+    /// and process env/dotenv. Stale activate_skill values are never used as
+    /// fallback. Keys removed from the allowlist are never injected, and
+    /// skill_env is cleared when the injected map is empty.
+    #[tokio::test]
+    #[serial]
+    async fn fresh_resolution_wins_over_stale_skill_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let skills_dir = config.skills_dir().expect("skills_dir");
+
+        let skill_dir = skills_dir.join("stale-test");
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: stale-test\ndescription: Stale test\nrequired_env:\n  - EGOPULSE_STALE_KEY\n---\nBody\n",
+        )
+        .expect("write");
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "EGOPULSE_STALE_KEY=original-value\n").expect("env");
+
+        let registry = test_registry(&config);
+        let context = test_context();
+
+        // activate_skill resolves KEY=original-value into skill_env
+        let result = registry
+            .execute(
+                "activate_skill",
+                json!({"skill_name": "stale-test"}),
+                &context,
+            )
+            .await;
+        assert!(!result.is_error);
+
+        // Rotate dotenv value — bash must use fresh resolution
+        std::fs::write(&env_path, "EGOPULSE_STALE_KEY=rotated-value\n").expect("env");
+
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_STALE_KEY"}),
+                &context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("original-value"),
+            "stale activate_skill value must not appear"
+        );
+        assert!(
+            !result.content.contains("rotated-value"),
+            "fresh secret value must be redacted"
+        );
+        assert!(
+            result
                 .content
-                .contains("[REDACTED:skill_env.EGOPULSE_SKILL_A_KEY]"),
-            "context A should have skill-a env"
+                .contains("[REDACTED:skill_env.EGOPULSE_STALE_KEY]"),
+            "fresh resolution should be reflected in redaction"
         );
 
-        // Context B should NOT have any skill env (fresh turn)
-        let result_b = registry
+        // Remove value from dotenv while required_env still declares the key
+        // → bash must not fall back to the stale activate_skill value
+        std::fs::write(&env_path, "").expect("env");
+
+        let result = registry
             .execute(
                 "bash",
-                json!({"command": "echo $EGOPULSE_SKILL_A_KEY"}),
-                &context_b,
+                json!({"command": "echo $EGOPULSE_STALE_KEY"}),
+                &context,
             )
             .await;
-        assert!(!result_b.is_error);
+        assert!(!result.is_error);
         assert!(
-            !result_b.content.contains("value-a"),
-            "context B must not leak context A's env"
+            !result.content.contains("original-value"),
+            "stale activate_skill value must not be injected after dotenv removal"
         );
         assert!(
-            !result_b.content.contains("[REDACTED"),
-            "context B should have no redaction (no env)"
+            !result.content.contains("[REDACTED"),
+            "unresolved key should not trigger redaction"
+        );
+
+        // Restore dotenv, then remove required_env from the skill entirely
+        std::fs::write(&env_path, "EGOPULSE_STALE_KEY=still-here\n").expect("env");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: stale-test\ndescription: Stale test\n---\nBody\n",
+        )
+        .expect("write");
+
+        // Pre-populate skill_env simulating a prior activate_skill call
+        let fresh_context = test_context();
+        fresh_context.skill_env.lock().expect("skill_env").insert(
+            "EGOPULSE_STALE_KEY".to_string(),
+            "orphaned-value".to_string(),
+        );
+
+        let result = registry
+            .execute(
+                "bash",
+                json!({"command": "echo $EGOPULSE_STALE_KEY"}),
+                &fresh_context,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("orphaned-value"),
+            "key removed from allowlist must not be injected"
+        );
+        assert!(
+            !result.content.contains("[REDACTED"),
+            "removed key should not trigger redaction"
+        );
+
+        // skill_env must be cleared — empty allowlist → empty injected map → cleared redaction buffer
+        let env_after = fresh_context.skill_env.lock().expect("skill_env").clone();
+        assert!(
+            env_after.is_empty(),
+            "skill_env must be cleared when injected map is empty"
         );
     }
 }
