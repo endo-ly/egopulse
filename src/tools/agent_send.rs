@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::agent_loop::{PendingAgentTurn, SurfaceContext};
 use crate::config::{AgentConfig, AgentId};
 use crate::llm::ToolDefinition;
+use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::send_message::lookup_chat_info;
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
@@ -122,6 +123,24 @@ impl Tool for AgentSendTool {
             return ToolResult::error("cannot send a message to yourself".to_string());
         }
 
+        // Preflight: reject if target turn would exceed stop conditions.
+        let target_chain_depth = context.chain_depth + 1;
+        if let Some(StopReason::ChainDepthExceeded) =
+            evaluate_stop_conditions(target_chain_depth, 0, &target_id, &[target_id.as_str()])
+        {
+            return sanitize_tool_result(
+                ToolResult::success(
+                    serde_json::to_string(&json!({
+                        "delivered": false,
+                        "to": target_id,
+                        "reason": "ChainDepthExceeded"
+                    }))
+                    .expect("json"),
+                ),
+                &[],
+            );
+        }
+
         let from_label = agent_label(&self.agents, &context.agent_id).to_string();
         let to_label = agent_label(&self.agents, &target_id).to_string();
         let display_text = format!("[{from_label} → {to_label}] {}", params.message);
@@ -170,7 +189,7 @@ impl Tool for AgentSendTool {
             chat_type: context.chat_type.clone(),
             agent_id: target_id.clone(),
             channel_log_chat_id: context.channel_log_chat_id,
-            chain_depth: context.chain_depth + 1,
+            chain_depth: target_chain_depth,
             origin_id: context.origin_id.clone(),
         };
 
@@ -320,6 +339,49 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
         assert_eq!(parsed["delivered"], true);
         assert_eq!(parsed["to"], "vega");
+    }
+
+    #[tokio::test]
+    async fn agent_send_returns_delivered_false_when_chain_depth_exceeded() {
+        let tool = tool_with_agents(test_agents());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut ctx = test_context_with_agent("lyre", tx);
+        // MAX_AGENT_CHAIN_DEPTH is 4, so chain_depth=4 means target would be 5 and rejected.
+        ctx.chain_depth = 4;
+        let result = tool
+            .execute(json!({"to": "vega", "message": "hello"}), &ctx)
+            .await;
+        assert!(
+            !result.is_error,
+            "should be success (not error), but delivered=false"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["delivered"], false);
+        assert_eq!(parsed["to"], "vega");
+        assert_eq!(parsed["reason"], "ChainDepthExceeded");
+        // No turn should be queued
+        assert!(
+            rx.try_recv().is_err(),
+            "no turn should be queued when chain depth exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_send_succeeds_at_max_chain_depth_boundary() {
+        let tool = tool_with_agents(test_agents());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut ctx = test_context_with_agent("lyre", tx);
+        // chain_depth=3 means target would be 4, which is allowed by the scheduler stop evaluator.
+        ctx.chain_depth = 3;
+        let result = tool
+            .execute(json!({"to": "vega", "message": "hello"}), &ctx)
+            .await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["delivered"], true);
+        // Turn should be queued with chain_depth = 4
+        let turn = rx.try_recv().expect("turn should be queued at boundary");
+        assert_eq!(turn.context.chain_depth, 4);
     }
 
     #[tokio::test]
@@ -684,6 +746,58 @@ mod integration_tests {
         );
         assert_eq!(turn.context.surface_thread, "123");
         assert_eq!(turn.context.session_key(), "discord:123:agent:vega");
+    }
+
+    #[tokio::test]
+    async fn agent_send_no_channel_log_when_chain_depth_exceeded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let (tool, db) = multi_agent_tool(&config);
+
+        let log_chat_id = call_blocking(Arc::clone(&db), |db| {
+            db.resolve_or_create_chat_id(
+                "discord",
+                "discord:123:multi-room-log",
+                None,
+                "channel_log",
+                "",
+            )
+        })
+        .await
+        .expect("log chat");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let ctx = ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "123".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: "lyre".to_string(),
+            channel_log_chat_id: Some(log_chat_id),
+            chain_depth: 4, // exceeds limit
+            origin_id: String::new(),
+            turn_sender: tx,
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = tool
+            .execute(json!({"to": "vega", "message": "should not persist"}), &ctx)
+            .await;
+
+        assert!(!result.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["delivered"], false);
+
+        let messages = call_blocking(Arc::clone(&db), move |db| {
+            db.get_channel_log_messages(log_chat_id, 10)
+        })
+        .await
+        .expect("messages");
+
+        assert!(
+            messages.is_empty(),
+            "no message should be persisted when chain depth exceeded"
+        );
     }
 
     #[tokio::test]
