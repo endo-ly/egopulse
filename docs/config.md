@@ -13,9 +13,10 @@
    - [2.5 Telegram チャネル](#25-telegram-チャネルchannelstelegram)
    - [2.6 Sleep Batch 設定](#26-sleep-batch-設定sleep_batch)
    - [2.7 Pulse 設定](#27-pulse-設定pulse)
-   - [2.8 エージェント定義](#28-エージェント定義agentsid)
-   - [2.9 完全 YAML 例](#29-完全-yaml-例)
-   - [2.10 環境変数オーバーライド](#210-環境変数オーバーライド)
+   - [2.8 Web Fetch 設定](#28-web-fetch-設定web_fetch)
+   - [2.9 エージェント定義](#29-エージェント定義agentsid)
+   - [2.10 完全 YAML 例](#210-完全-yaml-例)
+   - [2.11 環境変数オーバーライド](#211-環境変数オーバーライド)
 3. [モデル解決チェーン](#3-モデル解決チェーン)
 4. [SecretRef（シークレット参照）](#4-secretrefシークレット参照)
 5. [プロバイダープリセット](#5-プロバイダープリセット)
@@ -162,7 +163,36 @@ Pulse（注意活性化）のスケジューラ設定。
 | `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`） |
 | `pulse.timezone` | `string \| null` | 任意 | `null` | IANA タイムゾーン（例: `Asia/Tokyo`）。`null` の場合は UTC |
 
-### 2.8 エージェント定義（`agents.<id>`）
+### 2.8 Web Fetch 設定（`web_fetch`）
+
+`web_fetch` built-in tool の挙動を制御する設定。URL scheme、タイムアウト、SSRF 対策、コンテンツバリデーション、FeedSync の各項目を設定する。
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `web_fetch.allowed_schemes` | `[string]` | 任意 | `["https"]` | 許可する URL scheme |
+| `web_fetch.timeout_secs` | `u64` | 任意 | `15` | リクエストタイムアウト秒 |
+| `web_fetch.max_bytes` | `usize` | 任意 | `20000` | 最大レスポンスボディサイズ（バイト） |
+| `web_fetch.allow_private_ips` | `bool` | 任意 | `false` | プライベート/ループバック IP へのアクセスを許可 |
+| `web_fetch.denylist` | `[string]` | 任意 | `[]` | ブロックするホストのリスト（サブドメインワイルドカード `*.prefix` 対応） |
+| `web_fetch.allowlist` | `[string]` | 任意 | `[]` | 許可するホストのリスト（空の場合全許可） |
+| `web_fetch.content_validation.enabled` | `bool` | 任意 | `true` | コンテンツバリデーションの有効/無効 |
+| `web_fetch.content_validation.strict_mode` | `bool` | 任意 | `false` | 厳格モード: 低信頼度ヒットでもブロック |
+| `web_fetch.content_validation.max_scan_bytes` | `usize` | 任意 | `50000` | インジェクションスキャンの最大バイト数 |
+| `web_fetch.feed_sync.enabled` | `bool` | 任意 | `false` | FeedSync の有効/無効 |
+| `web_fetch.feed_sync.fail_open` | `bool` | 任意 | `false` | フィード取得失敗時に許可するか |
+| `web_fetch.feed_sync.sources` | `[WebFetchFeedSource]` | 任意 | `[]` | フィードソースのリスト |
+
+#### `WebFetchFeedSource` のフィールド
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `url` | `string` | **必須** | なし | フィードの URL |
+| `mode` | `string` | **必須** | なし | `"allowlist"` または `"denylist"` |
+| `format` | `string` | 任意 | `"lines"` | `"lines"` または `"csv_first_column"` |
+| `enabled` | `bool` | 任意 | `true` | このソースの有効/無効 |
+| `max_entries` | `usize` | 任意 | `1000` | ソースあたりの最大エントリ数 |
+
+### 2.9 エージェント定義（`agents.<id>`）
 
 `agents` はキーがエージェント ID のマップ。複数定義可能。
 
@@ -173,7 +203,7 @@ Pulse（注意活性化）のスケジューラ設定。
 | `model` | `string \| null` | `null` | エージェント固有のモデル名。`null` ならモデル解決チェーンに従う |
 | `discord_bot` | `string \| null` | `null` | このエージェントが紐づく Discord Bot ID。`discord.bots` のキーを参照。Phase 2+ で Bot ごとのエージェント分離に使用 |
 
-### 2.9 完全 YAML 例
+### 2.10 完全 YAML 例
 
 ```yaml
 # ========================================
@@ -298,7 +328,7 @@ pulse:
   timezone: Asia/Tokyo
 ```
 
-### 2.10 環境変数オーバーライド
+### 2.11 環境変数オーバーライド
 
 Config YAML の値を環境変数で上書き可能。環境変数が設定されている場合、YAML の値より優先される。
 
@@ -538,6 +568,7 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `max_*` | 次回セッション操作時に参照 |
 | `sleep_batch.*` | Sleep Batch 実行時に参照 |
 | `pulse.*` | Pulse 実行時に参照 |
+| `web_fetch.*` | 次回 web_fetch 実行時に参照 |
 
 ### 9.3 秘匿フィールド
 
