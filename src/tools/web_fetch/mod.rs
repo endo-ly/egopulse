@@ -46,8 +46,6 @@ struct FetchParams {
     timeout_secs: Option<u64>,
     #[serde(default)]
     max_bytes: Option<usize>,
-    #[serde(default)]
-    start_index: Option<usize>,
 }
 
 #[async_trait]
@@ -59,7 +57,7 @@ impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_fetch".to_string(),
-            description: "Fetch content from a URL and convert HTML to Markdown. Supports pagination via start_index for long pages.".to_string(),
+            description: "Fetch content from a URL and convert HTML to Markdown".to_string(),
             parameters: schema_object(
                 json!({
                     "url": {
@@ -73,10 +71,6 @@ impl Tool for WebFetchTool {
                     "max_bytes": {
                         "type": "integer",
                         "description": "Maximum bytes to return (default: from config)"
-                    },
-                    "start_index": {
-                        "type": "integer",
-                        "description": "Byte offset for pagination (0-based)"
                     }
                 }),
                 &["url"],
@@ -212,22 +206,18 @@ impl Tool for WebFetchTool {
 
         // 6. Streaming body read with max_bytes enforcement
         let mut body_buf = Vec::with_capacity(max_bytes.min(64 * 1024));
-        let mut body_exceeded = false;
 
         while let Some(chunk) = match response.chunk().await {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to read response: {e}")),
         } {
             if body_buf.len() + chunk.len() > max_bytes {
-                let remaining = max_bytes - body_buf.len();
-                body_buf.extend_from_slice(&chunk[..remaining]);
-                body_exceeded = true;
-                break;
+                return ToolResult::error(format!(
+                    "response too large: exceeds max_bytes {max_bytes}"
+                ));
             }
             body_buf.extend_from_slice(&chunk);
         }
-
-        let total_bytes = body_buf.len();
 
         let body_text = match std::str::from_utf8(&body_buf) {
             Ok(s) => s.to_string(),
@@ -237,8 +227,7 @@ impl Tool for WebFetchTool {
         };
 
         // 7. Process based on content type
-        let mut processed =
-            html_processing::process_response_body(&body_text, content_type.as_deref());
+        let processed = html_processing::process_response_body(&body_text, content_type.as_deref());
 
         // 8. Content validation
         if let Err(e) = content_validation::validate_content(&processed, &config.content_validation)
@@ -246,63 +235,15 @@ impl Tool for WebFetchTool {
             return ToolResult::error(format!("content blocked: {e}"));
         }
 
-        // 9. start_index + max_bytes truncation (UTF-8 safe)
-        // When body was capped by streaming, skip start_index pagination to avoid data loss.
-        let (truncated, next_start) = if body_exceeded {
-            // Content is already capped at max_bytes — truncation is inherent.
-            // No reliable pagination for truncated streams.
-            (true, None)
-        } else {
-            let start = params.start_index.unwrap_or(0);
-            let start = if start >= processed.len() {
-                processed.clear();
-                0
-            } else {
-                // Adjust to nearest char boundary ≤ start
-                let mut s = start;
-                while s > 0 && !processed.is_char_boundary(s) {
-                    s -= 1;
-                }
-                s
-            };
-
-            if start < processed.len() && !processed.is_empty() {
-                processed = processed[start..].to_string();
-            }
-
-            let was_truncated = processed.len() > max_bytes;
-            let bytes_consumed = if was_truncated {
-                let mut end = max_bytes;
-                while end > 0 && !processed.is_char_boundary(end) {
-                    end -= 1;
-                }
-                processed = processed[..end].to_string();
-                end
-            } else {
-                processed.len()
-            };
-
-            let ns = if was_truncated {
-                Some(start + bytes_consumed)
-            } else {
-                None
-            };
-
-            (was_truncated, ns)
-        };
-
-        // 10. Add untrusted content warning
+        // 9. Add untrusted content warning
         let content = format!("{processed}{UNTRUSTED_CONTENT_WARNING}");
 
-        // 11. Build result
+        // 10. Build result
         ToolResult::success_with_details(
             content,
             json!({
                 "final_url": final_url,
                 "content_type": content_type.unwrap_or_default(),
-                "truncated": truncated,
-                "total_bytes": total_bytes,
-                "next_start_index": next_start,
             }),
         )
     }
@@ -478,6 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn result_details_metadata() {
+        // Arrange
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
@@ -487,18 +429,19 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let tool = make_tool(test_web_fetch_config());
 
+        // Act
         let result = execute(&tool, json!({"url": server.uri()})).await;
 
+        // Assert
         assert!(!result.is_error);
         let details = result.details.expect("details should be present");
         assert!(details.get("final_url").is_some());
         assert!(details.get("content_type").is_some());
-        assert!(details.get("truncated").is_some());
-        assert!(details.get("total_bytes").is_some());
-        assert_eq!(details.get("truncated").unwrap(), false);
+        assert!(details.get("truncated").is_none());
+        assert!(details.get("total_bytes").is_none());
+        assert!(details.get("next_start_index").is_none());
     }
 
     #[tokio::test]
@@ -553,47 +496,6 @@ mod tests {
             "got: {}",
             result.content
         );
-    }
-
-    #[tokio::test]
-    async fn start_index_continuation() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
-                    .set_body_string("ABCDEFGHIJ"),
-            )
-            .mount(&server)
-            .await;
-
-        let tool = make_tool(test_web_fetch_config());
-
-        let result = execute(&tool, json!({"url": server.uri(), "start_index": 5})).await;
-
-        assert!(!result.is_error);
-        assert!(result.content.contains("FGHIJ"));
-    }
-
-    #[tokio::test]
-    async fn start_index_beyond_content() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
-                    .set_body_string("short"),
-            )
-            .mount(&server)
-            .await;
-
-        let tool = make_tool(test_web_fetch_config());
-
-        let result = execute(&tool, json!({"url": server.uri(), "start_index": 9999})).await;
-
-        assert!(!result.is_error);
-        // Content should be just the warning
-        assert!(!result.content.contains("short"));
     }
 
     #[tokio::test]
@@ -795,81 +697,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_index_utf8_boundary_safe() {
+    async fn streaming_overflow_returns_error() {
+        // Arrange: serve 200 bytes via chunked transfer (no Content-Length) with max_bytes=100
         let server = MockServer::start().await;
-        // 5 Japanese chars × 3 bytes = 15 bytes
-        let body = "あいうえお".to_string();
+        let body = "A".repeat(200);
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/plain")
+                    // No Content-Length header — forces streaming path
                     .set_body_string(&body),
             )
             .mount(&server)
             .await;
-
-        let tool = make_tool(test_web_fetch_config());
-
-        // 4 is in the middle of "い" (bytes 3-5) — should adjust to 3
-        let result = execute(&tool, json!({"url": server.uri(), "start_index": 4})).await;
-
-        assert!(!result.is_error, "error: {}", result.content);
-        assert!(result.content.contains("いうえお"));
-    }
-
-    #[tokio::test]
-    async fn next_start_index_respects_utf8_boundary() {
-        let server = MockServer::start().await;
-        let body = "あいうえお".to_string();
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
-                    .set_body_string(&body),
-            )
-            .mount(&server)
-            .await;
-
         let mut config = test_web_fetch_config();
-        config.max_bytes = 15;
+        config.max_bytes = 100;
         let tool = make_tool(config);
 
-        let result = execute(
-            &tool,
-            json!({"url": server.uri(), "max_bytes": 5, "start_index": 4}),
-        )
-        .await;
+        // Act
+        let result = execute(&tool, json!({"url": server.uri()})).await;
 
-        assert!(result.is_error);
+        // Assert
+        assert!(result.is_error, "expected error, got: {}", result.content);
         assert!(
             result.content.contains("too large"),
             "got: {}",
             result.content
         );
-    }
-
-    #[tokio::test]
-    async fn streaming_read_at_max_bytes_boundary() {
-        let server = MockServer::start().await;
-        let body = "A".repeat(100);
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
-                    .set_body_string(&body),
-            )
-            .mount(&server)
-            .await;
-
-        let mut config = test_web_fetch_config();
-        config.max_bytes = 100;
-        let tool = make_tool(config);
-
-        let result = execute(&tool, json!({"url": server.uri()})).await;
-
-        assert!(!result.is_error, "error: {}", result.content);
-        let details = result.details.expect("details");
-        assert_eq!(details.get("truncated").unwrap(), false);
-        assert!(details.get("next_start_index").unwrap().is_null());
     }
 }

@@ -389,7 +389,6 @@ Environment variables:
   - `url: string` 必須
   - `timeout_secs: integer` 任意。既定値は設定ファイル参照
   - `max_bytes: integer` 任意。既定値は設定ファイル参照
-  - `start_index: integer` 任意。バイトオフセット (0-based)
 - 挙動:
   - URL scheme 検証（デフォルト HTTPS のみ許可）
   - Host denylist/allowlist チェック
@@ -398,16 +397,12 @@ Environment variables:
   - HTTP リダイレクトは手動追跡（各ホップで SSRF 再検証、最大リダイレクト数制限あり）
   - HTML は `htmd` クレートで Markdown に変換、`text/plain` はそのまま返す
   - コンテンツバリデーション: プロンプトインジェクション検出パターンでスキャン
-  - `start_index` でバイト単位のページネーション対応
-  - `max_bytes` で UTF-8 安全なトランケーション
+  - `max_bytes` でレスポンスサイズの上限（超過時は即座にエラー）
   - 末尾に untrusted content warning を付与
   - 読み取り専用ツール (`is_read_only: true`)
 - `details`:
   - `final_url` (リダイレクト後の最終URL)
   - `content_type`
-  - `truncated`
-  - `total_bytes`
-  - `next_start_index` (truncated 時のみ)
 - 主な失敗:
   - `url must not be empty`
   - `scheme '...' is not allowed`
@@ -420,6 +415,7 @@ Environment variables:
   - `redirect without Location header`
   - `content blocked: ...`
   - `response body is not valid UTF-8`
+  - `response too large: exceeds max_bytes N`
 
 実装: [egopulse/src/tools/web_fetch/mod.rs](../../egopulse/src/tools/web_fetch/mod.rs)
 
