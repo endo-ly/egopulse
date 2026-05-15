@@ -326,6 +326,26 @@ pulse:
   enabled: true
   tick_interval: "1h"
   timezone: Asia/Tokyo
+
+# ========================================
+# Web Fetch 設定（任意）
+# ========================================
+web_fetch:
+  allowed_schemes:
+    - https
+  timeout_secs: 15
+  max_bytes: 20000
+  allow_private_ips: false
+  denylist: []
+  allowlist: []
+  content_validation:
+    enabled: true
+    strict_mode: false
+    max_scan_bytes: 50000
+  feed_sync:
+    enabled: false
+    fail_open: false
+    sources: []
 ```
 
 ### 2.11 環境変数オーバーライド
