@@ -117,7 +117,8 @@ struct FilePulseConfig {
 struct FileWebFetchConfig {
     allowed_schemes: Option<Vec<String>>,
     timeout_secs: Option<u64>,
-    max_bytes: Option<usize>,
+    max_fetch_bytes: Option<usize>,
+    max_output_bytes: Option<usize>,
     allow_private_ips: Option<bool>,
     denylist: Option<Vec<String>>,
     allowlist: Option<Vec<String>>,
@@ -998,7 +999,8 @@ fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
             .allowed_schemes
             .unwrap_or_else(|| vec!["https".to_string()]),
         timeout_secs: fw.timeout_secs.unwrap_or(15),
-        max_bytes: fw.max_bytes.unwrap_or(64 * 1024),
+        max_fetch_bytes: fw.max_fetch_bytes.unwrap_or(512 * 1024),
+        max_output_bytes: fw.max_output_bytes.unwrap_or(64 * 1024),
         allow_private_ips: fw.allow_private_ips.unwrap_or(false),
         denylist: fw.denylist.unwrap_or_default(),
         allowlist: fw.allowlist.unwrap_or_default(),
