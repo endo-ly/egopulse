@@ -59,9 +59,23 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
             // 169.254.169.254 is the cloud metadata endpoint — is_link_local()
             // covers the /16 range but the explicit check documents intent.
             let is_cloud_meta = octets == [169, 254, 169, 254];
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || is_cloud_meta
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || is_cloud_meta
         }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+        IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:0:0/96) must be unfolded and re-evaluated
+            // as IPv4, otherwise ::ffff:127.0.0.1 etc. bypass all checks.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
     }
 }
 
@@ -535,5 +549,29 @@ mod tests {
     #[test]
     fn allows_ipv6_public() {
         assert!(!is_blocked_ip(IpAddr::from_str("2001:db8::1").unwrap()));
+    }
+
+    #[test]
+    fn blocks_ipv4_unspecified() {
+        assert!(is_blocked_ip(IpAddr::from_str("0.0.0.0").unwrap()));
+    }
+
+    #[test]
+    fn blocks_ipv6_unspecified() {
+        assert!(is_blocked_ip(IpAddr::from_str("::").unwrap()));
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_loopback() {
+        assert!(is_blocked_ip(
+            IpAddr::from_str("::ffff:127.0.0.1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_private() {
+        assert!(is_blocked_ip(
+            IpAddr::from_str("::ffff:192.168.1.1").unwrap()
+        ));
     }
 }
