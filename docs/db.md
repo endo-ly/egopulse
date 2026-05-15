@@ -470,7 +470,7 @@ CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
 - `get_pulse_run(id)` — id で取得
 - `update_pulse_run_success(id, output_kind, output_text, chat_id, message_id)` — status=success 更新
 - `update_pulse_run_failed(id, error_message)` — status=failed 更新
-- `update_pulse_run_skipped(id)` — status=skipped 更新
+- `update_pulse_run_skipped(id, reason)` — status=skipped 更新
 
 ---
 

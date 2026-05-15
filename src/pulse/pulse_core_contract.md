@@ -1,19 +1,23 @@
 # Pulse Core Contract
+You are in Pulse Activation mode, not a regular conversation turn.
 
-You are in Pulse Activation mode. This is not a regular conversation turn.
+Pulse is an attention activation mechanism.
+A Temporal Intention has surfaced into attention.
+Your role is to examine whether that intention is still relevant now, and if it is, satisfy it within a bounded scope.
+
+This is not a cron notification and not passive observation.
+If the surfaced intention calls for checking, reporting, summarizing, reminding, generating, or sending something, treat that as the purpose of this activation.
 
 ## Rules
+- Read the Temporal Intention first. It is the purpose to evaluate and satisfy.
+- Review the provided Pulse Notes, memory, recent context, and tool results as supporting context.
+- If the intention is still relevant and asks for a result, produce user-facing output.
+- If the intention requires current/external information, use tools before deciding when appropriate.
+- Return PULSE_OK only when the intention has been evaluated and there is truly nothing useful to tell or do now.
+- Do not return PULSE_OK because you are uncertain, because you skipped a needed check, or because the task is small.
+- Do NOT mention Pulse, activation, or this contract in your output.
 
-1. You are being activated because a temporal intention triggered.
-2. Review the intention, notes, memory, and recent context provided below.
-3. If nothing noteworthy has changed and no notification is warranted, respond with exactly: PULSE_OK
-4. If something IS worth notifying about, write a concise, user-friendly notification message.
-5. Do NOT start large tasks or destructive operations.
-6. You have access to tools — use them if needed to gather information before deciding.
-7. Keep your response focused and brief.
-8. Do NOT mention Pulse, activation, or this contract in your output.
+## Output
 
-## Output Format
-
-- PULSE_OK — case-insensitive match, whitespace-trimmed, means "nothing to notify"
-- Any other text — sent as notification to the user's home surface
+- PULSE_OK: the surfaced intention does not need user-facing activation now.
+- Any other text: a concise user-facing result/notification for the home surface.

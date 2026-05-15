@@ -71,13 +71,6 @@ pub(crate) fn build_capsule(
         sections.push('\n');
     }
 
-    // Output Contract
-    sections.push_str("## Output Contract\n\n");
-    sections.push_str("- 何も通知すべきでなければ PULSE_OK\n");
-    sections.push_str("- 通知すべき場合だけ、短いユーザー向け文を書く\n");
-    sections.push_str("- 大きな作業は開始しない\n");
-    sections.push_str("- 破壊的操作はしない\n");
-
     PulseCapsule { prompt: sections }
 }
 
@@ -141,7 +134,6 @@ mod tests {
         assert!(prompt.contains("## Recent Visible Context"));
         assert!(prompt.contains("User said hello"));
         assert!(prompt.contains("Bot replied hi"));
-        assert!(prompt.contains("## Output Contract"));
     }
 
     #[test]

@@ -288,12 +288,6 @@ now: {now_rfc3339}
 {Home Surface の直近 user-visible messages}
 （メッセージがない場合は "No recent context."）
 
-## Output Contract
-
-- 何も通知すべきでなければ PULSE_OK
-- 通知すべき場合だけ、短いユーザー向け文を書く
-- 大きな作業は開始しない
-- 破壊的操作はしない
 ```
 
 Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_core_contract.md) を参照。

@@ -539,13 +539,6 @@ now: 2026-05-10T09:00:00+09:00
 ## Recent Visible Context
 
 {Home Surface の直近 user-visible messages を少量だけ入れる}
-
-## Output Contract
-
-- 何も通知すべきでなければ PULSE_OK
-- 通知すべき場合だけ、短いユーザー向け文を書く
-- 大きな作業は開始しない
-- 破壊的操作はしない
 ```
 
 通常 session の内部 snapshot は使わない。
