@@ -122,7 +122,6 @@ struct FileWebFetchConfig {
     denylist: Option<Vec<String>>,
     allowlist: Option<Vec<String>>,
     content_validation: Option<FileWebFetchContentValidationConfig>,
-    feed_sync: Option<FileWebFetchFeedSyncConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -130,22 +129,6 @@ struct FileWebFetchContentValidationConfig {
     enabled: Option<bool>,
     strict_mode: Option<bool>,
     max_scan_bytes: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct FileWebFetchFeedSyncConfig {
-    enabled: Option<bool>,
-    fail_open: Option<bool>,
-    sources: Option<Vec<FileWebFetchFeedSource>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileWebFetchFeedSource {
-    url: String,
-    mode: String,
-    format: Option<String>,
-    enabled: Option<bool>,
-    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1025,25 +1008,6 @@ fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
                 enabled: cv.enabled.unwrap_or(true),
                 strict_mode: cv.strict_mode.unwrap_or(false),
                 max_scan_bytes: cv.max_scan_bytes.unwrap_or(50_000),
-            })
-            .unwrap_or_default(),
-        feed_sync: fw
-            .feed_sync
-            .map(|fs| super::web_fetch::WebFetchFeedSyncConfig {
-                enabled: fs.enabled.unwrap_or(false),
-                fail_open: fs.fail_open.unwrap_or(false),
-                sources: fs
-                    .sources
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| super::web_fetch::WebFetchFeedSource {
-                        url: s.url,
-                        mode: s.mode,
-                        format: s.format,
-                        enabled: s.enabled,
-                        max_entries: s.max_entries,
-                    })
-                    .collect(),
             })
             .unwrap_or_default(),
     }

@@ -31,8 +31,6 @@ pub(crate) struct WebFetchConfig {
     pub allowlist: Vec<String>,
     /// Content validation settings.
     pub content_validation: WebFetchContentValidationConfig,
-    /// Feed sync settings.
-    pub feed_sync: WebFetchFeedSyncConfig,
 }
 
 /// Content-validation sub-settings for the web_fetch tool.
@@ -45,32 +43,6 @@ pub(crate) struct WebFetchContentValidationConfig {
     pub strict_mode: bool,
     /// Maximum bytes to scan for injection. Default: 50000
     pub max_scan_bytes: usize,
-}
-
-/// Feed-sync sub-settings for the web_fetch tool.
-#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
-#[serde(default)]
-pub(crate) struct WebFetchFeedSyncConfig {
-    /// Whether feed sync is enabled. Default: false
-    pub enabled: bool,
-    /// Whether to fail open (allow) when feed fetch fails. Default: false
-    pub fail_open: bool,
-    /// Feed sources.
-    pub sources: Vec<WebFetchFeedSource>,
-}
-
-/// A single feed source used by `WebFetchFeedSyncConfig`.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
-pub(crate) struct WebFetchFeedSource {
-    pub url: String,
-    /// `"allowlist"` or `"denylist"`.
-    pub mode: String,
-    /// `"lines"` or `"csv_first_column"`. Default: `"lines"`
-    pub format: Option<String>,
-    /// Whether this source is enabled. Default: true
-    pub enabled: Option<bool>,
-    /// Maximum entries per source. Default: 1000
-    pub max_entries: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +62,6 @@ impl Default for WebFetchConfig {
             denylist: Vec::new(),
             allowlist: Vec::new(),
             content_validation: WebFetchContentValidationConfig::default(),
-            feed_sync: WebFetchFeedSyncConfig::default(),
         }
     }
 }
@@ -133,8 +104,6 @@ impl WebFetchConfig {
             self.timeout_secs = DEFAULT_TIMEOUT_SECS;
         }
 
-        self.feed_sync.sources.retain(|s| !s.url.trim().is_empty());
-
         self
     }
 }
@@ -175,9 +144,6 @@ mod tests {
         assert!(cfg.content_validation.enabled);
         assert!(!cfg.content_validation.strict_mode);
         assert_eq!(cfg.content_validation.max_scan_bytes, 50_000);
-        assert!(!cfg.feed_sync.enabled);
-        assert!(!cfg.feed_sync.fail_open);
-        assert!(cfg.feed_sync.sources.is_empty());
     }
 
     #[test]
@@ -197,15 +163,6 @@ content_validation:
   enabled: false
   strict_mode: true
   max_scan_bytes: 100000
-feed_sync:
-  enabled: true
-  fail_open: true
-  sources:
-    - url: "https://feeds.example.com/block.txt"
-      mode: denylist
-      format: lines
-      enabled: true
-      max_entries: 500
 "#;
         let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
 
@@ -218,15 +175,6 @@ feed_sync:
         assert!(!cfg.content_validation.enabled);
         assert!(cfg.content_validation.strict_mode);
         assert_eq!(cfg.content_validation.max_scan_bytes, 100_000);
-        assert!(cfg.feed_sync.enabled);
-        assert!(cfg.feed_sync.fail_open);
-        assert_eq!(cfg.feed_sync.sources.len(), 1);
-        let src = &cfg.feed_sync.sources[0];
-        assert_eq!(src.url, "https://feeds.example.com/block.txt");
-        assert_eq!(src.mode, "denylist");
-        assert_eq!(src.format.as_deref(), Some("lines"));
-        assert_eq!(src.enabled, Some(true));
-        assert_eq!(src.max_entries, Some(500));
     }
 
     #[test]
@@ -238,7 +186,6 @@ feed_sync:
         assert_eq!(cfg.timeout_secs, 15);
         assert_eq!(cfg.max_bytes, 20_000);
         assert!(cfg.content_validation.enabled);
-        assert!(!cfg.feed_sync.enabled);
     }
 
     #[test]
@@ -285,29 +232,5 @@ timeout_secs: 0
 
         assert_eq!(normalized.max_bytes, 20_000);
         assert_eq!(normalized.timeout_secs, 15);
-    }
-
-    #[test]
-    fn feed_source_normalize() {
-        let yaml = r#"
-feed_sync:
-  sources:
-    - url: ""
-      mode: allowlist
-    - url: "  "
-      mode: denylist
-    - url: "https://valid.example.com/list.txt"
-      mode: denylist
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        assert_eq!(cfg.feed_sync.sources.len(), 3);
-
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.feed_sync.sources.len(), 1);
-        assert_eq!(
-            normalized.feed_sync.sources[0].url,
-            "https://valid.example.com/list.txt"
-        );
     }
 }

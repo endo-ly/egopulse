@@ -165,7 +165,7 @@ Pulse（注意活性化）のスケジューラ設定。
 
 ### 2.8 Web Fetch 設定（`web_fetch`）
 
-`web_fetch` built-in tool の挙動を制御する設定。URL scheme、タイムアウト、SSRF 対策、コンテンツバリデーション、FeedSync の各項目を設定する。
+`web_fetch` built-in tool の挙動を制御する設定。URL scheme、タイムアウト、SSRF 対策、コンテンツバリデーションの各項目を設定する。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -178,19 +178,6 @@ Pulse（注意活性化）のスケジューラ設定。
 | `web_fetch.content_validation.enabled` | `bool` | 任意 | `true` | コンテンツバリデーションの有効/無効 |
 | `web_fetch.content_validation.strict_mode` | `bool` | 任意 | `false` | 厳格モード: 低信頼度ヒットでもブロック |
 | `web_fetch.content_validation.max_scan_bytes` | `usize` | 任意 | `50000` | インジェクションスキャンの最大バイト数 |
-| `web_fetch.feed_sync.enabled` | `bool` | 任意 | `false` | FeedSync の有効/無効 |
-| `web_fetch.feed_sync.fail_open` | `bool` | 任意 | `false` | フィード取得失敗時に許可するか |
-| `web_fetch.feed_sync.sources` | `[WebFetchFeedSource]` | 任意 | `[]` | フィードソースのリスト |
-
-#### `WebFetchFeedSource` のフィールド
-
-| フィールド | 型 | 必須 | デフォルト | 説明 |
-|---|---|---|---|---|
-| `url` | `string` | **必須** | なし | フィードの URL |
-| `mode` | `string` | **必須** | なし | `"allowlist"` または `"denylist"` |
-| `format` | `string` | 任意 | `"lines"` | `"lines"` または `"csv_first_column"` |
-| `enabled` | `bool` | 任意 | `true` | このソースの有効/無効 |
-| `max_entries` | `usize` | 任意 | `1000` | ソースあたりの最大エントリ数 |
 
 ### 2.9 エージェント定義（`agents.<id>`）
 
@@ -342,10 +329,6 @@ web_fetch:
     enabled: true
     strict_mode: false
     max_scan_bytes: 50000
-  feed_sync:
-    enabled: false
-    fail_open: false
-    sources: []
 ```
 
 ### 2.11 環境変数オーバーライド

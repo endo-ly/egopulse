@@ -182,8 +182,6 @@ struct SerializableWebFetchConfig {
     allowlist: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_validation: Option<SerializableWebFetchContentValidation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    feed_sync: Option<SerializableWebFetchFeedSync>,
 }
 
 fn is_default_u64(v: &u64) -> bool {
@@ -206,28 +204,6 @@ struct SerializableWebFetchContentValidation {
 
 fn is_default_usize_50k(v: &usize) -> bool {
     *v == 50_000
-}
-
-#[derive(Serialize)]
-struct SerializableWebFetchFeedSync {
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    enabled: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    fail_open: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    sources: Vec<SerializableWebFetchFeedSource>,
-}
-
-#[derive(Serialize)]
-struct SerializableWebFetchFeedSource {
-    url: String,
-    mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_entries: Option<usize>,
 }
 
 impl From<&Config> for SerializableConfig {
@@ -390,8 +366,7 @@ impl From<&Config> for SerializableConfig {
                     && !wf.allow_private_ips
                     && wf.denylist.is_empty()
                     && wf.allowlist.is_empty()
-                    && wf.content_validation == wf_defaults.content_validation
-                    && wf.feed_sync == wf_defaults.feed_sync;
+                    && wf.content_validation == wf_defaults.content_validation;
                 if is_default {
                     None
                 } else {
@@ -416,28 +391,6 @@ impl From<&Config> for SerializableConfig {
                                     enabled: cv.enabled,
                                     strict_mode: cv.strict_mode,
                                     max_scan_bytes: cv.max_scan_bytes,
-                                })
-                            }
-                        },
-                        feed_sync: {
-                            let fs = &wf.feed_sync;
-                            if !fs.enabled && !fs.fail_open && fs.sources.is_empty() {
-                                None
-                            } else {
-                                Some(SerializableWebFetchFeedSync {
-                                    enabled: fs.enabled,
-                                    fail_open: fs.fail_open,
-                                    sources: fs
-                                        .sources
-                                        .iter()
-                                        .map(|s| SerializableWebFetchFeedSource {
-                                            url: s.url.clone(),
-                                            mode: s.mode.clone(),
-                                            format: s.format.clone(),
-                                            enabled: s.enabled,
-                                            max_entries: s.max_entries,
-                                        })
-                                        .collect(),
                                 })
                             }
                         },
