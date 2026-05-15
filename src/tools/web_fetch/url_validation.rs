@@ -79,25 +79,19 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Returns `true` when `host` matches an entry in `denylist`.
+/// Returns `true` when `host` matches any entry in `list`.
 ///
-/// Both exact matches and subdomain matches are considered: if the denylist
-/// contains `"evil.com"` then `"sub.evil.com"` is also blocked.
-fn is_host_denylisted(host: &str, denylist: &[String]) -> bool {
-    let normalized = host.to_ascii_lowercase();
-    denylist.iter().any(|entry| {
-        let entry_lower = entry.to_ascii_lowercase();
-        normalized == entry_lower || normalized.ends_with(&format!(".{entry_lower}"))
-    })
-}
-
-/// Returns `true` when `host` matches an entry in `allowlist` (exact match
-/// or subdomain match, mirroring the denylist logic).
-fn is_host_allowlisted(host: &str, allowlist: &[String]) -> bool {
-    let normalized = host.to_ascii_lowercase();
-    allowlist.iter().any(|entry| {
-        let entry_lower = entry.to_ascii_lowercase();
-        normalized == entry_lower || normalized.ends_with(&format!(".{entry_lower}"))
+/// Both exact matches and subdomain matches are considered. Entries are
+/// normalized (lowercase, trailing-dot removal, `*.` prefix stripping) before
+/// comparison, so `"*.evil.com"` matches `"sub.evil.com"`.
+fn host_matches_any(host: &str, list: &[String]) -> bool {
+    let normalized = normalize_host(host);
+    list.iter().any(|entry| {
+        let entry_norm = normalize_host(entry);
+        if entry_norm.is_empty() {
+            return false;
+        }
+        normalized == entry_norm || normalized.ends_with(&format!(".{entry_norm}"))
     })
 }
 
@@ -132,11 +126,11 @@ pub(crate) fn validate_url(url: &str, config: &WebFetchConfig) -> Result<Url, Ur
         .filter(|h| !h.is_empty())
         .ok_or_else(|| UrlValidationError::InvalidUrl("missing host".to_string()))?;
 
-    if is_host_denylisted(host, &config.denylist) {
+    if host_matches_any(host, &config.denylist) {
         return Err(UrlValidationError::HostBlocked(host.to_string()));
     }
 
-    if !config.allowlist.is_empty() && !is_host_allowlisted(host, &config.allowlist) {
+    if !config.allowlist.is_empty() && !host_matches_any(host, &config.allowlist) {
         return Err(UrlValidationError::HostNotInAllowlist(host.to_string()));
     }
 
@@ -354,6 +348,30 @@ mod tests {
     }
 
     #[test]
+    fn blocks_denylist_wildcard_prefix() {
+        let config = config_with_denylist(&["*.example.com"]);
+
+        let result = validate_url("https://sub.example.com", &config);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            UrlValidationError::HostBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn denylist_wildcard_also_blocks_base_domain() {
+        let config = config_with_denylist(&["*.example.com"]);
+
+        // normalize_host("*.example.com") → "example.com", so the bare domain
+        // is also blocked.
+        let result = validate_url("https://example.com", &config);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn allows_denylist_unrelated() {
         let config = config_with_denylist(&["bad.com"]);
 
@@ -375,6 +393,17 @@ mod tests {
             result.unwrap_err(),
             UrlValidationError::HostNotInAllowlist(_)
         ));
+    }
+
+    #[test]
+    fn allowlist_wildcard_matches_subdomain() {
+        let config = config_with_allowlist(&["*.safe.com"]);
+
+        assert!(validate_url("https://sub.safe.com", &config).is_ok());
+
+        let result = validate_url("https://other.com", &config);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -563,9 +592,7 @@ mod tests {
 
     #[test]
     fn blocks_ipv4_mapped_loopback() {
-        assert!(is_blocked_ip(
-            IpAddr::from_str("::ffff:127.0.0.1").unwrap()
-        ));
+        assert!(is_blocked_ip(IpAddr::from_str("::ffff:127.0.0.1").unwrap()));
     }
 
     #[test]
