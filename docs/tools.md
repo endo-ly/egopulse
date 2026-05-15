@@ -15,8 +15,10 @@
 9. [ls](#9-ls)
 10. [activate_skill](#10-activate_skill)
 11. [send_message](#11-send_message)
-12. [Skill Catalog](#12-skill-catalog)
-13. [セキュリティガード](#13-セキュリティガード)
+12. [agent_send](#12-agent_send)
+13. [Skill Catalog](#13-skill-catalog)
+14. [web_fetch](#14-web_fetch)
+15. [セキュリティガード](#15-セキュリティガード)
 
 ---
 
@@ -36,7 +38,7 @@
 
 ### Built-in tool
 
-registry に静的登録されている tool は次の 9 つ。
+registry に静的登録されている tool は次の 10 個。
 
 - `read`
 - `bash`
@@ -47,6 +49,7 @@ registry に静的登録されている tool は次の 9 つ。
 - `ls`
 - `activate_skill`
 - `send_message`
+- `web_fetch`
 
 登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 
@@ -379,7 +382,44 @@ Environment variables:
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
-## 14. セキュリティガード
+## 14. `web_fetch`
+
+- 目的: URL からコンテンツを取得し、HTML を Markdown に変換して返す
+- 入力:
+  - `url: string` 必須
+  - `timeout_secs: integer` 任意。既定値は設定ファイル参照
+  - `max_bytes: integer` 任意。既定値は設定ファイル参照（デフォルト 64KB）
+- 挙動:
+  - URL scheme 検証（デフォルト HTTPS のみ許可）
+  - Host denylist/allowlist チェック
+  - SSRF 対策: プライベート IP / ループバックアドレスへのアクセスをブロック（`allow_private_ips: true` で解除可）
+  - DNS 解決後の SSRF 再検証
+  - HTTP リダイレクトは手動追跡（各ホップで SSRF 再検証、最大リダイレクト数制限あり）
+  - HTML は `htmd` クレートで Markdown に変換、`text/plain` はそのまま返す
+  - コンテンツバリデーション: プロンプトインジェクション検出パターンでスキャン
+  - `max_bytes` でレスポンスサイズの上限（超過時は即座にエラー）
+  - 末尾に untrusted content warning を付与
+  - 読み取り専用ツール (`is_read_only: true`)
+- `details`:
+  - `final_url` (リダイレクト後の最終URL)
+  - `content_type`
+- 主な失敗:
+  - `url must not be empty`
+  - `scheme '...' is not allowed`
+  - `host '...' is blocked`
+  - `private/loopback IP address not allowed`
+  - `request timed out after Ns`
+  - `request failed: ...`
+  - `HTTP 404` (等、HTTP エラーステータス)
+  - `too many redirects`
+  - `redirect without Location header`
+  - `content blocked: ...`
+  - `response body is not valid UTF-8`
+  - `response too large: exceeds max_bytes N`
+
+実装: [egopulse/src/tools/web_fetch/mod.rs](../../egopulse/src/tools/web_fetch/mod.rs)
+
+## 15. セキュリティガード
 
 AI エージェントによるシークレット窃取を防ぐ多層防御。コマンド検閲・パス検閲・出力リダクションの 3 層で構成。
 

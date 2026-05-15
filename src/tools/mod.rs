@@ -15,6 +15,8 @@ mod search;
 mod send_message;
 mod shell;
 mod text;
+#[allow(dead_code)]
+mod web_fetch;
 
 #[allow(unused_imports)] // re-export for future use from other modules
 pub(crate) use command_guard::*;
@@ -215,6 +217,7 @@ impl ToolRegistry {
             Box::new(FindTool::new(workspace_dir.clone())),
             Box::new(LsTool::new(workspace_dir)),
             Box::new(ActivateSkillTool::new(skill_manager, env_path)),
+            Box::new(WebFetchTool::new(Arc::new(config.clone()))),
         ];
         Self {
             tool_index: build_tool_index(&tools),
@@ -310,6 +313,7 @@ impl ToolRegistry {
 
 pub(crate) use activate_skill::ActivateSkillTool;
 pub(crate) use agent_send::AgentSendTool;
+pub(crate) use web_fetch::WebFetchTool;
 
 fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
     json!({

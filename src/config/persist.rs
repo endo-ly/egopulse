@@ -93,6 +93,8 @@ struct SerializableConfig {
     agents: HashMap<String, SerializableAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sleep_batch: Option<SerializableSleepBatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_fetch: Option<SerializableWebFetchConfig>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +164,46 @@ where
         Some(v) => yaml_serde::Value::serialize(v, serializer),
         None => serializer.serialize_none(),
     }
+}
+
+#[derive(Serialize)]
+struct SerializableWebFetchConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allowed_schemes: Vec<String>,
+    #[serde(skip_serializing_if = "is_default_u64")]
+    timeout_secs: u64,
+    #[serde(skip_serializing_if = "is_default_usize_64k")]
+    max_bytes: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    allow_private_ips: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    denylist: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allowlist: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_validation: Option<SerializableWebFetchContentValidation>,
+}
+
+fn is_default_u64(v: &u64) -> bool {
+    *v == 0 || *v == 15
+}
+
+fn is_default_usize_64k(v: &usize) -> bool {
+    *v == 0 || *v == 64 * 1024
+}
+
+#[derive(Serialize)]
+struct SerializableWebFetchContentValidation {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enabled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    strict_mode: bool,
+    #[serde(skip_serializing_if = "is_default_usize_64k_scan")]
+    max_scan_bytes: usize,
+}
+
+fn is_default_usize_64k_scan(v: &usize) -> bool {
+    *v == 64 * 1024
 }
 
 impl From<&Config> for SerializableConfig {
@@ -311,6 +353,46 @@ impl From<&Config> for SerializableConfig {
                             })
                         } else {
                             None
+                        },
+                    })
+                }
+            },
+            web_fetch: {
+                let wf = &config.web_fetch;
+                let wf_defaults = super::web_fetch::WebFetchConfig::default();
+                let is_default = wf.allowed_schemes == wf_defaults.allowed_schemes
+                    && wf.timeout_secs == wf_defaults.timeout_secs
+                    && wf.max_bytes == wf_defaults.max_bytes
+                    && !wf.allow_private_ips
+                    && wf.denylist.is_empty()
+                    && wf.allowlist.is_empty()
+                    && wf.content_validation == wf_defaults.content_validation;
+                if is_default {
+                    None
+                } else {
+                    Some(SerializableWebFetchConfig {
+                        allowed_schemes: wf.allowed_schemes.clone(),
+                        timeout_secs: wf.timeout_secs,
+                        max_bytes: wf.max_bytes,
+                        allow_private_ips: wf.allow_private_ips,
+                        denylist: wf.denylist.clone(),
+                        allowlist: wf.allowlist.clone(),
+                        content_validation: {
+                            let cv = &wf.content_validation;
+                            let cv_defaults =
+                                super::web_fetch::WebFetchContentValidationConfig::default();
+                            if cv.enabled == cv_defaults.enabled
+                                && cv.strict_mode == cv_defaults.strict_mode
+                                && cv.max_scan_bytes == cv_defaults.max_scan_bytes
+                            {
+                                None
+                            } else {
+                                Some(SerializableWebFetchContentValidation {
+                                    enabled: cv.enabled,
+                                    strict_mode: cv.strict_mode,
+                                    max_scan_bytes: cv.max_scan_bytes,
+                                })
+                            }
                         },
                     })
                 }
@@ -538,6 +620,7 @@ mod tests {
             agents,
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
+            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
         }
     }
 

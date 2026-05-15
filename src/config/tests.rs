@@ -601,6 +601,7 @@ fn persists_agents_without_discord_config_surface() {
         agents,
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -1394,6 +1395,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         agents,
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
     // Act
@@ -2209,6 +2211,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
         )]),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2474,6 +2477,7 @@ fn persist_preserves_sleep_batch_config() {
             ..Default::default()
         },
         pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2886,6 +2890,7 @@ fn persist_preserves_sleep_batch_scheduler_config() {
             ..Default::default()
         },
         pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");

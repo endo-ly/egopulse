@@ -211,6 +211,7 @@ mod tests {
             agents: std::collections::HashMap::new(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
+            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
         }
     }
 

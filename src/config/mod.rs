@@ -3,6 +3,7 @@ pub(crate) mod persist;
 pub(crate) mod resolve;
 pub(crate) mod secret_ref;
 pub(crate) mod types;
+pub(crate) mod web_fetch;
 
 pub(crate) use loader::is_valid_base_url;
 pub use resolve::default_config_path;

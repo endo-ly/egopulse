@@ -138,7 +138,7 @@
 
 - 役割: URL を取得し、HTML から本文テキストを抽出して返す。
 - 主入力: `url`, `timeout_secs`
-- 挙動: script/style 除去済み。本文は最大 20KB。URL validation と content validation が入る。
+- 挙動: script/style 除去済み。本文は最大 64KB。URL validation と content validation が入る。
 
 ### `web_search`
 
