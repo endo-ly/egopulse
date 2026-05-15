@@ -61,7 +61,7 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
             let is_cloud_meta = octets == [169, 254, 169, 254];
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || is_cloud_meta
         }
-        IpAddr::V6(v6) => v6.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
     }
 }
 
@@ -191,13 +191,14 @@ pub(crate) fn validate_redirect(
 
 /// Returns `true` when `redirect_count` has reached [`MAX_REDIRECTS`].
 pub(crate) fn is_redirect_limit_exceeded(redirect_count: u8) -> bool {
-    redirect_count > MAX_REDIRECTS
+    redirect_count >= MAX_REDIRECTS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::web_fetch::WebFetchContentValidationConfig;
+    use std::str::FromStr;
 
     fn default_config() -> WebFetchConfig {
         WebFetchConfig::default()
@@ -354,6 +355,7 @@ mod tests {
         assert!(validate_url("https://ok.com", &config).is_ok());
 
         let result = validate_url("https://other.com", &config);
+
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -497,7 +499,8 @@ mod tests {
     fn redirect_too_many() {
         assert!(is_redirect_limit_exceeded(6));
         assert!(is_redirect_limit_exceeded(100));
-        assert!(!is_redirect_limit_exceeded(5));
+        assert!(is_redirect_limit_exceeded(5));
+        assert!(!is_redirect_limit_exceeded(4));
         assert!(!is_redirect_limit_exceeded(0));
     }
 
@@ -514,5 +517,23 @@ mod tests {
     #[test]
     fn host_normalization_wildcard_prefix() {
         assert_eq!(normalize_host("*.example.com"), "example.com");
+    }
+
+    #[test]
+    fn blocks_ipv6_ula() {
+        assert!(is_blocked_ip(IpAddr::from_str("fc00::1").unwrap()));
+        assert!(is_blocked_ip(
+            IpAddr::from_str("fd12:3456:789a::1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn blocks_ipv6_link_local() {
+        assert!(is_blocked_ip(IpAddr::from_str("fe80::1").unwrap()));
+    }
+
+    #[test]
+    fn allows_ipv6_public() {
+        assert!(!is_blocked_ip(IpAddr::from_str("2001:db8::1").unwrap()));
     }
 }

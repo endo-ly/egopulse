@@ -250,6 +250,7 @@ allowed_schemes: []
         assert!(cfg.allowed_schemes.is_empty());
 
         let normalized = cfg.normalize();
+
         assert_eq!(normalized.allowed_schemes, vec!["https"]);
     }
 
@@ -281,6 +282,7 @@ timeout_secs: 0
         assert_eq!(cfg.timeout_secs, 0);
 
         let normalized = cfg.normalize();
+
         assert_eq!(normalized.max_bytes, 20_000);
         assert_eq!(normalized.timeout_secs, 15);
     }
@@ -301,6 +303,7 @@ feed_sync:
         assert_eq!(cfg.feed_sync.sources.len(), 3);
 
         let normalized = cfg.normalize();
+
         assert_eq!(normalized.feed_sync.sources.len(), 1);
         assert_eq!(
             normalized.feed_sync.sources[0].url,

@@ -102,7 +102,17 @@ pub(crate) fn validate_content(
     }
 
     let scan_text = if config.max_scan_bytes > 0 {
-        &text[..text.len().min(config.max_scan_bytes)]
+        let limit = text.len().min(config.max_scan_bytes);
+        let boundary = if text.is_char_boundary(limit) {
+            limit
+        } else {
+            let mut b = limit;
+            while b > 0 && !text.is_char_boundary(b) {
+                b -= 1;
+            }
+            b
+        };
+        &text[..boundary]
     } else {
         text
     };
@@ -335,6 +345,20 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn scan_multibyte_utf8_no_panic() {
+        let config = WebFetchContentValidationConfig {
+            enabled: true,
+            strict_mode: false,
+            max_scan_bytes: 5,
+        };
+        let text = "abc世界def";
+
+        let result = validate_content(text, &config);
+
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]

@@ -123,8 +123,14 @@ impl Tool for WebFetchTool {
         }
 
         // 4. HTTP request with manual redirect loop
-        let timeout = params.timeout_secs.unwrap_or(config.timeout_secs);
-        let max_bytes = params.max_bytes.unwrap_or(config.max_bytes);
+        let timeout = params
+            .timeout_secs
+            .map(|v| v.min(config.timeout_secs))
+            .unwrap_or(config.timeout_secs);
+        let max_bytes = params
+            .max_bytes
+            .map(|v| v.min(config.max_bytes))
+            .unwrap_or(config.max_bytes);
 
         let mut redirect_count: u8 = 0;
         let response = loop {
@@ -216,28 +222,40 @@ impl Tool for WebFetchTool {
 
         // 8. start_index + max_bytes truncation (UTF-8 safe)
         let start = params.start_index.unwrap_or(0);
-        if start >= processed.len() {
+        let start = if start >= processed.len() {
             processed.clear();
+            0
         } else {
+            // Adjust to nearest char boundary ≤ start
+            let mut s = start;
+            while s > 0 && !processed.is_char_boundary(s) {
+                s -= 1;
+            }
+            s
+        };
+
+        if start < processed.len() && !processed.is_empty() {
             processed = processed[start..].to_string();
         }
 
         let truncated = processed.len() > max_bytes;
-        if truncated {
-            // Floor to the nearest UTF-8 char boundary ≤ max_bytes
+        let bytes_consumed = if truncated {
             let mut end = max_bytes;
-            while !processed.is_char_boundary(end) {
+            while end > 0 && !processed.is_char_boundary(end) {
                 end -= 1;
             }
             processed = processed[..end].to_string();
-        }
+            end
+        } else {
+            processed.len()
+        };
 
         // 9. Add untrusted content warning
         let content = format!("{processed}{UNTRUSTED_CONTENT_WARNING}");
 
         // 10. Build result
         let next_start = if truncated {
-            Some(start + max_bytes)
+            Some(start + bytes_consumed)
         } else {
             None
         };
@@ -706,5 +724,80 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("scheme"), "got: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn clamps_params_to_config_limits() {
+        let server = MockServer::start().await;
+        let body = "A".repeat(200);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = test_web_fetch_config();
+        config.max_bytes = 50;
+        let tool = make_tool(config);
+
+        let result = execute(&tool, json!({"url": server.uri(), "max_bytes": 99999})).await;
+
+        assert!(!result.is_error);
+        let details = result.details.expect("details");
+        assert_eq!(details.get("truncated").unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn start_index_utf8_boundary_safe() {
+        let server = MockServer::start().await;
+        // 5 Japanese chars × 3 bytes = 15 bytes
+        let body = "あいうえお".to_string();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = make_tool(test_web_fetch_config());
+
+        // 4 is in the middle of "い" (bytes 3-5) — should adjust to 3
+        let result = execute(&tool, json!({"url": server.uri(), "start_index": 4})).await;
+
+        assert!(!result.is_error, "error: {}", result.content);
+        assert!(result.content.contains("いうえお"));
+    }
+
+    #[tokio::test]
+    async fn next_start_index_uses_actual_bytes() {
+        let server = MockServer::start().await;
+        // "あ" = 3 bytes, "い" = 3 bytes, etc.
+        let body = "あいうえお".to_string();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = test_web_fetch_config();
+        config.max_bytes = 5; // Between あ(3 bytes) and い boundary(6 bytes)
+        let tool = make_tool(config);
+
+        let result = execute(&tool, json!({"url": server.uri()})).await;
+
+        assert!(!result.is_error);
+        let details = result.details.expect("details");
+        assert_eq!(details.get("truncated").unwrap(), true);
+        // next_start_index should be 3 (actual bytes consumed), not 5 (max_bytes)
+        let next = details.get("next_start_index").unwrap().as_u64().unwrap() as usize;
+        assert_eq!(next, 3);
     }
 }

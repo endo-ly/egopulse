@@ -69,6 +69,11 @@ pub(crate) async fn fetch_feed_entries(
             url: source.url.clone(),
             reason: e.to_string(),
         })?
+        .error_for_status()
+        .map_err(|e| FeedSyncError::FetchFailed {
+            url: source.url.clone(),
+            reason: e.to_string(),
+        })?
         .text()
         .await
         .map_err(|e| FeedSyncError::FetchFailed {
@@ -410,5 +415,26 @@ mod tests {
         let result = resolve_feed_sync(&config).await.expect("sync");
 
         assert_eq!(result.denylist.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_error_triggers_fetch_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let config = WebFetchFeedSyncConfig {
+            enabled: true,
+            fail_open: true,
+            sources: vec![test_source(&server.uri(), "denylist")],
+        };
+
+        let result = resolve_feed_sync(&config).await;
+
+        assert!(result.is_ok());
+        let merged = result.unwrap();
+        assert!(merged.denylist.is_empty());
     }
 }
