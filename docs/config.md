@@ -171,13 +171,13 @@ Pulse（注意活性化）のスケジューラ設定。
 |---|---|---|---|---|
 | `web_fetch.allowed_schemes` | `[string]` | 任意 | `["https"]` | 許可する URL scheme |
 | `web_fetch.timeout_secs` | `u64` | 任意 | `15` | リクエストタイムアウト秒 |
-| `web_fetch.max_bytes` | `usize` | 任意 | `20000` | 最大レスポンスボディサイズ（バイト） |
+| `web_fetch.max_bytes` | `usize` | 任意 | `65536` | 最大レスポンスボディサイズ（バイト） |
 | `web_fetch.allow_private_ips` | `bool` | 任意 | `false` | プライベート/ループバック IP へのアクセスを許可 |
 | `web_fetch.denylist` | `[string]` | 任意 | `[]` | ブロックするホストのリスト（サブドメインワイルドカード `*.prefix` 対応） |
 | `web_fetch.allowlist` | `[string]` | 任意 | `[]` | 許可するホストのリスト（空の場合全許可） |
 | `web_fetch.content_validation.enabled` | `bool` | 任意 | `true` | コンテンツバリデーションの有効/無効 |
 | `web_fetch.content_validation.strict_mode` | `bool` | 任意 | `false` | 厳格モード: 低信頼度ヒットでもブロック |
-| `web_fetch.content_validation.max_scan_bytes` | `usize` | 任意 | `50000` | インジェクションスキャンの最大バイト数 |
+| `web_fetch.content_validation.max_scan_bytes` | `usize` | 任意 | `65536` | インジェクションスキャンの最大バイト数 |
 
 ### 2.9 エージェント定義（`agents.<id>`）
 
@@ -321,14 +321,14 @@ web_fetch:
   allowed_schemes:
     - https
   timeout_secs: 15
-  max_bytes: 20000
+  max_bytes: 65536
   allow_private_ips: false
   denylist: []
   allowlist: []
   content_validation:
     enabled: true
     strict_mode: false
-    max_scan_bytes: 50000
+    max_scan_bytes: 65536
 ```
 
 ### 2.11 環境変数オーバーライド

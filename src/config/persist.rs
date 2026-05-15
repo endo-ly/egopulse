@@ -172,7 +172,7 @@ struct SerializableWebFetchConfig {
     allowed_schemes: Vec<String>,
     #[serde(skip_serializing_if = "is_default_u64")]
     timeout_secs: u64,
-    #[serde(skip_serializing_if = "is_default_usize_20k")]
+    #[serde(skip_serializing_if = "is_default_usize_64k")]
     max_bytes: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     allow_private_ips: bool,
@@ -188,8 +188,8 @@ fn is_default_u64(v: &u64) -> bool {
     *v == 0 || *v == 15
 }
 
-fn is_default_usize_20k(v: &usize) -> bool {
-    *v == 0 || *v == 20_000
+fn is_default_usize_64k(v: &usize) -> bool {
+    *v == 0 || *v == 64 * 1024
 }
 
 #[derive(Serialize)]
@@ -198,12 +198,12 @@ struct SerializableWebFetchContentValidation {
     enabled: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     strict_mode: bool,
-    #[serde(skip_serializing_if = "is_default_usize_50k")]
+    #[serde(skip_serializing_if = "is_default_usize_64k_scan")]
     max_scan_bytes: usize,
 }
 
-fn is_default_usize_50k(v: &usize) -> bool {
-    *v == 50_000
+fn is_default_usize_64k_scan(v: &usize) -> bool {
+    *v == 64 * 1024
 }
 
 impl From<&Config> for SerializableConfig {

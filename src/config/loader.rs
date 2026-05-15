@@ -998,7 +998,7 @@ fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
             .allowed_schemes
             .unwrap_or_else(|| vec!["https".to_string()]),
         timeout_secs: fw.timeout_secs.unwrap_or(15),
-        max_bytes: fw.max_bytes.unwrap_or(20_000),
+        max_bytes: fw.max_bytes.unwrap_or(64 * 1024),
         allow_private_ips: fw.allow_private_ips.unwrap_or(false),
         denylist: fw.denylist.unwrap_or_default(),
         allowlist: fw.allowlist.unwrap_or_default(),
@@ -1007,7 +1007,7 @@ fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
             .map(|cv| super::web_fetch::WebFetchContentValidationConfig {
                 enabled: cv.enabled.unwrap_or(true),
                 strict_mode: cv.strict_mode.unwrap_or(false),
-                max_scan_bytes: cv.max_scan_bytes.unwrap_or(50_000),
+                max_scan_bytes: cv.max_scan_bytes.unwrap_or(64 * 1024),
             })
             .unwrap_or_default(),
     }

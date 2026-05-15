@@ -515,7 +515,7 @@ mod tests {
             content_validation: WebFetchContentValidationConfig {
                 enabled: true,
                 strict_mode: false,
-                max_scan_bytes: 50_000,
+                max_scan_bytes: 64 * 1024,
             },
             ..test_web_fetch_config()
         };

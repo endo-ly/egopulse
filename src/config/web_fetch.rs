@@ -6,8 +6,8 @@
 
 const DEFAULT_ALLOWED_SCHEMES: &[&str] = &["https"];
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_MAX_BYTES: usize = 20_000;
-const DEFAULT_MAX_SCAN_BYTES: usize = 50_000;
+const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_SCAN_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Config types
@@ -21,7 +21,7 @@ pub(crate) struct WebFetchConfig {
     pub allowed_schemes: Vec<String>,
     /// Request timeout in seconds. Default: 15
     pub timeout_secs: u64,
-    /// Maximum response body size in bytes. Default: 20000
+    /// Maximum response body size in bytes. Default: 65536
     pub max_bytes: usize,
     /// Whether to allow requests to private/loopback IPs. Default: false
     pub allow_private_ips: bool,
@@ -41,7 +41,7 @@ pub(crate) struct WebFetchContentValidationConfig {
     pub enabled: bool,
     /// Strict mode: blocks on single low-confidence hit. Default: false
     pub strict_mode: bool,
-    /// Maximum bytes to scan for injection. Default: 50000
+    /// Maximum bytes to scan for injection. Default: 65536
     pub max_scan_bytes: usize,
 }
 
@@ -137,13 +137,13 @@ mod tests {
 
         assert_eq!(cfg.allowed_schemes, vec!["https"]);
         assert_eq!(cfg.timeout_secs, 15);
-        assert_eq!(cfg.max_bytes, 20_000);
+        assert_eq!(cfg.max_bytes, 64 * 1024);
         assert!(!cfg.allow_private_ips);
         assert!(cfg.denylist.is_empty());
         assert!(cfg.allowlist.is_empty());
         assert!(cfg.content_validation.enabled);
         assert!(!cfg.content_validation.strict_mode);
-        assert_eq!(cfg.content_validation.max_scan_bytes, 50_000);
+        assert_eq!(cfg.content_validation.max_scan_bytes, 64 * 1024);
     }
 
     #[test]
@@ -184,7 +184,7 @@ content_validation:
 
         assert_eq!(cfg.allowed_schemes, vec!["https"]);
         assert_eq!(cfg.timeout_secs, 15);
-        assert_eq!(cfg.max_bytes, 20_000);
+        assert_eq!(cfg.max_bytes, 64 * 1024);
         assert!(cfg.content_validation.enabled);
     }
 
@@ -230,7 +230,7 @@ timeout_secs: 0
 
         let normalized = cfg.normalize();
 
-        assert_eq!(normalized.max_bytes, 20_000);
+        assert_eq!(normalized.max_bytes, 64 * 1024);
         assert_eq!(normalized.timeout_secs, 15);
     }
 }

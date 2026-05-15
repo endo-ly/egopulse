@@ -388,7 +388,7 @@ Environment variables:
 - 入力:
   - `url: string` 必須
   - `timeout_secs: integer` 任意。既定値は設定ファイル参照
-  - `max_bytes: integer` 任意。既定値は設定ファイル参照
+  - `max_bytes: integer` 任意。既定値は設定ファイル参照（デフォルト 64KB）
 - 挙動:
   - URL scheme 検証（デフォルト HTTPS のみ許可）
   - Host denylist/allowlist チェック

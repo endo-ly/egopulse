@@ -156,7 +156,7 @@ mod tests {
         WebFetchContentValidationConfig {
             enabled: true,
             strict_mode: false,
-            max_scan_bytes: 50_000,
+            max_scan_bytes: 64 * 1024,
         }
     }
 
@@ -164,7 +164,7 @@ mod tests {
         WebFetchContentValidationConfig {
             enabled: true,
             strict_mode: true,
-            max_scan_bytes: 50_000,
+            max_scan_bytes: 64 * 1024,
         }
     }
 
@@ -172,7 +172,7 @@ mod tests {
         WebFetchContentValidationConfig {
             enabled: false,
             strict_mode: false,
-            max_scan_bytes: 50_000,
+            max_scan_bytes: 64 * 1024,
         }
     }
 
