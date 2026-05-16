@@ -417,11 +417,10 @@ mod tests {
     }
 
     fn test_registry(config: &Config) -> ToolRegistry {
+        let skills_dir = config.skills_dir().expect("skills_dir");
         ToolRegistry::new(
             config,
-            Arc::new(SkillManager::from_skills_dir(
-                config.skills_dir().expect("skills_dir"),
-            )),
+            Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
         )
     }
 
