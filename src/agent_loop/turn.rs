@@ -1144,6 +1144,15 @@ pub(crate) fn build_state(
     config: crate::config::Config,
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
+    build_state_for_config_file(config, llm, None)
+}
+
+#[cfg(test)]
+pub(crate) fn build_state_for_config_file(
+    config: crate::config::Config,
+    llm: Box<dyn crate::llm::LlmProvider>,
+    config_path: Option<std::path::PathBuf>,
+) -> AppState {
     use crate::assets::AssetStore;
     use crate::channels::adapter::ChannelRegistry;
     use crate::skills::SkillManager;
@@ -1162,7 +1171,7 @@ pub(crate) fn build_state(
     AppState {
         db,
         config: config.clone(),
-        config_path: None,
+        config_path,
         llm_override: Some(std::sync::Arc::from(llm)),
         channels: std::sync::Arc::new(ChannelRegistry::new()),
         skills: std::sync::Arc::clone(&skills),
@@ -1171,7 +1180,7 @@ pub(crate) fn build_state(
         assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents,
         memory_loader,
-        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         turn_scheduler: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),

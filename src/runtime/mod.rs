@@ -69,6 +69,7 @@ impl ActiveTurnTracker {
 }
 
 /// Holds the shared runtime dependencies used across all channels.
+#[derive(Clone)]
 pub struct AppState {
     pub(crate) db: Arc<Database>,
     pub(crate) config: Config,
@@ -81,7 +82,7 @@ pub struct AppState {
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
-    pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>,
+    pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Sender half of the pending-agent-turn channel for `agent_send` turn queuing.
@@ -90,29 +91,6 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
-}
-
-impl Clone for AppState {
-    fn clone(&self) -> Self {
-        Self {
-            db: Arc::clone(&self.db),
-            config: self.config.clone(),
-            config_path: self.config_path.clone(),
-            llm_override: self.llm_override.clone(),
-            channels: Arc::clone(&self.channels),
-            skills: Arc::clone(&self.skills),
-            tools: Arc::clone(&self.tools),
-            mcp_manager: self.mcp_manager.clone(),
-            assets: Arc::clone(&self.assets),
-            soul_agents: Arc::clone(&self.soul_agents),
-            memory_loader: Arc::clone(&self.memory_loader),
-            llm_cache: Mutex::new(HashMap::new()),
-            active_turns: Arc::clone(&self.active_turns),
-            turn_sender: self.turn_sender.clone(),
-            turn_scheduler: Arc::clone(&self.turn_scheduler),
-            turn_tracker: Arc::clone(&self.turn_tracker),
-        }
-    }
 }
 
 impl AppState {
@@ -250,7 +228,7 @@ pub async fn build_app_state_with_path(
         assets,
         soul_agents,
         memory_loader,
-        llm_cache: Mutex::new(HashMap::new()),
+        llm_cache: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(ActiveTurnTracker::new()),
         turn_sender,
         turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
@@ -301,7 +279,7 @@ pub fn build_sleep_app_state_with_path(
         assets,
         soul_agents,
         memory_loader,
-        llm_cache: Mutex::new(HashMap::new()),
+        llm_cache: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
@@ -905,25 +883,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_override_bypasses_cache() {
+    async fn cloned_app_state_shares_llm_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
-        let mut state = build_app_state(config).await.expect("build state");
+        let state = build_app_state(config).await.expect("build state");
+        let cloned = state.clone();
+        let context = crate::test_util::cli_context("cache-clone-test");
 
-        let override_provider: Arc<dyn crate::llm::LlmProvider> = Arc::from(
+        let a = state.llm_for_context(&context).expect("llm");
+        let b = cloned.llm_for_context(&context).expect("llm");
+
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn llm_override_bypasses_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let expected_provider = "override";
+        let expected_model = "model-x";
+
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
             crate::llm::create_provider(&resolved_config(
-                "override",
-                "model-x",
+                expected_provider,
+                expected_model,
                 "https://example.com/v1",
             ))
             .expect("provider"),
         );
-
-        state.llm_override = Some(Arc::clone(&override_provider));
         let context = crate::test_util::cli_context("override-test");
 
         let result = state.llm_for_context(&context).expect("llm");
-        assert!(Arc::ptr_eq(&result, &override_provider));
+        assert_eq!(result.provider_name(), expected_provider);
+        assert_eq!(result.model_name(), expected_model);
 
         let cache = state.llm_cache.lock().expect("lock");
         assert!(cache.is_empty());

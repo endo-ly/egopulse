@@ -91,7 +91,7 @@ pub(crate) fn build_state_with_provider(
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
-        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),

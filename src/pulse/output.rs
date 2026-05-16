@@ -425,6 +425,15 @@ mod tests {
     }
 
     fn build_test_state(dir: &tempfile::TempDir) -> AppState {
+        let mut channels = ChannelRegistry::new();
+        channels.register(Arc::new(MockChannelAdapter));
+        build_test_state_with_channels(dir, Arc::new(channels))
+    }
+
+    fn build_test_state_with_channels(
+        dir: &tempfile::TempDir,
+        channels: Arc<ChannelRegistry>,
+    ) -> AppState {
         let state_root = dir.path().to_str().expect("utf8").to_string();
         let config = crate::test_util::test_config(&state_root);
         let db = Arc::new(Database::new(&config.db_path()).expect("db"));
@@ -432,14 +441,12 @@ mod tests {
             config.user_skills_dir().expect("user_skills_dir"),
             config.skills_dir().expect("skills_dir"),
         ));
-        let mut channels = ChannelRegistry::new();
-        channels.register(Arc::new(MockChannelAdapter));
         AppState {
             db,
             config: config.clone(),
             config_path: None,
             llm_override: None,
-            channels: Arc::new(channels),
+            channels,
             skills: Arc::clone(&skills),
             tools: Arc::new(ToolRegistry::new(&config, skills)),
             mcp_manager: None,
@@ -448,7 +455,7 @@ mod tests {
             memory_loader: Arc::new(crate::memory::MemoryLoader::new(
                 std::path::PathBuf::from(&state_root).join("agents"),
             )),
-            llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
             turn_sender: tokio::sync::mpsc::channel(16).0,
             turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
@@ -896,8 +903,7 @@ mod tests {
     async fn notify_missing_adapter_fails_without_persisting_session_messages() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_test_state(&dir);
-        state.channels = Arc::new(ChannelRegistry::new());
+        let state = build_test_state_with_channels(&dir, Arc::new(ChannelRegistry::new()));
         let agent_id = "lyre";
         let intention = test_intention("missing_adapter");
         let pulse_run_id = "run-missing-adapter-001";
