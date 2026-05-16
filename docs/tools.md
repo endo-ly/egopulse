@@ -38,7 +38,9 @@
 
 ### Built-in tool
 
-registry に静的登録されている tool は次の 10 個。
+registry に登録される tool は次の通り。`agent_send` は Discord 有効時のみ登録される。
+
+#### 常時登録（10個）
 
 - `read`
 - `bash`
@@ -50,6 +52,10 @@ registry に静的登録されている tool は次の 10 個。
 - `activate_skill`
 - `send_message`
 - `web_fetch`
+
+#### 条件付き登録
+
+- `agent_send` — Discord チャネル有効時のみ
 
 登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 

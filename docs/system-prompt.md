@@ -219,7 +219,7 @@ Be concise and helpful.
 </agents>
 ```
 
-### 4.4 Skills セクション（注入順: ④、条件付き）
+### 4.4 Skills セクション（注入順: ⑤、条件付き）
 
 **コード**: `src/agent_loop/turn.rs:634`
 
