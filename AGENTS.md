@@ -8,6 +8,8 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 src/
 ├── main.rs              # CLI エントリポイント
 ├── lib.rs               # モジュール公開インターフェース
+├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
+├── builtin_skills.rs    # ビルトインスキルのコンパイル時埋め込み
 │
 ├── runtime/             # AppState 構築・チャネル起動・ライフサイクル管理
 ├── agent_loop/          # LLM 対話ターン実行・プロンプト構築・セッション管理
@@ -17,11 +19,15 @@ src/
 ├── storage/             # SQLite 永続化 (DB・マイグレーション・クエリ)
 ├── tools/               # ツールシステム (built-in + MCP)
 ├── setup/               # 初回セットアップウィザード
+├── sleep/               # sleep batch 実行・スケジューラ
+├── pulse/               # Pulse モジュール
 │
-├── slash_commands.rs    # スラッシュコマンド・LLM プロファイル管理
+├── memory.rs            # 長期記憶ファイルの読み込み
 ├── skills.rs            # スキル発見・読み込み・カタログ生成
-├── soul_agents.rs       # SOUL.md / AGENTS.md 読み込み
-└── error.rs             # エラー型
+├── slash_commands.rs    # スラッシュコマンド・LLM プロファイル管理
+├── error.rs             # エラー型
+├── test_env.rs          # テスト用環境ガード
+└── test_util.rs         # テストユーティリティ
 ```
 
 ## 開発コマンド
