@@ -431,8 +431,7 @@ fn preview_raw_response(raw: &str) -> String {
 pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
     let mut prompt = String::new();
 
-    prompt
-        .push_str(&include_str!("sleep_batch_prompt.md").replace("{AGENT_NAME}", &input.agent_id));
+    prompt.push_str(&include_str!("prompt.md").replace("{AGENT_NAME}", &input.agent_id));
     prompt.push_str("\n\n## セキュリティ\n\n");
     prompt.push_str("- 秘密情報、トークン、パスワード、APIキーは記憶に保存しない。\n");
     prompt.push_str("- 入力に秘密らしき値が含まれていても、出力からは必ず除外する。\n");

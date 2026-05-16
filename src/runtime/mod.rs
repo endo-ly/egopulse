@@ -652,7 +652,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         let scheduler_state = state.clone();
         info!("Starting sleep batch scheduler");
         let handle = tokio::spawn(async move {
-            crate::sleep_scheduler::run_scheduler_loop(scheduler_state).await
+            crate::sleep::scheduler::run_scheduler_loop(scheduler_state).await
         });
         handles.push(("sleep-scheduler".to_string(), handle));
     }
@@ -771,7 +771,7 @@ async fn write_startup_status(state: &AppState) {
     let sleep_scheduler = if state.config.sleep_batch.scheduler_enabled() {
         Some(status_mod::SleepSchedulerStatus {
             enabled: true,
-            next_run: crate::sleep_scheduler::next_scheduled_run(
+            next_run: crate::sleep::scheduler::next_scheduled_run(
                 &state.config.sleep_batch,
                 Utc::now(),
             )

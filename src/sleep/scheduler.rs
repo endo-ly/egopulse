@@ -8,8 +8,9 @@ use tracing::{info, warn};
 
 use crate::config::{AgentConfig, AgentId, SleepBatchConfig};
 use crate::runtime::AppState;
-use crate::sleep_batch::{self, SleepBatchError};
 use crate::storage::SleepRunTrigger;
+
+use super::{SleepBatchError, run_sleep_batch};
 
 /// Returns the next scheduled run as a UTC instant, or `None` if the scheduler
 /// is disabled or the configuration is incomplete.
@@ -96,13 +97,7 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
             tokio::time::sleep(std::time::Duration::from_secs((interval as u64) * 60)).await;
         }
 
-        match sleep_batch::run_sleep_batch(
-            state,
-            Some(agent_id.as_str()),
-            SleepRunTrigger::Scheduled,
-        )
-        .await
-        {
+        match run_sleep_batch(state, Some(agent_id.as_str()), SleepRunTrigger::Scheduled).await {
             Ok(()) => return Ok(()),
             Err(SleepBatchError::AlreadyRunning { .. }) => {
                 return Err(

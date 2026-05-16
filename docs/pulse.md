@@ -650,7 +650,7 @@ Sleep は記憶変換バッチであり、Pulse は注意活性化である。
 
 ```text
 src/
-├── sleep_scheduler.rs      # 既存のまま
+├── sleep/scheduler.rs      # Sleep scheduler
 ├── pulse_scheduler.rs      # 新規
 └── scheduler_utils.rs      # 小さな共通関数のみ
 ```

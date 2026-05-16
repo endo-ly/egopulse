@@ -139,8 +139,10 @@ src/
 ├── memory.rs            # 長期記憶ファイルの読み込み（episodic/semantic/prospective）
 ├── skills.rs            # スキル管理 (発見・読み込み・カタログ生成)
 ├── slash_commands.rs    # slash command dispatcher、LLM プロファイル管理
-├── sleep_batch.rs       # 手動 sleep batch の排他実行と監査記録
-├── sleep_scheduler.rs   # 自動 scheduler による定期 sleep batch 実行
+├── sleep/               # sleep batch 実行・scheduler
+│   ├── batch.rs         # 手動 sleep batch の排他実行と監査記録
+│   ├── scheduler.rs     # 自動 scheduler による定期 sleep batch 実行
+│   └── prompt.md        # sleep batch 用プロンプト本文
 ├── soul_agents.rs       # SOUL.md / AGENTS.md 読み込み
 ├── error.rs             # エラー型
 ├── test_env.rs          # テスト用 EnvVarGuard、ENV_MUTEX
@@ -295,10 +297,9 @@ pub(crate) struct SurfaceContext {
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
-| **Sleep Batch** | `sleep_batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
-| **Sleep Scheduler** | `sleep_scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
+| **Sleep Batch** | `sleep/batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
+| **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
-
