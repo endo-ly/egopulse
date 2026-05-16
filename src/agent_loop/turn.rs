@@ -19,10 +19,9 @@ use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::{MessageKind, StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use futures_util::future::join_all;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -30,6 +29,36 @@ const MAX_TOOL_ITERATIONS: usize = 50;
 
 /// Maximum number of Channel Log messages to inject as Channel Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
+
+/// Type-erased callback for agent lifecycle events (iteration, tool start, final response).
+///
+/// Wraps `Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>` so callers and
+/// internal helpers avoid a generic `F` parameter that proliferates through
+/// every function signature.
+#[derive(Clone)]
+pub(crate) struct EventEmitter(Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>);
+
+impl EventEmitter {
+    /// Creates a no-op emitter that discards all events.
+    fn none() -> Self {
+        Self(None)
+    }
+
+    /// Creates an emitter from a concrete callback.
+    fn new<F>(f: F) -> Self
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Emits a single event if a callback is registered.
+    fn emit(&self, event: AgentEvent) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
+}
 
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
@@ -99,7 +128,7 @@ pub(crate) async fn process_turn(
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn_inner(state, context, user_input, Option::<fn(AgentEvent)>::None).await
+    process_turn_inner(state, context, user_input, EventEmitter::none()).await
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
@@ -110,20 +139,17 @@ pub(crate) async fn process_turn_with_events<F>(
     on_event: F,
 ) -> Result<String, EgoPulseError>
 where
-    F: Fn(AgentEvent) + Send + Sync,
+    F: Fn(AgentEvent) + Send + Sync + 'static,
 {
-    process_turn_inner(state, context, user_input, Some(on_event)).await
+    process_turn_inner(state, context, user_input, EventEmitter::new(on_event)).await
 }
 
-async fn process_turn_inner<F>(
+async fn process_turn_inner(
     state: &AppState,
     context: &SurfaceContext,
     user_input: &str,
-    on_event: Option<F>,
-) -> Result<String, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+    on_event: EventEmitter,
+) -> Result<String, EgoPulseError> {
     state.active_turns.begin_turn(&context.agent_id);
     let _guard = ActiveTurnGuard {
         state,
@@ -192,7 +218,7 @@ where
     let mut retry_messages: Option<Vec<Message>> = None;
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        emit_event(&on_event, AgentEvent::Iteration { iteration });
+        on_event.emit(AgentEvent::Iteration { iteration });
         let mut request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
         // Inject Channel Context temporarily before LLM call
@@ -234,51 +260,59 @@ where
         }
 
         if response.tool_calls.is_empty() {
-            if let Some(final_content) = run_turn_action(
-                evaluate_end_turn(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut empty_reply_retry_attempted,
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )?,
-                state,
-                chat_id,
-                &mut messages,
-                session_updated_at.clone(),
-                &on_event,
-                &mut retry_messages,
-            )
-            .await?
-            {
-                return Ok(final_content);
+            match evaluate_end_turn(
+                &response.content,
+                response.reasoning_content.as_deref(),
+                &mut empty_reply_retry_attempted,
+                &mut declarative_retry_attempted,
+                &messages,
+            )? {
+                TurnAction::Retry(msgs) => retry_messages = msgs,
+                TurnAction::Done {
+                    final_content,
+                    reasoning_content,
+                } => {
+                    return persist_and_finalize(
+                        state,
+                        chat_id,
+                        &mut messages,
+                        session_updated_at.clone(),
+                        &on_event,
+                        final_content,
+                        reasoning_content,
+                    )
+                    .await;
+                }
             }
-
             continue;
         }
 
         let valid_tool_calls = filter_valid_tool_calls(response.tool_calls);
 
         if valid_tool_calls.is_empty() {
-            if let Some(final_content) = run_turn_action(
-                evaluate_malformed_response(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )?,
-                state,
-                chat_id,
-                &mut messages,
-                session_updated_at.clone(),
-                &on_event,
-                &mut retry_messages,
-            )
-            .await?
-            {
-                return Ok(final_content);
+            match evaluate_malformed_response(
+                &response.content,
+                response.reasoning_content.as_deref(),
+                &mut declarative_retry_attempted,
+                &messages,
+            )? {
+                TurnAction::Retry(msgs) => retry_messages = msgs,
+                TurnAction::Done {
+                    final_content,
+                    reasoning_content,
+                } => {
+                    return persist_and_finalize(
+                        state,
+                        chat_id,
+                        &mut messages,
+                        session_updated_at.clone(),
+                        &on_event,
+                        final_content,
+                        reasoning_content,
+                    )
+                    .await;
+                }
             }
-
             continue;
         }
 
@@ -317,17 +351,6 @@ where
     Err(EgoPulseError::Internal(format!(
         "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
     )))
-}
-
-fn emit_event<F>(on_event: &Option<F>, event: AgentEvent)
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    // TUI/Web などイベント購読者がいる場合だけ副作用を流し、
-    // 通常 CLI ではロジック本体を分岐させない。
-    if let Some(on_event) = on_event {
-        on_event(event);
-    }
 }
 
 fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
@@ -436,121 +459,42 @@ fn evaluate_malformed_response(
     })
 }
 
-async fn run_turn_action<F>(
-    action: TurnAction,
+async fn persist_and_finalize(
     state: &AppState,
     chat_id: i64,
     messages: &mut Vec<Message>,
     session_updated_at: Option<String>,
-    on_event: &Option<F>,
-    retry_messages: &mut Option<Vec<Message>>,
-) -> Result<Option<String>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    match handle_turn_action(
-        action,
-        state,
-        chat_id,
-        messages,
-        session_updated_at,
-        on_event,
-    )
-    .await?
-    {
-        ControlFlow::Continue(next_retry_messages) => {
-            *retry_messages = next_retry_messages;
-            Ok(None)
-        }
-        ControlFlow::Break(final_content) => Ok(Some(final_content)),
-    }
-}
-
-async fn handle_turn_action<F>(
-    action: TurnAction,
-    state: &AppState,
-    chat_id: i64,
-    messages: &mut Vec<Message>,
-    session_updated_at: Option<String>,
-    on_event: &Option<F>,
-) -> Result<ControlFlow<String, Option<Vec<Message>>>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    match action {
-        TurnAction::Retry(messages) => Ok(ControlFlow::Continue(messages)),
-        TurnAction::Done {
-            final_content,
-            reasoning_content,
-        } => persist_and_finalize(
-            state,
-            chat_id,
-            messages,
-            session_updated_at,
-            on_event,
-            final_content,
-            reasoning_content,
-        )
-        .await
-        .map(ControlFlow::Break),
-    }
-}
-
-async fn persist_and_finalize<F>(
-    state: &AppState,
-    chat_id: i64,
-    messages: &mut Vec<Message>,
-    session_updated_at: Option<String>,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     final_content: String,
     reasoning_content: Option<String>,
-) -> Result<String, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<String, EgoPulseError> {
     let mut assistant_message = Message::text("assistant", final_content.clone());
     assistant_message.reasoning_content = reasoning_content;
     messages.push(assistant_message.clone());
 
     let _persisted = persist_phase(
         state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: final_content.clone(),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
-        },
+        StoredMessage::bot(chat_id, final_content.clone()),
         assistant_message,
         messages,
         session_updated_at,
     )
     .await?;
 
-    emit_event(
-        on_event,
-        AgentEvent::FinalResponse {
-            text: final_content.clone(),
-        },
-    );
+    on_event.emit(AgentEvent::FinalResponse {
+        text: final_content.clone(),
+    });
     Ok(final_content)
 }
 
-async fn execute_and_persist_tools<F>(
+async fn execute_and_persist_tools(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     messages: Vec<Message>,
     session_updated_at: Option<String>,
     assistant_draft: ToolAssistantDraft,
-) -> Result<(Vec<Message>, Option<String>), EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
     let mut messages = messages;
     let persisted = persist_tool_call_assistant_message(
@@ -612,14 +556,7 @@ async fn persist_tool_call_assistant_message(
         state,
         StoredMessage {
             id: assistant_message_id.to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: assistant_preview,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
+            ..StoredMessage::bot(chat_id, assistant_preview)
         },
         assistant_message,
         &messages,
@@ -647,17 +584,7 @@ async fn persist_tool_result_messages(
     let preview = summarize_tool_result_messages(&tool_messages);
     persist_phase_messages(
         state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: preview,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
-        },
+        StoredMessage::bot(chat_id, preview),
         tool_messages,
         &messages_with_tools,
         session_updated_at,
@@ -674,16 +601,13 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
     preview_text(&joined, 160)
 }
 
-async fn execute_tool_calls<F>(
+async fn execute_tool_calls(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let all_read_only = valid_tool_calls
         .iter()
         .all(|tc| state.tools.is_read_only(&tc.name));
@@ -709,16 +633,13 @@ where
     .await
 }
 
-async fn execute_tool_calls_parallel<F>(
+async fn execute_tool_calls_parallel(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let tool_futures: Vec<_> = valid_tool_calls
         .into_iter()
         .map(|tool_call| {
@@ -735,16 +656,13 @@ where
     results.into_iter().collect()
 }
 
-async fn execute_tool_calls_sequential<F>(
+async fn execute_tool_calls_sequential(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let mut messages = Vec::with_capacity(valid_tool_calls.len());
     for tool_call in valid_tool_calls {
         messages.push(
@@ -761,23 +679,17 @@ where
     Ok(messages)
 }
 
-async fn execute_tool_call<F>(
+async fn execute_tool_call(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     tool_call: ToolCall,
-) -> Result<Message, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    emit_event(
-        on_event,
-        AgentEvent::ToolStart {
-            name: tool_call.name.clone(),
-            input: tool_call.arguments.clone(),
-        },
-    );
+) -> Result<Message, EgoPulseError> {
+    on_event.emit(AgentEvent::ToolStart {
+        name: tool_call.name.clone(),
+        input: tool_call.arguments.clone(),
+    });
 
     store_pending_tool_call(
         state,
@@ -802,15 +714,12 @@ where
     )
     .await?;
 
-    emit_event(
-        on_event,
-        AgentEvent::ToolResult {
-            name: tool_call.name.clone(),
-            is_error: result.is_error,
-            preview: preview_text(&tool_payload, 160),
-            duration_ms,
-        },
-    );
+    on_event.emit(AgentEvent::ToolResult {
+        name: tool_call.name.clone(),
+        is_error: result.is_error,
+        preview: preview_text(&tool_payload, 160),
+        duration_ms,
+    });
 
     Ok(Message {
         role: "tool".to_string(),
@@ -868,17 +777,11 @@ async fn persist_user_turn_with_compaction(
     prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, chat_id).await?;
-    let stored_message = StoredMessage {
-        id: uuid::Uuid::new_v4().to_string(),
+    let stored_message = StoredMessage::user(
         chat_id,
-        sender_name: context.surface_user.clone(),
-        content: user_input.to_string(),
-        is_from_bot: false,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        message_kind: MessageKind::Message,
-        sender_agent_id: None,
-        recipient_agent_id: None,
-    };
+        context.surface_user.clone(),
+        user_input.to_string(),
+    );
 
     for attempt in 0..2 {
         let mut candidate_messages = loaded.messages.clone();
@@ -1173,8 +1076,8 @@ pub(crate) fn build_state_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{
-        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext, build_state,
-        build_state_with_provider, cli_context, test_config,
+        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
+        build_state_with_provider, cli_context,
     };
     use serial_test::serial;
     use std::sync::Arc;
@@ -2137,16 +2040,19 @@ mod tests {
                 ctx.channel = "discord".to_string();
                 ctx
             }),
-            ("discord-no-mention", SurfaceContext {
-                channel: "discord".to_string(),
-                surface_user: "alice".to_string(),
-                surface_thread: "no-ctx-room".to_string(),
-                chat_type: "discord".to_string(),
-                agent_id: "default".to_string(),
-                channel_log_chat_id: None,
-                chain_depth: 0,
-                origin_id: String::new(),
-            }),
+            (
+                "discord-no-mention",
+                SurfaceContext {
+                    channel: "discord".to_string(),
+                    surface_user: "alice".to_string(),
+                    surface_thread: "no-ctx-room".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                    chain_depth: 0,
+                    origin_id: String::new(),
+                },
+            ),
         ];
 
         for (label, context) in cases {
@@ -2165,15 +2071,12 @@ mod tests {
                 Box::new(provider.clone()),
             );
 
-            let reply = process_turn(&state, &context, "hello")
-                .await
-                .expect("turn");
+            let reply = process_turn(&state, &context, "hello").await.expect("turn");
             assert_eq!(reply, "ok");
 
             let seen = provider.seen_messages();
             assert_eq!(seen.len(), 1, "[{label}] should have exactly one LLM call");
-            let user_msgs: Vec<_> =
-                seen[0].iter().filter(|m| m.role == "user").collect();
+            let user_msgs: Vec<_> = seen[0].iter().filter(|m| m.role == "user").collect();
             assert_eq!(
                 user_msgs.len(),
                 1,
@@ -2378,5 +2281,4 @@ mod tests {
             "session should not contain channel context"
         );
     }
-
 }

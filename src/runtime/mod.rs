@@ -19,6 +19,7 @@ use chrono::Utc;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
+use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
@@ -32,7 +33,6 @@ use crate::runtime::status::{
     ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
 };
 use crate::skills::SkillManager;
-use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
@@ -782,8 +782,8 @@ async fn write_startup_status(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ResolvedLlmConfig;
     use crate::agent_loop::soul_agents::SoulAgentsLoader;
+    use crate::config::ResolvedLlmConfig;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
@@ -932,5 +932,4 @@ mod tests {
         let cache = state.llm_cache.lock().expect("lock");
         assert!(cache.is_empty());
     }
-
 }

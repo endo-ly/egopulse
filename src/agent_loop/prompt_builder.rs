@@ -596,13 +596,7 @@ mod tests {
         let llm: std::sync::Arc<dyn crate::llm::LlmProvider> = std::sync::Arc::new(FakeProvider {
             responses: std::sync::Mutex::new(vec![]),
         });
-        let state = crate::test_util::build_state_with_config(
-            config,
-            Some(llm),
-            None,
-            None,
-            None,
-        );
+        let state = crate::test_util::build_state_with_config(config, Some(llm), None, None, None);
         let prompt = build_system_prompt(&state, &web_context("s1"));
 
         assert!(
