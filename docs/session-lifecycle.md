@@ -238,7 +238,10 @@ compaction 発火時は、compact 前の全文会話を markdown として archi
 
 ### 秘匿情報に関する注意
 
-archive はローカル監査用の sensitive artifact であり、secret redaction の保証対象外である。summary やログの redaction とは責務を分け、archive は元の会話全文を verbatim で保存する。
+archive はローカル監査用の sensitive artifact であるが、**secret redaction を適用する**。
+要約入力・出力と同様に、起動時に Config から収集したシークレット値（API キー、auth トークン等）と well-known パターン（`sk-`, `ghp_` 等）の二層リダクションを archive 全文に適用し、`[REDACTED:key]` / `[REDACTED:secret]` に置換する。
+
+さらに、archive ファイルのパーミッションは `0600`（owner 読み書きのみ）に設定される。
 
 ### 形式
 

@@ -695,8 +695,9 @@ async fn execute_batch(
 
         // 9. Archive sessions and clear session messages
         let groups_dir = state.config.groups_dir();
+        let secrets = crate::tools::collect_config_secrets(&state.config);
         for session in sessions {
-            if let Err(e) = archive_and_clear_session(&db, &groups_dir, session) {
+            if let Err(e) = archive_and_clear_session(&db, &groups_dir, session, &secrets) {
                 warn!(
                     agent_id = %agent_id,
                     chat_id = session.chat_id,
@@ -1014,6 +1015,7 @@ fn archive_and_clear_session(
     db: &Database,
     groups_dir: &Path,
     session: &AgentSessionInfo,
+    secrets: &[(String, String)],
 ) -> Result<(), SleepBatchError> {
     let snapshot = db
         .load_session_snapshot(session.chat_id, 100)
@@ -1023,7 +1025,13 @@ fn archive_and_clear_session(
     if let Some(json) = &snapshot.messages_json {
         let messages = parse_messages_json(json);
         if !messages.is_empty() {
-            archive_conversation_blocking(groups_dir, &session.channel, session.chat_id, &messages);
+            archive_conversation_blocking(
+                groups_dir,
+                &session.channel,
+                session.chat_id,
+                &messages,
+                secrets,
+            );
         } else {
             info!(
                 chat_id = session.chat_id,

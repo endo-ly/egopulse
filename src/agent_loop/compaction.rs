@@ -244,11 +244,13 @@ async fn archive_current_conversation(
     chat_id: i64,
     messages: &[Message],
 ) {
+    let secrets = crate::tools::collect_config_secrets(&state.config);
     archive_conversation(
         &state.config.groups_dir(),
         &context.channel,
         chat_id,
         messages,
+        &secrets,
     )
     .await;
 }
@@ -577,14 +579,16 @@ pub(crate) async fn archive_conversation(
     channel: &str,
     chat_id: i64,
     messages: &[Message],
+    secrets: &[(String, String)],
 ) {
     let groups_dir = groups_dir.to_path_buf();
     let channel = channel.to_string();
     let messages: std::sync::Arc<[Message]> =
         std::sync::Arc::from(messages.to_vec().into_boxed_slice());
+    let secrets: Vec<(String, String)> = secrets.to_vec();
     let join_channel = channel.clone();
     let join_result = tokio::task::spawn_blocking(move || {
-        archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages);
+        archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages, &secrets);
     })
     .await;
 
@@ -601,6 +605,7 @@ pub(crate) fn archive_conversation_blocking(
     channel: &str,
     chat_id: i64,
     messages: &[Message],
+    secrets: &[(String, String)],
 ) {
     let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let unique_suffix = uuid::Uuid::new_v4().simple();
@@ -624,7 +629,8 @@ pub(crate) fn archive_conversation_blocking(
     for message in messages {
         let role = &message.role;
         let text = message_to_archive_text(message);
-        content.push_str(&format!("## {role}\n\n{text}\n\n---\n\n"));
+        let redacted = crate::tools::sanitize_output_string(&text, secrets);
+        content.push_str(&format!("## {role}\n\n{redacted}\n\n---\n\n"));
     }
 
     if let Err(error) = std::fs::write(&path, content) {
@@ -633,6 +639,19 @@ pub(crate) fn archive_conversation_blocking(
             path.display()
         );
     } else {
+        // Set file permissions to owner-only (0600) for security.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!(
+                    "failed to set archive file permissions {}: {error}",
+                    path.display()
+                );
+            }
+        }
         info!(
             "archived conversation ({} messages) to {}",
             messages.len(),
