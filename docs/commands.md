@@ -152,9 +152,9 @@ provider.default_model（プロバイダーのデフォルトモデル）
 
 #### `/new`
 
-1. 現在のセッションの session snapshot を削除
-2. メッセージ履歴をクリア
-3. 確認メッセージを返信: `"Session cleared. Starting fresh."`
+1. 現在のセッションの `messages_json` を `[]` にリセット（楽観排他）
+2. メッセージ履歴は保持（`messages` / `tool_calls` レコードは削除しない）
+3. 確認メッセージを返信: `"Session cleared."`
 4. 次のメッセージから新しいセッションとして扱われる（同じ `SurfaceContext` で snapshot が空の状態から再構築）
 
 #### `/compact`

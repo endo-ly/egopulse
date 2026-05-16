@@ -189,7 +189,23 @@ pub(crate) fn unknown_command_response() -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_new(state: &AppState, chat_id: i64) -> Option<String> {
-    match call_blocking(Arc::clone(&state.db), move |db| db.clear_session(chat_id)).await {
+    match call_blocking(Arc::clone(&state.db), move |db| {
+        let snapshot = db.load_session_snapshot(chat_id, 1)?;
+        let updated_at = match snapshot.updated_at {
+            Some(ts) => ts,
+            None => return Ok(true), // no session row — nothing to clear
+        };
+        let cleared = db.clear_session_messages(chat_id, &updated_at)?;
+        if !cleared {
+            tracing::debug!(
+                chat_id,
+                "session already cleared or concurrently modified, treating as success"
+            );
+        }
+        Ok(true)
+    })
+    .await
+    {
         Ok(_) => Some("Session cleared.".to_string()),
         Err(e) => {
             tracing::warn!("failed to clear session: {e}");
@@ -908,12 +924,27 @@ mod tests {
 
         // Assert
         assert_eq!(result, Some("Session cleared.".to_string()));
+
+        // messages records are preserved — only the session snapshot is cleared
         let messages = call_blocking(Arc::clone(&state.db), move |db| {
             db.get_recent_messages(chat_id, 10)
         })
         .await
         .expect("messages");
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1, "message records should be preserved");
+        assert_eq!(messages[0].content, "hello");
+
+        // session snapshot should be empty
+        let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
+            db.load_session_snapshot(chat_id, 10)
+        })
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            snapshot.messages_json.as_deref(),
+            Some(r#"[]"#),
+            "session snapshot should be cleared to empty array"
+        );
     }
 
     #[tokio::test]

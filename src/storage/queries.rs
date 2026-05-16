@@ -351,15 +351,6 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn clear_session(&self, chat_id: i64) -> Result<(), StorageError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
-        tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Clears session message history by setting `messages_json` to an empty
     /// JSON array.  The session row itself and `messages` / `tool_calls`
     /// records are preserved.
@@ -1454,38 +1445,6 @@ mod tests {
                 .messages_json
                 .is_none()
         );
-    }
-
-    #[test]
-    fn clear_session_deletes_snapshots_and_messages() {
-        let (db, _dir) = test_db();
-        let chat_id = 100;
-
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
-        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
-        store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
-
-        db.clear_session(chat_id).expect("clear session");
-
-        assert!(
-            db.load_session_snapshot(chat_id, 10)
-                .expect("load session")
-                .messages_json
-                .is_none()
-        );
-        assert!(
-            db.get_recent_messages(chat_id, 10)
-                .expect("load recent messages")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn clear_session_idempotent_on_empty_chat() {
-        let (db, _dir) = test_db();
-
-        db.clear_session(999).expect("clear missing session");
     }
 
     #[test]

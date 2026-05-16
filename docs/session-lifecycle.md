@@ -115,8 +115,9 @@ execute_scheduled_turn():
 
 ### `messages`
 
-- 役割: 表示用・一覧用の message レコード
+- 役割: 表示用・一覧用の message レコード（**append-only**）
 - 主な列: `id`, `chat_id`, `sender_name`, `content`, `is_from_bot`, `timestamp`
+- `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
 
 ### `sessions`
 
