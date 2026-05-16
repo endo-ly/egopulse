@@ -126,8 +126,7 @@ Phase 1 の Home Surface 解決順序は以下とする。
 
 ```text
 1. agent が最後に会話した chat
-2. pulse.default_delivery
-3. 見つからなければ skipped
+2. 見つからなければ skipped
 ```
 
 将来的には、以下を追加できる。
@@ -302,20 +301,15 @@ Pulse の内部契約はバイナリ側に埋め込む。
 ```yaml
 pulse:
   enabled: true
-  tick_interval_secs: 60
+  tick_interval: "1m"
   timezone: Asia/Tokyo
-
-  default_delivery:
-    channel: discord
-    external_chat_id: "1234567890123456789"
 ```
 
 | 設定                         | 役割                               |
 | -------------------------- | -------------------------------- |
 | `pulse.enabled`            | Pulse 全体の有効化                     |
-| `pulse.tick_interval_secs` | due scan の周期                     |
+| `pulse.tick_interval`      | due scan の周期（Duration 形式: `30s`, `1m`, `1h`） |
 | `pulse.timezone`           | daily / weekly 判定の timezone      |
-| `pulse.default_delivery`   | Home Surface が見つからない場合の fallback |
 
 Temporal Intention の中身は config に置かない。
 それは agent の注意方針なので、`agents/{agent_id}/PULSE.md` に置く。
@@ -373,7 +367,7 @@ schedule:
 ```text
 ┌──────────────────────────────┐
 │        PulseScheduler         │
-│  tick_interval_secs ごとに起動 │
+│  tick_interval ごとに起動     │
 └──────────────┬───────────────┘
                │
                ▼
@@ -491,8 +485,7 @@ resolve_home_surface(agent_id):
 
 1. chats から agent_id に一致する最新 chat を探す
 2. channel adapter が存在し、送信可能なら採用
-3. 見つからなければ pulse.default_delivery を使う
-4. それも無ければ skipped
+3. それも無ければ skipped
 ```
 
 ## 8.3 注意点
@@ -682,7 +675,7 @@ src/
 
 | 項目                             | 内容                                                    |
 | ------------------------------ | ----------------------------------------------------- |
-| `pulse` config                 | enabled / tick_interval / timezone / default_delivery |
+| `pulse` config                 | enabled / tick_interval / timezone |
 | `PULSE.md` front matter parser | Temporal Intention を読む                                |
 | due 判定                         | daily / weekly / once                                 |
 | duplicate 判定                   | `pulse_runs` の `due_key`                              |
@@ -713,7 +706,7 @@ src/
 実装判断による元仕様との差分。実装者が迷わないよう明示する。
 
 ### `default_delivery` 未実装
-- Spec §3.2 の `pulse.default_delivery` は Phase 1 では未実装
+- Phase 1 では `default_delivery` は実装しない
 - Home Surface が見つからない場合は `skipped` になる
 - 将来フェーズで実装予定
 

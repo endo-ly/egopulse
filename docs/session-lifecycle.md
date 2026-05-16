@@ -226,8 +226,10 @@ compaction 発火時は、compact 前の全文会話を markdown として archi
 ### 出力先
 
 ```text
-<data_dir>/groups/<channel>/<chat_id>/conversations/<timestamp>-<unique_suffix>.md
+<state_root>/runtime/groups/<channel>/<chat_id>/conversations/<timestamp>-<unique_suffix>.md
 ```
+
+（`state_root` は通常 `~/.egopulse`。`runtime/groups/` 配下に配置される）
 
 ### 目的
 
