@@ -388,21 +388,30 @@ Environment variables:
 - 入力:
   - `url: string` 必須
   - `timeout_secs: integer` 任意。既定値は設定ファイル参照
-  - `max_bytes: integer` 任意。既定値は設定ファイル参照（デフォルト 64KB）
+  - `max_output_bytes: integer` 任意。本文の最大バイト数（warning は上限外、デフォルト 64KB）
 - 挙動:
   - URL scheme 検証（デフォルト HTTPS のみ許可）
   - Host denylist/allowlist チェック
   - SSRF 対策: プライベート IP / ループバックアドレスへのアクセスをブロック（`allow_private_ips: true` で解除可）
   - DNS 解決後の SSRF 再検証
   - HTTP リダイレクトは手動追跡（各ホップで SSRF 再検証、最大リダイレクト数制限あり）
-  - HTML は `htmd` クレートで Markdown に変換、`text/plain` はそのまま返す
+  - HTML は Mozilla Readability.js ベースの本文抽出（`readability-js` クレート）を行い、抽出した clean HTML を Markdown に変換。Readability 失敗時は `htmd` にフォールバック
+  - `text/plain` はそのまま返す
   - コンテンツバリデーション: プロンプトインジェクション検出パターンでスキャン
-  - `max_bytes` でレスポンスサイズの上限（超過時は即座にエラー）
+  - `max_fetch_bytes` でフェッチサイズの上限。超過時はエラーにせず取得済み部分を返す（partial content）。`max_output_bytes` で最終出力サイズを制限
   - 末尾に untrusted content warning を付与
+  - 本文抽出方式に応じて `extraction` details フィールドに `readability-js`, `fallback-html-to-markdown`, `verbatim` を返す
   - 読み取り専用ツール (`is_read_only: true`)
 - `details`:
   - `final_url` (リダイレクト後の最終URL)
   - `content_type`
+  - `content_length` (Content-Length ヘッダの値、無い場合は `null`)
+  - `fetched_bytes` (実際に取得したバイト数)
+  - `response_truncated` (fetch上限で打ち切ったか)
+  - `output_truncated` (出力上限で切ったか)
+  - `max_fetch_bytes`
+  - `max_output_bytes`
+  - `extraction` (本文抽出方式)
 - 主な失敗:
   - `url must not be empty`
   - `scheme '...' is not allowed`
@@ -415,7 +424,6 @@ Environment variables:
   - `redirect without Location header`
   - `content blocked: ...`
   - `response body is not valid UTF-8`
-  - `response too large: exceeds max_bytes N`
 
 実装: [egopulse/src/tools/web_fetch/mod.rs](../../egopulse/src/tools/web_fetch/mod.rs)
 

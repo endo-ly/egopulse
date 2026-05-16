@@ -1,11 +1,115 @@
 //! HTML processing utilities for the web-fetch tool.
 //!
-//! Provides HTML-to-Markdown conversion using [`htmd`], with smart primary-content
-//! extraction from `<main>`, `<article>`, or `<body>` elements.
+//! Provides content extraction via [`readability_js`] (Mozilla's Readability.js)
+//! with fallback to basic HTML-to-Markdown conversion using [`htmd`].
+
+use std::fmt;
 
 use htmd::HtmlToMarkdownBuilder;
 
 const SKIPPED_TAGS: &[&str] = &["script", "style", "nav", "footer", "header"];
+
+/// Result of processing an HTTP response body.
+pub(crate) struct ProcessedBody {
+    pub text: String,
+    pub extraction: ExtractionMethod,
+}
+
+/// Method used to extract content from an HTTP response.
+pub(crate) enum ExtractionMethod {
+    /// Mozilla Readability.js extracted the main article content.
+    ReadabilityJs,
+    /// Readability failed or returned empty; fell back to basic HTML→Markdown.
+    FallbackHtmlToMarkdown,
+    /// Non-HTML content returned verbatim (text/plain, JSON, etc.).
+    Verbatim,
+}
+
+impl fmt::Display for ExtractionMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadabilityJs => write!(f, "readability-js"),
+            Self::FallbackHtmlToMarkdown => write!(f, "fallback-html-to-markdown"),
+            Self::Verbatim => write!(f, "verbatim"),
+        }
+    }
+}
+
+/// Processes an HTTP response body with metadata about the extraction method.
+///
+/// For HTML content, attempts Readability.js extraction first, then falls back
+/// to basic HTML-to-Markdown. For non-HTML content, returns verbatim.
+pub(crate) fn process_response_body_with_metadata(
+    body: &str,
+    content_type: Option<&str>,
+    url: &str,
+) -> ProcessedBody {
+    if is_html_content(content_type) {
+        let (text, method) = extract_article(body, url);
+        ProcessedBody {
+            text,
+            extraction: method,
+        }
+    } else {
+        ProcessedBody {
+            text: body.to_owned(),
+            extraction: ExtractionMethod::Verbatim,
+        }
+    }
+}
+
+/// Processes an HTTP response body according to its content type (legacy API).
+pub(crate) fn process_response_body(body: &str, content_type: Option<&str>) -> String {
+    process_response_body_with_metadata(body, content_type, "").text
+}
+
+fn is_html_content(content_type: Option<&str>) -> bool {
+    match content_type {
+        Some(ct) => ct.to_ascii_lowercase().contains("text/html"),
+        None => true,
+    }
+}
+
+fn extract_article(html: &str, url: &str) -> (String, ExtractionMethod) {
+    match try_readability(html, url) {
+        Some(result) => result,
+        None => (
+            html_to_markdown(html),
+            ExtractionMethod::FallbackHtmlToMarkdown,
+        ),
+    }
+}
+
+fn try_readability(html: &str, url: &str) -> Option<(String, ExtractionMethod)> {
+    let result = std::panic::catch_unwind(|| {
+        let reader = readability_js::Readability::new().ok()?;
+        let article = if url.is_empty() {
+            reader.parse(html).ok()?
+        } else {
+            reader.parse_with_url(html, url).ok()?
+        };
+
+        if article.content.is_empty() {
+            return None;
+        }
+
+        let md = html_to_markdown(&article.content);
+
+        let text = if !article.title.is_empty() && !md.starts_with('#') {
+            format!("# {}\n\n{}", article.title, md)
+        } else {
+            md
+        };
+
+        Some(text)
+    });
+
+    match result {
+        Ok(Some(text)) => Some((text, ExtractionMethod::ReadabilityJs)),
+        Ok(None) => None,
+        Err(_) => None,
+    }
+}
 
 /// Extracts the most relevant content region from an HTML document.
 ///
@@ -14,18 +118,13 @@ const SKIPPED_TAGS: &[&str] = &["script", "style", "nav", "footer", "header"];
 /// 2. `<article>` element
 /// 3. `<body>` element
 /// 4. Full HTML (fallback)
-///
-/// The search is case-insensitive. Only the first matching element is used.
-pub(crate) fn extract_primary_html(html: &str) -> String {
+fn extract_primary_html(html: &str) -> String {
     extract_tag_content(html, "main")
         .or_else(|| extract_tag_content(html, "article"))
         .or_else(|| extract_tag_content(html, "body"))
         .unwrap_or_else(|| html.to_owned())
 }
 
-/// Returns the inner HTML between the first occurrence of `<{tag}…>` and `</{tag}>`.
-///
-/// Case-insensitive. Returns `None` when either the opening or closing tag is absent.
 fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
@@ -45,14 +144,7 @@ fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
     Some(html[content_start..content_end].to_owned())
 }
 
-/// Converts an HTML string to Markdown.
-///
-/// Internally calls [`extract_primary_html`] to isolate the primary content region,
-/// then uses **htmd** to perform the conversion. Tags listed in [`SKIPPED_TAGS`] are
-/// stripped before conversion.
-///
-/// If conversion fails the extracted HTML is returned as a graceful fallback.
-pub(crate) fn html_to_markdown(html: &str) -> String {
+fn html_to_markdown(html: &str) -> String {
     let primary = extract_primary_html(html);
 
     HtmlToMarkdownBuilder::new()
@@ -60,18 +152,6 @@ pub(crate) fn html_to_markdown(html: &str) -> String {
         .build()
         .convert(&primary)
         .unwrap_or(primary)
-}
-
-/// Processes an HTTP response body according to its content type.
-///
-/// - `text/html` or `None` → converted to Markdown via [`html_to_markdown`].
-/// - `text/plain` / `application/json` / anything else → returned verbatim.
-pub(crate) fn process_response_body(body: &str, content_type: Option<&str>) -> String {
-    match content_type {
-        Some(ct) if ct.contains("text/html") => html_to_markdown(body),
-        Some(_) => body.to_owned(),
-        None => html_to_markdown(body),
-    }
 }
 
 #[cfg(test)]
@@ -264,5 +344,153 @@ mod tests {
 
         assert!(result.contains("real content"), "got: {result}");
         assert!(!result.contains("before"), "got: {result}");
+    }
+
+    // --- Readability integration tests ---
+
+    fn article_html(title: &str, body: &str) -> String {
+        format!(
+            "<html><head><title>{title}</title></head>\
+             <body>\
+             <nav><a href=\"/home\">Home</a><a href=\"/about\">About</a></nav>\
+             <article><h1>{title}</h1><p>{body}</p></article>\
+             <footer><p>Copyright 2024</p></footer>\
+             </body></html>"
+        )
+    }
+
+    #[test]
+    fn readability_extracts_article_body() {
+        let html = article_html(
+            "Test Article",
+            "This is the main article body content that is long enough to pass readability checks.",
+        );
+
+        let result =
+            process_response_body_with_metadata(&html, Some("text/html"), "https://example.com");
+
+        assert!(
+            matches!(result.extraction, ExtractionMethod::ReadabilityJs),
+            "expected ReadabilityJs, got: {}",
+            result.extraction
+        );
+        assert!(
+            result.text.contains("main article body"),
+            "got: {}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn readability_excludes_nav_footer_header() {
+        let html = "\
+            <html><head><title>News</title></head><body>\
+            <nav><a>Home</a><a>About</a></nav>\
+            <header><p>Site header content</p></header>\
+            <aside><p>Sidebar content here</p></aside>\
+            <article><h1>Real Article Title</h1>\
+            <p>This is the actual article content with enough text to be considered the main readable content of the page by the algorithm.</p>\
+            <p>Second paragraph adds more substance to ensure the article passes readability checks and is properly extracted from the page.</p></article>\
+            <footer><p>Footer content</p></footer>\
+            <noscript>Enable JavaScript</noscript>\
+            </body></html>";
+
+        let result =
+            process_response_body_with_metadata(html, Some("text/html"), "https://example.com");
+
+        assert!(
+            matches!(result.extraction, ExtractionMethod::ReadabilityJs),
+            "expected ReadabilityJs, got: {}",
+            result.extraction
+        );
+        assert!(
+            !result.text.contains("Home"),
+            "nav should be excluded, got: {}",
+            result.text
+        );
+        assert!(
+            result.text.contains("actual article content"),
+            "article body should be included, got: {}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn readability_falls_back_on_minimal_content() {
+        let html = "<html><body><div>x</div></body></html>";
+
+        let result =
+            process_response_body_with_metadata(html, Some("text/html"), "https://example.com");
+
+        assert!(!result.text.is_empty(), "should produce output, got empty");
+    }
+
+    #[test]
+    fn readability_failure_falls_back_to_html_to_markdown() {
+        let html = "<html><body><p>Short</p></body></html>";
+
+        let result =
+            process_response_body_with_metadata(html, Some("text/html"), "https://example.com");
+
+        assert!(
+            !result.text.is_empty(),
+            "fallback should produce output, got empty"
+        );
+        assert!(result.text.contains("Short"), "got: {}", result.text);
+    }
+
+    #[test]
+    fn verbatim_for_non_html_content_types() {
+        let json = r#"{"key": "value"}"#;
+
+        let result = process_response_body_with_metadata(
+            json,
+            Some("application/json"),
+            "https://example.com/api",
+        );
+
+        assert!(matches!(result.extraction, ExtractionMethod::Verbatim));
+        assert_eq!(result.text, json);
+    }
+
+    #[test]
+    fn verbatim_for_text_plain() {
+        let text = "plain text content";
+
+        let result = process_response_body_with_metadata(
+            text,
+            Some("text/plain"),
+            "https://example.com/file.txt",
+        );
+
+        assert!(matches!(result.extraction, ExtractionMethod::Verbatim));
+        assert_eq!(result.text, text);
+    }
+
+    #[test]
+    fn verbatim_for_xml_content() {
+        let xml = r#"<?xml version="1.0"?><rss><channel></channel></rss>"#;
+
+        let result = process_response_body_with_metadata(
+            xml,
+            Some("application/xml"),
+            "https://example.com/feed",
+        );
+
+        assert!(matches!(result.extraction, ExtractionMethod::Verbatim));
+        assert_eq!(result.text, xml);
+    }
+
+    #[test]
+    fn extraction_method_display() {
+        assert_eq!(
+            ExtractionMethod::ReadabilityJs.to_string(),
+            "readability-js"
+        );
+        assert_eq!(
+            ExtractionMethod::FallbackHtmlToMarkdown.to_string(),
+            "fallback-html-to-markdown"
+        );
+        assert_eq!(ExtractionMethod::Verbatim.to_string(), "verbatim");
     }
 }

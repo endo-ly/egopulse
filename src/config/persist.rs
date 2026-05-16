@@ -172,8 +172,10 @@ struct SerializableWebFetchConfig {
     allowed_schemes: Vec<String>,
     #[serde(skip_serializing_if = "is_default_u64")]
     timeout_secs: u64,
+    #[serde(skip_serializing_if = "is_default_usize_512k")]
+    max_fetch_bytes: usize,
     #[serde(skip_serializing_if = "is_default_usize_64k")]
-    max_bytes: usize,
+    max_output_bytes: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     allow_private_ips: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -186,6 +188,10 @@ struct SerializableWebFetchConfig {
 
 fn is_default_u64(v: &u64) -> bool {
     *v == 0 || *v == 15
+}
+
+fn is_default_usize_512k(v: &usize) -> bool {
+    *v == 0 || *v == 512 * 1024
 }
 
 fn is_default_usize_64k(v: &usize) -> bool {
@@ -362,7 +368,8 @@ impl From<&Config> for SerializableConfig {
                 let wf_defaults = super::web_fetch::WebFetchConfig::default();
                 let is_default = wf.allowed_schemes == wf_defaults.allowed_schemes
                     && wf.timeout_secs == wf_defaults.timeout_secs
-                    && wf.max_bytes == wf_defaults.max_bytes
+                    && wf.max_fetch_bytes == wf_defaults.max_fetch_bytes
+                    && wf.max_output_bytes == wf_defaults.max_output_bytes
                     && !wf.allow_private_ips
                     && wf.denylist.is_empty()
                     && wf.allowlist.is_empty()
@@ -373,7 +380,8 @@ impl From<&Config> for SerializableConfig {
                     Some(SerializableWebFetchConfig {
                         allowed_schemes: wf.allowed_schemes.clone(),
                         timeout_secs: wf.timeout_secs,
-                        max_bytes: wf.max_bytes,
+                        max_fetch_bytes: wf.max_fetch_bytes,
+                        max_output_bytes: wf.max_output_bytes,
                         allow_private_ips: wf.allow_private_ips,
                         denylist: wf.denylist.clone(),
                         allowlist: wf.allowlist.clone(),

@@ -171,7 +171,8 @@ Pulse（注意活性化）のスケジューラ設定。
 |---|---|---|---|---|
 | `web_fetch.allowed_schemes` | `[string]` | 任意 | `["https"]` | 許可する URL scheme |
 | `web_fetch.timeout_secs` | `u64` | 任意 | `15` | リクエストタイムアウト秒 |
-| `web_fetch.max_bytes` | `usize` | 任意 | `65536` | 最大レスポンスボディサイズ（バイト） |
+| `web_fetch.max_fetch_bytes` | `usize` | 任意 | `524288` | 最大フェッチサイズ（バイト）。この上限までストリーム読み込み、超過時は取得済み部分を返す |
+| `web_fetch.max_output_bytes` | `usize` | 任意 | `65536` | 本文の最大バイト数。HTML処理後の本文をこの上限で切り詰める（warning は上限外） |
 | `web_fetch.allow_private_ips` | `bool` | 任意 | `false` | プライベート/ループバック IP へのアクセスを許可 |
 | `web_fetch.denylist` | `[string]` | 任意 | `[]` | ブロックするホストのリスト（サブドメインワイルドカード `*.prefix` 対応） |
 | `web_fetch.allowlist` | `[string]` | 任意 | `[]` | 許可するホストのリスト（空の場合全許可） |
@@ -321,7 +322,8 @@ web_fetch:
   allowed_schemes:
     - https
   timeout_secs: 15
-  max_bytes: 65536
+  max_fetch_bytes: 524288
+  max_output_bytes: 65536
   allow_private_ips: false
   denylist: []
   allowlist: []
