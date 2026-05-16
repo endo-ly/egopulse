@@ -7,8 +7,8 @@ use crate::agent_loop::formatting::{
 use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, MessagesResponse, ToolCall};
+use crate::pulse::capsule::HomeSurface;
 use crate::pulse::capsule::PulseCapsule;
-use crate::pulse::home_surface::HomeSurface;
 use crate::runtime::AppState;
 use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall};
 use crate::tools::ToolExecutionContext;
@@ -261,9 +261,9 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pulse::capsule::HomeSurface;
     use crate::pulse::capsule::build_capsule;
     use crate::pulse::definition::{TemporalIntention, TemporalSchedule};
-    use crate::pulse::home_surface::HomeSurface;
 
     fn test_intention() -> TemporalIntention {
         TemporalIntention {

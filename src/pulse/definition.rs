@@ -24,7 +24,6 @@ pub(crate) struct TemporalIntention {
 pub(crate) enum TemporalSchedule {
     Daily { at: String },
     Weekly { day: String, at: String },
-    Once { at: String },
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +65,7 @@ struct ScheduleRaw {
     day: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn parse_pulse_definition(content: &str) -> Result<PulseDefinition, PulseParseError> {
     parse_pulse_definition_inner(content, "")
 }
@@ -162,12 +162,11 @@ fn validate_and_build_schedule(
                 at: raw.schedule.at.clone(),
             })
         }
-        "once" => {
-            validate_rfc3339(agent_id, &raw.id, &raw.schedule.at)?;
-            Ok(TemporalSchedule::Once {
-                at: raw.schedule.at.clone(),
-            })
-        }
+        "once" => Err(PulseParseError::InvalidSchedule {
+            agent_id: agent_id.to_string(),
+            intention_id: raw.id.clone(),
+            detail: "once schedule is no longer supported; use daily or weekly instead".to_string(),
+        }),
         other => Err(PulseParseError::InvalidSchedule {
             agent_id: agent_id.to_string(),
             intention_id: raw.id.clone(),
@@ -210,17 +209,6 @@ fn validate_weekday(agent_id: &str, intention_id: &str, day: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_rfc3339(agent_id: &str, intention_id: &str, at: &str) -> Result<(), PulseParseError> {
-    if chrono::DateTime::parse_from_rfc3339(at).is_err() {
-        return Err(PulseParseError::InvalidSchedule {
-            agent_id: agent_id.to_string(),
-            intention_id: intention_id.to_string(),
-            detail: format!("invalid RFC3339 datetime: {at}"),
-        });
-    }
-    Ok(())
-}
-
 fn is_safe_agent_id(id: &str) -> bool {
     !id.is_empty()
         && !id.trim().is_empty()
@@ -235,12 +223,10 @@ fn is_safe_agent_id(id: &str) -> bool {
 /// # Examples
 /// - `Daily { at: "08:00" }` → `"daily 08:00"`
 /// - `Weekly { day: "sun", at: "21:00" }` → `"weekly sun 21:00"`
-/// - `Once { at: "2026-05-12T18:00:00+09:00" }` → `"once 2026-05-12T18:00:00+09:00"`
 pub(crate) fn format_schedule(schedule: &TemporalSchedule) -> String {
     match schedule {
         TemporalSchedule::Daily { at } => format!("daily {at}"),
         TemporalSchedule::Weekly { day, at } => format!("weekly {day} {at}"),
-        TemporalSchedule::Once { at } => format!("once {at}"),
     }
 }
 
@@ -271,10 +257,160 @@ pub(crate) fn load_pulse_definition(
     parse_pulse_definition_inner(&content, agent_id)
 }
 
+// ===========================================================================
+// Due Resolver
+// ===========================================================================
+
+use chrono::{DateTime, Datelike, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::Tz;
+
+/// Result of a due check for a single intention.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DueCheck {
+    /// Whether the intention is currently due.
+    pub due: bool,
+    /// Unique key identifying the current evaluation period for deduplication.
+    pub due_key: String,
+}
+
+/// Check if a temporal intention is due at the given time and produce its deduplication key.
+///
+/// `agent_id` identifies the agent for due_key generation.
+/// `now` is the current UTC time.
+/// `timezone` is the IANA timezone for daily/weekly evaluation (e.g. "Asia/Tokyo").
+pub(crate) fn check_due(
+    agent_id: &str,
+    intention: &TemporalIntention,
+    now: DateTime<Utc>,
+    timezone: &str,
+) -> DueCheck {
+    let due_key = generate_due_key(agent_id, intention, now, timezone);
+    let due = match &intention.schedule {
+        TemporalSchedule::Daily { at } => is_daily_due(at, now, timezone),
+        TemporalSchedule::Weekly { day, at } => is_weekly_due(day, at, now, timezone),
+    };
+    DueCheck { due, due_key }
+}
+
+/// Generate the deduplication key for a given intention at the current evaluation time.
+///
+/// Format per schedule kind:
+/// - daily:  `{agent_id}:{intention_id}:{YYYY-MM-DD}` (local date)
+/// - weekly: `{agent_id}:{intention_id}:{YYYY-WNN}`   (ISO week)
+pub(crate) fn generate_due_key(
+    agent_id: &str,
+    intention: &TemporalIntention,
+    now: DateTime<Utc>,
+    timezone: &str,
+) -> String {
+    let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+    match &intention.schedule {
+        TemporalSchedule::Daily { .. } => {
+            let local_now = now.with_timezone(&tz);
+            format!(
+                "{agent_id}:{}:{}",
+                intention.id,
+                local_now.format("%Y-%m-%d")
+            )
+        }
+        TemporalSchedule::Weekly { .. } => {
+            let local_now = now.with_timezone(&tz);
+            let iso = local_now.iso_week();
+            format!(
+                "{agent_id}:{}:{}-W{:02}",
+                intention.id,
+                iso.year(),
+                iso.week()
+            )
+        }
+    }
+}
+
+/// Evaluate daily schedule: parse `HH:MM`, construct today's local time in the
+/// configured timezone, and check if `now` has passed it.
+///
+/// DST handling:
+/// - **Gap** (non-existent local time, e.g. spring forward): treated as not due (skip).
+/// - **Fold** (ambiguous local time, e.g. fall back): uses the earlier occurrence.
+fn is_daily_due(at: &str, now: DateTime<Utc>, timezone: &str) -> bool {
+    let time = match parse_hhmm(at) {
+        Some(t) => t,
+        None => {
+            tracing::warn!("invalid time format in daily schedule: {at}");
+            return false;
+        }
+    };
+    let tz: Tz = match timezone.parse() {
+        Ok(tz) => tz,
+        Err(e) => {
+            tracing::warn!("invalid timezone \"{timezone}\": {e}");
+            return false;
+        }
+    };
+
+    let local_now = now.with_timezone(&tz);
+    let naive_dt = local_now.date_naive().and_time(time);
+
+    let target = match tz.from_local_datetime(&naive_dt) {
+        LocalResult::None => {
+            tracing::debug!("skipping daily intention: local time {at} falls in DST gap");
+            return false;
+        }
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earliest, _latest) => earliest,
+    };
+
+    now >= target.with_timezone(&Utc)
+}
+
+/// Evaluate weekly schedule: first check if the current local weekday matches
+/// the configured `day`, then delegate to the daily time check.
+fn is_weekly_due(day: &str, at: &str, now: DateTime<Utc>, timezone: &str) -> bool {
+    let target_weekday = match parse_weekday(day) {
+        Some(w) => w,
+        None => {
+            tracing::warn!("invalid weekday in weekly schedule: {day}");
+            return false;
+        }
+    };
+    let tz: Tz = match timezone.parse() {
+        Ok(tz) => tz,
+        Err(e) => {
+            tracing::warn!("invalid timezone \"{timezone}\": {e}");
+            return false;
+        }
+    };
+
+    let local_now = now.with_timezone(&tz);
+    if local_now.weekday() != target_weekday {
+        return false;
+    }
+
+    is_daily_due(at, now, timezone)
+}
+
+/// Parse a `HH:MM` time string into a [`NaiveTime`].
+fn parse_hhmm(at: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(at, "%H:%M").ok()
+}
+
+/// Map a lowercase weekday abbreviation to [`Weekday`].
+fn parse_weekday(day: &str) -> Option<Weekday> {
+    match day {
+        "mon" => Some(Weekday::Mon),
+        "tue" => Some(Weekday::Tue),
+        "wed" => Some(Weekday::Wed),
+        "thu" => Some(Weekday::Thu),
+        "fri" => Some(Weekday::Fri),
+        "sat" => Some(Weekday::Sat),
+        "sun" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn format_schedule_daily() {
@@ -291,19 +427,6 @@ mod tests {
             at: "21:00".to_string(),
         };
         assert_eq!(format_schedule(&schedule), "weekly sun 21:00");
-    }
-
-    #[test]
-    fn format_schedule_once() {
-        let schedule = TemporalSchedule::Once {
-            at: "2026-05-12T18:00:00+09:00".to_string(),
-        };
-        assert_eq!(format_schedule(&schedule), "once 2026-05-12T18:00:00+09:00");
-    }
-
-    fn write_file(path: &Path, content: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
     }
 
     fn valid_pulse_md() -> String {
@@ -324,12 +447,6 @@ intentions:
       at: \"21:00\"
     attention: |
       Reflect on the week.
-  - id: event_check
-    schedule:
-      kind: once
-      at: \"2026-05-12T18:00:00+09:00\"
-    attention: |
-      Check the event.
 ---
 
 # PULSE
@@ -347,14 +464,14 @@ intentions:
 
         let result = parse_pulse_definition(&content).expect("should parse successfully");
 
-        assert_eq!(result.intentions.len(), 3);
+        assert_eq!(result.intentions.len(), 2);
         assert_eq!(result.intentions[0].id, "morning_review");
         assert!(result.body.contains("# PULSE"));
         assert!(result.body.contains("Don't notify for trivial changes."));
     }
 
     #[test]
-    fn parse_daily_weekly_once_intentions() {
+    fn parse_daily_and_weekly_intentions() {
         let content = valid_pulse_md();
 
         let result = parse_pulse_definition(&content).expect("should parse successfully");
@@ -367,10 +484,6 @@ intentions:
             &result.intentions[1].schedule,
             TemporalSchedule::Weekly { day, at } if day == "sun" && at == "21:00"
         ));
-        assert!(matches!(
-            &result.intentions[2].schedule,
-            TemporalSchedule::Once { at } if at == "2026-05-12T18:00:00+09:00"
-        ));
 
         assert!(
             result.intentions[0]
@@ -382,7 +495,28 @@ intentions:
                 .attention
                 .contains("Reflect on the week")
         );
-        assert!(result.intentions[2].attention.contains("Check the event"));
+    }
+
+    #[test]
+    fn parse_rejects_once_schedule() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: event_check
+    schedule:
+      kind: once
+      at: \"2026-05-12T18:00:00+09:00\"
+    attention: test
+---
+
+body
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "event_check"),
+            "expected InvalidSchedule for once, got: {err}"
+        );
     }
 
     #[test]
@@ -523,5 +657,115 @@ body
         let result = parse_pulse_definition(no_frontmatter).unwrap();
         assert!(result.intentions.is_empty());
         assert!(result.body.contains("# Just a heading"));
+    }
+
+    // --- Due Resolver tests ---
+
+    fn make_daily(at: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: "test_intention".to_string(),
+            schedule: TemporalSchedule::Daily { at: at.to_string() },
+            attention: String::new(),
+        }
+    }
+
+    fn make_weekly(day: &str, at: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: "test_intention".to_string(),
+            schedule: TemporalSchedule::Weekly {
+                day: day.to_string(),
+                at: at.to_string(),
+            },
+            attention: String::new(),
+        }
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    #[test]
+    fn daily_due_after_local_time() {
+        let intention = make_daily("09:00");
+        let now = utc(2026, 5, 10, 0, 1, 0);
+        let result = check_due("lyre", &intention, now, "Asia/Tokyo");
+        assert!(result.due);
+    }
+
+    #[test]
+    fn daily_not_due_before_local_time() {
+        let intention = make_daily("09:00");
+        let now = utc(2026, 5, 9, 23, 59, 0);
+        let result = check_due("lyre", &intention, now, "Asia/Tokyo");
+        assert!(!result.due);
+    }
+
+    #[test]
+    fn weekly_due_only_on_matching_day() {
+        let intention = make_weekly("sun", "21:00");
+        let sunday = utc(2026, 5, 10, 12, 1, 0);
+        assert!(check_due("lyre", &intention, sunday, "Asia/Tokyo").due);
+        let saturday = utc(2026, 5, 9, 12, 1, 0);
+        assert!(!check_due("lyre", &intention, saturday, "Asia/Tokyo").due);
+    }
+
+    #[test]
+    fn due_key_daily_uses_local_date() {
+        let intention = TemporalIntention {
+            id: "morning_review".to_string(),
+            schedule: TemporalSchedule::Daily {
+                at: "09:00".to_string(),
+            },
+            attention: String::new(),
+        };
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo");
+        assert_eq!(key, "lyre:morning_review:2026-05-10");
+    }
+
+    #[test]
+    fn due_key_weekly_uses_iso_week() {
+        let intention = TemporalIntention {
+            id: "weekly_reflection".to_string(),
+            schedule: TemporalSchedule::Weekly {
+                day: "sun".to_string(),
+                at: "21:00".to_string(),
+            },
+            attention: String::new(),
+        };
+        let now = utc(2026, 5, 10, 12, 0, 0);
+        let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo");
+        assert_eq!(key, "kitara:weekly_reflection:2026-W19");
+    }
+
+    #[test]
+    fn due_resolver_handles_dst_gap_and_fold() {
+        let gap_intention = make_daily("02:30");
+        let now_after_gap = utc(2026, 3, 8, 7, 30, 0);
+        let result = check_due("test", &gap_intention, now_after_gap, "America/New_York");
+        assert!(
+            !result.due,
+            "intention at 02:30 should not be due during DST gap"
+        );
+        assert!(result.due_key.contains("2026-03-08"));
+
+        let fold_intention = make_daily("01:30");
+        let now_after_earlier = utc(2026, 11, 1, 5, 31, 0);
+        let result = check_due(
+            "test",
+            &fold_intention,
+            now_after_earlier,
+            "America/New_York",
+        );
+        assert!(result.due);
+
+        let now_before_earlier = utc(2026, 11, 1, 5, 29, 0);
+        let result = check_due(
+            "test",
+            &fold_intention,
+            now_before_earlier,
+            "America/New_York",
+        );
+        assert!(!result.due);
     }
 }

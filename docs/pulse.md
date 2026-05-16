@@ -337,24 +337,15 @@ schedule:
   at: "21:00"
 ```
 
-## once
-
-```yaml
-schedule:
-  kind: once
-  at: "2026-05-12T18:00:00+09:00"
-```
-
 ## validation
 
 | 項目              | 仕様                          |
 | --------------- | --------------------------- |
 | `id`            | agent 内で一意                  |
-| `schedule.kind` | `daily` / `weekly` / `once` |
+| `schedule.kind` | `daily` / `weekly` |
 | `daily.at`      | `HH:MM`                     |
 | `weekly.day`    | `mon`〜`sun`                 |
 | `weekly.at`     | `HH:MM`                     |
-| `once.at`       | RFC3339                     |
 | `attention`     | LLM に渡す注意対象。実行命令ではない        |
 
 `attention` は `task` ではない。
@@ -379,7 +370,7 @@ schedule:
                ▼
 ┌──────────────────────────────┐
 │        Temporal Due Resolver  │
-│ daily / weekly / once 判定     │
+│ daily / weekly 判定     │
 └──────────────┬───────────────┘
                │ due
                ▼
@@ -428,10 +419,6 @@ weekly:
   今日の曜日 == day
   かつ 今日の日付 + at <= now
   かつ due_key 未実行
-
-once:
-  at <= now
-  かつ due_key 未実行
 ```
 
 ## due_key
@@ -442,7 +429,6 @@ once:
 | -------- | -------------------------------------------- |
 | daily    | `lyre:morning_review:2026-05-10`             |
 | weekly   | `kitara:weekly_reflection:2026-W19`          |
-| once     | `lyre:event_check:2026-05-12T18:00:00+09:00` |
 
 ---
 
@@ -677,7 +663,7 @@ src/
 | ------------------------------ | ----------------------------------------------------- |
 | `pulse` config                 | enabled / tick_interval / timezone |
 | `PULSE.md` front matter parser | Temporal Intention を読む                                |
-| due 判定                         | daily / weekly / once                                 |
+| due 判定                         | daily / weekly                                 |
 | duplicate 判定                   | `pulse_runs` の `due_key`                              |
 | active turn defer              | agent active 中は起こさない                                  |
 | Home Surface 解決                | agent の最後の会話場所を使う                                     |
@@ -730,7 +716,7 @@ src/
   Attention:
   {attention}
   ```
-  - `Schedule` は `daily 08:00`, `weekly sun 21:00`, `once 2026-05-12T18:00:00+09:00` の形式
+  - `Schedule` は `daily 08:00`, `weekly sun 21:00` の形式
   - `Attention` は PULSE.md の intention 定義そのまま
 - sender_name は `Pulse`、message_kind は `SystemEvent`
 - ユーザーが Pulse 通知に返信すると、通常 turn が文脈（intention の目的・スケジュール・指示内容）を引き継げる

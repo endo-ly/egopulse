@@ -156,7 +156,7 @@ LLM に見える名前は `mcp_{server}_{tool}` 形式。英数字と `_` 以外
 
 出力が空なら `(no output)`。
 
-## 6. 障害と制約
+## 6. 障害とリカバリ
 
 ### エラー種別と runtime 方針
 
@@ -165,13 +165,29 @@ LLM に見える名前は `mcp_{server}_{tool}` 形式。英数字と `_` 以外
 - `mcp_tool_call_failed`
 
 1. config file 単位の失敗は skip して継続
-2. server 単位の接続失敗は warning を出して継続
+2. server 単位の接続失敗は warning を出して継続（`failed_servers` に保持）
 3. tool 実行時の失敗は tool error として LLM に返す
 4. 一部 server の失敗で runtime 全体は停止しない
 
-### 現実装の制約
+### 自動再接続（MCP Reconnect Loop）
 
-- health probe の常駐監視は未実装
-- retry / backoff / circuit breaker は未実装
-- tool list の TTL cache は未実装
-- `defaultProtocolVersion` / `protocol_version` は parse されるが接続時未使用
+`spawn_mcp_reconnect_loop()` が runtime 起動時にバックグラウンド task として稼働し、失敗した MCP server の自動再接続を試みる。
+
+```text
+loop:
+  failed_servers が空 → MAX_RETRY_SECS (300s) 待機 → 再評価
+  failed_servers が存在 → retry_secs 待機 → 再接続試行
+    再接続成功 → reconnected ツールを registry に追加 → retry_secs をリセット
+    再接続失敗 → retry_secs を指数バックオフ（×2）して MAX_RETRY_SECS にキャップ
+```
+
+| パラメータ | 値 | 説明 |
+---|---|---|
+| `INITIAL_RETRY_SECS` | 5 秒 | 初回の再接続間隔 |
+| `MAX_RETRY_SECS` | 300 秒 | バックオフ上限（5 分） |
+
+### 未実装の機能
+
+- health probe の常駐監視: 接続済み server の定期的な死活確認。現在は tool 呼び出しの失敗で初めて検知
+- tool list の TTL cache: 接続時に `list_all_tools()` を1回だけ呼び出し、以降は `cached_tools` を使い回す。server 側がツールを追加・削除しても runtime 再起動まで反映されない
+- `defaultProtocolVersion` / `protocol_version`: config から parse されるが接続時には未使用。常に rmcp デフォルトが使われる

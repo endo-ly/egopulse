@@ -16,8 +16,8 @@ use crate::agent_loop::session::{
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
+use crate::pulse::capsule::HomeSurface;
 use crate::pulse::definition::{TemporalIntention, format_schedule};
-use crate::pulse::home_surface::HomeSurface;
 use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
 use crate::storage::{MessageKind, PulseOutputKind, StoredMessage};

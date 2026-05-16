@@ -76,14 +76,14 @@ async fn process_intention(
     let agent_id_str = agent_id.as_str();
 
     // 1. Check due
-    let due_check = super::due::check_due(agent_id_str, intention, now, timezone);
+    let due_check = super::definition::check_due(agent_id_str, intention, now, timezone);
     if !due_check.due {
         return;
     }
 
     // 2. Evaluate gate
     let is_active = state.active_turns.is_active(agent_id_str);
-    let decision = match super::gate::evaluate_gate(
+    let decision = match super::capsule::evaluate_gate(
         &state.db,
         agent_id_str,
         &intention.id,
@@ -105,8 +105,10 @@ async fn process_intention(
     };
 
     match decision {
-        super::gate::GateDecision::Duplicate | super::gate::GateDecision::DeferActive => return,
-        super::gate::GateDecision::Allow => {}
+        super::capsule::GateDecision::Duplicate | super::capsule::GateDecision::DeferActive => {
+            return;
+        }
+        super::capsule::GateDecision::Allow => {}
     }
 
     // 3. Create pulse_run
@@ -131,44 +133,42 @@ async fn process_intention(
 
     // 4. Resolve home surface
     let available_channels = state.channels.names();
-    let home_surface = match super::home_surface::resolve_home_surface(
-        &state.db,
-        agent_id_str,
-        &available_channels,
-    )
-    .await
-    {
-        Ok(Some(surface)) => surface,
-        Ok(None) => {
-            if let Err(e) =
-                update_run_skipped(&state.db, &pulse_run_id, "no sendable home surface").await
-            {
-                warn!(
-                    pulse_run_id = %pulse_run_id,
-                    error = %e,
-                    "pulse scan: failed to mark pulse_run as skipped"
-                );
+    let home_surface =
+        match super::capsule::resolve_home_surface(&state.db, agent_id_str, &available_channels)
+            .await
+        {
+            Ok(Some(surface)) => surface,
+            Ok(None) => {
+                if let Err(e) =
+                    update_run_skipped(&state.db, &pulse_run_id, "no sendable home surface").await
+                {
+                    warn!(
+                        pulse_run_id = %pulse_run_id,
+                        error = %e,
+                        "pulse scan: failed to mark pulse_run as skipped"
+                    );
+                }
+                return;
             }
-            return;
-        }
-        Err(e) => {
-            warn!(
-                agent_id = agent_id_str,
-                error = %e,
-                "pulse scan: failed to resolve home surface"
-            );
-            if let Err(e) =
-                update_run_skipped(&state.db, &pulse_run_id, "home surface resolution failed").await
-            {
+            Err(e) => {
                 warn!(
-                    pulse_run_id = %pulse_run_id,
+                    agent_id = agent_id_str,
                     error = %e,
-                    "pulse scan: failed to mark pulse_run as skipped"
+                    "pulse scan: failed to resolve home surface"
                 );
+                if let Err(e) =
+                    update_run_skipped(&state.db, &pulse_run_id, "home surface resolution failed")
+                        .await
+                {
+                    warn!(
+                        pulse_run_id = %pulse_run_id,
+                        error = %e,
+                        "pulse scan: failed to mark pulse_run as skipped"
+                    );
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     // 5. Build capsule
     // Prospective memory is already injected via build_system_prompt() in the
