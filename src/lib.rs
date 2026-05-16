@@ -17,7 +17,6 @@ pub mod setup;
 pub(crate) mod skills;
 pub(crate) mod slash_commands;
 pub mod sleep;
-pub(crate) mod soul_agents;
 pub mod storage;
 pub(crate) mod tools;
 
