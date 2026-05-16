@@ -29,6 +29,38 @@ pub(crate) struct StoredMessage {
     pub recipient_agent_id: Option<String>,
 }
 
+impl StoredMessage {
+    /// Creates a bot-originated message with auto-generated id and timestamp.
+    pub(crate) fn bot(chat_id: i64, content: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name: "egopulse".to_string(),
+            content,
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
+        }
+    }
+
+    /// Creates a user-originated message with auto-generated id and timestamp.
+    pub(crate) fn user(chat_id: i64, sender_name: String, content: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_name,
+            content,
+            is_from_bot: false,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            sender_agent_id: None,
+            recipient_agent_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionSummary {
     pub chat_id: i64,

@@ -5,6 +5,40 @@ use std::sync::Mutex;
 
 use crate::agent_loop::ScheduledTurn;
 
+/// In-flight turn tracker used by the sleep scheduler to defer scheduled
+/// batches while an agent is actively processing a conversation turn.
+#[derive(Debug, Default)]
+pub(crate) struct ActiveTurnTracker {
+    turns: Mutex<HashMap<String, u32>>,
+}
+
+impl ActiveTurnTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn begin_turn(&self, agent_id: &str) {
+        let mut turns = self.turns.lock().expect("active_turns lock");
+        *turns.entry(agent_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Removes the entry when the count reaches zero so `is_active` stays O(1).
+    pub(crate) fn end_turn(&self, agent_id: &str) {
+        let mut turns = self.turns.lock().expect("active_turns lock");
+        if let Some(count) = turns.get_mut(agent_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                turns.remove(agent_id);
+            }
+        }
+    }
+
+    pub(crate) fn is_active(&self, agent_id: &str) -> bool {
+        let turns = self.turns.lock().expect("active_turns lock");
+        turns.get(agent_id).is_some_and(|&c| c > 0)
+    }
+}
+
 /// Maximum chain depth for `agent_send` cascading (A→B→C…).
 pub(crate) const MAX_AGENT_CHAIN_DEPTH: usize = 4;
 
@@ -357,5 +391,62 @@ mod tests {
         tracker.remove_origin("orig-1");
         assert_eq!(tracker.count("orig-1"), 0);
         assert!(tracker.terminal_reason("orig-1").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ActiveTurnTracker tests (migrated from runtime/mod.rs)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn active_turn_tracker_marks_agent_running_during_turn() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        assert!(tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_clears_agent_after_success() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_clears_agent_after_error() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        // Simulate error path: end_turn is called regardless
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn active_turn_tracker_counts_parallel_turns_per_agent() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        tracker.begin_turn("agent-a");
+        assert!(tracker.is_active("agent-a"));
+
+        tracker.end_turn("agent-a");
+        assert!(
+            tracker.is_active("agent-a"),
+            "still active after one turn ends"
+        );
+
+        tracker.end_turn("agent-a");
+        assert!(
+            !tracker.is_active("agent-a"),
+            "inactive after all turns end"
+        );
+    }
+
+    #[test]
+    fn active_turn_tracker_is_agent_scoped() {
+        let tracker = ActiveTurnTracker::new();
+        tracker.begin_turn("agent-a");
+        assert!(!tracker.is_active("agent-b"), "other agent unaffected");
+        tracker.end_turn("agent-a");
+        assert!(!tracker.is_active("agent-a"));
     }
 }

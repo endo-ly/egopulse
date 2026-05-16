@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-const DEFAULT_SOUL_MD: &str = include_str!("default_soul.md");
+const DEFAULT_SOUL_MD: &str = include_str!("../default_soul.md");
 
 struct CachedContent {
     content: String,

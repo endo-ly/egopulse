@@ -264,7 +264,6 @@ mod tests {
     use crate::pulse::capsule::build_capsule;
     use crate::pulse::definition::{TemporalIntention, TemporalSchedule};
     use crate::pulse::home_surface::HomeSurface;
-    use std::sync::Arc;
 
     fn test_intention() -> TemporalIntention {
         TemporalIntention {
@@ -377,41 +376,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
         let config = crate::test_util::test_config(&state_root);
-        let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
-        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
-        let tools = Arc::new(crate::tools::ToolRegistry::new(
-            &config,
-            Arc::clone(&skills),
-        ));
-
-        let state = AppState {
-            db,
-            config,
-            config_path: None,
-            llm_override: None,
-            channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
-            skills: state_skills_ref(&skills),
-            tools,
-            mcp_manager: None,
-            assets: Arc::new(
-                crate::assets::AssetStore::new(&dir.path().join("runtime").join("assets"))
-                    .expect("assets"),
-            ),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(
-                &crate::test_util::test_config(&state_root),
-            )),
-            memory_loader: Arc::new(crate::memory::MemoryLoader::new(
-                std::path::PathBuf::from(&state_root).join("agents"),
-            )),
-            llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
-            turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
-            turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-        };
+        let state = crate::test_util::build_state_with_config(config, None, None, None, None);
 
         // Act: tool definitions should be loadable
         let tool_defs = state.tools.definitions_async().await;
@@ -438,11 +403,5 @@ mod tests {
             PulseOutputKind::Notify
         );
         assert_eq!(classify_output(""), PulseOutputKind::Silent);
-    }
-
-    fn state_skills_ref(
-        skills: &Arc<crate::skills::SkillManager>,
-    ) -> Arc<crate::skills::SkillManager> {
-        Arc::clone(skills)
     }
 }

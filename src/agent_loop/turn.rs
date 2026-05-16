@@ -19,10 +19,9 @@ use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::{MessageKind, StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use futures_util::future::join_all;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -30,6 +29,36 @@ const MAX_TOOL_ITERATIONS: usize = 50;
 
 /// Maximum number of Channel Log messages to inject as Channel Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
+
+/// Type-erased callback for agent lifecycle events (iteration, tool start, final response).
+///
+/// Wraps `Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>` so callers and
+/// internal helpers avoid a generic `F` parameter that proliferates through
+/// every function signature.
+#[derive(Clone)]
+pub(crate) struct EventEmitter(Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>);
+
+impl EventEmitter {
+    /// Creates a no-op emitter that discards all events.
+    fn none() -> Self {
+        Self(None)
+    }
+
+    /// Creates an emitter from a concrete callback.
+    fn new<F>(f: F) -> Self
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Emits a single event if a callback is registered.
+    fn emit(&self, event: AgentEvent) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
+}
 
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
@@ -99,7 +128,7 @@ pub(crate) async fn process_turn(
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn_inner(state, context, user_input, Option::<fn(AgentEvent)>::None).await
+    process_turn_inner(state, context, user_input, EventEmitter::none()).await
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
@@ -110,20 +139,17 @@ pub(crate) async fn process_turn_with_events<F>(
     on_event: F,
 ) -> Result<String, EgoPulseError>
 where
-    F: Fn(AgentEvent) + Send + Sync,
+    F: Fn(AgentEvent) + Send + Sync + 'static,
 {
-    process_turn_inner(state, context, user_input, Some(on_event)).await
+    process_turn_inner(state, context, user_input, EventEmitter::new(on_event)).await
 }
 
-async fn process_turn_inner<F>(
+async fn process_turn_inner(
     state: &AppState,
     context: &SurfaceContext,
     user_input: &str,
-    on_event: Option<F>,
-) -> Result<String, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+    on_event: EventEmitter,
+) -> Result<String, EgoPulseError> {
     state.active_turns.begin_turn(&context.agent_id);
     let _guard = ActiveTurnGuard {
         state,
@@ -192,7 +218,7 @@ where
     let mut retry_messages: Option<Vec<Message>> = None;
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        emit_event(&on_event, AgentEvent::Iteration { iteration });
+        on_event.emit(AgentEvent::Iteration { iteration });
         let mut request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
 
         // Inject Channel Context temporarily before LLM call
@@ -234,51 +260,59 @@ where
         }
 
         if response.tool_calls.is_empty() {
-            if let Some(final_content) = run_turn_action(
-                evaluate_end_turn(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut empty_reply_retry_attempted,
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )?,
-                state,
-                chat_id,
-                &mut messages,
-                session_updated_at.clone(),
-                &on_event,
-                &mut retry_messages,
-            )
-            .await?
-            {
-                return Ok(final_content);
+            match evaluate_end_turn(
+                &response.content,
+                response.reasoning_content.as_deref(),
+                &mut empty_reply_retry_attempted,
+                &mut declarative_retry_attempted,
+                &messages,
+            )? {
+                TurnAction::Retry(msgs) => retry_messages = msgs,
+                TurnAction::Done {
+                    final_content,
+                    reasoning_content,
+                } => {
+                    return persist_and_finalize(
+                        state,
+                        chat_id,
+                        &mut messages,
+                        session_updated_at.clone(),
+                        &on_event,
+                        final_content,
+                        reasoning_content,
+                    )
+                    .await;
+                }
             }
-
             continue;
         }
 
         let valid_tool_calls = filter_valid_tool_calls(response.tool_calls);
 
         if valid_tool_calls.is_empty() {
-            if let Some(final_content) = run_turn_action(
-                evaluate_malformed_response(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )?,
-                state,
-                chat_id,
-                &mut messages,
-                session_updated_at.clone(),
-                &on_event,
-                &mut retry_messages,
-            )
-            .await?
-            {
-                return Ok(final_content);
+            match evaluate_malformed_response(
+                &response.content,
+                response.reasoning_content.as_deref(),
+                &mut declarative_retry_attempted,
+                &messages,
+            )? {
+                TurnAction::Retry(msgs) => retry_messages = msgs,
+                TurnAction::Done {
+                    final_content,
+                    reasoning_content,
+                } => {
+                    return persist_and_finalize(
+                        state,
+                        chat_id,
+                        &mut messages,
+                        session_updated_at.clone(),
+                        &on_event,
+                        final_content,
+                        reasoning_content,
+                    )
+                    .await;
+                }
             }
-
             continue;
         }
 
@@ -317,17 +351,6 @@ where
     Err(EgoPulseError::Internal(format!(
         "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
     )))
-}
-
-fn emit_event<F>(on_event: &Option<F>, event: AgentEvent)
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    // TUI/Web などイベント購読者がいる場合だけ副作用を流し、
-    // 通常 CLI ではロジック本体を分岐させない。
-    if let Some(on_event) = on_event {
-        on_event(event);
-    }
 }
 
 fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
@@ -436,121 +459,42 @@ fn evaluate_malformed_response(
     })
 }
 
-async fn run_turn_action<F>(
-    action: TurnAction,
+async fn persist_and_finalize(
     state: &AppState,
     chat_id: i64,
     messages: &mut Vec<Message>,
     session_updated_at: Option<String>,
-    on_event: &Option<F>,
-    retry_messages: &mut Option<Vec<Message>>,
-) -> Result<Option<String>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    match handle_turn_action(
-        action,
-        state,
-        chat_id,
-        messages,
-        session_updated_at,
-        on_event,
-    )
-    .await?
-    {
-        ControlFlow::Continue(next_retry_messages) => {
-            *retry_messages = next_retry_messages;
-            Ok(None)
-        }
-        ControlFlow::Break(final_content) => Ok(Some(final_content)),
-    }
-}
-
-async fn handle_turn_action<F>(
-    action: TurnAction,
-    state: &AppState,
-    chat_id: i64,
-    messages: &mut Vec<Message>,
-    session_updated_at: Option<String>,
-    on_event: &Option<F>,
-) -> Result<ControlFlow<String, Option<Vec<Message>>>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    match action {
-        TurnAction::Retry(messages) => Ok(ControlFlow::Continue(messages)),
-        TurnAction::Done {
-            final_content,
-            reasoning_content,
-        } => persist_and_finalize(
-            state,
-            chat_id,
-            messages,
-            session_updated_at,
-            on_event,
-            final_content,
-            reasoning_content,
-        )
-        .await
-        .map(ControlFlow::Break),
-    }
-}
-
-async fn persist_and_finalize<F>(
-    state: &AppState,
-    chat_id: i64,
-    messages: &mut Vec<Message>,
-    session_updated_at: Option<String>,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     final_content: String,
     reasoning_content: Option<String>,
-) -> Result<String, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<String, EgoPulseError> {
     let mut assistant_message = Message::text("assistant", final_content.clone());
     assistant_message.reasoning_content = reasoning_content;
     messages.push(assistant_message.clone());
 
     let _persisted = persist_phase(
         state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: final_content.clone(),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
-        },
+        StoredMessage::bot(chat_id, final_content.clone()),
         assistant_message,
         messages,
         session_updated_at,
     )
     .await?;
 
-    emit_event(
-        on_event,
-        AgentEvent::FinalResponse {
-            text: final_content.clone(),
-        },
-    );
+    on_event.emit(AgentEvent::FinalResponse {
+        text: final_content.clone(),
+    });
     Ok(final_content)
 }
 
-async fn execute_and_persist_tools<F>(
+async fn execute_and_persist_tools(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     messages: Vec<Message>,
     session_updated_at: Option<String>,
     assistant_draft: ToolAssistantDraft,
-) -> Result<(Vec<Message>, Option<String>), EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
     let mut messages = messages;
     let persisted = persist_tool_call_assistant_message(
@@ -612,14 +556,7 @@ async fn persist_tool_call_assistant_message(
         state,
         StoredMessage {
             id: assistant_message_id.to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: assistant_preview,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
+            ..StoredMessage::bot(chat_id, assistant_preview)
         },
         assistant_message,
         &messages,
@@ -647,17 +584,7 @@ async fn persist_tool_result_messages(
     let preview = summarize_tool_result_messages(&tool_messages);
     persist_phase_messages(
         state,
-        StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_name: "egopulse".to_string(),
-            content: preview,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            sender_agent_id: None,
-            recipient_agent_id: None,
-        },
+        StoredMessage::bot(chat_id, preview),
         tool_messages,
         &messages_with_tools,
         session_updated_at,
@@ -674,16 +601,13 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
     preview_text(&joined, 160)
 }
 
-async fn execute_tool_calls<F>(
+async fn execute_tool_calls(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let all_read_only = valid_tool_calls
         .iter()
         .all(|tc| state.tools.is_read_only(&tc.name));
@@ -709,16 +633,13 @@ where
     .await
 }
 
-async fn execute_tool_calls_parallel<F>(
+async fn execute_tool_calls_parallel(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let tool_futures: Vec<_> = valid_tool_calls
         .into_iter()
         .map(|tool_call| {
@@ -735,16 +656,13 @@ where
     results.into_iter().collect()
 }
 
-async fn execute_tool_calls_sequential<F>(
+async fn execute_tool_calls_sequential(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
+) -> Result<Vec<Message>, EgoPulseError> {
     let mut messages = Vec::with_capacity(valid_tool_calls.len());
     for tool_call in valid_tool_calls {
         messages.push(
@@ -761,23 +679,17 @@ where
     Ok(messages)
 }
 
-async fn execute_tool_call<F>(
+async fn execute_tool_call(
     state: &AppState,
-    on_event: &Option<F>,
+    on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     tool_call: ToolCall,
-) -> Result<Message, EgoPulseError>
-where
-    F: Fn(AgentEvent) + Send + Sync,
-{
-    emit_event(
-        on_event,
-        AgentEvent::ToolStart {
-            name: tool_call.name.clone(),
-            input: tool_call.arguments.clone(),
-        },
-    );
+) -> Result<Message, EgoPulseError> {
+    on_event.emit(AgentEvent::ToolStart {
+        name: tool_call.name.clone(),
+        input: tool_call.arguments.clone(),
+    });
 
     store_pending_tool_call(
         state,
@@ -802,15 +714,12 @@ where
     )
     .await?;
 
-    emit_event(
-        on_event,
-        AgentEvent::ToolResult {
-            name: tool_call.name.clone(),
-            is_error: result.is_error,
-            preview: preview_text(&tool_payload, 160),
-            duration_ms,
-        },
-    );
+    on_event.emit(AgentEvent::ToolResult {
+        name: tool_call.name.clone(),
+        is_error: result.is_error,
+        preview: preview_text(&tool_payload, 160),
+        duration_ms,
+    });
 
     Ok(Message {
         role: "tool".to_string(),
@@ -868,17 +777,11 @@ async fn persist_user_turn_with_compaction(
     prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, chat_id).await?;
-    let stored_message = StoredMessage {
-        id: uuid::Uuid::new_v4().to_string(),
+    let stored_message = StoredMessage::user(
         chat_id,
-        sender_name: context.surface_user.clone(),
-        content: user_input.to_string(),
-        is_from_bot: false,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        message_kind: MessageKind::Message,
-        sender_agent_id: None,
-        recipient_agent_id: None,
-    };
+        context.surface_user.clone(),
+        user_input.to_string(),
+    );
 
     for attempt in 0..2 {
         let mut candidate_messages = loaded.messages.clone();
@@ -1144,39 +1047,22 @@ pub(crate) fn build_state(
     config: crate::config::Config,
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
-    use crate::assets::AssetStore;
-    use crate::channels::adapter::ChannelRegistry;
-    use crate::skills::SkillManager;
-    use crate::storage::Database;
-    use crate::tools::ToolRegistry;
+    build_state_for_config_file(config, llm, None)
+}
 
-    let db = std::sync::Arc::new(Database::new(&config.db_path()).expect("db"));
-    let skills = std::sync::Arc::new(SkillManager::from_dirs(
-        config.user_skills_dir().expect("user_skills_dir"),
-        config.skills_dir().expect("skills_dir"),
-    ));
-    let soul_agents = std::sync::Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config));
-    let memory_loader = std::sync::Arc::new(crate::memory::MemoryLoader::new(
-        std::path::PathBuf::from(&config.state_root).join("agents"),
-    ));
-    AppState {
-        db,
-        config: config.clone(),
-        config_path: None,
-        llm_override: Some(std::sync::Arc::from(llm)),
-        channels: std::sync::Arc::new(ChannelRegistry::new()),
-        skills: std::sync::Arc::clone(&skills),
-        tools: std::sync::Arc::new(ToolRegistry::new(&config, skills)),
-        mcp_manager: None,
-        assets: std::sync::Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents,
-        memory_loader,
-        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-        active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
-        turn_scheduler: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
-        turn_tracker: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-    }
+#[cfg(test)]
+pub(crate) fn build_state_for_config_file(
+    config: crate::config::Config,
+    llm: Box<dyn crate::llm::LlmProvider>,
+    config_path: Option<std::path::PathBuf>,
+) -> AppState {
+    crate::test_util::build_state_with_config(
+        config,
+        Some(std::sync::Arc::from(llm)),
+        config_path,
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1190,8 +1076,8 @@ pub(crate) fn build_state_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{
-        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext, build_state,
-        build_state_with_provider, build_system_prompt, cli_context, test_config,
+        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
+        build_state_with_provider, cli_context,
     };
     use serial_test::serial;
     use std::sync::Arc;
@@ -1200,6 +1086,10 @@ mod tests {
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::storage::call_blocking;
+
+    // -----------------------------------------------------------------------
+    // Core turn execution
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     #[serial]
@@ -1300,49 +1190,9 @@ mod tests {
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn normal_tool_flow_still_works_after_port() {
-        // Regression: existing tool flow with multiple tool calls should still work
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                responses: std::sync::Mutex::new(vec![
-                    MessagesResponse {
-                        content: "Let me read that file.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path}),
-                        }],
-                        usage: None,
-                    },
-                    MessagesResponse {
-                        content: "Done reading. Final answer.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                        usage: None,
-                    },
-                ]),
-            }),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let file_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
-        std::fs::write(&file_path, "content").expect("a.txt");
-
-        let reply = process_turn(
-            &state,
-            &cli_context("regression-tool"),
-            &format!("read {relative_path}"),
-        )
-        .await
-        .expect("process turn");
-        assert_eq!(reply, "Done reading. Final answer.");
-    }
+    // -----------------------------------------------------------------------
+    // Tool call edge cases & error handling
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     #[serial]
@@ -1535,445 +1385,9 @@ mod tests {
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
-    fn web_context(session: &str) -> SurfaceContext {
-        SurfaceContext {
-            channel: "web".to_string(),
-            surface_user: "user".to_string(),
-            surface_thread: session.to_string(),
-            chat_type: "web".to_string(),
-            agent_id: "default".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-        }
-    }
-
-    fn write_file(path: &std::path::Path, content: &str) {
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir");
-        std::fs::write(path, content).expect("write");
-    }
-
-    #[test]
-    fn system_prompt_contains_soul_section_when_file_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("SOUL.md"), "I am a wise assistant.");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(prompt.contains("<soul>"), "should contain <soul> tag");
-        assert!(prompt.contains("</soul>"), "should contain </soul> tag");
-        assert!(
-            prompt.contains("I am a wise assistant."),
-            "should contain SOUL.md content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_uses_default_identity_when_no_soul() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(
-            !prompt.contains("<soul>"),
-            "should not contain <soul> tag when no SOUL.md"
-        );
-        assert!(
-            prompt.contains("You are an AI assistant running on the"),
-            "should contain identity text"
-        );
-    }
-
-    #[test]
-    fn system_prompt_contains_agents_section_when_file_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(
-            &dir.path().join("AGENTS.md"),
-            "Use Rust for all code tasks.",
-        );
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(prompt.contains("# Memories"), "should contain # Memories");
-        assert!(prompt.contains("<agents>"), "should contain <agents>");
-        assert!(
-            prompt.contains("Use Rust for all code tasks."),
-            "should contain AGENTS.md content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_no_agents_section_when_no_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(
-            !prompt.contains("# Memories"),
-            "should not contain # Memories when no AGENTS.md"
-        );
-        assert!(
-            !prompt.contains("<agents>"),
-            "should not contain <agents> when no AGENTS.md"
-        );
-    }
-
-    #[test]
-    fn system_prompt_order_soul_before_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("SOUL.md"), "Soul content here");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        let soul_pos = prompt.find("<soul>").expect("should find <soul>");
-        let identity_pos = prompt
-            .find("Built-in execution playbook")
-            .expect("should find execution playbook");
-        assert!(
-            soul_pos < identity_pos,
-            "<soul> should appear before execution playbook"
-        );
-    }
-
-    #[test]
-    fn system_prompt_order_agents_before_skills() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("AGENTS.md"), "Agents content");
-        std::fs::create_dir_all(dir.path().join("workspace/skills")).expect("workspace/skills");
-        let skill_dir = dir.path().join("skills/test-skill");
-        write_file(
-            &skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: A test skill\n---\nInstructions",
-        );
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        let memories_pos = prompt.find("# Memories").expect("should find # Memories");
-        let skills_pos = prompt
-            .find("# Agent Skills")
-            .expect("should find # Agent Skills");
-        assert!(
-            memories_pos < skills_pos,
-            "# Memories should appear before # Agent Skills"
-        );
-    }
-
-    #[test]
-    fn system_prompt_chat_agents_ignored_in_favor_of_global() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("AGENTS.md"), "Global agents content");
-        let chat_agents = dir.path().join("runtime/groups/web/thread1/AGENTS.md");
-        write_file(&chat_agents, "Chat-specific agents content");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("thread1"));
-
-        assert!(prompt.contains("<agents>"), "should contain <agents>");
-        assert!(
-            prompt.contains("Global agents content"),
-            "should contain global AGENTS.md content"
-        );
-        assert!(
-            !prompt.contains("<chat-agents>"),
-            "should NOT contain <chat-agents>"
-        );
-        assert!(
-            !prompt.contains("Chat-specific agents content"),
-            "should NOT contain chat AGENTS.md content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_chat_soul_no_longer_overrides_global() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("SOUL.md"), "global soul content");
-        let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
-        write_file(&chat_soul, "chat soul content");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("thread1"));
-
-        assert!(
-            prompt.contains("global soul content"),
-            "should contain global SOUL content"
-        );
-        assert!(
-            !prompt.contains("chat soul content"),
-            "should NOT contain chat SOUL content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_channel_soul_from_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("souls/work.md"), "Work soul content");
-        let mut config = test_config(dir.path().to_str().expect("utf8").to_string());
-        config.channels.insert(
-            crate::config::ChannelName::new("web"),
-            crate::config::ChannelConfig {
-                enabled: Some(true),
-                soul_path: Some("work".to_string()),
-                ..Default::default()
-            },
-        );
-        let state = build_state(config, no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(
-            prompt.contains("Work soul content"),
-            "should contain channel soul_path content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_channel_soul_fallback_to_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("SOUL.md"), "Default soul content");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(
-            prompt.contains("Default soul content"),
-            "should contain default SOUL.md content"
-        );
-    }
-
-    #[test]
-    fn system_prompt_account_soul_does_not_break_when_not_implemented() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("SOUL.md"), "Default soul");
-        let state =
-            build_state_with_provider(dir.path().to_str().expect("utf8").to_string(), no_tools());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
-
-        assert!(
-            prompt.contains("Default soul"),
-            "account_id=None should not break soul loading"
-        );
-        assert!(
-            prompt.contains("Built-in execution playbook"),
-            "should still contain identity section"
-        );
-    }
-
-    fn no_tools() -> Box<dyn crate::llm::LlmProvider> {
-        Box::new(FakeProvider {
-            responses: std::sync::Mutex::new(vec![]),
-        })
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn process_turn_logs_llm_usage_on_agent_loop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "hello world".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: Some(crate::llm::LlmUsage {
-                    input_tokens: 10,
-                    output_tokens: 20,
-                }),
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
-            .await
-            .expect("process turn");
-        assert_eq!(reply, "hello world");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:usage-log-single",
-                Some("usage-log-single"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-
-        // Wait for the spawned logging task to complete
-        for _ in 0..20 {
-            let (requests, input_tokens, output_tokens, total_tokens) =
-                call_blocking(Arc::clone(&state.db), move |db| {
-                    db.get_llm_usage_summary(Some(chat_id), None, None)
-                })
-                .await
-                .expect("summary");
-            if requests > 0 {
-                assert_eq!(requests, 1);
-                assert_eq!(input_tokens, 10);
-                assert_eq!(output_tokens, 20);
-                assert_eq!(total_tokens, 30);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("usage log was not written within the polling timeout");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn process_turn_logs_each_iteration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/data.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "checking".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-iter-1".to_string(),
-                        name: "read".to_string(),
-                        arguments: serde_json::json!({"path": relative_path}),
-                    }],
-                    usage: Some(crate::llm::LlmUsage {
-                        input_tokens: 15,
-                        output_tokens: 25,
-                    }),
-                }),
-                Ok(MessagesResponse {
-                    content: "done".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    usage: Some(crate::llm::LlmUsage {
-                        input_tokens: 30,
-                        output_tokens: 40,
-                    }),
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let file_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
-        std::fs::write(&file_path, "data").expect("file");
-
-        let reply = process_turn(&state, &cli_context("usage-log-multi"), "read the file")
-            .await
-            .expect("process turn");
-        assert_eq!(reply, "done");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:usage-log-multi",
-                Some("usage-log-multi"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-
-        for _ in 0..20 {
-            let (requests, input_tokens, output_tokens, total_tokens) =
-                call_blocking(Arc::clone(&state.db), move |db| {
-                    db.get_llm_usage_summary(Some(chat_id), None, None)
-                })
-                .await
-                .expect("summary");
-            if requests >= 2 {
-                assert_eq!(
-                    requests, 2,
-                    "should have 2 usage records (one per iteration)"
-                );
-                assert_eq!(input_tokens, 45);
-                assert_eq!(output_tokens, 65);
-                assert_eq!(total_tokens, 110);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("usage logs were not written within the polling timeout");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn usage_not_logged_when_response_has_no_usage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "no usage info".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        let reply = process_turn(&state, &cli_context("no-usage"), "hi")
-            .await
-            .expect("process turn");
-        assert_eq!(reply, "no usage info");
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (requests, _input_tokens, _output_tokens, _total_tokens) =
-            call_blocking(Arc::clone(&state.db), move |db| {
-                db.get_llm_usage_summary(None, None, None)
-            })
-            .await
-            .expect("summary");
-
-        assert_eq!(
-            requests, 0,
-            "no usage records should exist when response has no usage"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn turn_uses_agent_llm_resolution() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "agent reply".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        // Act
-        let result = process_turn(&state, &cli_context("agent-llm-test"), "hello")
-            .await
-            .expect("turn");
-
-        // Assert
-        assert_eq!(result, "agent reply");
-        let systems = provider.seen_systems();
-        assert_eq!(systems.len(), 1, "should have exactly one LLM call");
-    }
+    // -----------------------------------------------------------------------
+    // Tool execution strategy
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     #[serial]
@@ -2113,7 +1527,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Channel Context unit tests (Step 5 / 6)
+    // Usage logging
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_logs_llm_usage_on_agent_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello world".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: Some(crate::llm::LlmUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                }),
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+
+        let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "hello world");
+
+        // Verify LLM resolution: exactly one call with the right system prompt.
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 1, "should have exactly one LLM call");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:usage-log-single",
+                Some("usage-log-single"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        // Wait for the spawned logging task to complete
+        for _ in 0..20 {
+            let (requests, input_tokens, output_tokens, total_tokens) =
+                call_blocking(Arc::clone(&state.db), move |db| {
+                    db.get_llm_usage_summary(Some(chat_id), None, None)
+                })
+                .await
+                .expect("summary");
+            if requests > 0 {
+                assert_eq!(requests, 1);
+                assert_eq!(input_tokens, 10);
+                assert_eq!(output_tokens, 20);
+                assert_eq!(total_tokens, 30);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage log was not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_logs_each_iteration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/data.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "checking".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-iter-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 15,
+                        output_tokens: 25,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 30,
+                        output_tokens: 40,
+                    }),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let file_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&file_path, "data").expect("file");
+
+        let reply = process_turn(&state, &cli_context("usage-log-multi"), "read the file")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "done");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:usage-log-multi",
+                Some("usage-log-multi"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        for _ in 0..20 {
+            let (requests, input_tokens, output_tokens, total_tokens) =
+                call_blocking(Arc::clone(&state.db), move |db| {
+                    db.get_llm_usage_summary(Some(chat_id), None, None)
+                })
+                .await
+                .expect("summary");
+            if requests >= 2 {
+                assert_eq!(
+                    requests, 2,
+                    "should have 2 usage records (one per iteration)"
+                );
+                assert_eq!(input_tokens, 45);
+                assert_eq!(output_tokens, 65);
+                assert_eq!(total_tokens, 110);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage logs were not written within the polling timeout");
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel Context unit tests
     // -----------------------------------------------------------------------
 
     /// Helper: build a SurfaceContext with `channel_log_chat_id` set,
@@ -2288,64 +1848,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn channel_context_format() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let log_chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_channel_log_chat_id(55555)
-        })
-        .await
-        .expect("channel log chat");
-        insert_channel_log_message(
-            &state.db,
-            log_chat_id,
-            "cl-fmt",
-            "bob",
-            "hello",
-            false,
-            "2025-01-01T00:00:00Z",
-        );
-
-        let context = multi_agent_context("ctx-format", log_chat_id);
-
-        // Act
-        let _reply = process_turn(&state, &context, "test input")
-            .await
-            .expect("turn");
-
-        // Assert: correct format with header, tags, and sender prefix
-        let seen = provider.seen_messages();
-        let ctx_text = &seen[0][0].content.as_text_lossy();
-        assert!(
-            ctx_text.contains("# Channel Context"),
-            "expected '# Channel Context' header, got: {ctx_text}"
-        );
-        assert!(
-            ctx_text.contains("background observations"),
-            "expected instruction text, got: {ctx_text}"
-        );
-        assert!(
-            ctx_text.contains("<channel-context>\n[bob] hello\n</channel-context>"),
-            "expected proper channel-context formatting, got: {ctx_text}"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn direct_input_wrapped_in_user_message() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2402,39 +1904,71 @@ mod tests {
         );
     }
 
+    /// Verifies that channel context is never injected when `channel_log_chat_id` is None,
+    /// regardless of channel type or session configuration.
     #[tokio::test]
     #[serial]
-    async fn no_channel_context_for_single_agent() {
-        // Arrange: use a regular cli_context (channel_log_chat_id = None)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
+    async fn no_channel_context_without_channel_log_chat_id() {
+        let cases: Vec<(&'static str, SurfaceContext)> = vec![
+            ("cli", cli_context("no-ctx-cli")),
+            ("discord-dm", {
+                let mut ctx = cli_context("no-ctx-dm");
+                ctx.channel = "discord".to_string();
+                ctx
+            }),
+            (
+                "discord-no-mention",
+                SurfaceContext {
+                    channel: "discord".to_string(),
+                    surface_user: "alice".to_string(),
+                    surface_thread: "no-ctx-room".to_string(),
+                    chat_type: "discord".to_string(),
+                    agent_id: "default".to_string(),
+                    channel_log_chat_id: None,
+                    chain_depth: 0,
+                    origin_id: String::new(),
+                },
+            ),
+        ];
 
-        // Act
-        let _reply = process_turn(&state, &cli_context("no-ctx"), "hello")
-            .await
-            .expect("turn");
-
-        // Assert: no channel context in the messages
-        let seen = provider.seen_messages();
-        let messages = &seen[0];
-        for msg in messages {
-            let text = msg.content.as_text_lossy();
-            assert!(
-                !text.contains("<channel-context>"),
-                "single-agent session should not have channel context, but found: {text}"
+        for (label, context) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let provider = RecordingProvider::new(
+                vec![Ok(MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                })],
+                vec![0],
             );
+            let state = build_state_with_provider(
+                dir.path().to_str().expect("utf8").to_string(),
+                Box::new(provider.clone()),
+            );
+
+            let reply = process_turn(&state, &context, "hello").await.expect("turn");
+            assert_eq!(reply, "ok");
+
+            let seen = provider.seen_messages();
+            assert_eq!(seen.len(), 1, "[{label}] should have exactly one LLM call");
+            let user_msgs: Vec<_> = seen[0].iter().filter(|m| m.role == "user").collect();
+            assert_eq!(
+                user_msgs.len(),
+                1,
+                "[{label}] should have exactly one user message"
+            );
+            assert_eq!(
+                user_msgs[0].content.as_text_lossy(),
+                "hello",
+                "[{label}] user message should be the plain input"
+            );
+            for msg in &seen[0] {
+                assert!(
+                    !msg.content.as_text_lossy().contains("<channel-context>"),
+                    "[{label}] should not have channel context"
+                );
+            }
         }
     }
 
@@ -2622,130 +2156,5 @@ mod tests {
             !json.contains("channel-context"),
             "session should not contain channel context"
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn single_agent_regression() {
-        // Arrange: use a regular CLI context (no channel_log_chat_id)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "single agent reply".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        // Act
-        let reply = process_turn(&state, &cli_context("single-regression"), "hello")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "single agent reply");
-
-        // Assert: no channel context injected
-        let seen = provider.seen_messages();
-        assert_eq!(seen.len(), 1, "should have exactly one LLM call");
-        let messages = &seen[0];
-        let user_msgs: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
-        assert_eq!(
-            user_msgs.len(),
-            1,
-            "single-agent should have exactly one user message"
-        );
-        assert_eq!(
-            user_msgs[0].content.as_text_lossy(),
-            "hello",
-            "single-agent user message should be the plain input"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn dm_unchanged() {
-        // Arrange: DM context (no channel_log_chat_id, like a regular CLI session)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "dm reply".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let mut context = cli_context("dm-session");
-        context.channel = "discord".to_string();
-
-        // Act
-        let reply = process_turn(&state, &context, "dm message")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "dm reply");
-
-        // Assert: no channel context (DM = single-agent flow)
-        let seen = provider.seen_messages();
-        for msg in &seen[0] {
-            assert!(
-                !msg.content.as_text_lossy().contains("<channel-context>"),
-                "DM should not have channel context"
-            );
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn multi_room_no_mention_no_channel_context_injection() {
-        // When channel_log_chat_id is None (bot not mentioned in multi-agent room),
-        // no channel context should be injected.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "response".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let context = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "alice".to_string(),
-            surface_thread: "multi-no-mention".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "default".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-        };
-
-        let _reply = process_turn(&state, &context, "unrelated message")
-            .await
-            .expect("turn");
-
-        // Assert: no channel context injected
-        let seen = provider.seen_messages();
-        for msg in &seen[0] {
-            assert!(
-                !msg.content.as_text_lossy().contains("<channel-context>"),
-                "no-mention scenario should not have channel context"
-            );
-        }
     }
 }

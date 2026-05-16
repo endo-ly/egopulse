@@ -745,7 +745,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::agent_loop::SurfaceContext;
-    use crate::agent_loop::turn::{build_state, test_config};
+    use crate::agent_loop::turn::{build_state, build_state_for_config_file, test_config};
     use crate::config::{AgentId, Config};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
@@ -1385,8 +1385,7 @@ agents:
         std::fs::write(&path, yaml).expect("write config");
         let mut config = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
         config.state_root = dir.path().to_string_lossy().into_owned();
-        let mut state = build_state(config, Box::new(NoOpProvider));
-        state.config_path = Some(path.clone());
+        let state = build_state_for_config_file(config, Box::new(NoOpProvider), Some(path.clone()));
         (state, dir, path)
     }
 

@@ -305,12 +305,12 @@ Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_
 
 | 用途 | パス |
 |---|---|
-| 睡眠バッチ本文 | [`src/sleep_batch_prompt.md`](../src/sleep_batch_prompt.md) |
-| セキュリティ・JSON出力契約・入力データ注入 | [`src/sleep_batch.rs`](../src/sleep_batch.rs) |
+| 睡眠バッチ本文 | [`src/sleep/prompt.md`](../src/sleep/prompt.md) |
+| セキュリティ・JSON出力契約・入力データ注入 | [`src/sleep/batch.rs`](../src/sleep/batch.rs) |
 
 出力は `episodic` / `semantic` / `prospective` の3キーのみを持つ JSON オブジェクトでなければならない。追加キーは `parse_sleep_response()` で拒否される。
 
-#### セキュリティ・出力形式（`src/sleep_batch.rs` で追記）
+#### セキュリティ・出力形式（`src/sleep/batch.rs` で追記）
 
 ```markdown
 ## セキュリティ

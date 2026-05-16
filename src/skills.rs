@@ -93,24 +93,6 @@ impl SkillManager {
         }
     }
 
-    /// Backward-compatible constructor using a single skills directory.
-    pub fn from_skills_dir(skills_dir: impl Into<PathBuf>) -> Self {
-        let dir = skills_dir.into();
-        let builtin = dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|root| root.join("skills"))
-            .unwrap_or_else(|| dir.clone());
-        Self {
-            user_skills_dir: dir.clone(),
-            builtin_skills_dir: builtin,
-        }
-    }
-
-    pub fn skills_dir(&self) -> &Path {
-        &self.user_skills_dir
-    }
-
     /// Scan the workspace for available skills, filtering by platform and dependency availability.
     pub fn discover_skills(&self) -> Vec<SkillMetadata> {
         let mut skills_by_name = BTreeMap::new();
@@ -530,7 +512,7 @@ mod tests {
         let skills_dir = dir.path().join("workspace").join("skills");
         create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "pdf");
@@ -545,7 +527,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let skills_dir = dir.path().join("workspace").join("skills");
         create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
 
         let catalog = manager.build_skills_catalog();
         assert!(catalog.contains("<available_skills>"));
@@ -564,7 +546,7 @@ mod tests {
             "Use the resize workflow.",
         );
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
 
         assert_eq!(skills.len(), 2);
@@ -584,7 +566,7 @@ mod tests {
             "Fallback instructions.",
         );
 
-        let manager = SkillManager::from_skills_dir(skills_dir.clone());
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir.clone());
         let loaded = manager.load_skill_checked("pdf").expect("load skill");
 
         assert_eq!(loaded.metadata.dir_path, skills_dir.join("pdf"));
@@ -606,7 +588,7 @@ mod tests {
             "Should not be discovered.",
         );
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
 
         assert_eq!(skills.len(), 1);
@@ -618,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let skills_dir = dir.path().join("workspace").join("skills");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let formatted = manager.list_skills_formatted();
 
         assert_eq!(formatted, "No skills loaded.");
@@ -631,7 +613,7 @@ mod tests {
         create_skill(&skills_dir, "pdf", "Use the PDF workflow.");
         create_skill(&skills_dir, "docx", "Use the DOCX workflow.");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let formatted = manager.list_skills_formatted();
 
         assert!(formatted.starts_with("Available skills:\n"));
@@ -699,7 +681,7 @@ mod tests {
             "---\nname: agentmail\ndescription: AgentMail skill\nrequired_env:\n  - AGENTMAIL_API_KEY\n  - AGENTMAIL_BASE_URL\n---\nInstructions here\n",
         ).expect("write");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
         assert_eq!(skills.len(), 1);
         assert_eq!(
@@ -714,7 +696,7 @@ mod tests {
         let skills_dir = dir.path().join("workspace").join("skills");
         create_skill(&skills_dir, "basic", "No required_env field.");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
         assert_eq!(skills.len(), 1);
         assert!(skills[0].required_env.is_empty());
@@ -732,7 +714,7 @@ mod tests {
         )
         .expect("write");
 
-        let manager = SkillManager::from_skills_dir(skills_dir);
+        let manager = SkillManager::from_dirs(skills_dir.clone(), skills_dir);
         let skills = manager.discover_skills();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].required_env, vec!["SINGLE_KEY"]);

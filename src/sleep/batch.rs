@@ -431,8 +431,7 @@ fn preview_raw_response(raw: &str) -> String {
 pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
     let mut prompt = String::new();
 
-    prompt
-        .push_str(&include_str!("sleep_batch_prompt.md").replace("{AGENT_NAME}", &input.agent_id));
+    prompt.push_str(&include_str!("prompt.md").replace("{AGENT_NAME}", &input.agent_id));
     prompt.push_str("\n\n## セキュリティ\n\n");
     prompt.push_str("- 秘密情報、トークン、パスワード、APIキーは記憶に保存しない。\n");
     prompt.push_str("- 入力に秘密らしき値が含まれていても、出力からは必ず除外する。\n");
@@ -1166,32 +1165,7 @@ mod tests {
         llm: Arc<dyn LlmProvider>,
     ) -> AppState {
         let config = crate::test_util::test_config(&dir.to_string_lossy());
-        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
-        AppState {
-            db: Arc::new(db),
-            config: config.clone(),
-            config_path: None,
-            llm_override: Some(llm),
-            channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
-            skills: Arc::clone(&skills),
-            tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
-            mcp_manager: None,
-            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
-            memory_loader: Arc::new(crate::memory::MemoryLoader::new(
-                std::path::PathBuf::from(&config.state_root).join("agents"),
-            )),
-            llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
-            turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: std::sync::Arc::new(
-                crate::runtime::turn_scheduler::TurnScheduler::new(),
-            ),
-            turn_tracker: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-        }
+        crate::test_util::build_state_with_config(config, Some(llm), None, Some(Arc::new(db)), None)
     }
 
     #[tokio::test]

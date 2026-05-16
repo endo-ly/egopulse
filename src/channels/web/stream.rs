@@ -313,12 +313,13 @@ pub(super) async fn start_stream_run(
             }
         });
 
+        let evt_tx_clone = evt_tx.clone();
         let result = process_turn_with_events(
             &state_for_task.app_state,
             &context_for_task,
             &message,
-            |event| {
-                let _ = evt_tx.send(event);
+            move |event| {
+                let _ = evt_tx_clone.send(event);
             },
         )
         .await;

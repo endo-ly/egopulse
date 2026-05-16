@@ -4,23 +4,21 @@
 //! の各チャネルと設定・ストレージ・エージェント実行基盤をまとめて提供する。
 
 pub mod agent_loop;
-pub mod assets;
-pub mod builtin_skills;
+pub(crate) mod assets;
+pub(crate) mod builtin_skills;
 pub mod channels;
 pub mod config;
 pub mod error;
-pub mod llm;
-pub mod memory;
-pub mod pulse;
+pub(crate) mod llm;
+pub(crate) mod memory;
+pub(crate) mod pulse;
 pub mod runtime;
 pub mod setup;
-pub mod skills;
-pub mod slash_commands;
-pub mod sleep_batch;
-pub mod sleep_scheduler;
-pub mod soul_agents;
+pub(crate) mod skills;
+pub(crate) mod slash_commands;
+pub mod sleep;
 pub mod storage;
-pub mod tools;
+pub(crate) mod tools;
 
 #[cfg(test)]
 mod test_env;

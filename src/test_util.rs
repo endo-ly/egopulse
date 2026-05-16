@@ -11,7 +11,7 @@ use crate::config::{
     secret_ref::ResolvedValue,
 };
 use crate::memory::MemoryLoader;
-use crate::runtime::AppState;
+use crate::runtime::{AppState, AppStateParts};
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
@@ -73,30 +73,38 @@ pub(crate) fn build_state_with_provider(
     llm: Box<dyn crate::llm::LlmProvider>,
 ) -> AppState {
     let config = test_config(state_root);
+    build_state_with_config(config, Some(Arc::from(llm)), None, None, None)
+}
+
+pub(crate) fn build_state_with_config(
+    config: Config,
+    llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
+    config_path: Option<std::path::PathBuf>,
+    db: Option<Arc<Database>>,
+    channels: Option<Arc<ChannelRegistry>>,
+) -> AppState {
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
     ));
-    AppState {
-        db: Arc::new(Database::new(&config.db_path()).expect("db")),
+    AppState::from_parts(AppStateParts {
+        db: db.unwrap_or_else(|| Arc::new(Database::new(&config.db_path()).expect("db"))),
         config: config.clone(),
-        config_path: None,
-        llm_override: Some(Arc::from(llm)),
-        channels: Arc::new(ChannelRegistry::new()),
+        config_path,
+        llm_override,
+        channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
         skills: Arc::clone(&skills),
         tools: Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
+        soul_agents: Arc::new(crate::agent_loop::soul_agents::SoulAgentsLoader::new(
+            &config,
+        )),
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
-        llm_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-        active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
         turn_sender: tokio::sync::mpsc::channel(16).0,
-        turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
-        turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-    }
+    })
 }
 
 /// テスト用 CLI SurfaceContext。
