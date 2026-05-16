@@ -5,7 +5,6 @@
 pub mod gateway;
 pub mod logging;
 pub mod status;
-pub(crate) mod soul_agents;
 pub(crate) mod turn_scheduler;
 
 use std::collections::HashMap;
@@ -31,7 +30,7 @@ use crate::runtime::status::{
     ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
 };
 use crate::skills::SkillManager;
-use crate::runtime::soul_agents::SoulAgentsLoader;
+use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
@@ -816,7 +815,7 @@ async fn write_startup_status(state: &AppState) {
 mod tests {
     use super::*;
     use crate::config::ResolvedLlmConfig;
-    use crate::runtime::soul_agents::SoulAgentsLoader;
+    use crate::agent_loop::soul_agents::SoulAgentsLoader;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
