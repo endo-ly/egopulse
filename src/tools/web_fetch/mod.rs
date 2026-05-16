@@ -269,11 +269,38 @@ impl Tool for WebFetchTool {
 }
 
 fn truncate_to_utf8_boundary(buf: &mut Vec<u8>) {
-    while !buf.is_empty() {
-        if std::str::from_utf8(buf).is_ok() {
-            break;
-        }
-        buf.pop();
+    if buf.is_empty() {
+        return;
+    }
+
+    // Walk backward to find the leading byte of the last UTF-8 sequence.
+    // Continuation bytes have pattern 10xxxxxx (top 2 bits = 0b10).
+    let mut leading_pos = buf.len() - 1;
+    while leading_pos > 0 && (buf[leading_pos] >> 6) == 0b10 {
+        leading_pos -= 1;
+    }
+
+    let leading = buf[leading_pos];
+    if (leading >> 6) == 0b10 {
+        // Entire buffer is continuation bytes — unrecoverable.
+        buf.clear();
+        return;
+    }
+
+    let expected_len = if leading < 0x80 {
+        1
+    } else if (leading & 0xE0) == 0xC0 {
+        2
+    } else if (leading & 0xF0) == 0xE0 {
+        3
+    } else if (leading & 0xF8) == 0xF0 {
+        4
+    } else {
+        return;
+    };
+
+    if buf.len() - leading_pos < expected_len {
+        buf.truncate(leading_pos);
     }
 }
 

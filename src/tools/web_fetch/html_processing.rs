@@ -65,7 +65,7 @@ pub(crate) fn process_response_body(body: &str, content_type: Option<&str>) -> S
 
 fn is_html_content(content_type: Option<&str>) -> bool {
     match content_type {
-        Some(ct) => ct.contains("text/html"),
+        Some(ct) => ct.to_ascii_lowercase().contains("text/html"),
         None => true,
     }
 }
