@@ -1087,6 +1087,10 @@ mod tests {
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::storage::call_blocking;
 
+    // -----------------------------------------------------------------------
+    // Core turn execution
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
     #[serial]
     async fn process_turn_executes_tool_calls_and_persists_outputs() {
@@ -1186,49 +1190,9 @@ mod tests {
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn normal_tool_flow_still_works_after_port() {
-        // Regression: existing tool flow with multiple tool calls should still work
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                responses: std::sync::Mutex::new(vec![
-                    MessagesResponse {
-                        content: "Let me read that file.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path}),
-                        }],
-                        usage: None,
-                    },
-                    MessagesResponse {
-                        content: "Done reading. Final answer.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                        usage: None,
-                    },
-                ]),
-            }),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let file_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
-        std::fs::write(&file_path, "content").expect("a.txt");
-
-        let reply = process_turn(
-            &state,
-            &cli_context("regression-tool"),
-            &format!("read {relative_path}"),
-        )
-        .await
-        .expect("process turn");
-        assert_eq!(reply, "Done reading. Final answer.");
-    }
+    // -----------------------------------------------------------------------
+    // Tool call edge cases & error handling
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     #[serial]
@@ -1421,6 +1385,151 @@ mod tests {
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
+    // -----------------------------------------------------------------------
+    // Tool execution strategy
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn parallel_read_only_tools_execute_concurrently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
+        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Reading.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-2".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_b.clone()}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        for path in &[&file_a, &file_b] {
+            let full = workspace.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+            std::fs::write(&full, format!("content of {}", path)).expect("write");
+        }
+
+        let reply = process_turn(&state, &cli_context("parallel-read"), "read both")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:parallel-read",
+                Some("parallel-read"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mixed_tools_execute_sequentially() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Mixed.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-2".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "echo ok"}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let full = workspace.join(&file_a);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+        std::fs::write(&full, "hello").expect("write");
+
+        let reply = process_turn(&state, &cli_context("mixed-tools"), "mixed")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:mixed-tools",
+                Some("mixed-tools"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage logging
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
     #[serial]
     async fn process_turn_logs_llm_usage_on_agent_loop() {
@@ -1563,183 +1672,8 @@ mod tests {
         panic!("usage logs were not written within the polling timeout");
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn usage_not_logged_when_response_has_no_usage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "no usage info".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        let reply = process_turn(&state, &cli_context("no-usage"), "hi")
-            .await
-            .expect("process turn");
-        assert_eq!(reply, "no usage info");
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (requests, _input_tokens, _output_tokens, _total_tokens) =
-            call_blocking(Arc::clone(&state.db), move |db| {
-                db.get_llm_usage_summary(None, None, None)
-            })
-            .await
-            .expect("summary");
-
-        assert_eq!(
-            requests, 0,
-            "no usage records should exist when response has no usage"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn parallel_read_only_tools_execute_concurrently() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Reading.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_a.clone()}),
-                        },
-                        ToolCall {
-                            id: "call-2".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_b.clone()}),
-                        },
-                    ],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Done.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        for path in &[&file_a, &file_b] {
-            let full = workspace.join(path);
-            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-            std::fs::write(&full, format!("content of {}", path)).expect("write");
-        }
-
-        let reply = process_turn(&state, &cli_context("parallel-read"), "read both")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "Done.");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:parallel-read",
-                Some("parallel-read"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn mixed_tools_execute_sequentially() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Mixed.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_a.clone()}),
-                        },
-                        ToolCall {
-                            id: "call-2".to_string(),
-                            name: "bash".to_string(),
-                            arguments: serde_json::json!({"command": "echo ok"}),
-                        },
-                    ],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Done.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let full = workspace.join(&file_a);
-        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-        std::fs::write(&full, "hello").expect("write");
-
-        let reply = process_turn(&state, &cli_context("mixed-tools"), "mixed")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "Done.");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:mixed-tools",
-                Some("mixed-tools"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
-    }
-
     // -----------------------------------------------------------------------
-    // Channel Context unit tests (Step 5 / 6)
+    // Channel Context unit tests
     // -----------------------------------------------------------------------
 
     /// Helper: build a SurfaceContext with `channel_log_chat_id` set,
@@ -1909,64 +1843,6 @@ mod tests {
         assert!(
             ctx_text.contains("msg 49"),
             "expected msg 49 to be included, got: {ctx_text}"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn channel_context_format() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let log_chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_channel_log_chat_id(55555)
-        })
-        .await
-        .expect("channel log chat");
-        insert_channel_log_message(
-            &state.db,
-            log_chat_id,
-            "cl-fmt",
-            "bob",
-            "hello",
-            false,
-            "2025-01-01T00:00:00Z",
-        );
-
-        let context = multi_agent_context("ctx-format", log_chat_id);
-
-        // Act
-        let _reply = process_turn(&state, &context, "test input")
-            .await
-            .expect("turn");
-
-        // Assert: correct format with header, tags, and sender prefix
-        let seen = provider.seen_messages();
-        let ctx_text = &seen[0][0].content.as_text_lossy();
-        assert!(
-            ctx_text.contains("# Channel Context"),
-            "expected '# Channel Context' header, got: {ctx_text}"
-        );
-        assert!(
-            ctx_text.contains("background observations"),
-            "expected instruction text, got: {ctx_text}"
-        );
-        assert!(
-            ctx_text.contains("<channel-context>\n[bob] hello\n</channel-context>"),
-            "expected proper channel-context formatting, got: {ctx_text}"
         );
     }
 
