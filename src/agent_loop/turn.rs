@@ -1536,13 +1536,17 @@ mod tests {
         );
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
+            Box::new(provider.clone()),
         );
 
         let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
             .await
             .expect("process turn");
         assert_eq!(reply, "hello world");
+
+        // Verify LLM resolution: exactly one call with the right system prompt.
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 1, "should have exactly one LLM call");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
@@ -1692,36 +1696,6 @@ mod tests {
             requests, 0,
             "no usage records should exist when response has no usage"
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn turn_uses_agent_llm_resolution() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "agent reply".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        // Act
-        let result = process_turn(&state, &cli_context("agent-llm-test"), "hello")
-            .await
-            .expect("turn");
-
-        // Assert
-        assert_eq!(result, "agent reply");
-        let systems = provider.seen_systems();
-        assert_eq!(systems.len(), 1, "should have exactly one LLM call");
     }
 
     #[tokio::test]
@@ -2151,39 +2125,71 @@ mod tests {
         );
     }
 
+    /// Verifies that channel context is never injected when `channel_log_chat_id` is None,
+    /// regardless of channel type or session configuration.
     #[tokio::test]
     #[serial]
-    async fn no_channel_context_for_single_agent() {
-        // Arrange: use a regular cli_context (channel_log_chat_id = None)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
+    async fn no_channel_context_without_channel_log_chat_id() {
+        let cases: Vec<(&'static str, SurfaceContext)> = vec![
+            ("cli", cli_context("no-ctx-cli")),
+            ("discord-dm", {
+                let mut ctx = cli_context("no-ctx-dm");
+                ctx.channel = "discord".to_string();
+                ctx
+            }),
+            ("discord-no-mention", SurfaceContext {
+                channel: "discord".to_string(),
+                surface_user: "alice".to_string(),
+                surface_thread: "no-ctx-room".to_string(),
+                chat_type: "discord".to_string(),
+                agent_id: "default".to_string(),
+                channel_log_chat_id: None,
+                chain_depth: 0,
+                origin_id: String::new(),
+            }),
+        ];
 
-        // Act
-        let _reply = process_turn(&state, &cli_context("no-ctx"), "hello")
-            .await
-            .expect("turn");
-
-        // Assert: no channel context in the messages
-        let seen = provider.seen_messages();
-        let messages = &seen[0];
-        for msg in messages {
-            let text = msg.content.as_text_lossy();
-            assert!(
-                !text.contains("<channel-context>"),
-                "single-agent session should not have channel context, but found: {text}"
+        for (label, context) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let provider = RecordingProvider::new(
+                vec![Ok(MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                })],
+                vec![0],
             );
+            let state = build_state_with_provider(
+                dir.path().to_str().expect("utf8").to_string(),
+                Box::new(provider.clone()),
+            );
+
+            let reply = process_turn(&state, &context, "hello")
+                .await
+                .expect("turn");
+            assert_eq!(reply, "ok");
+
+            let seen = provider.seen_messages();
+            assert_eq!(seen.len(), 1, "[{label}] should have exactly one LLM call");
+            let user_msgs: Vec<_> =
+                seen[0].iter().filter(|m| m.role == "user").collect();
+            assert_eq!(
+                user_msgs.len(),
+                1,
+                "[{label}] should have exactly one user message"
+            );
+            assert_eq!(
+                user_msgs[0].content.as_text_lossy(),
+                "hello",
+                "[{label}] user message should be the plain input"
+            );
+            for msg in &seen[0] {
+                assert!(
+                    !msg.content.as_text_lossy().contains("<channel-context>"),
+                    "[{label}] should not have channel context"
+                );
+            }
         }
     }
 
@@ -2373,128 +2379,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn single_agent_regression() {
-        // Arrange: use a regular CLI context (no channel_log_chat_id)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "single agent reply".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        // Act
-        let reply = process_turn(&state, &cli_context("single-regression"), "hello")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "single agent reply");
-
-        // Assert: no channel context injected
-        let seen = provider.seen_messages();
-        assert_eq!(seen.len(), 1, "should have exactly one LLM call");
-        let messages = &seen[0];
-        let user_msgs: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
-        assert_eq!(
-            user_msgs.len(),
-            1,
-            "single-agent should have exactly one user message"
-        );
-        assert_eq!(
-            user_msgs[0].content.as_text_lossy(),
-            "hello",
-            "single-agent user message should be the plain input"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn dm_unchanged() {
-        // Arrange: DM context (no channel_log_chat_id, like a regular CLI session)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "dm reply".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let mut context = cli_context("dm-session");
-        context.channel = "discord".to_string();
-
-        // Act
-        let reply = process_turn(&state, &context, "dm message")
-            .await
-            .expect("turn");
-        assert_eq!(reply, "dm reply");
-
-        // Assert: no channel context (DM = single-agent flow)
-        let seen = provider.seen_messages();
-        for msg in &seen[0] {
-            assert!(
-                !msg.content.as_text_lossy().contains("<channel-context>"),
-                "DM should not have channel context"
-            );
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn multi_room_no_mention_no_channel_context_injection() {
-        // When channel_log_chat_id is None (bot not mentioned in multi-agent room),
-        // no channel context should be injected.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "response".to_string(),
-                reasoning_content: None,
-                tool_calls: vec![],
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-
-        let context = SurfaceContext {
-            channel: "discord".to_string(),
-            surface_user: "alice".to_string(),
-            surface_thread: "multi-no-mention".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "default".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-        };
-
-        let _reply = process_turn(&state, &context, "unrelated message")
-            .await
-            .expect("turn");
-
-        // Assert: no channel context injected
-        let seen = provider.seen_messages();
-        for msg in &seen[0] {
-            assert!(
-                !msg.content.as_text_lossy().contains("<channel-context>"),
-                "no-mention scenario should not have channel context"
-            );
-        }
-    }
 }
