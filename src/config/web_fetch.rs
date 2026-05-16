@@ -90,6 +90,8 @@ impl WebFetchConfig {
     /// * Fills `allowed_schemes` with `["https"]` when empty.
     /// * Lowercases / trims hosts in denylist/allowlist (handles `*.prefix`).
     /// * Falls back to defaults for zero-valued numeric fields.
+    /// * Ensures `content_validation.max_scan_bytes >= max_output_bytes` so that
+    ///   prompt-injection scanning covers the entire output body.
     pub(crate) fn normalize(mut self) -> Self {
         if self.allowed_schemes.is_empty() {
             self.allowed_schemes = DEFAULT_ALLOWED_SCHEMES
@@ -109,6 +111,9 @@ impl WebFetchConfig {
         }
         if self.timeout_secs == 0 {
             self.timeout_secs = DEFAULT_TIMEOUT_SECS;
+        }
+        if self.content_validation.max_scan_bytes < self.max_output_bytes {
+            self.content_validation.max_scan_bytes = self.max_output_bytes;
         }
 
         self
@@ -261,5 +266,38 @@ timeout_secs: 30
         assert_eq!(normalized.max_fetch_bytes, 100_000);
         assert_eq!(normalized.max_output_bytes, 50_000);
         assert_eq!(normalized.timeout_secs, 30);
+    }
+
+    #[test]
+    fn config_normalize_raises_max_scan_bytes_to_max_output_bytes() {
+        let yaml = r#"
+max_output_bytes: 200000
+content_validation:
+  max_scan_bytes: 10000
+"#;
+        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.max_output_bytes, 200_000);
+        assert_eq!(cfg.content_validation.max_scan_bytes, 10_000);
+
+        let normalized = cfg.normalize();
+
+        assert_eq!(normalized.max_output_bytes, 200_000);
+        assert_eq!(
+            normalized.content_validation.max_scan_bytes, 200_000,
+            "max_scan_bytes must be raised to max_output_bytes"
+        );
+    }
+
+    #[test]
+    fn config_normalize_preserves_max_scan_bytes_when_already_sufficient() {
+        let yaml = r#"
+max_output_bytes: 50000
+content_validation:
+  max_scan_bytes: 100000
+"#;
+        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
+        let normalized = cfg.normalize();
+
+        assert_eq!(normalized.content_validation.max_scan_bytes, 100_000);
     }
 }

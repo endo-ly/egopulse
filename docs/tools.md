@@ -388,7 +388,7 @@ Environment variables:
 - 入力:
   - `url: string` 必須
   - `timeout_secs: integer` 任意。既定値は設定ファイル参照
-  - `max_output_bytes: integer` 任意。既定値は設定ファイル参照（デフォルト 64KB）
+  - `max_output_bytes: integer` 任意。本文の最大バイト数（warning は上限外、デフォルト 64KB）
 - 挙動:
   - URL scheme 検証（デフォルト HTTPS のみ許可）
   - Host denylist/allowlist チェック
@@ -405,7 +405,7 @@ Environment variables:
 - `details`:
   - `final_url` (リダイレクト後の最終URL)
   - `content_type`
-  - `content_length` (Content-Length ヘッダの値、無い場合は省略)
+  - `content_length` (Content-Length ヘッダの値、無い場合は `null`)
   - `fetched_bytes` (実際に取得したバイト数)
   - `response_truncated` (fetch上限で打ち切ったか)
   - `output_truncated` (出力上限で切ったか)
