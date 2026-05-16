@@ -168,8 +168,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 | external_chat_id | TEXT | nullable | 外部プラットフォームのチャットID |
 | agent_id | TEXT | NOT NULL DEFAULT 'lyre' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紐付けに使用 |
 
-> **注意**: `agent_id` のデフォルト値はマイグレーションで `'lyre'` にハードコードされている（v4）。`config.default_agent` のデフォルト（`"default"`）とは独立。新規インストールで `default` エージェントのみを使用している場合、既存レコードの `agent_id` は `'lyre'` になるため、明示的に `default` に更新するか、エージェント定義に `lyre` を追加する必要がある。
-
 **操作**:
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
 - `resolve_or_create_chat_id(channel, external_chat_id, chat_title, chat_type)` — Upsert（`ON CONFLICT DO UPDATE`）
