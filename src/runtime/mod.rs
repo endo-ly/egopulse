@@ -91,9 +91,55 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
+    _sealed: (),
+}
+
+pub(crate) struct AppStateParts {
+    pub(crate) db: Arc<Database>,
+    pub(crate) config: Config,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
+    pub(crate) channels: Arc<ChannelRegistry>,
+    pub(crate) skills: Arc<SkillManager>,
+    pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
+    pub(crate) assets: Arc<AssetStore>,
+    pub(crate) soul_agents: Arc<SoulAgentsLoader>,
+    pub(crate) memory_loader: Arc<MemoryLoader>,
+    pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
+}
+
+struct AppStateDependencies {
+    db: Arc<Database>,
+    assets: Arc<AssetStore>,
+    skills: Arc<SkillManager>,
+    soul_agents: Arc<SoulAgentsLoader>,
+    memory_loader: Arc<MemoryLoader>,
 }
 
 impl AppState {
+    pub(crate) fn from_parts(parts: AppStateParts) -> Self {
+        Self {
+            db: parts.db,
+            config: parts.config,
+            config_path: parts.config_path,
+            llm_override: parts.llm_override,
+            channels: parts.channels,
+            skills: parts.skills,
+            tools: parts.tools,
+            mcp_manager: parts.mcp_manager,
+            assets: parts.assets,
+            soul_agents: parts.soul_agents,
+            memory_loader: parts.memory_loader,
+            llm_cache: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(ActiveTurnTracker::new()),
+            turn_sender: parts.turn_sender,
+            turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
+            turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
+            _sealed: (),
+        }
+    }
+
     /// 現在の設定スナップショットを返す。
     pub fn current_config(&self) -> Arc<Config> {
         Arc::new(self.config.clone())
@@ -147,18 +193,7 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
-    let db = Arc::new(Database::new(&config.db_path())?);
-    let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
-
-    if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
-    {
-        tracing::warn!("failed to expand built-in skills: {error}");
-    }
-
-    let skills = Arc::new(SkillManager::from_dirs(
-        config.user_skills_dir()?,
-        config.skills_dir()?,
-    ));
+    let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
@@ -179,7 +214,7 @@ pub async fn build_app_state_with_path(
     }
 
     let channels = Arc::new(channels);
-    let mut tools = ToolRegistry::new(&config, Arc::clone(&skills));
+    let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
 
     let workspace_dir = config.workspace_dir()?;
     let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
@@ -190,7 +225,7 @@ pub async fn build_app_state_with_path(
     tools.register_tool(Box::new(crate::tools::SendMessageTool::new(
         workspace_dir.clone(),
         Arc::clone(&channels),
-        Arc::clone(&db),
+        Arc::clone(&deps.db),
     )));
 
     let (turn_sender, turn_receiver) =
@@ -200,40 +235,27 @@ pub async fn build_app_state_with_path(
     if !config.discord_bots().is_empty() {
         tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
             config.agents.clone(),
-            Arc::clone(&db),
+            Arc::clone(&deps.db),
             Arc::clone(&channels),
         )));
     }
 
     let tools = Arc::new(tools);
 
-    let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
-    if let Err(error) = soul_agents.provision_default_soul() {
-        tracing::warn!("failed to provision default SOUL.md: {error}");
-    }
-
-    let memory_loader = Arc::new(MemoryLoader::new(
-        PathBuf::from(&config.state_root).join("agents"),
-    ));
-
-    let state = AppState {
-        db,
+    let state = AppState::from_parts(AppStateParts {
+        db: deps.db,
         config,
         config_path,
         llm_override: None,
         channels,
-        skills,
+        skills: deps.skills,
         tools,
         mcp_manager: Some(mcp_arc),
-        assets,
-        soul_agents,
-        memory_loader,
-        llm_cache: Arc::new(Mutex::new(HashMap::new())),
-        active_turns: Arc::new(ActiveTurnTracker::new()),
+        assets: deps.assets,
+        soul_agents: deps.soul_agents,
+        memory_loader: deps.memory_loader,
         turn_sender,
-        turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
-        turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
-    };
+    });
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);
 
@@ -248,6 +270,35 @@ pub fn build_sleep_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
+    let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
+    let channels = Arc::new(ChannelRegistry::new());
+    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&deps.skills)));
+
+    Ok(AppState::from_parts(AppStateParts {
+        db: deps.db,
+        config,
+        config_path,
+        llm_override: None,
+        channels,
+        skills: deps.skills,
+        tools,
+        mcp_manager: None,
+        assets: deps.assets,
+        soul_agents: deps.soul_agents,
+        memory_loader: deps.memory_loader,
+        turn_sender: tokio::sync::mpsc::channel(16).0,
+    }))
+}
+
+enum ProvisionDefaultSoul {
+    Yes,
+    No,
+}
+
+fn build_app_state_dependencies(
+    config: &Config,
+    provision_default_soul: ProvisionDefaultSoul,
+) -> Result<AppStateDependencies, EgoPulseError> {
     let db = Arc::new(Database::new(&config.db_path())?);
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
 
@@ -260,30 +311,22 @@ pub fn build_sleep_app_state_with_path(
         config.user_skills_dir()?,
         config.skills_dir()?,
     ));
-    let channels = Arc::new(ChannelRegistry::new());
-    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&skills)));
-    let soul_agents = Arc::new(SoulAgentsLoader::new(&config));
+    let soul_agents = Arc::new(SoulAgentsLoader::new(config));
+    if matches!(provision_default_soul, ProvisionDefaultSoul::Yes) {
+        if let Err(error) = soul_agents.provision_default_soul() {
+            tracing::warn!("failed to provision default SOUL.md: {error}");
+        }
+    }
     let memory_loader = Arc::new(MemoryLoader::new(
         PathBuf::from(&config.state_root).join("agents"),
     ));
 
-    Ok(AppState {
+    Ok(AppStateDependencies {
         db,
-        config,
-        config_path,
-        llm_override: None,
-        channels,
-        skills,
-        tools,
-        mcp_manager: None,
         assets,
+        skills,
         soul_agents,
         memory_loader,
-        llm_cache: Arc::new(Mutex::new(HashMap::new())),
-        active_turns: Arc::new(ActiveTurnTracker::new()),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
-        turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
-        turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
     })
 }
 

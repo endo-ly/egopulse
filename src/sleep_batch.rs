@@ -1166,32 +1166,7 @@ mod tests {
         llm: Arc<dyn LlmProvider>,
     ) -> AppState {
         let config = crate::test_util::test_config(&dir.to_string_lossy());
-        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
-        AppState {
-            db: Arc::new(db),
-            config: config.clone(),
-            config_path: None,
-            llm_override: Some(llm),
-            channels: Arc::new(crate::channels::adapter::ChannelRegistry::new()),
-            skills: Arc::clone(&skills),
-            tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
-            mcp_manager: None,
-            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
-            memory_loader: Arc::new(crate::memory::MemoryLoader::new(
-                std::path::PathBuf::from(&config.state_root).join("agents"),
-            )),
-            llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            active_turns: std::sync::Arc::new(crate::runtime::ActiveTurnTracker::new()),
-            turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: std::sync::Arc::new(
-                crate::runtime::turn_scheduler::TurnScheduler::new(),
-            ),
-            turn_tracker: std::sync::Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-        }
+        crate::test_util::build_state_with_config(config, Some(llm), None, Some(Arc::new(db)), None)
     }
 
     #[tokio::test]

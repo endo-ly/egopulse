@@ -329,34 +329,17 @@ mod tests {
             }
         }
 
-        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
         let mut channels = crate::channels::adapter::ChannelRegistry::new();
         channels.register(Arc::new(MockChannelAdapter("discord")));
         channels.register(Arc::new(MockChannelAdapter("telegram")));
 
-        AppState {
-            db: Arc::new(Database::new(&config.db_path()).expect("db")),
-            config: config.clone(),
-            config_path: None,
-            llm_override: Some(Arc::new(MockPulseLlm::new())),
-            channels: Arc::new(channels),
-            skills: Arc::clone(&skills),
-            tools: Arc::new(crate::tools::ToolRegistry::new(&config, skills)),
-            mcp_manager: None,
-            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
-            memory_loader: Arc::new(crate::memory::MemoryLoader::new(
-                std::path::PathBuf::from(&config.state_root).join("agents"),
-            )),
-            llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
-            turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
-            turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-        }
+        crate::test_util::build_state_with_config(
+            config.clone(),
+            Some(Arc::new(MockPulseLlm::new())),
+            None,
+            Some(Arc::new(Database::new(&config.db_path()).expect("db"))),
+            Some(Arc::new(channels)),
+        )
     }
 
     fn enabled_pulse_config() -> PulseConfig {

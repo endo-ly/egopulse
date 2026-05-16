@@ -358,9 +358,7 @@ mod tests {
     use super::*;
     use crate::channels::adapter::{ChannelAdapter, ChannelRegistry, ConversationKind};
     use crate::pulse::runner::ToolPhase;
-    use crate::skills::SkillManager;
     use crate::storage::Database;
-    use crate::tools::ToolRegistry;
     use std::sync::Arc;
 
     #[test]
@@ -437,30 +435,7 @@ mod tests {
         let state_root = dir.path().to_str().expect("utf8").to_string();
         let config = crate::test_util::test_config(&state_root);
         let db = Arc::new(Database::new(&config.db_path()).expect("db"));
-        let skills = Arc::new(SkillManager::from_dirs(
-            config.user_skills_dir().expect("user_skills_dir"),
-            config.skills_dir().expect("skills_dir"),
-        ));
-        AppState {
-            db,
-            config: config.clone(),
-            config_path: None,
-            llm_override: None,
-            channels,
-            skills: Arc::clone(&skills),
-            tools: Arc::new(ToolRegistry::new(&config, skills)),
-            mcp_manager: None,
-            assets: Arc::new(crate::assets::AssetStore::new(&config.assets_dir()).expect("assets")),
-            soul_agents: Arc::new(crate::soul_agents::SoulAgentsLoader::new(&config)),
-            memory_loader: Arc::new(crate::memory::MemoryLoader::new(
-                std::path::PathBuf::from(&state_root).join("agents"),
-            )),
-            llm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            active_turns: Arc::new(crate::runtime::ActiveTurnTracker::new()),
-            turn_sender: tokio::sync::mpsc::channel(16).0,
-            turn_scheduler: Arc::new(crate::runtime::turn_scheduler::TurnScheduler::new()),
-            turn_tracker: Arc::new(crate::runtime::turn_scheduler::TurnTracker::new()),
-        }
+        crate::test_util::build_state_with_config(config, None, None, Some(db), Some(channels))
     }
 
     fn test_intention(id: &str) -> TemporalIntention {
