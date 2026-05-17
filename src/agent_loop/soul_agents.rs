@@ -11,11 +11,9 @@ struct CachedContent {
 }
 
 pub(crate) struct SoulAgentsLoader {
-    state_root: PathBuf,
     soul_path: PathBuf,
     agents_path: PathBuf,
     agents_dir: PathBuf,
-    souls_dir: PathBuf,
     soul_cache: Mutex<Option<CachedContent>>,
     agents_cache: Mutex<Option<CachedContent>>,
 }
@@ -23,25 +21,26 @@ pub(crate) struct SoulAgentsLoader {
 impl SoulAgentsLoader {
     pub(crate) fn new(config: &crate::config::Config) -> Self {
         Self {
-            state_root: PathBuf::from(&config.state_root),
             soul_path: config.soul_path(),
             agents_path: config.agents_path(),
             agents_dir: PathBuf::from(&config.state_root).join("agents"),
-            souls_dir: config.souls_dir(),
             soul_cache: Mutex::new(None),
             agents_cache: Mutex::new(None),
         }
     }
 
-    /// Agent SOUL → channel soul_path → global SOUL.md
+    /// Agent SOUL → global SOUL.md
     pub(crate) fn load_soul(
         &self,
         _channel: &str,
         _thread: &str,
-        channel_soul_path: Option<&str>,
         agent_id: Option<&str>,
     ) -> Option<String> {
-        self.load_base_soul(channel_soul_path, agent_id)
+        if let Some(content) = agent_id.and_then(|id| self.read_agent_file(id, "SOUL.md")) {
+            return Some(content);
+        }
+
+        Self::cached_read_trimmed(&self.soul_path, &self.soul_cache)
     }
 
     fn read_agent_file(&self, agent_id: &str, file_name: &str) -> Option<String> {
@@ -67,44 +66,6 @@ impl SoulAgentsLoader {
             });
         }
         Some(content)
-    }
-
-    fn load_base_soul(
-        &self,
-        channel_soul_path: Option<&str>,
-        agent_id: Option<&str>,
-    ) -> Option<String> {
-        if let Some(content) = agent_id.and_then(|id| self.read_agent_file(id, "SOUL.md")) {
-            return Some(content);
-        }
-
-        if let Some(soul_path) = channel_soul_path {
-            let candidates = self.resolve_soul_path(soul_path);
-            for candidate in candidates {
-                if let Some(content) = read_trimmed(&candidate) {
-                    return Some(content);
-                }
-            }
-        }
-
-        Self::cached_read_trimmed(&self.soul_path, &self.soul_cache)
-    }
-
-    /// 相対パスを解決する。
-    /// - まず souls/ から探す
-    /// - 次に state_root から探す
-    fn resolve_soul_path(&self, path: &str) -> Vec<PathBuf> {
-        let p = Path::new(path);
-        if p.is_absolute() {
-            return vec![p.to_path_buf()];
-        }
-
-        vec![
-            self.souls_dir.join(format!("{path}.md")),
-            self.souls_dir.join(path),
-            self.state_root.join(format!("{path}.md")),
-            self.state_root.join(path),
-        ]
     }
 
     /// グローバル AGENTS.md を読み込む
@@ -178,11 +139,9 @@ mod tests {
 
     fn make_loader(dir: &Path) -> SoulAgentsLoader {
         SoulAgentsLoader {
-            state_root: dir.to_path_buf(),
             soul_path: dir.join("SOUL.md"),
             agents_path: dir.join("AGENTS.md"),
             agents_dir: dir.join("agents"),
-            souls_dir: dir.join("souls"),
             soul_cache: Mutex::new(None),
             agents_cache: Mutex::new(None),
         }
@@ -201,7 +160,7 @@ mod tests {
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "I am a helpful assistant.");
 
-        let result = loader.load_soul("web", "t1", None, None);
+        let result = loader.load_soul("web", "t1", None);
         assert_eq!(result, Some("I am a helpful assistant.".to_string()));
     }
 
@@ -210,7 +169,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
-        let result = loader.load_soul("web", "t1", None, None);
+        let result = loader.load_soul("web", "t1", None);
         assert_eq!(result, None);
     }
 
@@ -220,7 +179,7 @@ mod tests {
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "   \n\n  ");
 
-        let result = loader.load_soul("web", "t1", None, None);
+        let result = loader.load_soul("web", "t1", None);
         assert_eq!(result, None);
     }
 
@@ -255,7 +214,7 @@ mod tests {
         let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
         write_file(&chat_soul, "Chat-specific soul");
 
-        let result = loader.load_soul("web", "thread1", None, None);
+        let result = loader.load_soul("web", "thread1", None);
         assert_eq!(result, Some("Global soul".to_string()));
     }
 
@@ -264,82 +223,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
-        let result = loader.load_soul("web", "thread1", None, None);
+        let result = loader.load_soul("web", "thread1", None);
         assert_eq!(result, None);
     }
 
-    // --- resolve_soul_path tests ---
+    // --- global soul fallback tests ---
 
     #[test]
-    fn resolve_soul_path_absolute_uses_as_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.resolve_soul_path("/absolute/path");
-        assert_eq!(result, vec![PathBuf::from("/absolute/path")]);
-    }
-
-    #[test]
-    fn resolve_soul_path_relative_resolves_from_souls_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.resolve_soul_path("friendly");
-        assert_eq!(result[0], dir.path().join("souls/friendly.md"));
-    }
-
-    #[test]
-    fn resolve_soul_path_relative_resolves_from_state_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.resolve_soul_path("friendly");
-        assert_eq!(result[2], dir.path().join("friendly.md"));
-    }
-
-    // --- channel_soul_path fallback tests ---
-
-    #[test]
-    fn load_soul_prefers_channel_soul_over_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("SOUL.md"), "Default soul");
-        write_file(&dir.path().join("souls/custom.md"), "Custom channel soul");
-
-        let result = loader.load_soul("web", "t1", Some("custom"), None);
-        assert_eq!(result, Some("Custom channel soul".to_string()));
-    }
-
-    #[test]
-    fn load_soul_falls_back_to_default_when_channel_soul_missing() {
+    fn load_soul_falls_back_to_global_when_no_agent_soul() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "Default soul");
 
-        let result = loader.load_soul("web", "t1", Some("nonexistent"), None);
+        let result = loader.load_soul("web", "t1", None);
         assert_eq!(result, Some("Default soul".to_string()));
+    }
+
+    #[test]
+    fn load_soul_returns_none_when_nothing_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        let result = loader.load_soul("web", "t1", None);
+        assert_eq!(result, None);
     }
 
     // --- agent_id tests ---
 
     #[test]
-    fn load_soul_agent_id_falls_through_when_no_agent_soul() {
+    fn load_soul_agent_id_falls_through_to_global() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
-        write_file(&dir.path().join("SOUL.md"), "Default soul");
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
 
-        let result = loader.load_soul("web", "t1", None, Some("user1"));
-        assert_eq!(result, Some("Default soul".to_string()));
-    }
-
-    #[test]
-    fn load_soul_agent_id_falls_through_to_channel() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("souls/custom.md"), "Custom soul");
-
-        let result = loader.load_soul("web", "t1", Some("custom"), Some("user1"));
-        assert_eq!(result, Some("Custom soul".to_string()));
+        let result = loader.load_soul("web", "t1", Some("user1"));
+        assert_eq!(result, Some("Global soul".to_string()));
     }
 
     // --- build_soul_section tests ---
@@ -422,7 +340,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
-        let result = loader.load_soul("web", "t1", None, Some("../etc"));
+        let result = loader.load_soul("web", "t1", Some("../etc"));
         assert_eq!(result, None);
     }
 
@@ -430,36 +348,20 @@ mod tests {
     fn load_soul_rejects_parent_dir_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
-        assert!(
-            loader
-                .load_soul("../../../etc", "thread", None, None)
-                .is_none()
-        );
+        assert!(loader.load_soul("../../../etc", "thread", None).is_none());
     }
 
     // --- agent-specific SOUL/AGENTS tests ---
 
     #[test]
-    fn load_soul_prefers_agent_soul() {
+    fn load_soul_agent_soul_overrides_global() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("agents/alice/SOUL.md"), "Alice soul");
         write_file(&dir.path().join("SOUL.md"), "Global soul");
-        write_file(&dir.path().join("souls/custom.md"), "Custom soul");
 
-        let result = loader.load_soul("web", "t1", Some("custom"), Some("alice"));
+        let result = loader.load_soul("web", "t1", Some("alice"));
         assert_eq!(result, Some("Alice soul".to_string()));
-    }
-
-    #[test]
-    fn load_soul_falls_back_to_channel_soul_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("souls/custom.md"), "Custom soul");
-        write_file(&dir.path().join("SOUL.md"), "Global soul");
-
-        let result = loader.load_soul("web", "t1", Some("custom"), Some("alice"));
-        assert_eq!(result, Some("Custom soul".to_string()));
     }
 
     #[test]
@@ -468,7 +370,7 @@ mod tests {
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("SOUL.md"), "Global soul");
 
-        let result = loader.load_soul("web", "t1", None, Some("alice"));
+        let result = loader.load_soul("web", "t1", Some("alice"));
         assert_eq!(result, Some("Global soul".to_string()));
     }
 
@@ -502,7 +404,7 @@ mod tests {
             "Chat agents",
         );
 
-        let soul = loader.load_soul("web", "thread1", None, None);
+        let soul = loader.load_soul("web", "thread1", None);
         assert_eq!(soul, Some("Global soul".to_string()));
 
         let agents = loader.build_agents_section("web", "thread1", None);
@@ -514,26 +416,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
+        assert!(loader.load_soul("web", "t1", Some("../etc")).is_none());
         assert!(
             loader
-                .load_soul("web", "t1", None, Some("../etc"))
+                .load_soul("web", "t1", Some("../../soul_agents"))
                 .is_none()
         );
-        assert!(
-            loader
-                .load_soul("web", "t1", None, Some("../../soul_agents"))
-                .is_none()
-        );
-        assert!(loader.load_soul("web", "t1", None, Some("")).is_none());
-        assert!(
-            loader
-                .load_soul("web", "t1", None, Some("alice/bob"))
-                .is_none()
-        );
-        assert!(
-            loader
-                .load_soul("web", "t1", None, Some("foo:bar"))
-                .is_none()
-        );
+        assert!(loader.load_soul("web", "t1", Some("")).is_none());
+        assert!(loader.load_soul("web", "t1", Some("alice/bob")).is_none());
+        assert!(loader.load_soul("web", "t1", Some("foo:bar")).is_none());
     }
 }

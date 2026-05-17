@@ -319,47 +319,9 @@ fn souls_dir_returns_state_root_souls() {
     let config = Config::load(Some(&file_path)).expect("load config");
 
     assert_eq!(
-        config.souls_dir(),
-        PathBuf::from(&config.state_root).join("souls")
+        config.agents_path(),
+        PathBuf::from(&config.state_root).join("AGENTS.md")
     );
-}
-
-#[test]
-#[serial]
-fn channel_soul_path_reads_from_config() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret
-    soul_path: work"#,
-    );
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    let web = config.channels.get("web").expect("web channel");
-    assert_eq!(web.soul_path.as_deref(), Some("work"));
-}
-
-#[test]
-#[serial]
-fn channel_soul_path_none_when_unset() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    let web = config.channels.get("web").expect("web channel");
-    assert!(web.soul_path.is_none());
 }
 
 #[test]

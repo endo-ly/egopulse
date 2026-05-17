@@ -89,7 +89,6 @@
 | `port` | `u16` | 任意 | `10961` | バインドポート |
 | `auth_token` | `string \| SecretRef` | 条件付き | なし | Web 有効時は必須。ブラウザアクセス時の認証トークン。SecretRef 使用可能。秘匿フィールド |
 | `allowed_origins` | `[string]` | 任意 | `[]` | WebSocket CORS 許可オリジンリスト |
-| `soul_path` | `string \| null` | 任意 | `null` | エージェント人格ファイルのパス（[system-prompt.md §2](./system-prompt.md#2-soulmd-読み込み) 参照） |
 
 ### 2.4 Discord チャネル（`channels.discord`）
 
@@ -98,7 +97,6 @@
 | `enabled` | `bool` | 任意 | `false` | Discord Bot の有効化 |
 | `bots` | `map<BotId, DiscordBot>` | 条件付き | なし | Bot 定義。有効時は少なくとも 1 つの Bot が必要 |
 | `channels` | `map<u64, DiscordChannelConfig>` | 任意 | なし | 共有チャンネル設定。キーがチャンネル ID。キー存在 = 許可 |
-| `soul_path` | `string \| null` | 任意 | `null` | エージェント人格ファイルのパス（共通フィールド。§2.3 参照） |
 
 #### `bots.<bot_id>` のフィールド
 
@@ -126,7 +124,6 @@
 | `bot_token` | `string \| SecretRef` | 条件付き | なし | Telegram Bot トークン。有効時は必須。SecretRef 使用可能。環境変数 `TELEGRAM_BOT_TOKEN` でも指定可能。秘匿フィールド |
 | `bot_username` | `string` | 条件付き | なし | Bot のユーザー名。グループ内で `@botname` メンション検知に使用。有効時は必須 |
 | `chats` | `map<i64, TelegramChatConfig>` | 任意 | なし | チャットごとの設定。キーが chat ID。キー存在 = 許可 |
-| `soul_path` | `string \| null` | 任意 | `null` | エージェント人格ファイルのパス（共通フィールド。§2.3 参照） |
 
 #### `TelegramChatConfig` のフィールド
 
@@ -503,7 +500,6 @@ SecretRef 解決は以下の 2 層で構成される。
 
 - `log_level`, `compaction_*`, `max_*`, `default_context_window_tokens`
 - `channels.web.host`, `channels.web.port`, `channels.web.allowed_origins`
-- 各チャネルの `soul_path`
 - チャネル別アクセス制御（`channels`, `chats`）
 - 複数プロバイダーの追加
 

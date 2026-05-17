@@ -50,31 +50,13 @@ SOUL.md は3段階のフォールバックで読み込む。**最初に見つか
 | 優先度 | ソース | パス |
 |---|---|---|
 | 1（最高） | エージェント別 | `agents/{agent_id}/SOUL.md` |
-| 2 | チャネル別 | `ChannelConfig.soul_path` で指定されたファイル |
-| 3 | グローバル | `state_root/SOUL.md` |
+| 2 | グローバル | `state_root/SOUL.md` |
 
-### チャネル別 soul_path の解決
+### 解決チェーン
 
-`egopulse.config.yaml` でチャネルごとに人格を紐付けられる。
-
-```yaml
-channels:
-  discord:
-    soul_path: work          # souls/work.md を使用
-  telegram:
-    soul_path: professional  # souls/professional.md を使用
-  web:
-    # soul_path 未設定 → デフォルト SOUL.md
-```
-
-相対パスの候補リスト（上から順に探索）:
-
-1. `state_root/souls/{path}.md`
-2. `state_root/souls/{path}`
-3. `state_root/{path}.md`
-4. `state_root/{path}`
-
-絶対パスの場合はそのまま使用。いずれも見つからなければ次の優先度へフォールバック。
+1. `agents/{agent_id}/SOUL.md` を探す
+2. なければ `state_root/SOUL.md` にフォールバック
+3. どちらもなければ SOUL なし（エージェントループは問題なく動作する）
 
 ### ファイル内容の判定
 

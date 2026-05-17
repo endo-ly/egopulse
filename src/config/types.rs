@@ -117,7 +117,6 @@ pub(crate) struct ChannelConfig {
     pub bot_token: Option<ResolvedValue>,
     pub file_bot_token: Option<yaml_serde::Value>,
     pub bot_username: Option<String>,
-    pub soul_path: Option<String>,
     /// Per-chat Telegram configuration keyed by chat ID.
     pub chats: Option<HashMap<i64, TelegramChatConfig>>,
     pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
@@ -138,7 +137,6 @@ impl std::fmt::Debug for ChannelConfig {
             .field("bot_token", &debug_secret(self.bot_token.as_ref()))
             .field("bot_username", &self.bot_username)
             .field("chats", &self.chats)
-            .field("soul_path", &self.soul_path)
             .field("discord_bots", &self.discord_bots)
             .field("discord_channels", &self.discord_channels)
             .finish()

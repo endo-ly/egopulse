@@ -53,7 +53,6 @@ struct FileChannelConfig {
     bot_token: Option<StringOrRef>,
     bot_username: Option<String>,
     chats: Option<HashMap<String, FileTelegramChatConfig>>,
-    soul_path: Option<String>,
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
     channels: Option<HashMap<String, FileDiscordChannelConfig>>,
 }
@@ -365,7 +364,6 @@ fn normalize_channels(
             file_bot_token,
             bot_username: fc.bot_username,
             chats,
-            soul_path: fc.soul_path,
             discord_bots: None,
             discord_channels: None,
         };

@@ -36,16 +36,9 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
 }
 
 fn build_soul_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
-    let channel_key = context.channel.trim().to_ascii_lowercase();
-    let channel_soul_path = state
-        .config
-        .channels
-        .get(channel_key.as_str())
-        .and_then(|channel| channel.soul_path.as_deref());
     let soul_content = state.soul_agents.load_soul(
         &context.channel,
         &context.surface_thread,
-        channel_soul_path,
         Some(&context.agent_id),
     )?;
 
@@ -415,12 +408,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn web_context(session: &str) -> SurfaceContext {
+        web_context_with_agent(session, "default")
+    }
+
+    fn web_context_with_agent(session: &str, agent_id: &str) -> SurfaceContext {
         SurfaceContext {
             channel: "web".to_string(),
             surface_user: "user".to_string(),
             surface_thread: session.to_string(),
             chat_type: "web".to_string(),
-            agent_id: "default".to_string(),
+            agent_id: agent_id.to_string(),
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
@@ -581,27 +578,27 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_channel_soul_from_config() {
+    fn system_prompt_agent_soul_from_agent_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_file(&dir.path().join("souls/work.md"), "Work soul content");
-        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
-        config.channels.insert(
-            crate::config::ChannelName::new("web"),
-            crate::config::ChannelConfig {
-                enabled: Some(true),
-                soul_path: Some("work".to_string()),
-                ..Default::default()
-            },
+        write_file(
+            &dir.path().join("agents/alice/SOUL.md"),
+            "Alice soul content",
         );
+        write_file(&dir.path().join("SOUL.md"), "Default soul content");
+        let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
         let llm: std::sync::Arc<dyn crate::llm::LlmProvider> = std::sync::Arc::new(FakeProvider {
             responses: std::sync::Mutex::new(vec![]),
         });
         let state = crate::test_util::build_state_with_config(config, Some(llm), None, None, None);
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state, &web_context_with_agent("s1", "alice"));
 
         assert!(
-            prompt.contains("Work soul content"),
-            "should contain channel soul_path content"
+            prompt.contains("Alice soul content"),
+            "should contain agent SOUL content"
+        );
+        assert!(
+            !prompt.contains("Default soul content"),
+            "agent SOUL should override global"
         );
     }
 

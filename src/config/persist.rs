@@ -136,8 +136,6 @@ struct SerializableChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
     chats: Option<HashMap<String, SerializableTelegramChat>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    soul_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     channels: Option<HashMap<String, SerializableDiscordChannel>>,
@@ -255,7 +253,6 @@ impl From<&Config> for SerializableConfig {
                                 })
                                 .collect()
                         }),
-                        soul_path: c.soul_path.clone(),
                         bots: c.discord_bots.as_ref().map(|bots| {
                             bots.iter()
                                 .map(|(bot_id, bot)| {

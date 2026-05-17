@@ -259,11 +259,6 @@ impl Config {
         Path::new(&self.state_root).join("AGENTS.md")
     }
 
-    /// マルチソウル用ディレクトリ: `state_root/souls`。
-    pub(crate) fn souls_dir(&self) -> PathBuf {
-        Path::new(&self.state_root).join("souls")
-    }
-
     /// Resolves the context window for a given provider+model pair.
     ///
     /// Falls back to `default_context_window_tokens` when the model entry
