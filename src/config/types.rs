@@ -111,8 +111,6 @@ pub(crate) struct ChannelConfig {
     pub enabled: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
     pub auth_token: Option<ResolvedValue>,
     pub file_auth_token: Option<yaml_serde::Value>,
     pub allowed_origins: Option<Vec<String>>,
@@ -135,8 +133,6 @@ impl std::fmt::Debug for ChannelConfig {
             .field("enabled", &self.enabled)
             .field("port", &self.port)
             .field("host", &self.host)
-            .field("provider", &self.provider)
-            .field("model", &self.model)
             .field("auth_token", &debug_secret(self.auth_token.as_ref()))
             .field("allowed_origins", &self.allowed_origins)
             .field("bot_token", &debug_secret(self.bot_token.as_ref()))

@@ -119,10 +119,6 @@ struct SerializableChannel {
     port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
@@ -242,8 +238,6 @@ impl From<&Config> for SerializableConfig {
                         enabled: c.enabled,
                         port: c.port,
                         host: c.host.clone(),
-                        provider: c.provider.clone(),
-                        model: c.model.clone(),
                         auth_token: c.file_auth_token.clone(),
                         allowed_origins: c.allowed_origins.clone(),
                         bot_token: c.file_bot_token.clone(),

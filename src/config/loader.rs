@@ -48,8 +48,6 @@ struct FileChannelConfig {
     enabled: Option<bool>,
     port: Option<u16>,
     host: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
     auth_token: Option<StringOrRef>,
     allowed_origins: Option<Vec<String>>,
     bot_token: Option<StringOrRef>,
@@ -236,7 +234,7 @@ pub(super) fn build_config(
     apply_web_channel_env_overrides(&mut channels);
     apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
 
-    validate_channel_provider_references(&providers, &channels)?;
+    validate_agent_provider_references(&providers, &agents)?;
 
     let sleep_batch = normalize_sleep_batch(file_sleep_batch, &providers, &agents, &default_agent)?;
 
@@ -360,8 +358,6 @@ fn normalize_channels(
             enabled: fc.enabled,
             port: fc.port,
             host: fc.host,
-            provider: normalize_string(fc.provider),
-            model: normalize_string(fc.model),
             auth_token: resolved_auth,
             file_auth_token,
             allowed_origins: fc.allowed_origins,
@@ -882,13 +878,6 @@ fn validate_provider_references<'a>(
         }
     }
     Ok(())
-}
-
-fn validate_channel_provider_references(
-    providers: &HashMap<ProviderId, ProviderConfig>,
-    channels: &HashMap<ChannelName, ChannelConfig>,
-) -> Result<(), ConfigError> {
-    validate_provider_references(providers, channels.values().map(|c| c.provider.as_ref()))
 }
 
 fn validate_agent_provider_references(
