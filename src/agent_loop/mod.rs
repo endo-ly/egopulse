@@ -88,7 +88,7 @@ impl SurfaceContext {
 
     /// Returns the stable session key for the current surface and agent.
     pub(crate) fn session_key(&self) -> String {
-        if self.channel == "discord" && !self.agent_id.is_empty() {
+        if !self.agent_id.is_empty() {
             return format!(
                 "{}:{}:agent:{}",
                 self.channel, self.surface_thread, self.agent_id
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn non_discord_session_key_is_not_agent_scoped() {
+    fn session_key_includes_agent_for_all_channels() {
         let ctx = SurfaceContext::new(
             "web".to_string(),
             "dev".to_string(),
@@ -152,6 +152,19 @@ mod tests {
             "vega".to_string(),
         );
 
-        assert_eq!(ctx.session_key(), "web:session-1");
+        assert_eq!(ctx.session_key(), "web:session-1:agent:vega");
+    }
+
+    #[test]
+    fn session_key_without_agent_uses_simple_format() {
+        let ctx = SurfaceContext::new(
+            "cli".to_string(),
+            "user".to_string(),
+            "mysession".to_string(),
+            "cli".to_string(),
+            "".to_string(),
+        );
+
+        assert_eq!(ctx.session_key(), "cli:mysession");
     }
 }

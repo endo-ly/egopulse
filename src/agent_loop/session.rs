@@ -1008,8 +1008,8 @@ mod tests {
             origin_id: String::new(),
         };
 
-        assert_eq!(web_ctx.session_key(), "web:s1");
-        assert_eq!(telegram_ctx.session_key(), "telegram:s2");
+        assert_eq!(web_ctx.session_key(), "web:s1:agent:default");
+        assert_eq!(telegram_ctx.session_key(), "telegram:s2:agent:default");
     }
 
     #[test]

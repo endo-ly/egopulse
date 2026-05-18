@@ -1134,7 +1134,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:tool-flow",
+                "cli:tool-flow:agent:default",
                 Some("tool-flow"),
                 "cli",
                 "default",
@@ -1256,7 +1256,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:repeated-tool-call-id",
+                "cli:repeated-tool-call-id:agent:default",
                 Some("repeated-tool-call-id"),
                 "cli",
                 "default",
@@ -1324,7 +1324,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:duplicate-tool-call-id",
+                "cli:duplicate-tool-call-id:agent:default",
                 Some("duplicate-tool-call-id"),
                 "cli",
                 "default",
@@ -1442,7 +1442,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:parallel-read",
+                "cli:parallel-read:agent:default",
                 Some("parallel-read"),
                 "cli",
                 "default",
@@ -1509,7 +1509,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:mixed-tools",
+                "cli:mixed-tools:agent:default",
                 Some("mixed-tools"),
                 "cli",
                 "default",
@@ -1563,7 +1563,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:usage-log-single",
+                "cli:usage-log-single:agent:default",
                 Some("usage-log-single"),
                 "cli",
                 "default",
@@ -1641,7 +1641,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:usage-log-multi",
+                "cli:usage-log-multi:agent:default",
                 Some("usage-log-multi"),
                 "cli",
                 "default",
