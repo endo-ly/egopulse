@@ -1252,9 +1252,8 @@ mod tests {
         let id = crate::config::AgentId::new(label);
         let cfg = crate::config::AgentConfig {
             label: label.to_string(),
-            provider: None,
-            model: None,
             discord_bot: discord_bot.map(crate::config::BotId::new),
+            ..Default::default()
         };
         (id, cfg)
     }

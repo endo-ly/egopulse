@@ -345,6 +345,8 @@ fn normalize_channels(
                         chat_id,
                         TelegramChatConfig {
                             require_mention: v.require_mention,
+                            agents: Vec::new(),
+                            multi_agent: false,
                         },
                     );
                 }
@@ -366,6 +368,8 @@ fn normalize_channels(
             chats,
             discord_bots: None,
             discord_channels: None,
+            telegram_bots: None,
+            telegram_channels: None,
         };
         let was_discord = key.as_str() == "discord";
         normalized.insert(key, config);
@@ -502,6 +506,7 @@ fn normalize_agents(
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
             discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
+            telegram_bot: None,
         };
         normalized.insert(key, config);
     }

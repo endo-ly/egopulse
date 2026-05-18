@@ -2969,3 +2969,86 @@ fn pulse_config_rejects_invalid_tick_interval() {
         "expected PulseInvalidTickInterval, got {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Step 1: Telegram config type extension tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telegram_chat_config_accepts_agents_and_multi_agent() {
+    let mut agents = Vec::new();
+    agents.push(super::AgentId::new("alice"));
+    agents.push(super::AgentId::new("bob"));
+
+    let config = super::TelegramChatConfig {
+        require_mention: true,
+        agents: agents.clone(),
+        multi_agent: true,
+    };
+
+    assert!(config.require_mention);
+    assert!(config.multi_agent);
+    assert_eq!(config.agents.len(), 2);
+    assert_eq!(config.agents[0], super::AgentId::new("alice"));
+    assert_eq!(config.agents[1], super::AgentId::new("bob"));
+}
+
+#[test]
+fn channel_config_accepts_telegram_bots() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("main"),
+        super::TelegramBotConfig {
+            token: None,
+            file_token: None,
+            username: Some("my_bot".to_string()),
+        },
+    );
+
+    let config = super::ChannelConfig {
+        telegram_bots: Some(bots.clone()),
+        ..Default::default()
+    };
+
+    let bots_ref = config.telegram_bots.as_ref().expect("telegram_bots");
+    assert_eq!(bots_ref.len(), 1);
+    assert!(bots_ref.contains_key(&super::BotId::new("main")));
+}
+
+#[test]
+fn channel_config_accepts_telegram_channels() {
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        -100123456i64,
+        super::TelegramChatConfig {
+            require_mention: false,
+            agents: vec![super::AgentId::new("default")],
+            multi_agent: false,
+        },
+    );
+
+    let config = super::ChannelConfig {
+        telegram_channels: Some(channels),
+        ..Default::default()
+    };
+
+    let ch = config.telegram_channels.as_ref().expect("telegram_channels");
+    assert_eq!(ch.len(), 1);
+    let chat_config = ch.get(&-100123456).expect("chat config");
+    assert!(!chat_config.multi_agent);
+    assert_eq!(chat_config.agents, vec![super::AgentId::new("default")]);
+}
+
+#[test]
+fn agent_config_accepts_telegram_bot() {
+    let config = super::AgentConfig {
+        label: "Test Agent".to_string(),
+        telegram_bot: Some(super::BotId::new("tg_main")),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        config.telegram_bot.as_ref(),
+        Some(&super::BotId::new("tg_main"))
+    );
+}
