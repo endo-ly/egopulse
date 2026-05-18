@@ -3274,3 +3274,154 @@ channels:
     assert!(ch.require_mention);
     assert_eq!(ch.agents, vec![super::AgentId::new("default")]);
 }
+
+// ---------------------------------------------------------------------------
+// Step 3: Config resolve method tests for Telegram
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telegram_bots_returns_only_bots_with_token() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("with_token"),
+        super::TelegramBotConfig {
+            token: Some(crate::config::secret_ref::env_resolved_value(
+                "TG_TOKEN",
+                "123:abc",
+            )),
+            file_token: None,
+            username: Some("bot1".to_string()),
+        },
+    );
+    bots.insert(
+        super::BotId::new("without_token"),
+        super::TelegramBotConfig {
+            token: None,
+            file_token: None,
+            username: Some("bot2".to_string()),
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(true),
+            telegram_bots: Some(bots),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    let runtime_bots = config.telegram_bots();
+    assert_eq!(runtime_bots.len(), 1);
+    assert_eq!(*runtime_bots[0].bot_id, super::BotId::new("with_token"));
+}
+
+#[test]
+fn telegram_bots_disabled_channel_returns_empty() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("main"),
+        super::TelegramBotConfig {
+            token: Some(crate::config::secret_ref::env_resolved_value(
+                "TG_TOKEN",
+                "tok",
+            )),
+            file_token: None,
+            username: Some("bot1".to_string()),
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(false),
+            telegram_bots: Some(bots),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    assert!(config.telegram_bots().is_empty());
+}
+
+#[test]
+fn telegram_channels_returns_configured_map() {
+    let mut tg_channels = std::collections::HashMap::new();
+    tg_channels.insert(
+        -100123i64,
+        super::TelegramChatConfig {
+            require_mention: true,
+            agents: vec![super::AgentId::new("default")],
+            multi_agent: false,
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(true),
+            telegram_channels: Some(tg_channels),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    let ch = config.telegram_channels();
+    assert_eq!(ch.len(), 1);
+    let chat = ch.get(&-100123).expect("channel");
+    assert!(chat.require_mention);
+}
+
+#[test]
+fn telegram_channels_empty_when_not_configured() {
+    let channels = std::collections::HashMap::new();
+    let config = minimal_config_with_channels(channels);
+    assert!(config.telegram_channels().is_empty());
+}
+
+fn minimal_config_with_channels(
+    channels: std::collections::HashMap<super::ChannelName, super::ChannelConfig>,
+) -> super::Config {
+    let mut providers = std::collections::HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig {
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            default_model: "gpt-5".to_string(),
+            models: std::collections::HashMap::new(),
+        },
+    );
+    let mut agents = std::collections::HashMap::new();
+    agents.insert(
+        super::AgentId::new("default"),
+        super::AgentConfig {
+            label: "Default".to_string(),
+            ..Default::default()
+        },
+    );
+    super::Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers,
+        state_root: "/tmp/egopulse".to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels,
+        default_agent: super::AgentId::new("default"),
+        agents,
+        sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
+    }
+}
