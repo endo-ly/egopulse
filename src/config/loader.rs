@@ -14,7 +14,7 @@ use super::secret_ref::{
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
     DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig, SleepBatchConfig,
-    TelegramChatConfig, web_fetch::WebFetchConfig,
+    TelegramBotConfig, TelegramChatConfig, web_fetch::WebFetchConfig,
 };
 use crate::error::ConfigError;
 
@@ -53,8 +53,14 @@ struct FileChannelConfig {
     bot_token: Option<StringOrRef>,
     bot_username: Option<String>,
     chats: Option<HashMap<String, FileTelegramChatConfig>>,
+    /// Discord bot configs (`channels.discord.bots`).
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
+    /// Discord channel configs (`channels.discord.channels`).
     channels: Option<HashMap<String, FileDiscordChannelConfig>>,
+    /// Telegram bot configs (`channels.telegram.bots`).
+    telegram_bots: Option<HashMap<String, FileTelegramBotConfig>>,
+    /// Telegram channel (group/supergroup) configs (`channels.telegram.channels`).
+    telegram_channels: Option<HashMap<String, FileTelegramChatConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -76,6 +82,16 @@ struct FileDiscordChannelConfig {
 struct FileTelegramChatConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     require_mention: bool,
+    #[serde(default)]
+    agents: Option<Vec<String>>,
+    #[serde(default)]
+    multi_agent: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileTelegramBotConfig {
+    token: Option<StringOrRef>,
+    username: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -84,6 +100,7 @@ struct FileAgentConfig {
     provider: Option<String>,
     model: Option<String>,
     discord_bot: Option<String>,
+    telegram_bot: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -264,6 +281,7 @@ pub(super) fn build_config(
     validate_compaction_config(&config)?;
 
     validate_discord_bot_references(&config)?;
+    validate_telegram_bot_references(&config)?;
 
     if config.web_enabled() && config.web_auth_token().is_none() {
         return Err(ConfigError::MissingWebAuthToken);
@@ -372,7 +390,8 @@ fn normalize_channels(
             telegram_channels: None,
         };
         let was_discord = key.as_str() == "discord";
-        normalized.insert(key, config);
+        let was_telegram = key.as_str() == "telegram";
+        normalized.insert(key.clone(), config);
 
         if was_discord {
             if let Some(file_bots) = fc.bots {
@@ -383,6 +402,19 @@ fn normalize_channels(
             let shared_channels = normalize_discord_channels(fc.channels, default_agent)?;
             let discord_channel = normalized.get_mut("discord").expect("just inserted");
             discord_channel.discord_channels = shared_channels;
+        }
+
+        if was_telegram {
+            if let Some(file_bots) = fc.telegram_bots {
+                let bots = normalize_telegram_bots(file_bots, dotenv)?;
+                let tg = normalized.get_mut(&key).expect("just inserted");
+                tg.telegram_bots = Some(bots);
+            }
+            let tg_channels = normalize_telegram_channels(fc.telegram_channels, default_agent)?;
+            if let Some(ch) = tg_channels {
+                let tg = normalized.get_mut(&key).expect("just inserted");
+                tg.telegram_channels = Some(ch);
+            }
         }
     }
 
@@ -492,6 +524,80 @@ fn normalize_discord_channels(
     Ok(Some(result).filter(|m| !m.is_empty()))
 }
 
+fn normalize_telegram_bots(
+    file_bots: HashMap<String, FileTelegramBotConfig>,
+    dotenv: &HashMap<String, String>,
+) -> Result<HashMap<BotId, TelegramBotConfig>, ConfigError> {
+    use super::TelegramBotConfig;
+
+    let mut bots = HashMap::new();
+    for (name, fb) in file_bots {
+        let bot_id = BotId::new(&name);
+        validate_bot_id(&bot_id)?;
+
+        if bots.contains_key(&bot_id) {
+            return Err(ConfigError::DuplicateBotId {
+                bot_id: bot_id.to_string(),
+                original_key: name,
+            });
+        }
+
+        let resolved_token = resolve_string_or_ref(fb.token, dotenv)?;
+        let file_token = resolved_token.as_ref().map(|rv| {
+            if matches!(rv, ResolvedValue::Literal(_)) {
+                yaml_serde::Value::String(rv.value().to_string())
+            } else {
+                rv.to_yaml_value()
+            }
+        });
+
+        bots.insert(
+            bot_id,
+            TelegramBotConfig {
+                token: resolved_token,
+                file_token,
+                username: fb.username,
+            },
+        );
+    }
+    Ok(bots)
+}
+
+fn normalize_telegram_channels(
+    file_channels: Option<HashMap<String, FileTelegramChatConfig>>,
+    default_agent: &AgentId,
+) -> Result<Option<HashMap<i64, TelegramChatConfig>>, ConfigError> {
+    let Some(map) = file_channels else {
+        return Ok(None);
+    };
+    let mut result = HashMap::new();
+    for (k, v) in map {
+        let chat_id: i64 = k
+            .parse::<i64>()
+            .map_err(|_| ConfigError::InvalidChatsKey { key: k })?;
+        let mut agents: Vec<AgentId> = v
+            .agents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| normalize_string(Some(s)))
+            .map(|s| AgentId::new(&s))
+            .collect();
+        if agents.is_empty() {
+            agents.push(default_agent.clone());
+        }
+        let multi_agent = v.multi_agent.unwrap_or(false);
+        result.insert(
+            chat_id,
+            TelegramChatConfig {
+                require_mention: v.require_mention,
+                agents,
+                multi_agent,
+            },
+        );
+    }
+    Ok(Some(result).filter(|m| !m.is_empty()))
+}
+
 fn normalize_agents(
     agents: HashMap<String, FileAgentConfig>,
     _dotenv: &HashMap<String, String>,
@@ -506,7 +612,7 @@ fn normalize_agents(
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
             discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
-            telegram_bot: None,
+            telegram_bot: normalize_string(fa.telegram_bot).map(|s| BotId::new(&s)),
         };
         normalized.insert(key, config);
     }
@@ -858,6 +964,60 @@ fn validate_discord_bot_references(config: &Config) -> Result<(), ConfigError> {
         if let Some(ref bot_id) = agent_config.discord_bot {
             if !bots.contains_key(bot_id) {
                 return Err(ConfigError::AgentDiscordBotNotFound {
+                    agent_id: agent_id.to_string(),
+                    bot_id: bot_id.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_telegram_bot_references(config: &Config) -> Result<(), ConfigError> {
+    let empty_bots = HashMap::new();
+    let bots = config
+        .channels
+        .get("telegram")
+        .and_then(|ch| ch.telegram_bots.as_ref())
+        .unwrap_or(&empty_bots);
+
+    for bot_id in bots.keys() {
+        validate_bot_id(bot_id)?;
+    }
+
+    let telegram = config.channels.get("telegram");
+    if let Some(channels) = telegram.and_then(|ch| ch.telegram_channels.as_ref()) {
+        for (channel_id, channel_config) in channels {
+            for agent_id in &channel_config.agents {
+                if !config.agents.contains_key(agent_id) {
+                    return Err(ConfigError::TelegramBotChannelAgentNotFound {
+                        channel_id: *channel_id,
+                        agent_id: agent_id.to_string(),
+                    });
+                }
+            }
+            let agent_count = channel_config.agents.len();
+            let multi = channel_config.multi_agent;
+            if multi && agent_count < 2 {
+                return Err(ConfigError::TelegramBotChannelMultiAgentMismatch {
+                    channel_id: *channel_id,
+                    reason: "multi_agent is true but fewer than 2 agents specified".to_string(),
+                });
+            }
+            if !multi && agent_count > 1 {
+                return Err(ConfigError::TelegramBotChannelMultiAgentMismatch {
+                    channel_id: *channel_id,
+                    reason: "multi_agent is false but multiple agents specified".to_string(),
+                });
+            }
+        }
+    }
+
+    for (agent_id, agent_config) in &config.agents {
+        if let Some(ref bot_id) = agent_config.telegram_bot {
+            if !bots.contains_key(bot_id) {
+                return Err(ConfigError::AgentTelegramBotNotFound {
                     agent_id: agent_id.to_string(),
                     bot_id: bot_id.to_string(),
                 });

@@ -322,6 +322,49 @@ impl Config {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Returns runtime info for every bot under `channels.telegram.bots` that has
+    /// a resolved token.
+    ///
+    /// Sorted by `bot_id` for deterministic startup. Empty when Telegram is disabled.
+    pub(crate) fn telegram_bots(&self) -> Vec<TelegramBotRuntime<'_>> {
+        if !self.channel_enabled("telegram") {
+            return vec![];
+        }
+
+        let Some(telegram) = self.channels.get("telegram") else {
+            return vec![];
+        };
+        let Some(bots) = &telegram.telegram_bots else {
+            return vec![];
+        };
+
+        let mut runtime_bots: Vec<_> = bots
+            .iter()
+            .filter_map(|(bot_id, bot)| {
+                let token = bot.token.as_ref()?;
+                Some(TelegramBotRuntime {
+                    bot_id,
+                    token: token.value(),
+                    username: bot.username.as_deref().unwrap_or(""),
+                })
+            })
+            .collect();
+        runtime_bots.sort_by_key(|b| b.bot_id.as_str());
+        runtime_bots
+    }
+
+    /// Returns the Telegram channel (group/supergroup) configs, or an empty map
+    /// when none is configured.
+    pub(crate) fn telegram_channels(
+        &self,
+    ) -> HashMap<i64, super::TelegramChatConfig> {
+        self.channels
+            .get("telegram")
+            .and_then(|ch| ch.telegram_channels.as_ref())
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// Runtime data needed to start and operate one Discord bot.
@@ -329,6 +372,14 @@ impl Config {
 pub(crate) struct DiscordBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
+}
+
+/// Runtime data needed to start and operate one Telegram bot.
+#[derive(Clone, Debug)]
+pub(crate) struct TelegramBotRuntime<'a> {
+    pub bot_id: &'a BotId,
+    pub token: &'a str,
+    pub username: &'a str,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.
