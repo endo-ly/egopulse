@@ -6,8 +6,8 @@
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::formatting::{
-    format_tool_result, preview_text, sanitize_assistant_response_text, strip_thinking,
-    summarize_tool_calls_with_content, tool_message_content,
+    format_tool_result, message_to_text, preview_text, sanitize_assistant_response_text,
+    strip_thinking, summarize_tool_calls_with_content, tool_message_content,
 };
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
@@ -595,7 +595,7 @@ async fn persist_tool_result_messages(
 fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
     let joined = tool_messages
         .iter()
-        .map(|message| message.content.as_text_lossy())
+        .map(message_to_text)
         .collect::<Vec<_>>()
         .join("\n");
     preview_text(&joined, 160)

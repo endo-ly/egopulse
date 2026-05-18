@@ -5,6 +5,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
+use crate::agent_loop::formatting::message_to_text;
 use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
@@ -356,17 +357,21 @@ fn estimate_text_tokens(text: &str) -> usize {
     text.len().div_ceil(ESTIMATED_CHARS_PER_TOKEN)
 }
 
-/// Extracts message content from a JSON array of `{"role":"...","content":"..."}` objects.
+/// Extracts message text using [`message_to_text`] for uniform formatting.
+///
+/// Tool results are truncated to 200 chars (matching compaction behavior),
+/// assistant thinking tags are stripped, and tool calls are rendered as
+/// `[tool_use: name(args)]` notation.
 fn extract_messages_text(messages_json: &Option<String>) -> String {
     let Some(json_str) = messages_json else {
         return String::new();
     };
-    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
+    let Ok(messages) = serde_json::from_str::<Vec<Message>>(json_str) else {
         return String::new();
     };
-    values
+    messages
         .iter()
-        .filter_map(|v| v.get("content").and_then(|c| c.as_str()))
+        .map(message_to_text)
         .collect::<Vec<_>>()
         .join("\n")
 }
