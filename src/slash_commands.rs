@@ -397,7 +397,6 @@ const GLOBAL_SCOPE: &str = "global";
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProfileScope {
     Global,
-    Channel(ChannelName),
     Agent {
         agent_id: AgentId,
         channel: ChannelName,
@@ -408,7 +407,6 @@ impl std::fmt::Display for ProfileScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Global => f.write_str(GLOBAL_SCOPE),
-            Self::Channel(channel) => write!(f, "{channel}"),
             Self::Agent { agent_id, .. } => write!(f, "agent:{agent_id}"),
         }
     }
@@ -503,12 +501,6 @@ async fn handle_provider_command(
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
         match &scope {
             ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Channel(channel_name) => {
-                if let Some(channel) = config.channels.get_mut(channel_name.as_str()) {
-                    channel.provider = None;
-                    channel.model = None;
-                }
-            }
             ProfileScope::Agent { agent_id, .. } => {
                 let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
                     crate::error::ConfigError::AgentNotFound {
@@ -538,11 +530,6 @@ async fn handle_provider_command(
         ProfileScope::Global => {
             config.default_provider = provider_id;
             config.default_model = None;
-        }
-        ProfileScope::Channel(channel_name) => {
-            let channel = config.channels.entry(channel_name.clone()).or_default();
-            channel.provider = Some(value.to_string());
-            channel.model = None;
         }
         ProfileScope::Agent { agent_id, .. } => {
             let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
@@ -594,11 +581,6 @@ async fn handle_model_command(
         let mut config = Config::load_allow_missing_api_key(Some(path))?;
         match &scope {
             ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Channel(channel_name) => {
-                if let Some(channel) = config.channels.get_mut(channel_name.as_str()) {
-                    channel.model = None;
-                }
-            }
             ProfileScope::Agent { agent_id, .. } => {
                 let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
                     crate::error::ConfigError::AgentNotFound {
@@ -627,10 +609,6 @@ async fn handle_model_command(
                     .models
                     .insert(value.to_string(), crate::config::ModelConfig::default());
             }
-        }
-        ProfileScope::Channel(channel_name) => {
-            let channel = config.channels.entry(channel_name.clone()).or_default();
-            channel.model = Some(value.to_string());
         }
         ProfileScope::Agent { agent_id, channel } => {
             let provider_name = config
@@ -716,12 +694,9 @@ fn normalize_scope(
     if normalized == GLOBAL_SCOPE {
         return Ok(ProfileScope::Global);
     }
-    if config.channels.contains_key(&ChannelName::new(&normalized)) {
-        return Ok(ProfileScope::Channel(ChannelName::new(&normalized)));
-    }
     if let Some(agent_id) = normalized.strip_prefix("agent:") {
         let channel = match fallback {
-            ProfileScope::Agent { channel, .. } | ProfileScope::Channel(channel) => channel,
+            ProfileScope::Agent { channel, .. } => channel,
             ProfileScope::Global => config
                 .channels
                 .keys()
@@ -743,7 +718,6 @@ fn resolved_for_scope(
 ) -> Result<crate::config::ResolvedLlmConfig, EgoPulseError> {
     match scope {
         ProfileScope::Global => Ok(config.resolve_global_llm()),
-        ProfileScope::Channel(channel) => Ok(config.resolve_llm_for_channel(channel.as_str())?),
         ProfileScope::Agent { agent_id, channel } => {
             Ok(config.resolve_llm_for_agent_channel(agent_id, channel.as_str())?)
         }
@@ -1318,7 +1292,7 @@ providers:
     default_model: qwen2.5
 channels:
   discord:
-    provider: openai
+    enabled: true
 default_agent: alice
 agents:
   alice:
@@ -1349,13 +1323,6 @@ agents:
                 .and_then(|agent| agent.provider.as_deref()),
             Some("local")
         );
-        assert_eq!(
-            updated
-                .channels
-                .get("discord")
-                .and_then(|channel| channel.provider.as_deref()),
-            Some("openai")
-        );
     }
 
     #[tokio::test]
@@ -1370,7 +1337,7 @@ providers:
     default_model: gpt-4o-mini
 channels:
   discord:
-    model: channel-model
+    enabled: true
 default_agent: alice
 agents:
   alice:
@@ -1400,13 +1367,6 @@ agents:
                 .get(&AgentId::new("bob"))
                 .and_then(|agent| agent.model.as_deref()),
             Some("agent-model")
-        );
-        assert_eq!(
-            updated
-                .channels
-                .get("discord")
-                .and_then(|channel| channel.model.as_deref()),
-            Some("channel-model")
         );
     }
 

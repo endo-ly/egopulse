@@ -32,23 +32,12 @@ impl Config {
         }
     }
 
-    /// Returns the normalized provider key used for the given channel.
-    pub(crate) fn effective_provider_name(&self, channel: &str) -> String {
-        let channel_key = ChannelName::new(channel);
-        self.channels
-            .get(&channel_key)
-            .and_then(|config| config.provider.as_deref())
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| self.default_provider.to_string())
-    }
-
-    /// Resolves the provider/model pair for a specific agent on a given channel.
+    /// Resolves the provider/model pair for a specific agent.
     ///
     /// Resolution chain (highest priority first):
     /// 1. `agent.provider` / `agent.model`
-    /// 2. `channel.provider` / `channel.model`
-    /// 3. `config.default_provider` / `config.default_model`
-    /// 4. `provider.default_model`
+    /// 2. `config.default_provider` / `config.default_model`
+    /// 3. `provider.default_model`
     ///
     /// # Errors
     ///
@@ -58,7 +47,7 @@ impl Config {
     pub(crate) fn resolve_llm_for_agent_channel(
         &self,
         agent_id: &AgentId,
-        channel: &str,
+        _channel: &str,
     ) -> Result<ResolvedLlmConfig, ConfigError> {
         let agent = self
             .agents
@@ -67,13 +56,11 @@ impl Config {
                 agent_id: agent_id.to_string(),
             })?;
 
-        let channel_key = ChannelName::new(channel);
-
         let provider_name = agent
             .provider
             .as_deref()
             .map(|p| p.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| self.effective_provider_name(channel_key.as_str()));
+            .unwrap_or_else(|| self.default_provider.to_string());
 
         let provider_id = ProviderId::new(&provider_name);
         let provider = self.providers.get(&provider_id).ok_or_else(|| {
@@ -82,20 +69,11 @@ impl Config {
             }
         })?;
 
-        let model = agent
-            .model
-            .as_deref()
-            .map(String::from)
-            .or_else(|| {
-                self.channels
-                    .get(&channel_key)
-                    .and_then(|config| config.model.clone())
-            })
-            .unwrap_or_else(|| {
-                self.default_model
-                    .clone()
-                    .unwrap_or_else(|| provider.default_model.clone())
-            });
+        let model = agent.model.as_deref().map(String::from).unwrap_or_else(|| {
+            self.default_model
+                .clone()
+                .unwrap_or_else(|| provider.default_model.clone())
+        });
 
         Ok(ResolvedLlmConfig {
             provider: provider_name,
@@ -104,19 +82,6 @@ impl Config {
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
         })
-    }
-
-    /// Resolves the provider/model pair used for a request from the given channel
-    /// using the default agent.
-    ///
-    /// # Errors
-    ///
-    /// See [`resolve_llm_for_agent_channel`].
-    pub(crate) fn resolve_llm_for_channel(
-        &self,
-        channel: &str,
-    ) -> Result<ResolvedLlmConfig, ConfigError> {
-        self.resolve_llm_for_agent_channel(&self.default_agent, channel)
     }
 
     /// Resolves the provider/model pair for sleep batch LLM processing.
@@ -292,11 +257,6 @@ impl Config {
     /// デフォルト AGENTS.md パス: `state_root/AGENTS.md`。
     pub(crate) fn agents_path(&self) -> PathBuf {
         Path::new(&self.state_root).join("AGENTS.md")
-    }
-
-    /// マルチソウル用ディレクトリ: `state_root/souls`。
-    pub(crate) fn souls_dir(&self) -> PathBuf {
-        Path::new(&self.state_root).join("souls")
     }
 
     /// Resolves the context window for a given provider+model pair.

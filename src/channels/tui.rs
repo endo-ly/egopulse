@@ -706,7 +706,10 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, app: &TuiApp, chat: &ChatState) {
     let resolved_llm = app
         .state
         .config
-        .resolve_llm_for_channel(&chat.context.channel)
+        .resolve_llm_for_agent_channel(
+            &crate::config::AgentId::new(&chat.context.agent_id),
+            &chat.context.channel,
+        )
         .ok();
     let llm_line = resolved_llm
         .map(|resolved| format!("llm: {} / {}", resolved.provider, resolved.model))

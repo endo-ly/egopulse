@@ -41,9 +41,7 @@ channels:
     enabled: true
     auth_token: web-secret
   discord:
-    enabled: false
-    provider: local
-    model: qwen2.5-coder"#
+    enabled: false"#
 }
 
 #[test]
@@ -80,7 +78,9 @@ fn loads_provider_based_config() {
     assert!(config.web_enabled());
     assert_eq!(config.web_auth_token(), Some("web-secret"));
 
-    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
+    let web_llm = config
+        .resolve_llm_for_agent_channel(&config.default_agent, "web")
+        .expect("web llm");
     assert_eq!(web_llm.provider, "openai");
     assert_eq!(web_llm.model, "gpt-4o-mini");
     assert_eq!(web_llm.base_url, "https://api.openai.com/v1");
@@ -88,13 +88,6 @@ fn loads_provider_based_config() {
         web_llm.api_key.as_ref().map(ExposeSecret::expose_secret),
         Some("sk-openai")
     );
-
-    let discord_llm = config
-        .resolve_llm_for_channel("discord")
-        .expect("discord llm");
-    assert_eq!(discord_llm.provider, "local");
-    assert_eq!(discord_llm.model, "qwen2.5-coder");
-    assert!(discord_llm.api_key.is_none());
 }
 
 #[test]
@@ -117,7 +110,9 @@ channels:
     );
 
     let config = Config::load(Some(&file_path)).expect("load local config");
-    let resolved = config.resolve_llm_for_channel("web").expect("resolved llm");
+    let resolved = config
+        .resolve_llm_for_agent_channel(&config.default_agent, "web")
+        .expect("resolved llm");
     assert!(resolved.api_key.is_none());
 }
 
@@ -149,7 +144,7 @@ channels:
 
 #[test]
 #[serial]
-fn rejects_unknown_channel_provider() {
+fn rejects_unknown_agent_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
@@ -165,14 +160,17 @@ channels:
   web:
     enabled: true
     auth_token: web-secret
+agents:
+  alice:
+    label: Alice
     provider: missing"#,
     );
 
     let error = Config::load(Some(&file_path)).expect_err("invalid provider");
-    assert!(matches!(
-        error,
-        ConfigError::InvalidProviderReference { provider } if provider == "missing"
-    ));
+    assert!(
+        matches!(&error, ConfigError::InvalidProviderReference { provider } if provider == "missing"),
+        "expected InvalidProviderReference, got {error:?}"
+    );
 }
 
 #[test]
@@ -197,7 +195,7 @@ channels:
     let config = Config::load_allow_missing_api_key(Some(&file_path)).expect("allow missing key");
     assert!(
         config
-            .resolve_llm_for_channel("web")
+            .resolve_llm_for_agent_channel(&config.default_agent, "web")
             .expect("resolved")
             .api_key
             .is_none()
@@ -235,7 +233,9 @@ channels:
     assert_eq!(global.model, "gpt-5");
 
     // channel without model override also falls back to config.default_model
-    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
+    let web_llm = config
+        .resolve_llm_for_agent_channel(&config.default_agent, "web")
+        .expect("web llm");
     assert_eq!(web_llm.model, "gpt-5");
 }
 
@@ -319,52 +319,14 @@ fn souls_dir_returns_state_root_souls() {
     let config = Config::load(Some(&file_path)).expect("load config");
 
     assert_eq!(
-        config.souls_dir(),
-        PathBuf::from(&config.state_root).join("souls")
+        config.agents_path(),
+        PathBuf::from(&config.state_root).join("AGENTS.md")
     );
 }
 
 #[test]
 #[serial]
-fn channel_soul_path_reads_from_config() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret
-    soul_path: work"#,
-    );
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    let web = config.channels.get("web").expect("web channel");
-    assert_eq!(web.soul_path.as_deref(), Some("work"));
-}
-
-#[test]
-#[serial]
-fn channel_soul_path_none_when_unset() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    let web = config.channels.get("web").expect("web channel");
-    assert!(web.soul_path.is_none());
-}
-
-#[test]
-#[serial]
-fn model_resolution_chain_channel_overrides_global() {
+fn model_resolution_chain_agent_overrides_global() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
@@ -377,39 +339,32 @@ providers:
     base_url: https://api.openai.com/v1
     api_key: sk-openai
     default_model: gpt-4o-mini
-  local:
-    label: Local
-    base_url: http://127.0.0.1:1234/v1
-    default_model: qwen2.5
 channels:
   web:
     enabled: true
     auth_token: web-secret
-    model: gpt-4o
-  discord:
-    enabled: false
-    provider: local
-    model: qwen2.5-coder"#,
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob
+    model: gpt-4o"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
 
-    // channel.model > config.default_model
-    let web_llm = config.resolve_llm_for_channel("web").expect("web llm");
-    assert_eq!(web_llm.model, "gpt-4o");
+    // agent.model (bob) overrides config.default_model
+    let bob_llm = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("bob"), "web")
+        .expect("bob llm");
+    assert_eq!(bob_llm.model, "gpt-4o");
 
-    // channel.model > config.default_model (different provider)
-    let discord_llm = config
-        .resolve_llm_for_channel("discord")
-        .expect("discord llm");
-    assert_eq!(discord_llm.model, "qwen2.5-coder");
-    assert_eq!(discord_llm.provider, "local");
-
-    // channel without model → config.default_model (not provider.default_model)
-    let telegram_llm = config
-        .resolve_llm_for_channel("telegram")
-        .expect("telegram llm");
-    assert_eq!(telegram_llm.model, "gpt-5");
+    // agent without model → config.default_model
+    let alice_llm = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
+        .expect("alice llm");
+    assert_eq!(alice_llm.model, "gpt-5");
 }
 
 #[test]
@@ -632,8 +587,6 @@ providers:
 channels:
   discord:
     enabled: true
-    provider: local
-    model: qwen2.5-coder
 default_agent: alice
 agents:
   alice:
@@ -649,7 +602,7 @@ agents:
 
 #[test]
 #[serial]
-fn resolve_llm_for_agent_channel_uses_channel_provider_when_agent_has_none() {
+fn resolve_llm_for_agent_channel_falls_back_to_default_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, agent_config());
@@ -659,13 +612,13 @@ fn resolve_llm_for_agent_channel_uses_channel_provider_when_agent_has_none() {
         .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "discord")
         .expect("resolve");
 
-    assert_eq!(resolved.provider, "local");
-    assert_eq!(resolved.model, "qwen2.5-coder");
+    assert_eq!(resolved.provider, "openai");
+    assert_eq!(resolved.model, "gpt-5");
 }
 
 #[test]
 #[serial]
-fn resolve_llm_for_agent_channel_agent_provider_overrides_channel() {
+fn resolve_llm_for_agent_channel_agent_provider_takes_priority() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, agent_config());
@@ -682,7 +635,7 @@ fn resolve_llm_for_agent_channel_agent_provider_overrides_channel() {
 
 #[test]
 #[serial]
-fn resolve_llm_for_agent_channel_agent_model_overrides_channel_model() {
+fn resolve_llm_for_agent_channel_agent_model_with_default_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, agent_config());
@@ -692,7 +645,7 @@ fn resolve_llm_for_agent_channel_agent_model_overrides_channel_model() {
         .resolve_llm_for_agent_channel(&super::AgentId::new("carol"), "discord")
         .expect("resolve");
 
-    assert_eq!(resolved.provider, "local");
+    assert_eq!(resolved.provider, "openai");
     assert_eq!(resolved.model, "custom-model");
 }
 
@@ -760,18 +713,20 @@ agents:
 
 #[test]
 #[serial]
-fn resolve_llm_for_channel_delegates_to_default_agent() {
+fn resolve_llm_for_default_agent_matches_resolve_llm() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, agent_config());
     let config = Config::load(Some(&file_path)).expect("load config");
 
-    let via_channel = config.resolve_llm_for_channel("web").expect("via channel");
     let via_agent = config
         .resolve_llm_for_agent_channel(&config.default_agent, "web")
         .expect("via agent");
+    let via_resolve = config.resolve_global_llm();
 
-    assert_eq!(via_channel, via_agent);
+    // default agent (alice) uses default_provider + default_model
+    assert_eq!(via_agent.provider, via_resolve.provider);
+    assert_eq!(via_agent.model, via_resolve.model);
 }
 
 // --- Step 1: Discord Agent Bot Config Helper tests ---
@@ -1401,13 +1356,13 @@ fn discord_bots_preserve_secret_refs_on_save() {
     // Act
     save_config_with_secrets(&config, &path).expect("save config");
 
-    // Assert — YAML has SecretRef, not plain token
+    // Assert - YAML has SecretRef, not plain token
     let yaml = std::fs::read_to_string(&path).expect("yaml");
     assert!(yaml.contains("source: env"));
     assert!(yaml.contains("id: DISCORD_BOT_TOKEN"));
     assert!(!yaml.contains("secret-bot-token"));
 
-    // Assert — .env has the actual token
+    // Assert - .env has the actual token
     let dotenv = std::fs::read_to_string(temp_dir.path().join(".env")).expect(".env");
     assert!(dotenv.contains("DISCORD_BOT_TOKEN=secret-bot-token"));
 }
@@ -1588,7 +1543,9 @@ channels:
     auth_token: web-secret"#,
     );
     let config = Config::load(Some(&file_path)).expect("should load openai-codex without api_key");
-    let resolved = config.resolve_llm_for_channel("web").expect("web llm");
+    let resolved = config
+        .resolve_llm_for_agent_channel(&config.default_agent, "web")
+        .expect("web llm");
     assert_eq!(resolved.provider, "openai-codex");
     assert!(resolved.api_key.is_none());
 }

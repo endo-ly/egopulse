@@ -29,13 +29,6 @@ struct ProviderPayload {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-struct ChannelOverridePayload {
-    provider: Option<String>,
-    model: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
 struct ConfigPayload {
     default_provider: String,
     default_model: Option<String>,
@@ -49,7 +42,6 @@ struct ConfigPayload {
     has_api_key: bool,
     config_path: String,
     providers: Vec<ProviderPayload>,
-    channel_overrides: HashMap<String, ChannelOverridePayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,15 +61,6 @@ struct ProviderUpdatePayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct ChannelOverrideUpdatePayload {
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub(super) struct ConfigUpdateRequest {
     default_provider: String,
     #[serde(default)]
@@ -87,8 +70,6 @@ pub(super) struct ConfigUpdateRequest {
     web_enabled: bool,
     web_host: String,
     web_port: u16,
-    #[serde(default)]
-    channel_overrides: Option<HashMap<String, ChannelOverrideUpdatePayload>>,
 }
 
 /// Returns the persisted configuration visible to the web UI.
@@ -174,11 +155,6 @@ pub(super) async fn api_put_config(
         web.enabled = Some(web_enabled);
         web.host = Some(web_host);
         web.port = Some(web_port);
-    }
-
-    if let Some(overrides) = request.channel_overrides {
-        apply_channel_overrides(&mut config, overrides)
-            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     }
 
     config
@@ -319,49 +295,6 @@ fn apply_api_key_update(
     }
 }
 
-fn apply_channel_overrides(
-    config: &mut Config,
-    overrides: HashMap<String, ChannelOverrideUpdatePayload>,
-) -> Result<(), ConfigError> {
-    for (channel, update) in overrides {
-        let key = channel.trim().to_ascii_lowercase();
-        if key.is_empty() || key == "web" {
-            continue;
-        }
-
-        let entry = config.channels.entry(ChannelName::new(&key)).or_default();
-
-        let provider_name = match update.provider {
-            Some(provider) => {
-                let trimmed = provider.trim();
-                let channel_name = key.clone();
-                if trimmed.is_empty() {
-                    None
-                } else if config.providers.contains_key(trimmed) {
-                    Some(trimmed.to_string())
-                } else {
-                    return Err(ConfigError::InvalidProviderReference {
-                        provider: format!("{} for channel {}", trimmed, channel_name),
-                    });
-                }
-            }
-            None => entry.provider.clone(),
-        };
-        entry.provider = provider_name;
-
-        match update.model {
-            Some(model) if !model.trim().is_empty() => {
-                entry.model = Some(model.trim().to_string());
-            }
-            Some(_) => {
-                entry.model = None;
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-
 fn default_payload(path: &std::path::Path) -> Result<ConfigPayload, ConfigError> {
     Ok(ConfigPayload {
         default_provider: String::new(),
@@ -380,7 +313,6 @@ fn default_payload(path: &std::path::Path) -> Result<ConfigPayload, ConfigError>
         has_api_key: false,
         config_path: path.display().to_string(),
         providers: Vec::new(),
-        channel_overrides: HashMap::new(),
     })
 }
 
@@ -410,23 +342,6 @@ fn payload_from_config(
         })
         .collect::<Vec<_>>();
 
-    let channel_overrides = config
-        .channels
-        .iter()
-        .filter_map(|(id, channel)| {
-            if id.as_str() == "web" {
-                return None;
-            }
-            Some((
-                id.to_string(),
-                ChannelOverridePayload {
-                    provider: channel.provider.clone(),
-                    model: channel.model.clone(),
-                },
-            ))
-        })
-        .collect();
-
     Ok(ConfigPayload {
         default_provider: resolved.provider,
         default_model: config.default_model.clone(),
@@ -440,7 +355,6 @@ fn payload_from_config(
         has_api_key: resolved.api_key.is_some(),
         config_path: path.display().to_string(),
         providers,
-        channel_overrides,
     })
 }
 

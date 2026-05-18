@@ -119,10 +119,6 @@ struct SerializableChannel {
     port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_optional_yaml_value"
@@ -139,8 +135,6 @@ struct SerializableChannel {
     bot_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chats: Option<HashMap<String, SerializableTelegramChat>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    soul_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,8 +236,6 @@ impl From<&Config> for SerializableConfig {
                         enabled: c.enabled,
                         port: c.port,
                         host: c.host.clone(),
-                        provider: c.provider.clone(),
-                        model: c.model.clone(),
                         auth_token: c.file_auth_token.clone(),
                         allowed_origins: c.allowed_origins.clone(),
                         bot_token: c.file_bot_token.clone(),
@@ -261,7 +253,6 @@ impl From<&Config> for SerializableConfig {
                                 })
                                 .collect()
                         }),
-                        soul_path: c.soul_path.clone(),
                         bots: c.discord_bots.as_ref().map(|bots| {
                             bots.iter()
                                 .map(|(bot_id, bot)| {
