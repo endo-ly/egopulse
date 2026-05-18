@@ -362,16 +362,31 @@ fn estimate_text_tokens(text: &str) -> usize {
 /// Tool results are truncated to 200 chars (matching compaction behavior),
 /// assistant thinking tags are stripped, and tool calls are rendered as
 /// `[tool_use: name(args)]` notation.
+///
+/// Falls back to raw `content` field extraction when the stored JSON cannot
+/// be deserialized as `Vec<Message>` (e.g. schema mismatch from an older
+/// version or a corrupted snapshot), so that session text is never silently
+/// dropped.
 fn extract_messages_text(messages_json: &Option<String>) -> String {
     let Some(json_str) = messages_json else {
         return String::new();
     };
-    let Ok(messages) = serde_json::from_str::<Vec<Message>>(json_str) else {
+    if let Ok(messages) = serde_json::from_str::<Vec<Message>>(json_str) {
+        return messages
+            .iter()
+            .map(message_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    // Fallback: extract raw "content" fields from whatever JSON structure
+    // is present, preserving session text even when the Message schema has
+    // changed or the snapshot is partially corrupt.
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
         return String::new();
     };
-    messages
+    values
         .iter()
-        .map(message_to_text)
+        .filter_map(|v| v.get("content").and_then(|c| c.as_str()))
         .collect::<Vec<_>>()
         .join("\n")
 }
