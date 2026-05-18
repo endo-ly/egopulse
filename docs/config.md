@@ -358,7 +358,7 @@ provider.default_model（プロバイダーのデフォルトモデル）
 2. **`config.default_model`**: エージェント指定がない場合のグローバルフォールバック。全チャネルで統一モデルを使いたい場合に設定する。
 3. **`provider.default_model`**: 最終フォールバック。プロバイダー定義に記述されたデフォルトモデルが使われる。
 
-> **Note**: `agent.provider` と `agent.model` は独立して解決される。`agent.provider` だけを設定しても、そのプロバイダーの `default_model` は自動適用されない。モデル解決は別途 `agent.model` → `channel.model` → `config.default_model` → `provider.default_model` へフォールバックする。
+> **Note**: `agent.provider` と `agent.model` は独立して解決される。`agent.provider` だけを設定しても、そのプロバイダーの `default_model` は自動適用されない。モデル解決は上記チェーンに従い、プロバイダーが解決された後にモデル解決が独立して走る。
 
 `/provider` / `/model` のデフォルト更新対象は現在の `agent_id`（`agents.<id>.provider` / `agents.<id>.model`）。チャネル設定を変更したい場合は `--scope discord` のように明示する。
 
@@ -570,13 +570,4 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 
 ---
 
-## 内部定数（Multi-Agent Room）
 
-以下の定数はソースコードにハードコードされており、設定ファイル (`egopulse.config.yaml`) からは変更できない。
-
-| 定数 | 値 | 定義場所 | 説明 |
-|---|---|---|---|
-| `MAX_AGENT_CHAIN_DEPTH` | 4 | `src/runtime/turn_scheduler.rs` | `agent_send` の最大チェーン深度。A→B→C→D まで許可し、5 段階目以降はドロップ |
-| `MAX_AGENT_TURNS_PER_INPUT` | 12 | `src/runtime/turn_scheduler.rs` | 同一 origin（ヒューマン入力）から派生するターンの上限。到達すると Channel Log に SystemEvent を記録して停止 |
-
-制限に到達した場合でも、人間が新しくメッセージを送信すると新しい `origin_id` が発行され、エージェントは通常通り応答を再開する。
