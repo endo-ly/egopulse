@@ -26,6 +26,12 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build reqwest client")
 });
 
+/// Maximum time allowed for HTML processing (readability-js extraction +
+/// htmd Markdown conversion).  Covers parsing, extraction, and conversion
+/// of the fetched body.  When exceeded the tool returns a timeout error
+/// instead of hanging the agent loop.
+const HTML_PROCESSING_TIMEOUT_SECS: u64 = 30;
+
 pub(crate) struct WebFetchTool {
     config: Arc<Config>,
 }
@@ -222,11 +228,36 @@ impl Tool for WebFetchTool {
         };
 
         // 7. Process with metadata (readability extraction)
-        let processed = html_processing::process_response_body_with_metadata(
-            &body_text,
-            content_type.as_deref(),
-            &final_url,
-        );
+        //    Isolated in a blocking thread with a hard timeout so that
+        //    pathological HTML (huge DOM, JS-heavy pages, etc.) cannot stall
+        //    the async executor or hang the agent loop indefinitely.
+        let processing_timeout = std::time::Duration::from_secs(HTML_PROCESSING_TIMEOUT_SECS);
+        let body_for_processing = body_text;
+        let ct_for_processing = content_type.clone();
+        let url_for_processing = final_url.clone();
+
+        let processed = match tokio::time::timeout(
+            processing_timeout,
+            tokio::task::spawn_blocking(move || {
+                html_processing::process_response_body_with_metadata(
+                    &body_for_processing,
+                    ct_for_processing.as_deref(),
+                    &url_for_processing,
+                )
+            }),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => {
+                return ToolResult::error(format!("html processing failed: {join_err}"));
+            }
+            Err(_) => {
+                return ToolResult::error(format!(
+                    "html processing timed out after {HTML_PROCESSING_TIMEOUT_SECS}s"
+                ));
+            }
+        };
 
         // 8. Output truncation
         let max_output = params
