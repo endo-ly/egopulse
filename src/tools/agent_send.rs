@@ -106,13 +106,6 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
-        // Validate: agent_send is only available on Discord channels
-        if context.channel != "discord" {
-            return ToolResult::error(
-                "agent_send is only available in Discord multi-agent rooms".to_string(),
-            );
-        }
-
         // Validate: agent must exist in config.agents
         if !self.agents.contains_key(&AgentId::new(&target_id)) {
             return ToolResult::error(format!("agent '{target_id}' not found"));

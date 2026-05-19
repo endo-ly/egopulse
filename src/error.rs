@@ -54,12 +54,6 @@ impl EgoPulseError {
     pub(crate) fn user_message(&self) -> String {
         format!("Error: {self}")
     }
-
-    /// ネットワーク到達不能など、ユーザー通知を抑制すべきノイズエラーなら true。
-    pub(crate) fn should_suppress_user_error(&self) -> bool {
-        let text = self.to_string().to_ascii_lowercase();
-        text.contains("error sending request for url")
-    }
 }
 
 /// Configuration loading and validation errors.
@@ -157,6 +151,14 @@ pub enum ConfigError {
     },
     #[error("agent_discord_bot_not_found: agent={agent_id} bot={bot_id}")]
     AgentDiscordBotNotFound { agent_id: String, bot_id: String },
+    #[error("telegram_bot_channel_agent_not_found: channel={channel_id} agent={agent_id}")]
+    TelegramBotChannelAgentNotFound { channel_id: i64, agent_id: String },
+    #[error("telegram_bot_channel_multi_agent_mismatch: channel={channel_id} {reason}")]
+    TelegramBotChannelMultiAgentMismatch { channel_id: i64, reason: String },
+    #[error("agent_telegram_bot_not_found: agent={agent_id} bot={bot_id}")]
+    AgentTelegramBotNotFound { agent_id: String, bot_id: String },
+    #[error("telegram_bot_username_missing: bot={bot_id}")]
+    TelegramBotUsernameMissing { bot_id: String },
     #[error("pulse_invalid_timezone: {timezone}")]
     PulseInvalidTimezone { timezone: String },
     #[error("pulse_invalid_tick_interval: {reason}")]

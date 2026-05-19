@@ -489,6 +489,16 @@ impl Database {
         self.resolve_or_create_chat_id("discord", &external_id, None, "channel_log", "")
     }
 
+    /// Resolves or creates a Channel Log chat for Telegram multi-agent rooms.
+    /// Same concept as [`resolve_channel_log_chat_id`] but keyed by Telegram `i64` chat ID.
+    pub(crate) fn resolve_telegram_channel_log_chat_id(
+        &self,
+        chat_id: i64,
+    ) -> Result<i64, StorageError> {
+        let external_id = format!("telegram:{chat_id}:multi-room-log");
+        self.resolve_or_create_chat_id("telegram", &external_id, None, "channel_log", "")
+    }
+
     /// Returns the most recent messages from a Channel Log, ordered oldest-first.
     pub(crate) fn get_channel_log_messages(
         &self,

@@ -1750,15 +1750,17 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
-      "123":"#,
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
+      "123": {}"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    let telegram = config.channels.get("telegram").expect("telegram");
-    let chats = telegram.chats.as_ref().expect("chats");
-    let chat = chats.get(&123i64).expect("chat 123");
+    let channels = config.telegram_channels();
+    let chat = channels.get(&123i64).expect("chat 123");
     assert!(!chat.require_mention);
 }
 
@@ -1783,20 +1785,18 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
       "456":
         require_mention: true"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    let telegram = config.channels.get("telegram").expect("telegram");
-    let chat = telegram
-        .chats
-        .as_ref()
-        .expect("chats")
-        .get(&456i64)
-        .expect("chat");
+    let channels = config.telegram_channels();
+    let chat = channels.get(&456i64).expect("chat");
     assert!(chat.require_mention);
 }
 
@@ -1851,8 +1851,11 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
       "not_a_number": {}"#,
     );
 
@@ -2968,4 +2971,462 @@ fn pulse_config_rejects_invalid_tick_interval() {
         matches!(error, ConfigError::PulseInvalidTickInterval { .. }),
         "expected PulseInvalidTickInterval, got {error:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: Telegram config type extension tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telegram_chat_config_accepts_agents_and_multi_agent() {
+    let agents = vec![super::AgentId::new("alice"), super::AgentId::new("bob")];
+
+    let config = super::TelegramChatConfig {
+        require_mention: true,
+        agents: agents.clone(),
+        multi_agent: true,
+    };
+
+    assert!(config.require_mention);
+    assert!(config.multi_agent);
+    assert_eq!(config.agents.len(), 2);
+    assert_eq!(config.agents[0], super::AgentId::new("alice"));
+    assert_eq!(config.agents[1], super::AgentId::new("bob"));
+}
+
+#[test]
+fn channel_config_accepts_telegram_bots() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("main"),
+        super::TelegramBotConfig {
+            token: None,
+            file_token: None,
+            username: Some("my_bot".to_string()),
+        },
+    );
+
+    let config = super::ChannelConfig {
+        telegram_bots: Some(bots.clone()),
+        ..Default::default()
+    };
+
+    let bots_ref = config.telegram_bots.as_ref().expect("telegram_bots");
+    assert_eq!(bots_ref.len(), 1);
+    assert!(bots_ref.contains_key(&super::BotId::new("main")));
+}
+
+#[test]
+fn channel_config_accepts_telegram_channels() {
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        -100123456i64,
+        super::TelegramChatConfig {
+            require_mention: false,
+            agents: vec![super::AgentId::new("default")],
+            multi_agent: false,
+        },
+    );
+
+    let config = super::ChannelConfig {
+        telegram_channels: Some(channels),
+        ..Default::default()
+    };
+
+    let ch = config
+        .telegram_channels
+        .as_ref()
+        .expect("telegram_channels");
+    assert_eq!(ch.len(), 1);
+    let chat_config = ch.get(&-100123456).expect("chat config");
+    assert!(!chat_config.multi_agent);
+    assert_eq!(chat_config.agents, vec![super::AgentId::new("default")]);
+}
+
+#[test]
+fn agent_config_accepts_telegram_bot() {
+    let config = super::AgentConfig {
+        label: "Test Agent".to_string(),
+        telegram_bot: Some(super::BotId::new("tg_main")),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        config.telegram_bot.as_ref(),
+        Some(&super::BotId::new("tg_main"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Config Loader / Persist tests for Telegram multi-bot
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn telegram_bots_parse_from_yaml() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
+
+    let yaml = r#"
+default_provider: openai
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token: 123456:ABC-DEF
+        username: my_bot
+      secondary:
+        token:
+          source: env
+          id: TG_BOT_2_TOKEN
+        username: my_other_bot
+"#;
+    let env_path = temp_dir.path().join(".env");
+    std::fs::write(&env_path, "TG_BOT_2_TOKEN=999:ZZZ\n").expect("write dotenv");
+    std::fs::write(&yaml_path, yaml).expect("write yaml");
+
+    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
+
+    let bots = config.telegram_bots();
+    assert_eq!(bots.len(), 2, "should have 2 telegram bots");
+    let bot_ids: Vec<&str> = bots.iter().map(|b| b.bot_id.as_str()).collect();
+    assert!(bot_ids.contains(&"main"), "should contain 'main' bot");
+    assert!(
+        bot_ids.contains(&"secondary"),
+        "should contain 'secondary' bot"
+    );
+}
+
+#[test]
+#[serial]
+fn telegram_channels_parse_from_yaml() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
+
+    let yaml = r#"
+default_provider: openai
+default_agent: default
+agents:
+  default:
+    label: Default Agent
+  alice:
+    label: Alice
+  bob:
+    label: Bob
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token: 123456:ABC-DEF
+        username: my_bot
+    telegram_channels:
+      "-100123456":
+        require_mention: true
+        agents:
+          - alice
+          - bob
+        multi_agent: true
+"#;
+    std::fs::write(&yaml_path, yaml).expect("write yaml");
+
+    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
+
+    let channels = config.telegram_channels();
+    let ch = channels.get(&-100123456i64).expect("channel should exist");
+    assert!(ch.require_mention);
+    assert!(ch.multi_agent);
+    assert_eq!(ch.agents.len(), 2);
+    assert_eq!(ch.agents[0], super::AgentId::new("alice"));
+    assert_eq!(ch.agents[1], super::AgentId::new("bob"));
+}
+
+#[test]
+#[serial]
+fn telegram_chat_config_defaults_agents_to_default_agent() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
+
+    let yaml = r#"
+default_provider: openai
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token: 123456:ABC-DEF
+        username: my_bot
+    telegram_channels:
+      "-100999":
+        require_mention: false
+"#;
+    std::fs::write(&yaml_path, yaml).expect("write yaml");
+
+    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
+
+    let channels = config.telegram_channels();
+    let ch = channels.get(&-100999i64).expect("channel should exist");
+    assert_eq!(ch.agents, vec![super::AgentId::new("default")]);
+    assert!(!ch.multi_agent);
+}
+
+#[test]
+#[serial]
+fn telegram_bot_token_secret_ref() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
+    let env_path = temp_dir.path().join(".env");
+    std::fs::write(&env_path, "TG_TOKEN_SECRET=secret-tok-123\n").expect("write dotenv");
+
+    let yaml = r#"
+default_provider: openai
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token:
+          source: env
+          id: TG_TOKEN_SECRET
+        username: my_bot
+"#;
+    std::fs::write(&yaml_path, yaml).expect("write yaml");
+
+    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
+
+    let bots = config.telegram_bots();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(bots[0].token, "secret-tok-123");
+}
+
+#[test]
+#[serial]
+fn save_load_round_trip_preserves_telegram_bots() {
+    use crate::config::persist::save_config_with_secrets;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let path = temp_dir.path().join("egopulse.config.yaml");
+    let env_path = temp_dir.path().join(".env");
+    std::fs::write(&env_path, "TG_BOT_TOKEN=123:abc\n").expect("write dotenv");
+
+    let yaml = r#"
+default_provider: openai
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token:
+          source: env
+          id: TG_BOT_TOKEN
+        username: my_bot
+    telegram_channels:
+      "-100111":
+        require_mention: true
+        agents:
+          - default
+"#;
+    std::fs::write(&path, yaml).expect("write yaml");
+
+    let config = Config::load_allow_missing_api_key(Some(&path)).expect("load first");
+
+    // Verify parsed correctly
+    let bots = config.telegram_bots();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(*bots[0].bot_id, super::BotId::new("main"));
+    let channels = config.telegram_channels();
+    let ch = channels.get(&-100111).expect("channel");
+    assert!(ch.require_mention);
+
+    // Round-trip: save → reload
+    save_config_with_secrets(&config, &path).expect("save");
+    let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load second");
+
+    let bots = loaded.telegram_bots();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(*bots[0].bot_id, super::BotId::new("main"));
+    let channels = loaded.telegram_channels();
+    let ch = channels.get(&-100111).expect("channel");
+    assert!(ch.require_mention);
+    assert_eq!(ch.agents, vec![super::AgentId::new("default")]);
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Config resolve method tests for Telegram
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telegram_bots_returns_only_bots_with_token() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("with_token"),
+        super::TelegramBotConfig {
+            token: Some(crate::config::secret_ref::env_resolved_value(
+                "TG_TOKEN", "123:abc",
+            )),
+            file_token: None,
+            username: Some("bot1".to_string()),
+        },
+    );
+    bots.insert(
+        super::BotId::new("without_token"),
+        super::TelegramBotConfig {
+            token: None,
+            file_token: None,
+            username: Some("bot2".to_string()),
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(true),
+            telegram_bots: Some(bots),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    let runtime_bots = config.telegram_bots();
+    assert_eq!(runtime_bots.len(), 1);
+    assert_eq!(*runtime_bots[0].bot_id, super::BotId::new("with_token"));
+}
+
+#[test]
+fn telegram_bots_disabled_channel_returns_empty() {
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        super::BotId::new("main"),
+        super::TelegramBotConfig {
+            token: Some(crate::config::secret_ref::env_resolved_value(
+                "TG_TOKEN", "tok",
+            )),
+            file_token: None,
+            username: Some("bot1".to_string()),
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(false),
+            telegram_bots: Some(bots),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    assert!(config.telegram_bots().is_empty());
+}
+
+#[test]
+fn telegram_channels_returns_configured_map() {
+    let mut tg_channels = std::collections::HashMap::new();
+    tg_channels.insert(
+        -100123i64,
+        super::TelegramChatConfig {
+            require_mention: true,
+            agents: vec![super::AgentId::new("default")],
+            multi_agent: false,
+        },
+    );
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        super::ChannelName::new("telegram"),
+        super::ChannelConfig {
+            enabled: Some(true),
+            telegram_channels: Some(tg_channels),
+            ..Default::default()
+        },
+    );
+
+    let config = minimal_config_with_channels(channels);
+    let ch = config.telegram_channels();
+    assert_eq!(ch.len(), 1);
+    let chat = ch.get(&-100123).expect("channel");
+    assert!(chat.require_mention);
+}
+
+#[test]
+fn telegram_channels_empty_when_not_configured() {
+    let channels = std::collections::HashMap::new();
+    let config = minimal_config_with_channels(channels);
+    assert!(config.telegram_channels().is_empty());
+}
+
+fn minimal_config_with_channels(
+    channels: std::collections::HashMap<super::ChannelName, super::ChannelConfig>,
+) -> super::Config {
+    let mut providers = std::collections::HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig {
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            default_model: "gpt-5".to_string(),
+            models: std::collections::HashMap::new(),
+        },
+    );
+    let mut agents = std::collections::HashMap::new();
+    agents.insert(
+        super::AgentId::new("default"),
+        super::AgentConfig {
+            label: "Default".to_string(),
+            ..Default::default()
+        },
+    );
+    super::Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers,
+        state_root: "/tmp/egopulse".to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels,
+        default_agent: super::AgentId::new("default"),
+        agents,
+        sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
+    }
 }

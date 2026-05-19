@@ -968,7 +968,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:compaction-success",
+                "cli:compaction-success:agent:default",
                 Some("compaction-success"),
                 "cli",
                 "default",
@@ -1068,7 +1068,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:compaction-fallback",
+                "cli:compaction-fallback:agent:default",
                 Some("compaction-fallback"),
                 "cli",
                 "default",
@@ -1282,7 +1282,7 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:compaction-usage",
+                "cli:compaction-usage:agent:default",
                 Some("compaction-usage"),
                 "cli",
                 "default",

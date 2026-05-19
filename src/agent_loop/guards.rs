@@ -159,7 +159,7 @@ mod tests {
         let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:declarative-guard",
+                "cli:declarative-guard:agent:default",
                 Some("declarative-guard"),
                 "cli",
                 "default",

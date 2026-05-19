@@ -24,6 +24,17 @@ struct SerializableDiscordBot {
 }
 
 #[derive(Serialize)]
+struct SerializableTelegramBot {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    token: Option<yaml_serde::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+}
+
+#[derive(Serialize)]
 struct SerializableDiscordChannel {
     #[serde(skip_serializing_if = "is_default")]
     require_mention: bool,
@@ -46,6 +57,8 @@ struct SerializableAgent {
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     discord_bot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_bot: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -126,25 +139,24 @@ struct SerializableChannel {
     auth_token: Option<yaml_serde::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_origins: Option<Vec<String>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_yaml_value"
-    )]
-    bot_token: Option<yaml_serde::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bot_username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chats: Option<HashMap<String, SerializableTelegramChat>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     channels: Option<HashMap<String, SerializableDiscordChannel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_bots: Option<HashMap<String, SerializableTelegramBot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_channels: Option<HashMap<String, SerializableTelegramChannel>>,
 }
 
 #[derive(Serialize)]
-struct SerializableTelegramChat {
+struct SerializableTelegramChannel {
     #[serde(skip_serializing_if = "is_default")]
     require_mention: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    multi_agent: bool,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -238,21 +250,6 @@ impl From<&Config> for SerializableConfig {
                         host: c.host.clone(),
                         auth_token: c.file_auth_token.clone(),
                         allowed_origins: c.allowed_origins.clone(),
-                        bot_token: c.file_bot_token.clone(),
-                        bot_username: c.bot_username.clone(),
-                        chats: c.chats.as_ref().map(|chat_map| {
-                            chat_map
-                                .iter()
-                                .map(|(chat_id, chat_config)| {
-                                    (
-                                        chat_id.to_string(),
-                                        SerializableTelegramChat {
-                                            require_mention: chat_config.require_mention,
-                                        },
-                                    )
-                                })
-                                .collect()
-                        }),
                         bots: c.discord_bots.as_ref().map(|bots| {
                             bots.iter()
                                 .map(|(bot_id, bot)| {
@@ -284,6 +281,38 @@ impl From<&Config> for SerializableConfig {
                                 })
                                 .collect()
                         }),
+                        telegram_bots: c.telegram_bots.as_ref().map(|bots| {
+                            bots.iter()
+                                .map(|(bot_id, bot)| {
+                                    (
+                                        bot_id.to_string(),
+                                        SerializableTelegramBot {
+                                            token: bot.file_token.clone(),
+                                            username: bot.username.clone(),
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
+                        telegram_channels: c.telegram_channels.as_ref().map(|ch_map| {
+                            ch_map
+                                .iter()
+                                .map(|(ch_id, ch_config)| {
+                                    (
+                                        ch_id.to_string(),
+                                        SerializableTelegramChannel {
+                                            require_mention: ch_config.require_mention,
+                                            agents: ch_config
+                                                .agents
+                                                .iter()
+                                                .map(|a| a.to_string())
+                                                .collect(),
+                                            multi_agent: ch_config.multi_agent,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }),
                     },
                 )
             })
@@ -300,6 +329,7 @@ impl From<&Config> for SerializableConfig {
                         provider: a.provider.clone(),
                         model: a.model.clone(),
                         discord_bot: a.discord_bot.as_ref().map(|b| b.to_string()),
+                        telegram_bot: a.telegram_bot.as_ref().map(|b| b.to_string()),
                     },
                 )
             })
@@ -451,10 +481,15 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
         if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.auth_token {
             entries.push((env_id.clone(), value.clone()));
         }
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.bot_token {
-            entries.push((env_id.clone(), value.clone()));
-        }
         if let Some(bots) = &channel.discord_bots {
+            for (bot_id, bot) in bots {
+                if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
+                    entries.push((env_id.clone(), value.clone()));
+                }
+                let _ = bot_id;
+            }
+        }
+        if let Some(bots) = &channel.telegram_bots {
             for (bot_id, bot) in bots {
                 if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
                     entries.push((env_id.clone(), value.clone()));
@@ -584,11 +619,20 @@ mod tests {
             ChannelName::new("discord"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(env_resolved_value(
-                    DISCORD_BOT_TOKEN_ENV_NAME,
-                    "discord-token",
-                )),
-                file_bot_token: Some(env_yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
+                discord_bots: Some({
+                    let mut bots = HashMap::new();
+                    bots.insert(
+                        super::super::BotId::new("main"),
+                        super::super::DiscordBotConfig {
+                            token: Some(env_resolved_value(
+                                DISCORD_BOT_TOKEN_ENV_NAME,
+                                "discord-token",
+                            )),
+                            file_token: Some(env_yaml_value(DISCORD_BOT_TOKEN_ENV_NAME)),
+                        },
+                    );
+                    bots
+                }),
                 ..Default::default()
             },
         );
@@ -668,9 +712,11 @@ channels:
       id: {WEB_AUTH_TOKEN_ENV_NAME}
   discord:
     enabled: true
-    bot_token:
-      source: env
-      id: {DISCORD_BOT_TOKEN_ENV_NAME}
+    bots:
+      main:
+        token:
+          source: env
+          id: {DISCORD_BOT_TOKEN_ENV_NAME}
 "#
         );
         fs::write(&path, initial_yaml).expect("write yaml");

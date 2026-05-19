@@ -174,11 +174,25 @@ pub async fn build_app_state_with_path(
     }
 
     #[cfg(feature = "channel-telegram")]
-    if let Some(token) = config.telegram_bot_token() {
-        let bot = teloxide::Bot::new(&token);
-        channels.register(Arc::new(crate::channels::telegram::TelegramAdapter::new(
-            bot,
-        )));
+    if !config.telegram_bots().is_empty() {
+        let bot_tokens: std::collections::HashMap<String, String> = config
+            .telegram_bots()
+            .into_iter()
+            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
+            .collect();
+        let agent_bots: std::collections::HashMap<String, String> = config
+            .agents
+            .iter()
+            .filter_map(|(agent_id, agent)| {
+                let bot_id = agent.telegram_bot.as_ref()?;
+                Some((agent_id.to_string(), bot_id.to_string()))
+            })
+            .collect();
+        channels.register(Arc::new(
+            crate::channels::telegram::TelegramAdapter::new_multi(
+                bot_tokens, agent_bots, "default",
+            ),
+        ));
     }
 
     let channels = Arc::new(channels);
@@ -199,14 +213,11 @@ pub async fn build_app_state_with_path(
     let (turn_sender, turn_receiver) =
         tokio::sync::mpsc::channel::<crate::agent_loop::PendingAgentTurn>(16);
 
-    #[cfg(feature = "channel-discord")]
-    if !config.discord_bots().is_empty() {
-        tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
-            config.agents.clone(),
-            Arc::clone(&deps.db),
-            Arc::clone(&channels),
-        )));
-    }
+    tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
+        config.agents.clone(),
+        Arc::clone(&deps.db),
+        Arc::clone(&channels),
+    )));
 
     let tools = Arc::new(tools);
 
@@ -584,28 +595,58 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
     // Telegram bot 起動
     #[cfg(feature = "channel-telegram")]
-    if state.config.channel_enabled("telegram") {
-        if let Some(token) = state.config.telegram_bot_token() {
+    {
+        let shared_channels = state.config.telegram_channels();
+        let default_agent = state.config.default_agent.clone();
+        let bot_configs: Vec<_> = state
+            .config
+            .telegram_bots()
+            .into_iter()
+            .map(|b| {
+                (
+                    b.bot_id.clone(),
+                    b.token.to_string(),
+                    b.username.to_string(),
+                    default_agent.clone(),
+                )
+            })
+            .collect();
+
+        if !bot_configs.is_empty() {
             has_active_channels = true;
-            let telegram_state = Arc::new(state.clone());
-            let bot_username = state.config.telegram_bot_username().unwrap_or_default();
-            info!("Starting Telegram bot as @{bot_username}...");
-            let handle = tokio::spawn(async move {
-                crate::channels::telegram::start_telegram_bot(telegram_state, token)
+            let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
+            for (bot_id, token, bot_username, default_agent) in bot_configs {
+                let telegram_state = Arc::new(state.clone());
+                let handle_name = format!("telegram[{bot_id}]");
+                info!(
+                    "Starting Telegram bot '{bot_id}' (agent {default_agent}) as @{bot_username}..."
+                );
+                let bid = bot_id.clone();
+                let chain_state = Arc::clone(&shared_chain_state);
+                let channels = shared_channels.clone();
+                let handle = tokio::spawn(async move {
+                    crate::channels::telegram::start_telegram_bot_for_bot(
+                        telegram_state,
+                        &token,
+                        &bid,
+                        &bot_username,
+                        &default_agent,
+                        &channels,
+                        chain_state,
+                    )
                     .await
                     .map_err(|error| {
                         EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                            "telegram bot failed: {error}"
+                            "telegram bot ({bid}) failed: {error}",
                         )))
                     })
-            });
-            handles.push(("telegram".to_string(), handle));
-        } else {
+                });
+                handles.push((handle_name, handle));
+            }
+        } else if state.config.channel_enabled("telegram") {
             tracing::warn!(
-                "Telegram channel is enabled but no bot_token is configured. \
-                 Set channels.telegram.bot_token in egopulse.config.yaml, \
-                  set TELEGRAM_BOT_TOKEN environment variable, \
-                  or add TELEGRAM_BOT_TOKEN to ~/.egopulse/.env."
+                "Telegram channel is enabled but no bots have a token configured. \
+                 Set channels.telegram.bots.<id>.token in egopulse.config.yaml."
             );
         }
     }

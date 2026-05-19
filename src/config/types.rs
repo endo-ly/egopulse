@@ -80,11 +80,37 @@ pub(crate) struct DiscordChannelConfig {
     pub multi_agent: bool,
 }
 
-/// Per-chat Telegram configuration stored inside `ChannelConfig.chats`.
+/// Per-chat Telegram configuration stored inside `ChannelConfig.telegram_channels`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TelegramChatConfig {
     /// Whether this chat requires an explicit @mention to trigger the bot.
     pub require_mention: bool,
+    /// Agents assigned to this chat.
+    pub agents: Vec<AgentId>,
+    /// Whether this chat operates as a multi-agent room.
+    pub multi_agent: bool,
+}
+
+/// Per-bot Telegram configuration stored under `channels.telegram.bots.<bot_id>`.
+///
+/// Each bot connects to Telegram with its own token and routes messages to agents
+/// based on shared channel config or falls back to the global `default_agent`.
+/// Channel-to-agent mappings live at the Telegram level (`channels.telegram.channels`).
+#[derive(Clone)]
+pub(crate) struct TelegramBotConfig {
+    pub token: Option<ResolvedValue>,
+    pub file_token: Option<yaml_serde::Value>,
+    /// Telegram bot username (required — cannot be auto-detected from API like Discord).
+    pub username: Option<String>,
+}
+
+impl std::fmt::Debug for TelegramBotConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramBotConfig")
+            .field("token", &debug_secret(self.token.as_ref()))
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 /// Per-bot Discord configuration stored under `channels.discord.bots.<bot_id>`.
@@ -114,16 +140,15 @@ pub(crate) struct ChannelConfig {
     pub auth_token: Option<ResolvedValue>,
     pub file_auth_token: Option<yaml_serde::Value>,
     pub allowed_origins: Option<Vec<String>>,
-    pub bot_token: Option<ResolvedValue>,
-    pub file_bot_token: Option<yaml_serde::Value>,
-    pub bot_username: Option<String>,
-    /// Per-chat Telegram configuration keyed by chat ID.
-    pub chats: Option<HashMap<i64, TelegramChatConfig>>,
     pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
     /// Shared Discord channel configs at the channel level (`channels.discord.channels`).
     /// Each bot determines channel membership by checking which agents in each
     /// channel's `agents` list have `discord_bot` set to the bot's ID.
     pub discord_channels: Option<HashMap<u64, DiscordChannelConfig>>,
+    /// Telegram bot configs under `channels.telegram.bots`.
+    pub telegram_bots: Option<HashMap<BotId, TelegramBotConfig>>,
+    /// Telegram channel (group/supergroup) configs under `channels.telegram.channels`.
+    pub telegram_channels: Option<HashMap<i64, TelegramChatConfig>>,
 }
 
 impl std::fmt::Debug for ChannelConfig {
@@ -134,11 +159,10 @@ impl std::fmt::Debug for ChannelConfig {
             .field("host", &self.host)
             .field("auth_token", &debug_secret(self.auth_token.as_ref()))
             .field("allowed_origins", &self.allowed_origins)
-            .field("bot_token", &debug_secret(self.bot_token.as_ref()))
-            .field("bot_username", &self.bot_username)
-            .field("chats", &self.chats)
             .field("discord_bots", &self.discord_bots)
             .field("discord_channels", &self.discord_channels)
+            .field("telegram_bots", &self.telegram_bots)
+            .field("telegram_channels", &self.telegram_channels)
             .finish()
     }
 }
@@ -339,6 +363,7 @@ pub(crate) struct AgentConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub discord_bot: Option<BotId>,
+    pub telegram_bot: Option<BotId>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -348,6 +373,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("discord_bot", &self.discord_bot)
+            .field("telegram_bot", &self.telegram_bot)
             .finish()
     }
 }

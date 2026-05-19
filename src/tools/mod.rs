@@ -671,10 +671,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut config = test_config(dir.path().to_str().expect("utf8"));
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::DiscordBotConfig {
+                token: None,
+                file_token: Some(yaml_serde::Value::String("sk-secret-token-123".to_string())),
+            },
+        );
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
-                file_bot_token: Some(yaml_serde::Value::String("sk-secret-token-123".to_string())),
+                discord_bots: Some(bots),
                 ..Default::default()
             },
         );

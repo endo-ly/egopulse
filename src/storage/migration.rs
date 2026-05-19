@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 1;
+pub(super) const SCHEMA_VERSION: i64 = 2;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -195,10 +195,26 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         )?;
         set_schema_version(
             conn,
-            SCHEMA_VERSION,
+            1,
             "full schema: chats, messages, sessions, tool_calls, llm_usage_logs, sleep_runs, memory_snapshots, pulse_runs",
         )?;
-        version = SCHEMA_VERSION;
+        version = 1;
+    }
+
+    if version < 2 {
+        conn.execute_batch(
+            "UPDATE chats
+             SET external_chat_id = external_chat_id || ':agent:default'
+             WHERE external_chat_id NOT LIKE '%:agent:%'
+               AND channel NOT IN ('discord')
+               AND chat_type != 'channel_log'",
+        )?;
+        set_schema_version(
+            conn,
+            2,
+            "append :agent:default to session keys without :agent: segment",
+        )?;
+        version = 2;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -243,6 +259,134 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version");
+        assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v2_appends_agent_default_to_session_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("migrations");
+        let conn = db.conn.lock().expect("lock");
+
+        // Insert old-format session keys
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('tg-chat', 'group', '2025-01-01T00:00:00Z', 'telegram', 'telegram:-100123', 'default')",
+            [],
+        ).expect("insert telegram");
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('cli-chat', 'private', '2025-01-01T00:00:00Z', 'cli', 'cli:mysession', 'default')",
+            [],
+        ).expect("insert cli");
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('tui-chat', 'private', '2025-01-01T00:00:00Z', 'tui', 'tui:local-abc', 'default')",
+            [],
+        ).expect("insert tui");
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('web-chat', 'private', '2025-01-01T00:00:00Z', 'web', 'web:s1', 'default')",
+            [],
+        ).expect("insert web");
+        // Discord already has :agent: — should be untouched
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('dc-chat', 'guild', '2025-01-01T00:00:00Z', 'discord', 'discord:123:agent:alice', 'alice')",
+            [],
+        ).expect("insert discord");
+
+        // Roll back schema version to 1 so v2 migration runs
+        conn.execute(
+            "UPDATE db_meta SET value = '1' WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("rollback version");
+
+        drop(conn);
+
+        // Re-run migrations (v2 will apply)
+        {
+            let conn = db.conn.lock().expect("lock");
+            super::run_migrations(&conn).expect("re-run migrations");
+        }
+
+        let conn = db.conn.lock().expect("lock");
+
+        // Telegram renamed
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'telegram'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("telegram key");
+        assert_eq!(key, "telegram:-100123:agent:default");
+
+        // CLI renamed
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'cli'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("cli key");
+        assert_eq!(key, "cli:mysession:agent:default");
+
+        // TUI renamed
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'tui'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("tui key");
+        assert_eq!(key, "tui:local-abc:agent:default");
+
+        // Web renamed
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'web'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("web key");
+        assert_eq!(key, "web:s1:agent:default");
+
+        // Discord untouched
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'discord'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("discord key");
+        assert_eq!(key, "discord:123:agent:alice");
+    }
+
+    #[test]
+    fn migration_v2_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("migrations");
+
+        // Run migration twice
+        {
+            let conn = db.conn.lock().expect("lock");
+            super::run_migrations(&conn).expect("first run");
+            super::run_migrations(&conn).expect("second run");
+        }
+
+        // Schema version should still be 2
+        let conn = db.conn.lock().expect("lock");
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version");
         assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
     }
 }
