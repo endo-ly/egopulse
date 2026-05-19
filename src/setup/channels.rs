@@ -94,7 +94,7 @@ pub(crate) fn build_channel_configs(
     use crate::config::secret_ref::{
         TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value,
     };
-    use crate::config::{ChannelConfig, ChannelName};
+    use crate::config::{BotId, ChannelConfig, ChannelName, TelegramBotConfig};
 
     let mut channels = HashMap::new();
 
@@ -121,16 +121,23 @@ pub(crate) fn build_channel_configs(
     }
 
     if telegram_enabled {
+        let mut bots = HashMap::new();
+        bots.insert(
+            BotId::new("default"),
+            TelegramBotConfig {
+                token: Some(env_resolved_value(
+                    TELEGRAM_BOT_TOKEN_ENV_NAME,
+                    telegram_bot_token,
+                )),
+                file_token: Some(env_yaml_value(TELEGRAM_BOT_TOKEN_ENV_NAME)),
+                username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
+            },
+        );
         channels.insert(
             ChannelName::new("telegram"),
             ChannelConfig {
                 enabled: Some(true),
-                bot_token: Some(env_resolved_value(
-                    TELEGRAM_BOT_TOKEN_ENV_NAME,
-                    telegram_bot_token,
-                )),
-                file_bot_token: Some(env_yaml_value(TELEGRAM_BOT_TOKEN_ENV_NAME)),
-                bot_username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
+                telegram_bots: Some(bots),
                 ..Default::default()
             },
         );
@@ -215,9 +222,12 @@ mod tests {
         assert!(discord.file_bot_token.is_none());
 
         let telegram = channels.get("telegram").expect("telegram");
+        let bots = telegram.telegram_bots.as_ref().expect("telegram bots");
+        let default_bot = bots.get(&crate::config::BotId::new("default")).expect("default bot");
         let telegram_file =
-            yaml_serde::to_string(telegram.file_bot_token.as_ref().expect("telegram file"))
+            yaml_serde::to_string(default_bot.file_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");
         assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
+        assert_eq!(default_bot.username.as_deref(), Some("botname"));
     }
 }
