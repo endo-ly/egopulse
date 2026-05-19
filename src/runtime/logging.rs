@@ -1,15 +1,35 @@
 //! ロギング初期化。
 //!
-//! tracing-subscriber を用いたグローバルロガーのセットアップを提供する。
+//! tracing-subscriber を用いたグローバルロガーのセットアップと、
+//! panic 時の二重 abort を防ぐカスタム panic hook の設定を提供する。
+
+use std::io::Write;
+use std::sync::OnceLock;
 
 use tracing_subscriber::EnvFilter;
 
 use crate::error::LoggingError;
 
+/// Targets that emit excessive debug output and are clamped to `warn`.
+/// Pulled in by readability-js via html5ever — thousands of log lines per
+/// large HTML document can fill the stderr pipe buffer.
+const NOISY_CRATE_OVERRIDES: &[&str] = &["html5ever=warn", "markup5ever=warn", "selectors=warn"];
+
+/// Ensures [`install_eagain_safe_panic_hook`] runs exactly once even if
+/// `init_logging` is called multiple times.
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
 /// Initialize the global tracing subscriber with the given log level.
+///
+/// Also installs a panic hook that tolerates `EAGAIN` on stderr to prevent
+/// the double-panic → `abort()` chain described in [`install_eagain_safe_panic_hook`].
 pub fn init_logging(level: &str) -> Result<(), LoggingError> {
-    let filter = EnvFilter::try_new(level)
-        .or_else(|_| EnvFilter::try_new(level.to_ascii_lowercase()))
+    PANIC_HOOK_INSTALLED.get_or_init(install_eagain_safe_panic_hook);
+
+    let noisy_directives = NOISY_CRATE_OVERRIDES.join(",");
+    let filter_string = format!("{level},{noisy_directives}");
+    let filter = EnvFilter::try_new(&filter_string)
+        .or_else(|_| EnvFilter::try_new(filter_string.to_ascii_lowercase()))
         .map_err(|error| LoggingError::InitFailed(error.to_string()))?;
 
     match tracing_subscriber::fmt()
@@ -27,4 +47,21 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
         }
         Err(error) => Err(LoggingError::InitFailed(error.to_string())),
     }
+}
+
+/// Installs a panic hook that ignores stderr write failures.
+///
+/// The default hook writes the panic message to stderr and panics again if
+/// that write fails.  When the stderr pipe is full (e.g. html5ever flood),
+/// this triggers a double-panic → `abort()`, bypassing `catch_unwind`.
+/// This hook discards write failures instead, allowing normal unwinding.
+fn install_eagain_safe_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{info}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            default_hook(info);
+        }));
+    }));
 }
