@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{FileId, InputFile, MessageEntityKind};
+use teloxide::types::{FileId, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::SurfaceContext;
@@ -399,60 +399,71 @@ impl TelegramHandler {
 
 // ---------------------------------------------------------------------------
 // TelegramAdapter — アウトバウンド送信のみ
+//
+// Discord と同じく reqwest で Telegram Bot REST API を直接叩く。
+// これにより external_chat_id の :agent: セグメントから agent → bot_id → token
+// を引いて、送信Bot を正しくルーティングできる。
 // ---------------------------------------------------------------------------
 
 /// Telegram チャネルアダプター。
 ///
-/// アウトバウンドメッセージ送信用。Bot API 経由で Telegram にメッセージを送信する。
+/// アウトバウンドメッセージ送信用。Telegram Bot REST API 経由でメッセージを送信する。
 pub(crate) struct TelegramAdapter {
-    /// デフォルトの Bot クライアント (単一ボットまたはフォールバック用)。
-    default_bot: Bot,
-    /// `bot_id → token` のマップ。マルチボット構成で使用。
-    #[allow(dead_code)]
+    /// `bot_id → token` のマップ。
     bot_tokens: std::collections::HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
-    #[allow(dead_code)]
     agent_bot_map: std::collections::HashMap<String, String>,
+    /// フォールバック用トークン（単一Bot 構成やマッピングなし時）。
+    default_token: String,
+    http_client: reqwest::Client,
 }
 
 impl TelegramAdapter {
-    /// Creates a Telegram adapter backed by the provided bot client.
+    /// Creates a single-bot Telegram adapter.
     #[allow(dead_code)]
     pub(crate) fn new(bot: Bot) -> Self {
+        // Extract token from the bot — teloxide doesn't expose it, so we
+        // accept the Bot only for API compatibility; callers should use new_multi.
+        let _ = bot;
         Self {
-            default_bot: bot,
             bot_tokens: std::collections::HashMap::new(),
             agent_bot_map: std::collections::HashMap::new(),
+            default_token: String::new(),
+            http_client: reqwest::Client::new(),
         }
     }
 
     /// Creates a multi-bot Telegram adapter with token routing.
     pub(crate) fn new_multi(
-        default_bot: Bot,
         bot_tokens: std::collections::HashMap<String, String>,
         agent_bot_map: std::collections::HashMap<String, String>,
     ) -> Self {
+        let default_token = bot_tokens.values().next().cloned().unwrap_or_default();
         Self {
-            default_bot,
             bot_tokens,
             agent_bot_map,
+            default_token,
+            http_client: reqwest::Client::new(),
         }
     }
 
-    /// Get the appropriate bot for sending to the given external_chat_id.
+    /// Resolve the bot token for a given external_chat_id.
     ///
-    /// Resolves agent_id from the `:agent:` segment, then looks up
-    /// agent → bot_id → token to find the right Bot.
-    /// Falls back to `default_bot` if no mapping exists.
-    fn bot_for(&self, external_chat_id: &str) -> &Bot {
-        // Currently teloxide::Bot is tied to a single token at construction time.
-        // Multi-bot outbound routing requires per-token Bot instances.
-        // For now, return default_bot as the token routing is not yet
-        // implemented at the adapter level.
-        //
-        // TODO: Create Bot instances per-token when outbound routing is needed.
-        let _ = external_chat_id;
-        &self.default_bot
+    /// Extracts agent_id from the `:agent:` segment, maps agent → bot_id → token.
+    /// Falls back to `default_token` if no mapping is found.
+    fn select_token(&self, external_chat_id: &str) -> &str {
+        let agent_id = external_chat_id
+            .find(":agent:")
+            .map(|pos| &external_chat_id[pos + ":agent:".len()..])
+            .unwrap_or("");
+        if !agent_id.is_empty() {
+            if let Some(bot_id) = self.agent_bot_map.get(agent_id) {
+                if let Some(token) = self.bot_tokens.get(bot_id) {
+                    return token;
+                }
+            }
+        }
+        &self.default_token
     }
 }
 
@@ -477,36 +488,19 @@ impl ChannelAdapter for TelegramAdapter {
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
-
-        const MAX_RETRIES: u32 = 3;
+        let token = self.select_token(external_chat_id);
 
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
-            let mut attempt = 0;
-            loop {
-                match self
-                    .bot_for(external_chat_id)
-                    .send_message(ChatId(chat_id), &chunk)
-                    .await
-                {
-                    Ok(_) => break,
-                    Err(e) => {
-                        if let teloxide::RequestError::RetryAfter(seconds) = &e {
-                            if attempt < MAX_RETRIES {
-                                let wait = seconds.duration();
-                                debug!(
-                                    attempt = attempt + 1,
-                                    retry_after = wait.as_secs(),
-                                    "Telegram rate limited, retrying after {wait:?}"
-                                );
-                                tokio::time::sleep(wait).await;
-                                attempt += 1;
-                                continue;
-                            }
-                        }
-                        return Err(format!("Telegram send_message failed: {e}"));
-                    }
-                }
-            }
+            send_telegram_api(
+                &self.http_client,
+                token,
+                "sendMessage",
+                serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": chunk,
+                }),
+            )
+            .await?;
         }
 
         Ok(())
@@ -520,6 +514,16 @@ impl ChannelAdapter for TelegramAdapter {
         caption: Option<&str>,
     ) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
+        let token = self.select_token(external_chat_id);
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let file_bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| format!("failed to read file: {e}"))?;
 
         let extension = file_path
             .extension()
@@ -539,35 +543,39 @@ impl ChannelAdapter for TelegramAdapter {
             caption_text
         };
 
-        if is_image {
-            let input_file = InputFile::file(file_path);
-            let mut req = self
-                .bot_for(external_chat_id)
-                .send_photo(ChatId(chat_id), input_file);
-            if !caption_value.is_empty() {
-                req = req.caption(caption_value);
-            }
-            req.await
-                .map_err(|e| format!("Telegram send_photo failed: {e}"))?;
+        let method = if is_image {
+            "sendPhoto"
         } else {
-            let input_file = InputFile::file(file_path);
-            let mut req = self
-                .bot_for(external_chat_id)
-                .send_document(ChatId(chat_id), input_file);
-            if !caption_value.is_empty() {
-                req = req.caption(caption_value);
-            }
-            req.await
-                .map_err(|e| format!("Telegram send_document failed: {e}"))?;
+            "sendDocument"
+        };
+        let file_part_name = if is_image { "photo" } else { "document" };
+
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename)
+            .mime_str("application/octet-stream")
+            .expect("'application/octet-stream' is a valid MIME type");
+
+        let mut form = reqwest::multipart::Form::new().part(file_part_name, part);
+        form = form.text("chat_id", chat_id.to_string());
+        if !caption_value.is_empty() {
+            form = form.text("caption", caption_value.to_string());
         }
+
+        send_telegram_multipart(&self.http_client, token, method, form).await?;
 
         if let Some(t) = text {
             if caption.is_some() && !t.is_empty() {
                 for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
-                    self.bot_for(external_chat_id)
-                        .send_message(ChatId(chat_id), &chunk)
-                        .await
-                        .map_err(|e| format!("Telegram send_message failed: {e}"))?;
+                    send_telegram_api(
+                        &self.http_client,
+                        token,
+                        "sendMessage",
+                        serde_json::json!({
+                            "chat_id": chat_id,
+                            "text": chunk,
+                        }),
+                    )
+                    .await?;
                 }
             }
         }
@@ -579,6 +587,84 @@ impl ChannelAdapter for TelegramAdapter {
 // ---------------------------------------------------------------------------
 // ヘルパー関数
 // ---------------------------------------------------------------------------
+
+/// Telegram Bot API の JSON エンドポイントにリクエストを送信する。
+/// 429 レート制限時は自動リトライする。
+const MAX_RETRIES: u32 = 3;
+
+async fn send_telegram_api(
+    client: &reqwest::Client,
+    token: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/{method}");
+    let mut attempt = 0;
+    loop {
+        let resp = client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Telegram API request failed: {e}"))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status.as_u16() == 429 && attempt < MAX_RETRIES {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2);
+            debug!(
+                attempt = attempt + 1,
+                retry_after, "Telegram rate limited, retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+            attempt += 1;
+            continue;
+        }
+
+        let response_body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Telegram API error: HTTP {status} {}",
+            response_body.chars().take(300).collect::<String>()
+        ));
+    }
+}
+
+/// Telegram Bot API の multipart エンドポイントにリクエストを送信する。
+async fn send_telegram_multipart(
+    client: &reqwest::Client,
+    token: &str,
+    method: &str,
+    form: reqwest::multipart::Form,
+) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/{method}");
+    let resp = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Telegram API multipart request failed: {e}"))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let response_body = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "Telegram API error: HTTP {status} {}",
+        response_body.chars().take(300).collect::<String>()
+    ))
+}
 
 /// Telegram からファイルをダウンロードし、`workspace/media/inbound/` に保存する。
 async fn download_and_save(
@@ -1070,15 +1156,19 @@ mod tests {
 
     #[test]
     fn adapter_name() {
-        let bot = Bot::new("test-token");
-        let adapter = TelegramAdapter::new(bot);
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
+            std::collections::HashMap::new(),
+        );
         assert_eq!(adapter.name(), "telegram");
     }
 
     #[test]
     fn adapter_chat_type_routes() {
-        let bot = Bot::new("test-token");
-        let adapter = TelegramAdapter::new(bot);
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
+            std::collections::HashMap::new(),
+        );
         let routes = adapter.chat_type_routes();
         assert!(routes.len() >= 6);
         assert!(
@@ -1100,6 +1190,42 @@ mod tests {
             -100123
         );
         assert!(parse_telegram_chat_id("telegram:not-a-number").is_err());
+    }
+
+    // --- Token routing tests ---
+
+    #[test]
+    fn select_token_routes_to_bound_bot() {
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([
+                ("main".to_string(), "token-main".to_string()),
+                ("other".to_string(), "token-other".to_string()),
+            ]),
+            std::collections::HashMap::from([
+                ("alice".to_string(), "main".to_string()),
+                ("bob".to_string(), "other".to_string()),
+            ]),
+        );
+        assert_eq!(
+            adapter.select_token("telegram:-100:agent:alice"),
+            "token-main"
+        );
+        assert_eq!(
+            adapter.select_token("telegram:-100:agent:bob"),
+            "token-other"
+        );
+    }
+
+    #[test]
+    fn select_token_falls_back_to_default() {
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            adapter.select_token("telegram:-100:agent:unknown"),
+            "token-main"
+        );
     }
 
     /// Telegram BotCommand リストが all_commands() レジストリと整合することを確認。

@@ -188,11 +188,8 @@ pub async fn build_app_state_with_path(
                 Some((agent_id.to_string(), bot_id.to_string()))
             })
             .collect();
-        // Use the first bot as the default for the adapter
-        let first_token = bot_tokens.values().next().expect("at least one bot");
-        let bot = teloxide::Bot::new(first_token);
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(bot, bot_tokens, agent_bots),
+            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
         ));
     }
 
