@@ -189,7 +189,9 @@ pub async fn build_app_state_with_path(
             })
             .collect();
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
+            crate::channels::telegram::TelegramAdapter::new_multi(
+                bot_tokens, agent_bots, "default",
+            ),
         ));
     }
 

@@ -419,26 +419,19 @@ pub(crate) struct TelegramAdapter {
 }
 
 impl TelegramAdapter {
-    /// Creates a single-bot Telegram adapter.
-    #[allow(dead_code)]
-    pub(crate) fn new(bot: Bot) -> Self {
-        // Extract token from the bot — teloxide doesn't expose it, so we
-        // accept the Bot only for API compatibility; callers should use new_multi.
-        let _ = bot;
-        Self {
-            bot_tokens: std::collections::HashMap::new(),
-            agent_bot_map: std::collections::HashMap::new(),
-            default_token: String::new(),
-            http_client: reqwest::Client::new(),
-        }
-    }
-
     /// Creates a multi-bot Telegram adapter with token routing.
+    ///
+    /// `default_bot_id` determines which token is used when agent resolution
+    /// fails (e.g. DM with default_agent that has no explicit telegram_bot binding).
+    /// Panics if `default_bot_id` is not present in `bot_tokens`.
     pub(crate) fn new_multi(
         bot_tokens: std::collections::HashMap<String, String>,
         agent_bot_map: std::collections::HashMap<String, String>,
+        default_bot_id: &str,
     ) -> Self {
-        let default_token = bot_tokens.values().next().cloned().unwrap_or_default();
+        let default_token = bot_tokens.get(default_bot_id).cloned().unwrap_or_else(|| {
+            panic!("TelegramAdapter: default_bot_id '{default_bot_id}' not found in bot_tokens")
+        });
         Self {
             bot_tokens,
             agent_bot_map,
@@ -550,18 +543,22 @@ impl ChannelAdapter for TelegramAdapter {
         };
         let file_part_name = if is_image { "photo" } else { "document" };
 
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(filename)
-            .mime_str("application/octet-stream")
-            .expect("'application/octet-stream' is a valid MIME type");
-
-        let mut form = reqwest::multipart::Form::new().part(file_part_name, part);
-        form = form.text("chat_id", chat_id.to_string());
+        let mut fields: Vec<(&str, String)> = vec![("chat_id", chat_id.to_string())];
         if !caption_value.is_empty() {
-            form = form.text("caption", caption_value.to_string());
+            fields.push(("caption", caption_value.to_string()));
         }
+        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        send_telegram_multipart(&self.http_client, token, method, form).await?;
+        send_telegram_multipart(
+            &self.http_client,
+            token,
+            method,
+            file_part_name,
+            &filename,
+            &file_bytes,
+            &field_refs,
+        )
+        .await?;
 
         if let Some(t) = text {
             if caption.is_some() && !t.is_empty() {
@@ -643,27 +640,61 @@ async fn send_telegram_multipart(
     client: &reqwest::Client,
     token: &str,
     method: &str,
-    form: reqwest::multipart::Form,
+    file_part_name: &str,
+    filename: &str,
+    file_bytes: &[u8],
+    fields: &[(&str, &str)],
 ) -> Result<(), String> {
     let url = format!("https://api.telegram.org/bot{token}/{method}");
-    let resp = client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(60))
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("Telegram API multipart request failed: {e}"))?;
+    let file_part_name_owned = file_part_name.to_string();
+    let filename_owned = filename.to_string();
+    let mut attempt = 0;
+    loop {
+        let part = reqwest::multipart::Part::bytes(file_bytes.to_vec())
+            .file_name(filename_owned.clone())
+            .mime_str("application/octet-stream")
+            .expect("'application/octet-stream' is a valid MIME type");
 
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(());
+        let mut form = reqwest::multipart::Form::new().part(file_part_name_owned.clone(), part);
+        for (key, value) in fields {
+            form = form.text(key.to_string(), value.to_string());
+        }
+
+        let resp = client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| format!("Telegram API multipart request failed: {e}"))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status.as_u16() == 429 && attempt < MAX_RETRIES {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2);
+            debug!(
+                attempt = attempt + 1,
+                retry_after, "Telegram multipart rate limited, retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+            attempt += 1;
+            continue;
+        }
+
+        let response_body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Telegram API error: HTTP {status} {}",
+            response_body.chars().take(300).collect::<String>()
+        ));
     }
-
-    let response_body = resp.text().await.unwrap_or_default();
-    Err(format!(
-        "Telegram API error: HTTP {status} {}",
-        response_body.chars().take(300).collect::<String>()
-    ))
 }
 
 /// Telegram からファイルをダウンロードし、`workspace/media/inbound/` に保存する。
@@ -840,14 +871,6 @@ async fn handle_message(
         .get(&raw_chat_id)
         .is_some_and(|c| c.multi_agent);
 
-    let channel_log_chat_id = if is_multi_agent && !is_dm {
-        handler
-            .store_human_channel_log_message(raw_chat_id, &sender_name, msg.id.0, &text)
-            .await
-    } else {
-        None
-    };
-
     // ObserveOnly: Channel Log に保存済み、応答はしない
     let Some(agent_id) = route.response_agent_id().map(ToString::to_string) else {
         return Ok(());
@@ -895,6 +918,15 @@ async fn handle_message(
     if combined_text.is_empty() {
         return Ok(());
     }
+
+    // Channel Log: multi-agent room では combined_text（添付情報込み）を保存
+    let channel_log_chat_id = if is_multi_agent && !is_dm {
+        handler
+            .store_human_channel_log_message(raw_chat_id, &sender_name, msg.id.0, &combined_text)
+            .await
+    } else {
+        None
+    };
 
     let mut context = handler.make_context(&sender_name, &thread, &agent_id);
     context.channel_log_chat_id = channel_log_chat_id;
@@ -1159,6 +1191,7 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
+            "main",
         );
         assert_eq!(adapter.name(), "telegram");
     }
@@ -1168,6 +1201,7 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
+            "main",
         );
         let routes = adapter.chat_type_routes();
         assert!(routes.len() >= 6);
@@ -1205,6 +1239,7 @@ mod tests {
                 ("alice".to_string(), "main".to_string()),
                 ("bob".to_string(), "other".to_string()),
             ]),
+            "main",
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:alice"),
@@ -1221,6 +1256,7 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
             std::collections::HashMap::new(),
+            "main",
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:unknown"),
