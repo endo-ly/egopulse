@@ -199,13 +199,28 @@ pub async fn build_app_state_with_path(
     let (turn_sender, turn_receiver) =
         tokio::sync::mpsc::channel::<crate::agent_loop::PendingAgentTurn>(16);
 
-    #[cfg(feature = "channel-discord")]
-    if !config.discord_bots().is_empty() {
-        tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
-            config.agents.clone(),
-            Arc::clone(&deps.db),
-            Arc::clone(&channels),
-        )));
+    #[cfg(any(feature = "channel-discord", feature = "channel-telegram"))]
+    {
+        let has_remote_bots = {
+            #[cfg(feature = "channel-discord")]
+            let has = !config.discord_bots().is_empty();
+            #[cfg(not(feature = "channel-discord"))]
+            let has = false;
+
+            #[cfg(feature = "channel-telegram")]
+            let tg_has = !config.telegram_bots().is_empty();
+            #[cfg(not(feature = "channel-telegram"))]
+            let tg_has = false;
+
+            has || tg_has
+        };
+        if has_remote_bots {
+            tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
+                config.agents.clone(),
+                Arc::clone(&deps.db),
+                Arc::clone(&channels),
+            )));
+        }
     }
 
     let tools = Arc::new(tools);
