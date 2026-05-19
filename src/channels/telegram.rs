@@ -406,13 +406,56 @@ impl TelegramHandler {
 ///
 /// アウトバウンドメッセージ送信用。Bot API 経由で Telegram にメッセージを送信する。
 pub(crate) struct TelegramAdapter {
-    bot: Bot,
+    /// デフォルトの Bot クライアント (単一ボットまたはフォールバック用)。
+    default_bot: Bot,
+    /// `agent_id → bot_token` のマップ。マルチボット構成で使用。
+    bot_tokens: std::collections::HashMap<String, String>,
+    /// `agent_id → bot_id` のマップ。
+    agent_bot_map: std::collections::HashMap<String, String>,
 }
 
 impl TelegramAdapter {
     /// Creates a Telegram adapter backed by the provided bot client.
     pub(crate) fn new(bot: Bot) -> Self {
-        Self { bot }
+        Self {
+            default_bot: bot,
+            bot_tokens: std::collections::HashMap::new(),
+            agent_bot_map: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Creates a multi-bot Telegram adapter with token routing.
+    pub(crate) fn new_multi(
+        default_bot: Bot,
+        bot_tokens: std::collections::HashMap<String, String>,
+        agent_bot_map: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            default_bot,
+            bot_tokens,
+            agent_bot_map,
+        }
+    }
+
+    /// Resolve the bot token for a given external_chat_id.
+    /// Extracts agent_id from `:agent:` segment and resolves via agent_bot_map.
+    fn select_token(&self, external_chat_id: &str) -> Option<&str> {
+        let agent_id = external_chat_id
+            .find(":agent:")
+            .map(|pos| &external_chat_id[pos + ":agent:".len()..])?;
+        if agent_id.is_empty() {
+            return None;
+        }
+        let bot_id = self.agent_bot_map.get(agent_id)?;
+        self.bot_tokens.get(bot_id).map(String::as_str)
+    }
+
+    /// Get the appropriate bot for sending to the given external_chat_id.
+    fn bot_for(&self, external_chat_id: &str) -> &Bot {
+        // For now, always use default_bot since teloxide::Bot is tied to one token
+        // Token selection would require HTTP client approach (future improvement)
+        let _ = external_chat_id;
+        &self.default_bot
     }
 }
 
@@ -443,7 +486,7 @@ impl ChannelAdapter for TelegramAdapter {
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
             let mut attempt = 0;
             loop {
-                match self.bot.send_message(ChatId(chat_id), &chunk).await {
+                match self.bot_for(external_chat_id).send_message(ChatId(chat_id), &chunk).await {
                     Ok(_) => break,
                     Err(e) => {
                         if let teloxide::RequestError::RetryAfter(seconds) = &e {
@@ -497,7 +540,7 @@ impl ChannelAdapter for TelegramAdapter {
 
         if is_image {
             let input_file = InputFile::file(file_path);
-            let mut req = self.bot.send_photo(ChatId(chat_id), input_file);
+            let mut req = self.bot_for(external_chat_id).send_photo(ChatId(chat_id), input_file);
             if !caption_value.is_empty() {
                 req = req.caption(caption_value);
             }
@@ -505,7 +548,7 @@ impl ChannelAdapter for TelegramAdapter {
                 .map_err(|e| format!("Telegram send_photo failed: {e}"))?;
         } else {
             let input_file = InputFile::file(file_path);
-            let mut req = self.bot.send_document(ChatId(chat_id), input_file);
+            let mut req = self.bot_for(external_chat_id).send_document(ChatId(chat_id), input_file);
             if !caption_value.is_empty() {
                 req = req.caption(caption_value);
             }
@@ -516,7 +559,7 @@ impl ChannelAdapter for TelegramAdapter {
         if let Some(t) = text {
             if caption.is_some() && !t.is_empty() {
                 for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
-                    self.bot
+                    self.bot_for(external_chat_id)
                         .send_message(ChatId(chat_id), &chunk)
                         .await
                         .map_err(|e| format!("Telegram send_message failed: {e}"))?;
