@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -133,7 +132,6 @@ impl Config {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pulse(&self) -> &PulseConfig {
         &self.pulse
     }
@@ -193,27 +191,6 @@ impl Config {
         Err(ConfigError::AutoConfigNotFound {
             searched_paths: vec![candidate],
         })
-    }
-
-    /// Telegram bot token (env override or config file).
-    #[allow(dead_code)]
-    pub(crate) fn telegram_bot_token(&self) -> Option<String> {
-        env::var("TELEGRAM_BOT_TOKEN")
-            .ok()
-            .and_then(|v| super::loader::normalize_string(Some(v)))
-            .or_else(|| {
-                self.channels
-                    .get("telegram")
-                    .and_then(|c| c.bot_token.as_ref().map(|rv| rv.value().to_string()))
-            })
-    }
-
-    /// Telegram bot username for group mention detection.
-    #[allow(dead_code)]
-    pub(crate) fn telegram_bot_username(&self) -> Option<&str> {
-        self.channels
-            .get("telegram")
-            .and_then(|c| c.bot_username.as_deref())
     }
 
     /// 組み込みスキルディレクトリ: `state_root/skills`。

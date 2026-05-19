@@ -54,13 +54,6 @@ impl EgoPulseError {
     pub(crate) fn user_message(&self) -> String {
         format!("Error: {self}")
     }
-
-    /// ネットワーク到達不能など、ユーザー通知を抑制すべきノイズエラーなら true。
-    #[allow(dead_code)]
-    pub(crate) fn should_suppress_user_error(&self) -> bool {
-        let text = self.to_string().to_ascii_lowercase();
-        text.contains("error sending request for url")
-    }
 }
 
 /// Configuration loading and validation errors.

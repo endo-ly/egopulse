@@ -34,15 +34,10 @@ use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 /// Telegram メッセージ長制限 (文字数)。
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
-/// タイピングインジケーターの送信間隔。
-#[allow(dead_code)]
-const TYPING_INTERVAL_SECS: u64 = 4;
-
 /// Bot-to-bot 連鎖の最大深さ（チャット単位）。
 const BOT_CHAIN_MAX_DEPTH: u32 = 5;
 
 /// Bot-to-bot 連鎖状態の TTL（秒）。
-#[allow(dead_code)]
 const BOT_CHAIN_TTL_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
@@ -56,13 +51,11 @@ struct ChainEntry {
 }
 
 /// Bot-to-bot 連鎖の深さをチャット単位で追跡し、制限を超えたメッセージを拒否する。
-#[allow(dead_code)]
 pub(crate) struct BotChainState {
     ttl: Duration,
     chains: Mutex<HashMap<i64, ChainEntry>>,
 }
 
-#[allow(dead_code)]
 impl BotChainState {
     pub(crate) fn new() -> Self {
         Self::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS))
@@ -964,7 +957,6 @@ async fn handle_message(
 // ---------------------------------------------------------------------------
 
 /// 指定した Bot ID で Telegram bot を起動する (multi-bot 用)。
-#[allow(dead_code)]
 #[allow(private_interfaces)]
 pub(crate) async fn start_telegram_bot_for_bot(
     state: Arc<AppState>,
