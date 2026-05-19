@@ -299,7 +299,8 @@ mod tests {
         conn.execute(
             "UPDATE db_meta SET value = '1' WHERE key = 'schema_version'",
             [],
-        ).expect("rollback version");
+        )
+        .expect("rollback version");
 
         drop(conn);
 
@@ -312,38 +313,53 @@ mod tests {
         let conn = db.conn.lock().expect("lock");
 
         // Telegram renamed
-        let key = conn.query_row(
-            "SELECT external_chat_id FROM chats WHERE channel = 'telegram'",
-            [], |row| row.get::<_, String>(0),
-        ).expect("telegram key");
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'telegram'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("telegram key");
         assert_eq!(key, "telegram:-100123:agent:default");
 
         // CLI renamed
-        let key = conn.query_row(
-            "SELECT external_chat_id FROM chats WHERE channel = 'cli'",
-            [], |row| row.get::<_, String>(0),
-        ).expect("cli key");
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'cli'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("cli key");
         assert_eq!(key, "cli:mysession:agent:default");
 
         // TUI renamed
-        let key = conn.query_row(
-            "SELECT external_chat_id FROM chats WHERE channel = 'tui'",
-            [], |row| row.get::<_, String>(0),
-        ).expect("tui key");
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'tui'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("tui key");
         assert_eq!(key, "tui:local-abc:agent:default");
 
         // Web renamed
-        let key = conn.query_row(
-            "SELECT external_chat_id FROM chats WHERE channel = 'web'",
-            [], |row| row.get::<_, String>(0),
-        ).expect("web key");
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'web'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("web key");
         assert_eq!(key, "web:s1:agent:default");
 
         // Discord untouched
-        let key = conn.query_row(
-            "SELECT external_chat_id FROM chats WHERE channel = 'discord'",
-            [], |row| row.get::<_, String>(0),
-        ).expect("discord key");
+        let key = conn
+            .query_row(
+                "SELECT external_chat_id FROM chats WHERE channel = 'discord'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("discord key");
         assert_eq!(key, "discord:123:agent:alice");
     }
 

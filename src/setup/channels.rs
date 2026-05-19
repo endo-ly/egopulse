@@ -223,7 +223,9 @@ mod tests {
 
         let telegram = channels.get("telegram").expect("telegram");
         let bots = telegram.telegram_bots.as_ref().expect("telegram bots");
-        let default_bot = bots.get(&crate::config::BotId::new("default")).expect("default bot");
+        let default_bot = bots
+            .get(&crate::config::BotId::new("default"))
+            .expect("default bot");
         let telegram_file =
             yaml_serde::to_string(default_bot.file_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");

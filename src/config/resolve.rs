@@ -196,6 +196,7 @@ impl Config {
     }
 
     /// Telegram bot token (env override or config file).
+    #[allow(dead_code)]
     pub(crate) fn telegram_bot_token(&self) -> Option<String> {
         env::var("TELEGRAM_BOT_TOKEN")
             .ok()
@@ -208,6 +209,7 @@ impl Config {
     }
 
     /// Telegram bot username for group mention detection.
+    #[allow(dead_code)]
     pub(crate) fn telegram_bot_username(&self) -> Option<&str> {
         self.channels
             .get("telegram")
@@ -356,9 +358,7 @@ impl Config {
 
     /// Returns the Telegram channel (group/supergroup) configs, or an empty map
     /// when none is configured.
-    pub(crate) fn telegram_channels(
-        &self,
-    ) -> HashMap<i64, super::TelegramChatConfig> {
+    pub(crate) fn telegram_channels(&self) -> HashMap<i64, super::TelegramChatConfig> {
         self.channels
             .get("telegram")
             .and_then(|ch| ch.telegram_channels.as_ref())

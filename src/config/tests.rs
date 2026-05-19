@@ -2976,9 +2976,7 @@ fn pulse_config_rejects_invalid_tick_interval() {
 
 #[test]
 fn telegram_chat_config_accepts_agents_and_multi_agent() {
-    let mut agents = Vec::new();
-    agents.push(super::AgentId::new("alice"));
-    agents.push(super::AgentId::new("bob"));
+    let agents = vec![super::AgentId::new("alice"), super::AgentId::new("bob")];
 
     let config = super::TelegramChatConfig {
         require_mention: true,
@@ -3032,7 +3030,10 @@ fn channel_config_accepts_telegram_channels() {
         ..Default::default()
     };
 
-    let ch = config.telegram_channels.as_ref().expect("telegram_channels");
+    let ch = config
+        .telegram_channels
+        .as_ref()
+        .expect("telegram_channels");
     assert_eq!(ch.len(), 1);
     let chat_config = ch.get(&-100123456).expect("chat config");
     assert!(!chat_config.multi_agent);
@@ -3094,7 +3095,10 @@ channels:
     assert_eq!(bots.len(), 2, "should have 2 telegram bots");
     let bot_ids: Vec<&str> = bots.iter().map(|b| b.bot_id.as_str()).collect();
     assert!(bot_ids.contains(&"main"), "should contain 'main' bot");
-    assert!(bot_ids.contains(&"secondary"), "should contain 'secondary' bot");
+    assert!(
+        bot_ids.contains(&"secondary"),
+        "should contain 'secondary' bot"
+    );
 }
 
 #[test]
@@ -3286,8 +3290,7 @@ fn telegram_bots_returns_only_bots_with_token() {
         super::BotId::new("with_token"),
         super::TelegramBotConfig {
             token: Some(crate::config::secret_ref::env_resolved_value(
-                "TG_TOKEN",
-                "123:abc",
+                "TG_TOKEN", "123:abc",
             )),
             file_token: None,
             username: Some("bot1".to_string()),
@@ -3325,8 +3328,7 @@ fn telegram_bots_disabled_channel_returns_empty() {
         super::BotId::new("main"),
         super::TelegramBotConfig {
             token: Some(crate::config::secret_ref::env_resolved_value(
-                "TG_TOKEN",
-                "tok",
+                "TG_TOKEN", "tok",
             )),
             file_token: None,
             username: Some("bot1".to_string()),

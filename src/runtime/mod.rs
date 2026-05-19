@@ -633,8 +633,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
         if !bot_configs.is_empty() {
             has_active_channels = true;
-            let shared_chain_state =
-                Arc::new(crate::channels::telegram::BotChainState::new());
+            let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
             for (bot_id, token, bot_username, default_agent) in bot_configs {
                 let telegram_state = Arc::new(state.clone());
                 let handle_name = format!("telegram[{bot_id}]");

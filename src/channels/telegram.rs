@@ -294,7 +294,11 @@ impl TelegramHandler {
     }
 
     /// テキスト内に @username メンションが含まれているかを判定する。
-    fn is_bot_mentioned_in_text(&self, text: &str, entities: &[teloxide::types::MessageEntity]) -> bool {
+    fn is_bot_mentioned_in_text(
+        &self,
+        text: &str,
+        entities: &[teloxide::types::MessageEntity],
+    ) -> bool {
         let username = &self.bot_username;
         if username.is_empty() {
             return false;
@@ -341,13 +345,10 @@ impl TelegramHandler {
         msg_id: i32,
         text: &str,
     ) -> Option<i64> {
-        match crate::storage::call_blocking(
-            std::sync::Arc::clone(&self.app_state.db),
-            {
-                let db = std::sync::Arc::clone(&self.app_state.db);
-                move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
-            },
-        )
+        match crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
+            let db = std::sync::Arc::clone(&self.app_state.db);
+            move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
+        })
         .await
         {
             Ok(chat_id) => {
@@ -408,14 +409,17 @@ impl TelegramHandler {
 pub(crate) struct TelegramAdapter {
     /// デフォルトの Bot クライアント (単一ボットまたはフォールバック用)。
     default_bot: Bot,
-    /// `agent_id → bot_token` のマップ。マルチボット構成で使用。
+    /// `bot_id → token` のマップ。マルチボット構成で使用。
+    #[allow(dead_code)]
     bot_tokens: std::collections::HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
+    #[allow(dead_code)]
     agent_bot_map: std::collections::HashMap<String, String>,
 }
 
 impl TelegramAdapter {
     /// Creates a Telegram adapter backed by the provided bot client.
+    #[allow(dead_code)]
     pub(crate) fn new(bot: Bot) -> Self {
         Self {
             default_bot: bot,
@@ -435,19 +439,6 @@ impl TelegramAdapter {
             bot_tokens,
             agent_bot_map,
         }
-    }
-
-    /// Resolve the bot token for a given external_chat_id.
-    /// Extracts agent_id from `:agent:` segment and resolves via agent_bot_map.
-    fn select_token(&self, external_chat_id: &str) -> Option<&str> {
-        let agent_id = external_chat_id
-            .find(":agent:")
-            .map(|pos| &external_chat_id[pos + ":agent:".len()..])?;
-        if agent_id.is_empty() {
-            return None;
-        }
-        let bot_id = self.agent_bot_map.get(agent_id)?;
-        self.bot_tokens.get(bot_id).map(String::as_str)
     }
 
     /// Get the appropriate bot for sending to the given external_chat_id.
@@ -486,7 +477,11 @@ impl ChannelAdapter for TelegramAdapter {
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
             let mut attempt = 0;
             loop {
-                match self.bot_for(external_chat_id).send_message(ChatId(chat_id), &chunk).await {
+                match self
+                    .bot_for(external_chat_id)
+                    .send_message(ChatId(chat_id), &chunk)
+                    .await
+                {
                     Ok(_) => break,
                     Err(e) => {
                         if let teloxide::RequestError::RetryAfter(seconds) = &e {
@@ -540,7 +535,9 @@ impl ChannelAdapter for TelegramAdapter {
 
         if is_image {
             let input_file = InputFile::file(file_path);
-            let mut req = self.bot_for(external_chat_id).send_photo(ChatId(chat_id), input_file);
+            let mut req = self
+                .bot_for(external_chat_id)
+                .send_photo(ChatId(chat_id), input_file);
             if !caption_value.is_empty() {
                 req = req.caption(caption_value);
             }
@@ -548,7 +545,9 @@ impl ChannelAdapter for TelegramAdapter {
                 .map_err(|e| format!("Telegram send_photo failed: {e}"))?;
         } else {
             let input_file = InputFile::file(file_path);
-            let mut req = self.bot_for(external_chat_id).send_document(ChatId(chat_id), input_file);
+            let mut req = self
+                .bot_for(external_chat_id)
+                .send_document(ChatId(chat_id), input_file);
             if !caption_value.is_empty() {
                 req = req.caption(caption_value);
             }
@@ -701,7 +700,11 @@ async fn handle_message(
     let context = handler.make_context(&sender_name, &thread, &route_agent_id);
 
     // スラッシュコマンドインターセプト
-    if msg.text().is_some() && msg.photo().is_none() && msg.document().is_none() && msg.voice().is_none() {
+    if msg.text().is_some()
+        && msg.photo().is_none()
+        && msg.document().is_none()
+        && msg.voice().is_none()
+    {
         if !mentions_bot && !is_dm && slash_commands::is_slash_command(&text) {
             debug!(
                 chat_id = raw_chat_id,
@@ -832,69 +835,6 @@ async fn handle_message(
 // ---------------------------------------------------------------------------
 // Bot 起動
 // ---------------------------------------------------------------------------
-
-/// Telegram bot を起動。
-///
-/// Long polling モードでメッセージの受信を開始する。
-pub(crate) async fn start_telegram_bot(
-    state: Arc<AppState>,
-    token: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bot = Bot::new(&token);
-
-    // 既存の webhook を削除して polling モードを確保
-    bot.delete_webhook().await.inspect_err(|e| {
-        error!("Telegram: failed to delete webhook: {e}");
-    })?;
-
-    // BotFather にコマンド一覧を登録 (メニュー表示用)
-    {
-        use teloxide::types::BotCommand;
-
-        let commands: Vec<BotCommand> = slash_commands::all_commands()
-            .iter()
-            .map(|c| BotCommand::new(c.name, c.description))
-            .collect();
-        if let Err(e) = bot.set_my_commands(commands).await {
-            warn!("Telegram: failed to set bot commands: {e}");
-        }
-    }
-
-    info!("Starting Telegram bot...");
-
-    let handler = Update::filter_message().endpoint(handle_message);
-
-    let listener = teloxide::update_listeners::polling_default(bot.clone()).await;
-    let listener_error_handler = teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
-        "An error from the Telegram update listener".to_string(),
-    );
-
-    let mut dispatcher = Dispatcher::builder(bot, handler)
-        .default_handler(|_| async {})
-        .dependencies(dptree::deps![state])
-        .build();
-    let shutdown_token = dispatcher.shutdown_token();
-    let shutdown_task = tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Telegram bot failed to listen for Ctrl-C: {e}");
-            return;
-        }
-        if let Ok(wait_for_shutdown) = shutdown_token.shutdown() {
-            wait_for_shutdown.await;
-        }
-    });
-
-    dispatcher
-        .try_dispatch_with_listener(listener, listener_error_handler)
-        .await
-        .inspect_err(|e| {
-            error!("Telegram dispatcher exited with error: {e}");
-        })?;
-
-    shutdown_task.abort();
-
-    Ok(())
-}
 
 /// 指定した Bot ID で Telegram bot を起動する (multi-bot 用)。
 #[allow(dead_code)]
@@ -1048,11 +988,7 @@ mod tests {
         crate::config::AgentId::new(id)
     }
 
-    fn channel(
-        agent_ids: &[&str],
-        multi_agent: bool,
-        require_mention: bool,
-    ) -> TelegramChatConfig {
+    fn channel(agent_ids: &[&str], multi_agent: bool, require_mention: bool) -> TelegramChatConfig {
         TelegramChatConfig {
             require_mention,
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
@@ -1269,10 +1205,7 @@ mod tests {
             "developer",
             agents(&[("reviewer", Some("main"))]),
         );
-        assert_eq!(
-            route_responder_agent_id(&handler, -100, false, false),
-            None
-        );
+        assert_eq!(route_responder_agent_id(&handler, -100, false, false), None);
     }
 
     #[test]
@@ -1391,8 +1324,14 @@ mod tests {
         for _ in 0..BOT_CHAIN_MAX_DEPTH {
             assert!(state.check_and_increment(-100));
         }
-        assert!(state.check_and_increment(-200), "different chat_id is independent");
-        assert!(!state.check_and_increment(-100), "original chat still at max");
+        assert!(
+            state.check_and_increment(-200),
+            "different chat_id is independent"
+        );
+        assert!(
+            !state.check_and_increment(-100),
+            "original chat still at max"
+        );
     }
 
     #[test]
@@ -1409,11 +1348,8 @@ mod tests {
     fn mention_detects_at_username() {
         let handler = test_handler(HashMap::new());
         let text = "@my_bot hello";
-        let entity = teloxide::types::MessageEntity::new(
-            teloxide::types::MessageEntityKind::Mention,
-            0,
-            7,
-        );
+        let entity =
+            teloxide::types::MessageEntity::new(teloxide::types::MessageEntityKind::Mention, 0, 7);
         assert!(handler.is_bot_mentioned_in_text(text, &[entity]));
     }
 
@@ -1433,11 +1369,8 @@ mod tests {
     fn mention_rejects_different_username() {
         let handler = test_handler(HashMap::new());
         let text = "@other_bot hello";
-        let entity = teloxide::types::MessageEntity::new(
-            teloxide::types::MessageEntityKind::Mention,
-            0,
-            10,
-        );
+        let entity =
+            teloxide::types::MessageEntity::new(teloxide::types::MessageEntityKind::Mention, 0, 10);
         assert!(!handler.is_bot_mentioned_in_text(text, &[entity]));
     }
 
@@ -1446,11 +1379,8 @@ mod tests {
         let mut handler = test_handler(HashMap::new());
         handler.bot_username = String::new();
         let text = "@my_bot hello";
-        let entity = teloxide::types::MessageEntity::new(
-            teloxide::types::MessageEntityKind::Mention,
-            0,
-            7,
-        );
+        let entity =
+            teloxide::types::MessageEntity::new(teloxide::types::MessageEntityKind::Mention, 0, 7);
         assert!(!handler.is_bot_mentioned_in_text(text, &[entity]));
     }
 

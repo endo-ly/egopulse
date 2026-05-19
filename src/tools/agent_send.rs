@@ -109,7 +109,8 @@ impl Tool for AgentSendTool {
         // Validate: agent_send is only available on remote multi-agent channels
         if !matches!(context.channel.as_str(), "discord" | "telegram") {
             return ToolResult::error(
-                "agent_send is only available in Discord and Telegram multi-agent rooms".to_string(),
+                "agent_send is only available in Discord and Telegram multi-agent rooms"
+                    .to_string(),
             );
         }
 
