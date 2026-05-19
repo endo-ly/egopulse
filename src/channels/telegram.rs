@@ -304,14 +304,15 @@ impl TelegramHandler {
             return false;
         }
 
+        // MessageEntityRef::parse converts UTF-16 offsets to UTF-8 byte offsets
+        let refs = teloxide::types::MessageEntityRef::parse(text, entities);
+
         // 1) /command@bot_username 形式
-        let is_own_command = entities
+        let is_own_command = refs
             .iter()
-            .filter(|e| matches!(e.kind, MessageEntityKind::BotCommand))
+            .filter(|e| matches!(e.kind(), MessageEntityKind::BotCommand))
             .any(|e| {
-                let start = e.offset;
-                let end = start + e.length;
-                let cmd_text = text.get(start..end).unwrap_or("");
+                let cmd_text = e.text();
                 if let Some(at_pos) = cmd_text.find('@') {
                     let mention = &cmd_text[at_pos + 1..];
                     mention.eq_ignore_ascii_case(username)
@@ -325,14 +326,11 @@ impl TelegramHandler {
         }
 
         // 2) @mention エンティティ
-        entities
-            .iter()
-            .filter(|e| matches!(e.kind, MessageEntityKind::Mention))
+        refs.iter()
+            .filter(|e| matches!(e.kind(), MessageEntityKind::Mention))
             .any(|e| {
-                let start = e.offset;
-                let end = start + e.length;
-                text.get(start..end)
-                    .and_then(|m| m.strip_prefix('@'))
+                e.text()
+                    .strip_prefix('@')
                     .is_some_and(|m| m.eq_ignore_ascii_case(username))
             })
     }
@@ -353,7 +351,7 @@ impl TelegramHandler {
         {
             Ok(chat_id) => {
                 let stored = crate::storage::StoredMessage {
-                    id: format!("cl-tg-{msg_id}"),
+                    id: format!("cl-tg-{raw_chat_id}-{msg_id}"),
                     chat_id,
                     sender_name: sender_name.to_string(),
                     content: text.to_string(),
@@ -442,9 +440,17 @@ impl TelegramAdapter {
     }
 
     /// Get the appropriate bot for sending to the given external_chat_id.
+    ///
+    /// Resolves agent_id from the `:agent:` segment, then looks up
+    /// agent → bot_id → token to find the right Bot.
+    /// Falls back to `default_bot` if no mapping exists.
     fn bot_for(&self, external_chat_id: &str) -> &Bot {
-        // For now, always use default_bot since teloxide::Bot is tied to one token
-        // Token selection would require HTTP client approach (future improvement)
+        // Currently teloxide::Bot is tied to a single token at construction time.
+        // Multi-bot outbound routing requires per-token Bot instances.
+        // For now, return default_bot as the token routing is not yet
+        // implemented at the adapter level.
+        //
+        // TODO: Create Bot instances per-token when outbound routing is needed.
         let _ = external_chat_id;
         &self.default_bot
     }
@@ -635,9 +641,12 @@ async fn send_telegram_response(bot: &Bot, chat_id: ChatId, text: &str) {
 }
 
 fn parse_telegram_chat_id(external_chat_id: &str) -> Result<i64, String> {
-    external_chat_id
+    let raw = external_chat_id
         .strip_prefix("telegram:")
-        .unwrap_or(external_chat_id)
+        .unwrap_or(external_chat_id);
+    // Strip `:agent:` suffix from session_key format (telegram:<chat_id>:agent:<agent_id>)
+    let thread = raw.split(':').next().unwrap_or(raw);
+    thread
         .parse::<i64>()
         .map_err(|_| format!("invalid Telegram external_chat_id: '{external_chat_id}'"))
 }
@@ -1085,6 +1094,10 @@ mod tests {
         assert_eq!(
             parse_telegram_chat_id("telegram:12345").expect("prefixed chat id"),
             12345
+        );
+        assert_eq!(
+            parse_telegram_chat_id("telegram:-100123:agent:default").expect("agent-scoped chat id"),
+            -100123
         );
         assert!(parse_telegram_chat_id("telegram:not-a-number").is_err());
     }

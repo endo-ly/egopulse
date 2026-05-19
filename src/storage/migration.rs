@@ -205,7 +205,9 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         conn.execute_batch(
             "UPDATE chats
              SET external_chat_id = external_chat_id || ':agent:default'
-             WHERE external_chat_id NOT LIKE '%:agent:%'",
+             WHERE external_chat_id NOT LIKE '%:agent:%'
+               AND channel NOT IN ('discord')
+               AND chat_type != 'channel_log'",
         )?;
         set_schema_version(
             conn,

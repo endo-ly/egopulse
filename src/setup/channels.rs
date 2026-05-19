@@ -44,20 +44,31 @@ pub(crate) fn load_channel_fields(
     insert_channel_string(ch_map, "web", "auth_token", result, "WEB_AUTH_TOKEN");
     insert_channel_bool(ch_map, "discord", "enabled", result, "DISCORD_ENABLED");
     insert_channel_bool(ch_map, "telegram", "enabled", result, "TELEGRAM_ENABLED");
-    insert_channel_string(
-        ch_map,
-        "telegram",
-        "bot_token",
-        result,
-        "TELEGRAM_BOT_TOKEN",
-    );
-    insert_channel_string(
-        ch_map,
-        "telegram",
-        "bot_username",
-        result,
-        "TELEGRAM_BOT_USERNAME",
-    );
+
+    // Read from new bots map first, fall back to legacy fields
+    let telegram_token_loaded =
+        insert_telegram_bot_field(ch_map, "token", result, "TELEGRAM_BOT_TOKEN");
+    if !telegram_token_loaded {
+        insert_channel_string(
+            ch_map,
+            "telegram",
+            "bot_token",
+            result,
+            "TELEGRAM_BOT_TOKEN",
+        );
+    }
+
+    let telegram_username_loaded =
+        insert_telegram_bot_field(ch_map, "username", result, "TELEGRAM_BOT_USERNAME");
+    if !telegram_username_loaded {
+        insert_channel_string(
+            ch_map,
+            "telegram",
+            "bot_username",
+            result,
+            "TELEGRAM_BOT_USERNAME",
+        );
+    }
 }
 
 pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<String> {
@@ -178,6 +189,28 @@ fn insert_channel_bool(
     };
 
     result.insert(result_key.into(), value.to_string());
+}
+
+/// Try to read a field from `channels.telegram.bots.default.<field>`.
+/// Returns `true` if the value was found and inserted.
+fn insert_telegram_bot_field(
+    channels: &yaml_serde::Mapping,
+    field: &str,
+    result: &mut HashMap<String, String>,
+    result_key: &str,
+) -> bool {
+    let Some(value) = channel_mapping(channels, "telegram")
+        .and_then(|tg| tg.get(yaml_key("bots")))
+        .and_then(|bots| bots.as_mapping())
+        .and_then(|bots_map| bots_map.get(yaml_key("default")))
+        .and_then(|bot| bot.as_mapping())
+        .and_then(|bot_map| bot_map.get(yaml_key(field)))
+        .and_then(|v| v.as_str())
+    else {
+        return false;
+    };
+    result.insert(result_key.into(), value.to_string());
+    true
 }
 
 fn insert_channel_string(

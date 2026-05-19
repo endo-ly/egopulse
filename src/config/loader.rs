@@ -986,6 +986,19 @@ fn validate_telegram_bot_references(config: &Config) -> Result<(), ConfigError> 
         validate_bot_id(bot_id)?;
     }
 
+    for (bot_id, bot_cfg) in bots {
+        let username_ok = bot_cfg
+            .username
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|u| !u.is_empty());
+        if !username_ok {
+            return Err(ConfigError::TelegramBotUsernameMissing {
+                bot_id: bot_id.to_string(),
+            });
+        }
+    }
+
     let telegram = config.channels.get("telegram");
     if let Some(channels) = telegram.and_then(|ch| ch.telegram_channels.as_ref()) {
         for (channel_id, channel_config) in channels {
