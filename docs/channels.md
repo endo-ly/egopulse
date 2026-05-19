@@ -203,24 +203,30 @@ Multi-Agent Room では、同一エージェントセッションへの同時タ
 
 `teloxide` フレームワークの Long Polling モードで接続。
 起動時に既存の Webhook を削除し、ポーリングに切り替える。
+複数 Bot が設定されている場合、各 Bot が独立した Dispatcher を持つ。
 
 ### データフロー
 
-- **メッセージ受信**: `handle_message()` がトリガー
+- **メッセージ受信**: `TelegramHandler` がルーティング判定後に `handle_message()` で処理
+- **ルーティング**:
+  - DM → `default_agent` が応答
+  - Single-Agent チャネル → バインドされたエージェントが応答
+  - Multi-Agent ルーム → @mention された Bot のエージェントが応答。非メンション時は Channel Log のみ記録
+- **Bot Chain State**: Bot-to-bot 連鎖をチャット単位で追跡（最大深さ 5、TTL 300秒）
 - **添付ファイル**: 写真（最大サイズのものを選択）・ドキュメント・音声を `workspace/media/inbound/` にダウンロード
-- **チャット種別判定**: `private`, `group`, `supergroup` で処理を分岐
+- **TurnScheduler**: Discord と同様に `ScheduledTurn` 経由でターンを実行。同チャットの同時ターンを直列化
+- **Channel Log**: Multi-Agent ルームでは人間メッセージを Channel Log に保存
 - **アクセス制御**:
-  - `chats` マップに含まれるチャットのみ応答
+  - `channels` マップに含まれるチャットのみ応答
   - `require_mention: false`（デフォルト）= 即応答
-  - `require_mention: true` = @mention 必須
+  - `require_mention: true` = @mention または `/command@botname` 必須
 - **応答**: 4096 文字制限に合わせて自動分割送信
-
 
 ### 制約
 
 - 1 メッセージ 4096 文字（自動分割）
 - キャプション 1024 文字
-- グループでは `chats` マップ外のチャットに応答しない
+- グループでは `channels` マップ外のチャットに応答しない
 - `require_mention: true` のチャットでは @mention なしで応答しない
 - チャネル（Channel）メッセージは無視
 - チャネルプロバイダーが Telegram 未対応の場合あり（プロバイダー側の制限）
@@ -229,9 +235,10 @@ Multi-Agent Room では、同一エージェントセッションへの同時タ
 
 1. [@BotFather](https://t.me/BotFather) とチャットし `/newbot` を実行
 2. 表示名とユーザー名（末尾 `bot` 必須）を設定
-3. 発行されたトークンを `bot_token` に設定
-4. ユーザー名（`@` なし）を `bot_username` に設定
+3. 発行されたトークンを `bots.<bot_id>.token` に設定
+4. ユーザー名（`@` なし）を `bots.<bot_id>.username` に設定
 5. グループに追加する場合は Bot のプライバシーモードを無効化（`/setprivacy` → Disable）
+6. `agents.<id>.telegram_bot` でエージェントと Bot を紐付け
 
 ---
 
