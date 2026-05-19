@@ -8,8 +8,8 @@ use url::Url;
 
 use super::ModelConfig;
 use super::secret_ref::{
-    ResolvedValue, StringOrRef, TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, dotenv_path,
-    read_dotenv, resolve_string_or_ref,
+    ResolvedValue, StringOrRef, WEB_AUTH_TOKEN_ENV_NAME, dotenv_path, read_dotenv,
+    resolve_string_or_ref,
 };
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
@@ -50,9 +50,6 @@ struct FileChannelConfig {
     host: Option<String>,
     auth_token: Option<StringOrRef>,
     allowed_origins: Option<Vec<String>>,
-    bot_token: Option<StringOrRef>,
-    bot_username: Option<String>,
-    chats: Option<HashMap<String, FileTelegramChatConfig>>,
     /// Discord bot configs (`channels.discord.bots`).
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
     /// Discord channel configs (`channels.discord.channels`).
@@ -248,7 +245,6 @@ pub(super) fn build_config(
     let mut channels =
         normalize_channels(file_channels.unwrap_or_default(), &dotenv, &default_agent)?;
     apply_web_channel_env_overrides(&mut channels);
-    apply_channel_bot_token_env_override(&mut channels, "telegram", TELEGRAM_BOT_TOKEN_ENV_NAME);
 
     validate_agent_provider_references(&providers, &agents)?;
 
@@ -334,7 +330,6 @@ fn normalize_channels(
         }
 
         let resolved_auth = resolve_string_or_ref(fc.auth_token, dotenv)?;
-        let resolved_bot = resolve_string_or_ref(fc.bot_token, dotenv)?;
 
         let file_auth_token = resolved_auth.as_ref().map(|rv| {
             if matches!(rv, ResolvedValue::Literal(_)) {
@@ -343,35 +338,6 @@ fn normalize_channels(
                 rv.to_yaml_value()
             }
         });
-        let file_bot_token = resolved_bot.as_ref().map(|rv| {
-            if matches!(rv, ResolvedValue::Literal(_)) {
-                yaml_serde::Value::String(rv.value().to_string())
-            } else {
-                rv.to_yaml_value()
-            }
-        });
-
-        let chats = fc
-            .chats
-            .map(|map| {
-                let mut result = HashMap::new();
-                for (k, v) in map {
-                    let chat_id: i64 = k
-                        .parse::<i64>()
-                        .map_err(|_| ConfigError::InvalidChatsKey { key: k.clone() })?;
-                    result.insert(
-                        chat_id,
-                        TelegramChatConfig {
-                            require_mention: v.require_mention,
-                            agents: Vec::new(),
-                            multi_agent: false,
-                        },
-                    );
-                }
-                Ok(result)
-            })
-            .transpose()?
-            .filter(|m| !m.is_empty());
 
         let config = ChannelConfig {
             enabled: fc.enabled,
@@ -380,10 +346,6 @@ fn normalize_channels(
             auth_token: resolved_auth,
             file_auth_token,
             allowed_origins: fc.allowed_origins,
-            bot_token: resolved_bot,
-            file_bot_token,
-            bot_username: fc.bot_username,
-            chats,
             discord_bots: None,
             discord_channels: None,
             telegram_bots: None,
@@ -1106,17 +1068,6 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelCo
     }
     if web.port.is_none() {
         web.port = Some(super::resolve::default_web_port());
-    }
-}
-
-fn apply_channel_bot_token_env_override(
-    channels: &mut HashMap<ChannelName, ChannelConfig>,
-    channel_name: &str,
-    env_key: &str,
-) {
-    if let Some(token) = env_var(env_key) {
-        let channel = channels.entry(ChannelName::new(channel_name)).or_default();
-        channel.bot_token = Some(ResolvedValue::Literal(token));
     }
 }
 

@@ -182,9 +182,6 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
         if let Some(rv) = &channel.auth_token {
             secrets.push((format!("channel.{name}.auth_token"), rv.value().to_string()));
         }
-        if let Some(rv) = &channel.bot_token {
-            secrets.push((format!("channel.{name}.bot_token"), rv.value().to_string()));
-        }
         if let Some(bots) = &channel.discord_bots {
             for (bot_id, bot) in bots {
                 if let Some(rv) = &bot.token {
@@ -486,12 +483,22 @@ mod tests {
         assert_eq!(secrets[0].1, "sk-test-key-123");
     }
 
-    /// collect_config_secrets: Channel の auth_token / bot_token が抽出される。
+    /// collect_config_secrets: Channel の auth_token / Discord bot token が抽出される。
     #[test]
     fn test_collect_config_secrets_extracts_auth_tokens() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
+                file_token: None,
+            },
+        );
+
         let config = Config {
             default_provider: ProviderId::new("local"),
             default_model: None,
@@ -510,8 +517,7 @@ mod tests {
                     enabled: Some(true),
                     auth_token: Some(ResolvedValue::Literal("auth-token-value".to_string())),
                     file_auth_token: None,
-                    bot_token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
-                    file_bot_token: None,
+                    discord_bots: Some(bots),
                     ..Default::default()
                 },
             )]),
@@ -528,7 +534,7 @@ mod tests {
         // Assert
         let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"channel.discord.auth_token"));
-        assert!(keys.contains(&"channel.discord.bot_token"));
+        assert!(keys.contains(&"channels.discord.bots.main.token"));
         assert_eq!(secrets.len(), 2);
     }
 

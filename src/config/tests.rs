@@ -1750,15 +1750,17 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
-      "123":"#,
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
+      "123": {}"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    let telegram = config.channels.get("telegram").expect("telegram");
-    let chats = telegram.chats.as_ref().expect("chats");
-    let chat = chats.get(&123i64).expect("chat 123");
+    let channels = config.telegram_channels();
+    let chat = channels.get(&123i64).expect("chat 123");
     assert!(!chat.require_mention);
 }
 
@@ -1783,20 +1785,18 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
       "456":
         require_mention: true"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    let telegram = config.channels.get("telegram").expect("telegram");
-    let chat = telegram
-        .chats
-        .as_ref()
-        .expect("chats")
-        .get(&456i64)
-        .expect("chat");
+    let channels = config.telegram_channels();
+    let chat = channels.get(&456i64).expect("chat");
     assert!(chat.require_mention);
 }
 
@@ -1851,8 +1851,11 @@ agents:
 channels:
   telegram:
     enabled: true
-    bot_token: test-token
-    chats:
+    bots:
+      main:
+        token: test-token
+        username: my_bot
+    telegram_channels:
       "not_a_number": {}"#,
     );
 

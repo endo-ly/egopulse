@@ -251,8 +251,7 @@ mod tests {
         assert!(web_file.contains("id: WEB_AUTH_TOKEN"));
 
         let discord = channels.get("discord").expect("discord");
-        assert!(discord.bot_token.is_none());
-        assert!(discord.file_bot_token.is_none());
+        assert!(discord.enabled == Some(true));
 
         let telegram = channels.get("telegram").expect("telegram");
         let bots = telegram.telegram_bots.as_ref().expect("telegram bots");
