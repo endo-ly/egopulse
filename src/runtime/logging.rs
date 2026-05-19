@@ -15,14 +15,14 @@ use crate::error::LoggingError;
 /// large HTML document can fill the stderr pipe buffer.
 const NOISY_CRATE_OVERRIDES: &[&str] = &["html5ever=warn", "markup5ever=warn", "selectors=warn"];
 
-/// Ensures [`install_eagain_safe_panic_hook`] runs exactly once even if
+/// Ensures `install_eagain_safe_panic_hook` runs exactly once even if
 /// `init_logging` is called multiple times.
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 /// Initialize the global tracing subscriber with the given log level.
 ///
 /// Also installs a panic hook that tolerates `EAGAIN` on stderr to prevent
-/// the double-panic → `abort()` chain described in [`install_eagain_safe_panic_hook`].
+/// the double-panic → `abort()` chain described in `install_eagain_safe_panic_hook`.
 pub fn init_logging(level: &str) -> Result<(), LoggingError> {
     PANIC_HOOK_INSTALLED.get_or_init(install_eagain_safe_panic_hook);
 
@@ -55,7 +55,7 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
 /// that write fails.  When the stderr pipe is full (e.g. html5ever flood),
 /// this triggers a double-panic → `abort()`, bypassing `catch_unwind`.
 /// This hook discards write failures instead, allowing normal unwinding.
-fn install_eagain_safe_panic_hook() {
+pub(crate) fn install_eagain_safe_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stderr = std::io::stderr().lock();
