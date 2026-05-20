@@ -19,6 +19,15 @@ const SERVICE_NAME: &str = "egopulse.service";
 const USER_BIN_DIR: &str = ".local/bin";
 const BINARY_NAME: &str = "egopulse";
 
+/// Minimum time (seconds) the service must remain `active` before declaring startup success.
+const SERVICE_START_MIN_OBSERVE_SECS: u64 = 2;
+/// Maximum time (seconds) to wait for the service to become active after start/restart.
+const SERVICE_START_TIMEOUT_SECS: u64 = 10;
+/// Interval (milliseconds) between `is-active` polls during startup verification.
+const SERVICE_START_POLL_INTERVAL_MS: u64 = 500;
+/// Number of journal log lines to show on startup failure.
+const SERVICE_FAILURE_LOG_LINES: usize = 10;
+
 struct ExtractedBinary {
     _tmp_dir: tempfile::TempDir,
     path: PathBuf,
@@ -290,6 +299,75 @@ fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoP
     )))
 }
 
+/// After `start` / `restart`, polls `systemctl is-active` until the service
+/// reaches `active` state or the timeout expires.
+///
+/// To guard against processes that start then immediately crash, the service
+/// must remain `active` for at least [`SERVICE_START_MIN_OBSERVE_SECS`] before
+/// success is returned.
+///
+/// # Errors
+///
+/// Returns an error with recent journal logs if the service enters `failed`
+/// state or does not become active within the timeout.
+fn verify_service_started(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
+    let start = std::time::Instant::now();
+    let min_observe = std::time::Duration::from_secs(SERVICE_START_MIN_OBSERVE_SECS);
+    let timeout = std::time::Duration::from_secs(SERVICE_START_TIMEOUT_SECS);
+    let interval = std::time::Duration::from_millis(SERVICE_START_POLL_INTERVAL_MS);
+
+    loop {
+        std::thread::sleep(interval);
+
+        let output = systemctl_cmd(&["is-active", SERVICE_NAME], runtime_dir)?;
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        match state.as_str() {
+            "active" if start.elapsed() >= min_observe => return Ok(()),
+            "failed" => return Err(format_start_failure(runtime_dir)),
+            _ if start.elapsed() >= timeout => {
+                return Err(format_start_failure(runtime_dir));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Builds an [`EgoPulseError::Internal`] with recent journal log entries on
+/// service startup failure.
+fn format_start_failure(runtime_dir: Option<&str>) -> EgoPulseError {
+    let mut msg = "egopulse service failed to start".to_string();
+    if let Some(logs) = fetch_recent_service_logs(runtime_dir) {
+        msg.push_str("\n\nRecent logs:\n");
+        msg.push_str(&logs);
+    }
+    EgoPulseError::Internal(msg)
+}
+
+/// Retrieves the last few journal log lines for the egopulse service.
+fn fetch_recent_service_logs(runtime_dir: Option<&str>) -> Option<String> {
+    let mut cmd = ProcessCommand::new("journalctl");
+    cmd.args([
+        "--user",
+        "-u",
+        SERVICE_NAME,
+        "--no-pager",
+        "-n",
+        &SERVICE_FAILURE_LOG_LINES.to_string(),
+    ]);
+    if let Some(rd) = runtime_dir {
+        cmd.env("XDG_RUNTIME_DIR", rd)
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={rd}/bus"));
+    }
+    let output = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
+}
+
 fn restart_service() -> Result<(), EgoPulseError> {
     let unit = unit_path()?;
     if !unit.exists() {
@@ -299,15 +377,15 @@ fn restart_service() -> Result<(), EgoPulseError> {
 
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
     let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
-    if output.status.success() {
-        println!("egopulse service restarted");
-        Ok(())
-    } else {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(EgoPulseError::Internal(format!(
+        return Err(EgoPulseError::Internal(format!(
             "failed to restart egopulse service: {stderr}"
-        )))
+        )));
     }
+    verify_service_started(runtime_dir.as_deref())?;
+    println!("egopulse service restarted");
+    Ok(())
 }
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
@@ -375,12 +453,14 @@ ACTIONS:
                     systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?,
                     "restart service",
                 )?;
+                verify_service_started(runtime_dir.as_deref())?;
                 println!("Updated and restarted egopulse service: {}", unit.display());
             } else {
                 ensure_success(
                     systemctl_cmd(&["enable", "--now", SERVICE_NAME], runtime_dir.as_deref())?,
                     "enable service",
                 )?;
+                verify_service_started(runtime_dir.as_deref())?;
                 println!("Installed and started egopulse service: {}", unit.display());
             }
             Ok(())
@@ -391,6 +471,7 @@ ACTIONS:
                 systemctl_cmd(&["start", SERVICE_NAME], runtime_dir.as_deref())?,
                 "start service",
             )?;
+            verify_service_started(runtime_dir.as_deref())?;
             println!("egopulse service started");
             Ok(())
         }
@@ -443,15 +524,15 @@ ACTIONS:
         GatewayAction::Restart => {
             let runtime_dir = ensure_user_session()?;
             let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
-            if output.status.success() {
-                println!("egopulse service restarted");
-                Ok(())
-            } else {
+            if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Err(EgoPulseError::Internal(format!(
+                return Err(EgoPulseError::Internal(format!(
                     "failed to restart egopulse service: {stderr}"
-                )))
+                )));
             }
+            verify_service_started(runtime_dir.as_deref())?;
+            println!("egopulse service restarted");
+            Ok(())
         }
     }
 }
@@ -980,5 +1061,64 @@ mod tests {
     #[should_panic(expected = "must not contain newlines")]
     fn systemd_escape_env_rejects_newlines() {
         systemd_escape_env("line1\nline2");
+    }
+
+    #[test]
+    fn format_start_failure_contains_base_message() {
+        let err = format_start_failure(None);
+        let msg = match &err {
+            EgoPulseError::Internal(m) => m.clone(),
+            other => panic!("expected Internal error, got {other}"),
+        };
+        assert!(
+            msg.starts_with("egopulse service failed to start"),
+            "message should start with base text: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_start_failure_includes_logs_when_available() {
+        // On a system with journalctl and prior service runs, logs may be
+        // present.  The test only asserts the structural contract: if logs
+        // are returned, they appear under a "Recent logs:" header.
+        let err = format_start_failure(None);
+        let msg = match &err {
+            EgoPulseError::Internal(m) => m.clone(),
+            other => panic!("expected Internal error, got {other}"),
+        };
+        if msg.contains("Recent logs:") {
+            // Lines after the header should be non-empty.
+            let body = msg.split("Recent logs:\n").nth(1).unwrap_or("");
+            assert!(!body.trim().is_empty());
+        }
+        // If no logs are available the message is just the base text.
+    }
+
+    #[test]
+    fn fetch_recent_service_logs_does_not_panic_without_journalctl() {
+        // On any environment (including CI without journalctl) this must
+        // return None rather than panicking.
+        let result = fetch_recent_service_logs(None);
+        // We only assert it returns without panicking; the value depends on
+        // the environment.
+        assert!(result.is_none() || result.as_ref().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn service_start_constants_are_consistent() {
+        const {
+            assert!(
+                SERVICE_START_MIN_OBSERVE_SECS < SERVICE_START_TIMEOUT_SECS,
+                "min observe must be shorter than timeout"
+            );
+            assert!(
+                SERVICE_START_POLL_INTERVAL_MS > 0,
+                "poll interval must be positive"
+            );
+            assert!(
+                SERVICE_FAILURE_LOG_LINES > 0,
+                "failure log lines must be positive"
+            );
+        }
     }
 }
