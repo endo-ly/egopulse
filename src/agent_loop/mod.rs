@@ -63,6 +63,9 @@ pub(crate) struct SurfaceContext {
     /// Origin ID: UUID tracking all turns caused by a single human input.
     /// Empty string when origin tracking is not applicable (e.g. non-Discord channels).
     pub origin_id: String,
+    /// Trace ID for observability: UUID correlating all log events within a single turn.
+    /// Generated in `execute_scheduled_turn` and propagated through the turn lifecycle.
+    pub trace_id: String,
 }
 
 impl SurfaceContext {
@@ -83,6 +86,7 @@ impl SurfaceContext {
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         }
     }
 
@@ -126,6 +130,8 @@ mod tests {
         assert_eq!(ctx.surface_thread, surface_thread);
         assert_eq!(ctx.chat_type, chat_type);
         assert_eq!(ctx.agent_id, agent_id);
+        assert_eq!(ctx.trace_id, "");
+        assert_eq!(ctx.origin_id, "");
     }
 
     #[test]

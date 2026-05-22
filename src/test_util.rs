@@ -119,6 +119,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         channel_log_chat_id: None,
         chain_depth: 0,
         origin_id: String::new(),
+        trace_id: String::new(),
     }
 }
 
