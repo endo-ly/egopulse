@@ -28,6 +28,8 @@ pub(crate) struct RuntimeStatus {
 }
 
 /// Immutable point-in-time copy suitable for serialization.
+///
+#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StatusSnapshot {
     pub version: String,
@@ -41,6 +43,7 @@ pub(crate) struct StatusSnapshot {
 /// Operational state of a single channel (web / discord / telegram / …).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub(crate) enum ChannelState {
     Starting,
     Running,
@@ -82,6 +85,7 @@ pub(crate) struct AuditError {
 // Internal mutable state
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct RuntimeStatusInner {
     started_at: chrono::DateTime<Utc>,
     pid: u32,
@@ -96,6 +100,7 @@ struct RuntimeStatusInner {
 // Implementation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 impl RuntimeStatus {
     /// Creates a new `RuntimeStatus` initialized with the current timestamp,
     /// process ID, and crate version.

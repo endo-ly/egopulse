@@ -11,7 +11,7 @@ use crate::config::{
     secret_ref::ResolvedValue,
 };
 use crate::memory::MemoryLoader;
-use crate::runtime::{AppState, AppStateParts};
+use crate::runtime::{AppState, AppStateParts, RuntimeStatus};
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
@@ -104,6 +104,7 @@ pub(crate) fn build_state_with_config(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        runtime_status: Arc::new(RuntimeStatus::new()),
     })
 }
 
