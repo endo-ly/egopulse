@@ -158,9 +158,14 @@ async fn process_turn_inner(
         agent_id: &context.agent_id,
     };
 
+    let trace_id = if context.trace_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        context.trace_id.clone()
+    };
     let span = tracing::info_span!(
         "agent_turn",
-        trace_id = %context.trace_id,
+        trace_id = %trace_id,
         agent_id = %context.agent_id,
         channel = %context.channel,
         session = %context.surface_thread,
@@ -2180,6 +2185,63 @@ mod tests {
     // Tracing span observability
     // -----------------------------------------------------------------------
 
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct SpanCapture {
+        spans: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SpanCapture {
+        fn new() -> Self {
+            Self {
+                spans: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured_trace_ids(&self) -> Vec<String> {
+            self.spans.lock().expect("spans").clone()
+        }
+    }
+
+    struct FieldVisitor {
+        trace_id: Option<String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "trace_id" {
+                self.trace_id = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "agent_turn" {
+                return;
+            }
+            let mut visitor = FieldVisitor { trace_id: None };
+            attrs.record(&mut visitor);
+            if let Some(trace_id) = visitor.trace_id {
+                self.spans.lock().expect("spans").push(trace_id);
+            }
+        }
+    }
+
+    fn install_capture_subscriber(capture: &SpanCapture) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::set_default(subscriber)
+    }
+
     #[tokio::test]
     #[serial]
     async fn process_turn_emits_span_with_trace_id() {
@@ -2202,11 +2264,65 @@ mod tests {
         let expected_trace_id = uuid::Uuid::new_v4().to_string();
         context.trace_id = expected_trace_id.clone();
 
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
         let reply = process_turn(&state, &context, "trace me")
             .await
             .expect("turn");
 
         assert_eq!(reply, "traced response");
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert_eq!(
+            trace_ids[0], expected_trace_id,
+            "span trace_id must match the context trace_id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_auto_fills_empty_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "auto traced".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let context = cli_context("auto-trace");
+        assert!(context.trace_id.is_empty());
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "auto trace me")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "auto traced");
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert!(
+            !trace_ids[0].is_empty(),
+            "span trace_id must be auto-generated when context has empty trace_id"
+        );
     }
 
     #[tokio::test]
@@ -2230,6 +2346,9 @@ mod tests {
         let ctx = cli_context("sched-trace");
         assert!(ctx.trace_id.is_empty());
 
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
         let turn = crate::agent_loop::ScheduledTurn {
             context: ctx,
             input: "scheduled turn".to_string(),
@@ -2237,5 +2356,16 @@ mod tests {
         };
 
         crate::runtime::execute_scheduled_turn(&state, turn).await;
+
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert!(
+            !trace_ids[0].is_empty(),
+            "execute_scheduled_turn must generate a non-empty trace_id"
+        );
     }
 }

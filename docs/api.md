@@ -10,7 +10,7 @@ WebUI が使用する REST API および WebSocket の仕様。
     - [Readiness](#22-readiness)
     - [メトリクス](#23-メトリクス)
     - [設定](#24-設定)
-    - [セッション](#25-セッション)
+    - [セッション一覧](#25-セッション一覧)
     - [メッセージ履歴](#26-メッセージ履歴)
     - [ストリーミングチャット](#27-ストリーミングチャット)
 3. [WebSocket](#3-websocket)
@@ -37,7 +37,7 @@ Authorization: Bearer <token>
 
 **認証不要**
 
-```
+```text
 GET /health
 ```
 
@@ -65,7 +65,7 @@ GET /health
 
 サービスがリクエストを処理可能かを判定するエンドポイント。チャネル状態、DB 接続、MCP 接続、アクティブターン数、直近エラーを返す。
 
-```
+```text
 GET /ready
 ```
 
@@ -114,13 +114,13 @@ GET /ready
 
 Prometheus 形式のテキスト出力。`egopulse_` プレフィックス、低カーディナリティラベル。
 
-```
+```text
 GET /metrics
 ```
 
 #### レスポンス (200)
 
-```
+```text
 # HELP egopulse_uptime_seconds Process uptime in seconds
 # TYPE egopulse_uptime_seconds gauge
 egopulse_uptime_seconds 86400

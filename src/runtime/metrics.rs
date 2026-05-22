@@ -40,14 +40,9 @@ pub fn init_metrics() -> &'static PrometheusHandle {
 
 /// Renders the current Prometheus text exposition.
 ///
-/// # Panics
-///
-/// Panics if [`init_metrics`] has not been called yet.
+/// Idempotent — initializes the recorder if not yet installed.
 pub fn metrics_output() -> String {
-    HANDLE
-        .get()
-        .expect("metrics not initialized — call init_metrics() first")
-        .render()
+    init_metrics().render()
 }
 
 #[allow(dead_code)]

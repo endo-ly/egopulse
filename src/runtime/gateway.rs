@@ -419,68 +419,71 @@ fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError>
     Ok(())
 }
 
-fn print_gateway_status_text(status_json: &str) {
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m {s}s")
+    } else if mins > 0 {
+        format!("{mins}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn format_gateway_status(status_json: &str) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(status_json) {
         Ok(v) => v,
-        Err(_) => {
-            print!("{status_json}");
-            return;
-        }
+        Err(_) => return status_json.to_owned(),
     };
 
-    println!("Service: active (systemd)");
-    println!();
+    let mut out = String::new();
+
+    let ok = parsed["ok"].as_bool().unwrap_or(false);
+    let status_label = if ok { "healthy" } else { "unhealthy" };
+    out.push_str(&format!("Service: active (systemd)  [{status_label}]\n\n"));
 
     if let Some(version) = parsed["version"].as_str() {
         let pid = parsed["pid"].as_u64().unwrap_or(0);
-        let uptime = parsed["uptime"].as_str().unwrap_or("unknown");
-        print!("EgoPulse v{version}  PID {pid}  uptime {uptime}");
+        let uptime_secs = parsed["uptime_secs"].as_u64().unwrap_or(0);
+        let uptime = format_uptime(uptime_secs);
+        out.push_str(&format!(
+            "EgoPulse v{version}  PID {pid}  uptime {uptime}\n"
+        ));
     }
 
-    if let Some(provider) = parsed.get("provider") {
-        let name = provider["provider"].as_str().unwrap_or("unknown");
-        let model = provider["model"].as_str().unwrap_or("unknown");
-        println!("  Provider: {name} / {model}");
-    } else {
-        println!();
+    if let Some(active_turns) = parsed.get("active_turns").and_then(|v| v.as_u64()) {
+        out.push_str(&format!("Active Turns: {active_turns}\n"));
     }
 
     if let Some(channels) = parsed.get("channels") {
-        println!();
-        println!("Channels");
-        if let Some(ch) = channels.get("web") {
-            let state = ch["state"].as_str().unwrap_or("unknown");
-            let marker = if state == "running" { "●" } else { "✗" };
-            println!("  web      {marker} {state}");
-        }
-        if let Some(ch) = channels.get("discord") {
-            let state = ch["state"].as_str().unwrap_or("unknown");
-            let marker = if state == "running" { "●" } else { "✗" };
-            println!("  discord  {marker} {state}");
-        }
-        if let Some(ch) = channels.get("telegram") {
-            let state = ch["state"].as_str().unwrap_or("unknown");
-            let marker = if state == "running" { "●" } else { "✗" };
-            println!("  telegram {marker} {state}");
-        }
-    }
-
-    if let Some(errors) = parsed.get("recent_errors") {
-        if let Some(arr) = errors.as_array() {
-            if !arr.is_empty() {
-                println!();
-                println!("Recent Errors (last 1h: {})", arr.len());
-                for err in arr {
-                    let time = err["time"].as_str().unwrap_or("-");
-                    let kind = err["kind"].as_str().unwrap_or("-");
-                    let agent = err["agent"].as_str().unwrap_or("-");
-                    let channel = err["channel"].as_str().unwrap_or("-");
-                    let message = err["message"].as_str().unwrap_or("-");
-                    println!("  {time}  {kind}  {agent}  {channel}  \"{message}\"");
-                }
+        out.push('\n');
+        out.push_str("Channels\n");
+        for name in ["web", "discord", "telegram"] {
+            if let Some(ch) = channels.get(name) {
+                let state = ch["state"].as_str().unwrap_or("unknown");
+                let marker = if state == "running" { "●" } else { "✗" };
+                out.push_str(&format!("{name:>10} {marker} {state}\n"));
             }
         }
     }
+
+    if let Some(count) = parsed.get("recent_errors_count").and_then(|v| v.as_u64()) {
+        if count > 0 {
+            out.push('\n');
+            out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
+        }
+    }
+
+    out
+}
+
+fn print_gateway_status_text(status_json: &str) {
+    print!("{}", format_gateway_status(status_json));
 }
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
@@ -1259,22 +1262,89 @@ mod tests {
     }
 
     #[test]
-    fn print_gateway_status_text_formats_channels() {
+    fn format_gateway_status_parses_ready_response() {
         let json = serde_json::json!({
+            "ok": true,
             "version": "0.1.0",
+            "uptime_secs": 5400,
             "pid": 12345,
-            "uptime": "1h 30m",
-            "provider": { "provider": "openrouter", "model": "gpt-5" },
+            "db": { "ok": true },
             "channels": {
                 "web": { "state": "running" },
                 "discord": { "state": "running" },
                 "telegram": { "state": "failed" }
+            },
+            "active_turns": 2,
+            "recent_errors_count": 3
+        })
+        .to_string();
+
+        let output = format_gateway_status(&json);
+
+        assert!(
+            output.contains("1h 30m 0s"),
+            "expected formatted uptime, got: {output}"
+        );
+        assert!(
+            output.contains("healthy"),
+            "expected healthy status, got: {output}"
+        );
+        assert!(output.contains("v0.1.0"), "expected version, got: {output}");
+        assert!(output.contains("PID 12345"), "expected PID, got: {output}");
+        assert!(
+            output.contains("● running"),
+            "expected running channel, got: {output}"
+        );
+        assert!(
+            output.contains("✗ failed"),
+            "expected failed channel, got: {output}"
+        );
+        assert!(
+            output.contains("Active Turns: 2"),
+            "expected active turns, got: {output}"
+        );
+        assert!(
+            output.contains("Recent Errors (last 1h): 3"),
+            "expected errors count, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_uptime_various() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(90), "1m 30s");
+        assert_eq!(format_uptime(5400), "1h 30m 0s");
+        assert_eq!(format_uptime(90061), "1d 1h 1m");
+    }
+
+    #[test]
+    fn format_gateway_status_without_errors() {
+        let json = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 3600,
+            "pid": 99,
+            "channels": {
+                "web": { "state": "running" }
             }
         })
         .to_string();
 
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["channels"]["web"]["state"], "running");
-        assert_eq!(parsed["channels"]["telegram"]["state"], "failed");
+        let output = format_gateway_status(&json);
+        assert!(
+            !output.contains("Recent Errors"),
+            "should not show errors section when count is 0 or absent, got: {output}"
+        );
+        assert!(
+            output.contains("1h 0m 0s"),
+            "expected 1h uptime, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_invalid_json_passthrough() {
+        let output = format_gateway_status("not json at all");
+        assert_eq!(output, "not json at all");
     }
 }

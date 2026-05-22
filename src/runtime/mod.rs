@@ -395,7 +395,7 @@ pub(crate) fn execute_scheduled_turn(
                 .turn_tracker
                 .set_terminal_reason(&origin_id, reason.clone());
             state.runtime_status.push_error(
-                &origin_id,
+                &turn.context.trace_id,
                 "stop_condition",
                 agent_id,
                 &turn.context.channel,

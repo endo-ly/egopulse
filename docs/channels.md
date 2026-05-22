@@ -297,7 +297,7 @@ Web サーバーが提供するヘルスチェック・メトリクス用の HTT
 
 プロセスが生存しているかを確認する最小限のエンドポイント。
 
-```
+```text
 GET /health
 ```
 
@@ -319,7 +319,7 @@ GET /health
 
 サービスがリクエストを処理可能かを判定するエンドポイント。チャネル状態、DB 接続、MCP 接続、アクティブターン数、直近エラーを含む。
 
-```
+```text
 GET /ready
 ```
 
@@ -353,11 +353,11 @@ GET /ready
 
 Prometheus 形式のテキスト出力を返す。`egopulse_` プレフィックスの低カーディナリティラベルで構成される。
 
-```
+```text
 GET /metrics
 ```
 
-```
+```text
 # HELP egopulse_uptime_seconds Process uptime in seconds
 # TYPE egopulse_uptime_seconds gauge
 egopulse_uptime_seconds 86400
