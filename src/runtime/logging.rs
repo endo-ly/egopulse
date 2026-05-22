@@ -32,11 +32,22 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
         .or_else(|_| EnvFilter::try_new(filter_string.to_ascii_lowercase()))
         .map_err(|error| LoggingError::InitFailed(error.to_string()))?;
 
-    match tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init()
-    {
+    let format = std::env::var("EGOPULSE_LOG_FORMAT").unwrap_or_default();
+
+    let result = if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .json()
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .try_init()
+    };
+
+    match result {
         Ok(()) => Ok(()),
         Err(error)
             if error
@@ -64,4 +75,47 @@ pub(crate) fn install_eagain_safe_panic_hook() {
             default_hook(info);
         }));
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn init_logging_default_is_text() {
+        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
+        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
+        let result = init_logging("info");
+        assert!(
+            result.is_ok(),
+            "default text format should init: {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn init_logging_json_format() {
+        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
+        unsafe { std::env::set_var("EGOPULSE_LOG_FORMAT", "json") };
+        let result = init_logging("info");
+        assert!(result.is_ok(), "json format should init: {result:?}");
+        // SAFETY: test-only env var cleanup
+        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
+    }
+
+    #[test]
+    #[serial]
+    fn init_logging_invalid_format_falls_back() {
+        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
+        unsafe { std::env::set_var("EGOPULSE_LOG_FORMAT", "xml") };
+        let result = init_logging("info");
+        assert!(
+            result.is_ok(),
+            "invalid format should fall back to text: {result:?}"
+        );
+        // SAFETY: test-only env var cleanup
+        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
+    }
 }
