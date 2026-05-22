@@ -85,7 +85,7 @@ src/
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
-│   ├── metrics.rs       # Prometheus メトリクス初期化・ヘルパー
+│   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
 │   ├── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
 │   └── status.rs        # MCP ステータス型
 │
@@ -324,7 +324,7 @@ pub(crate) struct SurfaceContext {
 
 ### 8.2 RuntimeStatus
 
-`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/health` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。これにより、従来の `status.json`（起動時スナップショットのファイル書き出し）は廃止され、ライブ `/health` エンドポイントに置き換えられた。
+`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/health` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。
 
 ### 8.3 trace_id 伝播
 
