@@ -45,7 +45,7 @@ tokio = { version = "1.48", features = ["macros", "process", "rt-multi-thread", 
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 rand = "0.9"
 readability-js = "0.1.5"
@@ -59,6 +59,8 @@ rmcp = { version = "1.4", features = [
 similar = "2.7"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 
 [dev-dependencies]
 serial_test = "3.2"

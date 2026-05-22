@@ -354,6 +354,8 @@ fn log_summarizer_usage(
     let model = llm.model_name().to_string();
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
+    crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
+    crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
     tokio::spawn(async move {
         let _ = crate::storage::call_blocking(db, move |db| {
             db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
@@ -363,7 +365,7 @@ fn log_summarizer_usage(
                 model: &model,
                 input_tokens,
                 output_tokens,
-                request_kind: "summarize",
+                request_kind: "compaction",
             })
         })
         .await
@@ -1253,7 +1255,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn compaction_logs_llm_usage_as_summarize() {
+    async fn compaction_logs_llm_usage_as_compaction() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![

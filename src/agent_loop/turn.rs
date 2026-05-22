@@ -23,6 +23,7 @@ use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use futures_util::future::join_all;
 use std::sync::Arc;
+use tracing::Instrument;
 use tracing::warn;
 
 const MAX_TOOL_ITERATIONS: usize = 50;
@@ -102,6 +103,7 @@ pub async fn ask_in_session(
         channel_log_chat_id: None,
         chain_depth: 0,
         origin_id: String::new(),
+        trace_id: String::new(),
     };
 
     tokio::select! {
@@ -151,206 +153,228 @@ async fn process_turn_inner(
     on_event: EventEmitter,
 ) -> Result<String, EgoPulseError> {
     state.active_turns.begin_turn(&context.agent_id);
+    crate::runtime::metrics::inc_turns_total(&context.agent_id, &context.channel);
     let _guard = ActiveTurnGuard {
         state,
         agent_id: &context.agent_id,
     };
 
-    let chat_id = resolve_chat_id(state, context).await.inspect_err(|e| {
-        warn!(
-            error_kind = e.error_kind(),
-            error = %e,
-            channel = context.channel,
-            surface_thread = context.surface_thread,
-            "resolve_chat_id failed"
-        );
-    })?;
-    let tool_context = ToolExecutionContext {
-        chat_id,
-        channel: context.channel.clone(),
-        surface_thread: context.surface_thread.clone(),
-        chat_type: context.chat_type.clone(),
-        agent_id: context.agent_id.clone(),
-        channel_log_chat_id: context.channel_log_chat_id,
-        chain_depth: context.chain_depth,
-        origin_id: context.origin_id.clone(),
-        turn_sender: state.turn_sender.clone(),
-        skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    let trace_id = if context.trace_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        context.trace_id.clone()
     };
-    let system_prompt = build_system_prompt(state, context);
-    let channel_llm = state.llm_for_context(context).inspect_err(|e| {
-        warn!(
-            error_kind = e.error_kind(),
-            error = %e,
-            channel = context.channel,
-            "llm_for_context failed"
-        );
-    })?;
+    let span = tracing::info_span!(
+        "agent_turn",
+        trace_id = %trace_id,
+        agent_id = %context.agent_id,
+        channel = %context.channel,
+        session = %context.surface_thread,
+        origin_id = %context.origin_id,
+        chain_depth = context.chain_depth,
+    );
 
-    let user_message = Message::text("user", user_input);
+    async move {
+        let chat_id = resolve_chat_id(state, context).await.inspect_err(|e| {
+            warn!(
+                error_kind = e.error_kind(),
+                error = %e,
+                channel = context.channel,
+                surface_thread = context.surface_thread,
+                "resolve_chat_id failed"
+            );
+        })?;
+        let tool_context = ToolExecutionContext {
+            chat_id,
+            channel: context.channel.clone(),
+            surface_thread: context.surface_thread.clone(),
+            chat_type: context.chat_type.clone(),
+            agent_id: context.agent_id.clone(),
+            channel_log_chat_id: context.channel_log_chat_id,
+            chain_depth: context.chain_depth,
+            origin_id: context.origin_id.clone(),
+            turn_sender: state.turn_sender.clone(),
+            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+        let system_prompt = build_system_prompt(state, context);
+        let channel_llm = state.llm_for_context(context).inspect_err(|e| {
+            warn!(
+                error_kind = e.error_kind(),
+                error = %e,
+                channel = context.channel,
+                "llm_for_context failed"
+            );
+        })?;
 
-    let tool_defs = state.tools.definitions_async().await;
-    let tools_json = serde_json::to_string(&tool_defs).ok();
-    let prompt_ctx = PromptContext {
-        system_prompt: &system_prompt,
-        tools_json: tools_json.as_deref(),
-    };
+        let user_message = Message::text("user", user_input);
 
-    let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
-        state,
-        context,
-        chat_id,
-        &user_message,
-        user_input,
-        &channel_llm,
-        &prompt_ctx,
-    )
-    .await?;
+        let tool_defs = state.tools.definitions_async().await;
+        let tools_json = serde_json::to_string(&tool_defs).ok();
+        let prompt_ctx = PromptContext {
+            system_prompt: &system_prompt,
+            tools_json: tools_json.as_deref(),
+        };
 
-    // Load Channel Context for multi-agent rooms (temporary injection)
-    let channel_context_msg = load_channel_context(state, context).await;
-
-    // LLM → tool execution → tool result feedback を 1 反復として回し、
-    // tool_calls が空になるまで続ける。
-    // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
-    let mut empty_reply_retry_attempted = false;
-    let mut declarative_retry_attempted = false;
-    let mut retry_messages: Option<Vec<Message>> = None;
-
-    for iteration in 1..=MAX_TOOL_ITERATIONS {
-        on_event.emit(AgentEvent::Iteration { iteration });
-        let mut request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
-
-        // Inject Channel Context temporarily before LLM call
-        if iteration == 1 {
-            if let Some(ref ctx_msg) = channel_context_msg {
-                request_messages.insert(0, ctx_msg.clone());
-            }
-        }
-
-        let response = channel_llm
-            .send_message(&system_prompt, request_messages, Some(tool_defs.clone()))
-            .await
-            .inspect_err(|e| {
-                warn!(error = %e, iteration, "LLM send_message failed");
-            })?;
-
-        if let Some(usage) = &response.usage {
-            let db = Arc::clone(&state.db);
-            let channel = context.channel.clone();
-            let provider = channel_llm.provider_name().to_string();
-            let model = channel_llm.model_name().to_string();
-            let input_tokens = usage.input_tokens;
-            let output_tokens = usage.output_tokens;
-            tokio::spawn(async move {
-                let _ = call_blocking(db, move |db| {
-                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                        chat_id,
-                        caller_channel: &channel,
-                        provider: &provider,
-                        model: &model,
-                        input_tokens,
-                        output_tokens,
-                        request_kind: "agent_loop",
-                    })
-                })
-                .await
-                .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
-            });
-        }
-
-        if response.tool_calls.is_empty() {
-            match evaluate_end_turn(
-                &response.content,
-                response.reasoning_content.as_deref(),
-                &mut empty_reply_retry_attempted,
-                &mut declarative_retry_attempted,
-                &messages,
-            )? {
-                TurnAction::Retry(msgs) => retry_messages = msgs,
-                TurnAction::Done {
-                    final_content,
-                    reasoning_content,
-                } => {
-                    return persist_and_finalize(
-                        state,
-                        chat_id,
-                        &mut messages,
-                        session_updated_at.clone(),
-                        &on_event,
-                        final_content,
-                        reasoning_content,
-                    )
-                    .await;
-                }
-            }
-            continue;
-        }
-
-        let valid_tool_calls = filter_valid_tool_calls(response.tool_calls);
-
-        if valid_tool_calls.is_empty() {
-            match evaluate_malformed_response(
-                &response.content,
-                response.reasoning_content.as_deref(),
-                &mut declarative_retry_attempted,
-                &messages,
-            )? {
-                TurnAction::Retry(msgs) => retry_messages = msgs,
-                TurnAction::Done {
-                    final_content,
-                    reasoning_content,
-                } => {
-                    return persist_and_finalize(
-                        state,
-                        chat_id,
-                        &mut messages,
-                        session_updated_at.clone(),
-                        &on_event,
-                        final_content,
-                        reasoning_content,
-                    )
-                    .await;
-                }
-            }
-            continue;
-        }
-
-        let (updated_messages, updated_at) = execute_and_persist_tools(
-            state,
-            &on_event,
-            &tool_context,
-            messages,
-            session_updated_at,
-            ToolAssistantDraft {
-                content: response.content,
-                reasoning_content: response.reasoning_content,
-                valid_tool_calls,
-            },
-        )
-        .await?;
-        messages = updated_messages;
-        session_updated_at = updated_at;
-        empty_reply_retry_attempted = false;
-        declarative_retry_attempted = false;
-
-        if let Ok(compacted) = maybe_compact_messages(
+        let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
             state,
             context,
             chat_id,
-            &messages,
+            &user_message,
+            user_input,
             &channel_llm,
             &prompt_ctx,
         )
-        .await
-        {
-            messages = compacted;
-        }
-    }
+        .await?;
 
-    Err(EgoPulseError::Internal(format!(
-        "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
-    )))
+        // Load Channel Context for multi-agent rooms (temporary injection)
+        let channel_context_msg = load_channel_context(state, context).await;
+
+        // LLM → tool execution → tool result feedback を 1 反復として回し、
+        // tool_calls が空になるまで続ける。
+        // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
+        let mut empty_reply_retry_attempted = false;
+        let mut declarative_retry_attempted = false;
+        let mut retry_messages: Option<Vec<Message>> = None;
+
+        for iteration in 1..=MAX_TOOL_ITERATIONS {
+            on_event.emit(AgentEvent::Iteration { iteration });
+            let mut request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
+
+            // Inject Channel Context temporarily before LLM call
+            if iteration == 1 {
+                if let Some(ref ctx_msg) = channel_context_msg {
+                    request_messages.insert(0, ctx_msg.clone());
+                }
+            }
+
+            let response = channel_llm
+                .send_message(&system_prompt, request_messages, Some(tool_defs.clone()))
+                .await
+                .inspect_err(|e| {
+                    warn!(error = %e, iteration, "LLM send_message failed");
+                })?;
+
+            if let Some(usage) = &response.usage {
+                let db = Arc::clone(&state.db);
+                let channel = context.channel.clone();
+                let provider = channel_llm.provider_name().to_string();
+                let model = channel_llm.model_name().to_string();
+                let input_tokens = usage.input_tokens;
+                let output_tokens = usage.output_tokens;
+                crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
+                crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
+                tokio::spawn(async move {
+                    let _ = call_blocking(db, move |db| {
+                        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                            chat_id,
+                            caller_channel: &channel,
+                            provider: &provider,
+                            model: &model,
+                            input_tokens,
+                            output_tokens,
+                            request_kind: "agent_loop",
+                        })
+                    })
+                    .await
+                    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
+                });
+            }
+
+            if response.tool_calls.is_empty() {
+                match evaluate_end_turn(
+                    &response.content,
+                    response.reasoning_content.as_deref(),
+                    &mut empty_reply_retry_attempted,
+                    &mut declarative_retry_attempted,
+                    &messages,
+                )? {
+                    TurnAction::Retry(msgs) => retry_messages = msgs,
+                    TurnAction::Done {
+                        final_content,
+                        reasoning_content,
+                    } => {
+                        return persist_and_finalize(
+                            state,
+                            chat_id,
+                            &mut messages,
+                            session_updated_at.clone(),
+                            &on_event,
+                            final_content,
+                            reasoning_content,
+                        )
+                        .await;
+                    }
+                }
+                continue;
+            }
+
+            let valid_tool_calls = filter_valid_tool_calls(response.tool_calls);
+
+            if valid_tool_calls.is_empty() {
+                match evaluate_malformed_response(
+                    &response.content,
+                    response.reasoning_content.as_deref(),
+                    &mut declarative_retry_attempted,
+                    &messages,
+                )? {
+                    TurnAction::Retry(msgs) => retry_messages = msgs,
+                    TurnAction::Done {
+                        final_content,
+                        reasoning_content,
+                    } => {
+                        return persist_and_finalize(
+                            state,
+                            chat_id,
+                            &mut messages,
+                            session_updated_at.clone(),
+                            &on_event,
+                            final_content,
+                            reasoning_content,
+                        )
+                        .await;
+                    }
+                }
+                continue;
+            }
+
+            let (updated_messages, updated_at) = execute_and_persist_tools(
+                state,
+                &on_event,
+                &tool_context,
+                messages,
+                session_updated_at,
+                ToolAssistantDraft {
+                    content: response.content,
+                    reasoning_content: response.reasoning_content,
+                    valid_tool_calls,
+                },
+            )
+            .await?;
+            messages = updated_messages;
+            session_updated_at = updated_at;
+            empty_reply_retry_attempted = false;
+            declarative_retry_attempted = false;
+
+            if let Ok(compacted) = maybe_compact_messages(
+                state,
+                context,
+                chat_id,
+                &messages,
+                &channel_llm,
+                &prompt_ctx,
+            )
+            .await
+            {
+                messages = compacted;
+            }
+        }
+
+        Err(EgoPulseError::Internal(format!(
+            "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
+        )))
+    }
+    .instrument(span)
+    .await
 }
 
 fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
@@ -705,6 +729,10 @@ async fn execute_tool_call(
         .await;
     let duration_ms = tool_start.elapsed().as_millis();
     let tool_payload = format_tool_result(&tool_call, &result);
+    crate::runtime::metrics::inc_tool_calls_total(
+        &tool_call.name,
+        if result.is_error { "error" } else { "ok" },
+    );
     update_tool_call_output(
         state,
         tool_context.chat_id,
@@ -1688,6 +1716,7 @@ mod tests {
             channel_log_chat_id: Some(channel_log_chat_id),
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         }
     }
 
@@ -1927,6 +1956,7 @@ mod tests {
                     channel_log_chat_id: None,
                     chain_depth: 0,
                     origin_id: String::new(),
+                    trace_id: String::new(),
                 },
             ),
         ];
@@ -2155,6 +2185,194 @@ mod tests {
         assert!(
             !json.contains("channel-context"),
             "session should not contain channel context"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tracing span observability
+    // -----------------------------------------------------------------------
+
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct SpanCapture {
+        spans: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SpanCapture {
+        fn new() -> Self {
+            Self {
+                spans: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured_trace_ids(&self) -> Vec<String> {
+            self.spans.lock().expect("spans").clone()
+        }
+    }
+
+    struct FieldVisitor {
+        trace_id: Option<String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "trace_id" {
+                self.trace_id = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "agent_turn" {
+                return;
+            }
+            let mut visitor = FieldVisitor { trace_id: None };
+            attrs.record(&mut visitor);
+            if let Some(trace_id) = visitor.trace_id {
+                self.spans.lock().expect("spans").push(trace_id);
+            }
+        }
+    }
+
+    fn install_capture_subscriber(capture: &SpanCapture) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_emits_span_with_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "traced response".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let mut context = cli_context("trace-test");
+        let expected_trace_id = uuid::Uuid::new_v4().to_string();
+        context.trace_id = expected_trace_id.clone();
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "trace me")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "traced response");
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert_eq!(
+            trace_ids[0], expected_trace_id,
+            "span trace_id must match the context trace_id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_turn_auto_fills_empty_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "auto traced".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let context = cli_context("auto-trace");
+        assert!(context.trace_id.is_empty());
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "auto trace me")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "auto traced");
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert!(
+            !trace_ids[0].is_empty(),
+            "span trace_id must be auto-generated when context has empty trace_id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn execute_scheduled_turn_generates_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "scheduled".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let ctx = cli_context("sched-trace");
+        assert!(ctx.trace_id.is_empty());
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let turn = crate::agent_loop::ScheduledTurn {
+            context: ctx,
+            input: "scheduled turn".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        crate::runtime::execute_scheduled_turn(&state, turn).await;
+
+        let trace_ids = capture.captured_trace_ids();
+        assert_eq!(
+            trace_ids.len(),
+            1,
+            "should capture exactly one agent_turn span"
+        );
+        assert!(
+            !trace_ids[0].is_empty(),
+            "execute_scheduled_turn must generate a non-empty trace_id"
         );
     }
 }

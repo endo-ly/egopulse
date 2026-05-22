@@ -11,6 +11,7 @@
 5. [リクエストフロー](#5-リクエストフロー)
 6. [起動・停止シーケンス](#6-起動停止シーケンス)
 7. [設計パターン](#7-設計パターン)
+8. [オブザーバビリティレイヤー](#8-オブザーバビリティレイヤー)
 
 ---
 
@@ -84,7 +85,9 @@ src/
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
-│   └── status.rs        # ランタイムステータス
+│   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
+│   ├── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
+│   └── status.rs        # MCP ステータス型
 │
 ├── agent_loop/          # エージェントループ
 │   ├── mod.rs           # SurfaceContext, process_turn()
@@ -175,6 +178,7 @@ pub struct AppState {
     pub(crate) turn_sender: mpsc::Sender<PendingAgentTurn>,
     pub(crate) turn_scheduler: Arc<TurnScheduler>,
     pub(crate) turn_tracker: Arc<TurnTracker>,
+    pub(crate) runtime_status: Arc<RuntimeStatus>,  // インメモリヘルスサマリー
 }
 ```
 
@@ -192,6 +196,7 @@ pub(crate) struct SurfaceContext {
     pub channel_log_chat_id: Option<i64>, // Multi-Agent Room の Channel Log
     pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
     pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
+    pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
 }
 ```
 
@@ -255,11 +260,10 @@ pub(crate) struct SurfaceContext {
       └─ SOUL.md プロビジョニング
       │
 4. start_channels()
-      │
-      ├─ status.json を書き出し
-      ├─ Web server 起動 (tokio::spawn)
-      ├─ Discord bot 起動 (tokio::spawn × bot 数)
-      ├─ Telegram bot 起動 (tokio::spawn)
+       │
+       ├─ Web server 起動 (tokio::spawn)
+       ├─ Discord bot 起動 (tokio::spawn × bot 数)
+       ├─ Telegram bot 起動 (tokio::spawn)
       │
       └─ 監視ループ (2 秒間隔でタスク状態をチェック)
          └─ いずれかのチャネルが異常終了 → 全チャネルを停止
@@ -303,3 +307,52 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
+
+---
+
+## 8. オブザーバビリティレイヤー
+
+3 層構造で運用時の可観測性を提供する。
+
+### 8.1 3 層モデル
+
+| 層 | 形式 | 用途 |
+|---|---|---|
+| **構造化ログ** | `tracing` スパン + `trace_id` | リクエスト単位のログ追跡、`journalctl` / Loki での検索 |
+| **Live Health API** | `/health` | ヘルスプローブ、オペレーション確認 |
+| **テレメトリー API** | `/telemetry` | JSON メトリクス・ターン履歴・エラー詳細（AI エージェント向け） |
+
+### 8.2 RuntimeStatus
+
+`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/health` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。
+
+### 8.3 trace_id 伝播
+
+エージェントターンのライフサイクル全体で `trace_id` が伝播する。
+
+1. `execute_scheduled_turn` で UUID v4 を生成し `SurfaceContext.trace_id` に設定
+2. `process_turn_inner` は空 `trace_id` を自動補完（UUID v4 を再生成）
+3. `tracing::info_span!` に `trace_id` フィールドとして注入
+4. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
+
+### 8.4 エラーリングバッファ
+
+直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/telemetry` エンドポイントの `recent_errors` フィールドから `trace_id` 付きで参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
+
+### 8.5 ターン履歴リングバッファ
+
+直近のターン実行結果をインメモリのリングバッファ（容量 100 件）に保持する。`/telemetry` エンドポイントの `recent_turns` フィールドから参照可能。各レコードには `trace_id`、`agent_id`、`channel`、`started_at`、`duration_secs`、`ok` が含まれる。
+
+### 8.6 メトリクス
+
+`/telemetry` エンドポイントは JSON 形式でメトリクスを出力する。`egopulse_` プレフィックスのカウンター・ゲージをラベル付きで返す。
+
+主要メトリクス:
+
+| メトリクス | 型 | 説明 |
+|---|---|---|
+| `egopulse_turns_total` | counter | 処理済みターン総数（ラベル: `agent`, `channel`） |
+| `egopulse_turn_errors_total` | counter | ターンエラー総数（ラベル: `kind`, `agent`） |
+| `egopulse_llm_tokens_total` | counter | LLM トークン消費量（ラベル: `direction`, `provider`） |
+| `egopulse_tool_calls_total` | counter | ツール呼び出し総数（ラベル: `tool`, `status`） |
+| `egopulse_active_turns` | gauge | 実行中のエージェントターン数 |

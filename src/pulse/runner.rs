@@ -113,6 +113,32 @@ pub(crate) async fn run_activation(
                 warn!(error = %e, iteration, "pulse LLM send_message failed");
             })?;
 
+        if let Some(usage) = &response.usage {
+            let db = std::sync::Arc::clone(&state.db);
+            let channel = context.channel.clone();
+            let provider = channel_llm.provider_name().to_string();
+            let model = channel_llm.model_name().to_string();
+            let input_tokens = usage.input_tokens;
+            let output_tokens = usage.output_tokens;
+            crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
+            crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
+            tokio::spawn(async move {
+                let _ = crate::storage::call_blocking(db, move |db| {
+                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                        chat_id,
+                        caller_channel: &channel,
+                        provider: &provider,
+                        model: &model,
+                        input_tokens,
+                        output_tokens,
+                        request_kind: "pulse",
+                    })
+                })
+                .await
+                .inspect_err(|e| warn!(error = %e, "pulse llm usage logging failed"));
+            });
+        }
+
         if response.tool_calls.is_empty() {
             let output_text = response.content.trim().to_string();
             let output_kind = classify_output(&output_text);
@@ -404,5 +430,76 @@ mod tests {
             PulseOutputKind::Notify
         );
         assert_eq!(classify_output(""), PulseOutputKind::Silent);
+    }
+
+    #[tokio::test]
+    async fn activation_logs_llm_usage_with_pulse_request_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+
+        let provider = crate::agent_loop::turn::RecordingProvider::new(
+            vec![Ok(crate::llm::MessagesResponse {
+                content: "PULSE_OK".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: Some(crate::llm::LlmUsage {
+                    input_tokens: 50,
+                    output_tokens: 25,
+                }),
+            })],
+            vec![0],
+        );
+
+        let config = crate::test_util::test_config(&state_root);
+        let state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+
+        let surface = HomeSurface {
+            chat_id: 1,
+            channel: "cli".to_string(),
+            external_chat_id: "test-pulse".to_string(),
+            chat_type: "cli".to_string(),
+        };
+
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        let result = run_activation(&state, "default", &capsule, &surface)
+            .await
+            .expect("activation");
+
+        assert_eq!(result.output_kind, PulseOutputKind::Silent);
+
+        for _ in 0..20 {
+            let row: Option<(String, i64, i64)> = {
+                let conn = state.db.conn.lock().expect("lock");
+                conn.query_row(
+                    "SELECT request_kind, input_tokens, output_tokens FROM llm_usage_logs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok()
+            };
+
+            if let Some((kind, input, output)) = row {
+                assert_eq!(kind, "pulse");
+                assert_eq!(input, 50);
+                assert_eq!(output, 25);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("pulse llm usage log was not written within the polling timeout");
     }
 }

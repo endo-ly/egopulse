@@ -4,9 +4,13 @@
 
 pub mod gateway;
 pub mod logging;
+pub(crate) mod metrics;
+pub(crate) mod runtime_status;
 pub mod status;
 pub(crate) mod turn_scheduler;
 
+pub(crate) use runtime_status::ChannelState;
+pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
 
 use std::collections::HashMap;
@@ -14,8 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-
-use chrono::Utc;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
@@ -28,10 +30,6 @@ use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
-use crate::runtime::status as status_mod;
-use crate::runtime::status::{
-    ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
-};
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
@@ -59,6 +57,8 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
+    /// In-memory runtime health summary for observability.
+    pub(crate) runtime_status: Arc<RuntimeStatus>,
     _sealed: (),
 }
 
@@ -75,6 +75,7 @@ pub(crate) struct AppStateParts {
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
+    pub(crate) runtime_status: Arc<RuntimeStatus>,
 }
 
 struct AppStateDependencies {
@@ -104,6 +105,7 @@ impl AppState {
             turn_sender: parts.turn_sender,
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
+            runtime_status: parts.runtime_status,
             _sealed: (),
         }
     }
@@ -161,6 +163,8 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
+    crate::runtime::metrics::init_metrics();
+
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
 
     let mut channels = ChannelRegistry::new();
@@ -221,6 +225,8 @@ pub async fn build_app_state_with_path(
 
     let tools = Arc::new(tools);
 
+    let runtime_status = Arc::new(RuntimeStatus::new());
+
     let state = AppState::from_parts(AppStateParts {
         db: deps.db,
         config,
@@ -234,6 +240,7 @@ pub async fn build_app_state_with_path(
         soul_agents: deps.soul_agents,
         memory_loader: deps.memory_loader,
         turn_sender,
+        runtime_status: Arc::clone(&runtime_status),
     });
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);
@@ -253,6 +260,8 @@ pub fn build_sleep_app_state_with_path(
     let channels = Arc::new(ChannelRegistry::new());
     let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&deps.skills)));
 
+    let runtime_status = Arc::new(RuntimeStatus::new());
+
     Ok(AppState::from_parts(AppStateParts {
         db: deps.db,
         config,
@@ -266,6 +275,7 @@ pub fn build_sleep_app_state_with_path(
         soul_agents: deps.soul_agents,
         memory_loader: deps.memory_loader,
         turn_sender: tokio::sync::mpsc::channel(16).0,
+        runtime_status,
     }))
 }
 
@@ -336,12 +346,20 @@ pub(crate) fn execute_scheduled_turn(
     turn: crate::agent_loop::ScheduledTurn,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        let mut turn = turn;
+        turn.context.trace_id = trace_id;
+
         let session_key = turn.session_key();
         let origin_id = if turn.origin_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
             turn.origin_id.clone()
         };
+
+        state
+            .runtime_status
+            .touch_channel_activity(&turn.context.channel);
 
         if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
             tracing::warn!(
@@ -376,6 +394,14 @@ pub(crate) fn execute_scheduled_turn(
             state
                 .turn_tracker
                 .set_terminal_reason(&origin_id, reason.clone());
+            state.runtime_status.push_error(
+                &turn.context.trace_id,
+                "stop_condition",
+                agent_id,
+                &turn.context.channel,
+                &format!("{reason:?}"),
+            );
+            crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -404,14 +430,39 @@ pub(crate) fn execute_scheduled_turn(
             None => None,
         };
 
-        match crate::agent_loop::process_turn(state, &turn.context, &turn.input).await {
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let started = std::time::Instant::now();
+
+        let turn_result = crate::agent_loop::process_turn(state, &turn.context, &turn.input).await;
+        let duration = started.elapsed().as_secs_f64();
+
+        match turn_result {
             Ok(response) => {
+                state.runtime_status.push_turn(
+                    &turn.context.trace_id,
+                    &turn.context.agent_id,
+                    &turn.context.channel,
+                    &started_at,
+                    duration,
+                    true,
+                );
                 if let Some(adapter) = adapter {
                     if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                         tracing::warn!(
                             agent_id = %turn.context.agent_id,
                             error = %error,
                             "scheduled turn: failed to send response to channel"
+                        );
+                        state.runtime_status.push_error(
+                            &origin_id,
+                            "channel_send",
+                            &turn.context.agent_id,
+                            &turn.context.channel,
+                            &error.to_string(),
+                        );
+                        crate::runtime::metrics::inc_turn_errors_total(
+                            "channel_send",
+                            &turn.context.agent_id,
                         );
                     }
                 }
@@ -435,10 +486,29 @@ pub(crate) fn execute_scheduled_turn(
                 }
             }
             Err(error) => {
+                state.runtime_status.push_turn(
+                    &turn.context.trace_id,
+                    &turn.context.agent_id,
+                    &turn.context.channel,
+                    &started_at,
+                    duration,
+                    false,
+                );
                 tracing::warn!(
                     agent_id = %turn.context.agent_id,
                     error = %error,
                     "scheduled turn: process_turn failed"
+                );
+                state.runtime_status.push_error(
+                    &origin_id,
+                    "turn_failure",
+                    &turn.context.agent_id,
+                    &turn.context.channel,
+                    &error.to_string(),
+                );
+                crate::runtime::metrics::inc_turn_errors_total(
+                    "turn_failure",
+                    &turn.context.agent_id,
                 );
                 state
                     .turn_tracker
@@ -526,14 +596,14 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
 /// Starts all enabled channels and supervises them until shutdown or failure.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
-    write_startup_status(&state).await;
-
     let mut has_active_channels = false;
     let mut handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
 
     // Web サーバー起動
     if state.config.web_enabled() {
         has_active_channels = true;
+        let rs = Arc::clone(&state.runtime_status);
+        rs.update_channel("web", ChannelState::Starting);
         let web_state = state.clone();
         let host = state.config.web_host().to_owned();
         let port = state.config.web_port();
@@ -559,6 +629,8 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
         if !bot_configs.is_empty() {
             has_active_channels = true;
+            let rs = Arc::clone(&state.runtime_status);
+            rs.update_channel("discord", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
             for (bot_id, token, default_agent) in bot_configs {
                 let discord_state = Arc::new(state.clone());
@@ -614,6 +686,8 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
         if !bot_configs.is_empty() {
             has_active_channels = true;
+            let rs = Arc::clone(&state.runtime_status);
+            rs.update_channel("telegram", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
             for (bot_id, token, bot_username, default_agent) in bot_configs {
                 let telegram_state = Arc::new(state.clone());
@@ -733,91 +807,6 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
     EgoPulseError::Channel(ChannelError::SendFailed(format!(
         "channel '{name}' task join failed: {error}"
     )))
-}
-
-async fn write_startup_status(state: &AppState) {
-    let mcp = if let Some(m) = &state.mcp_manager {
-        m.read().await.status_snapshot()
-    } else {
-        Default::default()
-    };
-
-    let resolved_llm = state.config.resolve_global_llm();
-
-    let web = if state.config.web_enabled() {
-        Some(WebChannelStatus {
-            enabled: true,
-            host: Some(state.config.web_host().to_owned()),
-            port: Some(state.config.web_port()),
-        })
-    } else {
-        None
-    };
-
-    let discord_bot_count = state.config.discord_bots().len();
-    let discord = if discord_bot_count > 0 {
-        Some(ChannelEntry {
-            enabled: true,
-            agent_count: Some(discord_bot_count),
-        })
-    } else if state.config.channel_enabled("discord") {
-        Some(ChannelEntry {
-            enabled: true,
-            agent_count: Some(0),
-        })
-    } else {
-        None
-    };
-
-    let telegram = state
-        .config
-        .channel_enabled("telegram")
-        .then_some(ChannelEntry {
-            enabled: true,
-            agent_count: None,
-        });
-
-    let sleep_scheduler = if state.config.sleep_batch.scheduler_enabled() {
-        Some(status_mod::SleepSchedulerStatus {
-            enabled: true,
-            next_run: crate::sleep::scheduler::next_scheduled_run(
-                &state.config.sleep_batch,
-                Utc::now(),
-            )
-            .map(|dt| dt.to_rfc3339()),
-            schedule: state.config.sleep_batch.schedule.clone(),
-            timezone: state.config.sleep_batch.timezone.clone(),
-        })
-    } else {
-        None
-    };
-
-    let snapshot = StatusSnapshot {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        pid: std::process::id(),
-        started_at: Utc::now().to_rfc3339(),
-        config_path: state
-            .config_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        mcp,
-        channels: ChannelsStatus {
-            web,
-            discord,
-            telegram,
-        },
-        provider: ProviderStatus {
-            default: resolved_llm.provider.clone(),
-            model: resolved_llm.model.clone(),
-        },
-        sleep_scheduler,
-    };
-
-    let state_root = PathBuf::from(&state.config.state_root);
-    if let Err(error) = status_mod::write_status(&state_root, &snapshot) {
-        tracing::warn!("failed to write startup status: {error}");
-    }
 }
 
 #[cfg(test)]
@@ -972,5 +961,34 @@ mod tests {
 
         let cache = state.llm_cache.lock().expect("lock");
         assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_app_state_includes_runtime_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let snap = state.runtime_status.snapshot();
+        assert!(!snap.version.is_empty());
+        assert!(snap.pid > 0);
+        assert!(!snap.started_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cloned_app_state_shares_runtime_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let cloned = state.clone();
+        assert!(Arc::ptr_eq(&state.runtime_status, &cloned.runtime_status));
+    }
+
+    #[test]
+    fn build_sleep_app_state_includes_runtime_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_sleep_app_state_with_path(config, None).expect("build sleep state");
+        let snap = state.runtime_status.snapshot();
+        assert!(!snap.version.is_empty());
     }
 }

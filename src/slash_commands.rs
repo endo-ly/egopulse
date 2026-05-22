@@ -860,6 +860,7 @@ mod tests {
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         }
     }
 
@@ -1191,6 +1192,7 @@ mod tests {
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1230,6 +1232,7 @@ mod tests {
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1309,6 +1312,7 @@ agents:
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1354,6 +1358,7 @@ agents:
             channel_log_chat_id: None,
             chain_depth: 0,
             origin_id: String::new(),
+            trace_id: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;

@@ -1728,6 +1728,38 @@ mod tests {
     }
 
     #[test]
+    fn log_llm_usage_stores_request_kind() {
+        let (db, _dir) = test_db();
+
+        for kind in &["agent_loop", "compaction", "sleep_batch", "pulse"] {
+            db.log_llm_usage(&LlmUsageLogEntry {
+                chat_id: 0,
+                caller_channel: "test",
+                provider: "test",
+                model: "test",
+                input_tokens: 1,
+                output_tokens: 1,
+                request_kind: kind,
+            })
+            .expect("log usage");
+        }
+
+        let conn = db.conn.lock().expect("lock");
+        let kinds: Vec<String> = conn
+            .prepare("SELECT request_kind FROM llm_usage_logs ORDER BY rowid")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        assert_eq!(
+            kinds,
+            &["agent_loop", "compaction", "sleep_batch", "pulse"].map(|s| s.to_string())
+        );
+    }
+
+    #[test]
     fn resolve_or_create_chat_id_sets_agent_id() {
         let (db, _dir) = test_db();
 
