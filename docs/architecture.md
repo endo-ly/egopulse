@@ -85,7 +85,9 @@ src/
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
-│   └── status.rs        # ランタイムステータス
+│   ├── metrics.rs       # Prometheus メトリクス初期化・ヘルパー
+│   ├── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
+│   └── status.rs        # MCP ステータス型
 │
 ├── agent_loop/          # エージェントループ
 │   ├── mod.rs           # SurfaceContext, process_turn()
@@ -176,6 +178,7 @@ pub struct AppState {
     pub(crate) turn_sender: mpsc::Sender<PendingAgentTurn>,
     pub(crate) turn_scheduler: Arc<TurnScheduler>,
     pub(crate) turn_tracker: Arc<TurnTracker>,
+    pub(crate) runtime_status: Arc<RuntimeStatus>,  // インメモリヘルスサマリー
 }
 ```
 
@@ -193,6 +196,7 @@ pub(crate) struct SurfaceContext {
     pub channel_log_chat_id: Option<i64>, // Multi-Agent Room の Channel Log
     pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
     pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
+    pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
 }
 ```
 
@@ -326,9 +330,9 @@ pub(crate) struct SurfaceContext {
 
 エージェントターンのライフサイクル全体で `trace_id` が伝播する。
 
-1. `process_turn()` の開始時に UUID v4 を生成
-2. `tracing::info_span!` に `trace_id` フィールドとして注入
-3. `EGOPULSE_LOG_FORMAT=json` 環境変数設定時は、全ログ行に `trace_id` フィールドが含まれる
+1. `execute_scheduled_turn` で UUID v4 を生成し `SurfaceContext.trace_id` に設定
+2. `process_turn_inner` は空 `trace_id` を自動補完（UUID v4 を再生成）
+3. `tracing::info_span!` に `trace_id` フィールドとして注入
 4. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
 
 ### 8.4 エラーリングバッファ
