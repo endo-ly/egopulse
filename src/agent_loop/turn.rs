@@ -153,6 +153,7 @@ async fn process_turn_inner(
     on_event: EventEmitter,
 ) -> Result<String, EgoPulseError> {
     state.active_turns.begin_turn(&context.agent_id);
+    crate::runtime::metrics::inc_turns_total(&context.agent_id, &context.channel);
     let _guard = ActiveTurnGuard {
         state,
         agent_id: &context.agent_id,
@@ -260,6 +261,8 @@ async fn process_turn_inner(
                 let model = channel_llm.model_name().to_string();
                 let input_tokens = usage.input_tokens;
                 let output_tokens = usage.output_tokens;
+                crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
+                crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
                 tokio::spawn(async move {
                     let _ = call_blocking(db, move |db| {
                         db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
@@ -726,6 +729,10 @@ async fn execute_tool_call(
         .await;
     let duration_ms = tool_start.elapsed().as_millis();
     let tool_payload = format_tool_result(&tool_call, &result);
+    crate::runtime::metrics::inc_tool_calls_total(
+        &tool_call.name,
+        if result.is_error { "error" } else { "ok" },
+    );
     update_tool_call_output(
         state,
         tool_context.chat_id,

@@ -45,31 +45,26 @@ pub fn metrics_output() -> String {
     init_metrics().render()
 }
 
-#[allow(dead_code)]
 pub(crate) fn inc_turns_total(agent: &str, channel: &str) {
     counter!("egopulse_turns_total", "agent" => agent.to_owned(), "channel" => channel.to_owned())
         .increment(1);
 }
 
-#[allow(dead_code)]
 pub(crate) fn inc_turn_errors_total(kind: &str, agent: &str) {
     counter!("egopulse_turn_errors_total", "kind" => kind.to_owned(), "agent" => agent.to_owned())
         .increment(1);
 }
 
 /// `direction` should be `"input"` or `"output"`.
-#[allow(dead_code)]
-pub(crate) fn inc_llm_tokens_total(direction: &str, provider: &str, amount: u64) {
+pub(crate) fn inc_llm_tokens_total(direction: &str, provider: &str, amount: i64) {
     counter!("egopulse_llm_tokens_total", "direction" => direction.to_owned(), "provider" => provider.to_owned())
-        .increment(amount);
+        .increment(amount as u64);
 }
 
-#[allow(dead_code)]
 pub(crate) fn set_active_turns_gauge(count: usize) {
     gauge!("egopulse_active_turns").set(count as f64);
 }
 
-#[allow(dead_code)]
 pub(crate) fn inc_tool_calls_total(tool: &str, status: &str) {
     counter!("egopulse_tool_calls_total", "tool" => tool.to_owned(), "status" => status.to_owned())
         .increment(1);

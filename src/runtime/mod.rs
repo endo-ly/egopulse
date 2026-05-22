@@ -401,6 +401,7 @@ pub(crate) fn execute_scheduled_turn(
                 &turn.context.channel,
                 &format!("{reason:?}"),
             );
+            crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -445,6 +446,10 @@ pub(crate) fn execute_scheduled_turn(
                             &turn.context.channel,
                             &error.to_string(),
                         );
+                        crate::runtime::metrics::inc_turn_errors_total(
+                            "channel_send",
+                            &turn.context.agent_id,
+                        );
                     }
                 }
                 if !response.is_empty() {
@@ -478,6 +483,10 @@ pub(crate) fn execute_scheduled_turn(
                     &turn.context.agent_id,
                     &turn.context.channel,
                     &error.to_string(),
+                );
+                crate::runtime::metrics::inc_turn_errors_total(
+                    "turn_failure",
+                    &turn.context.agent_id,
                 );
                 state
                     .turn_tracker

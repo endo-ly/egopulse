@@ -20,6 +20,7 @@ impl ActiveTurnTracker {
     pub(crate) fn begin_turn(&self, agent_id: &str) {
         let mut turns = self.turns.lock().expect("active_turns lock");
         *turns.entry(agent_id.to_string()).or_insert(0) += 1;
+        crate::runtime::metrics::set_active_turns_gauge(turns.values().map(|&c| c as usize).sum());
     }
 
     /// Removes the entry when the count reaches zero so `is_active` stays O(1).
@@ -31,6 +32,7 @@ impl ActiveTurnTracker {
                 turns.remove(agent_id);
             }
         }
+        crate::runtime::metrics::set_active_turns_gauge(turns.values().map(|&c| c as usize).sum());
     }
 
     pub(crate) fn is_active(&self, agent_id: &str) -> bool {

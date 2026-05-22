@@ -719,6 +719,8 @@ async fn execute_batch(
         if input_tokens > 0 || output_tokens > 0 {
             let provider_name = provider.provider_name().to_string();
             let model_name = provider.model_name().to_string();
+            crate::runtime::metrics::inc_llm_tokens_total("input", &provider_name, input_tokens);
+            crate::runtime::metrics::inc_llm_tokens_total("output", &provider_name, output_tokens);
             let db_for_usage = Arc::clone(&db);
             tokio::spawn(async move {
                 let _ = crate::storage::call_blocking(db_for_usage, move |db| {
