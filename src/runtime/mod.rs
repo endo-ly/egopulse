@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-
-use chrono::Utc;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
@@ -32,10 +30,6 @@ use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
-use crate::runtime::status as status_mod;
-use crate::runtime::status::{
-    ChannelEntry, ChannelsStatus, ProviderStatus, StatusSnapshot, WebChannelStatus,
-};
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
@@ -571,8 +565,6 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
 /// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
 /// Starts all enabled channels and supervises them until shutdown or failure.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
-    write_startup_status(&state).await;
-
     let mut has_active_channels = false;
     let mut handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
 
@@ -784,91 +776,6 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
     EgoPulseError::Channel(ChannelError::SendFailed(format!(
         "channel '{name}' task join failed: {error}"
     )))
-}
-
-async fn write_startup_status(state: &AppState) {
-    let mcp = if let Some(m) = &state.mcp_manager {
-        m.read().await.status_snapshot()
-    } else {
-        Default::default()
-    };
-
-    let resolved_llm = state.config.resolve_global_llm();
-
-    let web = if state.config.web_enabled() {
-        Some(WebChannelStatus {
-            enabled: true,
-            host: Some(state.config.web_host().to_owned()),
-            port: Some(state.config.web_port()),
-        })
-    } else {
-        None
-    };
-
-    let discord_bot_count = state.config.discord_bots().len();
-    let discord = if discord_bot_count > 0 {
-        Some(ChannelEntry {
-            enabled: true,
-            agent_count: Some(discord_bot_count),
-        })
-    } else if state.config.channel_enabled("discord") {
-        Some(ChannelEntry {
-            enabled: true,
-            agent_count: Some(0),
-        })
-    } else {
-        None
-    };
-
-    let telegram = state
-        .config
-        .channel_enabled("telegram")
-        .then_some(ChannelEntry {
-            enabled: true,
-            agent_count: None,
-        });
-
-    let sleep_scheduler = if state.config.sleep_batch.scheduler_enabled() {
-        Some(status_mod::SleepSchedulerStatus {
-            enabled: true,
-            next_run: crate::sleep::scheduler::next_scheduled_run(
-                &state.config.sleep_batch,
-                Utc::now(),
-            )
-            .map(|dt| dt.to_rfc3339()),
-            schedule: state.config.sleep_batch.schedule.clone(),
-            timezone: state.config.sleep_batch.timezone.clone(),
-        })
-    } else {
-        None
-    };
-
-    let snapshot = StatusSnapshot {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        pid: std::process::id(),
-        started_at: Utc::now().to_rfc3339(),
-        config_path: state
-            .config_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        mcp,
-        channels: ChannelsStatus {
-            web,
-            discord,
-            telegram,
-        },
-        provider: ProviderStatus {
-            default: resolved_llm.provider.clone(),
-            model: resolved_llm.model.clone(),
-        },
-        sleep_scheduler,
-    };
-
-    let state_root = PathBuf::from(&state.config.state_root);
-    if let Err(error) = status_mod::write_status(&state_root, &snapshot) {
-        tracing::warn!("failed to write startup status: {error}");
-    }
 }
 
 #[cfg(test)]

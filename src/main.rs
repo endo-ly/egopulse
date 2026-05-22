@@ -14,7 +14,6 @@ use egopulse::error::{ConfigError, EgoPulseError};
 use egopulse::runtime;
 use egopulse::runtime::gateway::{self, GatewayAction};
 use egopulse::runtime::logging::init_logging;
-use egopulse::runtime::status;
 use egopulse::setup;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,12 +56,6 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Show last startup status (MCP, channels, provider).
-    Status {
-        /// Output raw JSON instead of formatted text
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 /// Parses the CLI, runs the requested command, and exits with status 1 on failure.
@@ -82,11 +75,6 @@ async fn run() -> Result<(), EgoPulseError> {
         return setup::run_setup_wizard(cli.config.clone())
             .await
             .map_err(EgoPulseError::Internal);
-    }
-
-    // status は設定ファイル不要で即座に実行する。
-    if let Some(Command::Status { json }) = cli.command {
-        return status::run_status(json).map_err(EgoPulseError::Internal);
     }
 
     match cli.command {
@@ -175,7 +163,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
-        Some(Command::Gateway { .. }) | Some(Command::Update) | Some(Command::Status { .. }) => {
+        Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
         }
         None => runtime::run_tui(config, resolved_config_path).await,
@@ -215,5 +203,11 @@ mod tests {
     fn sleep_command_rejects_invalid_flags() {
         let result = Cli::try_parse_from(["egopulse", "sleep", "--invalid"]);
         assert!(result.is_err(), "should reject --invalid flag");
+    }
+
+    #[test]
+    fn status_command_removed_from_clap() {
+        let result = Cli::try_parse_from(["egopulse", "status"]);
+        assert!(result.is_err(), "`egopulse status` should no longer parse");
     }
 }

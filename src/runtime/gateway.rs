@@ -179,8 +179,12 @@ pub enum GatewayAction {
     Stop,
     /// Disable and remove the systemd service
     Uninstall,
-    /// Show systemd service status
-    Status,
+    /// Show systemd service status with live runtime info
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Restart the systemd service
     Restart,
 }
@@ -388,6 +392,97 @@ fn restart_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
+async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<String> {
+    let config = resolve_config_for_service(cli_config).ok()?;
+    let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
+    let port = loaded.web_port();
+    let url = format!("http://127.0.0.1:{port}/ready");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    let resp = client.get(&url).send().await.ok()?;
+    if resp.status().is_success() {
+        Some(resp.text().await.ok()?)
+    } else {
+        None
+    }
+}
+
+fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
+    let output = systemctl_cmd(&["status", SERVICE_NAME, "--no-pager"], runtime_dir)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{stdout}{stderr}");
+    Ok(())
+}
+
+fn print_gateway_status_text(status_json: &str) {
+    let parsed: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => {
+            print!("{status_json}");
+            return;
+        }
+    };
+
+    println!("Service: active (systemd)");
+    println!();
+
+    if let Some(version) = parsed["version"].as_str() {
+        let pid = parsed["pid"].as_u64().unwrap_or(0);
+        let uptime = parsed["uptime"].as_str().unwrap_or("unknown");
+        print!("EgoPulse v{version}  PID {pid}  uptime {uptime}");
+    }
+
+    if let Some(provider) = parsed.get("provider") {
+        let name = provider["provider"].as_str().unwrap_or("unknown");
+        let model = provider["model"].as_str().unwrap_or("unknown");
+        println!("  Provider: {name} / {model}");
+    } else {
+        println!();
+    }
+
+    if let Some(channels) = parsed.get("channels") {
+        println!();
+        println!("Channels");
+        if let Some(ch) = channels.get("web") {
+            let state = ch["state"].as_str().unwrap_or("unknown");
+            let marker = if state == "running" { "●" } else { "✗" };
+            println!("  web      {marker} {state}");
+        }
+        if let Some(ch) = channels.get("discord") {
+            let state = ch["state"].as_str().unwrap_or("unknown");
+            let marker = if state == "running" { "●" } else { "✗" };
+            println!("  discord  {marker} {state}");
+        }
+        if let Some(ch) = channels.get("telegram") {
+            let state = ch["state"].as_str().unwrap_or("unknown");
+            let marker = if state == "running" { "●" } else { "✗" };
+            println!("  telegram {marker} {state}");
+        }
+    }
+
+    if let Some(errors) = parsed.get("recent_errors") {
+        if let Some(arr) = errors.as_array() {
+            if !arr.is_empty() {
+                println!();
+                println!("Recent Errors (last 1h: {})", arr.len());
+                for err in arr {
+                    let time = err["time"].as_str().unwrap_or("-");
+                    let kind = err["kind"].as_str().unwrap_or("-");
+                    let agent = err["agent"].as_str().unwrap_or("-");
+                    let channel = err["channel"].as_str().unwrap_or("-");
+                    let message = err["message"].as_str().unwrap_or("-");
+                    println!("  {time}  {kind}  {agent}  {channel}  \"{message}\"");
+                }
+            }
+        }
+    }
+}
+
 /// Executes the requested gateway action for the EgoPulse systemd service.
 pub async fn run_gateway(
     cli_config: Option<&PathBuf>,
@@ -503,23 +598,30 @@ ACTIONS:
             println!("Uninstalled egopulse service");
             Ok(())
         }
-        GatewayAction::Status => {
+        GatewayAction::Status { json } => {
             let runtime_dir = ensure_user_session()?;
-            let output = systemctl_cmd(
-                &["status", SERVICE_NAME, "--no-pager"],
-                runtime_dir.as_deref(),
-            )?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            print!("{stdout}{stderr}");
 
-            if output.status.success() {
-                Ok(())
+            let is_active_output =
+                systemctl_cmd(&["is-active", SERVICE_NAME], runtime_dir.as_deref())?;
+            let is_active = String::from_utf8_lossy(&is_active_output.stdout).trim() == "active";
+
+            if is_active {
+                let live_status = fetch_live_status(cli_config).await;
+
+                match live_status {
+                    Some(status_json) => {
+                        if json {
+                            println!("{status_json}");
+                        } else {
+                            print_gateway_status_text(&status_json);
+                        }
+                    }
+                    None => show_systemctl_status(runtime_dir.as_deref())?,
+                }
             } else {
-                Err(EgoPulseError::Internal(
-                    "egopulse service is not running".into(),
-                ))
+                show_systemctl_status(runtime_dir.as_deref())?;
             }
+            Ok(())
         }
         GatewayAction::Restart => {
             let runtime_dir = ensure_user_session()?;
@@ -1120,5 +1222,59 @@ mod tests {
                 "failure log lines must be positive"
             );
         }
+    }
+
+    #[test]
+    fn gateway_status_json_flag_parses() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: GatewayAction,
+        }
+
+        let cli: Cli = Parser::try_parse_from(["egopulse", "status", "--json"]).expect("parse");
+        match cli.action {
+            GatewayAction::Status { json } => assert!(json),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_status_without_json_parses() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: GatewayAction,
+        }
+
+        let cli: Cli = Parser::try_parse_from(["egopulse", "status"]).expect("parse");
+        match cli.action {
+            GatewayAction::Status { json } => assert!(!json),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn print_gateway_status_text_formats_channels() {
+        let json = serde_json::json!({
+            "version": "0.1.0",
+            "pid": 12345,
+            "uptime": "1h 30m",
+            "provider": { "provider": "openrouter", "model": "gpt-5" },
+            "channels": {
+                "web": { "state": "running" },
+                "discord": { "state": "running" },
+                "telegram": { "state": "failed" }
+            }
+        })
+        .to_string();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["channels"]["web"]["state"], "running");
+        assert_eq!(parsed["channels"]["telegram"]["state"], "failed");
     }
 }
