@@ -57,6 +57,9 @@ pub(crate) fn inc_turn_errors_total(kind: &str, agent: &str) {
 
 /// `direction` should be `"input"` or `"output"`.
 pub(crate) fn inc_llm_tokens_total(direction: &str, provider: &str, amount: i64) {
+    if amount <= 0 {
+        return;
+    }
     counter!("egopulse_llm_tokens_total", "direction" => direction.to_owned(), "provider" => provider.to_owned())
         .increment(amount as u64);
 }
