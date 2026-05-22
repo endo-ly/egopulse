@@ -342,6 +342,7 @@ schedule:
 | 項目              | 仕様                          |
 | --------------- | --------------------------- |
 | `id`            | agent 内で一意                  |
+| `enabled`       | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
 | `schedule.kind` | `daily` / `weekly` |
 | `daily.at`      | `HH:MM`                     |
 | `weekly.day`    | `mon`〜`sun`                 |

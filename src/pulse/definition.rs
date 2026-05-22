@@ -15,6 +15,7 @@ pub(crate) struct PulseDefinition {
 #[allow(dead_code)]
 pub(crate) struct TemporalIntention {
     pub id: String,
+    pub enabled: bool,
     pub schedule: TemporalSchedule,
     pub attention: String,
 }
@@ -54,8 +55,14 @@ struct PulseFrontMatter {
 #[derive(Deserialize)]
 struct IntentionRaw {
     id: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
     schedule: ScheduleRaw,
     attention: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -129,6 +136,7 @@ fn parse_pulse_definition_inner(
         let schedule = validate_and_build_schedule(agent_id, &raw)?;
         intentions.push(TemporalIntention {
             id: raw.id,
+            enabled: raw.enabled,
             schedule,
             attention: raw.attention,
         });
@@ -664,6 +672,7 @@ body
     fn make_daily(at: &str) -> TemporalIntention {
         TemporalIntention {
             id: "test_intention".to_string(),
+            enabled: true,
             schedule: TemporalSchedule::Daily { at: at.to_string() },
             attention: String::new(),
         }
@@ -672,6 +681,7 @@ body
     fn make_weekly(day: &str, at: &str) -> TemporalIntention {
         TemporalIntention {
             id: "test_intention".to_string(),
+            enabled: true,
             schedule: TemporalSchedule::Weekly {
                 day: day.to_string(),
                 at: at.to_string(),
@@ -713,6 +723,7 @@ body
     fn due_key_daily_uses_local_date() {
         let intention = TemporalIntention {
             id: "morning_review".to_string(),
+            enabled: true,
             schedule: TemporalSchedule::Daily {
                 at: "09:00".to_string(),
             },
@@ -727,6 +738,7 @@ body
     fn due_key_weekly_uses_iso_week() {
         let intention = TemporalIntention {
             id: "weekly_reflection".to_string(),
+            enabled: true,
             schedule: TemporalSchedule::Weekly {
                 day: "sun".to_string(),
                 at: "21:00".to_string(),
@@ -767,5 +779,99 @@ body
             "America/New_York",
         );
         assert!(!result.due);
+    }
+
+    // --- enabled field tests ---
+
+    #[test]
+    fn parse_enabled_defaults_to_true_when_omitted() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        assert!(result.intentions[0].enabled);
+    }
+
+    #[test]
+    fn parse_explicitly_disabled_intention() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    enabled: false
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        assert!(!result.intentions[0].enabled);
+    }
+
+    #[test]
+    fn parse_mixed_enabled_and_disabled_intentions() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: active_one
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: active
+  - id: paused_one
+    enabled: false
+    schedule:
+      kind: weekly
+      day: sun
+      at: \"21:00\"
+    attention: paused
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 2);
+        assert!(result.intentions[0].enabled);
+        assert!(!result.intentions[1].enabled);
+        assert_eq!(result.intentions[0].id, "active_one");
+        assert_eq!(result.intentions[1].id, "paused_one");
+    }
+
+    #[test]
+    fn parse_explicitly_enabled_intention() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    enabled: true
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        assert!(result.intentions[0].enabled);
     }
 }

@@ -365,6 +365,7 @@ mod tests {
     fn format_synthetic_content_daily() {
         let intention = TemporalIntention {
             id: "morning_review".to_string(),
+            enabled: true,
             schedule: crate::pulse::definition::TemporalSchedule::Daily {
                 at: "08:00".to_string(),
             },
@@ -381,6 +382,7 @@ mod tests {
     fn format_synthetic_content_weekly() {
         let intention = TemporalIntention {
             id: "weekly_reflection".to_string(),
+            enabled: true,
             schedule: crate::pulse::definition::TemporalSchedule::Weekly {
                 day: "sun".to_string(),
                 at: "21:00".to_string(),
@@ -397,6 +399,7 @@ mod tests {
     fn format_synthetic_content_trims_attention_whitespace() {
         let intention = TemporalIntention {
             id: "test".to_string(),
+            enabled: true,
             schedule: crate::pulse::definition::TemporalSchedule::Daily {
                 at: "09:00".to_string(),
             },
@@ -441,6 +444,7 @@ mod tests {
     fn test_intention(id: &str) -> TemporalIntention {
         TemporalIntention {
             id: id.to_string(),
+            enabled: true,
             schedule: crate::pulse::definition::TemporalSchedule::Daily {
                 at: "09:00".to_string(),
             },

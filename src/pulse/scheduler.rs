@@ -75,13 +75,18 @@ async fn process_intention(
 ) {
     let agent_id_str = agent_id.as_str();
 
-    // 1. Check due
+    // 1. Skip disabled intentions
+    if !intention.enabled {
+        return;
+    }
+
+    // 2. Check due
     let due_check = super::definition::check_due(agent_id_str, intention, now, timezone);
     if !due_check.due {
         return;
     }
 
-    // 2. Evaluate gate
+    // 3. Evaluate gate
     let is_active = state.active_turns.is_active(agent_id_str);
     let decision = match super::capsule::evaluate_gate(
         &state.db,
@@ -111,7 +116,7 @@ async fn process_intention(
         super::capsule::GateDecision::Allow => {}
     }
 
-    // 3. Create pulse_run
+    // 4. Create pulse_run
     let pulse_run_id = uuid::Uuid::new_v4().to_string();
     if let Err(e) = create_pulse_run(
         &state.db,
@@ -131,7 +136,7 @@ async fn process_intention(
         return;
     }
 
-    // 4. Resolve home surface
+    // 5. Resolve home surface
     let available_channels = state.channels.names();
     let home_surface =
         match super::capsule::resolve_home_surface(&state.db, agent_id_str, &available_channels)
@@ -170,7 +175,7 @@ async fn process_intention(
             }
         };
 
-    // 5. Build capsule
+    // 6. Build capsule
     // Prospective memory is already injected via build_system_prompt() in the
     // system prompt; omitting it here avoids duplication.
     let recent_messages = load_recent_messages(&state.db, home_surface.chat_id).await;
@@ -185,7 +190,7 @@ async fn process_intention(
         &now_rfc3339,
     );
 
-    // 6. Run activation
+    // 7. Run activation
     let activation_result =
         match super::runner::run_activation(state, agent_id_str, &capsule, &home_surface).await {
             Ok(result) => result,
@@ -207,7 +212,7 @@ async fn process_intention(
             }
         };
 
-    // 7. Handle output
+    // 8. Handle output
     if let Err(e) = super::output::handle_output(
         state,
         agent_id_str,
@@ -656,5 +661,103 @@ body
                 }),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn scheduler_skips_disabled_intention() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disabled_pulse_md = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    enabled: false
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: Check today.
+---
+
+# Notes
+Some notes.
+";
+        let state = build_pulse_state(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", disabled_pulse_md)],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            0,
+            "disabled intention should not create any pulse_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_only_enabled_intentions_when_mixed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mixed_pulse_md = "\
+---
+version: 1
+intentions:
+  - id: active_check
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: Active one.
+  - id: paused_check
+    enabled: false
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: Paused one.
+---
+
+# Notes
+";
+        let state = build_pulse_state(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", mixed_pulse_md)],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "only enabled intention should create a pulse_run"
+        );
+
+        // Verify it was the enabled one
+        let conn = state.db.conn.lock().expect("lock");
+        let intention_id: String = conn
+            .query_row(
+                "SELECT intention_id FROM pulse_runs WHERE agent_id = ?1",
+                rusqlite::params!["default"],
+                |row| row.get(0),
+            )
+            .expect("intention_id");
+        drop(conn);
+        assert_eq!(intention_id, "active_check");
     }
 }

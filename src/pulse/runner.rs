@@ -268,6 +268,7 @@ mod tests {
     fn test_intention() -> TemporalIntention {
         TemporalIntention {
             id: "morning_review".to_string(),
+            enabled: true,
             schedule: TemporalSchedule::Daily {
                 at: "09:00".to_string(),
             },
