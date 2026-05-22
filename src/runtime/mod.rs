@@ -4,6 +4,7 @@
 
 pub mod gateway;
 pub mod logging;
+pub(crate) mod metrics;
 pub(crate) mod runtime_status;
 pub mod status;
 pub(crate) mod turn_scheduler;
@@ -168,6 +169,8 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
+    crate::runtime::metrics::init_metrics();
+
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
 
     let mut channels = ChannelRegistry::new();
@@ -349,6 +352,10 @@ pub(crate) fn execute_scheduled_turn(
     turn: crate::agent_loop::ScheduledTurn,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        let mut turn = turn;
+        turn.context.trace_id = trace_id;
+
         let session_key = turn.session_key();
         let origin_id = if turn.origin_id.is_empty() {
             uuid::Uuid::new_v4().to_string()

@@ -37,6 +37,12 @@ impl ActiveTurnTracker {
         let turns = self.turns.lock().expect("active_turns lock");
         turns.get(agent_id).is_some_and(|&c| c > 0)
     }
+
+    /// Returns the total number of currently in-flight turns across all agents.
+    pub(crate) fn total_active(&self) -> usize {
+        let turns = self.turns.lock().expect("active_turns lock");
+        turns.values().map(|&c| c as usize).sum()
+    }
 }
 
 /// Maximum chain depth for `agent_send` cascading (A→B→C…).
