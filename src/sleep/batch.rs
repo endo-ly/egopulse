@@ -715,7 +715,29 @@ async fn execute_batch(
         // 10. Save AFTER snapshots from parsed output, preserving empty files too.
         save_output_snapshots(&db, &run_id, agent_id, &output).await?;
 
-        // 11. Update run success with token usage
+        // 11. Log LLM usage
+        if input_tokens > 0 || output_tokens > 0 {
+            let provider_name = provider.provider_name().to_string();
+            let model_name = provider.model_name().to_string();
+            let db_for_usage = Arc::clone(&db);
+            tokio::spawn(async move {
+                let _ = crate::storage::call_blocking(db_for_usage, move |db| {
+                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                        chat_id: 0,
+                        caller_channel: "sleep_batch",
+                        provider: &provider_name,
+                        model: &model_name,
+                        input_tokens,
+                        output_tokens,
+                        request_kind: "sleep_batch",
+                    })
+                })
+                .await
+                .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
+            });
+        }
+
+        // 12. Update run success with token usage
         let run_id_owned = run_id.clone();
         let source_chats = source_chats_json.to_string();
         call_blocking(Arc::clone(&db), move |db| {
@@ -1078,6 +1100,8 @@ mod tests {
 
     struct MockLlmProvider {
         response: String,
+        input_tokens: i64,
+        output_tokens: i64,
     }
 
     impl MockLlmProvider {
@@ -1089,12 +1113,29 @@ mod tests {
                     "prospective": ""
                 })
                 .to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
             }
         }
 
         fn with_response(response: serde_json::Value) -> Self {
             Self {
                 response: response.to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+
+        fn with_usage(input: i64, output: i64) -> Self {
+            Self {
+                response: serde_json::json!({
+                    "episodic": "",
+                    "semantic": "",
+                    "prospective": ""
+                })
+                .to_string(),
+                input_tokens: input,
+                output_tokens: output,
             }
         }
     }
@@ -1118,8 +1159,8 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: vec![],
                 usage: Some(LlmUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
                 }),
             })
         }
@@ -2453,5 +2494,39 @@ mod tests {
         let input = "just plain text";
         let result = normalize_llm_response(input);
         assert_eq!(result, "just plain text");
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_logs_llm_usage_with_sleep_batch_request_kind() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let llm = Arc::new(MockLlmProvider::with_usage(100, 200));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        for _ in 0..20 {
+            let result: Option<(String, i64, i64)> = {
+                let conn = state.db.conn.lock().expect("lock");
+                conn.query_row(
+                    "SELECT request_kind, input_tokens, output_tokens FROM llm_usage_logs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok()
+            };
+
+            if let Some((kind, input, output)) = result {
+                assert_eq!(kind, "sleep_batch");
+                assert_eq!(input, 100);
+                assert_eq!(output, 200);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("sleep batch llm usage log was not written within the polling timeout");
     }
 }

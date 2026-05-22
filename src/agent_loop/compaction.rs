@@ -363,7 +363,7 @@ fn log_summarizer_usage(
                 model: &model,
                 input_tokens,
                 output_tokens,
-                request_kind: "summarize",
+                request_kind: "compaction",
             })
         })
         .await
@@ -1253,7 +1253,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn compaction_logs_llm_usage_as_summarize() {
+    async fn compaction_logs_llm_usage_as_compaction() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![
