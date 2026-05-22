@@ -318,18 +318,12 @@ curl -s http://127.0.0.1:10961/health | jq .ok
 
 `ok` が `true` の場合、DB 接続が正常で少なくとも 1 チャネルが稼働中。systemd の `ExecStartPre` や外部監視（Uptime Kuma 等）での利用を想定。
 
-### 5.3 Prometheus スクレイピング
+### 5.3 テレメトリー
 
-`/metrics` エンドポイントから `egopulse_` プレフィックスのメトリクスを取得できる。信頼ネットワーク前提で認証は不要。
+`/telemetry` エンドポイントから JSON 形式でメトリクス・ターン履歴・エラー詳細を取得できる。AI エージェントの運用監視向け。信頼ネットワーク前提で認証は不要。
 
-Prometheus の `prometheus.yml` に以下を追加:
-
-```yaml
-scrape_configs:
-  - job_name: "egopulse"
-    static_configs:
-      - targets: ["127.0.0.1:10961"]
-    metrics_path: "/metrics"
+```bash
+curl -s http://127.0.0.1:10961/telemetry | jq .
 ```
 
 ## 6. リリースプロセス

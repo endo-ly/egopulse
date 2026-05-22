@@ -78,40 +78,52 @@ GET /health
 
 ---
 
-### 2.2 メトリクス
+### 2.2 テレメトリー
 
 **認証不要**
 
-Prometheus 形式のテキスト出力。`egopulse_` プレフィックス、低カーディナリティラベル。
+JSON 形式でメトリクス・直近ターン履歴・エラー詳細を返す。AI エージェントの運用監視向け。
 
 ```text
-GET /metrics
+GET /telemetry
 ```
 
 #### レスポンス (200)
 
-```text
-# HELP egopulse_turns_total Total number of agent turns executed
-# TYPE egopulse_turns_total counter
-egopulse_turns_total{agent="alice",channel="discord"} 42
-
-# HELP egopulse_turn_errors_total Total number of turn errors
-# TYPE egopulse_turn_errors_total counter
-egopulse_turn_errors_total{kind="llm",agent="alice"} 3
-
-# HELP egopulse_llm_tokens_total Total LLM tokens used
-# TYPE egopulse_llm_tokens_total counter
-egopulse_llm_tokens_total{direction="input",provider="openrouter"} 15000
-egopulse_llm_tokens_total{direction="output",provider="openrouter"} 3200
-
-# HELP egopulse_tool_calls_total Total tool calls executed
-# TYPE egopulse_tool_calls_total counter
-egopulse_tool_calls_total{tool="shell",status="ok"} 28
-
-# HELP egopulse_active_turns Number of currently active turns
-# TYPE egopulse_active_turns gauge
-egopulse_active_turns 2
+```json
+{
+  "metrics": {
+    "egopulse_turns_total": [
+      { "labels": { "agent": "alice", "channel": "discord" }, "value": 42 }
+    ],
+    "egopulse_turn_errors_total": [
+      { "labels": { "kind": "llm", "agent": "alice" }, "value": 3 }
+    ],
+    "egopulse_llm_tokens_total": [
+      { "labels": { "direction": "input", "provider": "openrouter" }, "value": 15000 },
+      { "labels": { "direction": "output", "provider": "openrouter" }, "value": 3200 }
+    ],
+    "egopulse_tool_calls_total": [
+      { "labels": { "tool": "shell", "status": "ok" }, "value": 28 }
+    ],
+    "egopulse_active_turns": [
+      { "labels": {}, "value": 2 }
+    ]
+  },
+  "recent_turns": [
+    { "trace_id": "abc-123", "agent_id": "alice", "channel": "discord", "started_at": "2025-05-22T10:30:00Z", "duration_secs": 5.2, "ok": true }
+  ],
+  "recent_errors": [
+    { "at": "2025-05-22T10:31:00Z", "trace_id": "def-456", "error_kind": "turn_failure", "agent_id": "alice", "channel": "discord", "summary": "rate limited" }
+  ]
+}
 ```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `metrics` | `object` | メトリクス名 → `[{labels, value}]` のマップ |
+| `recent_turns` | `array` | 直近 100 件のターン履歴（新しい順） |
+| `recent_errors` | `array` | 直近 100 件のエラー詳細（`trace_id` 付き） |
 
 ---
 

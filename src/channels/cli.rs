@@ -56,8 +56,34 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         }
 
         write_line(&mut stdout, format_args!("you: {trimmed}"))?;
-        let response = process_turn(state, &context, trimmed).await?;
-        write_line(&mut stdout, format_args!("assistant: {response}"))?;
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let started = std::time::Instant::now();
+        match process_turn(state, &context, trimmed).await {
+            Ok(response) => {
+                let duration = started.elapsed().as_secs_f64();
+                state.runtime_status.push_turn(
+                    &context.trace_id,
+                    &context.agent_id,
+                    &context.channel,
+                    &started_at,
+                    duration,
+                    true,
+                );
+                write_line(&mut stdout, format_args!("assistant: {response}"))?;
+            }
+            Err(error) => {
+                let duration = started.elapsed().as_secs_f64();
+                state.runtime_status.push_turn(
+                    &context.trace_id,
+                    &context.agent_id,
+                    &context.channel,
+                    &started_at,
+                    duration,
+                    false,
+                );
+                return Err(error);
+            }
+        }
         flush(&mut stdout)?;
     }
 

@@ -1,9 +1,9 @@
-//! Web-layer health and Prometheus metrics endpoints.
+//! Web-layer health and telemetry endpoints.
+
+use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderValue, header};
-use axum::response::Response;
 
 use crate::runtime::metrics;
 use crate::runtime::runtime_status::ChannelState;
@@ -36,15 +36,115 @@ pub(super) async fn health(state: State<WebState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// Prometheus text exposition endpoint.
-pub(super) async fn metrics_handler() -> Response {
-    let body = metrics::metrics_output();
-    let mut response = Response::new(body.into());
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-    );
-    response
+/// JSON telemetry endpoint combining Prometheus counters with recent turns and errors.
+pub(super) async fn telemetry_handler(state: State<WebState>) -> Json<serde_json::Value> {
+    let prom_text = metrics::metrics_output();
+    let parsed_metrics = parse_prometheus_to_json(&prom_text);
+
+    let recent_turns = state.app_state.runtime_status.recent_turns();
+    let recent_errors = state.app_state.runtime_status.recent_errors();
+
+    Json(serde_json::json!({
+        "metrics": parsed_metrics,
+        "recent_turns": recent_turns,
+        "recent_errors": recent_errors,
+    }))
+}
+
+fn parse_prometheus_to_json(prom_text: &str) -> BTreeMap<String, Vec<serde_json::Value>> {
+    let mut result: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+
+    for line in prom_text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        let (metric_name, labels, value) = match parse_prometheus_line(line) {
+            Some(parsed) => parsed,
+            None => continue,
+        };
+
+        result
+            .entry(metric_name.to_string())
+            .or_default()
+            .push(serde_json::json!({
+                "labels": labels,
+                "value": value,
+            }));
+    }
+
+    result
+}
+
+fn parse_prometheus_line(
+    line: &str,
+) -> Option<(&str, serde_json::Map<String, serde_json::Value>, f64)> {
+    let space_pos = line.rfind(' ')?;
+    let value_str = &line[space_pos + 1..];
+    let value: f64 = value_str.parse().ok()?;
+
+    let (metric_name, labels) = if let Some(bp) = line.find('{') {
+        let name = &line[..bp];
+        let labels_end = line.rfind('}')?;
+        let labels_str = &line[bp + 1..labels_end];
+        (name, parse_labels(labels_str)?)
+    } else {
+        let name = &line[..space_pos];
+        (name, serde_json::Map::new())
+    };
+
+    Some((metric_name, labels, value))
+}
+
+fn parse_labels(input: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let input = input.trim();
+    let input = input.strip_suffix('}').unwrap_or(input);
+    let mut map = serde_json::Map::new();
+
+    for pair in split_label_pairs(input) {
+        let (key, value) = split_key_value(&pair)?;
+        map.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
+    Some(map)
+}
+
+fn split_label_pairs(input: &str) -> Vec<String> {
+    let mut pairs = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in input.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+        } else if ch == ',' && !in_quotes {
+            if !current.trim().is_empty() {
+                pairs.push(current.trim().to_string());
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.trim().is_empty() {
+        pairs.push(current.trim().to_string());
+    }
+    pairs
+}
+
+fn split_key_value(pair: &str) -> Option<(&str, &str)> {
+    let eq_pos = pair.find('=')?;
+    let key = pair[..eq_pos].trim();
+    let raw_value = pair[eq_pos + 1..].trim();
+    let value = raw_value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(raw_value);
+    Some((key, value))
 }
 
 fn uptime_from_snapshot(started_at: &str) -> u64 {
@@ -207,56 +307,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_returns_prometheus_text() {
+    async fn telemetry_returns_json_with_metrics_and_recent_data() {
         crate::runtime::metrics::init_metrics();
-        crate::runtime::metrics::inc_turns_total("health-check", "test");
+        crate::runtime::metrics::inc_turns_total("telemetry-check", "test");
 
-        let response = metrics_handler().await;
-        let ct = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .expect("content-type header")
-            .to_str()
-            .expect("utf8");
+        let rs = Arc::new(RuntimeStatus::new());
+        rs.update_channel("web", ChannelState::Running);
+        rs.push_turn("t1", "agent", "web", "2025-01-01T00:00:00Z", 1.5, true);
+        rs.push_error("e1", "timeout", "agent", "web", "timed out");
+
+        let ws = test_web_state_from_status(rs);
+        let state = State(ws);
+
+        let Json(value) = telemetry_handler(state).await;
+
+        assert!(value["metrics"].is_object(), "metrics should be an object");
         assert!(
-            ct.contains("text/plain"),
-            "content-type should be text/plain: {ct}"
+            value["metrics"]
+                .as_object()
+                .expect("metrics map")
+                .contains_key("egopulse_turns_total"),
+            "metrics should contain egopulse_turns_total"
         );
 
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
-        assert!(
-            text.contains("# HELP"),
-            "should contain Prometheus HELP lines: {text}"
-        );
-        assert!(
-            text.contains("# TYPE"),
-            "should contain Prometheus TYPE lines: {text}"
-        );
+        let turns = value["recent_turns"]
+            .as_array()
+            .expect("recent_turns array");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["trace_id"], "t1");
+
+        let errors = value["recent_errors"]
+            .as_array()
+            .expect("recent_errors array");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["trace_id"], "e1");
     }
 
     #[tokio::test]
-    async fn metrics_contains_egopulse_prefix() {
+    async fn telemetry_metrics_have_egopulse_prefix() {
         crate::runtime::metrics::init_metrics();
         crate::runtime::metrics::inc_turns_total("test", "web");
         crate::runtime::metrics::inc_tool_calls_total("shell", "ok");
 
-        let response = metrics_handler().await;
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        let ws = test_web_state();
+        let state = State(ws);
 
-        for line in text.lines() {
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-            let metric_name = line.split('{').next().unwrap_or(line);
+        let Json(value) = telemetry_handler(state).await;
+
+        let metrics = value["metrics"].as_object().expect("metrics map");
+        for key in metrics.keys() {
             assert!(
-                metric_name.starts_with("egopulse_"),
-                "metric must have egopulse_ prefix: {line}"
+                key.starts_with("egopulse_"),
+                "metric key must have egopulse_ prefix: {key}"
             );
         }
     }

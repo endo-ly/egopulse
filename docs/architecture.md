@@ -320,7 +320,7 @@ pub(crate) struct SurfaceContext {
 |---|---|---|
 | **構造化ログ** | `tracing` スパン + `trace_id` | リクエスト単位のログ追跡、`journalctl` / Loki での検索 |
 | **Live Health API** | `/health` | ヘルスプローブ、オペレーション確認 |
-| **Prometheus メトリクス** | `/metrics` | 時系列モニタリング、アラート、ダッシュボード |
+| **テレメトリー API** | `/telemetry` | JSON メトリクス・ターン履歴・エラー詳細（AI エージェント向け） |
 
 ### 8.2 RuntimeStatus
 
@@ -337,11 +337,15 @@ pub(crate) struct SurfaceContext {
 
 ### 8.4 エラーリングバッファ
 
-直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/health` エンドポイントの `recent_errors_count` フィールドから参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
+直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/telemetry` エンドポイントの `recent_errors` フィールドから `trace_id` 付きで参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
 
-### 8.5 メトリクス
+### 8.5 ターン履歴リングバッファ
 
-`/metrics` エンドポイントは `egopulse_` プレフィックスの Prometheus テキスト形式で出力する。ラベルは低カーディナリティに抑え、メトリクス爆発を防止する。
+直近のターン実行結果をインメモリのリングバッファ（容量 100 件）に保持する。`/telemetry` エンドポイントの `recent_turns` フィールドから参照可能。各レコードには `trace_id`、`agent_id`、`channel`、`started_at`、`duration_secs`、`ok` が含まれる。
+
+### 8.6 メトリクス
+
+`/telemetry` エンドポイントは JSON 形式でメトリクスを出力する。`egopulse_` プレフィックスのカウンター・ゲージをラベル付きで返す。
 
 主要メトリクス:
 

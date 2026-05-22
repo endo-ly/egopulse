@@ -430,8 +430,22 @@ pub(crate) fn execute_scheduled_turn(
             None => None,
         };
 
-        match crate::agent_loop::process_turn(state, &turn.context, &turn.input).await {
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let started = std::time::Instant::now();
+
+        let turn_result = crate::agent_loop::process_turn(state, &turn.context, &turn.input).await;
+        let duration = started.elapsed().as_secs_f64();
+
+        match turn_result {
             Ok(response) => {
+                state.runtime_status.push_turn(
+                    &turn.context.trace_id,
+                    &turn.context.agent_id,
+                    &turn.context.channel,
+                    &started_at,
+                    duration,
+                    true,
+                );
                 if let Some(adapter) = adapter {
                     if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                         tracing::warn!(
@@ -472,6 +486,14 @@ pub(crate) fn execute_scheduled_turn(
                 }
             }
             Err(error) => {
+                state.runtime_status.push_turn(
+                    &turn.context.trace_id,
+                    &turn.context.agent_id,
+                    &turn.context.channel,
+                    &started_at,
+                    duration,
+                    false,
+                );
                 tracing::warn!(
                     agent_id = %turn.context.agent_id,
                     error = %error,

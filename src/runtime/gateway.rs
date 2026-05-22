@@ -392,23 +392,31 @@ fn restart_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
-async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<String> {
+async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<(String, Option<String>)> {
     let config = resolve_config_for_service(cli_config).ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
     let port = loaded.web_port();
-    let url = format!("http://127.0.0.1:{port}/health");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
 
-    let resp = client.get(&url).send().await.ok()?;
-    if resp.status().is_success() {
-        Some(resp.text().await.ok()?)
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    let health_resp = client.get(&health_url).send().await.ok()?;
+    let health_text = if health_resp.status().is_success() {
+        health_resp.text().await.ok()?
     } else {
-        None
-    }
+        return None;
+    };
+
+    let telemetry_url = format!("http://127.0.0.1:{port}/telemetry");
+    let telemetry_text = match client.get(&telemetry_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+        _ => None,
+    };
+
+    Some((health_text, telemetry_text))
 }
 
 fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
@@ -435,32 +443,35 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
-fn format_gateway_status(status_json: &str) -> String {
-    let parsed: serde_json::Value = match serde_json::from_str(status_json) {
+fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> String {
+    let health: serde_json::Value = match serde_json::from_str(health_json) {
         Ok(v) => v,
-        Err(_) => return status_json.to_owned(),
+        Err(_) => return health_json.to_owned(),
     };
+
+    let telemetry: Option<serde_json::Value> =
+        telemetry_json.and_then(|t| serde_json::from_str(t).ok());
 
     let mut out = String::new();
 
-    let ok = parsed["ok"].as_bool().unwrap_or(false);
+    let ok = health["ok"].as_bool().unwrap_or(false);
     let status_label = if ok { "healthy" } else { "unhealthy" };
     out.push_str(&format!("Service: active (systemd)  [{status_label}]\n\n"));
 
-    if let Some(version) = parsed["version"].as_str() {
-        let pid = parsed["pid"].as_u64().unwrap_or(0);
-        let uptime_secs = parsed["uptime_secs"].as_u64().unwrap_or(0);
+    if let Some(version) = health["version"].as_str() {
+        let pid = health["pid"].as_u64().unwrap_or(0);
+        let uptime_secs = health["uptime_secs"].as_u64().unwrap_or(0);
         let uptime = format_uptime(uptime_secs);
         out.push_str(&format!(
             "EgoPulse v{version}  PID {pid}  uptime {uptime}\n"
         ));
     }
 
-    if let Some(active_turns) = parsed.get("active_turns").and_then(|v| v.as_u64()) {
+    if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
         out.push_str(&format!("Active Turns: {active_turns}\n"));
     }
 
-    if let Some(channels) = parsed.get("channels") {
+    if let Some(channels) = health.get("channels") {
         out.push('\n');
         out.push_str("Channels\n");
         for name in ["web", "discord", "telegram"] {
@@ -472,7 +483,42 @@ fn format_gateway_status(status_json: &str) -> String {
         }
     }
 
-    if let Some(count) = parsed.get("recent_errors_count").and_then(|v| v.as_u64()) {
+    if let Some(ref tel) = telemetry {
+        if let Some(errors) = tel.get("recent_errors").and_then(|v| v.as_array()) {
+            if !errors.is_empty() {
+                out.push('\n');
+                out.push_str(&format!("Recent Errors (last 1h): {}\n", errors.len()));
+                for err in errors.iter().take(5) {
+                    let kind = err["error_kind"].as_str().unwrap_or("?");
+                    let trace = err["trace_id"].as_str().unwrap_or("?");
+                    let summary = err["summary"].as_str().unwrap_or("");
+                    out.push_str(&format!("  [{kind}] trace={trace} {summary}\n"));
+                }
+            }
+        }
+
+        if let Some(turns) = tel.get("recent_turns").and_then(|v| v.as_array()) {
+            if !turns.is_empty() {
+                out.push('\n');
+                let last_turns: Vec<&serde_json::Value> = turns.iter().rev().take(5).collect();
+                out.push_str(&format!(
+                    "Recent Turns (last {} shown):\n",
+                    last_turns.len()
+                ));
+                for turn in last_turns {
+                    let agent = turn["agent_id"].as_str().unwrap_or("?");
+                    let channel = turn["channel"].as_str().unwrap_or("?");
+                    let ok_marker = if turn["ok"].as_bool().unwrap_or(false) {
+                        "ok"
+                    } else {
+                        "FAIL"
+                    };
+                    let dur = turn["duration_secs"].as_f64().unwrap_or(0.0);
+                    out.push_str(&format!("  {agent}/{channel} [{ok_marker}] {dur:.1}s\n"));
+                }
+            }
+        }
+    } else if let Some(count) = health.get("recent_errors_count").and_then(|v| v.as_u64()) {
         if count > 0 {
             out.push('\n');
             out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
@@ -482,8 +528,23 @@ fn format_gateway_status(status_json: &str) -> String {
     out
 }
 
-fn print_gateway_status_text(status_json: &str) {
-    print!("{}", format_gateway_status(status_json));
+fn print_gateway_status_text(health_json: &str, telemetry_json: Option<&str>) {
+    print!("{}", format_gateway_status(health_json, telemetry_json));
+}
+
+fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
+    let mut health: serde_json::Value =
+        serde_json::from_str(health_json).unwrap_or(serde_json::Value::Null);
+
+    if let Some(tel_str) = telemetry_json {
+        if let Ok(tel) = serde_json::from_str::<serde_json::Value>(tel_str) {
+            if let Some(obj) = health.as_object_mut() {
+                obj.insert("telemetry".to_string(), tel);
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&health).unwrap_or_else(|_| health_json.to_owned())
 }
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
@@ -612,11 +673,13 @@ ACTIONS:
                 let live_status = fetch_live_status(cli_config).await;
 
                 match live_status {
-                    Some(status_json) => {
+                    Some((health_json, telemetry_json)) => {
                         if json {
-                            println!("{status_json}");
+                            let merged =
+                                merge_health_and_telemetry(&health_json, telemetry_json.as_deref());
+                            println!("{merged}");
                         } else {
-                            print_gateway_status_text(&status_json);
+                            print_gateway_status_text(&health_json, telemetry_json.as_deref());
                         }
                     }
                     None => show_systemctl_status(runtime_dir.as_deref())?,
@@ -1263,7 +1326,7 @@ mod tests {
 
     #[test]
     fn format_gateway_status_parses_ready_response() {
-        let json = serde_json::json!({
+        let health = serde_json::json!({
             "ok": true,
             "version": "0.1.0",
             "uptime_secs": 5400,
@@ -1279,7 +1342,7 @@ mod tests {
         })
         .to_string();
 
-        let output = format_gateway_status(&json);
+        let output = format_gateway_status(&health, None);
 
         assert!(
             output.contains("1h 30m 0s"),
@@ -1320,7 +1383,7 @@ mod tests {
 
     #[test]
     fn format_gateway_status_without_errors() {
-        let json = serde_json::json!({
+        let health = serde_json::json!({
             "ok": true,
             "version": "0.1.0",
             "uptime_secs": 3600,
@@ -1331,7 +1394,7 @@ mod tests {
         })
         .to_string();
 
-        let output = format_gateway_status(&json);
+        let output = format_gateway_status(&health, None);
         assert!(
             !output.contains("Recent Errors"),
             "should not show errors section when count is 0 or absent, got: {output}"
@@ -1344,7 +1407,137 @@ mod tests {
 
     #[test]
     fn format_gateway_status_invalid_json_passthrough() {
-        let output = format_gateway_status("not json at all");
+        let output = format_gateway_status("not json at all", None);
         assert_eq!(output, "not json at all");
+    }
+
+    #[test]
+    fn format_gateway_status_with_telemetry_shows_errors_and_turns() {
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1,
+            "channels": {
+                "web": { "state": "running" }
+            },
+            "active_turns": 1,
+            "recent_errors_count": 2
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": {},
+            "recent_errors": [
+                {
+                    "at": "2025-01-01T00:00:00Z",
+                    "trace_id": "abc-123",
+                    "error_kind": "turn_failure",
+                    "agent_id": "alice",
+                    "channel": "discord",
+                    "summary": "rate limited"
+                },
+                {
+                    "at": "2025-01-01T00:01:00Z",
+                    "trace_id": "def-456",
+                    "error_kind": "timeout",
+                    "agent_id": "bob",
+                    "channel": "web",
+                    "summary": "connection lost"
+                }
+            ],
+            "recent_turns": [
+                {
+                    "trace_id": "t1",
+                    "agent_id": "alice",
+                    "channel": "discord",
+                    "started_at": "2025-01-01T00:00:00Z",
+                    "duration_secs": 5.2,
+                    "ok": true
+                },
+                {
+                    "trace_id": "t2",
+                    "agent_id": "bob",
+                    "channel": "web",
+                    "started_at": "2025-01-01T00:01:00Z",
+                    "duration_secs": 0.3,
+                    "ok": false
+                }
+            ]
+        })
+        .to_string();
+
+        let output = format_gateway_status(&health, Some(&telemetry));
+
+        assert!(
+            output.contains("Recent Errors"),
+            "should show errors section: {output}"
+        );
+        assert!(
+            output.contains("trace=abc-123"),
+            "should show error trace_id: {output}"
+        );
+        assert!(
+            output.contains("turn_failure"),
+            "should show error kind: {output}"
+        );
+        assert!(
+            output.contains("rate limited"),
+            "should show error summary: {output}"
+        );
+        assert!(
+            output.contains("Recent Turns"),
+            "should show turns section: {output}"
+        );
+        assert!(
+            output.contains("alice/discord [ok]"),
+            "should show successful turn: {output}"
+        );
+        assert!(
+            output.contains("bob/web [FAIL]"),
+            "should show failed turn: {output}"
+        );
+    }
+
+    #[test]
+    fn merge_health_and_telemetry_combines_json() {
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0"
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": { "turns": 5 },
+            "recent_errors": [],
+            "recent_turns": []
+        })
+        .to_string();
+
+        let merged = merge_health_and_telemetry(&health, Some(&telemetry));
+        let parsed: serde_json::Value = serde_json::from_str(&merged).expect("valid json");
+
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["version"], "0.1.0");
+        assert!(parsed["telemetry"].is_object());
+        assert_eq!(parsed["telemetry"]["metrics"]["turns"], 5);
+    }
+
+    #[test]
+    fn merge_health_and_telemetry_without_telemetry() {
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0"
+        })
+        .to_string();
+
+        let merged = merge_health_and_telemetry(&health, None);
+        let parsed: serde_json::Value = serde_json::from_str(&merged).expect("valid json");
+
+        assert_eq!(parsed["ok"], true);
+        assert!(
+            parsed.get("telemetry").is_none(),
+            "should not have telemetry key when no telemetry provided"
+        );
     }
 }

@@ -14,6 +14,8 @@ use serde::Serialize;
 
 /// Default capacity for the recent-errors ring buffer.
 const DEFAULT_ERROR_CAPACITY: usize = 100;
+/// Default capacity for the recent-turns ring buffer.
+const DEFAULT_TURN_CAPACITY: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Public (crate) types
@@ -38,6 +40,7 @@ pub(crate) struct StatusSnapshot {
     pub db_healthy: bool,
     pub channels: HashMap<String, ChannelHealth>,
     pub recent_errors: Vec<AuditError>,
+    pub recent_turns: Vec<TurnRecord>,
 }
 
 /// Operational state of a single channel (web / discord / telegram / …).
@@ -81,6 +84,17 @@ pub(crate) struct AuditError {
     pub summary: String,
 }
 
+/// A single turn record in the recent-turns ring buffer.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TurnRecord {
+    pub trace_id: String,
+    pub agent_id: String,
+    pub channel: String,
+    pub started_at: String,
+    pub duration_secs: f64,
+    pub ok: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Internal mutable state
 // ---------------------------------------------------------------------------
@@ -94,6 +108,8 @@ struct RuntimeStatusInner {
     channels: HashMap<String, ChannelHealth>,
     recent_errors: VecDeque<AuditError>,
     error_capacity: usize,
+    recent_turns: VecDeque<TurnRecord>,
+    turn_capacity: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +133,8 @@ impl RuntimeStatus {
                 channels: HashMap::new(),
                 recent_errors: VecDeque::new(),
                 error_capacity: DEFAULT_ERROR_CAPACITY,
+                recent_turns: VecDeque::new(),
+                turn_capacity: DEFAULT_TURN_CAPACITY,
             }),
         }
     }
@@ -219,6 +237,7 @@ impl RuntimeStatus {
             db_healthy: guard.db_healthy,
             channels: guard.channels.clone(),
             recent_errors: guard.recent_errors.iter().cloned().collect(),
+            recent_turns: guard.recent_turns.iter().cloned().collect(),
         }
     }
 
@@ -227,6 +246,40 @@ impl RuntimeStatus {
     pub(crate) fn recent_errors(&self) -> Vec<AuditError> {
         let guard = self.inner.read().expect("runtime_status lock");
         guard.recent_errors.iter().cloned().collect()
+    }
+
+    /// Appends a turn record to the ring buffer.
+    ///
+    /// If the buffer is at capacity the oldest entry is discarded.
+    pub(crate) fn push_turn(
+        &self,
+        trace_id: &str,
+        agent_id: &str,
+        channel: &str,
+        started_at: &str,
+        duration_secs: f64,
+        ok: bool,
+    ) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        let entry = TurnRecord {
+            trace_id: trace_id.to_string(),
+            agent_id: agent_id.to_string(),
+            channel: channel.to_string(),
+            started_at: started_at.to_string(),
+            duration_secs,
+            ok,
+        };
+        if guard.recent_turns.len() >= guard.turn_capacity {
+            guard.recent_turns.pop_front();
+        }
+        guard.recent_turns.push_back(entry);
+    }
+
+    /// Returns a copy of all recent turns in chronological order (oldest
+    /// first).
+    pub(crate) fn recent_turns(&self) -> Vec<TurnRecord> {
+        let guard = self.inner.read().expect("runtime_status lock");
+        guard.recent_turns.iter().cloned().collect()
     }
 
     /// Returns the health record for the named channel, or `None` if the
@@ -270,6 +323,10 @@ mod tests {
         assert!(
             snapshot.recent_errors.is_empty(),
             "recent_errors should start empty"
+        );
+        assert!(
+            snapshot.recent_turns.is_empty(),
+            "recent_turns should start empty"
         );
     }
 
@@ -435,5 +492,82 @@ mod tests {
 
         // Assert
         assert!(result.is_none());
+    }
+
+    // 11. push_turn_appends_to_ring_buffer
+    #[test]
+    fn push_turn_appends_to_ring_buffer() {
+        // Arrange
+        let status = RuntimeStatus::new();
+
+        // Act
+        status.push_turn("t1", "alice", "discord", "2025-01-01T00:00:00Z", 5.2, true);
+
+        // Assert
+        let turns = status.recent_turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].trace_id, "t1");
+        assert_eq!(turns[0].agent_id, "alice");
+        assert_eq!(turns[0].channel, "discord");
+        assert_eq!(turns[0].started_at, "2025-01-01T00:00:00Z");
+        assert!((turns[0].duration_secs - 5.2).abs() < f64::EPSILON);
+        assert!(turns[0].ok);
+    }
+
+    // 12. push_turn_respects_capacity
+    #[test]
+    fn push_turn_respects_capacity() {
+        // Arrange
+        let status = RuntimeStatus::new();
+        for i in 0..102 {
+            status.push_turn(
+                &format!("trace-{i}"),
+                "agent",
+                "web",
+                "2025-01-01T00:00:00Z",
+                1.0,
+                i % 2 == 0,
+            );
+        }
+
+        // Act
+        let turns = status.recent_turns();
+
+        // Assert
+        assert_eq!(turns.len(), 100, "should cap at 100 entries");
+        assert_eq!(turns[0].trace_id, "trace-2");
+        assert_eq!(turns[99].trace_id, "trace-101");
+    }
+
+    // 13. push_turn_records_failure
+    #[test]
+    fn push_turn_records_failure() {
+        // Arrange
+        let status = RuntimeStatus::new();
+
+        // Act
+        status.push_turn("tid-err", "bob", "cli", "2025-06-01T12:00:00Z", 0.5, false);
+
+        // Assert
+        let turns = status.recent_turns();
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].ok);
+    }
+
+    // 14. recent_turns_preserves_order
+    #[test]
+    fn recent_turns_preserves_order() {
+        // Arrange
+        let status = RuntimeStatus::new();
+
+        // Act
+        status.push_turn("first", "a", "web", "2025-01-01T00:00:00Z", 1.0, true);
+        status.push_turn("second", "b", "web", "2025-01-01T00:01:00Z", 2.0, true);
+
+        // Assert
+        let turns = status.recent_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].trace_id, "first");
+        assert_eq!(turns[1].trace_id, "second");
     }
 }
