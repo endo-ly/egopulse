@@ -4,9 +4,11 @@
 
 pub mod gateway;
 pub mod logging;
+pub(crate) mod runtime_status;
 pub mod status;
 pub(crate) mod turn_scheduler;
 
+pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
 
 use std::collections::HashMap;
