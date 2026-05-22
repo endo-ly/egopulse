@@ -324,7 +324,6 @@ pub(crate) async fn run_server(
         .route("/", get(index_html))
         .route("/ws", get(ws::ws_handler))
         .route("/health", get(health::health))
-        .route("/ready", get(health::readiness))
         .route("/metrics", get(health::metrics_handler))
         .merge(api_routes)
         .fallback(get(index_or_asset))

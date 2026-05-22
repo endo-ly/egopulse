@@ -7,12 +7,11 @@ WebUI が使用する REST API および WebSocket の仕様。
 1. [認証](#1-認証)
 2. [REST API](#2-rest-api)
     - [ヘルスチェック](#21-ヘルスチェック)
-    - [Readiness](#22-readiness)
-    - [メトリクス](#23-メトリクス)
-    - [設定](#24-設定)
-    - [セッション一覧](#25-セッション一覧)
-    - [メッセージ履歴](#26-メッセージ履歴)
-    - [ストリーミングチャット](#27-ストリーミングチャット)
+    - [メトリクス](#22-メトリクス)
+    - [設定](#23-設定)
+    - [セッション一覧](#24-セッション一覧)
+    - [メッセージ履歴](#25-メッセージ履歴)
+    - [ストリーミングチャット](#26-ストリーミングチャット)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -37,6 +36,8 @@ Authorization: Bearer <token>
 
 **認証不要**
 
+チャネル状態、DB 接続、MCP 接続、アクティブターン数、直近エラーを含むフルヘルス情報。
+
 ```text
 GET /health
 ```
@@ -47,68 +48,37 @@ GET /health
 {
   "ok": true,
   "version": "0.1.0",
-  "uptime_secs": 86400
-}
-```
-
-| フィールド | 型 | 説明 |
-|-----------|-----|------|
-| `ok` | `boolean` | 常に `true`（200 応答時） |
-| `version` | `string` | バイナリのバージョン |
-| `uptime_secs` | `number` | プロセス起動からの経過秒数 |
-
----
-
-### 2.2 Readiness
-
-**認証不要**
-
-サービスがリクエストを処理可能かを判定するエンドポイント。チャネル状態、DB 接続、MCP 接続、アクティブターン数、直近エラーを返す。
-
-```text
-GET /ready
-```
-
-#### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "version": "0.1.0",
   "uptime_secs": 86400,
-  "channels": [
-    { "name": "web", "status": "Running" },
-    { "name": "discord", "status": "Running" },
-    { "name": "telegram", "status": "Failed" }
-  ],
-  "mcp_servers": [
-    { "name": "context7", "status": "Connected", "tools": 2 },
-    { "name": "github", "status": "Failed", "error": "connection timed out" }
-  ],
-  "db": "healthy",
-  "active_turns": 3,
-  "recent_errors": []
+  "pid": 12345,
+  "db": { "ok": true },
+  "channels": {
+    "web": { "state": "running" },
+    "discord": { "state": "running" },
+    "telegram": { "state": "failed", "last_error": "bot token rejected" }
+  },
+  "mcp": {
+    "healthy": 1,
+    "failed": 0,
+    "servers": []
+  },
+  "active_turns": 2,
+  "recent_errors_count": 3
 }
 ```
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `ok` | `boolean` | DB 正常かつ少なくとも 1 チャネル Running のとき `true` |
-| `channels` | `array` | 各チャネルの状態（`Running` / `Failed`） |
-| `mcp_servers` | `array` | 各 MCP サーバーの接続状態 |
-| `db` | `string` | DB 接続状態（`healthy` / `failed`） |
+| `pid` | `number` | プロセス ID |
+| `channels` | `object` | 各チャネルの状態（`running` / `failed`） |
+| `mcp` | `object` | MCP サーバーの接続状態 |
+| `db` | `object` | DB 接続状態 |
 | `active_turns` | `number` | 現在実行中のエージェントターン数 |
-| `recent_errors` | `array` | 直近のエラーログ（最大 100 件、リングバッファ、再起動で消失） |
-
-#### `ok` の判定ロジック
-
-- DB が正常 **かつ** 少なくとも 1 つの設定済みチャネルが Running のとき `true`
-- チャネルの一部が Failed であっても `ok` には影響しない
-- MCP サーバーの接続失敗も `ok` には影響しない
+| `recent_errors_count` | `number` | 直近のエラー数（リングバッファ、最大 100 件、再起動で消失） |
 
 ---
 
-### 2.3 メトリクス
+### 2.2 メトリクス
 
 **認証不要**
 
@@ -121,28 +91,31 @@ GET /metrics
 #### レスポンス (200)
 
 ```text
-# HELP egopulse_uptime_seconds Process uptime in seconds
-# TYPE egopulse_uptime_seconds gauge
-egopulse_uptime_seconds 86400
+# HELP egopulse_turns_total Total number of agent turns executed
+# TYPE egopulse_turns_total counter
+egopulse_turns_total{agent="alice",channel="discord"} 42
 
-# HELP egopulse_active_turns Number of currently executing agent turns
+# HELP egopulse_turn_errors_total Total number of turn errors
+# TYPE egopulse_turn_errors_total counter
+egopulse_turn_errors_total{kind="llm",agent="alice"} 3
+
+# HELP egopulse_llm_tokens_total Total LLM tokens used
+# TYPE egopulse_llm_tokens_total counter
+egopulse_llm_tokens_total{direction="input",provider="openrouter"} 15000
+egopulse_llm_tokens_total{direction="output",provider="openrouter"} 3200
+
+# HELP egopulse_tool_calls_total Total tool calls executed
+# TYPE egopulse_tool_calls_total counter
+egopulse_tool_calls_total{tool="shell",status="ok"} 28
+
+# HELP egopulse_active_turns Number of currently active turns
 # TYPE egopulse_active_turns gauge
-egopulse_active_turns 3
-
-# HELP egopulse_turn_total Total number of agent turns processed
-# TYPE egopulse_turn_total counter
-egopulse_turn_total 142
-
-# HELP egopulse_channel_status Channel status (1=Running, 0=Failed)
-# TYPE egopulse_channel_status gauge
-egopulse_channel_status{channel="web"} 1
-egopulse_channel_status{channel="discord"} 1
-egopulse_channel_status{channel="telegram"} 0
+egopulse_active_turns 2
 ```
 
 ---
 
-### 2.4 設定
+### 2.3 設定
 
 #### 取得
 
@@ -248,7 +221,7 @@ GET と同一形式。
 
 ---
 
-### 2.5 セッション一覧
+### 2.4 セッション一覧
 
 ```
 GET /api/sessions
@@ -283,7 +256,7 @@ GET /api/sessions
 
 ---
 
-### 2.6 メッセージ履歴
+### 2.5 メッセージ履歴
 
 ```
 GET /api/history?session_key=main&limit=100
@@ -323,7 +296,7 @@ GET /api/history?session_key=main&limit=100
 
 ---
 
-### 2.7 ストリーミングチャット
+### 2.6 ストリーミングチャット
 
 #### リクエスト送信
 

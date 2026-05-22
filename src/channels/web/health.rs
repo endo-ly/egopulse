@@ -1,4 +1,4 @@
-//! Web-layer health, readiness, and Prometheus metrics endpoints.
+//! Web-layer health and Prometheus metrics endpoints.
 
 use axum::Json;
 use axum::extract::State;
@@ -10,20 +10,8 @@ use crate::runtime::runtime_status::ChannelState;
 
 use super::WebState;
 
-/// Minimal liveness payload — process is up and responding.
+/// Health probe — returns DB, channels, MCP, active turns, and recent errors.
 pub(super) async fn health(state: State<WebState>) -> Json<serde_json::Value> {
-    let snapshot = state.app_state.runtime_status.snapshot();
-    let uptime_secs = uptime_from_snapshot(&snapshot.started_at);
-
-    Json(serde_json::json!({
-        "ok": true,
-        "version": snapshot.version,
-        "uptime_secs": uptime_secs,
-    }))
-}
-
-/// Deep readiness probe — checks DB, channels, MCP, and active turns.
-pub(super) async fn readiness(state: State<WebState>) -> Json<serde_json::Value> {
     let snapshot = state.app_state.runtime_status.snapshot();
     let active_turns = state.app_state.active_turns.total_active();
 
@@ -146,8 +134,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_ok_version_uptime() {
-        let ws = test_web_state();
+    async fn health_returns_full_status() {
+        let rs = Arc::new(RuntimeStatus::new());
+        rs.update_channel("web", ChannelState::Running);
+
+        let ws = test_web_state_from_status(rs);
         let state = State(ws);
 
         let Json(value) = health(state).await;
@@ -156,18 +147,7 @@ mod tests {
         assert!(value["version"].is_string());
         assert_ne!(value["version"].as_str().unwrap_or(""), "");
         assert!(value["uptime_secs"].is_number());
-    }
-
-    #[tokio::test]
-    async fn ready_returns_runtime_status() {
-        let ws = test_web_state();
-        let state = State(ws);
-
-        let Json(value) = readiness(state).await;
-
-        assert!(value["version"].is_string());
         assert!(value["pid"].is_number());
-        assert!(value["uptime_secs"].is_number());
         assert!(value["db"].is_object());
         assert!(value["channels"].is_object());
         assert!(value["active_turns"].is_number());
@@ -175,21 +155,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_ok_when_all_healthy() {
+    async fn health_ok_when_all_healthy() {
         let rs = Arc::new(RuntimeStatus::new());
         rs.update_channel("web", ChannelState::Running);
 
         let ws = test_web_state_from_status(rs);
         let state = State(ws);
 
-        let Json(value) = readiness(state).await;
+        let Json(value) = health(state).await;
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["db"]["ok"], true);
     }
 
     #[tokio::test]
-    async fn ready_not_ok_when_db_unhealthy() {
+    async fn health_not_ok_when_db_unhealthy() {
         let rs = Arc::new(RuntimeStatus::new());
         rs.update_channel("web", ChannelState::Running);
         rs.set_db_healthy(false);
@@ -197,33 +177,32 @@ mod tests {
         let ws = test_web_state_from_status(rs);
         let state = State(ws);
 
-        let Json(value) = readiness(state).await;
+        let Json(value) = health(state).await;
 
         assert_eq!(value["ok"], false);
         assert_eq!(value["db"]["ok"], false);
     }
 
     #[tokio::test]
-    async fn ready_not_ok_when_all_channels_failed() {
+    async fn health_not_ok_when_all_channels_failed() {
         let rs = Arc::new(RuntimeStatus::new());
         rs.update_channel_error("web", "connection refused");
 
         let ws = test_web_state_from_status(rs);
         let state = State(ws);
 
-        let Json(value) = readiness(state).await;
+        let Json(value) = health(state).await;
 
         assert_eq!(value["ok"], false);
     }
 
     #[tokio::test]
-    async fn ready_includes_mcp_status() {
+    async fn health_includes_mcp_status() {
         let ws = test_web_state();
         let state = State(ws);
 
-        let Json(value) = readiness(state).await;
+        let Json(value) = health(state).await;
 
-        // mcp_manager is None in test state, so mcp should be null
         assert!(value["mcp"].is_null());
     }
 

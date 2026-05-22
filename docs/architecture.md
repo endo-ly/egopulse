@@ -315,12 +315,12 @@ pub(crate) struct SurfaceContext {
 | 層 | 形式 | 用途 |
 |---|---|---|
 | **構造化ログ** | `tracing` スパン + `trace_id` | リクエスト単位のログ追跡、`journalctl` / Loki での検索 |
-| **Live Health API** | `/health`, `/ready` | liveness / readiness プローブ、オペレーション確認 |
+| **Live Health API** | `/health` | ヘルスプローブ、オペレーション確認 |
 | **Prometheus メトリクス** | `/metrics` | 時系列モニタリング、アラート、ダッシュボード |
 
 ### 8.2 RuntimeStatus
 
-`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/ready` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。これにより、従来の `status.json`（起動時スナップショットのファイル書き出し）は廃止され、ライブ `/ready` エンドポイントに置き換えられた。
+`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/health` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。これにより、従来の `status.json`（起動時スナップショットのファイル書き出し）は廃止され、ライブ `/health` エンドポイントに置き換えられた。
 
 ### 8.3 trace_id 伝播
 
@@ -333,7 +333,7 @@ pub(crate) struct SurfaceContext {
 
 ### 8.4 エラーリングバッファ
 
-直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/ready` エンドポイントの `recent_errors` フィールドから参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
+直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/health` エンドポイントの `recent_errors_count` フィールドから参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
 
 ### 8.5 メトリクス
 
@@ -343,10 +343,8 @@ pub(crate) struct SurfaceContext {
 
 | メトリクス | 型 | 説明 |
 |---|---|---|
-| `egopulse_uptime_seconds` | gauge | プロセス稼働秒数 |
+| `egopulse_turns_total` | counter | 処理済みターン総数（ラベル: `agent`, `channel`） |
+| `egopulse_turn_errors_total` | counter | ターンエラー総数（ラベル: `kind`, `agent`） |
+| `egopulse_llm_tokens_total` | counter | LLM トークン消費量（ラベル: `direction`, `provider`） |
+| `egopulse_tool_calls_total` | counter | ツール呼び出し総数（ラベル: `tool`, `status`） |
 | `egopulse_active_turns` | gauge | 実行中のエージェントターン数 |
-| `egopulse_turn_total` | counter | 処理済みターン総数 |
-| `egopulse_channel_status` | gauge | チャネル状態（ラベル: `channel`、値: 1=Running, 0=Failed） |
-| `egopulse_turn_duration_seconds` | histogram | ターン処理時間 |
-| `egopulse_llm_request_total` | counter | LLM API 呼び出し回数（ラベル: `provider`） |
-| `egopulse_llm_request_duration_seconds` | histogram | LLM API 応答時間 |

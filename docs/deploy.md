@@ -310,10 +310,10 @@ journalctl --user -u egopulse --no-pager -o json | jq 'select(.trace_id == "abc1
 
 ### 5.2 ヘルスチェック
 
-`/ready` エンドポイントでサービスの readiness を確認できる。
+`/health` エンドポイントでサービスの稼働状態を確認できる。
 
 ```bash
-curl -s http://127.0.0.1:10961/ready | jq .ok
+curl -s http://127.0.0.1:10961/health | jq .ok
 ```
 
 `ok` が `true` の場合、DB 接続が正常で少なくとも 1 チャネルが稼働中。systemd の `ExecStartPre` や外部監視（Uptime Kuma 等）での利用を想定。

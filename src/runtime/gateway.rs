@@ -396,7 +396,7 @@ async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<String> {
     let config = resolve_config_for_service(cli_config).ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
     let port = loaded.web_port();
-    let url = format!("http://127.0.0.1:{port}/ready");
+    let url = format!("http://127.0.0.1:{port}/health");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
