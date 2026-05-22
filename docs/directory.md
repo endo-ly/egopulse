@@ -52,7 +52,6 @@
 │   │   └── discord/
 │   │       └── {chat_id}/
 │   │           └── conversations/
-│   └── status.json
 │
 └── workspace/
     ├── skills/
@@ -141,7 +140,6 @@ skills/
 |---|---|
 | `egopulse.db` | SQLite。会話履歴、セッション、ツール呼び出し記録 |
 | `assets/` | 会話中に生成・参照される画像等のバイナリアセット |
-| `status.json` | ランタイムステータス（起動時刻、接続状態等） |
 | `groups/` | チャット別永続データのルート |
 
 ### 2.4 runtime/groups/ — チャット別アーカイブ

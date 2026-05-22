@@ -11,6 +11,7 @@
 5. [リクエストフロー](#5-リクエストフロー)
 6. [起動・停止シーケンス](#6-起動停止シーケンス)
 7. [設計パターン](#7-設計パターン)
+8. [オブザーバビリティレイヤー](#8-オブザーバビリティレイヤー)
 
 ---
 
@@ -255,11 +256,10 @@ pub(crate) struct SurfaceContext {
       └─ SOUL.md プロビジョニング
       │
 4. start_channels()
-      │
-      ├─ status.json を書き出し
-      ├─ Web server 起動 (tokio::spawn)
-      ├─ Discord bot 起動 (tokio::spawn × bot 数)
-      ├─ Telegram bot 起動 (tokio::spawn)
+       │
+       ├─ Web server 起動 (tokio::spawn)
+       ├─ Discord bot 起動 (tokio::spawn × bot 数)
+       ├─ Telegram bot 起動 (tokio::spawn)
       │
       └─ 監視ループ (2 秒間隔でタスク状態をチェック)
          └─ いずれかのチャネルが異常終了 → 全チャネルを停止
@@ -303,3 +303,50 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
+
+---
+
+## 8. オブザーバビリティレイヤー
+
+3 層構造で運用時の可観測性を提供する。
+
+### 8.1 3 層モデル
+
+| 層 | 形式 | 用途 |
+|---|---|---|
+| **構造化ログ** | `tracing` スパン + `trace_id` | リクエスト単位のログ追跡、`journalctl` / Loki での検索 |
+| **Live Health API** | `/health`, `/ready` | liveness / readiness プローブ、オペレーション確認 |
+| **Prometheus メトリクス** | `/metrics` | 時系列モニタリング、アラート、ダッシュボード |
+
+### 8.2 RuntimeStatus
+
+`AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、`/ready` エンドポイントの応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。これにより、従来の `status.json`（起動時スナップショットのファイル書き出し）は廃止され、ライブ `/ready` エンドポイントに置き換えられた。
+
+### 8.3 trace_id 伝播
+
+エージェントターンのライフサイクル全体で `trace_id` が伝播する。
+
+1. `process_turn()` の開始時に UUID v4 を生成
+2. `tracing::info_span!` に `trace_id` フィールドとして注入
+3. `EGOPULSE_LOG_FORMAT=json` 環境変数設定時は、全ログ行に `trace_id` フィールドが含まれる
+4. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
+
+### 8.4 エラーリングバッファ
+
+直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。`/ready` エンドポイントの `recent_errors` フィールドから参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
+
+### 8.5 メトリクス
+
+`/metrics` エンドポイントは `egopulse_` プレフィックスの Prometheus テキスト形式で出力する。ラベルは低カーディナリティに抑え、メトリクス爆発を防止する。
+
+主要メトリクス:
+
+| メトリクス | 型 | 説明 |
+|---|---|---|
+| `egopulse_uptime_seconds` | gauge | プロセス稼働秒数 |
+| `egopulse_active_turns` | gauge | 実行中のエージェントターン数 |
+| `egopulse_turn_total` | counter | 処理済みターン総数 |
+| `egopulse_channel_status` | gauge | チャネル状態（ラベル: `channel`、値: 1=Running, 0=Failed） |
+| `egopulse_turn_duration_seconds` | histogram | ターン処理時間 |
+| `egopulse_llm_request_total` | counter | LLM API 呼び出し回数（ラベル: `provider`） |
+| `egopulse_llm_request_duration_seconds` | histogram | LLM API 応答時間 |
