@@ -592,7 +592,7 @@ fn parse_extract_events_response(response: &str) -> Result<ExtractEventsOutput, 
 
 #[allow(dead_code)]
 fn build_extract_system_prompt(agent_id: &str, sessions_text: &str) -> String {
-    let mut prompt = include_str!("extract_prompt.md").replace("{AGENT_NAME}", agent_id);
+    let mut prompt = include_str!("sleep_batch_prompt_1.md").replace("{AGENT_NAME}", agent_id);
 
     if !sessions_text.is_empty() {
         prompt.push_str("\n\n## 入力データ\n\n<sessions>\n");
