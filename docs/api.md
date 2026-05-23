@@ -52,9 +52,9 @@ GET /health
   "pid": 12345,
   "db": { "ok": true },
   "channels": {
-    "web": { "state": "running" },
-    "discord": { "state": "running" },
-    "telegram": { "state": "failed", "last_error": "bot token rejected" }
+    "web": { "state": "running", "last_error": null, "last_activity": "2026-05-23T10:00:00Z" },
+    "discord": { "state": "starting", "last_error": null, "last_activity": null },
+    "telegram": { "state": "failed", "last_error": "bot token rejected", "last_activity": null }
   },
   "mcp": {
     "healthy": 1,
@@ -69,10 +69,16 @@ GET /health
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `ok` | `boolean` | DB 正常かつ少なくとも 1 チャネル Running のとき `true` |
+| `version` | `string` | EgoPulse バージョン |
+| `uptime_secs` | `number` | 起動からの経過秒数 |
 | `pid` | `number` | プロセス ID |
-| `channels` | `object` | 各チャネルの状態（`running` / `failed`） |
-| `mcp` | `object` | MCP サーバーの接続状態 |
-| `db` | `object` | DB 接続状態 |
+| `db` | `object` | DB 接続状態（`{ "ok": boolean }`） |
+| `channels` | `object` | 各チャネルの状態。値は `{ state, last_error, last_activity }` |
+| `channels.*.state` | `string` | チャネル状態（`starting` / `running` / `failed` / `stopped`） |
+| `channels.*.last_error` | `string \| null` | 直近のエラーメッセージ |
+| `channels.*.last_activity` | `string \| null` | 直近のアクティビティ時刻（RFC 3339） |
+| `mcp` | `object` | MCP サーバーの接続状態（`{ healthy, failed, servers }`） |
+| `mcp.servers[]` | `array` | MCP サーバー一覧。各要素は `{ name, connected, error? }` |
 | `active_turns` | `number` | 現在実行中のエージェントターン数 |
 | `recent_errors_count` | `number` | 直近のエラー数（リングバッファ、最大 100 件、再起動で消失） |
 
@@ -94,20 +100,20 @@ GET /telemetry
 {
   "metrics": {
     "egopulse_turns_total": [
-      { "labels": { "agent": "alice", "channel": "discord" }, "value": 42 }
+      { "labels": { "agent": "alice", "channel": "discord" }, "value": 42.0 }
     ],
     "egopulse_turn_errors_total": [
-      { "labels": { "kind": "llm", "agent": "alice" }, "value": 3 }
+      { "labels": { "kind": "llm", "agent": "alice" }, "value": 3.0 }
     ],
     "egopulse_llm_tokens_total": [
-      { "labels": { "direction": "input", "provider": "openrouter" }, "value": 15000 },
-      { "labels": { "direction": "output", "provider": "openrouter" }, "value": 3200 }
+      { "labels": { "direction": "input", "provider": "openrouter" }, "value": 15000.0 },
+      { "labels": { "direction": "output", "provider": "openrouter" }, "value": 3200.0 }
     ],
     "egopulse_tool_calls_total": [
-      { "labels": { "tool": "shell", "status": "ok" }, "value": 28 }
+      { "labels": { "tool": "shell", "status": "ok" }, "value": 28.0 }
     ],
     "egopulse_active_turns": [
-      { "labels": {}, "value": 2 }
+      { "labels": {}, "value": 2.0 }
     ]
   },
   "recent_turns": [

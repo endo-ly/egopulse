@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::RwLock;
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Default capacity for the recent-errors ring buffer.
 const DEFAULT_ERROR_CAPACITY: usize = 100;
@@ -32,7 +32,7 @@ pub(crate) struct RuntimeStatus {
 /// Immutable point-in-time copy suitable for serialization.
 ///
 #[allow(dead_code)]
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct StatusSnapshot {
     pub version: String,
     pub pid: u32,
@@ -44,7 +44,7 @@ pub(crate) struct StatusSnapshot {
 }
 
 /// Operational state of a single channel (web / discord / telegram / …).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub(crate) enum ChannelState {
@@ -66,7 +66,7 @@ impl fmt::Display for ChannelState {
 }
 
 /// Per-channel health record.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ChannelHealth {
     pub state: ChannelState,
     pub last_error: Option<String>,
@@ -74,7 +74,7 @@ pub(crate) struct ChannelHealth {
 }
 
 /// A single error entry in the recent-errors ring buffer.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct AuditError {
     pub at: String,
     pub trace_id: String,
@@ -85,7 +85,7 @@ pub(crate) struct AuditError {
 }
 
 /// A single turn record in the recent-turns ring buffer.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TurnRecord {
     pub trace_id: String,
     pub agent_id: String,

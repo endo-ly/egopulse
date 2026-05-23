@@ -24,7 +24,7 @@ use crate::runtime::AppState;
 
 mod auth;
 mod config;
-mod health;
+pub(crate) mod health;
 mod sessions;
 mod sleep;
 pub(crate) mod sse;

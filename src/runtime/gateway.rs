@@ -427,6 +427,59 @@ fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError>
     Ok(())
 }
 
+/// Sums all `value` fields from the array associated with `metric_name` in a
+/// metrics object.
+///
+/// Returns `None` when the key is absent (so the caller can skip display).
+fn sum_metric_values(
+    metrics: &serde_json::Map<String, serde_json::Value>,
+    metric_name: &str,
+) -> Option<u64> {
+    metrics.get(metric_name).and_then(|entries| {
+        let arr = entries.as_array()?;
+        if arr.is_empty() {
+            return None;
+        }
+        Some(
+            arr.iter()
+                .map(|e| e["value"].as_f64().unwrap_or(0.0) as u64)
+                .sum(),
+        )
+    })
+}
+
+fn sum_metric_by_label(
+    metrics: &serde_json::Map<String, serde_json::Value>,
+    metric_name: &str,
+    label_key: &str,
+    label_value: &str,
+) -> Option<u64> {
+    metrics.get(metric_name).and_then(|entries| {
+        let arr = entries.as_array()?;
+        if arr.is_empty() {
+            return None;
+        }
+        let sum: u64 = arr
+            .iter()
+            .filter(|e| {
+                e.get("labels")
+                    .and_then(|l| l.get(label_key))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v == label_value)
+            })
+            .map(|e| e["value"].as_f64().unwrap_or(0.0) as u64)
+            .sum();
+        if sum == 0
+            && arr
+                .iter()
+                .all(|e| e["value"].as_f64().unwrap_or(0.0) == 0.0)
+        {
+            return None;
+        }
+        Some(sum)
+    })
+}
+
 fn format_uptime(secs: u64) -> String {
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
@@ -467,8 +520,12 @@ fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> Str
         ));
     }
 
-    if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
-        out.push_str(&format!("Active Turns: {active_turns}\n"));
+    // DB section
+    if let Some(db) = health.get("db") {
+        let db_ok = db["ok"].as_bool().unwrap_or(false);
+        let marker = if db_ok { "●" } else { "✗" };
+        let label = if db_ok { "ok" } else { "unhealthy" };
+        out.push_str(&format!("DB       {marker} {label}\n"));
     }
 
     if let Some(channels) = health.get("channels") {
@@ -479,6 +536,128 @@ fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> Str
                 let state = ch["state"].as_str().unwrap_or("unknown");
                 let marker = if state == "running" { "●" } else { "✗" };
                 out.push_str(&format!("{name:>10} {marker} {state}\n"));
+            }
+        }
+    }
+
+    // MCP section
+    if let Some(mcp) = health.get("mcp") {
+        if !mcp.is_null() {
+            let healthy = mcp["healthy"].as_u64().unwrap_or(0);
+            let failed = mcp["failed"].as_u64().unwrap_or(0);
+
+            let connected_names: Vec<String> = mcp
+                .get("servers")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|s| s["connected"].as_bool().unwrap_or(false))
+                        .filter_map(|s| s["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let failed_names: Vec<String> = mcp
+                .get("servers")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|s| !s["connected"].as_bool().unwrap_or(false))
+                        .filter_map(|s| s["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !connected_names.is_empty() {
+                out.push_str(&format!(
+                    "MCP       {healthy} connected ({})\n",
+                    connected_names.join(", ")
+                ));
+            } else if healthy > 0 {
+                out.push_str(&format!("MCP       {healthy} connected\n"));
+            }
+
+            if !failed_names.is_empty() {
+                out.push_str(&format!(
+                    "          {failed} failed ({})\n",
+                    failed_names.join(", ")
+                ));
+            } else if failed > 0 {
+                out.push_str(&format!("          {failed} failed\n"));
+            }
+        }
+    }
+
+    if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
+        out.push_str(&format!("Active Turns: {active_turns}\n"));
+    }
+
+    // recent errors count (when no telemetry)
+    if telemetry.is_none() {
+        if let Some(count) = health.get("recent_errors_count").and_then(|v| v.as_u64()) {
+            if count > 0 {
+                out.push('\n');
+                out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
+            }
+        }
+    }
+
+    // Metrics section
+    if let Some(ref tel) = telemetry {
+        if let Some(metrics) = tel.get("metrics") {
+            if let Some(obj) = metrics.as_object() {
+                if !obj.is_empty() {
+                    let turns = sum_metric_values(obj, "egopulse_turns_total");
+                    let errors = sum_metric_values(obj, "egopulse_turn_errors_total");
+                    let tokens_in =
+                        sum_metric_by_label(obj, "egopulse_llm_tokens_total", "direction", "input");
+                    let tokens_out = sum_metric_by_label(
+                        obj,
+                        "egopulse_llm_tokens_total",
+                        "direction",
+                        "output",
+                    );
+                    let tool_calls = sum_metric_values(obj, "egopulse_tool_calls_total");
+
+                    let has_any = turns.is_some()
+                        || errors.is_some()
+                        || tokens_in.is_some()
+                        || tokens_out.is_some()
+                        || tool_calls.is_some();
+
+                    if has_any {
+                        out.push('\n');
+                        out.push_str("Metrics\n");
+
+                        if turns.is_some() || errors.is_some() {
+                            let mut line = String::from("  ");
+                            if let Some(t) = turns {
+                                line.push_str(&format!("Turns: {t}  "));
+                            }
+                            if let Some(e) = errors {
+                                line.push_str(&format!("Errors: {e}  "));
+                            }
+                            out.push_str(line.trim_end());
+                            out.push('\n');
+                        }
+
+                        if tokens_in.is_some() || tokens_out.is_some() {
+                            let mut line = String::from("  Tokens:");
+                            if let Some(ti) = tokens_in {
+                                line.push_str(&format!(" {ti} in"));
+                            }
+                            if let Some(to) = tokens_out {
+                                line.push_str(&format!(" / {to} out"));
+                            }
+                            out.push_str(&line);
+                            out.push('\n');
+                        }
+
+                        if let Some(tc) = tool_calls {
+                            out.push_str(&format!("  Tool Calls: {tc}\n"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -533,18 +712,27 @@ fn print_gateway_status_text(health_json: &str, telemetry_json: Option<&str>) {
 }
 
 fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
-    let mut health: serde_json::Value =
-        serde_json::from_str(health_json).unwrap_or(serde_json::Value::Null);
+    use crate::channels::web::health::{GatewayStatusResponse, HealthResponse};
 
-    if let Some(tel_str) = telemetry_json {
-        if let Ok(tel) = serde_json::from_str::<serde_json::Value>(tel_str) {
-            if let Some(obj) = health.as_object_mut() {
-                obj.insert("telemetry".to_string(), tel);
+    let health: HealthResponse = match serde_json::from_str(health_json) {
+        Ok(h) => h,
+        Err(_) => {
+            let mut health: serde_json::Value =
+                serde_json::from_str(health_json).unwrap_or(serde_json::Value::Null);
+            if let (Some(tel_str), Some(obj)) = (telemetry_json, health.as_object_mut()) {
+                if let Ok(tel) = serde_json::from_str::<serde_json::Value>(tel_str) {
+                    obj.insert("telemetry".to_string(), tel);
+                }
             }
+            return serde_json::to_string_pretty(&health)
+                .unwrap_or_else(|_| health_json.to_owned());
         }
-    }
+    };
 
-    serde_json::to_string_pretty(&health).unwrap_or_else(|_| health_json.to_owned())
+    let telemetry = telemetry_json.and_then(|s| serde_json::from_str(s).ok());
+
+    let merged = GatewayStatusResponse { health, telemetry };
+    serde_json::to_string_pretty(&merged).unwrap_or_else(|_| health_json.to_owned())
 }
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
@@ -1538,6 +1726,329 @@ mod tests {
         assert!(
             parsed.get("telemetry").is_none(),
             "should not have telemetry key when no telemetry provided"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_db_section_shows_ok() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1,
+            "db": { "ok": true }
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            output.contains("DB       ● ok"),
+            "expected DB ok section, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_db_section_shows_unhealthy() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": false,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1,
+            "db": { "ok": false }
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            output.contains("DB       ✗ unhealthy"),
+            "expected DB unhealthy section, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_db_section_absent_when_missing() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            !output.contains("DB"),
+            "should not show DB section when absent, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_mcp_section_shows_connected_servers() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1,
+            "mcp": {
+                "healthy": 2,
+                "failed": 1,
+                "servers": [
+                    { "name": "context7", "connected": true },
+                    { "name": "egograph", "connected": true },
+                    { "name": "broken-svc", "connected": false }
+                ]
+            }
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            output.contains("MCP       2 connected (context7, egograph)"),
+            "expected MCP connected section, got: {output}"
+        );
+        assert!(
+            output.contains("1 failed (broken-svc)"),
+            "expected MCP failed section, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_mcp_section_skipped_when_null() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1,
+            "mcp": null
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            !output.contains("MCP"),
+            "should not show MCP section when null, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_mcp_section_skipped_when_absent() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            !output.contains("MCP"),
+            "should not show MCP section when absent, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_metrics_section_shows_values() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": {
+                "egopulse_turns_total": [
+                    { "labels": {}, "value": 42 }
+                ],
+                "egopulse_turn_errors_total": [
+                    { "labels": {}, "value": 3 }
+                ],
+                "egopulse_llm_tokens_total": [
+                    { "labels": { "direction": "input" }, "value": 15000 },
+                    { "labels": { "direction": "output" }, "value": 3200 }
+                ],
+                "egopulse_tool_calls_total": [
+                    { "labels": {}, "value": 28 }
+                ]
+            },
+            "recent_errors": [],
+            "recent_turns": []
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, Some(&telemetry));
+
+        // Assert
+        assert!(
+            output.contains("Metrics\n"),
+            "expected Metrics section, got: {output}"
+        );
+        assert!(
+            output.contains("Turns: 42  Errors: 3"),
+            "expected Turns/Errors line, got: {output}"
+        );
+        assert!(
+            output.contains("Tokens: 15000 in / 3200 out"),
+            "expected Tokens line, got: {output}"
+        );
+        assert!(
+            output.contains("Tool Calls: 28"),
+            "expected Tool Calls line, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_metrics_section_sums_multiple_entries() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": {
+                "egopulse_turns_total": [
+                    { "labels": {"channel": "discord"}, "value": 10 },
+                    { "labels": {"channel": "web"}, "value": 32 }
+                ]
+            },
+            "recent_errors": [],
+            "recent_turns": []
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, Some(&telemetry));
+
+        // Assert
+        assert!(
+            output.contains("Turns: 42"),
+            "expected summed turns, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_metrics_section_skipped_when_empty() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": {},
+            "recent_errors": [],
+            "recent_turns": []
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, Some(&telemetry));
+
+        // Assert
+        assert!(
+            !output.contains("Metrics"),
+            "should not show Metrics section when empty, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_metrics_section_skipped_when_no_telemetry() {
+        // Arrange
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, None);
+
+        // Assert
+        assert!(
+            !output.contains("Metrics"),
+            "should not show Metrics section without telemetry, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_metrics_partial_only_tokens() {
+        // Arrange — only token metrics present, turns/errors/tool_calls absent
+        let health = serde_json::json!({
+            "ok": true,
+            "version": "0.1.0",
+            "uptime_secs": 100,
+            "pid": 1
+        })
+        .to_string();
+
+        let telemetry = serde_json::json!({
+            "metrics": {
+                "egopulse_llm_tokens_total": [
+                    { "labels": { "direction": "input" }, "value": 500 },
+                    { "labels": { "direction": "output" }, "value": 100 }
+                ]
+            },
+            "recent_errors": [],
+            "recent_turns": []
+        })
+        .to_string();
+
+        // Act
+        let output = format_gateway_status(&health, Some(&telemetry));
+
+        // Assert
+        assert!(
+            output.contains("Metrics\n"),
+            "expected Metrics section, got: {output}"
+        );
+        assert!(
+            output.contains("Tokens: 500 in / 100 out"),
+            "expected Tokens line, got: {output}"
+        );
+        assert!(
+            !output.contains("Turns:"),
+            "should not show Turns when absent, got: {output}"
+        );
+        assert!(
+            !output.contains("Tool Calls:"),
+            "should not show Tool Calls when absent, got: {output}"
         );
     }
 }
