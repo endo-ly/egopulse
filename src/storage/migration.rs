@@ -476,7 +476,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("check table");
-        assert!(exists, "episode_events should be created by v2→v3 migration");
+        assert!(
+            exists,
+            "episode_events should be created by v2→v3 migration"
+        );
     }
 
     #[test]
@@ -512,10 +515,7 @@ mod tests {
             .collect();
 
         for name in &expected_columns {
-            assert!(
-                columns.iter().any(|c| c == *name),
-                "missing column: {name}"
-            );
+            assert!(columns.iter().any(|c| c == *name), "missing column: {name}");
         }
     }
 
@@ -545,10 +545,7 @@ mod tests {
             .collect();
 
         for name in &expected_indexes {
-            assert!(
-                indexes.iter().any(|i| i == *name),
-                "missing index: {name}"
-            );
+            assert!(indexes.iter().any(|i| i == *name), "missing index: {name}");
         }
     }
 }

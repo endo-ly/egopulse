@@ -11,7 +11,7 @@ use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{
-    AgentSessionInfo, Database, EpisodeEventCertainty, EpisodeEventKind, MemoryFile,
+    AgentSessionInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, MemoryFile,
     SleepRunTrigger, StoredMessage, call_blocking,
 };
 
@@ -1012,11 +1012,63 @@ async fn execute_batch(
         let memory_before = state.memory_loader.load(agent_id);
         save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
 
-        // 5-7. Process every chunk in order, feeding each output into the next.
+        // 5. Call 1: Event Extraction (best-effort)
+        let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
+            let mut all_messages = Vec::new();
+            for session in sessions {
+                let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
+                all_messages.extend(snapshot.recent_messages);
+            }
+            let max_chars = chunk_session_tokens.saturating_mul(ESTIMATED_CHARS_PER_TOKEN);
+            let chunks = build_extraction_chunks(&all_messages, max_chars);
+            run_extract_events_for_chunks(&provider, agent_id, chunks).await
+        }
+        .await;
+
+        let (extract_input_tokens, extract_output_tokens) = match extract_result {
+            Ok((extracted_events, inp, out)) => {
+                if !extracted_events.is_empty() {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let agent_for_events = agent_id.to_string();
+                    let run_id_for_insert = run_id.clone();
+                    let episode_events: Vec<EpisodeEvent> = extracted_events
+                        .into_iter()
+                        .map(|e| EpisodeEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: agent_for_events.clone(),
+                            experienced_at: e.experienced_at,
+                            encoded_at: now.clone(),
+                            kind: e.kind,
+                            title: e.title,
+                            body_md: e.body_md,
+                            ripple_strength: e.ripple_strength,
+                            certainty: e.certainty,
+                            sleep_run_id: run_id_for_insert.clone(),
+                            source_refs_json: e.source_refs_json,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        })
+                        .collect();
+                    let event_count = episode_events.len();
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.insert_episode_events(&run_id_for_insert, &episode_events)
+                    })
+                    .await?;
+                    info!(count = event_count, "extracted episode events");
+                }
+                (inp, out)
+            }
+            Err(e) => {
+                warn!(error = %e, "event extraction failed, continuing with memory update");
+                (0, 0)
+            }
+        };
+
+        // 6-8. Process every chunk in order, feeding each output into the next.
         let mut current_memory = memory_before.unwrap_or_default();
         let mut final_output = None;
-        let mut input_tokens = 0_i64;
-        let mut output_tokens = 0_i64;
+        let mut input_tokens = extract_input_tokens;
+        let mut output_tokens = extract_output_tokens;
         let total_chunks = session_chunks.len();
 
         for (index, sessions_text) in session_chunks.into_iter().enumerate() {
@@ -2812,7 +2864,12 @@ mod tests {
         let first = "Not JSON";
         let second = "Also not JSON";
 
-        let provider = SequentialMockProvider::new(vec![first.to_string(), second.to_string()]);
+        let provider = SequentialMockProvider::new(vec![
+            first.to_string(),
+            second.to_string(),
+            first.to_string(),
+            second.to_string(),
+        ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
         let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -3087,5 +3144,242 @@ mod tests {
         .to_string();
         let err = parse_extract_events_response(&response).expect_err("should fail");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5: Event Extraction Integration tests
+    // -----------------------------------------------------------------------
+
+    /// Mock that returns sequential responses with per-response token usage.
+    struct SequentialMockWithUsage {
+        responses: std::sync::Mutex<Vec<(String, i64, i64)>>,
+    }
+
+    impl SequentialMockWithUsage {
+        fn new(responses: Vec<(String, i64, i64)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockWithUsage {
+        fn provider_name(&self) -> &str {
+            "sequential-usage-mock"
+        }
+        fn model_name(&self) -> &str {
+            "sequential-usage-model"
+        }
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let mut locked = self.responses.lock().expect("responses lock");
+            let (content, input_tokens, output_tokens) = locked.remove(0);
+            Ok(MessagesResponse {
+                content,
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: Some(LlmUsage {
+                    input_tokens,
+                    output_tokens,
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extracts_events_before_memory_update() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:01:00Z",
+                "kind": "decision",
+                "title": "test event",
+                "body_md": "decided to test",
+                "ripple_strength": 3,
+                "certainty": "observed",
+                "source_message_ids": ["m-1"]
+            }]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+
+        let events = state
+            .db
+            .list_episode_events_by_run(&runs[0].id)
+            .expect("list events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "test event");
+        assert_eq!(events[0].kind, EpisodeEventKind::Decision);
+        assert_eq!(events[0].agent_id, "test-agent");
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_saves_extracted_events_to_db() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [
+                {
+                    "experienced_at": "2025-01-01T00:01:00Z",
+                    "kind": "insight",
+                    "title": "learned rust",
+                    "body_md": "discovered ownership model",
+                    "ripple_strength": 4,
+                    "certainty": "observed",
+                    "source_message_ids": ["m-2"]
+                },
+                {
+                    "experienced_at": "2025-01-01T00:02:00Z",
+                    "kind": "anomaly",
+                    "title": "unexpected error",
+                    "body_md": "crash on startup",
+                    "ripple_strength": 5,
+                    "certainty": "inferred",
+                    "source_message_ids": ["m-3"]
+                }
+            ]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "updated",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let events = state
+            .db
+            .list_episode_events_by_run(&runs[0].id)
+            .expect("list events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].title, "unexpected error"); // ordered by experienced_at DESC
+        assert_eq!(events[0].kind, EpisodeEventKind::Anomaly);
+        assert_eq!(events[0].ripple_strength, 5);
+        assert_eq!(events[0].certainty, EpisodeEventCertainty::Inferred);
+        assert_eq!(events[1].title, "learned rust");
+        assert_eq!(events[1].kind, EpisodeEventKind::Insight);
+        assert_eq!(events[1].body_md, "discovered ownership model");
+
+        // Verify sleep_run_id linkage
+        assert_eq!(events[0].sleep_run_id, runs[0].id);
+        assert_eq!(events[1].sleep_run_id, runs[0].id);
+
+        // Verify non-empty source_refs_json (mapped from message IDs)
+        assert!(events[0].source_refs_json.is_some());
+        assert!(events[1].source_refs_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extract_call_failure_continues() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        // Extraction will fail (invalid JSON, then retry also invalid),
+        // but the batch should still succeed with memory update.
+        let provider = SequentialMockProvider::new(vec![
+            "not json at all".to_string(),
+            "still not json".to_string(),
+            serde_json::json!({
+                "episodic": "",
+                "semantic": "",
+                "prospective": ""
+            })
+            .to_string(),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch should succeed despite extraction failure");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+
+        // No events should have been inserted
+        let events = state
+            .db
+            .list_episode_events("test-agent", None, None, 10)
+            .expect("list events");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extract_call_tokens_logged() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:01:00Z",
+                "kind": "feat",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 2,
+                "certainty": "observed",
+                "source_message_ids": ["m-1"]
+            }]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        // Extraction call: input=50, output=30
+        // Memory update call: input=100, output=200
+        let provider = SequentialMockWithUsage::new(vec![
+            (events_response, 50, 30),
+            (memory_response, 100, 200),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let run = state
+            .db
+            .get_sleep_run(&runs[0].id)
+            .expect("get")
+            .expect("exists");
+
+        // Token counts should aggregate Call 1 + memory update
+        assert_eq!(run.input_tokens, 150);
+        assert_eq!(run.output_tokens, 230);
     }
 }
