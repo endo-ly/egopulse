@@ -337,6 +337,98 @@ pub(crate) struct PulseRun {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpisodeEventKind {
+    Self_,
+    Relationship,
+    World,
+    Feat,
+    Anomaly,
+    Decision,
+    Insight,
+    Rhythm,
+}
+
+impl fmt::Display for EpisodeEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Self_ => write!(f, "self"),
+            Self::Relationship => write!(f, "relationship"),
+            Self::World => write!(f, "world"),
+            Self::Feat => write!(f, "feat"),
+            Self::Anomaly => write!(f, "anomaly"),
+            Self::Decision => write!(f, "decision"),
+            Self::Insight => write!(f, "insight"),
+            Self::Rhythm => write!(f, "rhythm"),
+        }
+    }
+}
+
+impl FromStr for EpisodeEventKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "self" => Ok(Self::Self_),
+            "relationship" => Ok(Self::Relationship),
+            "world" => Ok(Self::World),
+            "feat" => Ok(Self::Feat),
+            "anomaly" => Ok(Self::Anomaly),
+            "decision" => Ok(Self::Decision),
+            "insight" => Ok(Self::Insight),
+            "rhythm" => Ok(Self::Rhythm),
+            other => Err(format!("invalid episode event kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpisodeEventCertainty {
+    Observed,
+    Inferred,
+    Uncertain,
+}
+
+impl fmt::Display for EpisodeEventCertainty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observed => write!(f, "observed"),
+            Self::Inferred => write!(f, "inferred"),
+            Self::Uncertain => write!(f, "uncertain"),
+        }
+    }
+}
+
+impl FromStr for EpisodeEventCertainty {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "observed" => Ok(Self::Observed),
+            "inferred" => Ok(Self::Inferred),
+            "uncertain" => Ok(Self::Uncertain),
+            other => Err(format!("invalid episode event certainty: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EpisodeEvent {
+    pub id: String,
+    pub agent_id: String,
+    pub experienced_at: String,
+    pub encoded_at: String,
+    pub kind: EpisodeEventKind,
+    pub title: String,
+    pub body_md: String,
+    pub ripple_strength: i64,
+    pub certainty: EpisodeEventCertainty,
+    pub sleep_run_id: String,
+    pub source_refs_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 pub(crate) struct LlmUsageLogEntry<'a> {
     pub chat_id: i64,
     pub caller_channel: &'a str,
@@ -368,6 +460,11 @@ const _: () = {
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
     assert_display::<PulseRun>();
+
+    assert_display::<EpisodeEventKind>();
+    assert_from_str::<EpisodeEventKind>();
+    assert_display::<EpisodeEventCertainty>();
+    assert_from_str::<EpisodeEventCertainty>();
 };
 
 impl fmt::Display for SleepRun {
@@ -549,5 +646,86 @@ mod tests {
             MemoryFile::Prospective
         );
         assert!(MemoryFile::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn episode_event_kind_display() {
+        assert_eq!(EpisodeEventKind::Self_.to_string(), "self");
+        assert_eq!(EpisodeEventKind::Relationship.to_string(), "relationship");
+        assert_eq!(EpisodeEventKind::World.to_string(), "world");
+        assert_eq!(EpisodeEventKind::Feat.to_string(), "feat");
+        assert_eq!(EpisodeEventKind::Anomaly.to_string(), "anomaly");
+        assert_eq!(EpisodeEventKind::Decision.to_string(), "decision");
+        assert_eq!(EpisodeEventKind::Insight.to_string(), "insight");
+        assert_eq!(EpisodeEventKind::Rhythm.to_string(), "rhythm");
+    }
+
+    #[test]
+    fn episode_event_kind_from_str_valid() {
+        assert_eq!(
+            EpisodeEventKind::from_str("self").unwrap(),
+            EpisodeEventKind::Self_
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("relationship").unwrap(),
+            EpisodeEventKind::Relationship
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("world").unwrap(),
+            EpisodeEventKind::World
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("feat").unwrap(),
+            EpisodeEventKind::Feat
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("anomaly").unwrap(),
+            EpisodeEventKind::Anomaly
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("decision").unwrap(),
+            EpisodeEventKind::Decision
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("insight").unwrap(),
+            EpisodeEventKind::Insight
+        );
+        assert_eq!(
+            EpisodeEventKind::from_str("rhythm").unwrap(),
+            EpisodeEventKind::Rhythm
+        );
+    }
+
+    #[test]
+    fn episode_event_kind_from_str_invalid() {
+        assert!(EpisodeEventKind::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn episode_event_certainty_display() {
+        assert_eq!(EpisodeEventCertainty::Observed.to_string(), "observed");
+        assert_eq!(EpisodeEventCertainty::Inferred.to_string(), "inferred");
+        assert_eq!(EpisodeEventCertainty::Uncertain.to_string(), "uncertain");
+    }
+
+    #[test]
+    fn episode_event_certainty_from_str_valid() {
+        assert_eq!(
+            EpisodeEventCertainty::from_str("observed").unwrap(),
+            EpisodeEventCertainty::Observed
+        );
+        assert_eq!(
+            EpisodeEventCertainty::from_str("inferred").unwrap(),
+            EpisodeEventCertainty::Inferred
+        );
+        assert_eq!(
+            EpisodeEventCertainty::from_str("uncertain").unwrap(),
+            EpisodeEventCertainty::Uncertain
+        );
+    }
+
+    #[test]
+    fn episode_event_certainty_from_str_invalid() {
+        assert!(EpisodeEventCertainty::from_str("invalid").is_err());
     }
 }
