@@ -48,21 +48,7 @@
 
 ## 出力例
 
-```json
-{
-  "events": [
-    {
-      "experienced_at": "2025-05-20T14:30:00Z",
-      "kind": "decision",
-      "title": "メモリアーキテクチャの変更を決定",
-      "body_md": "SQLiteベースの記憶管理からファイルベースに移行することが合意された。",
-      "ripple_strength": 4,
-      "certainty": "observed",
-      "source_message_ids": ["msg-001", "msg-003"]
-    }
-  ]
-}
-```
+{ "events": [ { "experienced_at": "2025-05-20T14:30:00Z", "kind": "decision", "title": "メモリアーキテクチャの変更を決定", "body_md": "SQLiteベースの記憶管理からファイルベースに移行することが合意された。", "ripple_strength": 4, "certainty": "observed", "source_message_ids": ["msg-001", "msg-003"] } ] }
 
 ## 抽出基準
 

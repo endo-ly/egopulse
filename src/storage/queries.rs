@@ -1357,24 +1357,41 @@ impl Database {
 impl Database {
     /// Inserts episode events for a given `sleep_run_id`.
     ///
-    /// Skips **all** events if any event with the same `sleep_run_id` already
-    /// exists (idempotent bulk insert).
+    /// Runs inside an explicit transaction so that either all events are
+    /// persisted or none are.  Skips the entire batch if any row with the
+    /// same `sleep_run_id` already exists (idempotent bulk insert).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] if any event's `sleep_run_id`
+    /// does not match the supplied `sleep_run_id` argument.
     pub(crate) fn insert_episode_events(
         &self,
         sleep_run_id: &str,
         events: &[EpisodeEvent],
     ) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
-        let count: i64 = conn.query_row(
+        let tx = conn.unchecked_transaction()?;
+
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM episode_events WHERE sleep_run_id = ?1",
             params![sleep_run_id],
             |row| row.get(0),
         )?;
         if count > 0 {
+            tx.rollback()?;
             return Ok(());
         }
+
         for event in events {
-            conn.execute(
+            if event.sleep_run_id != sleep_run_id {
+                tx.rollback()?;
+                return Err(StorageError::Conflict(format!(
+                    "event sleep_run_id '{}' does not match expected '{sleep_run_id}'",
+                    event.sleep_run_id,
+                )));
+            }
+            tx.execute(
                 "INSERT INTO episode_events
                      (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
                       ripple_strength, certainty, sleep_run_id, source_refs_json,
@@ -1397,6 +1414,8 @@ impl Database {
                 ],
             )?;
         }
+
+        tx.commit()?;
         Ok(())
     }
 

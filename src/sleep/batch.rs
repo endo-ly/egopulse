@@ -631,6 +631,8 @@ async fn send_extract_events_request(
                 raw_preview = %preview_raw_response(&response.content),
                 "event extraction parse failed; retrying once with events guard"
             );
+            let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
 
             let retry_messages = vec![
                 user_message,
@@ -642,8 +644,15 @@ async fn send_extract_events_request(
                 .await
                 .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
+            let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
+            let combined_input = first_input.saturating_add(retry_input);
+            let combined_output = first_output.saturating_add(retry_output);
+
             match parse_extract_events_response(&retry_response.content) {
-                Ok(parsed) => (parsed, retry_response),
+                Ok(parsed) => {
+                    return Ok((parsed, combined_input, combined_output));
+                }
                 Err(retry_error) => {
                     warn!(
                         agent_id = %agent_id,
@@ -692,6 +701,29 @@ fn build_extraction_chunks(messages: &[StoredMessage], max_chars: usize) -> Vec<
             });
         }
 
+        // Truncate oversized single messages to max_chars to avoid unbounded chunks.
+        let xml_line = if line_len > max_chars {
+            let truncated = format!(
+                "<message id=\"{}\" ts=\"{}\" role=\"{}\">{}</message>",
+                msg.id,
+                msg.timestamp,
+                msg.sender_name,
+                &escaped_content[..escaped_content
+                    .char_indices()
+                    .nth(max_chars.saturating_sub(80).max(100))
+                    .map_or(escaped_content.len(), |(i, _)| i)]
+            );
+            warn!(
+                message_id = %msg.id,
+                original_len = line_len,
+                max_chars,
+                "message exceeds max_chars, truncating"
+            );
+            truncated
+        } else {
+            xml_line
+        };
+
         current_text.push_str(&xml_line);
         current_text.push('\n');
         current_map.insert(
@@ -731,10 +763,10 @@ async fn run_extract_events_for_chunks(
     let mut all_events = Vec::new();
     let mut total_input = 0_i64;
     let mut total_output = 0_i64;
+    let total_chunks = chunks.len();
 
     for (index, chunk) in chunks.into_iter().enumerate() {
         let system_prompt = build_extract_system_prompt(agent_id, &chunk.text);
-        let total_chunks = 1;
         let (output, in_tok, out_tok) = send_extract_events_request(
             provider,
             agent_id,
