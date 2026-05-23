@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -9,7 +10,10 @@ use crate::agent_loop::formatting::message_to_text;
 use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
-use crate::storage::{AgentSessionInfo, Database, MemoryFile, SleepRunTrigger, call_blocking};
+use crate::storage::{
+    AgentSessionInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, MemoryFile,
+    SleepRunTrigger, StoredMessage, call_blocking,
+};
 
 /// Ratio of context window used as overflow threshold for sleep batch input.
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
@@ -27,6 +31,14 @@ const JSON_RETRY_GUARD: &str = "\
 Your previous response was not valid JSON. \
 You must respond with ONLY a JSON object containing exactly these three keys: \
 \"episodic\", \"semantic\", \"prospective\". \
+Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
+Output the raw JSON object and nothing else.";
+
+/// Guard message injected on retry when the event extraction response is not valid JSON.
+const EVENTS_RETRY_GUARD: &str = "\
+Your previous response was not valid JSON. \
+You must respond with ONLY a JSON object containing exactly one key: \
+\"events\" (an array of episode event objects). \
 Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
 Output the raw JSON object and nothing else.";
 
@@ -127,6 +139,40 @@ struct SleepRequestResult {
     output: SleepBatchOutput,
     input_tokens: i64,
     output_tokens: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Event extraction types (LLM Call 1)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedEvent {
+    experienced_at: String,
+    kind: EpisodeEventKind,
+    title: String,
+    body_md: String,
+    ripple_strength: i64,
+    certainty: EpisodeEventCertainty,
+    source_message_ids: Vec<String>,
+    source_refs_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractEventsOutput {
+    events: Vec<ExtractedEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceRef {
+    chat_id: i64,
+    message_id: String,
+    timestamp: String,
+    role: String,
+}
+
+struct ExtractionChunk {
+    text: String,
+    message_map: std::collections::HashMap<String, SourceRef>,
 }
 
 /// Builds the sleep prompt input by loading memory and session data.
@@ -427,6 +473,340 @@ fn preview_raw_response(raw: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Event extraction functions (LLM Call 1)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn parse_extract_events_response(response: &str) -> Result<ExtractEventsOutput, SleepBatchError> {
+    let normalized = normalize_llm_response(response);
+    let value: serde_json::Value = serde_json::from_str(&normalized)
+        .map_err(|e| SleepBatchError::ParseFailed(format!("invalid JSON: {e}")))?;
+
+    let map = value.as_object().ok_or_else(|| {
+        SleepBatchError::ParseFailed("response must be a JSON object".to_string())
+    })?;
+
+    let events_val = map
+        .get("events")
+        .ok_or_else(|| SleepBatchError::ParseFailed("missing required key: events".to_string()))?;
+
+    let events_arr = events_val
+        .as_array()
+        .ok_or_else(|| SleepBatchError::ParseFailed("events must be an array".to_string()))?;
+
+    let mut events = Vec::with_capacity(events_arr.len());
+    for (i, ev) in events_arr.iter().enumerate() {
+        let obj = ev.as_object().ok_or_else(|| {
+            SleepBatchError::ParseFailed(format!("events[{i}] must be an object"))
+        })?;
+
+        let experienced_at = obj
+            .get("experienced_at")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SleepBatchError::ParseFailed(format!(
+                    "events[{i}]: missing or invalid experienced_at"
+                ))
+            })?
+            .to_string();
+
+        let kind_str = obj.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+            SleepBatchError::ParseFailed(format!("events[{i}]: missing or invalid kind"))
+        })?;
+        let kind = EpisodeEventKind::from_str(kind_str).map_err(SleepBatchError::ParseFailed)?;
+
+        let title = obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SleepBatchError::ParseFailed(format!("events[{i}]: missing or invalid title"))
+            })?
+            .to_string();
+
+        let body_md = obj
+            .get("body_md")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SleepBatchError::ParseFailed(format!("events[{i}]: missing or invalid body_md"))
+            })?
+            .to_string();
+
+        let ripple_strength = obj
+            .get("ripple_strength")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3);
+        if !(1..=5).contains(&ripple_strength) {
+            return Err(SleepBatchError::ParseFailed(format!(
+                "events[{i}]: ripple_strength must be 1-5, got {ripple_strength}"
+            )));
+        }
+
+        let certainty_str = obj
+            .get("certainty")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SleepBatchError::ParseFailed(format!("events[{i}]: missing or invalid certainty"))
+            })?;
+        let certainty =
+            EpisodeEventCertainty::from_str(certainty_str).map_err(SleepBatchError::ParseFailed)?;
+
+        let source_message_ids = match obj.get("source_message_ids") {
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| {
+                    SleepBatchError::ParseFailed(format!(
+                        "events[{i}]: source_message_ids must be an array"
+                    ))
+                })?
+                .iter()
+                .map(|item| {
+                    item.as_str().map(String::from).ok_or_else(|| {
+                        SleepBatchError::ParseFailed(format!(
+                            "events[{i}]: source_message_ids must contain strings"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => {
+                return Err(SleepBatchError::ParseFailed(format!(
+                    "events[{i}]: missing source_message_ids"
+                )));
+            }
+        };
+
+        events.push(ExtractedEvent {
+            experienced_at,
+            kind,
+            title,
+            body_md,
+            ripple_strength,
+            certainty,
+            source_message_ids,
+            source_refs_json: None,
+        });
+    }
+
+    Ok(ExtractEventsOutput { events })
+}
+
+#[allow(dead_code)]
+fn build_extract_system_prompt(agent_id: &str, sessions_text: &str) -> String {
+    let mut prompt = include_str!("sleep_batch_prompt_1.md").replace("{AGENT_NAME}", agent_id);
+
+    if !sessions_text.is_empty() {
+        prompt.push_str("\n\n## 入力データ\n\n<sessions>\n");
+        prompt.push_str(&escape_xml_content(sessions_text));
+        prompt.push_str("\n</sessions>\n");
+    }
+
+    prompt
+}
+
+#[allow(dead_code)]
+async fn send_extract_events_request(
+    provider: &Arc<dyn LlmProvider>,
+    agent_id: &str,
+    system_prompt: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> Result<(ExtractEventsOutput, i64, i64), SleepBatchError> {
+    let user_message = Message::text(
+        "user",
+        format!("Extract episode events from chunk {chunk_index} of {total_chunks}."),
+    );
+    let response = provider
+        .send_message(system_prompt, vec![user_message.clone()], None)
+        .await
+        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+    let (output, response) = match parse_extract_events_response(&response.content) {
+        Ok(parsed) => (parsed, response),
+        Err(first_error) => {
+            warn!(
+                agent_id = %agent_id,
+                chunk_index,
+                total_chunks,
+                error = %first_error,
+                raw_preview = %preview_raw_response(&response.content),
+                "event extraction parse failed; retrying once with events guard"
+            );
+            let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
+
+            let retry_messages = vec![
+                user_message,
+                Message::text("assistant", &response.content),
+                Message::text("user", EVENTS_RETRY_GUARD),
+            ];
+            let retry_response = provider
+                .send_message(system_prompt, retry_messages, None)
+                .await
+                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+            let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
+            let combined_input = first_input.saturating_add(retry_input);
+            let combined_output = first_output.saturating_add(retry_output);
+
+            match parse_extract_events_response(&retry_response.content) {
+                Ok(parsed) => {
+                    return Ok((parsed, combined_input, combined_output));
+                }
+                Err(retry_error) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        chunk_index,
+                        total_chunks,
+                        error = %retry_error,
+                        raw_preview = %preview_raw_response(&retry_response.content),
+                        "event extraction retry also failed"
+                    );
+                    return Err(retry_error);
+                }
+            }
+        }
+    };
+
+    let input_tokens = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+    let output_tokens = response.usage.as_ref().map_or(0, |u| u.output_tokens);
+    Ok((output, input_tokens, output_tokens))
+}
+
+#[allow(dead_code)]
+fn build_extraction_chunks(messages: &[StoredMessage], max_chars: usize) -> Vec<ExtractionChunk> {
+    if messages.is_empty() {
+        return vec![ExtractionChunk {
+            text: String::new(),
+            message_map: std::collections::HashMap::new(),
+        }];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_text = String::new();
+    let mut current_map = std::collections::HashMap::new();
+
+    for msg in messages {
+        let escaped_content = escape_xml_content(&msg.content);
+        let xml_line = format!(
+            "<message id=\"{}\" ts=\"{}\" role=\"{}\">{}</message>",
+            msg.id, msg.timestamp, msg.sender_name, escaped_content
+        );
+        let line_len = xml_line.len();
+
+        if !current_text.is_empty() && current_text.len().saturating_add(line_len) > max_chars {
+            chunks.push(ExtractionChunk {
+                text: std::mem::take(&mut current_text),
+                message_map: std::mem::take(&mut current_map),
+            });
+        }
+
+        // Truncate oversized single messages to max_chars to avoid unbounded chunks.
+        let xml_line = if line_len > max_chars {
+            let truncated = format!(
+                "<message id=\"{}\" ts=\"{}\" role=\"{}\">{}</message>",
+                msg.id,
+                msg.timestamp,
+                msg.sender_name,
+                &escaped_content[..escaped_content
+                    .char_indices()
+                    .nth(max_chars.saturating_sub(80).max(100))
+                    .map_or(escaped_content.len(), |(i, _)| i)]
+            );
+            warn!(
+                message_id = %msg.id,
+                original_len = line_len,
+                max_chars,
+                "message exceeds max_chars, truncating"
+            );
+            truncated
+        } else {
+            xml_line
+        };
+
+        current_text.push_str(&xml_line);
+        current_text.push('\n');
+        current_map.insert(
+            msg.id.clone(),
+            SourceRef {
+                chat_id: msg.chat_id,
+                message_id: msg.id.clone(),
+                timestamp: msg.timestamp.clone(),
+                role: msg.sender_name.clone(),
+            },
+        );
+    }
+
+    if !current_text.is_empty() || current_map.is_empty() {
+        chunks.push(ExtractionChunk {
+            text: current_text,
+            message_map: current_map,
+        });
+    }
+
+    if chunks.is_empty() {
+        chunks.push(ExtractionChunk {
+            text: String::new(),
+            message_map: std::collections::HashMap::new(),
+        });
+    }
+
+    chunks
+}
+
+#[allow(dead_code)]
+async fn run_extract_events_for_chunks(
+    provider: &Arc<dyn LlmProvider>,
+    agent_id: &str,
+    chunks: Vec<ExtractionChunk>,
+) -> Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> {
+    let mut all_events = Vec::new();
+    let mut total_input = 0_i64;
+    let mut total_output = 0_i64;
+    let total_chunks = chunks.len();
+
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let system_prompt = build_extract_system_prompt(agent_id, &chunk.text);
+        let (output, in_tok, out_tok) = send_extract_events_request(
+            provider,
+            agent_id,
+            &system_prompt,
+            index + 1,
+            total_chunks,
+        )
+        .await?;
+
+        total_input = total_input.saturating_add(in_tok);
+        total_output = total_output.saturating_add(out_tok);
+
+        for mut ev in output.events {
+            let mut refs = Vec::new();
+            for mid in &ev.source_message_ids {
+                match chunk.message_map.get(mid) {
+                    Some(sr) => refs.push(sr.clone()),
+                    None => {
+                        warn!(
+                            agent_id = %agent_id,
+                            message_id = %mid,
+                            "unknown source_message_id in extracted event, skipping"
+                        );
+                    }
+                }
+            }
+
+            ev.source_refs_json = if refs.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&refs).unwrap_or_else(|_| "[]".to_string()))
+            };
+            ev.source_message_ids = refs.into_iter().map(|r| r.message_id).collect();
+            all_events.push(ev);
+        }
+    }
+
+    Ok((all_events, total_input, total_output))
+}
+
 /// Builds the system prompt for the sleep batch LLM call.
 ///
 /// The prompt instructs the LLM to consolidate memory during sleep batch
@@ -664,11 +1044,63 @@ async fn execute_batch(
         let memory_before = state.memory_loader.load(agent_id);
         save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
 
-        // 5-7. Process every chunk in order, feeding each output into the next.
+        // 5. Call 1: Event Extraction (best-effort)
+        let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
+            let mut all_messages = Vec::new();
+            for session in sessions {
+                let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
+                all_messages.extend(snapshot.recent_messages);
+            }
+            let max_chars = chunk_session_tokens.saturating_mul(ESTIMATED_CHARS_PER_TOKEN);
+            let chunks = build_extraction_chunks(&all_messages, max_chars);
+            run_extract_events_for_chunks(&provider, agent_id, chunks).await
+        }
+        .await;
+
+        let (extract_input_tokens, extract_output_tokens) = match extract_result {
+            Ok((extracted_events, inp, out)) => {
+                if !extracted_events.is_empty() {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let agent_for_events = agent_id.to_string();
+                    let run_id_for_insert = run_id.clone();
+                    let episode_events: Vec<EpisodeEvent> = extracted_events
+                        .into_iter()
+                        .map(|e| EpisodeEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: agent_for_events.clone(),
+                            experienced_at: e.experienced_at,
+                            encoded_at: now.clone(),
+                            kind: e.kind,
+                            title: e.title,
+                            body_md: e.body_md,
+                            ripple_strength: e.ripple_strength,
+                            certainty: e.certainty,
+                            sleep_run_id: run_id_for_insert.clone(),
+                            source_refs_json: e.source_refs_json,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        })
+                        .collect();
+                    let event_count = episode_events.len();
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.insert_episode_events(&run_id_for_insert, &episode_events)
+                    })
+                    .await?;
+                    info!(count = event_count, "extracted episode events");
+                }
+                (inp, out)
+            }
+            Err(e) => {
+                warn!(error = %e, "event extraction failed, continuing with memory update");
+                (0, 0)
+            }
+        };
+
+        // 6-8. Process every chunk in order, feeding each output into the next.
         let mut current_memory = memory_before.unwrap_or_default();
         let mut final_output = None;
-        let mut input_tokens = 0_i64;
-        let mut output_tokens = 0_i64;
+        let mut input_tokens = extract_input_tokens;
+        let mut output_tokens = extract_output_tokens;
         let total_chunks = session_chunks.len();
 
         for (index, sessions_text) in session_chunks.into_iter().enumerate() {
@@ -2464,7 +2896,12 @@ mod tests {
         let first = "Not JSON";
         let second = "Also not JSON";
 
-        let provider = SequentialMockProvider::new(vec![first.to_string(), second.to_string()]);
+        let provider = SequentialMockProvider::new(vec![
+            first.to_string(),
+            second.to_string(),
+            first.to_string(),
+            second.to_string(),
+        ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
         let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -2530,5 +2967,451 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("sleep batch llm usage log was not written within the polling timeout");
+    }
+
+    // -----------------------------------------------------------------------
+    // Event extraction tests (Step 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_extract_events_response_valid() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-05-20T14:30:00Z",
+                "kind": "decision",
+                "title": "arch change",
+                "body_md": "Decided to move to SQLite.",
+                "ripple_strength": 4,
+                "certainty": "observed",
+                "source_message_ids": ["m1", "m2"]
+            }]
+        })
+        .to_string();
+
+        let output = parse_extract_events_response(&response).expect("should parse");
+        assert_eq!(output.events.len(), 1);
+        let ev = &output.events[0];
+        assert_eq!(ev.experienced_at, "2025-05-20T14:30:00Z");
+        assert_eq!(ev.kind, EpisodeEventKind::Decision);
+        assert_eq!(ev.title, "arch change");
+        assert_eq!(ev.body_md, "Decided to move to SQLite.");
+        assert_eq!(ev.ripple_strength, 4);
+        assert_eq!(ev.certainty, EpisodeEventCertainty::Observed);
+        assert_eq!(ev.source_message_ids, vec!["m1", "m2"]);
+    }
+
+    #[test]
+    fn parse_extract_events_response_missing_events_key() {
+        let response = r#"{"other": []}"#;
+        let err = parse_extract_events_response(response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_extract_events_response_invalid_event_kind() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "unknown_kind",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 3,
+                "certainty": "observed",
+                "source_message_ids": []
+            }]
+        })
+        .to_string();
+        let err = parse_extract_events_response(&response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_extract_events_response_salience_out_of_range() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "feat",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 6,
+                "certainty": "observed",
+                "source_message_ids": []
+            }]
+        })
+        .to_string();
+        let err = parse_extract_events_response(&response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_extract_events_response_certainty_invalid() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "self",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 3,
+                "certainty": "definite",
+                "source_message_ids": []
+            }]
+        })
+        .to_string();
+        let err = parse_extract_events_response(&response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_extract_events_response_with_thinking_tags() {
+        let inner = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "insight",
+                "title": "learned",
+                "body_md": "learned something new",
+                "ripple_strength": 2,
+                "certainty": "inferred",
+                "source_message_ids": []
+            }]
+        })
+        .to_string();
+        let response = format!("<thinking>analyzing...</thinking>{inner}");
+        let output = parse_extract_events_response(&response).expect("should parse");
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].kind, EpisodeEventKind::Insight);
+    }
+
+    #[test]
+    fn parse_extract_events_response_json_code_block() {
+        let inner = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "anomaly",
+                "title": "error",
+                "body_md": "unexpected crash",
+                "ripple_strength": 5,
+                "certainty": "observed",
+                "source_message_ids": ["x"]
+            }]
+        })
+        .to_string();
+        let response = format!("```json\n{inner}\n```");
+        let output = parse_extract_events_response(&response).expect("should parse");
+        assert_eq!(output.events[0].kind, EpisodeEventKind::Anomaly);
+    }
+
+    #[test]
+    fn build_extract_system_prompt_includes_sessions() {
+        let prompt = build_extract_system_prompt("test-bot", "session content here");
+        assert!(prompt.contains("session content here"));
+        assert!(prompt.contains("test-bot"));
+        assert!(prompt.contains("<sessions>"));
+        assert!(prompt.contains("</sessions>"));
+    }
+
+    #[test]
+    fn build_extract_system_prompt_includes_kinds() {
+        let prompt = build_extract_system_prompt("bot", "");
+        assert!(prompt.contains("`self`"));
+        assert!(prompt.contains("`relationship`"));
+        assert!(prompt.contains("`world`"));
+        assert!(prompt.contains("`feat`"));
+        assert!(prompt.contains("`anomaly`"));
+        assert!(prompt.contains("`decision`"));
+        assert!(prompt.contains("`insight`"));
+        assert!(prompt.contains("`rhythm`"));
+    }
+
+    #[test]
+    fn parse_extract_events_valid_source_message_ids() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "world",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 3,
+                "certainty": "observed",
+                "source_message_ids": ["msg-a", "msg-b", "msg-c"]
+            }]
+        })
+        .to_string();
+        let output = parse_extract_events_response(&response).expect("should parse");
+        assert_eq!(
+            output.events[0].source_message_ids,
+            vec!["msg-a", "msg-b", "msg-c"]
+        );
+    }
+
+    #[test]
+    fn parse_extract_events_empty_source_message_ids() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "rhythm",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 1,
+                "certainty": "uncertain",
+                "source_message_ids": []
+            }]
+        })
+        .to_string();
+        let output = parse_extract_events_response(&response).expect("should parse");
+        assert!(output.events[0].source_message_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_extract_events_missing_source_message_ids() {
+        let response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:00:00Z",
+                "kind": "self",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 3,
+                "certainty": "observed"
+            }]
+        })
+        .to_string();
+        let err = parse_extract_events_response(&response).expect_err("should fail");
+        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5: Event Extraction Integration tests
+    // -----------------------------------------------------------------------
+
+    /// Mock that returns sequential responses with per-response token usage.
+    struct SequentialMockWithUsage {
+        responses: std::sync::Mutex<Vec<(String, i64, i64)>>,
+    }
+
+    impl SequentialMockWithUsage {
+        fn new(responses: Vec<(String, i64, i64)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockWithUsage {
+        fn provider_name(&self) -> &str {
+            "sequential-usage-mock"
+        }
+        fn model_name(&self) -> &str {
+            "sequential-usage-model"
+        }
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let mut locked = self.responses.lock().expect("responses lock");
+            let (content, input_tokens, output_tokens) = locked.remove(0);
+            Ok(MessagesResponse {
+                content,
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: Some(LlmUsage {
+                    input_tokens,
+                    output_tokens,
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extracts_events_before_memory_update() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:01:00Z",
+                "kind": "decision",
+                "title": "test event",
+                "body_md": "decided to test",
+                "ripple_strength": 3,
+                "certainty": "observed",
+                "source_message_ids": ["m-1"]
+            }]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+
+        let events = state
+            .db
+            .list_episode_events_by_run(&runs[0].id)
+            .expect("list events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "test event");
+        assert_eq!(events[0].kind, EpisodeEventKind::Decision);
+        assert_eq!(events[0].agent_id, "test-agent");
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_saves_extracted_events_to_db() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [
+                {
+                    "experienced_at": "2025-01-01T00:01:00Z",
+                    "kind": "insight",
+                    "title": "learned rust",
+                    "body_md": "discovered ownership model",
+                    "ripple_strength": 4,
+                    "certainty": "observed",
+                    "source_message_ids": ["m-2"]
+                },
+                {
+                    "experienced_at": "2025-01-01T00:02:00Z",
+                    "kind": "anomaly",
+                    "title": "unexpected error",
+                    "body_md": "crash on startup",
+                    "ripple_strength": 5,
+                    "certainty": "inferred",
+                    "source_message_ids": ["m-3"]
+                }
+            ]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "updated",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let events = state
+            .db
+            .list_episode_events_by_run(&runs[0].id)
+            .expect("list events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].title, "unexpected error"); // ordered by experienced_at DESC
+        assert_eq!(events[0].kind, EpisodeEventKind::Anomaly);
+        assert_eq!(events[0].ripple_strength, 5);
+        assert_eq!(events[0].certainty, EpisodeEventCertainty::Inferred);
+        assert_eq!(events[1].title, "learned rust");
+        assert_eq!(events[1].kind, EpisodeEventKind::Insight);
+        assert_eq!(events[1].body_md, "discovered ownership model");
+
+        // Verify sleep_run_id linkage
+        assert_eq!(events[0].sleep_run_id, runs[0].id);
+        assert_eq!(events[1].sleep_run_id, runs[0].id);
+
+        // Verify non-empty source_refs_json (mapped from message IDs)
+        assert!(events[0].source_refs_json.is_some());
+        assert!(events[1].source_refs_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extract_call_failure_continues() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        // Extraction will fail (invalid JSON, then retry also invalid),
+        // but the batch should still succeed with memory update.
+        let provider = SequentialMockProvider::new(vec![
+            "not json at all".to_string(),
+            "still not json".to_string(),
+            serde_json::json!({
+                "episodic": "",
+                "semantic": "",
+                "prospective": ""
+            })
+            .to_string(),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch should succeed despite extraction failure");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+
+        // No events should have been inserted
+        let events = state
+            .db
+            .list_episode_events("test-agent", None, None, 10)
+            .expect("list events");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_extract_call_tokens_logged() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let events_response = serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:01:00Z",
+                "kind": "feat",
+                "title": "t",
+                "body_md": "b",
+                "ripple_strength": 2,
+                "certainty": "observed",
+                "source_message_ids": ["m-1"]
+            }]
+        })
+        .to_string();
+        let memory_response = serde_json::json!({
+            "episodic": "",
+            "semantic": "",
+            "prospective": ""
+        })
+        .to_string();
+
+        // Extraction call: input=50, output=30
+        // Memory update call: input=100, output=200
+        let provider = SequentialMockWithUsage::new(vec![
+            (events_response, 50, 30),
+            (memory_response, 100, 200),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let run = state
+            .db
+            .get_sleep_run(&runs[0].id)
+            .expect("get")
+            .expect("exists");
+
+        // Token counts should aggregate Call 1 + memory update
+        assert_eq!(run.input_tokens, 150);
+        assert_eq!(run.output_tokens, 230);
     }
 }

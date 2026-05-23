@@ -5,9 +5,10 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use crate::error::StorageError;
 
 use super::{
-    AgentSessionInfo, ChatInfo, Database, LlmUsageLogEntry, MemoryFile, MemorySnapshot,
-    MessageKind, PulseOutputKind, PulseRun, PulseRunStatus, SessionSnapshot, SessionSummary,
-    SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage, ToolCall,
+    AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
+    LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind, PulseRun,
+    PulseRunStatus, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger,
+    StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -124,6 +125,40 @@ fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PulseRun> {
         output_kind,
         output_text: row.get(10)?,
         error_message: row.get(11)?,
+    })
+}
+
+fn row_to_episode_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeEvent> {
+    let kind_str: String = row.get(4)?;
+    let kind = EpisodeEventKind::from_str(&kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let certainty_str: String = row.get(8)?;
+    let certainty = EpisodeEventCertainty::from_str(&certainty_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(EpisodeEvent {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        experienced_at: row.get(2)?,
+        encoded_at: row.get(3)?,
+        kind,
+        title: row.get(5)?,
+        body_md: row.get(6)?,
+        ripple_strength: row.get(7)?,
+        certainty,
+        sleep_run_id: row.get(9)?,
+        source_refs_json: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -1305,6 +1340,155 @@ impl Database {
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Episode events
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 1 episode event queries; exercised by unit tests below, wired into runtime in Phase 2+"
+    )
+)]
+impl Database {
+    /// Inserts episode events for a given `sleep_run_id`.
+    ///
+    /// Runs inside an explicit transaction so that either all events are
+    /// persisted or none are.  Skips the entire batch if any row with the
+    /// same `sleep_run_id` already exists (idempotent bulk insert).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] if any event's `sleep_run_id`
+    /// does not match the supplied `sleep_run_id` argument.
+    pub(crate) fn insert_episode_events(
+        &self,
+        sleep_run_id: &str,
+        events: &[EpisodeEvent],
+    ) -> Result<(), StorageError> {
+        let conn = self.lock_conn()?;
+        let tx = conn.unchecked_transaction()?;
+
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM episode_events WHERE sleep_run_id = ?1",
+            params![sleep_run_id],
+            |row| row.get(0),
+        )?;
+        if count > 0 {
+            tx.rollback()?;
+            return Ok(());
+        }
+
+        for event in events {
+            if event.sleep_run_id != sleep_run_id {
+                tx.rollback()?;
+                return Err(StorageError::Conflict(format!(
+                    "event sleep_run_id '{}' does not match expected '{sleep_run_id}'",
+                    event.sleep_run_id,
+                )));
+            }
+            tx.execute(
+                "INSERT INTO episode_events
+                     (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                      ripple_strength, certainty, sleep_run_id, source_refs_json,
+                      created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    event.id,
+                    event.agent_id,
+                    event.experienced_at,
+                    event.encoded_at,
+                    event.kind.to_string(),
+                    event.title,
+                    event.body_md,
+                    event.ripple_strength,
+                    event.certainty.to_string(),
+                    event.sleep_run_id,
+                    event.source_refs_json,
+                    event.created_at,
+                    event.updated_at,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lists events for an agent, ordered by `experienced_at DESC`.
+    ///
+    /// Optional filters: `kind` (exact match), `ripple_min` (>= threshold).
+    pub(crate) fn list_episode_events(
+        &self,
+        agent_id: &str,
+        kind: Option<EpisodeEventKind>,
+        ripple_min: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<EpisodeEvent>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut sql = String::from(
+            "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                    ripple_strength, certainty, sleep_run_id, source_refs_json,
+                    created_at, updated_at
+             FROM episode_events
+             WHERE agent_id = ?",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        param_values.push(Box::new(agent_id.to_string()));
+
+        if let Some(k) = kind {
+            sql.push_str(" AND kind = ?");
+            param_values.push(Box::new(k.to_string()));
+        }
+        if let Some(min) = ripple_min {
+            sql.push_str(" AND ripple_strength >= ?");
+            param_values.push(Box::new(min));
+        }
+
+        sql.push_str(" ORDER BY experienced_at DESC LIMIT ?");
+        param_values.push(Box::new(limit));
+
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(params.as_slice(), row_to_episode_event)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Counts total events for an agent.
+    pub(crate) fn count_episode_events(&self, agent_id: &str) -> Result<i64, StorageError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM episode_events WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Lists events by `sleep_run_id`.
+    pub(crate) fn list_episode_events_by_run(
+        &self,
+        sleep_run_id: &str,
+    ) -> Result<Vec<EpisodeEvent>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                    ripple_strength, certainty, sleep_run_id, source_refs_json,
+                    created_at, updated_at
+             FROM episode_events
+             WHERE sleep_run_id = ?1
+             ORDER BY experienced_at DESC",
+        )?;
+        stmt.query_map(params![sleep_run_id], row_to_episode_event)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -2826,5 +3010,336 @@ mod tests {
         // Attempting to create a second run with same due_key should conflict
         let result = db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01");
         assert!(matches!(result, Err(StorageError::Conflict(_))));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Episode event tests
+    // ---------------------------------------------------------------------------
+
+    fn make_event(
+        id: &str,
+        agent_id: &str,
+        experienced_at: &str,
+        kind: EpisodeEventKind,
+        ripple_strength: i64,
+        certainty: EpisodeEventCertainty,
+        sleep_run_id: &str,
+    ) -> EpisodeEvent {
+        EpisodeEvent {
+            id: id.to_string(),
+            agent_id: agent_id.to_string(),
+            experienced_at: experienced_at.to_string(),
+            encoded_at: "2025-01-15T12:00:00Z".to_string(),
+            kind,
+            title: format!("event {id}"),
+            body_md: format!("body of {id}"),
+            ripple_strength,
+            certainty,
+            sleep_run_id: sleep_run_id.to_string(),
+            source_refs_json: None,
+            created_at: "2025-01-15T12:00:00Z".to_string(),
+            updated_at: "2025-01-15T12:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn insert_episode_event_succeeds() {
+        let (db, _dir) = test_db();
+
+        let events = vec![
+            make_event(
+                "evt-1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                3,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-2",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+        ];
+
+        db.insert_episode_events("run-1", &events).expect("insert");
+
+        let count = db.count_episode_events("agent-a").expect("count");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn insert_duplicate_sleep_run_id_skips() {
+        let (db, _dir) = test_db();
+
+        let events_batch_1 = vec![make_event(
+            "evt-1",
+            "agent-a",
+            "2025-01-10T10:00:00Z",
+            EpisodeEventKind::Self_,
+            3,
+            EpisodeEventCertainty::Observed,
+            "run-1",
+        )];
+
+        db.insert_episode_events("run-1", &events_batch_1)
+            .expect("first insert");
+
+        let events_batch_2 = vec![make_event(
+            "evt-2",
+            "agent-a",
+            "2025-01-11T10:00:00Z",
+            EpisodeEventKind::World,
+            4,
+            EpisodeEventCertainty::Inferred,
+            "run-1",
+        )];
+
+        db.insert_episode_events("run-1", &events_batch_2)
+            .expect("second insert");
+
+        let count = db.count_episode_events("agent-a").expect("count");
+        assert_eq!(
+            count, 1,
+            "second insert with same sleep_run_id should be skipped"
+        );
+    }
+
+    #[test]
+    fn list_episode_events_by_agent_experienced_desc() {
+        let (db, _dir) = test_db();
+
+        let events = vec![
+            make_event(
+                "evt-1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                3,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-2",
+                "agent-a",
+                "2025-01-12T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+            make_event(
+                "evt-3",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::Relationship,
+                2,
+                EpisodeEventCertainty::Uncertain,
+                "run-1",
+            ),
+        ];
+
+        db.insert_episode_events("run-1", &events).expect("insert");
+
+        let listed = db
+            .list_episode_events("agent-a", None, None, 10)
+            .expect("list");
+
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].id, "evt-2");
+        assert_eq!(listed[1].id, "evt-3");
+        assert_eq!(listed[2].id, "evt-1");
+    }
+
+    #[test]
+    fn list_episode_events_by_agent_kind() {
+        let (db, _dir) = test_db();
+
+        let events = vec![
+            make_event(
+                "evt-1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                3,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-2",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+            make_event(
+                "evt-3",
+                "agent-a",
+                "2025-01-12T10:00:00Z",
+                EpisodeEventKind::World,
+                5,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+        ];
+
+        db.insert_episode_events("run-1", &events).expect("insert");
+
+        let world_events = db
+            .list_episode_events("agent-a", Some(EpisodeEventKind::World), None, 10)
+            .expect("list");
+
+        assert_eq!(world_events.len(), 2);
+        assert!(
+            world_events
+                .iter()
+                .all(|e| e.kind == EpisodeEventKind::World)
+        );
+    }
+
+    #[test]
+    fn list_episode_events_by_agent_ripple() {
+        let (db, _dir) = test_db();
+
+        let events = vec![
+            make_event(
+                "evt-1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                2,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-2",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+            make_event(
+                "evt-3",
+                "agent-a",
+                "2025-01-12T10:00:00Z",
+                EpisodeEventKind::Feat,
+                5,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+        ];
+
+        db.insert_episode_events("run-1", &events).expect("insert");
+
+        let strong_events = db
+            .list_episode_events("agent-a", None, Some(4), 10)
+            .expect("list");
+
+        assert_eq!(strong_events.len(), 2);
+        assert!(strong_events.iter().all(|e| e.ripple_strength >= 4));
+    }
+
+    #[test]
+    fn count_episode_events_by_agent() {
+        let (db, _dir) = test_db();
+
+        let events_a = vec![
+            make_event(
+                "evt-a1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                3,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-a2",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+        ];
+        let events_b = vec![make_event(
+            "evt-b1",
+            "agent-b",
+            "2025-01-10T10:00:00Z",
+            EpisodeEventKind::Feat,
+            5,
+            EpisodeEventCertainty::Observed,
+            "run-2",
+        )];
+
+        db.insert_episode_events("run-1", &events_a)
+            .expect("insert a");
+        db.insert_episode_events("run-2", &events_b)
+            .expect("insert b");
+
+        assert_eq!(db.count_episode_events("agent-a").expect("count a"), 2);
+        assert_eq!(db.count_episode_events("agent-b").expect("count b"), 1);
+        assert_eq!(db.count_episode_events("agent-c").expect("count c"), 0);
+    }
+
+    #[test]
+    fn list_episode_events_by_sleep_run_id() {
+        let (db, _dir) = test_db();
+
+        let events_run1 = vec![
+            make_event(
+                "evt-1",
+                "agent-a",
+                "2025-01-10T10:00:00Z",
+                EpisodeEventKind::Self_,
+                3,
+                EpisodeEventCertainty::Observed,
+                "run-1",
+            ),
+            make_event(
+                "evt-2",
+                "agent-a",
+                "2025-01-11T10:00:00Z",
+                EpisodeEventKind::World,
+                4,
+                EpisodeEventCertainty::Inferred,
+                "run-1",
+            ),
+        ];
+        let events_run2 = vec![make_event(
+            "evt-3",
+            "agent-a",
+            "2025-01-12T10:00:00Z",
+            EpisodeEventKind::Feat,
+            5,
+            EpisodeEventCertainty::Observed,
+            "run-2",
+        )];
+
+        db.insert_episode_events("run-1", &events_run1)
+            .expect("insert run-1");
+        db.insert_episode_events("run-2", &events_run2)
+            .expect("insert run-2");
+
+        let run1_events = db.list_episode_events_by_run("run-1").expect("list");
+        assert_eq!(run1_events.len(), 2);
+        assert!(run1_events.iter().all(|e| e.sleep_run_id == "run-1"));
+
+        let run2_events = db.list_episode_events_by_run("run-2").expect("list");
+        assert_eq!(run2_events.len(), 1);
+        assert_eq!(run2_events[0].id, "evt-3");
+
+        let empty = db.list_episode_events_by_run("run-999").expect("list");
+        assert!(empty.is_empty());
     }
 }

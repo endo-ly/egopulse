@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 2;
+pub(super) const SCHEMA_VERSION: i64 = 3;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -217,6 +217,46 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 2;
     }
 
+    if version < 3 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS episode_events (
+                id               TEXT PRIMARY KEY,
+                agent_id         TEXT NOT NULL,
+                experienced_at   TEXT NOT NULL,
+                encoded_at       TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                body_md          TEXT NOT NULL,
+                ripple_strength  INTEGER NOT NULL DEFAULT 3,
+                certainty        TEXT NOT NULL DEFAULT 'observed',
+                sleep_run_id     TEXT NOT NULL,
+                source_refs_json TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                CHECK (kind IN (
+                    'self', 'relationship', 'world', 'feat',
+                    'anomaly', 'decision', 'insight', 'rhythm'
+                )),
+                CHECK (ripple_strength BETWEEN 1 AND 5),
+                CHECK (certainty IN ('observed', 'inferred', 'uncertain'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
+                ON episode_events(agent_id, experienced_at);
+
+            CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced
+                ON episode_events(agent_id, kind, experienced_at);
+
+            CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced
+                ON episode_events(agent_id, ripple_strength, experienced_at);
+
+            CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
+                ON episode_events(sleep_run_id);",
+        )?;
+        set_schema_version(conn, 3, "add episode_events table")?;
+        version = 3;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -240,6 +280,7 @@ mod tests {
             "sleep_runs",
             "memory_snapshots",
             "pulse_runs",
+            "episode_events",
         ];
         for name in &expected_tables {
             let exists: bool = conn
@@ -378,7 +419,6 @@ mod tests {
             super::run_migrations(&conn).expect("second run");
         }
 
-        // Schema version should still be 2
         let conn = db.conn.lock().expect("lock");
         let version: String = conn
             .query_row(
@@ -388,5 +428,124 @@ mod tests {
             )
             .expect("version");
         assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
+    }
+
+    // --- v3: episode_events ---------------------------------------------------
+
+    #[test]
+    fn fresh_db_includes_episode_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let _db = super::super::Database::new(&db_path).expect("migrations");
+
+        let conn = _db.conn.lock().expect("lock");
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episode_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(exists, "episode_events table should exist on fresh DB");
+    }
+
+    #[test]
+    fn migration_from_v2_to_v3_adds_episode_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("migrations");
+        let conn = db.conn.lock().expect("lock");
+
+        conn.execute(
+            "UPDATE db_meta SET value = '2' WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("rollback version");
+        drop(conn);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            super::run_migrations(&conn).expect("re-run migrations");
+        }
+
+        let conn = db.conn.lock().expect("lock");
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episode_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(
+            exists,
+            "episode_events should be created by v2→v3 migration"
+        );
+    }
+
+    #[test]
+    fn episode_events_all_columns_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let _db = super::super::Database::new(&db_path).expect("migrations");
+        let conn = _db.conn.lock().expect("lock");
+
+        let expected_columns = [
+            "id",
+            "agent_id",
+            "experienced_at",
+            "encoded_at",
+            "kind",
+            "title",
+            "body_md",
+            "ripple_strength",
+            "certainty",
+            "sleep_run_id",
+            "source_refs_json",
+            "created_at",
+            "updated_at",
+        ];
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(episode_events)")
+            .expect("prepare pragma");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .map(|r| r.expect("col"))
+            .collect();
+
+        for name in &expected_columns {
+            assert!(columns.iter().any(|c| c == *name), "missing column: {name}");
+        }
+    }
+
+    #[test]
+    fn episode_events_indexes_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let _db = super::super::Database::new(&db_path).expect("migrations");
+        let conn = _db.conn.lock().expect("lock");
+
+        let expected_indexes = [
+            "idx_episode_events_agent_experienced",
+            "idx_episode_events_agent_kind_experienced",
+            "idx_episode_events_agent_ripple_experienced",
+            "idx_episode_events_sleep_run",
+        ];
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_episode_events%'",
+            )
+            .expect("prepare");
+        let indexes: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .map(|r| r.expect("idx"))
+            .collect();
+
+        for name in &expected_indexes {
+            assert!(indexes.iter().any(|i| i == *name), "missing index: {name}");
+        }
     }
 }
