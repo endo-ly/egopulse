@@ -58,9 +58,9 @@ export function useStream({
 
     const userMessage: MessageItem = {
       id: makeId("message"),
-      sender_name: "web-user",
+      sender_id: "user:web:default",
+      sender_kind: "user",
       content: text,
-      is_from_bot: false,
       timestamp: nowIso(),
     };
 
@@ -138,9 +138,9 @@ export function useStream({
               ...prev,
               {
                 id: draftId,
-                sender_name: "egopulse",
+                sender_id: "egopulse",
+                sender_kind: "assistant",
                 content: delta,
-                is_from_bot: true,
                 timestamp: nowIso(),
               },
             ];
@@ -169,9 +169,9 @@ export function useStream({
                 ...prev,
                 {
                   id: `${draftId}:done`,
-                  sender_name: "egopulse",
+                  sender_id: "egopulse",
+                  sender_kind: "assistant",
                   content: responseText,
-                  is_from_bot: true,
                   timestamp: nowIso(),
                 },
               ];

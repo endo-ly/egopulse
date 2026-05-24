@@ -11,9 +11,9 @@ export type SessionItem = {
 /** メッセージアイテム */
 export type MessageItem = {
   id: string;
-  sender_name: string;
+  sender_id: string;
+  sender_kind: "user" | "assistant" | "system" | "tool";
   content: string;
-  is_from_bot: boolean;
   timestamp: string;
 };
 
