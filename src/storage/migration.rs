@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 4;
+pub(super) const SCHEMA_VERSION: i64 = 5;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -335,6 +335,114 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 4;
     }
 
+    if version < 5 {
+        let tx = conn.unchecked_transaction()?;
+
+        let needs_migration: bool = tx
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'is_from_bot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if needs_migration {
+            tx.execute_batch(
+                "CREATE TABLE messages_v5 (
+                    id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    sender_kind TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    message_kind TEXT NOT NULL DEFAULT 'message',
+                    recipient_agent_id TEXT,
+                    PRIMARY KEY (id, chat_id)
+                );",
+            )?;
+
+            {
+                struct V4Row {
+                    id: String,
+                    chat_id: i64,
+                    sender_name: String,
+                    content: String,
+                    is_from_bot: i32,
+                    timestamp: String,
+                    message_kind: String,
+                    sender_agent_id: Option<String>,
+                    recipient_agent_id: Option<String>,
+                }
+
+                let mut stmt = tx.prepare(
+                    "SELECT id, chat_id, sender_name, content, is_from_bot,
+                            timestamp, message_kind, sender_agent_id, recipient_agent_id
+                     FROM messages",
+                )?;
+                let rows: Vec<V4Row> = stmt
+                    .query_map([], |row| {
+                        Ok(V4Row {
+                            id: row.get::<_, String>(0)?,
+                            chat_id: row.get::<_, i64>(1)?,
+                            sender_name: row.get::<_, String>(2)?,
+                            content: row.get::<_, String>(3)?,
+                            is_from_bot: row.get::<_, i32>(4)?,
+                            timestamp: row.get::<_, String>(5)?,
+                            message_kind: row.get::<_, String>(6)?,
+                            sender_agent_id: row.get::<_, Option<String>>(7)?,
+                            recipient_agent_id: row.get::<_, Option<String>>(8)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                for row in &rows {
+                    let (sender_id, sender_kind) =
+                        if row.is_from_bot != 0 && row.message_kind == "system_event" {
+                            ("system".to_string(), "system")
+                        } else if row.is_from_bot != 0 && row.sender_agent_id.is_some() {
+                            (row.sender_agent_id.clone().unwrap(), "assistant")
+                        } else if row.is_from_bot != 0 {
+                            (row.sender_name.clone(), "assistant")
+                        } else {
+                            (row.sender_name.clone(), "user")
+                        };
+
+                    tx.execute(
+                        "INSERT INTO messages_v5
+                            (id, chat_id, sender_id, content, sender_kind,
+                             timestamp, message_kind, recipient_agent_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            row.id,
+                            row.chat_id,
+                            sender_id,
+                            row.content,
+                            sender_kind,
+                            row.timestamp,
+                            row.message_kind,
+                            row.recipient_agent_id,
+                        ],
+                    )?;
+                }
+            }
+
+            tx.execute_batch("DROP TABLE messages;")?;
+            tx.execute_batch("ALTER TABLE messages_v5 RENAME TO messages;")?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+                    ON messages(chat_id, timestamp);",
+            )?;
+        }
+
+        set_schema_version_in_tx(
+            &tx,
+            5,
+            "replace sender_name/is_from_bot/sender_agent_id with sender_id/sender_kind",
+        )?;
+        tx.commit()?;
+        version = 5;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -625,5 +733,286 @@ mod tests {
         for name in &expected_indexes {
             assert!(indexes.iter().any(|i| i == *name), "missing index: {name}");
         }
+    }
+
+    // --- v5: messages sender_id / sender_kind ---------------------------------
+
+    fn seed_v4_messages(conn: &rusqlite::Connection) {
+        // Bot message (no agent id)
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES ('m1', 1, 'egopulse', 'bot hello', 1, '2024-01-01T00:00:00Z', 'message', NULL, NULL)",
+            [],
+        ).unwrap();
+        // Agent message (has sender_agent_id)
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES ('m2', 1, 'lyre', 'agent reply', 1, '2024-01-01T00:00:01Z', 'message', 'lyre', NULL)",
+            [],
+        ).unwrap();
+        // User message
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES ('m3', 1, 'alice', 'user hello', 0, '2024-01-01T00:00:02Z', 'message', NULL, NULL)",
+            [],
+        ).unwrap();
+        // System event
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES ('m4', 1, 'system', '{\"reason\":\"TurnCountExceeded\"}', 1, '2024-01-01T00:00:03Z', 'system_event', NULL, NULL)",
+            [],
+        ).unwrap();
+        // Agent message with recipient
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
+             VALUES ('m5', 1, 'lyre', 'agent send', 1, '2024-01-01T00:00:04Z', 'agent_send', 'lyre', 'bob')",
+            [],
+        ).unwrap();
+    }
+
+    fn run_v5_migration(db: &super::super::Database) {
+        {
+            let conn = db.conn.lock().expect("lock");
+            super::run_migrations(&conn).expect("re-run migrations");
+        }
+    }
+
+    /// Creates a Database with v4 schema (old messages columns) for testing v5 migration.
+    fn create_v4_db(dir: &tempfile::TempDir) -> super::super::Database {
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // v1 schema — only the tables needed for v5 migration tests
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_title TEXT,
+                chat_type TEXT NOT NULL DEFAULT 'private',
+                last_message_time TEXT NOT NULL,
+                channel TEXT,
+                external_chat_id TEXT,
+                agent_id TEXT NOT NULL DEFAULT 'default'
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                is_from_bot INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL,
+                message_kind TEXT NOT NULL DEFAULT 'message',
+                sender_agent_id TEXT,
+                recipient_agent_id TEXT,
+                PRIMARY KEY (id, chat_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+                ON messages(chat_id, timestamp);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS db_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        super::set_schema_version(&conn, 4, "test v4 baseline").unwrap();
+
+        super::super::Database {
+            conn: std::sync::Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn migration_v4_to_v5_adds_sender_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let has_sender_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'sender_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check");
+        assert!(has_sender_id, "messages should have sender_id column");
+    }
+
+    #[test]
+    fn migration_v4_to_v5_removes_is_from_bot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let has_is_from_bot: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'is_from_bot'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check");
+        assert!(
+            !has_is_from_bot,
+            "messages should not have is_from_bot column after migration"
+        );
+    }
+
+    #[test]
+    fn migration_v4_to_v5_converts_bot_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let (sender_id, sender_kind): (String, String) = conn
+            .query_row(
+                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(sender_id, "egopulse");
+        assert_eq!(sender_kind, "assistant");
+    }
+
+    #[test]
+    fn migration_v4_to_v5_converts_agent_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let (sender_id, sender_kind): (String, String) = conn
+            .query_row(
+                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(sender_id, "lyre");
+        assert_eq!(sender_kind, "assistant");
+    }
+
+    #[test]
+    fn migration_v4_to_v5_converts_user_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let (sender_id, sender_kind): (String, String) = conn
+            .query_row(
+                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(sender_id, "alice");
+        assert_eq!(sender_kind, "user");
+    }
+
+    #[test]
+    fn migration_v4_to_v5_converts_system_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let (sender_id, sender_kind): (String, String) = conn
+            .query_row(
+                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm4'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(sender_id, "system");
+        assert_eq!(sender_kind, "system");
+    }
+
+    #[test]
+    fn migration_v4_to_v5_preserves_recipient_agent_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let recipient: Option<String> = conn
+            .query_row(
+                "SELECT recipient_agent_id FROM messages WHERE id = 'm5'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(recipient.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn migration_v4_to_v5_preserves_data_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 5);
     }
 }
