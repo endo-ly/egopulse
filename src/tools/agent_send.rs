@@ -141,17 +141,14 @@ impl Tool for AgentSendTool {
         // 1. Save to Channel Log
         let message_id = uuid::Uuid::new_v4().to_string();
         let chat_id = context.chat_id;
-        let stored = StoredMessage {
-            id: message_id,
-            chat_id: context.channel_log_chat_id.unwrap_or(chat_id),
-            sender_name: "egopulse".to_string(),
-            content: display_text.clone(),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::AgentSend,
-            sender_agent_id: Some(context.agent_id.clone()),
-            recipient_agent_id: Some(target_id.clone()),
-        };
+        let mut stored = StoredMessage::tool(
+            context.channel_log_chat_id.unwrap_or(chat_id),
+            context.agent_id.clone(),
+            target_id.clone(),
+            display_text.clone(),
+        );
+        stored.id = message_id;
+        stored.message_kind = MessageKind::AgentSend;
 
         if let Err(error) = call_blocking(Arc::clone(&self.db), move |db| {
             db.store_message_only(&stored)
@@ -219,7 +216,7 @@ impl Tool for AgentSendTool {
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, AgentId};
-    use crate::storage::MessageKind;
+    use crate::storage::{MessageKind, SenderKind};
     use crate::test_util::test_config;
     use crate::tools::ToolExecutionContext;
     use serde_json::json;
@@ -550,7 +547,8 @@ mod tests {
         .await
         .expect("messages");
 
-        assert_eq!(messages[0].sender_agent_id.as_deref(), Some("lyre"));
+        assert_eq!(messages[0].sender_id, "lyre");
+        assert_eq!(messages[0].sender_kind, SenderKind::Tool);
         assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
     }
 }
@@ -559,7 +557,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::config::{AgentConfig, AgentId};
-    use crate::storage::{MessageKind, call_blocking};
+    use crate::storage::{MessageKind, SenderKind, call_blocking};
     use crate::test_util::test_config;
     use serde_json::json;
     use std::collections::HashMap;
@@ -703,7 +701,8 @@ mod integration_tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_kind, MessageKind::AgentSend);
-        assert_eq!(messages[0].sender_agent_id.as_deref(), Some("lyre"));
+        assert_eq!(messages[0].sender_id, "lyre");
+        assert_eq!(messages[0].sender_kind, SenderKind::Tool);
         assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
         assert!(messages[0].content.contains("[Lyre → Vega]"));
         assert!(messages[0].content.contains("check this design"));

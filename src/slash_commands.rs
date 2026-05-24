@@ -629,6 +629,7 @@ async fn handle_model_command(
             }
         }
     }
+
     config.save_config_with_secrets(path)?;
     let updated = Config::load_allow_missing_api_key(Some(path))?;
     let effective = resolved_for_scope(&updated, &scope)?;
@@ -740,7 +741,7 @@ mod tests {
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;
-    use crate::storage::{MessageKind, StoredMessage, call_blocking};
+    use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
     use super::{
         SlashCommandOutcome, all_commands, handle_slash_command, is_slash_command,
@@ -878,12 +879,11 @@ mod tests {
                     &StoredMessage {
                         id: "msg-1".to_string(),
                         chat_id,
-                        sender_name: "user".to_string(),
+                        sender_id: "user:cli:default".to_string(),
                         content: "hello".to_string(),
-                        is_from_bot: false,
+                        sender_kind: SenderKind::User,
                         timestamp: "2024-01-01T00:00:00Z".to_string(),
                         message_kind: MessageKind::Message,
-                        sender_agent_id: None,
                         recipient_agent_id: None,
                     },
                     r#"[{"role":"user","content":"hello"}]"#,
@@ -1440,5 +1440,12 @@ agents:
             }
             other => panic!("expected Respond with unknown fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn slash_command_cli_user_sets_user_kind() {
+        let msg = StoredMessage::user(1, "user:cli:default".to_string(), "/status".to_string());
+        assert_eq!(msg.sender_kind, SenderKind::User);
+        assert_eq!(msg.sender_id, "user:cli:default");
     }
 }
