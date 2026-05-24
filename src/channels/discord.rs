@@ -597,31 +597,32 @@ impl Handler {
         .await
         {
             Ok(chat_id) => {
+                let sender_id = format!("user:discord:{}", msg.author.id.get());
                 let stored = crate::storage::StoredMessage {
                     id: format!("cl-{}", msg.id.get()),
                     chat_id,
-                    sender_name: msg.author.name.clone(),
+                    sender_id,
                     content: text.to_string(),
-                    is_from_bot: false,
+                    sender_kind: crate::storage::SenderKind::User,
                     timestamp: msg.timestamp.to_string(),
                     message_kind: crate::storage::MessageKind::Message,
-                    sender_agent_id: None,
                     recipient_agent_id: None,
                 };
                 let db = std::sync::Arc::clone(&self.app_state.db);
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.lock_conn()?;
                     conn.execute(
-                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             stored.id,
                             stored.chat_id,
-                            stored.sender_name,
+                            stored.sender_id,
                             stored.content,
-                            stored.is_from_bot as i32,
+                            stored.sender_kind.to_string(),
                             stored.timestamp,
                             stored.message_kind.to_string(),
+                            stored.recipient_agent_id.as_deref(),
                         ],
                     )?;
                     Ok::<_, crate::error::StorageError>(())
@@ -2149,5 +2150,27 @@ mod tests {
 
         let result = route_responder_agent_id(&handler, 999, true, false);
         assert_eq!(result, Some("developer".to_string()));
+    }
+
+    // --- Sender ID / SenderKind tests (Step 6) ---
+
+    #[test]
+    fn discord_user_message_sender_id() {
+        let author_id: u64 = 123456789;
+        let sender_id = format!("user:discord:{author_id}");
+        assert!(sender_id.starts_with("user:discord:"));
+        assert!(sender_id.ends_with("123456789"));
+    }
+
+    #[test]
+    fn discord_stored_message_has_user_kind() {
+        let chat_id = 42;
+        let msg = crate::storage::StoredMessage::user(
+            chat_id,
+            "user:discord:123456789".to_string(),
+            "hello".to_string(),
+        );
+        assert_eq!(msg.sender_kind, crate::storage::SenderKind::User);
+        assert_eq!(msg.sender_id, "user:discord:123456789");
     }
 }
