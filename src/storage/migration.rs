@@ -399,6 +399,13 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                     let (sender_id, sender_kind) =
                         if row.is_from_bot != 0 && row.message_kind == "system_event" {
                             ("system".to_string(), "system")
+                        } else if row.is_from_bot != 0 && row.message_kind == "agent_send" {
+                            (
+                                row.sender_agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| row.sender_name.clone()),
+                                "tool",
+                            )
                         } else if row.is_from_bot != 0 && row.sender_agent_id.is_some() {
                             (row.sender_agent_id.clone().unwrap(), "assistant")
                         } else if row.is_from_bot != 0 {
@@ -1014,5 +1021,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn migration_v4_to_v5_converts_agent_send_to_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v4_db(&dir);
+
+        {
+            let conn = db.conn.lock().expect("lock");
+            seed_v4_messages(&conn);
+        }
+
+        run_v5_migration(&db);
+
+        let conn = db.conn.lock().expect("lock");
+        let (sender_id, sender_kind): (String, String) = conn
+            .query_row(
+                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm5'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(sender_id, "lyre");
+        assert_eq!(sender_kind, "tool");
     }
 }

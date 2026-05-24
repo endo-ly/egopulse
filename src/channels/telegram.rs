@@ -816,9 +816,14 @@ async fn handle_message(
         .unwrap_or_else(|| "unknown".to_string());
 
     let storage_sender_id = msg
-        .from
+        .sender_chat
         .as_ref()
-        .map(|u| format!("user:telegram:{}", u.id.0))
+        .map(|chat| format!("chat:telegram:{}", chat.id.0))
+        .or_else(|| {
+            msg.from
+                .as_ref()
+                .map(|u| format!("user:telegram:{}", u.id.0))
+        })
         .unwrap_or_else(|| "user:telegram:unknown".to_string());
 
     let thread = raw_chat_id.to_string();
