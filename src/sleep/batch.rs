@@ -12,7 +12,7 @@ use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{
     AgentSessionInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, MemoryFile,
-    SleepRunTrigger, StoredMessage, call_blocking,
+    SleepRunTrigger, call_blocking,
 };
 
 /// Ratio of context window used as overflow threshold for sleep batch input.
@@ -153,26 +153,11 @@ struct ExtractedEvent {
     body_md: String,
     ripple_strength: i64,
     certainty: EpisodeEventCertainty,
-    source_message_ids: Vec<String>,
-    source_refs_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ExtractEventsOutput {
     events: Vec<ExtractedEvent>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SourceRef {
-    chat_id: i64,
-    message_id: String,
-    timestamp: String,
-    role: String,
-}
-
-struct ExtractionChunk {
-    text: String,
-    message_map: std::collections::HashMap<String, SourceRef>,
 }
 
 /// Builds the sleep prompt input by loading memory and session data.
@@ -551,30 +536,6 @@ fn parse_extract_events_response(response: &str) -> Result<ExtractEventsOutput, 
         let certainty =
             EpisodeEventCertainty::from_str(certainty_str).map_err(SleepBatchError::ParseFailed)?;
 
-        let source_message_ids = match obj.get("source_message_ids") {
-            Some(v) => v
-                .as_array()
-                .ok_or_else(|| {
-                    SleepBatchError::ParseFailed(format!(
-                        "events[{i}]: source_message_ids must be an array"
-                    ))
-                })?
-                .iter()
-                .map(|item| {
-                    item.as_str().map(String::from).ok_or_else(|| {
-                        SleepBatchError::ParseFailed(format!(
-                            "events[{i}]: source_message_ids must contain strings"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            None => {
-                return Err(SleepBatchError::ParseFailed(format!(
-                    "events[{i}]: missing source_message_ids"
-                )));
-            }
-        };
-
         events.push(ExtractedEvent {
             experienced_at,
             kind,
@@ -582,8 +543,6 @@ fn parse_extract_events_response(response: &str) -> Result<ExtractEventsOutput, 
             body_md,
             ripple_strength,
             certainty,
-            source_message_ids,
-            source_refs_json: None,
         });
     }
 
@@ -674,133 +633,41 @@ async fn send_extract_events_request(
 }
 
 #[allow(dead_code)]
-fn build_extraction_chunks(messages: &[StoredMessage], max_chars: usize) -> Vec<ExtractionChunk> {
-    if messages.is_empty() {
-        return vec![ExtractionChunk {
-            text: String::new(),
-            message_map: std::collections::HashMap::new(),
-        }];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current_text = String::new();
-    let mut current_map = std::collections::HashMap::new();
-
-    for msg in messages {
-        let escaped_content = escape_xml_content(&msg.content);
-        let xml_line = format!(
-            "<message id=\"{}\" ts=\"{}\" role=\"{}\">{}</message>",
-            msg.id, msg.timestamp, msg.sender_name, escaped_content
-        );
-        let line_len = xml_line.len();
-
-        if !current_text.is_empty() && current_text.len().saturating_add(line_len) > max_chars {
-            chunks.push(ExtractionChunk {
-                text: std::mem::take(&mut current_text),
-                message_map: std::mem::take(&mut current_map),
-            });
-        }
-
-        // Truncate oversized single messages to max_chars to avoid unbounded chunks.
-        let xml_line = if line_len > max_chars {
-            let truncated = format!(
-                "<message id=\"{}\" ts=\"{}\" role=\"{}\">{}</message>",
-                msg.id,
-                msg.timestamp,
-                msg.sender_name,
-                &escaped_content[..escaped_content
-                    .char_indices()
-                    .nth(max_chars.saturating_sub(80).max(100))
-                    .map_or(escaped_content.len(), |(i, _)| i)]
-            );
-            warn!(
-                message_id = %msg.id,
-                original_len = line_len,
-                max_chars,
-                "message exceeds max_chars, truncating"
-            );
-            truncated
-        } else {
-            xml_line
-        };
-
-        current_text.push_str(&xml_line);
-        current_text.push('\n');
-        current_map.insert(
-            msg.id.clone(),
-            SourceRef {
-                chat_id: msg.chat_id,
-                message_id: msg.id.clone(),
-                timestamp: msg.timestamp.clone(),
-                role: msg.sender_name.clone(),
-            },
-        );
-    }
-
-    if !current_text.is_empty() || current_map.is_empty() {
-        chunks.push(ExtractionChunk {
-            text: current_text,
-            message_map: current_map,
-        });
-    }
-
-    if chunks.is_empty() {
-        chunks.push(ExtractionChunk {
-            text: String::new(),
-            message_map: std::collections::HashMap::new(),
-        });
-    }
-
-    chunks
-}
-
-#[allow(dead_code)]
 async fn run_extract_events_for_chunks(
     provider: &Arc<dyn LlmProvider>,
     agent_id: &str,
-    chunks: Vec<ExtractionChunk>,
+    session_chunks: Vec<String>,
+    total_chunks: usize,
 ) -> Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> {
     let mut all_events = Vec::new();
     let mut total_input = 0_i64;
     let mut total_output = 0_i64;
-    let total_chunks = chunks.len();
 
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let system_prompt = build_extract_system_prompt(agent_id, &chunk.text);
-        let (output, in_tok, out_tok) = send_extract_events_request(
+    for (index, sessions_text) in session_chunks.into_iter().enumerate() {
+        let system_prompt = build_extract_system_prompt(agent_id, &sessions_text);
+        match send_extract_events_request(
             provider,
             agent_id,
             &system_prompt,
             index + 1,
             total_chunks,
         )
-        .await?;
-
-        total_input = total_input.saturating_add(in_tok);
-        total_output = total_output.saturating_add(out_tok);
-
-        for mut ev in output.events {
-            let mut refs = Vec::new();
-            for mid in &ev.source_message_ids {
-                match chunk.message_map.get(mid) {
-                    Some(sr) => refs.push(sr.clone()),
-                    None => {
-                        warn!(
-                            agent_id = %agent_id,
-                            message_id = %mid,
-                            "unknown source_message_id in extracted event, skipping"
-                        );
-                    }
-                }
+        .await
+        {
+            Ok((output, in_tok, out_tok)) => {
+                total_input = total_input.saturating_add(in_tok);
+                total_output = total_output.saturating_add(out_tok);
+                all_events.extend(output.events);
             }
-
-            ev.source_refs_json = if refs.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&refs).unwrap_or_else(|_| "[]".to_string()))
-            };
-            ev.source_message_ids = refs.into_iter().map(|r| r.message_id).collect();
-            all_events.push(ev);
+            Err(e) => {
+                warn!(
+                    agent_id = %agent_id,
+                    chunk_index = index + 1,
+                    total_chunks,
+                    error = %e,
+                    "event extraction failed for chunk, skipping"
+                );
+            }
         }
     }
 
@@ -1044,16 +911,11 @@ async fn execute_batch(
         let memory_before = state.memory_loader.load(agent_id);
         save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
 
-        // 5. Call 1: Event Extraction (best-effort)
+        // 5. Call 1: Event Extraction (best-effort, reuses session_chunks)
         let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
-            let mut all_messages = Vec::new();
-            for session in sessions {
-                let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
-                all_messages.extend(snapshot.recent_messages);
-            }
-            let max_chars = chunk_session_tokens.saturating_mul(ESTIMATED_CHARS_PER_TOKEN);
-            let chunks = build_extraction_chunks(&all_messages, max_chars);
-            run_extract_events_for_chunks(&provider, agent_id, chunks).await
+            let total_chunks = session_chunks.len();
+            run_extract_events_for_chunks(&provider, agent_id, session_chunks.clone(), total_chunks)
+                .await
         }
         .await;
 
@@ -1076,7 +938,7 @@ async fn execute_batch(
                             ripple_strength: e.ripple_strength,
                             certainty: e.certainty,
                             sleep_run_id: run_id_for_insert.clone(),
-                            source_refs_json: e.source_refs_json,
+                            source_refs_json: None,
                             created_at: now.clone(),
                             updated_at: now.clone(),
                         })
@@ -2982,8 +2844,7 @@ mod tests {
                 "title": "arch change",
                 "body_md": "Decided to move to SQLite.",
                 "ripple_strength": 4,
-                "certainty": "observed",
-                "source_message_ids": ["m1", "m2"]
+                "certainty": "observed"
             }]
         })
         .to_string();
@@ -2997,7 +2858,6 @@ mod tests {
         assert_eq!(ev.body_md, "Decided to move to SQLite.");
         assert_eq!(ev.ripple_strength, 4);
         assert_eq!(ev.certainty, EpisodeEventCertainty::Observed);
-        assert_eq!(ev.source_message_ids, vec!["m1", "m2"]);
     }
 
     #[test]
@@ -3016,8 +2876,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 3,
-                "certainty": "observed",
-                "source_message_ids": []
+                "certainty": "observed"
             }]
         })
         .to_string();
@@ -3034,8 +2893,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 6,
-                "certainty": "observed",
-                "source_message_ids": []
+                "certainty": "observed"
             }]
         })
         .to_string();
@@ -3052,8 +2910,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 3,
-                "certainty": "definite",
-                "source_message_ids": []
+                "certainty": "definite"
             }]
         })
         .to_string();
@@ -3070,8 +2927,7 @@ mod tests {
                 "title": "learned",
                 "body_md": "learned something new",
                 "ripple_strength": 2,
-                "certainty": "inferred",
-                "source_message_ids": []
+                "certainty": "inferred"
             }]
         })
         .to_string();
@@ -3090,8 +2946,7 @@ mod tests {
                 "title": "error",
                 "body_md": "unexpected crash",
                 "ripple_strength": 5,
-                "certainty": "observed",
-                "source_message_ids": ["x"]
+                "certainty": "observed"
             }]
         })
         .to_string();
@@ -3120,62 +2975,6 @@ mod tests {
         assert!(prompt.contains("`decision`"));
         assert!(prompt.contains("`insight`"));
         assert!(prompt.contains("`rhythm`"));
-    }
-
-    #[test]
-    fn parse_extract_events_valid_source_message_ids() {
-        let response = serde_json::json!({
-            "events": [{
-                "experienced_at": "2025-01-01T00:00:00Z",
-                "kind": "world",
-                "title": "t",
-                "body_md": "b",
-                "ripple_strength": 3,
-                "certainty": "observed",
-                "source_message_ids": ["msg-a", "msg-b", "msg-c"]
-            }]
-        })
-        .to_string();
-        let output = parse_extract_events_response(&response).expect("should parse");
-        assert_eq!(
-            output.events[0].source_message_ids,
-            vec!["msg-a", "msg-b", "msg-c"]
-        );
-    }
-
-    #[test]
-    fn parse_extract_events_empty_source_message_ids() {
-        let response = serde_json::json!({
-            "events": [{
-                "experienced_at": "2025-01-01T00:00:00Z",
-                "kind": "rhythm",
-                "title": "t",
-                "body_md": "b",
-                "ripple_strength": 1,
-                "certainty": "uncertain",
-                "source_message_ids": []
-            }]
-        })
-        .to_string();
-        let output = parse_extract_events_response(&response).expect("should parse");
-        assert!(output.events[0].source_message_ids.is_empty());
-    }
-
-    #[test]
-    fn parse_extract_events_missing_source_message_ids() {
-        let response = serde_json::json!({
-            "events": [{
-                "experienced_at": "2025-01-01T00:00:00Z",
-                "kind": "self",
-                "title": "t",
-                "body_md": "b",
-                "ripple_strength": 3,
-                "certainty": "observed"
-            }]
-        })
-        .to_string();
-        let err = parse_extract_events_response(&response).expect_err("should fail");
-        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -3235,8 +3034,7 @@ mod tests {
                 "title": "test event",
                 "body_md": "decided to test",
                 "ripple_strength": 3,
-                "certainty": "observed",
-                "source_message_ids": ["m-1"]
+                "certainty": "observed"
             }]
         })
         .to_string();
@@ -3327,10 +3125,6 @@ mod tests {
         // Verify sleep_run_id linkage
         assert_eq!(events[0].sleep_run_id, runs[0].id);
         assert_eq!(events[1].sleep_run_id, runs[0].id);
-
-        // Verify non-empty source_refs_json (mapped from message IDs)
-        assert!(events[0].source_refs_json.is_some());
-        assert!(events[1].source_refs_json.is_some());
     }
 
     #[tokio::test]
@@ -3379,8 +3173,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 2,
-                "certainty": "observed",
-                "source_message_ids": ["m-1"]
+                "certainty": "observed"
             }]
         })
         .to_string();
