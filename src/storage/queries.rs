@@ -3053,7 +3053,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 3,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3062,7 +3062,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
         ];
@@ -3083,7 +3083,7 @@ mod tests {
             "2025-01-10T10:00:00Z",
             EpisodeEventKind::Self_,
             3,
-            EpisodeEventCertainty::Observed,
+            EpisodeEventCertainty::Stated,
             "run-1",
         )];
 
@@ -3096,7 +3096,7 @@ mod tests {
             "2025-01-11T10:00:00Z",
             EpisodeEventKind::World,
             4,
-            EpisodeEventCertainty::Inferred,
+            EpisodeEventCertainty::Derived,
             "run-1",
         )];
 
@@ -3121,7 +3121,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 3,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3130,7 +3130,7 @@ mod tests {
                 "2025-01-12T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
             make_event(
@@ -3139,7 +3139,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::Relationship,
                 2,
-                EpisodeEventCertainty::Uncertain,
+                EpisodeEventCertainty::Tentative,
                 "run-1",
             ),
         ];
@@ -3167,7 +3167,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 3,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3176,7 +3176,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
             make_event(
@@ -3185,7 +3185,7 @@ mod tests {
                 "2025-01-12T10:00:00Z",
                 EpisodeEventKind::World,
                 5,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
         ];
@@ -3215,7 +3215,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 2,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3224,7 +3224,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
             make_event(
@@ -3233,7 +3233,7 @@ mod tests {
                 "2025-01-12T10:00:00Z",
                 EpisodeEventKind::Feat,
                 5,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
         ];
@@ -3259,7 +3259,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 3,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3268,7 +3268,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
         ];
@@ -3278,7 +3278,7 @@ mod tests {
             "2025-01-10T10:00:00Z",
             EpisodeEventKind::Feat,
             5,
-            EpisodeEventCertainty::Observed,
+            EpisodeEventCertainty::Stated,
             "run-2",
         )];
 
@@ -3303,7 +3303,7 @@ mod tests {
                 "2025-01-10T10:00:00Z",
                 EpisodeEventKind::Self_,
                 3,
-                EpisodeEventCertainty::Observed,
+                EpisodeEventCertainty::Stated,
                 "run-1",
             ),
             make_event(
@@ -3312,7 +3312,7 @@ mod tests {
                 "2025-01-11T10:00:00Z",
                 EpisodeEventKind::World,
                 4,
-                EpisodeEventCertainty::Inferred,
+                EpisodeEventCertainty::Derived,
                 "run-1",
             ),
         ];
@@ -3322,7 +3322,7 @@ mod tests {
             "2025-01-12T10:00:00Z",
             EpisodeEventKind::Feat,
             5,
-            EpisodeEventCertainty::Observed,
+            EpisodeEventCertainty::Stated,
             "run-2",
         )];
 

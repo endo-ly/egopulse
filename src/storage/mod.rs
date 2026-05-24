@@ -384,17 +384,20 @@ impl FromStr for EpisodeEventKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpisodeEventCertainty {
-    Observed,
-    Inferred,
-    Uncertain,
+    /// Conclusion explicitly stated in conversation.
+    Stated,
+    /// Conclusion derived from multiple messages / patterns.
+    Derived,
+    /// Tentative hypothesis with weak evidence.
+    Tentative,
 }
 
 impl fmt::Display for EpisodeEventCertainty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Observed => write!(f, "observed"),
-            Self::Inferred => write!(f, "inferred"),
-            Self::Uncertain => write!(f, "uncertain"),
+            Self::Stated => write!(f, "stated"),
+            Self::Derived => write!(f, "derived"),
+            Self::Tentative => write!(f, "tentative"),
         }
     }
 }
@@ -404,9 +407,9 @@ impl FromStr for EpisodeEventCertainty {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "observed" => Ok(Self::Observed),
-            "inferred" => Ok(Self::Inferred),
-            "uncertain" => Ok(Self::Uncertain),
+            "stated" => Ok(Self::Stated),
+            "derived" => Ok(Self::Derived),
+            "tentative" => Ok(Self::Tentative),
             other => Err(format!("invalid episode event certainty: {other}")),
         }
     }
@@ -703,24 +706,24 @@ mod tests {
 
     #[test]
     fn episode_event_certainty_display() {
-        assert_eq!(EpisodeEventCertainty::Observed.to_string(), "observed");
-        assert_eq!(EpisodeEventCertainty::Inferred.to_string(), "inferred");
-        assert_eq!(EpisodeEventCertainty::Uncertain.to_string(), "uncertain");
+        assert_eq!(EpisodeEventCertainty::Stated.to_string(), "stated");
+        assert_eq!(EpisodeEventCertainty::Derived.to_string(), "derived");
+        assert_eq!(EpisodeEventCertainty::Tentative.to_string(), "tentative");
     }
 
     #[test]
     fn episode_event_certainty_from_str_valid() {
         assert_eq!(
-            EpisodeEventCertainty::from_str("observed").unwrap(),
-            EpisodeEventCertainty::Observed
+            EpisodeEventCertainty::from_str("stated").unwrap(),
+            EpisodeEventCertainty::Stated
         );
         assert_eq!(
-            EpisodeEventCertainty::from_str("inferred").unwrap(),
-            EpisodeEventCertainty::Inferred
+            EpisodeEventCertainty::from_str("derived").unwrap(),
+            EpisodeEventCertainty::Derived
         );
         assert_eq!(
-            EpisodeEventCertainty::from_str("uncertain").unwrap(),
-            EpisodeEventCertainty::Uncertain
+            EpisodeEventCertainty::from_str("tentative").unwrap(),
+            EpisodeEventCertainty::Tentative
         );
     }
 

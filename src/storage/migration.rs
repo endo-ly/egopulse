@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -47,6 +47,33 @@ fn set_schema_version(conn: &Connection, version: i64, note: &str) -> Result<(),
         [],
     )?;
     conn.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
+         VALUES(?1, ?2, ?3)",
+        params![version, chrono::Utc::now().to_rfc3339(), note],
+    )?;
+    Ok(())
+}
+
+/// Transaction 内でスキーマバージョンを更新する。
+fn set_schema_version_in_tx(
+    tx: &rusqlite::Transaction,
+    version: i64,
+    note: &str,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO db_meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![version.to_string()],
+    )?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            note TEXT
+        )",
+        [],
+    )?;
+    tx.execute(
         "INSERT OR REPLACE INTO schema_migrations(version, applied_at, note)
          VALUES(?1, ?2, ?3)",
         params![version, chrono::Utc::now().to_rfc3339(), note],
@@ -228,7 +255,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 title            TEXT NOT NULL,
                 body_md          TEXT NOT NULL,
                 ripple_strength  INTEGER NOT NULL DEFAULT 3,
-                certainty        TEXT NOT NULL DEFAULT 'observed',
+                certainty        TEXT NOT NULL DEFAULT 'stated',
                 sleep_run_id     TEXT NOT NULL,
                 source_refs_json TEXT,
                 created_at       TEXT NOT NULL,
@@ -238,7 +265,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                     'anomaly', 'decision', 'insight', 'rhythm'
                 )),
                 CHECK (ripple_strength BETWEEN 1 AND 5),
-                CHECK (certainty IN ('observed', 'inferred', 'uncertain'))
+                CHECK (certainty IN ('stated', 'derived', 'tentative'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
@@ -255,6 +282,57 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         )?;
         set_schema_version(conn, 3, "add episode_events table")?;
         version = 3;
+    }
+
+    if version < 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "UPDATE episode_events SET certainty = 'stated' WHERE certainty = 'observed';
+             UPDATE episode_events SET certainty = 'derived' WHERE certainty = 'inferred';
+             UPDATE episode_events SET certainty = 'tentative' WHERE certainty = 'uncertain';
+
+             CREATE TABLE episode_events_v4 (
+                 id               TEXT PRIMARY KEY,
+                 agent_id         TEXT NOT NULL,
+                 experienced_at   TEXT NOT NULL,
+                 encoded_at       TEXT NOT NULL,
+                 kind             TEXT NOT NULL,
+                 title            TEXT NOT NULL,
+                 body_md          TEXT NOT NULL,
+                 ripple_strength  INTEGER NOT NULL DEFAULT 3,
+                 certainty        TEXT NOT NULL DEFAULT 'stated',
+                 sleep_run_id     TEXT NOT NULL,
+                 source_refs_json TEXT,
+                 created_at       TEXT NOT NULL,
+                 updated_at       TEXT NOT NULL,
+                 CHECK (kind IN (
+                     'self', 'relationship', 'world', 'feat',
+                     'anomaly', 'decision', 'insight', 'rhythm'
+                 )),
+                 CHECK (ripple_strength BETWEEN 1 AND 5),
+                 CHECK (certainty IN ('stated', 'derived', 'tentative'))
+             );
+
+             INSERT INTO episode_events_v4 SELECT * FROM episode_events;
+             DROP TABLE episode_events;
+             ALTER TABLE episode_events_v4 RENAME TO episode_events;
+
+             CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
+                 ON episode_events(agent_id, experienced_at);
+             CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced
+                 ON episode_events(agent_id, kind, experienced_at);
+             CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced
+                 ON episode_events(agent_id, ripple_strength, experienced_at);
+             CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
+                 ON episode_events(sleep_run_id);",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            4,
+            "rename certainty values: observed→stated, inferred→derived, uncertain→tentative",
+        )?;
+        tx.commit()?;
+        version = 4;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");

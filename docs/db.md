@@ -544,7 +544,7 @@ CREATE TABLE IF NOT EXISTS episode_events (
     title            TEXT NOT NULL,
     body_md          TEXT NOT NULL,
     ripple_strength  INTEGER NOT NULL DEFAULT 3,
-    certainty        TEXT NOT NULL DEFAULT 'observed',
+    certainty        TEXT NOT NULL DEFAULT 'stated',
     sleep_run_id     TEXT NOT NULL,
     source_refs_json TEXT,
     created_at       TEXT NOT NULL,
@@ -554,7 +554,7 @@ CREATE TABLE IF NOT EXISTS episode_events (
         'anomaly', 'decision', 'insight', 'rhythm'
     )),
     CHECK (ripple_strength BETWEEN 1 AND 5),
-    CHECK (certainty IN ('observed', 'inferred', 'uncertain'))
+    CHECK (certainty IN ('stated', 'derived', 'tentative'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
@@ -580,7 +580,7 @@ CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
 | title | TEXT | NOT NULL | 短い見出し |
 | body_md | TEXT | NOT NULL | Markdown 本文 |
 | ripple_strength | INTEGER | NOT NULL DEFAULT 3 | 再活性化強さ（1〜5） |
-| certainty | TEXT | NOT NULL DEFAULT 'observed' | 断定度 |
+| certainty | TEXT | NOT NULL DEFAULT 'stated' | 断定度 |
 | sleep_run_id | TEXT | NOT NULL | 抽出元 Sleep Run ID |
 | source_refs_json | TEXT | nullable | 根拠メッセージ参照（JSON 配列） |
 | created_at | TEXT | NOT NULL | DB管理用作成時刻（RFC3339） |
@@ -591,7 +591,7 @@ CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
 |------|--------|
 | kind | `'self'`, `'relationship'`, `'world'`, `'feat'`, `'anomaly'`, `'decision'`, `'insight'`, `'rhythm'` のいずれか |
 | ripple_strength | 1 以上 5 以下 |
-| certainty | `'observed'`, `'inferred'`, `'uncertain'` のいずれか |
+| certainty | `'stated'`, `'derived'`, `'tentative'` のいずれか |
 
 **操作**:
 - `insert_episode_events(run_id, events)` — batch INSERT（同一 run_id の既存レコードを先に DELETE）
@@ -669,7 +669,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | `MemorySnapshot` | memory_snapshots | id, run_id, agent_id, file, content_before, content_after, created_at |
 | `EpisodeEvent` | episode_events | id, agent_id, experienced_at, encoded_at, kind, title, body_md, ripple_strength, certainty, sleep_run_id, source_refs_json, created_at, updated_at |
 | `EpisodeEventKind` | — | 8種の enum: `Self_`, `Relationship`, `World`, `Feat`, `Anomaly`, `Decision`, `Insight`, `Rhythm`（SQL: `self`, `relationship`, `world`, `feat`, `anomaly`, `decision`, `insight`, `rhythm`） |
-| `EpisodeEventCertainty` | — | 3種の enum: `Observed`, `Inferred`, `Uncertain`（SQL: `observed`, `inferred`, `uncertain`） |
+| `EpisodeEventCertainty` | — | 3種の enum: `Stated`, `Derived`, `Tentative`（SQL: `stated`, `derived`, `tentative`） |
 
 ---
 
@@ -789,7 +789,7 @@ CREATE TABLE IF NOT EXISTS episode_events (
     title            TEXT NOT NULL,
     body_md          TEXT NOT NULL,
     ripple_strength  INTEGER NOT NULL DEFAULT 3,
-    certainty        TEXT NOT NULL DEFAULT 'observed',
+    certainty        TEXT NOT NULL DEFAULT 'stated',
     sleep_run_id     TEXT NOT NULL,
     source_refs_json TEXT,
     created_at       TEXT NOT NULL,
@@ -797,7 +797,7 @@ CREATE TABLE IF NOT EXISTS episode_events (
     CHECK (kind IN ('self', 'relationship', 'world', 'feat',
                     'anomaly', 'decision', 'insight', 'rhythm')),
     CHECK (ripple_strength BETWEEN 1 AND 5),
-    CHECK (certainty IN ('observed', 'inferred', 'uncertain'))
+    CHECK (certainty IN ('stated', 'derived', 'tentative'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced

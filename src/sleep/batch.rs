@@ -2844,7 +2844,7 @@ mod tests {
                 "title": "arch change",
                 "body_md": "Decided to move to SQLite.",
                 "ripple_strength": 4,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();
@@ -2857,7 +2857,7 @@ mod tests {
         assert_eq!(ev.title, "arch change");
         assert_eq!(ev.body_md, "Decided to move to SQLite.");
         assert_eq!(ev.ripple_strength, 4);
-        assert_eq!(ev.certainty, EpisodeEventCertainty::Observed);
+        assert_eq!(ev.certainty, EpisodeEventCertainty::Stated);
     }
 
     #[test]
@@ -2876,7 +2876,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 3,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();
@@ -2893,7 +2893,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 6,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();
@@ -2927,7 +2927,7 @@ mod tests {
                 "title": "learned",
                 "body_md": "learned something new",
                 "ripple_strength": 2,
-                "certainty": "inferred"
+                "certainty": "derived"
             }]
         })
         .to_string();
@@ -2946,7 +2946,7 @@ mod tests {
                 "title": "error",
                 "body_md": "unexpected crash",
                 "ripple_strength": 5,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();
@@ -3034,7 +3034,7 @@ mod tests {
                 "title": "test event",
                 "body_md": "decided to test",
                 "ripple_strength": 3,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();
@@ -3078,7 +3078,7 @@ mod tests {
                     "title": "learned rust",
                     "body_md": "discovered ownership model",
                     "ripple_strength": 4,
-                    "certainty": "observed",
+                    "certainty": "stated",
                     "source_message_ids": ["m-2"]
                 },
                 {
@@ -3087,7 +3087,7 @@ mod tests {
                     "title": "unexpected error",
                     "body_md": "crash on startup",
                     "ripple_strength": 5,
-                    "certainty": "inferred",
+                    "certainty": "derived",
                     "source_message_ids": ["m-3"]
                 }
             ]
@@ -3117,7 +3117,7 @@ mod tests {
         assert_eq!(events[0].title, "unexpected error"); // ordered by experienced_at DESC
         assert_eq!(events[0].kind, EpisodeEventKind::Anomaly);
         assert_eq!(events[0].ripple_strength, 5);
-        assert_eq!(events[0].certainty, EpisodeEventCertainty::Inferred);
+        assert_eq!(events[0].certainty, EpisodeEventCertainty::Derived);
         assert_eq!(events[1].title, "learned rust");
         assert_eq!(events[1].kind, EpisodeEventKind::Insight);
         assert_eq!(events[1].body_md, "discovered ownership model");
@@ -3173,7 +3173,7 @@ mod tests {
                 "title": "t",
                 "body_md": "b",
                 "ripple_strength": 2,
-                "certainty": "observed"
+                "certainty": "stated"
             }]
         })
         .to_string();

@@ -100,7 +100,7 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
 | `title` | string | エピソード記憶の見出し |
 | `body_md` | string | エピソード記憶本文（Markdown） |
 | `ripple_strength` | integer | 1（弱）〜 5（強） |
-| `certainty` | string | `observed` / `inferred` / `uncertain` |
+| `certainty` | string | `stated` / `derived` / `tentative` |
 | `source_message_ids` | array of string | 実際に存在する `<message id="...">` の `id` 属性値のみ。推測で id を作ってはいけない。該当なしは `[]` |
 
 ---
@@ -125,11 +125,14 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
 
 ### certainty
 
-| 値 | 意味 |
-|---|---|
-| `observed` | ユーザー発言、アシスタント出力、tool result、ログから直接確認できる |
-| `inferred` | 文脈から合理的に推測できるが、明示はされていない |
-| `uncertain` | 根拠が弱い、曖昧、または注意が必要 |
+イベントの**結論そのもの**がどれだけ確かかを表す。
+会話ログに登場したというだけで `stated` にしてはいけない。
+
+| 値 | 意味 | 判断基準 |
+|---|---|---|
+| `stated` | 結論が会話中で明示的に述べられている | ユーザーが「〜に決めた」「〜だ」と直接発言している、またはアシスタントが明示的に結論を出力している。**単一のメッセージを指して「この発言が根拠だ」と言える**場合のみ |
+| `derived` | 複数のメッセージを繋げて初めて導ける結論 | 明示はされていないが、発言の積み重ね・行動のパターン・暗黙の前提から合理的に推測できる。**多くのイベントはこれに該当する** |
+| `tentative` | 根拠が弱い、または断言を避けるべき | 単発の弱いシグナルだけ、解釈が分かれる、前提が崩れる可能性がある。 |
 
 ---
 
@@ -158,8 +161,26 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
       "title": "メモリアーキテクチャの変更を決定",
       "body_md": "これまで SQLite ベースで管理していた記憶を、ファイルベースに移行することが合意された。\n\n主な理由はスキーマ変更の運用コストで、移行によってマイグレーション不要になる見込み。\n次回の Sleep Batch から新形式での書き込みを開始する。",
       "ripple_strength": 4,
-      "certainty": "observed",
+      "certainty": "stated",
       "source_message_ids": ["msg-001", "msg-003"]
+    },
+    {
+      "experienced_at": "2025-05-20T15:00:00Z",
+      "kind": "insight",
+      "title": "ユーザーはCLIツールを好む傾向がある",
+      "body_md": "ここ数日の会話で、ユーザーはGUIよりもCLIツールを選ぶ傾向が見られる。\n明言はされていないが、ツール選定のたびにCLI版が選ばれている。",
+      "ripple_strength": 3,
+      "certainty": "derived",
+      "source_message_ids": ["msg-010", "msg-015", "msg-022"]
+    },
+    {
+      "experienced_at": "2025-05-20T16:00:00Z",
+      "kind": "rhythm",
+      "title": "ユーザーは午前中に活動的な可能性がある",
+      "body_md": "今日の会話は午前中に集中していた。ただし1日分のデータしかないため、傾向と断言するには早い。",
+      "ripple_strength": 1,
+      "certainty": "tentative",
+      "source_message_ids": []
     }
   ]
 }
