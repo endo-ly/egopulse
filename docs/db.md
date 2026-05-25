@@ -48,9 +48,9 @@ egopulse.db (SQLite / WAL mode)
 │    chats         │1    * │    messages      │
 │──────────────────│───────│──────────────────│
 │ chat_id (PK)     │       │ (id, chat_id) PK │
-│ chat_title       │       │ sender_name      │
+│ chat_title       │       │ sender_id        │
 │ chat_type        │       │ content          │
-│ last_message_time│       │ is_from_bot      │
+│ last_message_time│       │ sender_kind      │
 │ channel          │       │ timestamp        │
 │ external_chat_id │       └──────────────────┘
 │ agent_id         │
@@ -208,12 +208,11 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
-    sender_name TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
     content TEXT NOT NULL,
-    is_from_bot INTEGER NOT NULL DEFAULT 0,
+    sender_kind TEXT NOT NULL DEFAULT 'user',
     timestamp TEXT NOT NULL,
     message_kind TEXT NOT NULL DEFAULT 'message',
-    sender_agent_id TEXT,
     recipient_agent_id TEXT,
     PRIMARY KEY (id, chat_id)
 );
@@ -226,12 +225,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 |--------|----|------|------|
 | id | TEXT | PK（複合） | プラットフォーム固有のメッセージID |
 | chat_id | INTEGER | PK（複合） | chats.chat_id への参照 |
-| sender_name | TEXT | NOT NULL | 送信者表示名 |
+| sender_id | TEXT | NOT NULL | 統一送信者識別子（例: `"lyre"`, `"user:discord:123"`, `"system"`, `"pulse"`） |
 | content | TEXT | NOT NULL | メッセージ本文 |
-| is_from_bot | INTEGER | NOT NULL DEFAULT 0 | ボット発言フラグ（0/1） |
+| sender_kind | TEXT | NOT NULL DEFAULT 'user' | 送信者種別（`user`, `assistant`, `system`, `tool`） |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 | message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`） |
-| sender_agent_id | TEXT | nullable | 送信エージェント ID。Multi-Agent Room で使用 |
 | recipient_agent_id | TEXT | nullable | 受信エージェント ID。Multi-Agent Room で使用 |
 
 **操作**:
@@ -245,8 +243,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 | 値 | 説明 |
 |----|------|
 | `message` | 通常のチャットメッセージ（デフォルト） |
-| `agent_send` | エージェント間通信。`sender_agent_id` に送信元、`recipient_agent_id` に宛先エージェント ID が設定される |
-| `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_name` は `"system"`、`is_from_bot` は `true`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
+| `agent_send` | エージェント間通信。`sender_kind` は `tool`、`recipient_agent_id` に宛先エージェント ID が設定される |
+| `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_id` は `"system"`、`sender_kind` は `system`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
 
 ---
 
@@ -656,7 +654,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 | 構造体 | テーブル | フィールド |
 |--------|----------|-----------|
-| `StoredMessage` | messages | id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id |
+| `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id |
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
 | `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |

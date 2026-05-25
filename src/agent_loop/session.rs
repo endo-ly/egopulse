@@ -10,7 +10,7 @@ use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, MessageContentPart};
 use crate::runtime::AppState;
-use crate::storage::{SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
+use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.
@@ -71,14 +71,12 @@ pub(crate) async fn load_session_messages(
     Ok(history
         .into_iter()
         .map(|message| {
-            Message::text(
-                if message.is_from_bot {
-                    "assistant"
-                } else {
-                    "user"
-                },
-                message.content,
-            )
+            let role = match message.sender_kind {
+                SenderKind::Assistant | SenderKind::Tool => "assistant",
+                SenderKind::User => "user",
+                SenderKind::System => "system",
+            };
+            Message::text(role, message.content)
         })
         .collect())
 }
@@ -260,14 +258,12 @@ fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
             .recent_messages
             .iter()
             .map(|message| {
-                Message::text(
-                    if message.is_from_bot {
-                        "assistant"
-                    } else {
-                        "user"
-                    },
-                    message.content.clone(),
-                )
+                let role = match message.sender_kind {
+                    SenderKind::Assistant | SenderKind::Tool => "assistant",
+                    SenderKind::User => "user",
+                    SenderKind::System => "system",
+                };
+                Message::text(role, message.content.clone())
             })
             .collect(),
         session_updated_at: snapshot.updated_at.clone(),
@@ -434,7 +430,7 @@ mod tests {
         LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,
     };
     use crate::runtime::AppState;
-    use crate::storage::{MessageKind, StoredMessage, call_blocking};
+    use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
     struct FakeProvider {
         response: String,
@@ -515,12 +511,11 @@ mod tests {
         let seed_message = StoredMessage {
             id: "seed-user".to_string(),
             chat_id,
-            sender_name: context.surface_user.clone(),
+            sender_id: context.surface_user.clone(),
             content: "hello".to_string(),
-            is_from_bot: false,
+            sender_kind: SenderKind::User,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
@@ -547,12 +542,11 @@ mod tests {
         let concurrent_message = StoredMessage {
             id: "seed-assistant".to_string(),
             chat_id,
-            sender_name: "egopulse".to_string(),
+            sender_id: "egopulse".to_string(),
             content: "hi".to_string(),
-            is_from_bot: true,
+            sender_kind: SenderKind::Assistant,
             timestamp: "2024-01-01T00:00:01Z".to_string(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
@@ -575,12 +569,11 @@ mod tests {
             StoredMessage {
                 id: "new-user".to_string(),
                 chat_id,
-                sender_name: context.surface_user.clone(),
+                sender_id: context.surface_user.clone(),
                 content: "next".to_string(),
-                is_from_bot: false,
+                sender_kind: SenderKind::User,
                 timestamp: "2024-01-01T00:00:02Z".to_string(),
                 message_kind: MessageKind::Message,
-                sender_agent_id: None,
                 recipient_agent_id: None,
             },
             Message::text("user", "next"),
@@ -631,12 +624,11 @@ mod tests {
             StoredMessage {
                 id: "tool-msg".to_string(),
                 chat_id,
-                sender_name: "egopulse".to_string(),
+                sender_id: "egopulse".to_string(),
                 content: "Read image file [image/png]".to_string(),
-                is_from_bot: true,
+                sender_kind: SenderKind::Assistant,
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
                 message_kind: MessageKind::Message,
-                sender_agent_id: None,
                 recipient_agent_id: None,
             },
             messages[0].clone(),
@@ -843,12 +835,11 @@ mod tests {
         let concurrent_message = StoredMessage {
             id: "concurrent-assistant".to_string(),
             chat_id,
-            sender_name: "egopulse".to_string(),
+            sender_id: "egopulse".to_string(),
             content: "concurrent".to_string(),
-            is_from_bot: true,
+            sender_kind: SenderKind::Assistant,
             timestamp: "2024-01-01T00:00:52Z".to_string(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
         };
         let mut latest_messages = seed_messages.clone();
@@ -874,12 +865,11 @@ mod tests {
             StoredMessage {
                 id: "new-user-full".to_string(),
                 chat_id,
-                sender_name: context.surface_user.clone(),
+                sender_id: context.surface_user.clone(),
                 content: "next".to_string(),
-                is_from_bot: false,
+                sender_kind: SenderKind::User,
                 timestamp: "2024-01-01T00:00:53Z".to_string(),
                 message_kind: MessageKind::Message,
-                sender_agent_id: None,
                 recipient_agent_id: None,
             },
             Message::text("user", "next"),
@@ -1068,5 +1058,119 @@ mod tests {
         let second = super::resolve_chat_id(&state, &ctx).await.expect("second");
 
         assert_eq!(first, second, "reentry must preserve existing chat id");
+    }
+
+    // -- Step 4: SenderKind role mapping tests ----------------------------------
+
+    #[test]
+    fn load_session_maps_assistant_to_assistant() {
+        let message = StoredMessage::assistant(1, "lyre".to_string(), "hello".to_string());
+        assert_eq!(message.sender_kind, SenderKind::Assistant);
+        let role = match message.sender_kind {
+            SenderKind::Assistant | SenderKind::Tool => "assistant",
+            SenderKind::User => "user",
+            SenderKind::System => "system",
+        };
+        assert_eq!(role, "assistant");
+    }
+
+    #[test]
+    fn load_session_maps_user_to_user() {
+        let message = StoredMessage::user(1, "user:cli:default".to_string(), "hi".to_string());
+        assert_eq!(message.sender_kind, SenderKind::User);
+        let role = match message.sender_kind {
+            SenderKind::Assistant | SenderKind::Tool => "assistant",
+            SenderKind::User => "user",
+            SenderKind::System => "system",
+        };
+        assert_eq!(role, "user");
+    }
+
+    #[test]
+    fn load_session_maps_system_to_system() {
+        let message = StoredMessage::system(1, "boot complete".to_string());
+        assert_eq!(message.sender_kind, SenderKind::System);
+        let role = match message.sender_kind {
+            SenderKind::Assistant | SenderKind::Tool => "assistant",
+            SenderKind::User => "user",
+            SenderKind::System => "system",
+        };
+        assert_eq!(role, "system");
+    }
+
+    #[test]
+    fn load_session_maps_tool_to_assistant() {
+        let message = StoredMessage::tool(
+            1,
+            "lyre".to_string(),
+            "vega".to_string(),
+            "hello".to_string(),
+        );
+        assert_eq!(message.sender_kind, SenderKind::Tool);
+        let role = match message.sender_kind {
+            SenderKind::Assistant | SenderKind::Tool => "assistant",
+            SenderKind::User => "user",
+            SenderKind::System => "system",
+        };
+        assert_eq!(role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn loaded_from_recent_preserves_sender_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("sender-kind");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+
+        call_blocking(Arc::clone(&state.db), {
+            move |db| {
+                db.store_message_only(&StoredMessage {
+                    id: "msg-user".to_string(),
+                    chat_id,
+                    sender_id: "user:cli:default".to_string(),
+                    content: "hello".to_string(),
+                    sender_kind: SenderKind::User,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                    message_kind: MessageKind::Message,
+                    recipient_agent_id: None,
+                })
+            }
+        })
+        .await
+        .expect("store user message");
+
+        call_blocking(Arc::clone(&state.db), {
+            move |db| {
+                db.store_message_only(&StoredMessage {
+                    id: "msg-assistant".to_string(),
+                    chat_id,
+                    sender_id: "lyre".to_string(),
+                    content: "response".to_string(),
+                    sender_kind: SenderKind::Assistant,
+                    timestamp: "2024-01-01T00:00:01Z".to_string(),
+                    message_kind: MessageKind::Message,
+                    recipient_agent_id: None,
+                })
+            }
+        })
+        .await
+        .expect("store assistant message");
+
+        let loaded = load_messages_for_turn(&state, chat_id)
+            .await
+            .expect("load messages");
+
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].role, "user");
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "hello");
+        assert_eq!(loaded.messages[1].role, "assistant");
+        assert_eq!(loaded.messages[1].content.as_text_lossy(), "response");
     }
 }

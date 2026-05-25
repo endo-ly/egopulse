@@ -20,7 +20,7 @@ use crate::pulse::capsule::HomeSurface;
 use crate::pulse::definition::{TemporalIntention, format_schedule};
 use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
-use crate::storage::{MessageKind, PulseOutputKind, StoredMessage};
+use crate::storage::{MessageKind, PulseOutputKind, SenderKind, StoredMessage};
 
 /// Result of output handling.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,12 +241,11 @@ async fn persist_notification_with_session(
     let synthetic_input = StoredMessage {
         id: format!("pulse-in-{}", uuid::Uuid::new_v4()),
         chat_id,
-        sender_name: "Pulse".to_string(),
+        sender_id: "pulse".to_string(),
         content: synthetic_content.clone(),
-        is_from_bot: false,
+        sender_kind: SenderKind::User,
         timestamp: now.clone(),
         message_kind: MessageKind::SystemEvent,
-        sender_agent_id: None,
         recipient_agent_id: None,
     };
 
@@ -276,12 +275,11 @@ async fn persist_notification_with_session(
             StoredMessage {
                 id: phase.assistant_message_id.clone(),
                 chat_id,
-                sender_name: agent_id.to_string(),
+                sender_id: agent_id.to_string(),
                 content: phase.assistant_preview.clone(),
-                is_from_bot: true,
+                sender_kind: SenderKind::Assistant,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 message_kind: MessageKind::Message,
-                sender_agent_id: Some(agent_id.to_string()),
                 recipient_agent_id: None,
             },
             phase.assistant_message.clone(),
@@ -304,12 +302,11 @@ async fn persist_notification_with_session(
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
                     chat_id,
-                    sender_name: agent_id.to_string(),
+                    sender_id: agent_id.to_string(),
                     content: preview_text(&phase.tool_result_preview, 160),
-                    is_from_bot: true,
+                    sender_kind: SenderKind::Assistant,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     message_kind: MessageKind::Message,
-                    sender_agent_id: Some(agent_id.to_string()),
                     recipient_agent_id: None,
                 },
                 phase.tool_messages.clone(),
@@ -326,12 +323,11 @@ async fn persist_notification_with_session(
     let assistant_msg = StoredMessage {
         id: assistant_id.clone(),
         chat_id,
-        sender_name: agent_id.to_string(),
+        sender_id: agent_id.to_string(),
         content: output_text.to_string(),
-        is_from_bot: true,
+        sender_kind: SenderKind::Assistant,
         timestamp: now,
         message_kind: MessageKind::Message,
-        sender_agent_id: Some(agent_id.to_string()),
         recipient_agent_id: None,
     };
 
@@ -358,7 +354,7 @@ mod tests {
     use super::*;
     use crate::channels::adapter::{ChannelAdapter, ChannelRegistry, ConversationKind};
     use crate::pulse::runner::ToolPhase;
-    use crate::storage::Database;
+    use crate::storage::{Database, SenderKind};
     use std::sync::Arc;
 
     #[test]
@@ -571,15 +567,15 @@ mod tests {
                 .content
                 .contains("Check today's schedule and unresolved items.")
         );
-        assert!(!synthetic.is_from_bot);
+        assert_eq!(synthetic.sender_kind, SenderKind::User);
         assert_eq!(synthetic.message_kind, MessageKind::SystemEvent);
-        assert_eq!(synthetic.sender_name, "Pulse");
+        assert_eq!(synthetic.sender_id, "pulse");
 
         let assistant = &messages[1];
         assert_eq!(assistant.content, notification_text);
-        assert!(assistant.is_from_bot);
+        assert_eq!(assistant.sender_kind, SenderKind::Assistant);
         assert_eq!(assistant.message_kind, MessageKind::Message);
-        assert_eq!(assistant.sender_name, agent_id);
+        assert_eq!(assistant.sender_id, agent_id);
     }
 
     #[tokio::test]
@@ -915,5 +911,22 @@ mod tests {
             messages.is_empty(),
             "missing adapter should fail before session persistence"
         );
+    }
+
+    #[test]
+    fn pulse_synthetic_sets_user_kind() {
+        let msg = StoredMessage {
+            id: "test-pulse".to_string(),
+            chat_id: 1,
+            sender_id: "pulse".to_string(),
+            content: "[Pulse: test] content".to_string(),
+            sender_kind: SenderKind::User,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message_kind: MessageKind::SystemEvent,
+            recipient_agent_id: None,
+        };
+        assert_eq!(msg.sender_kind, SenderKind::User);
+        assert_eq!(msg.sender_id, "pulse");
+        assert_eq!(msg.message_kind, MessageKind::SystemEvent);
     }
 }

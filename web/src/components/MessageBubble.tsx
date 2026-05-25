@@ -34,16 +34,16 @@ const markdownComponents: Components = {
 
 export function MessageBubble({ message }: MessageBubbleProps) {
   const isStreaming = message.id.startsWith("draft:");
+  const isRenderable =
+    message.sender_kind === "assistant" || message.sender_kind === "tool";
 
   return (
-    <article
-      className={`bubble ${message.is_from_bot ? "bubble-bot" : "bubble-user"}`}
-    >
+    <article className={`bubble bubble-${message.sender_kind}`}>
       <div className="bubble-meta">
-        <span>{message.sender_name}</span>
+        <span>{message.sender_id}</span>
         <time>{new Date(message.timestamp).toLocaleTimeString()}</time>
       </div>
-      {message.is_from_bot ? (
+      {isRenderable ? (
         <div className={isStreaming ? "streaming-cursor" : ""}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}

@@ -19,7 +19,7 @@ use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{SenderKind, StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
 use futures_util::future::join_all;
 use std::sync::Arc;
@@ -296,11 +296,11 @@ async fn process_turn_inner(
                         return persist_and_finalize(
                             state,
                             chat_id,
+                            &context.agent_id,
                             &mut messages,
                             session_updated_at.clone(),
                             &on_event,
-                            final_content,
-                            reasoning_content,
+                            (final_content, reasoning_content),
                         )
                         .await;
                     }
@@ -325,11 +325,11 @@ async fn process_turn_inner(
                         return persist_and_finalize(
                             state,
                             chat_id,
+                            &context.agent_id,
                             &mut messages,
                             session_updated_at.clone(),
                             &on_event,
-                            final_content,
-                            reasoning_content,
+                            (final_content, reasoning_content),
                         )
                         .await;
                     }
@@ -486,19 +486,20 @@ fn evaluate_malformed_response(
 async fn persist_and_finalize(
     state: &AppState,
     chat_id: i64,
+    agent_id: &str,
     messages: &mut Vec<Message>,
     session_updated_at: Option<String>,
     on_event: &EventEmitter,
-    final_content: String,
-    reasoning_content: Option<String>,
+    response: (String, Option<String>),
 ) -> Result<String, EgoPulseError> {
+    let (final_content, reasoning_content) = response;
     let mut assistant_message = Message::text("assistant", final_content.clone());
     assistant_message.reasoning_content = reasoning_content;
     messages.push(assistant_message.clone());
 
     let _persisted = persist_phase(
         state,
-        StoredMessage::bot(chat_id, final_content.clone()),
+        StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
         messages,
         session_updated_at,
@@ -524,6 +525,7 @@ async fn execute_and_persist_tools(
     let persisted = persist_tool_call_assistant_message(
         state,
         tool_context.chat_id,
+        &tool_context.agent_id,
         &assistant_message_id,
         &assistant_draft,
         messages,
@@ -544,6 +546,7 @@ async fn execute_and_persist_tools(
     let persisted = persist_tool_result_messages(
         state,
         tool_context.chat_id,
+        &tool_context.agent_id,
         messages,
         tool_messages,
         session_updated_at,
@@ -558,6 +561,7 @@ async fn execute_and_persist_tools(
 async fn persist_tool_call_assistant_message(
     state: &AppState,
     chat_id: i64,
+    agent_id: &str,
     assistant_message_id: &str,
     assistant_draft: &ToolAssistantDraft,
     mut messages: Vec<Message>,
@@ -580,7 +584,7 @@ async fn persist_tool_call_assistant_message(
         state,
         StoredMessage {
             id: assistant_message_id.to_string(),
-            ..StoredMessage::bot(chat_id, assistant_preview)
+            ..StoredMessage::assistant(chat_id, agent_id.to_string(), assistant_preview)
         },
         assistant_message,
         &messages,
@@ -592,6 +596,7 @@ async fn persist_tool_call_assistant_message(
 async fn persist_tool_result_messages(
     state: &AppState,
     chat_id: i64,
+    agent_id: &str,
     messages: Vec<Message>,
     tool_messages: Vec<Message>,
     session_updated_at: Option<String>,
@@ -608,7 +613,7 @@ async fn persist_tool_result_messages(
     let preview = summarize_tool_result_messages(&tool_messages);
     persist_phase_messages(
         state,
-        StoredMessage::bot(chat_id, preview),
+        StoredMessage::assistant(chat_id, agent_id.to_string(), preview),
         tool_messages,
         &messages_with_tools,
         session_updated_at,
@@ -873,12 +878,11 @@ async fn load_channel_context(state: &AppState, context: &SurfaceContext) -> Opt
 
     let formatted: String = messages
         .iter()
-        .map(|m| {
-            if m.is_from_bot {
-                format!("[Bot] {}", m.content)
-            } else {
-                format!("[{}] {}", m.sender_name, m.content)
-            }
+        .map(|m| match m.sender_kind {
+            SenderKind::User => format!("[{}] {}", m.sender_id, m.content),
+            SenderKind::Assistant => format!("[{}] {}", m.sender_id, m.content),
+            SenderKind::System => format!("[system] {}", m.content),
+            SenderKind::Tool => format!("[tool/{}] {}", m.sender_id, m.content),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1113,7 +1117,7 @@ mod tests {
     use crate::agent_loop::process_turn;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
-    use crate::storage::call_blocking;
+    use crate::storage::{SenderKind, call_blocking};
 
     // -----------------------------------------------------------------------
     // Core turn execution
@@ -1725,16 +1729,16 @@ mod tests {
         db: &crate::storage::Database,
         chat_id: i64,
         id: &str,
-        sender: &str,
+        sender_id: &str,
         content: &str,
-        is_from_bot: bool,
+        sender_kind: SenderKind,
         ts: &str,
     ) {
         let conn = db.conn.lock().expect("lock");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, chat_id, sender, content, is_from_bot as i32, ts, "message"],
+            rusqlite::params![id, chat_id, sender_id, content, sender_kind.to_string(), ts, "message"],
         )
         .expect("insert channel log message");
     }
@@ -1769,7 +1773,7 @@ mod tests {
             "cl-1",
             "alice",
             "hello from alice",
-            false,
+            SenderKind::User,
             "2025-01-01T00:00:00Z",
         );
         insert_channel_log_message(
@@ -1778,7 +1782,7 @@ mod tests {
             "cl-2",
             "Bot",
             "hi there",
-            true,
+            SenderKind::Assistant,
             "2025-01-01T00:00:01Z",
         );
 
@@ -1844,7 +1848,7 @@ mod tests {
                 &format!("cl-{i}"),
                 "alice",
                 &format!("msg {i}"),
-                false,
+                SenderKind::User,
                 &format!("2025-01-01T00:{i:02}:00Z"),
             );
         }
@@ -1905,7 +1909,7 @@ mod tests {
             "cl-di",
             "alice",
             "background",
-            false,
+            SenderKind::User,
             "2025-01-01T00:00:00Z",
         );
 
@@ -2032,7 +2036,7 @@ mod tests {
             "cl-persist",
             "alice",
             "should not persist",
-            false,
+            SenderKind::User,
             "2025-01-01T00:00:00Z",
         );
 
@@ -2122,7 +2126,7 @@ mod tests {
             "int-1",
             "alice",
             "previous message",
-            false,
+            SenderKind::User,
             "2025-01-01T00:00:00Z",
         );
 
@@ -2374,5 +2378,61 @@ mod tests {
             !trace_ids[0].is_empty(),
             "execute_scheduled_turn must generate a non-empty trace_id"
         );
+    }
+
+    // -- Step 5: SenderKind formatting tests for load_channel_context ------------
+
+    #[test]
+    fn build_channel_context_formats_user() {
+        let msg = crate::storage::StoredMessage::user(1, "Alice".to_string(), "hello".to_string());
+        let formatted = match msg.sender_kind {
+            SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::System => format!("[system] {}", msg.content),
+            SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
+        };
+        assert_eq!(formatted, "[Alice] hello");
+    }
+
+    #[test]
+    fn build_channel_context_formats_assistant() {
+        let msg =
+            crate::storage::StoredMessage::assistant(1, "lyre".to_string(), "response".to_string());
+        let formatted = match msg.sender_kind {
+            SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::System => format!("[system] {}", msg.content),
+            SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
+        };
+        assert_eq!(formatted, "[lyre] response");
+    }
+
+    #[test]
+    fn build_channel_context_formats_system() {
+        let msg = crate::storage::StoredMessage::system(1, "boot complete".to_string());
+        let formatted = match msg.sender_kind {
+            SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::System => format!("[system] {}", msg.content),
+            SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
+        };
+        assert_eq!(formatted, "[system] boot complete");
+    }
+
+    #[test]
+    fn build_channel_context_formats_tool() {
+        let msg = crate::storage::StoredMessage::tool(
+            1,
+            "lyre".to_string(),
+            "vega".to_string(),
+            "sent".to_string(),
+        );
+        let formatted = match msg.sender_kind {
+            SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
+            SenderKind::System => format!("[system] {}", msg.content),
+            SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
+        };
+        assert_eq!(formatted, "[tool/lyre] sent");
     }
 }

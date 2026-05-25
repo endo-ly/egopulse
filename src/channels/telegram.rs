@@ -332,7 +332,7 @@ impl TelegramHandler {
     async fn store_human_channel_log_message(
         &self,
         raw_chat_id: i64,
-        sender_name: &str,
+        sender_id: &str,
         msg_id: i32,
         text: &str,
     ) -> Option<i64> {
@@ -346,28 +346,28 @@ impl TelegramHandler {
                 let stored = crate::storage::StoredMessage {
                     id: format!("cl-tg-{raw_chat_id}-{msg_id}"),
                     chat_id,
-                    sender_name: sender_name.to_string(),
+                    sender_id: sender_id.to_string(),
                     content: text.to_string(),
-                    is_from_bot: false,
+                    sender_kind: crate::storage::SenderKind::User,
                     timestamp: Utc::now().to_rfc3339(),
                     message_kind: crate::storage::MessageKind::Message,
-                    sender_agent_id: None,
                     recipient_agent_id: None,
                 };
                 let db = std::sync::Arc::clone(&self.app_state.db);
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.lock_conn()?;
                     conn.execute(
-                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             stored.id,
                             stored.chat_id,
-                            stored.sender_name,
+                            stored.sender_id,
                             stored.content,
-                            stored.is_from_bot as i32,
+                            stored.sender_kind.to_string(),
                             stored.timestamp,
                             stored.message_kind.to_string(),
+                            stored.recipient_agent_id.as_deref(),
                         ],
                     )?;
                     Ok::<_, crate::error::StorageError>(())
@@ -815,6 +815,17 @@ async fn handle_message(
         .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
+    let storage_sender_id = msg
+        .sender_chat
+        .as_ref()
+        .map(|chat| format!("chat:telegram:{}", chat.id.0))
+        .or_else(|| {
+            msg.from
+                .as_ref()
+                .map(|u| format!("user:telegram:{}", u.id.0))
+        })
+        .unwrap_or_else(|| "user:telegram:unknown".to_string());
+
     let thread = raw_chat_id.to_string();
     let context = handler.make_context(&sender_name, &thread, &route_agent_id);
 
@@ -915,7 +926,12 @@ async fn handle_message(
     // Channel Log: multi-agent room では combined_text（添付情報込み）を保存
     let channel_log_chat_id = if is_multi_agent && !is_dm {
         handler
-            .store_human_channel_log_message(raw_chat_id, &sender_name, msg.id.0, &combined_text)
+            .store_human_channel_log_message(
+                raw_chat_id,
+                &storage_sender_id,
+                msg.id.0,
+                &combined_text,
+            )
             .await
     } else {
         None
@@ -1655,5 +1671,27 @@ mod tests {
             handler.should_process_message(false, false, -100, false),
             ReceiveDecision::Accept { reset_chain: true }
         );
+    }
+
+    // --- Sender ID / SenderKind tests (Step 6) ---
+
+    #[test]
+    fn telegram_user_message_sender_id() {
+        let user_id: i64 = 987654321;
+        let sender_id = format!("user:telegram:{user_id}");
+        assert!(sender_id.starts_with("user:telegram:"));
+        assert!(sender_id.ends_with("987654321"));
+    }
+
+    #[test]
+    fn telegram_stored_message_has_user_kind() {
+        let chat_id = 42;
+        let msg = crate::storage::StoredMessage::user(
+            chat_id,
+            "user:telegram:987654321".to_string(),
+            "hello".to_string(),
+        );
+        assert_eq!(msg.sender_kind, crate::storage::SenderKind::User);
+        assert_eq!(msg.sender_id, "user:telegram:987654321");
     }
 }

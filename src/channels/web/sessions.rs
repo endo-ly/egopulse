@@ -137,9 +137,9 @@ pub(super) async fn get_history(
         "session_key": session_key,
         "messages": messages.into_iter().map(|message| serde_json::json!({
             "id": message.id,
-            "sender_name": message.sender_name,
+            "sender_id": message.sender_id,
+            "sender_kind": message.sender_kind.to_string(),
             "content": message.content,
-            "is_from_bot": message.is_from_bot,
             "timestamp": message.timestamp,
         })).collect::<Vec<_>>()
     })))
@@ -161,5 +161,73 @@ mod tests {
         assert_eq!(parse_chat_id_from_session_key("web:main"), None);
         assert_eq!(parse_chat_id_from_session_key("chat:"), None);
         assert_eq!(parse_chat_id_from_session_key("chat:abc"), None);
+    }
+
+    #[test]
+    fn api_messages_returns_sender_id() {
+        let message = crate::storage::StoredMessage::user(
+            1,
+            "user:discord:123".to_string(),
+            "hello".to_string(),
+        );
+        let json = serde_json::json!({
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "sender_kind": message.sender_kind.to_string(),
+            "content": message.content,
+            "timestamp": message.timestamp,
+        });
+        assert_eq!(json["sender_id"], "user:discord:123");
+    }
+
+    #[test]
+    fn api_messages_returns_sender_kind() {
+        let message = crate::storage::StoredMessage::user(
+            1,
+            "user:discord:123".to_string(),
+            "hello".to_string(),
+        );
+        let json = serde_json::json!({
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "sender_kind": message.sender_kind.to_string(),
+            "content": message.content,
+            "timestamp": message.timestamp,
+        });
+        assert_eq!(json["sender_kind"], "user");
+    }
+
+    #[test]
+    fn api_messages_excludes_sender_name() {
+        let message = crate::storage::StoredMessage::user(
+            1,
+            "user:discord:123".to_string(),
+            "hello".to_string(),
+        );
+        let json = serde_json::json!({
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "sender_kind": message.sender_kind.to_string(),
+            "content": message.content,
+            "timestamp": message.timestamp,
+        });
+        assert!(json.get("sender_name").is_none());
+    }
+
+    #[test]
+    fn api_messages_excludes_is_from_bot() {
+        let message = crate::storage::StoredMessage::user(
+            1,
+            "user:discord:123".to_string(),
+            "hello".to_string(),
+        );
+        let json = serde_json::json!({
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "sender_kind": message.sender_kind.to_string(),
+            "content": message.content,
+            "timestamp": message.timestamp,
+        });
+        assert!(json.get("is_from_bot").is_none());
     }
 }

@@ -7,11 +7,20 @@ use crate::error::StorageError;
 use super::{
     AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
     LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind, PulseRun,
-    PulseRunStatus, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunTrigger,
-    StoredMessage, ToolCall,
+    PulseRunStatus, SenderKind, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus,
+    SleepRunTrigger, StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    let sender_kind_str: String = row.get(4)?;
+    let sender_kind = SenderKind::from_str(&sender_kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+
     let message_kind_str: String = row.get(6)?;
     let message_kind = MessageKind::from_str(&message_kind_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -24,13 +33,12 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
     Ok(StoredMessage {
         id: row.get(0)?,
         chat_id: row.get(1)?,
-        sender_name: row.get(2)?,
+        sender_id: row.get(2)?,
         content: row.get(3)?,
-        is_from_bot: row.get::<_, i32>(4)? != 0,
+        sender_kind,
         timestamp: row.get(5)?,
         message_kind,
-        sender_agent_id: row.get(7)?,
-        recipient_agent_id: row.get(8)?,
+        recipient_agent_id: row.get(7)?,
     })
 }
 
@@ -330,8 +338,8 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
-                    message_kind, sender_agent_id, recipient_agent_id
+            "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                    message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
              ORDER BY timestamp DESC
@@ -351,8 +359,8 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
-                    message_kind, sender_agent_id, recipient_agent_id
+            "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                    message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
              ORDER BY timestamp ASC",
@@ -418,17 +426,16 @@ impl Database {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.id,
                 message.chat_id,
-                message.sender_name,
+                message.sender_id,
                 message.content,
-                message.is_from_bot as i32,
+                message.sender_kind.to_string(),
                 message.timestamp,
                 message.message_kind.to_string(),
-                message.sender_agent_id.as_deref(),
                 message.recipient_agent_id.as_deref(),
             ],
         )?;
@@ -480,8 +487,8 @@ impl Database {
 
         let recent_messages = {
             let mut stmt = tx.prepare(
-                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp,
-                        message_kind, sender_agent_id, recipient_agent_id
+                "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                        message_kind, recipient_agent_id
                  FROM messages
                  WHERE chat_id = ?1
                  ORDER BY timestamp DESC
@@ -548,17 +555,16 @@ impl Database {
     pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind, sender_agent_id, recipient_agent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.id,
                 message.chat_id,
-                message.sender_name,
+                message.sender_id,
                 message.content,
-                message.is_from_bot as i32,
+                message.sender_kind.to_string(),
                 message.timestamp,
                 message.message_kind.to_string(),
-                message.sender_agent_id.as_deref(),
                 message.recipient_agent_id.as_deref(),
             ],
         )?;
@@ -568,7 +574,7 @@ impl Database {
     /// Persists a stop-reason system event to the Channel Log.
     ///
     /// Content format: `{"reason": "StopReasonVariant"}`.
-    /// Sender: `"system"`, `is_from_bot: true`.
+    /// Sender: `sender_id = "system"`, `sender_kind = System`.
     pub(crate) fn store_system_event(
         &self,
         channel_log_chat_id: i64,
@@ -579,24 +585,15 @@ impl Database {
         })
         .to_string();
 
-        let message = StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id: channel_log_chat_id,
-            sender_name: "system".to_string(),
-            content,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::SystemEvent,
-            sender_agent_id: None,
-            recipient_agent_id: None,
-        };
+        let mut message = StoredMessage::system(channel_log_chat_id, content);
+        message.message_kind = MessageKind::SystemEvent;
 
         self.store_message_only(&message)
     }
 
     /// Persists a bot response to the Channel Log.
     ///
-    /// Sender is the agent ID, `is_from_bot: true`, `MessageKind::Message`.
+    /// Sender is the agent ID, `sender_kind = Assistant`, `MessageKind::Message`.
     pub(crate) fn store_channel_log_bot_response(
         &self,
         channel_log_chat_id: i64,
@@ -606,12 +603,11 @@ impl Database {
         let message = StoredMessage {
             id: format!("cl-bot-{}", uuid::Uuid::new_v4()),
             chat_id: channel_log_chat_id,
-            sender_name: agent_id.to_string(),
+            sender_id: agent_id.to_string(),
             content: response.to_string(),
-            is_from_bot: true,
+            sender_kind: SenderKind::Assistant,
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
-            sender_agent_id: Some(agent_id.to_string()),
             recipient_agent_id: None,
         };
         self.store_message_only(&message)
@@ -1556,9 +1552,9 @@ mod tests {
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.conn.lock().expect("lock");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp, message_kind)
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, chat_id, "alice", content, 0, ts, "message"],
+            rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
         )
         .expect("store message");
     }
@@ -1698,12 +1694,11 @@ mod tests {
         let message = StoredMessage {
             id: "msg-1".to_string(),
             chat_id: 100,
-            sender_name: "alice".to_string(),
+            sender_id: "user:cli:default".to_string(),
             content: "hello".to_string(),
-            is_from_bot: false,
+            sender_kind: SenderKind::User,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
         };
 
@@ -1714,12 +1709,11 @@ mod tests {
             &StoredMessage {
                 id: "msg-2".to_string(),
                 chat_id: 100,
-                sender_name: "alice".to_string(),
+                sender_id: "user:cli:default".to_string(),
                 content: "hello again".to_string(),
-                is_from_bot: false,
+                sender_kind: SenderKind::User,
                 timestamp: "2024-01-01T00:00:01Z".to_string(),
                 message_kind: MessageKind::Message,
-                sender_agent_id: None,
                 recipient_agent_id: None,
             },
             r#"[{"role":"user","content":"hello again"}]"#,
@@ -2769,11 +2763,12 @@ mod tests {
         .expect("store");
 
         let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs[0].sender_name, "system");
+        assert_eq!(msgs[0].sender_id, "system");
+        assert_eq!(msgs[0].sender_kind, SenderKind::System);
     }
 
     #[test]
-    fn store_system_event_is_from_bot_true() {
+    fn store_system_event_sender_kind_is_system() {
         let (db, _dir) = test_db();
 
         let chat_id = db.resolve_channel_log_chat_id(303).expect("create");
@@ -2784,7 +2779,188 @@ mod tests {
         .expect("store");
 
         let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
-        assert!(msgs[0].is_from_bot);
+        assert_eq!(msgs[0].sender_kind, SenderKind::System);
+    }
+
+    #[test]
+    fn store_message_with_sender_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:sender-kind", None, "cli", "default")
+            .expect("create chat");
+        let message = StoredMessage {
+            id: "msg-assistant".to_string(),
+            chat_id,
+            sender_id: "lyre".to_string(),
+            content: "assistant says hi".to_string(),
+            sender_kind: SenderKind::Assistant,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message_kind: MessageKind::Message,
+            recipient_agent_id: None,
+        };
+
+        db.store_message_with_session(&message, r#"[]"#, None)
+            .expect("store");
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_id, "lyre");
+        assert_eq!(msgs[0].sender_kind, SenderKind::Assistant);
+    }
+
+    #[test]
+    fn store_message_user_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:user-kind", None, "cli", "default")
+            .expect("create chat");
+        let message =
+            StoredMessage::user(chat_id, "user:discord:123".to_string(), "hello".to_string());
+
+        db.store_message_with_session(&message, r#"[]"#, None)
+            .expect("store");
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_kind, SenderKind::User);
+        assert_eq!(msgs[0].sender_id, "user:discord:123");
+    }
+
+    #[test]
+    fn store_message_system_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:sys-kind", None, "cli", "default")
+            .expect("create chat");
+        let message = StoredMessage::system(chat_id, "boot complete".to_string());
+
+        db.store_message_with_session(&message, r#"[]"#, None)
+            .expect("store");
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_kind, SenderKind::System);
+        assert_eq!(msgs[0].sender_id, "system");
+    }
+
+    #[test]
+    fn store_message_tool_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:tool-kind", None, "cli", "default")
+            .expect("create chat");
+        let message = StoredMessage::tool(
+            chat_id,
+            "tool:web_fetch".to_string(),
+            "lyre".to_string(),
+            "fetched https://example.com".to_string(),
+        );
+
+        db.store_message_with_session(&message, r#"[]"#, None)
+            .expect("store");
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_kind, SenderKind::Tool);
+        assert_eq!(msgs[0].sender_id, "tool:web_fetch");
+        assert_eq!(msgs[0].recipient_agent_id.as_deref(), Some("lyre"));
+    }
+
+    #[test]
+    fn get_recent_messages_returns_sender_id() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:sender-id", None, "web", "default")
+            .expect("create chat");
+
+        let conn = db.conn.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+             VALUES ('m1', ?1, 'user:cli:alice', 'hello', 'user', '2024-01-01T00:00:00Z', 'message')",
+            rusqlite::params![chat_id],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs[0].sender_id, "user:cli:alice");
+        assert_eq!(msgs[0].sender_kind, SenderKind::User);
+    }
+
+    #[test]
+    fn find_message_by_content_finds_system_event() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(500).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::LlmFailure,
+        )
+        .expect("store");
+
+        let msgs = db.get_all_messages(chat_id).expect("messages");
+        let found = msgs.iter().find(|m| m.content.contains("LlmFailure"));
+        assert!(found.is_some(), "should find system event by content");
+        assert_eq!(found.unwrap().sender_kind, SenderKind::System);
+    }
+
+    #[test]
+    fn store_system_event_sets_system_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(600).expect("create");
+        db.store_system_event(
+            chat_id,
+            &crate::runtime::turn_scheduler::StopReason::ChainDepthExceeded,
+        )
+        .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs[0].sender_id, "system");
+        assert_eq!(msgs[0].sender_kind, SenderKind::System);
+        assert_eq!(msgs[0].message_kind, MessageKind::SystemEvent);
+    }
+
+    #[test]
+    fn store_agent_response_sets_assistant_kind() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db.resolve_channel_log_chat_id(700).expect("create");
+        db.store_channel_log_bot_response(chat_id, "lyre", "Hello from agent")
+            .expect("store");
+
+        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs[0].sender_id, "lyre");
+        assert_eq!(msgs[0].sender_kind, SenderKind::Assistant);
+        assert_eq!(msgs[0].content, "Hello from agent");
+    }
+
+    #[test]
+    fn roundtrip_recipient_agent_id() {
+        let (db, _dir) = test_db();
+
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:recipient", None, "cli", "default")
+            .expect("create chat");
+        let message = StoredMessage::tool(
+            chat_id,
+            "tool:read".to_string(),
+            "bob".to_string(),
+            "file contents".to_string(),
+        );
+
+        db.store_message_with_session(&message, r#"[]"#, None)
+            .expect("store");
+
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].recipient_agent_id.as_deref(), Some("bob"));
+        assert_eq!(msgs[0].sender_kind, SenderKind::Tool);
     }
 
     #[test]

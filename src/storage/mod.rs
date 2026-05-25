@@ -20,43 +20,71 @@ pub struct Database {
 pub(crate) struct StoredMessage {
     pub id: String,
     pub chat_id: i64,
-    pub sender_name: String,
+    pub sender_id: String,
     pub content: String,
-    pub is_from_bot: bool,
+    pub sender_kind: SenderKind,
     pub timestamp: String,
     pub message_kind: MessageKind,
-    pub sender_agent_id: Option<String>,
     pub recipient_agent_id: Option<String>,
 }
 
 impl StoredMessage {
-    /// Creates a bot-originated message with auto-generated id and timestamp.
-    pub(crate) fn bot(chat_id: i64, content: String) -> Self {
+    /// Creates an assistant-originated message with auto-generated id and timestamp.
+    pub(crate) fn assistant(chat_id: i64, sender_id: String, content: String) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
-            sender_name: "egopulse".to_string(),
+            sender_id,
             content,
-            is_from_bot: true,
+            sender_kind: SenderKind::Assistant,
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
         }
     }
 
     /// Creates a user-originated message with auto-generated id and timestamp.
-    pub(crate) fn user(chat_id: i64, sender_name: String, content: String) -> Self {
+    pub(crate) fn user(chat_id: i64, sender_id: String, content: String) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
-            sender_name,
+            sender_id,
             content,
-            is_from_bot: false,
+            sender_kind: SenderKind::User,
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
-            sender_agent_id: None,
             recipient_agent_id: None,
+        }
+    }
+
+    pub(crate) fn system(chat_id: i64, content: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_id: "system".to_string(),
+            content,
+            sender_kind: SenderKind::System,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            recipient_agent_id: None,
+        }
+    }
+
+    pub(crate) fn tool(
+        chat_id: i64,
+        sender_id: String,
+        recipient_id: String,
+        content: String,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            sender_id,
+            content,
+            sender_kind: SenderKind::Tool,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            recipient_agent_id: Some(recipient_id),
         }
     }
 }
@@ -135,6 +163,39 @@ impl FromStr for MessageKind {
             "agent_send" => Ok(Self::AgentSend),
             "system_event" => Ok(Self::SystemEvent),
             other => Err(format!("invalid message kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SenderKind {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+impl fmt::Display for SenderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Assistant => write!(f, "assistant"),
+            Self::System => write!(f, "system"),
+            Self::Tool => write!(f, "tool"),
+        }
+    }
+}
+
+impl FromStr for SenderKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "system" => Ok(Self::System),
+            "tool" => Ok(Self::Tool),
+            other => Err(format!("invalid sender kind: {other}")),
         }
     }
 }
@@ -446,6 +507,8 @@ const _: () = {
     const fn assert_display<T: fmt::Display>() {}
     const fn assert_from_str<T: FromStr>() {}
 
+    assert_display::<SenderKind>();
+    assert_from_str::<SenderKind>();
     assert_display::<SleepRunStatus>();
     assert_display::<SleepRunTrigger>();
     assert_display::<MemoryFile>();
@@ -730,5 +793,60 @@ mod tests {
     #[test]
     fn episode_event_certainty_from_str_invalid() {
         assert!(EpisodeEventCertainty::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn sender_kind_display() {
+        assert_eq!(SenderKind::User.to_string(), "user");
+    }
+
+    #[test]
+    fn sender_kind_display_assistant() {
+        assert_eq!(SenderKind::Assistant.to_string(), "assistant");
+    }
+
+    #[test]
+    fn sender_kind_display_system() {
+        assert_eq!(SenderKind::System.to_string(), "system");
+    }
+
+    #[test]
+    fn sender_kind_display_tool() {
+        assert_eq!(SenderKind::Tool.to_string(), "tool");
+    }
+
+    #[test]
+    fn sender_kind_from_str() {
+        assert_eq!(
+            SenderKind::from_str("assistant").unwrap(),
+            SenderKind::Assistant
+        );
+        assert_eq!(SenderKind::from_str("user").unwrap(), SenderKind::User);
+        assert_eq!(SenderKind::from_str("system").unwrap(), SenderKind::System);
+        assert_eq!(SenderKind::from_str("tool").unwrap(), SenderKind::Tool);
+    }
+
+    #[test]
+    fn sender_kind_from_str_invalid() {
+        assert!(SenderKind::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn stored_message_assistant_factory() {
+        let msg = StoredMessage::assistant(42, "lyre".to_string(), "hello".to_string());
+        assert_eq!(msg.sender_id, "lyre");
+        assert_eq!(msg.sender_kind, SenderKind::Assistant);
+        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.chat_id, 42);
+        assert!(msg.recipient_agent_id.is_none());
+    }
+
+    #[test]
+    fn stored_message_user_factory() {
+        let msg = StoredMessage::user(10, "user:cli:default".to_string(), "hi".to_string());
+        assert_eq!(msg.sender_id, "user:cli:default");
+        assert_eq!(msg.sender_kind, SenderKind::User);
+        assert_eq!(msg.content, "hi");
+        assert!(msg.recipient_agent_id.is_none());
     }
 }

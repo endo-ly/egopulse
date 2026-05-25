@@ -196,8 +196,23 @@
   background: rgba(192, 132, 252, 0.06);
 }
 
-.bubble-bot {
+.bubble-assistant {
   align-self: flex-start;
+}
+
+.bubble-tool {
+  align-self: flex-start;
+  border-color: rgba(0, 212, 255, 0.15);
+  background: rgba(0, 212, 255, 0.03);
+}
+
+.bubble-system {
+  align-self: center;
+  max-width: min(760px, 90%);
+  font-size: 0.82rem;
+  color: var(--color-muted);
+  background: rgba(8, 16, 32, 0.5);
+  border-style: dashed;
 }
 
 .bubble-meta {
