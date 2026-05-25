@@ -1961,13 +1961,14 @@ mod tests {
             user_msgs.len()
         );
         let last_user = user_msgs.last().expect("last user message");
+        let last_user_text = last_user.content.as_text_lossy();
         assert!(
-            last_user
-                .content
-                .as_text_lossy()
-                .ends_with("my direct question"),
-            "expected the user's actual input as the last user message, got: {}",
-            last_user.content.as_text_lossy()
+            last_user_text.starts_with("[Current time: "),
+            "expected timestamp prefix in last user message, got: {last_user_text}",
+        );
+        assert!(
+            last_user_text.ends_with("my direct question"),
+            "expected the user's actual input as the last user message, got: {last_user_text}",
         );
     }
 
@@ -2026,10 +2027,14 @@ mod tests {
                 1,
                 "[{label}] should have exactly one user message"
             );
+            let user_text = user_msgs[0].content.as_text_lossy();
             assert!(
-                user_msgs[0].content.as_text_lossy().ends_with("hello"),
-                "[{label}] user message should end with the plain input, got: {}",
-                user_msgs[0].content.as_text_lossy()
+                user_text.starts_with("[Current time: "),
+                "[{label}] user message should include timestamp prefix, got: {user_text}",
+            );
+            assert!(
+                user_text.ends_with("hello"),
+                "[{label}] user message should end with the plain input, got: {user_text}",
             );
             for msg in &seen[0] {
                 assert!(

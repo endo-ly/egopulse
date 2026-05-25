@@ -457,7 +457,7 @@ Channel Log に記録された `MessageKind::SystemEvent` メッセージは Cha
 
 毎ターンの user message 先頭に、現在時刻が以下の形式で注入される。
 
-```
+```text
 [Current time: 2026-05-25 (Mon) 14:32:19 Asia/Tokyo]
 ```
 
