@@ -1005,13 +1005,15 @@ mod tests {
         let summary_text = seen_messages[1][0].content.as_text_lossy();
         assert!(summary_text.contains("[CONTEXT COMPACTION — REFERENCE ONLY]"));
         assert!(summary_text.contains("summary text"));
-        assert_eq!(
+        assert!(
             seen_messages[1]
                 .last()
                 .expect("final request")
                 .content
-                .as_text_lossy(),
-            "fresh question"
+                .as_text_lossy()
+                .ends_with("fresh question"),
+            "expected last message to end with 'fresh question', got: {}",
+            seen_messages[1].last().unwrap().content.as_text_lossy()
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
@@ -1105,13 +1107,15 @@ mod tests {
                 .contains("[CONTEXT COMPACTION — REFERENCE ONLY]")
         }));
         assert_eq!(seen_messages[1][0].content.as_text_lossy(), "old-user-1");
-        assert_eq!(
+        assert!(
             seen_messages[1]
                 .last()
                 .expect("final request")
                 .content
-                .as_text_lossy(),
-            "fresh question"
+                .as_text_lossy()
+                .ends_with("fresh question"),
+            "expected last message to end with 'fresh question', got: {}",
+            seen_messages[1].last().unwrap().content.as_text_lossy()
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)

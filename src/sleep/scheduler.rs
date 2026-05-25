@@ -19,13 +19,13 @@ use super::{SleepBatchError, run_sleep_batch};
 /// side-effects, making it straightforward to unit-test without tokio.
 pub(crate) fn next_scheduled_run(
     config: &SleepBatchConfig,
+    timezone: &str,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     if !config.scheduler_enabled() {
         return None;
     }
     let schedule = config.schedule.as_ref()?;
-    let timezone = config.timezone.as_ref()?;
     let tz: Tz = timezone.parse().ok()?;
     let time = parse_schedule_time(schedule)?;
     next_run_for_time(tz, time, now)
@@ -130,7 +130,8 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
 pub(crate) async fn run_scheduler_loop(state: AppState) -> Result<(), crate::error::EgoPulseError> {
     loop {
         let now = Utc::now();
-        let next = match next_scheduled_run(&state.config.sleep_batch, now) {
+        let next = match next_scheduled_run(&state.config.sleep_batch, &state.config.timezone, now)
+        {
             Some(t) => t,
             None => {
                 info!("sleep scheduler: disabled or no schedule configured, exiting loop");
@@ -228,11 +229,10 @@ fn resolve_gap(
 mod tests {
     use super::*;
 
-    fn enabled_config(schedule: &str, timezone: &str) -> SleepBatchConfig {
+    fn enabled_config(schedule: &str, _timezone: &str) -> SleepBatchConfig {
         SleepBatchConfig {
             enabled: true,
             schedule: Some(schedule.to_string()),
-            timezone: Some(timezone.to_string()),
             ..Default::default()
         }
     }
@@ -243,7 +243,7 @@ mod tests {
         // 2026-01-15 05:00 UTC = 2026-01-15 14:00 JST
         // Set now to 13:00 JST = 04:00 UTC → target is still in the future
         let now = "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "Asia/Tokyo", now).unwrap();
         // Expected: 2026-01-15 14:00 JST = 2026-01-15 05:00 UTC
         assert_eq!(
             result,
@@ -256,7 +256,7 @@ mod tests {
         let config = enabled_config("14:00", "Asia/Tokyo");
         // Set now to 15:00 JST = 06:00 UTC → target already passed today
         let now = "2026-01-15T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "Asia/Tokyo", now).unwrap();
         // Expected: 2026-01-16 14:00 JST = 2026-01-16 05:00 UTC
         assert_eq!(
             result,
@@ -269,7 +269,7 @@ mod tests {
         let config = enabled_config("09:00", "America/New_York");
         // 2026-01-15 04:00 UTC = 2026-01-14 23:00 EST → 09:00 EST is tomorrow
         let now = "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "America/New_York", now).unwrap();
         // Expected: 2026-01-15 09:00 EST = 2026-01-15 14:00 UTC
         assert_eq!(
             result,
@@ -281,7 +281,7 @@ mod tests {
     fn next_run_handles_utc_timezone() {
         let config = enabled_config("04:00", "UTC");
         let now = "2026-01-15T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "UTC", now).unwrap();
         assert_eq!(
             result,
             "2026-01-15T04:00:00Z".parse::<DateTime<Utc>>().unwrap()
@@ -295,7 +295,7 @@ mod tests {
         let config = enabled_config("02:30", "America/New_York");
         // 2026-03-08 01:00 EST = 06:00 UTC (before the gap)
         let now = "2026-03-08T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "America/New_York", now).unwrap();
         // Expected: 2026-03-08 03:00 EDT = 07:00 UTC
         assert_eq!(
             result,
@@ -310,7 +310,7 @@ mod tests {
         let config = enabled_config("01:30", "America/New_York");
         // 2026-11-01 00:00 EDT = 04:00 UTC (before the fold)
         let now = "2026-11-01T04:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "America/New_York", now).unwrap();
         // Expected: 2026-11-01 01:30 EDT = 05:30 UTC (earliest instant)
         assert_eq!(
             result,
@@ -325,7 +325,7 @@ mod tests {
         // If now is between them (05:45 UTC), earliest is past but latest is still future.
         let config = enabled_config("01:30", "America/New_York");
         let now = "2026-11-01T05:45:00Z".parse::<DateTime<Utc>>().unwrap();
-        let result = next_scheduled_run(&config, now).unwrap();
+        let result = next_scheduled_run(&config, "America/New_York", now).unwrap();
         // Expected: 2026-11-01 01:30 EST = 06:30 UTC (latest instant)
         assert_eq!(
             result,
@@ -337,7 +337,7 @@ mod tests {
     fn next_run_rejects_invalid_local_time() {
         let config = enabled_config("99:00", "Asia/Tokyo");
         let now = "2026-01-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert!(next_scheduled_run(&config, now).is_none());
+        assert!(next_scheduled_run(&config, "Asia/Tokyo", now).is_none());
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
             ..Default::default()
         };
         let now = "2026-01-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert!(next_scheduled_run(&config, now).is_none());
+        assert!(next_scheduled_run(&config, "UTC", now).is_none());
     }
 
     fn agent_map(agent_ids: &[&str]) -> HashMap<AgentId, AgentConfig> {
@@ -429,7 +429,6 @@ mod tests {
         SleepBatchConfig {
             enabled,
             schedule: Some("03:00".to_string()),
-            timezone: Some("UTC".to_string()),
             agents: agent_ids.map(|ids| ids.into_iter().map(AgentId::new).collect()),
             ..Default::default()
         }

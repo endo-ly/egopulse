@@ -133,14 +133,10 @@ pub enum ConfigError {
     SecretRefExecFailed { command: String, detail: String },
     #[error("sleep_batch_enabled_requires_schedule")]
     SleepBatchEnabledRequiresSchedule,
-    #[error("sleep_batch_enabled_requires_timezone")]
-    SleepBatchEnabledRequiresTimezone,
     #[error("sleep_batch_unknown_agent: {agent_id}")]
     SleepBatchUnknownAgent { agent_id: String },
     #[error("sleep_batch_invalid_schedule: {schedule}")]
     SleepBatchInvalidSchedule { schedule: String },
-    #[error("sleep_batch_invalid_timezone: {timezone}")]
-    SleepBatchInvalidTimezone { timezone: String },
     #[error("sleep_batch_invalid_retry: {detail}")]
     SleepBatchInvalidRetry { detail: String },
     #[error("discord_bot_channel_multi_agent_mismatch: bot={bot_id} channel={channel_id} {reason}")]
@@ -163,6 +159,8 @@ pub enum ConfigError {
     PulseInvalidTimezone { timezone: String },
     #[error("pulse_invalid_tick_interval: {reason}")]
     PulseInvalidTickInterval { reason: String },
+    #[error("invalid_timezone: {timezone}")]
+    InvalidTimezone { timezone: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

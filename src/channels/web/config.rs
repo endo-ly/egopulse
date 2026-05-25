@@ -415,6 +415,7 @@ mod tests {
             channels: HashMap::new(),
             default_agent: crate::config::AgentId::new("default"),
             agents: HashMap::new(),
+            timezone: "UTC".to_string(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
