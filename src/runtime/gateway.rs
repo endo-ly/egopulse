@@ -872,8 +872,25 @@ ACTIONS:
                     }
                     None => show_systemctl_status(runtime_dir.as_deref())?,
                 }
+            } else if json {
+                let state = String::from_utf8_lossy(&is_active_output.stdout)
+                    .trim()
+                    .to_string();
+                let logs = fetch_recent_service_logs(runtime_dir.as_deref());
+                let status_json = serde_json::json!({
+                    "ok": false,
+                    "service": state,
+                    "recent_logs": logs,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status_json).unwrap_or_default()
+                );
             } else {
                 show_systemctl_status(runtime_dir.as_deref())?;
+                if let Some(logs) = fetch_recent_service_logs(runtime_dir.as_deref()) {
+                    println!("\nLast error:\n{logs}");
+                }
             }
             Ok(())
         }
