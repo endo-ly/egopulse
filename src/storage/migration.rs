@@ -286,12 +286,11 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 
     if version < 4 {
         let tx = conn.unchecked_transaction()?;
+        // NOTE: we must NOT issue UPDATEs on the old table before recreating it,
+        // because the existing CHECK constraint only allows
+        // ('observed','inferred','uncertain').  Mapping happens in the SELECT below.
         tx.execute_batch(
-            "UPDATE episode_events SET certainty = 'stated' WHERE certainty = 'observed';
-             UPDATE episode_events SET certainty = 'derived' WHERE certainty = 'inferred';
-             UPDATE episode_events SET certainty = 'tentative' WHERE certainty = 'uncertain';
-
-             CREATE TABLE episode_events_v4 (
+            "CREATE TABLE episode_events_v4 (
                  id               TEXT PRIMARY KEY,
                  agent_id         TEXT NOT NULL,
                  experienced_at   TEXT NOT NULL,
@@ -313,7 +312,28 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                  CHECK (certainty IN ('stated', 'derived', 'tentative'))
              );
 
-             INSERT INTO episode_events_v4 SELECT * FROM episode_events;
+             INSERT INTO episode_events_v4
+                 SELECT
+                     id,
+                     agent_id,
+                     experienced_at,
+                     encoded_at,
+                     kind,
+                     title,
+                     body_md,
+                     ripple_strength,
+                     CASE certainty
+                         WHEN 'observed'  THEN 'stated'
+                         WHEN 'inferred'  THEN 'derived'
+                         WHEN 'uncertain' THEN 'tentative'
+                         ELSE certainty
+                     END,
+                     sleep_run_id,
+                     source_refs_json,
+                     created_at,
+                     updated_at
+                 FROM episode_events;
+
              DROP TABLE episode_events;
              ALTER TABLE episode_events_v4 RENAME TO episode_events;
 
