@@ -575,7 +575,7 @@ async fn send_extract_events_request(
         format!("Extract episode events from chunk {chunk_index} of {total_chunks}."),
     );
     let response = provider
-        .send_message(system_prompt, vec![user_message.clone()], None)
+        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
         .await
         .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
@@ -599,7 +599,7 @@ async fn send_extract_events_request(
                 Message::text("user", EVENTS_RETRY_GUARD),
             ];
             let retry_response = provider
-                .send_message(system_prompt, retry_messages, None)
+                .send_message(system_prompt, Arc::new(retry_messages), None)
                 .await
                 .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
@@ -738,7 +738,7 @@ async fn send_sleep_request(
         format!("Please process memory update chunk {chunk_index} of {total_chunks}."),
     );
     let response = provider
-        .send_message(system_prompt, vec![user_message.clone()], None)
+        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
         .await
         .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
@@ -760,7 +760,7 @@ async fn send_sleep_request(
                 Message::text("user", JSON_RETRY_GUARD),
             ];
             let retry_response = provider
-                .send_message(system_prompt, retry_messages, None)
+                .send_message(system_prompt, Arc::new(retry_messages), None)
                 .await
                 .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
@@ -1393,6 +1393,7 @@ mod tests {
     use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolDefinition};
     use crate::storage::{Database, SleepRunStatus};
     use async_trait::async_trait;
+    use std::sync::Arc;
 
     struct MockLlmProvider {
         response: String,
@@ -1447,8 +1448,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<Message>,
-            _tools: Option<Vec<ToolDefinition>>,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
         ) -> Result<MessagesResponse, crate::error::LlmError> {
             Ok(MessagesResponse {
                 content: self.response.clone(),
@@ -1470,7 +1471,7 @@ mod tests {
     }
 
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1695,7 +1696,7 @@ mod tests {
         std::fs::write(memory_dir.join("episodic.md"), "episodic content").expect("write");
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             conn.execute_batch(
                 "CREATE TRIGGER fail_memory_snapshot_insert
                  BEFORE INSERT ON memory_snapshots
@@ -2708,8 +2709,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<Message>,
-            _tools: Option<Vec<ToolDefinition>>,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
         ) -> Result<MessagesResponse, crate::error::LlmError> {
             let mut locked = self.responses.lock().expect("responses lock");
             let content = locked.remove(0);
@@ -2811,7 +2812,7 @@ mod tests {
 
         for _ in 0..20 {
             let result: Option<(String, i64, i64)> = {
-                let conn = state.db.conn.lock().expect("lock");
+                let conn = state.db.get_conn().expect("pool");
                 conn.query_row(
                     "SELECT request_kind, input_tokens, output_tokens FROM llm_usage_logs",
                     [],
@@ -3005,8 +3006,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<Message>,
-            _tools: Option<Vec<ToolDefinition>>,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
         ) -> Result<MessagesResponse, crate::error::LlmError> {
             let mut locked = self.responses.lock().expect("responses lock");
             let (content, input_tokens, output_tokens) = locked.remove(0);

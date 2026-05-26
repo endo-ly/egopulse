@@ -15,7 +15,7 @@ use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage,
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
-    pub(crate) messages: Vec<Message>,
+    pub(crate) messages: Arc<Vec<Message>>,
     pub(crate) session_updated_at: Option<String>,
 }
 
@@ -145,12 +145,13 @@ pub(crate) async fn persist_phase_messages(
     // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
     // 今回の phase 群だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
     let LoadedSession {
-        messages: mut refreshed_messages,
+        messages: refreshed_messages,
         session_updated_at: refreshed_updated_at,
     } = load_messages_for_turn(state, message.chat_id).await?;
-    refreshed_messages.extend(phase_messages);
+    let mut all_messages = Arc::try_unwrap(refreshed_messages).unwrap_or_else(|arc| (*arc).clone());
+    all_messages.extend(phase_messages);
 
-    store_phase_snapshot(state, message, refreshed_messages, refreshed_updated_at)
+    store_phase_snapshot(state, message, all_messages, refreshed_updated_at)
         .await
         .map_err(EgoPulseError::Storage)
 }
@@ -186,7 +187,7 @@ async fn snapshot_to_loaded(
     };
 
     Ok(LoadedSession {
-        messages: repair_orphan_tool_outputs(messages),
+        messages: Arc::new(repair_orphan_tool_outputs(messages)),
         session_updated_at: snapshot.updated_at,
     })
 }
@@ -254,18 +255,20 @@ fn orphan_tool_output_message(tool_call_id: String) -> Message {
 
 fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
     LoadedSession {
-        messages: snapshot
-            .recent_messages
-            .iter()
-            .map(|message| {
-                let role = match message.sender_kind {
-                    SenderKind::Assistant | SenderKind::Tool => "assistant",
-                    SenderKind::User => "user",
-                    SenderKind::System => "system",
-                };
-                Message::text(role, message.content.clone())
-            })
-            .collect(),
+        messages: Arc::new(
+            snapshot
+                .recent_messages
+                .iter()
+                .map(|message| {
+                    let role = match message.sender_kind {
+                        SenderKind::Assistant | SenderKind::Tool => "assistant",
+                        SenderKind::User => "user",
+                        SenderKind::System => "system",
+                    };
+                    Message::text(role, message.content.clone())
+                })
+                .collect(),
+        ),
         session_updated_at: snapshot.updated_at.clone(),
     }
 }
@@ -338,16 +341,42 @@ fn persist_part(
 }
 
 /// Deserialize snapshot JSON as `Vec<Message>` and hydrate `InputImageRef` → `InputImage`.
+///
+/// For text-only sessions (the common case), the JSON string is scanned for
+/// `"input_image_ref"` before any per-message work. When absent the hydration
+/// pass is skipped entirely, eliminating the second iteration.
 fn restore_snapshot_messages(
     assets: &AssetStore,
     json: &str,
 ) -> Result<Vec<Message>, StorageError> {
     let messages: Vec<Message> =
         serde_json::from_str(json).map_err(StorageError::SessionSerialize)?;
+
+    // Fast path: no image references in the serialized form → nothing to hydrate.
+    if !json.contains("\"input_image_ref\"") {
+        return Ok(messages);
+    }
+
+    // Selective hydration: only transform messages that actually contain refs.
     Ok(messages
         .into_iter()
-        .map(|message| hydrate_message(assets, message))
+        .map(|message| {
+            if message_contains_image_ref(&message) {
+                hydrate_message(assets, message)
+            } else {
+                message
+            }
+        })
         .collect())
+}
+
+fn message_contains_image_ref(message: &Message) -> bool {
+    match &message.content {
+        MessageContent::Text(_) => false,
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .any(|part| matches!(part, MessageContentPart::InputImageRef { .. })),
+    }
 }
 
 fn hydrate_message(assets: &AssetStore, message: Message) -> Message {
@@ -424,6 +453,7 @@ mod tests {
 
     use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::SurfaceContext;
+    use crate::assets::AssetStore;
     use crate::config::Config;
     use crate::error::LlmError;
     use crate::llm::{
@@ -449,8 +479,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            messages: Vec<Message>,
-            _tools: Option<Vec<crate::llm::ToolDefinition>>,
+            messages: Arc<Vec<Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<MessagesResponse, LlmError> {
             let prompt = messages
                 .iter()
@@ -1172,5 +1202,209 @@ mod tests {
         assert_eq!(loaded.messages[0].content.as_text_lossy(), "hello");
         assert_eq!(loaded.messages[1].role, "assistant");
         assert_eq!(loaded.messages[1].content.as_text_lossy(), "response");
+    }
+
+    // -- Restore snapshot hydration optimization tests -------------------------
+
+    #[test]
+    fn text_only_snapshot_skips_hydration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = AssetStore::new(dir.path()).expect("store");
+        let json = serde_json::to_string(&vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "world"),
+        ])
+        .expect("json");
+
+        let messages = super::restore_snapshot_messages(&assets, &json).expect("restore");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.as_text_lossy(), "hello");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content.as_text_lossy(), "world");
+    }
+
+    #[test]
+    fn image_snapshot_hydrates_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = AssetStore::new(dir.path()).expect("store");
+        let data_url = "data:image/png;base64,AAAA";
+        let stored = assets.persist_image_data_url(data_url).expect("persist");
+
+        let snapshot = vec![Message {
+            role: "tool".to_string(),
+            content: MessageContent::parts(vec![
+                MessageContentPart::InputText {
+                    text: "screenshot".to_string(),
+                },
+                MessageContentPart::InputImageRef {
+                    image_ref: stored.image_ref.clone(),
+                    mime_type: stored.mime_type.clone(),
+                    detail: Some("auto".to_string()),
+                },
+            ]),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".to_string()),
+        }];
+        let json = serde_json::to_string(&snapshot).expect("json");
+
+        let messages = super::restore_snapshot_messages(&assets, &json).expect("restore");
+        assert_eq!(messages.len(), 1);
+        match &messages[0].content {
+            MessageContent::Parts(parts) => {
+                assert!(matches!(
+                    &parts[1],
+                    MessageContentPart::InputImage { image_url, detail }
+                    if image_url == data_url && detail.as_deref() == Some("auto")
+                ));
+            }
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_output_to_two_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = AssetStore::new(dir.path()).expect("store");
+        let data_url = "data:image/png;base64,iVBORw==";
+        let stored = assets.persist_image_data_url(data_url).expect("persist");
+
+        let snapshot = vec![
+            Message::text("user", "look at this"),
+            Message {
+                role: "tool".to_string(),
+                content: MessageContent::parts(vec![
+                    MessageContentPart::InputText {
+                        text: "file read".to_string(),
+                    },
+                    MessageContentPart::InputImageRef {
+                        image_ref: stored.image_ref.clone(),
+                        mime_type: stored.mime_type.clone(),
+                        detail: None,
+                    },
+                ]),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_img".to_string()),
+            },
+            Message::text("assistant", "I see the image"),
+        ];
+        let json = serde_json::to_string(&snapshot).expect("json");
+
+        let single_pass = super::restore_snapshot_messages(&assets, &json).expect("single");
+
+        // Simulate old two-pass: deserialize then hydrate every message unconditionally.
+        let raw: Vec<Message> = serde_json::from_str(&json).expect("deserialize");
+        let two_pass: Vec<Message> = raw
+            .into_iter()
+            .map(|message| {
+                let content = match message.content {
+                    MessageContent::Text(text) => MessageContent::Text(text),
+                    MessageContent::Parts(parts) => MessageContent::Parts(
+                        parts
+                            .into_iter()
+                            .map(|part| match part {
+                                MessageContentPart::InputText { text } => {
+                                    MessageContentPart::InputText { text }
+                                }
+                                MessageContentPart::InputImage { image_url, detail } => {
+                                    MessageContentPart::InputImage { image_url, detail }
+                                }
+                                MessageContentPart::InputImageRef {
+                                    image_ref,
+                                    mime_type,
+                                    detail,
+                                } => assets
+                                    .load_image_data_url(&image_ref, &mime_type)
+                                    .map(|image_url| MessageContentPart::InputImage {
+                                        image_url,
+                                        detail,
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        MessageContentPart::InputText {
+                                            text: format!(
+                                                "Previously attached image could not be restored: {error}"
+                                            ),
+                                        }
+                                    }),
+                            })
+                            .collect(),
+                    ),
+                };
+                Message {
+                    content,
+                    ..message
+                }
+            })
+            .collect();
+
+        assert_eq!(single_pass, two_pass);
+    }
+
+    #[test]
+    fn large_session_load_performance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = AssetStore::new(dir.path()).expect("store");
+        let messages: Vec<Message> = (0..1000)
+            .map(|index| {
+                Message::text(
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    format!("message-{index}"),
+                )
+            })
+            .collect();
+        let json = serde_json::to_string(&messages).expect("json");
+
+        let start = std::time::Instant::now();
+        let restored = super::restore_snapshot_messages(&assets, &json).expect("restore");
+        let _elapsed = start.elapsed();
+
+        assert_eq!(restored.len(), 1000);
+    }
+
+    /// Verifies that `persist_phase` borrows `&[Message]` for serialization,
+    /// so the caller retains ownership of the `Arc<Vec<Message>>`.
+    #[tokio::test]
+    async fn persist_phase_borrows_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let context = cli_context("borrow-test");
+        let chat_id = super::resolve_chat_id(&state, &context)
+            .await
+            .expect("chat id");
+
+        let messages: Arc<Vec<Message>> = Arc::new(vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "hi"),
+        ]);
+
+        let _persisted = persist_phase(
+            &state,
+            StoredMessage {
+                id: "borrow-msg".to_string(),
+                chat_id,
+                sender_id: "user".to_string(),
+                content: "test".to_string(),
+                sender_kind: SenderKind::User,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                message_kind: MessageKind::Message,
+                recipient_agent_id: None,
+            },
+            Message::text("user", "test"),
+            &messages,
+            None,
+        )
+        .await
+        .expect("persist");
+
+        assert_eq!(Arc::strong_count(&messages), 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_text_lossy(), "hello");
     }
 }

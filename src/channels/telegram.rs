@@ -355,7 +355,7 @@ impl TelegramHandler {
                 };
                 let db = std::sync::Arc::clone(&self.app_state.db);
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
-                    let conn = db.lock_conn()?;
+                    let conn = db.get_conn()?;
                     conn.execute(
                         "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",

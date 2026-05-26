@@ -1,9 +1,10 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use r2d2::ManageConnection;
 use rusqlite::Connection;
 
 use crate::error::StorageError;
@@ -11,9 +12,49 @@ use crate::error::StorageError;
 mod migration;
 mod queries;
 
-/// Thread-safe SQLite database wrapper for conversation persistence.
+/// Connection factory that opens a SQLite database file with WAL mode and
+/// busy_timeout configured on every new connection.
+#[derive(Debug)]
+pub(crate) struct SqliteConnectionManager {
+    path: PathBuf,
+}
+
+impl SqliteConnectionManager {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ManageConnection for SqliteConnectionManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> Result<Connection, Self::Error> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> Result<(), Self::Error> {
+        conn.execute_batch("")
+    }
+
+    fn has_broken(&self, _conn: &mut Connection) -> bool {
+        false
+    }
+}
+
+type Pool = r2d2::Pool<SqliteConnectionManager>;
+type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+
+/// Thread-safe SQLite database wrapper backed by a connection pool.
+///
+/// Each connection in the pool is created with `PRAGMA journal_mode=WAL`
+/// and `busy_timeout = 5 s`.  Read-heavy workloads benefit from concurrent
+/// access because WAL mode allows simultaneous readers.
 pub struct Database {
-    pub(crate) conn: Mutex<Connection>,
+    pool: Pool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,21 +624,38 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let manager = SqliteConnectionManager::new(db_path.to_path_buf());
+        let pool = r2d2::Pool::builder()
+            .max_size(4)
+            .build(manager)
+            .map_err(|e| StorageError::InitFailed(e.to_string()))?;
 
-        migration::run_migrations(&conn)?;
+        {
+            let conn = pool
+                .get()
+                .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+            migration::run_migrations(&conn)?;
+        }
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(Self { pool })
     }
 
-    pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
-        self.conn
-            .lock()
-            .map_err(|error| StorageError::InitFailed(error.to_string()))
+    pub(crate) fn get_conn(&self) -> Result<PooledConn, StorageError> {
+        self.pool
+            .get()
+            .map_err(|e| StorageError::InitFailed(e.to_string()))
+    }
+
+    /// Creates a pool-backed Database without running migrations.
+    /// Used by migration tests that need a specific schema version.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(db_path: &Path) -> Result<Self, StorageError> {
+        let manager = SqliteConnectionManager::new(db_path.to_path_buf());
+        let pool = r2d2::Pool::builder()
+            .max_size(4)
+            .build(manager)
+            .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+        Ok(Self { pool })
     }
 }
 

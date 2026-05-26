@@ -8,6 +8,8 @@ mod messages;
 mod openai;
 mod responses;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use secrecy::ExposeSecret;
@@ -169,8 +171,8 @@ pub(crate) trait LlmProvider: Send + Sync {
     async fn send_message(
         &self,
         system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
     ) -> Result<MessagesResponse, LlmError>;
 }
 
@@ -183,18 +185,20 @@ pub(crate) fn create_provider(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::ResolvedLlmConfig;
 
     use super::{
-        Message, MessageContent, MessageContentPart, ToolCall, ToolDefinition, create_provider,
-        extract_raw_tool_use_blocks,
+        LlmError, LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse,
+        ToolCall, ToolDefinition, create_provider, extract_raw_tool_use_blocks,
     };
 
-    fn message(content: &str) -> Vec<Message> {
-        vec![Message::text("user", content)]
+    fn message(content: &str) -> Arc<Vec<Message>> {
+        Arc::new(vec![Message::text("user", content)])
     }
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -372,11 +376,11 @@ mod tests {
             .send_message(
                 "system prompt",
                 message("read it"),
-                Some(vec![ToolDefinition {
+                Some(Arc::new(vec![ToolDefinition {
                     name: "read".to_string(),
                     description: "Read a file".to_string(),
                     parameters: serde_json::json!({"type": "object"}),
-                }]),
+                }])),
             )
             .await
             .expect("response");
@@ -419,7 +423,7 @@ mod tests {
         let response = provider
             .send_message(
                 "",
-                vec![
+                Arc::new(vec![
                     Message {
                         role: "assistant".to_string(),
                         content: MessageContent::text(""),
@@ -446,12 +450,12 @@ mod tests {
                         tool_calls: Vec::new(),
                         tool_call_id: Some("call_1".to_string()),
                     },
-                ],
-                Some(vec![ToolDefinition {
+                ]),
+                Some(Arc::new(vec![ToolDefinition {
                     name: "read".to_string(),
                     description: "Read a file".to_string(),
                     parameters: serde_json::json!({"type": "object"}),
-                }]),
+                }])),
             )
             .await
             .expect("response");
@@ -691,5 +695,82 @@ mod tests {
 
         assert_eq!(provider.provider_name(), "test");
         assert_eq!(provider.model_name(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn send_message_accepts_arc_tools() {
+        fn assert_arc_tools_param(
+            _provider: &dyn LlmProvider,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) {
+        }
+
+        struct StubProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for StubProvider {
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+            fn model_name(&self) -> &str {
+                "stub-model"
+            }
+            async fn send_message(
+                &self,
+                _system: &str,
+                _messages: Arc<Vec<Message>>,
+                tools: Option<Arc<Vec<ToolDefinition>>>,
+            ) -> Result<MessagesResponse, LlmError> {
+                let _ = tools;
+                unreachable!()
+            }
+        }
+
+        let stub = StubProvider;
+        let tools: Option<Arc<Vec<ToolDefinition>>> = Some(Arc::new(vec![ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }]));
+        assert_arc_tools_param(&stub, tools);
+        assert_arc_tools_param(&stub, None);
+    }
+
+    /// Verifies that `send_message` accepts shared `Arc<Vec<Message>>` without
+    /// requiring the caller to clone the entire message history.
+    #[test]
+    fn send_message_accepts_shared_messages() {
+        fn assert_shared_messages(_provider: &dyn LlmProvider, _messages: Arc<Vec<Message>>) {}
+
+        struct SharedMessagesProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for SharedMessagesProvider {
+            fn provider_name(&self) -> &str {
+                "shared"
+            }
+            fn model_name(&self) -> &str {
+                "shared-model"
+            }
+            async fn send_message(
+                &self,
+                _system: &str,
+                _messages: Arc<Vec<Message>>,
+                _tools: Option<Arc<Vec<ToolDefinition>>>,
+            ) -> Result<MessagesResponse, LlmError> {
+                unreachable!()
+            }
+        }
+
+        let provider = SharedMessagesProvider;
+        let messages: Arc<Vec<Message>> = Arc::new(vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "world"),
+        ]);
+
+        let shared = Arc::clone(&messages);
+        assert_eq!(Arc::strong_count(&messages), 2);
+        assert_shared_messages(&provider, shared);
+        assert_eq!(Arc::strong_count(&messages), 1);
     }
 }

@@ -346,6 +346,26 @@ impl McpManager {
             .collect()
     }
 
+    /// Returns `true` if the MCP tool's annotations indicate it is read-only.
+    ///
+    /// Returns `false` if the tool is not found, has no annotations, or
+    /// `read_only_hint` is not explicitly `true`.
+    pub(crate) fn is_tool_read_only(&self, sanitized_name: &str) -> bool {
+        let Some((server_idx, original_name)) = self.tool_name_index.get(sanitized_name) else {
+            return false;
+        };
+        let Some(server) = self.servers.get(*server_idx) else {
+            return false;
+        };
+        server
+            .cached_tools
+            .iter()
+            .find(|t| t.name.as_ref() == original_name)
+            .and_then(|t| t.annotations.as_ref())
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false)
+    }
+
     pub(crate) async fn execute_tool_by_name(
         &self,
         sanitized_name: &str,
@@ -826,5 +846,47 @@ mod tests {
         let server = &config.mcp_servers["context7"];
         assert!(matches!(server.transport, TransportType::Stdio));
         assert_eq!(server.command.as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn tool_annotations_read_only_hint_is_checked() {
+        use rmcp::model::{Tool, ToolAnnotations};
+        use std::sync::Arc;
+
+        let schema: Arc<serde_json::Map<String, serde_json::Value>> = Arc::new(
+            serde_json::json!({"type": "object"})
+                .as_object()
+                .expect("object")
+                .clone(),
+        );
+
+        let read_only_tool = Tool::new("search", "search docs", schema.clone())
+            .annotate(ToolAnnotations::new().read_only(true));
+        assert_eq!(
+            read_only_tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint),
+            Some(true)
+        );
+
+        let write_tool = Tool::new("write", "write data", schema.clone())
+            .annotate(ToolAnnotations::new().read_only(false));
+        assert_eq!(
+            write_tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint),
+            Some(false)
+        );
+
+        let no_annotations = Tool::new("bare", "bare tool", schema);
+        assert_eq!(
+            no_annotations
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint),
+            None
+        );
     }
 }

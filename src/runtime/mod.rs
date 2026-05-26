@@ -574,7 +574,7 @@ fn spawn_mcp_reconnect_loop(
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
     let llm = create_provider(&config.resolve_global_llm())?;
-    let messages = vec![Message::text("user", prompt)];
+    let messages = Arc::new(vec![Message::text("user", prompt)]);
 
     tokio::select! {
         response = llm.send_message("", messages, None) => Ok(response?.content),

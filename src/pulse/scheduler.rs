@@ -373,7 +373,7 @@ Some notes.
     }
 
     fn count_agent_runs(db: &Arc<Database>, agent_id: &str) -> usize {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pulse_runs WHERE agent_id = ?1",
@@ -385,7 +385,7 @@ Some notes.
     }
 
     fn latest_run_status(db: &Arc<Database>, agent_id: &str) -> PulseRunStatus {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let status_str: String = conn
             .query_row(
                 "SELECT status FROM pulse_runs WHERE agent_id = ?1 ORDER BY started_at DESC LIMIT 1",
@@ -647,8 +647,8 @@ body
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<crate::llm::Message>,
-            _tools: Option<Vec<crate::llm::ToolDefinition>>,
+            _messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             Ok(crate::llm::MessagesResponse {
                 content: "PULSE_OK".to_string(),
@@ -748,7 +748,7 @@ intentions:
         );
 
         // Verify it was the enabled one
-        let conn = state.db.conn.lock().expect("lock");
+        let conn = state.db.get_conn().expect("pool");
         let intention_id: String = conn
             .query_row(
                 "SELECT intention_id FROM pulse_runs WHERE agent_id = ?1",

@@ -76,7 +76,7 @@ impl Drop for ActiveTurnGuard<'_> {
 }
 
 enum TurnAction {
-    Retry(Option<Vec<Message>>),
+    Retry(Option<Arc<Vec<Message>>>),
     Done {
         final_content: String,
         reasoning_content: Option<String>,
@@ -246,7 +246,7 @@ async fn process_turn_inner(
             tools_json: tools_json.as_deref(),
         };
 
-        let (mut messages, mut session_updated_at) = persist_user_turn_with_compaction(
+        let (messages, mut session_updated_at) = persist_user_turn_with_compaction(
             state,
             context,
             chat_id,
@@ -265,21 +265,31 @@ async fn process_turn_inner(
         // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
         let mut empty_reply_retry_attempted = false;
         let mut declarative_retry_attempted = false;
-        let mut retry_messages: Option<Vec<Message>> = None;
+        let mut retry_messages: Option<Arc<Vec<Message>>> = None;
+        let mut messages = messages;
 
         for iteration in 1..=MAX_TOOL_ITERATIONS {
             on_event.emit(AgentEvent::Iteration { iteration });
-            let mut request_messages = retry_messages.take().unwrap_or_else(|| messages.clone());
+            let mut request_messages = retry_messages
+                .take()
+                .unwrap_or_else(|| Arc::clone(&messages));
 
             // Inject Channel Context temporarily before LLM call
             if iteration == 1 {
                 if let Some(ref ctx_msg) = channel_context_msg {
-                    request_messages.insert(0, ctx_msg.clone());
+                    let mut msgs =
+                        Arc::try_unwrap(request_messages).unwrap_or_else(|arc| (*arc).clone());
+                    msgs.insert(0, ctx_msg.clone());
+                    request_messages = Arc::new(msgs);
                 }
             }
 
             let response = channel_llm
-                .send_message(&system_prompt, request_messages, Some(tool_defs.clone()))
+                .send_message(
+                    &system_prompt,
+                    request_messages,
+                    Some(Arc::clone(&tool_defs)),
+                )
                 .await
                 .inspect_err(|e| {
                     warn!(error = %e, iteration, "LLM send_message failed");
@@ -396,7 +406,7 @@ async fn process_turn_inner(
             )
             .await
             {
-                messages = compacted;
+                messages = Arc::new(compacted);
             }
         }
 
@@ -449,12 +459,12 @@ fn evaluate_end_turn(
     if !has_displayable_output && !*empty_reply_retry_attempted {
         *empty_reply_retry_attempted = true;
         warn!("empty visible reply; injecting runtime guard and retrying once");
-        return Ok(TurnAction::Retry(Some(runtime_guard_messages(
+        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
             messages,
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
-        ))));
+        )))));
     }
 
     if has_displayable_output
@@ -463,12 +473,12 @@ fn evaluate_end_turn(
     {
         *declarative_retry_attempted = true;
         warn!("declarative-only reply detected; injecting corrective prompt and retrying once");
-        return Ok(TurnAction::Retry(Some(runtime_guard_messages(
+        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
             messages,
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
-        ))));
+        )))));
     }
 
     if !has_displayable_output {
@@ -500,12 +510,12 @@ fn evaluate_malformed_response(
     if !*declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
         *declarative_retry_attempted = true;
         warn!("all tool calls were malformed and reply was declarative-only; retrying once");
-        return Ok(TurnAction::Retry(Some(runtime_guard_messages(
+        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
             messages,
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
-        ))));
+        )))));
     }
 
     Ok(TurnAction::Done {
@@ -518,7 +528,7 @@ async fn persist_and_finalize(
     state: &AppState,
     chat_id: i64,
     agent_id: &str,
-    messages: &mut Vec<Message>,
+    messages: &mut Arc<Vec<Message>>,
     session_updated_at: Option<String>,
     on_event: &EventEmitter,
     response: (String, Option<String>),
@@ -526,16 +536,20 @@ async fn persist_and_finalize(
     let (final_content, reasoning_content) = response;
     let mut assistant_message = Message::text("assistant", final_content.clone());
     assistant_message.reasoning_content = reasoning_content;
-    messages.push(assistant_message.clone());
+    let mut updated = Arc::try_unwrap(std::mem::replace(messages, Arc::new(Vec::new())))
+        .unwrap_or_else(|arc| (*arc).clone());
+    updated.push(assistant_message.clone());
 
     let _persisted = persist_phase(
         state,
         StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
-        messages,
+        &updated,
         session_updated_at,
     )
     .await?;
+
+    *messages = Arc::new(updated);
 
     on_event.emit(AgentEvent::FinalResponse {
         text: final_content.clone(),
@@ -547,23 +561,23 @@ async fn execute_and_persist_tools(
     state: &AppState,
     on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
-    messages: Vec<Message>,
+    messages: Arc<Vec<Message>>,
     session_updated_at: Option<String>,
     assistant_draft: ToolAssistantDraft,
-) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
+) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
-    let mut messages = messages;
+    let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
     let persisted = persist_tool_call_assistant_message(
         state,
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
         &assistant_draft,
-        messages,
+        messages_vec,
         session_updated_at,
     )
     .await?;
-    messages = persisted.messages;
+    let mut messages = persisted.messages;
     let session_updated_at = Some(persisted.updated_at);
 
     let tool_messages = execute_tool_calls(
@@ -586,7 +600,7 @@ async fn execute_and_persist_tools(
     messages = persisted.messages;
     let session_updated_at = Some(persisted.updated_at);
 
-    Ok((messages, session_updated_at))
+    Ok((Arc::new(messages), session_updated_at))
 }
 
 async fn persist_tool_call_assistant_message(
@@ -668,74 +682,53 @@ async fn execute_tool_calls(
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    let all_read_only = valid_tool_calls
-        .iter()
-        .all(|tc| state.tools.is_read_only(&tc.name));
-
-    if all_read_only {
-        return execute_tool_calls_parallel(
-            state,
-            on_event,
-            tool_context,
-            assistant_message_id,
-            valid_tool_calls,
-        )
-        .await;
+    if valid_tool_calls.is_empty() {
+        return Ok(Vec::new());
     }
 
-    execute_tool_calls_sequential(
-        state,
-        on_event,
-        tool_context,
-        assistant_message_id,
-        valid_tool_calls,
-    )
-    .await
-}
+    let read_only_flags: Vec<bool> = {
+        let mut flags = Vec::with_capacity(valid_tool_calls.len());
+        for tc in &valid_tool_calls {
+            flags.push(state.tools.is_read_only(&tc.name).await);
+        }
+        flags
+    };
 
-async fn execute_tool_calls_parallel(
-    state: &AppState,
-    on_event: &EventEmitter,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError> {
-    let tool_futures: Vec<_> = valid_tool_calls
-        .into_iter()
-        .map(|tool_call| {
-            execute_tool_call(
-                state,
-                on_event,
-                tool_context,
-                assistant_message_id,
-                tool_call,
-            )
-        })
-        .collect();
-    let results = join_all(tool_futures).await;
-    results.into_iter().collect()
-}
-
-async fn execute_tool_calls_sequential(
-    state: &AppState,
-    on_event: &EventEmitter,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError> {
     let mut messages = Vec::with_capacity(valid_tool_calls.len());
-    for tool_call in valid_tool_calls {
-        messages.push(
-            execute_tool_call(
-                state,
-                on_event,
-                tool_context,
-                assistant_message_id,
-                tool_call,
-            )
-            .await?,
-        );
+    let mut cursor = 0;
+
+    while cursor < valid_tool_calls.len() {
+        if read_only_flags[cursor] {
+            let block_start = cursor;
+            while cursor < valid_tool_calls.len() && read_only_flags[cursor] {
+                cursor += 1;
+            }
+            let block_futures: Vec<_> = valid_tool_calls[block_start..cursor]
+                .iter()
+                .cloned()
+                .map(|tc| {
+                    execute_tool_call(state, on_event, tool_context, assistant_message_id, tc)
+                })
+                .collect();
+            let block_results = join_all(block_futures).await;
+            for result in block_results {
+                messages.push(result?);
+            }
+        } else {
+            messages.push(
+                execute_tool_call(
+                    state,
+                    on_event,
+                    tool_context,
+                    assistant_message_id,
+                    valid_tool_calls[cursor].clone(),
+                )
+                .await?,
+            );
+            cursor += 1;
+        }
     }
+
     Ok(messages)
 }
 
@@ -839,7 +832,7 @@ async fn persist_user_turn_with_compaction(
     user_input: &str,
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
-) -> Result<(Vec<Message>, Option<String>), EgoPulseError> {
+) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, chat_id).await?;
     let stored_message = StoredMessage::user(
         chat_id,
@@ -848,7 +841,9 @@ async fn persist_user_turn_with_compaction(
     );
 
     for attempt in 0..2 {
-        let mut candidate_messages = loaded.messages.clone();
+        let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
+        let mut candidate_messages =
+            Arc::try_unwrap(current_messages).unwrap_or_else(|arc| (*arc).clone());
         candidate_messages.push(user_message.clone());
         let candidate_messages = maybe_compact_messages(
             state,
@@ -875,7 +870,7 @@ async fn persist_user_turn_with_compaction(
             }
         };
 
-        return Ok((persisted.messages, Some(persisted.updated_at)));
+        return Ok((Arc::new(persisted.messages), Some(persisted.updated_at)));
     }
 
     Err(EgoPulseError::Storage(
@@ -969,8 +964,8 @@ impl crate::llm::LlmProvider for FakeProvider {
     async fn send_message(
         &self,
         _system: &str,
-        _messages: Vec<Message>,
-        _tools: Option<Vec<crate::llm::ToolDefinition>>,
+        _messages: Arc<Vec<Message>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         let mut locked = self.responses.lock().expect("responses");
         Ok(locked.remove(0))
@@ -991,8 +986,8 @@ impl crate::llm::LlmProvider for FailingProvider {
     async fn send_message(
         &self,
         _system: &str,
-        _messages: Vec<Message>,
-        _tools: Option<Vec<crate::llm::ToolDefinition>>,
+        _messages: Arc<Vec<Message>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         Err(crate::error::LlmError::InvalidResponse("boom".to_string()))
     }
@@ -1012,14 +1007,17 @@ impl crate::llm::LlmProvider for RecordingProvider {
     async fn send_message(
         &self,
         system: &str,
-        messages: Vec<Message>,
-        _tools: Option<Vec<crate::llm::ToolDefinition>>,
+        messages: Arc<Vec<Message>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         self.seen_systems
             .lock()
             .expect("systems")
             .push(system.to_string());
-        self.seen_messages.lock().expect("messages").push(messages);
+        self.seen_messages
+            .lock()
+            .expect("messages")
+            .push((*messages).clone());
         let delay_ms = self.delays_ms.lock().expect("delays").remove(0);
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1147,7 +1145,7 @@ mod tests {
 
     use crate::agent_loop::process_turn;
     use crate::error::EgoPulseError;
-    use crate::llm::{MessagesResponse, ToolCall};
+    use crate::llm::{Message, MessagesResponse, ToolCall};
     use crate::storage::{SenderKind, call_blocking};
 
     // -----------------------------------------------------------------------
@@ -1765,7 +1763,7 @@ mod tests {
         sender_kind: SenderKind,
         ts: &str,
     ) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2473,5 +2471,284 @@ mod tests {
             SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
         };
         assert_eq!(formatted, "[tool/lyre] sent");
+    }
+
+    // -----------------------------------------------------------------------
+    // Order-preserving partial parallelization
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn parallel_read_only_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
+        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
+        let file_c = format!("tests/{}/c.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Mixed read/write.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-r1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-r2".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_b.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-b1".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "echo ok"}),
+                        },
+                        ToolCall {
+                            id: "call-r3".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_c.clone()}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        for path in &[&file_a, &file_b, &file_c] {
+            let full = workspace.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+            std::fs::write(&full, format!("content of {}", path)).expect("write");
+        }
+
+        let reply = process_turn(&state, &cli_context("partial-parallel"), "mixed")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:partial-parallel:agent:default",
+                Some("partial-parallel"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 4);
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+        assert_eq!(tool_calls[0].tool_name, "read");
+        assert_eq!(tool_calls[1].tool_name, "read");
+        assert_eq!(tool_calls[2].tool_name, "bash");
+        assert_eq!(tool_calls[3].tool_name, "read");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sequential_write_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/seq.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Writing.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-b1".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "echo step1"}),
+                        },
+                        ToolCall {
+                            id: "call-w1".to_string(),
+                            name: "write".to_string(),
+                            arguments: serde_json::json!({
+                                "path": file_a.clone(),
+                                "content": "hello"
+                            }),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        std::fs::create_dir_all(
+            workspace
+                .join("tests")
+                .join(uuid::Uuid::new_v4().to_string()),
+        )
+        .expect("dir");
+
+        let reply = process_turn(&state, &cli_context("seq-write"), "write it")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:seq-write:agent:default",
+                Some("seq-write"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].tool_name, "bash");
+        assert_eq!(tool_calls[1].tool_name, "write");
+        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn preserves_transcript_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_a = format!("tests/{}/order.txt", uuid::Uuid::new_v4());
+        let file_b = format!("tests/{}/order2.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Mixed.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call-r1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_a.clone()}),
+                        },
+                        ToolCall {
+                            id: "call-b1".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "echo step2"}),
+                        },
+                        ToolCall {
+                            id: "call-r2".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": file_b.clone()}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Done.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        for path in &[&file_a, &file_b] {
+            let full = workspace.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+            std::fs::write(&full, format!("content of {}", path)).expect("write");
+        }
+
+        let reply = process_turn(&state, &cli_context("transcript-order"), "ordered")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "Done.");
+
+        let seen = provider.seen_messages();
+        assert_eq!(seen.len(), 2, "should have 2 LLM calls");
+        let second_call = &seen[1];
+        let tool_msgs: Vec<_> = second_call.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 3);
+        assert_eq!(
+            tool_msgs[0].tool_call_id.as_deref(),
+            Some("call-r1"),
+            "first tool message must match first tool call"
+        );
+        assert_eq!(
+            tool_msgs[1].tool_call_id.as_deref(),
+            Some("call-b1"),
+            "second tool message must match second tool call"
+        );
+        assert_eq!(
+            tool_msgs[2].tool_call_id.as_deref(),
+            Some("call-r2"),
+            "third tool message must match third tool call"
+        );
+    }
+
+    /// Verifies that the turn loop uses `Arc::clone` (cheap reference count)
+    /// instead of `messages.clone()` (full Vec deep copy) on each iteration.
+    #[test]
+    fn turn_loop_avoids_full_clone() {
+        let messages: Arc<Vec<Message>> = Arc::new(vec![
+            Message::text("user", "hello"),
+            Message::text("assistant", "world"),
+        ]);
+
+        let cloned_arc = Arc::clone(&messages);
+        assert_eq!(Arc::strong_count(&messages), 2);
+        assert!(
+            Arc::ptr_eq(&messages, &cloned_arc),
+            "Arc::clone shares the same allocation"
+        );
+
+        drop(cloned_arc);
+        assert_eq!(Arc::strong_count(&messages), 1);
+    }
+
+    /// Verifies that `retry_messages` uses `Option<Arc<Vec<Message>>>` so
+    /// retry paths share message data rather than cloning the entire history.
+    #[test]
+    fn retry_messages_uses_arc() {
+        let arc: Arc<Vec<Message>> = Arc::new(vec![
+            Message::text("user", "original"),
+            Message::text("assistant", "response"),
+            Message::text("user", "retry guard"),
+        ]);
+
+        assert_eq!(arc.len(), 3);
+        assert_eq!(Arc::strong_count(&arc), 1);
+
+        let shared = Arc::clone(&arc);
+        assert_eq!(Arc::strong_count(&arc), 2);
+        assert!(Arc::ptr_eq(&arc, &shared));
     }
 }

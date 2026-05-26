@@ -7,8 +7,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -19,6 +18,41 @@ use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
 use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
 use crate::storage::call_blocking;
+
+#[derive(Debug, Serialize)]
+struct StatusPayload {
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolStartPayload {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolResultPayload {
+    name: String,
+    is_error: bool,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct DonePayload {
+    response: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorPayload {
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayMetaPayload {
+    replay_truncated: bool,
+    oldest_event_id: Option<u64>,
+    requested_last_event_id: Option<u64>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 /// Represents a chat message request sent from the web UI.
@@ -41,6 +75,13 @@ pub(super) struct StartedRun {
     pub session_key: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SendStreamResponse {
+    ok: bool,
+    run_id: String,
+    session_key: String,
+}
+
 /// Starts a streaming run and returns its identifiers.
 pub(super) async fn api_send_stream(
     State(state): State<WebState>,
@@ -48,11 +89,13 @@ pub(super) async fn api_send_stream(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let started = start_stream_run(state, request, WEB_ACTOR).await?;
 
-    Ok(Json(json!({
-        "ok": true,
-        "run_id": started.run_id,
-        "session_key": started.session_key,
-    })))
+    serde_json::to_value(SendStreamResponse {
+        ok: true,
+        run_id: started.run_id,
+        session_key: started.session_key,
+    })
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 /// Streams run events over SSE, including replay when available.
@@ -74,12 +117,12 @@ pub(super) async fn api_stream(
 
     let stream = async_stream::stream! {
         let meta = Event::default().event("replay_meta").data(
-            json!({
-                "replay_truncated": replay_truncated,
-                "oldest_event_id": oldest_event_id,
-                "requested_last_event_id": query.last_event_id,
+            serde_json::to_string(&ReplayMetaPayload {
+                replay_truncated,
+                oldest_event_id,
+                requested_last_event_id: query.last_event_id,
             })
-            .to_string()
+            .unwrap_or_default(),
         );
         yield Ok::<Event, std::convert::Infallible>(meta);
 
@@ -207,7 +250,11 @@ pub(super) async fn start_stream_run(
         crate::slash_commands::SlashCommandOutcome::Respond(response) => {
             state
                 .run_hub
-                .publish(&run_id, "done", json!({"response": response}).to_string())
+                .publish(
+                    &run_id,
+                    "done",
+                    serde_json::to_string(&DonePayload { response }).unwrap_or_default(),
+                )
                 .await;
             state
                 .run_hub
@@ -221,7 +268,11 @@ pub(super) async fn start_stream_run(
         crate::slash_commands::SlashCommandOutcome::Error(e) => {
             state
                 .run_hub
-                .publish(&run_id, "error", json!({"error": e}).to_string())
+                .publish(
+                    &run_id,
+                    "error",
+                    serde_json::to_string(&ErrorPayload { error: e }).unwrap_or_default(),
+                )
                 .await;
             state
                 .run_hub
@@ -244,7 +295,10 @@ pub(super) async fn start_stream_run(
             .publish(
                 &run_id_for_task,
                 "status",
-                json!({"message": "running"}).to_string(),
+                serde_json::to_string(&StatusPayload {
+                    message: "running".to_string(),
+                })
+                .unwrap_or_default(),
             )
             .await;
 
@@ -259,7 +313,10 @@ pub(super) async fn start_stream_run(
                             .publish(
                                 &run_id_for_events,
                                 "status",
-                                json!({"message": format!("iteration {iteration}")}).to_string(),
+                                serde_json::to_string(&StatusPayload {
+                                    message: format!("iteration {iteration}"),
+                                })
+                                .unwrap_or_default(),
                             )
                             .await;
                     }
@@ -268,7 +325,8 @@ pub(super) async fn start_stream_run(
                             .publish(
                                 &run_id_for_events,
                                 "tool_start",
-                                json!({"name": name}).to_string(),
+                                serde_json::to_string(&ToolStartPayload { name })
+                                    .unwrap_or_default(),
                             )
                             .await;
                     }
@@ -282,12 +340,12 @@ pub(super) async fn start_stream_run(
                             .publish(
                                 &run_id_for_events,
                                 "tool_result",
-                                json!({
-                                    "name": name,
-                                    "is_error": is_error,
-                                    "duration_ms": duration_ms,
+                                serde_json::to_string(&ToolResultPayload {
+                                    name,
+                                    is_error,
+                                    duration_ms,
                                 })
-                                .to_string(),
+                                .unwrap_or_default(),
                             )
                             .await;
                     }
@@ -296,7 +354,8 @@ pub(super) async fn start_stream_run(
                             .publish(
                                 &run_id_for_events,
                                 "done",
-                                json!({"response": text}).to_string(),
+                                serde_json::to_string(&DonePayload { response: text })
+                                    .unwrap_or_default(),
                             )
                             .await;
                     }
@@ -305,7 +364,8 @@ pub(super) async fn start_stream_run(
                             .publish(
                                 &run_id_for_events,
                                 "error",
-                                json!({"error": message}).to_string(),
+                                serde_json::to_string(&ErrorPayload { error: message })
+                                    .unwrap_or_default(),
                             )
                             .await;
                     }
@@ -349,4 +409,97 @@ pub(super) async fn start_stream_run(
         run_id,
         session_key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_event_format_matches() {
+        let done_json = serde_json::to_string(&DonePayload {
+            response: "hello".to_string(),
+        })
+        .unwrap();
+        let done_parsed: serde_json::Value = serde_json::from_str(&done_json).unwrap();
+        assert_eq!(done_parsed["response"], "hello");
+
+        let error_json = serde_json::to_string(&ErrorPayload {
+            error: "oops".to_string(),
+        })
+        .unwrap();
+        let error_parsed: serde_json::Value = serde_json::from_str(&error_json).unwrap();
+        assert_eq!(error_parsed["error"], "oops");
+
+        let status_json = serde_json::to_string(&StatusPayload {
+            message: "running".to_string(),
+        })
+        .unwrap();
+        let status_parsed: serde_json::Value = serde_json::from_str(&status_json).unwrap();
+        assert_eq!(status_parsed["message"], "running");
+
+        let tool_start_json = serde_json::to_string(&ToolStartPayload {
+            name: "read".to_string(),
+        })
+        .unwrap();
+        let tool_start_parsed: serde_json::Value = serde_json::from_str(&tool_start_json).unwrap();
+        assert_eq!(tool_start_parsed["name"], "read");
+
+        let tool_result_json = serde_json::to_string(&ToolResultPayload {
+            name: "write".to_string(),
+            is_error: false,
+            duration_ms: 123,
+        })
+        .unwrap();
+        let tool_result_parsed: serde_json::Value =
+            serde_json::from_str(&tool_result_json).unwrap();
+        assert_eq!(tool_result_parsed["name"], "write");
+        assert_eq!(tool_result_parsed["is_error"], false);
+        assert_eq!(tool_result_parsed["duration_ms"], 123);
+    }
+
+    #[tokio::test]
+    async fn stream_event_data_is_ws_compatible() {
+        let hub = super::super::RunHub::default();
+        hub.create("test-run", "test-actor".to_string()).await;
+
+        let done_data = serde_json::to_string(&DonePayload {
+            response: "final".to_string(),
+        })
+        .unwrap();
+        hub.publish("test-run", "done", done_data).await;
+
+        let (_rx, replay, done, _, _) = hub
+            .subscribe_with_replay("test-run", None, "test-actor", false)
+            .await
+            .unwrap();
+
+        assert!(done);
+        assert_eq!(replay.len(), 1);
+        let event = &replay[0];
+        assert_eq!(event.event, "done");
+
+        let parsed: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(parsed["response"], "final");
+
+        let error_data = serde_json::to_string(&ErrorPayload {
+            error: "fail".to_string(),
+        })
+        .unwrap();
+        let parsed_error: serde_json::Value = serde_json::from_str(&error_data).unwrap();
+        assert_eq!(parsed_error["error"], "fail");
+    }
+
+    #[test]
+    fn replay_meta_serializes_with_camel_case() {
+        let meta = ReplayMetaPayload {
+            replay_truncated: true,
+            oldest_event_id: Some(5),
+            requested_last_event_id: Some(3),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"replayTruncated\":true"));
+        assert!(json.contains("\"oldestEventId\":5"));
+        assert!(json.contains("\"requestedLastEventId\":3"));
+    }
 }

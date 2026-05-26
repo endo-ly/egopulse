@@ -198,7 +198,7 @@ mod tests {
 
     use crate::channels::web::{RunHub, WebState};
     use crate::error::LlmError;
-    use crate::llm::{LlmProvider, Message, MessagesResponse, ToolDefinition};
+    use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::storage::Database;
 
     struct DummyLlm;
@@ -216,8 +216,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<Message>,
-            _tools: Option<Vec<ToolDefinition>>,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<MessagesResponse, LlmError> {
             panic!("handler tests should not call LLM")
         }
@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn insert_sleep_run(db: &Database, id: &str, agent_id: &str, source_chats_json: &str) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at, source_chats_json)
              VALUES (?1, ?2, 'success', 'manual', '2024-01-01T00:00:00Z', ?3)",
@@ -246,7 +246,7 @@ mod tests {
     }
 
     fn insert_memory_snapshot(db: &Database, id: &str, run_id: &str, agent_id: &str) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
              VALUES (?1, ?2, ?3, 'episodic', 'before', 'after', '2024-01-01T00:00:00Z')",

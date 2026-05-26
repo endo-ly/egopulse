@@ -482,7 +482,7 @@ mod tests {
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("all migrations succeed");
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
 
         let expected_tables = [
             "chats",
@@ -521,7 +521,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("migrations");
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
 
         // Insert old-format session keys
         conn.execute(
@@ -562,11 +562,11 @@ mod tests {
 
         // Re-run migrations (v2 will apply)
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             super::run_migrations(&conn).expect("re-run migrations");
         }
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
 
         // Telegram renamed
         let key = conn
@@ -627,12 +627,12 @@ mod tests {
 
         // Run migration twice
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             super::run_migrations(&conn).expect("first run");
             super::run_migrations(&conn).expect("second run");
         }
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let version: String = conn
             .query_row(
                 "SELECT value FROM db_meta WHERE key = 'schema_version'",
@@ -651,7 +651,7 @@ mod tests {
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let _db = super::super::Database::new(&db_path).expect("migrations");
 
-        let conn = _db.conn.lock().expect("lock");
+        let conn = _db.get_conn().expect("pool");
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episode_events'",
@@ -667,7 +667,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("migrations");
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
 
         conn.execute(
             "UPDATE db_meta SET value = '2' WHERE key = 'schema_version'",
@@ -677,11 +677,11 @@ mod tests {
         drop(conn);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             super::run_migrations(&conn).expect("re-run migrations");
         }
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episode_events'",
@@ -700,7 +700,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let _db = super::super::Database::new(&db_path).expect("migrations");
-        let conn = _db.conn.lock().expect("lock");
+        let conn = _db.get_conn().expect("pool");
 
         let expected_columns = [
             "id",
@@ -737,7 +737,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let _db = super::super::Database::new(&db_path).expect("migrations");
-        let conn = _db.conn.lock().expect("lock");
+        let conn = _db.get_conn().expect("pool");
 
         let expected_indexes = [
             "idx_episode_events_agent_experienced",
@@ -799,7 +799,7 @@ mod tests {
 
     fn run_v5_migration(db: &super::super::Database) {
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             super::run_migrations(&conn).expect("re-run migrations");
         }
     }
@@ -810,55 +810,55 @@ mod tests {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT,
+                    chat_type TEXT NOT NULL DEFAULT 'private',
+                    last_message_time TEXT NOT NULL,
+                    channel TEXT,
+                    external_chat_id TEXT,
+                    agent_id TEXT NOT NULL DEFAULT 'default'
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    is_from_bot INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL,
+                    message_kind TEXT NOT NULL DEFAULT 'message',
+                    sender_agent_id TEXT,
+                    recipient_agent_id TEXT,
+                    PRIMARY KEY (id, chat_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+                    ON messages(chat_id, timestamp);",
+            )
             .unwrap();
 
-        // v1 schema — only the tables needed for v5 migration tests
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                chat_title TEXT,
-                chat_type TEXT NOT NULL DEFAULT 'private',
-                last_message_time TEXT NOT NULL,
-                channel TEXT,
-                external_chat_id TEXT,
-                agent_id TEXT NOT NULL DEFAULT 'default'
-            );
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS db_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
 
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                sender_name TEXT NOT NULL,
-                content TEXT NOT NULL,
-                is_from_bot INTEGER NOT NULL DEFAULT 0,
-                timestamp TEXT NOT NULL,
-                message_kind TEXT NOT NULL DEFAULT 'message',
-                sender_agent_id TEXT,
-                recipient_agent_id TEXT,
-                PRIMARY KEY (id, chat_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
-                ON messages(chat_id, timestamp);",
-        )
-        .unwrap();
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS db_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            [],
-        )
-        .unwrap();
-
-        super::set_schema_version(&conn, 4, "test v4 baseline").unwrap();
-
-        super::super::Database {
-            conn: std::sync::Mutex::new(conn),
+            super::set_schema_version(&conn, 4, "test v4 baseline").unwrap();
         }
+
+        super::super::Database::new_unchecked(&db_path).unwrap()
     }
 
     #[test]
@@ -868,7 +868,7 @@ mod tests {
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let has_sender_id: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'sender_id'",
@@ -885,13 +885,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let has_is_from_bot: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'is_from_bot'",
@@ -911,13 +911,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (sender_id, sender_kind): (String, String) = conn
             .query_row(
                 "SELECT sender_id, sender_kind FROM messages WHERE id = 'm1'",
@@ -935,13 +935,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (sender_id, sender_kind): (String, String) = conn
             .query_row(
                 "SELECT sender_id, sender_kind FROM messages WHERE id = 'm2'",
@@ -959,13 +959,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (sender_id, sender_kind): (String, String) = conn
             .query_row(
                 "SELECT sender_id, sender_kind FROM messages WHERE id = 'm3'",
@@ -983,13 +983,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (sender_id, sender_kind): (String, String) = conn
             .query_row(
                 "SELECT sender_id, sender_kind FROM messages WHERE id = 'm4'",
@@ -1007,13 +1007,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let recipient: Option<String> = conn
             .query_row(
                 "SELECT recipient_agent_id FROM messages WHERE id = 'm5'",
@@ -1030,13 +1030,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("count");
@@ -1049,13 +1049,13 @@ mod tests {
         let db = create_v4_db(&dir);
 
         {
-            let conn = db.conn.lock().expect("lock");
+            let conn = db.get_conn().expect("pool");
             seed_v4_messages(&conn);
         }
 
         run_v5_migration(&db);
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (sender_id, sender_kind): (String, String) = conn
             .query_row(
                 "SELECT sender_id, sender_kind FROM messages WHERE id = 'm5'",

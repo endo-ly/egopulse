@@ -251,7 +251,7 @@ async fn persist_notification_with_session(
 
     let loaded = crate::agent_loop::session::load_messages_for_turn(state, chat_id).await?;
 
-    let mut session_messages = loaded.messages;
+    let mut session_messages = (*loaded.messages).clone();
     session_messages.push(Message::text("user", &synthetic_input.content));
 
     let PersistedTurn {
@@ -851,7 +851,7 @@ mod tests {
         };
 
         {
-            let conn = state.db.conn.lock().expect("lock");
+            let conn = state.db.get_conn().expect("pool");
             conn.execute("DROP TABLE messages", rusqlite::params![])
                 .expect("drop messages");
         }
