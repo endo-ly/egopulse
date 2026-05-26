@@ -2,6 +2,7 @@ use super::*;
 use super::{messages::*, responses::*};
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
+use std::sync::Arc;
 
 const REQUEST_TIMEOUT_SECS: u64 = 300;
 
@@ -60,12 +61,16 @@ impl OpenAiProvider {
     async fn send_message_via_responses(
         &self,
         system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
     ) -> Result<MessagesResponse, LlmError> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let mut body =
-            build_responses_request_body(&self.model, system, &messages, tools.as_deref());
+        let mut body = build_responses_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref().map(|arc| arc.as_slice()),
+        );
         if self.is_codex {
             body["store"] = serde_json::Value::Bool(false);
             body["stream"] = serde_json::Value::Bool(true);
@@ -201,8 +206,8 @@ impl LlmProvider for OpenAiProvider {
     async fn send_message(
         &self,
         system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
     ) -> Result<MessagesResponse, LlmError> {
         if self.is_codex {
             crate::llm::codex_auth::refresh_if_needed(&self.http).await;
@@ -228,7 +233,7 @@ impl LlmProvider for OpenAiProvider {
                 &self.model,
                 system,
                 &messages,
-                tools.as_deref(),
+                tools.as_deref().map(|arc| arc.as_slice()),
                 None,
                 should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
             ))

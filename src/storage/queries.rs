@@ -180,7 +180,7 @@ impl Database {
         channel: &str,
         external_chat_id: &str,
     ) -> Result<Option<i64>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         match conn.query_row(
             "SELECT chat_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
             params![channel, external_chat_id],
@@ -193,7 +193,7 @@ impl Database {
     }
 
     pub(crate) fn get_chat_by_id(&self, chat_id: i64) -> Result<Option<ChatInfo>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         match conn.query_row(
             "SELECT channel, external_chat_id, chat_type, agent_id FROM chats WHERE chat_id = ?1 LIMIT 1",
             params![chat_id],
@@ -221,7 +221,7 @@ impl Database {
         chat_type: &str,
         agent_id: &str,
     ) -> Result<i64, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         match conn.query_row(
@@ -264,8 +264,8 @@ impl Database {
     }
 
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 c.chat_id,
                 c.channel,
@@ -336,8 +336,8 @@ impl Database {
         chat_id: i64,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
                     message_kind, recipient_agent_id
              FROM messages
@@ -357,8 +357,8 @@ impl Database {
         &self,
         chat_id: i64,
     ) -> Result<Vec<StoredMessage>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
                     message_kind, recipient_agent_id
              FROM messages
@@ -381,7 +381,7 @@ impl Database {
         chat_id: i64,
         messages_json: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (chat_id, messages_json, updated_at)
@@ -407,7 +407,7 @@ impl Database {
         chat_id: i64,
         expected_updated_at: &str,
     ) -> Result<bool, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         let rows = conn.execute(
             "UPDATE sessions SET messages_json = '[]', updated_at = ?1 \
@@ -423,7 +423,7 @@ impl Database {
         messages_json: &str,
         expected_updated_at: Option<&str>,
     ) -> Result<String, StorageError> {
-        let mut conn = self.lock_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
@@ -474,7 +474,7 @@ impl Database {
         chat_id: i64,
         limit: usize,
     ) -> Result<SessionSnapshot, StorageError> {
-        let mut conn = self.lock_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
 
         let session = tx
@@ -553,7 +553,7 @@ impl Database {
     /// Stores a message without touching the session snapshot.
     /// Used for Channel Log entries (agent_send, system events) that have no session.
     pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -620,7 +620,7 @@ impl Database {
 
 impl Database {
     pub(crate) fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.execute(
             "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -644,7 +644,7 @@ impl Database {
         id: &str,
         output: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let rows_updated = conn.execute(
             "UPDATE tool_calls
              SET tool_output = ?1
@@ -660,7 +660,7 @@ impl Database {
     }
 
     pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
         let created_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -696,7 +696,7 @@ impl Database {
         agent_id: &str,
         trigger: SleepRunTrigger,
     ) -> Result<String, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let id = uuid::Uuid::new_v4().to_string();
         let status = SleepRunStatus::Running.to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
@@ -724,7 +724,7 @@ impl Database {
         agent_id: &str,
         trigger: SleepRunTrigger,
     ) -> Result<Option<String>, StorageError> {
-        let mut conn = self.lock_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let running = SleepRunStatus::Running.to_string();
         let count: i64 = tx.query_row(
@@ -761,7 +761,7 @@ impl Database {
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let total_tokens = input_tokens.saturating_add(output_tokens);
         let status = SleepRunStatus::Success.to_string();
@@ -798,7 +798,7 @@ impl Database {
         id: &str,
         error_message: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = SleepRunStatus::Failed.to_string();
         let running = SleepRunStatus::Running.to_string();
@@ -817,7 +817,7 @@ impl Database {
     }
 
     pub(crate) fn update_sleep_run_skipped(&self, id: &str) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = SleepRunStatus::Skipped.to_string();
         let running = SleepRunStatus::Running.to_string();
@@ -835,7 +835,7 @@ impl Database {
     }
 
     pub(crate) fn get_sleep_run(&self, id: &str) -> Result<Option<SleepRun>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.query_row(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
                     source_chats_json, source_digest_md,
@@ -853,8 +853,8 @@ impl Database {
         agent_id: &str,
         limit: i64,
     ) -> Result<Vec<SleepRun>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
                     source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
@@ -869,17 +869,17 @@ impl Database {
     }
 
     pub(crate) fn list_distinct_agent_ids(&self) -> Result<Vec<String>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let mut stmt =
-            conn.prepare("SELECT DISTINCT agent_id FROM sleep_runs ORDER BY agent_id")?;
+            conn.prepare_cached("SELECT DISTINCT agent_id FROM sleep_runs ORDER BY agent_id")?;
         stmt.query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
     pub(crate) fn list_all_sleep_runs(&self, limit: i64) -> Result<Vec<SleepRun>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
                     source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
@@ -896,7 +896,7 @@ impl Database {
         &self,
         agent_id: &str,
     ) -> Result<Option<SleepRun>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.query_row(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
                     source_chats_json, source_digest_md,
@@ -917,7 +917,7 @@ impl Database {
         agent_id: &str,
         since: Option<&str>,
     ) -> Result<i64, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         if let Some(cutoff) = since {
             conn.query_row(
                 "SELECT COUNT(*)
@@ -947,9 +947,9 @@ impl Database {
         since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AgentSessionInfo>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         if let Some(cutoff) = since {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT
                     c.chat_id,
                     c.channel,
@@ -976,7 +976,7 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT
                     c.chat_id,
                     c.channel,
@@ -1017,7 +1017,7 @@ impl Database {
         content_before: &str,
         content_after: &str,
     ) -> Result<String, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
 
@@ -1050,7 +1050,7 @@ impl Database {
         file: MemoryFile,
         content_after: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let changed = conn.execute(
             "UPDATE memory_snapshots SET content_after = ?1
              WHERE run_id = ?2 AND agent_id = ?3 AND file = ?4",
@@ -1089,8 +1089,8 @@ impl Database {
         &self,
         run_id: &str,
     ) -> Result<Vec<MemorySnapshot>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
              WHERE run_id = ?1
@@ -1106,8 +1106,8 @@ impl Database {
         agent_id: &str,
         limit: i64,
     ) -> Result<Vec<MemorySnapshot>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
              WHERE agent_id = ?1
@@ -1124,7 +1124,7 @@ impl Database {
         agent_id: &str,
         file: MemoryFile,
     ) -> Result<Option<MemorySnapshot>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.query_row(
             "SELECT id, run_id, agent_id, file, content_before, content_after, created_at
              FROM memory_snapshots
@@ -1162,7 +1162,7 @@ impl Database {
         intention_id: &str,
         due_key: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let status = PulseRunStatus::Running.to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
 
@@ -1193,7 +1193,7 @@ impl Database {
         output_kind: PulseOutputKind,
         output_text: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = PulseRunStatus::Success.to_string();
         let running = PulseRunStatus::Running.to_string();
@@ -1227,7 +1227,7 @@ impl Database {
         id: &str,
         error_message: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = PulseRunStatus::Failed.to_string();
         let running = PulseRunStatus::Running.to_string();
@@ -1250,7 +1250,7 @@ impl Database {
         id: &str,
         reason: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = PulseRunStatus::Skipped.to_string();
         let running = PulseRunStatus::Running.to_string();
@@ -1276,7 +1276,7 @@ impl Database {
         intention_id: &str,
         due_key: &str,
     ) -> Result<bool, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pulse_runs
              WHERE agent_id = ?1 AND intention_id = ?2 AND due_key = ?3",
@@ -1287,7 +1287,7 @@ impl Database {
     }
 
     pub(crate) fn get_pulse_run(&self, id: &str) -> Result<Option<PulseRun>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.query_row(
             "SELECT id, agent_id, intention_id, due_key, chat_id, message_id,
                     status, started_at, finished_at, output_kind, output_text, error_message
@@ -1305,7 +1305,7 @@ impl Database {
         agent_id: &str,
         channels: &[&str],
     ) -> Result<Vec<ChatInfo>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
 
         let placeholders: Vec<&str> = channels.iter().map(|_| "?").collect();
         let sql = format!(
@@ -1316,7 +1316,7 @@ impl Database {
             placeholders.join(", ")
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> = {
             let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(1 + channels.len());
             p.push(&agent_id);
@@ -1366,7 +1366,7 @@ impl Database {
         sleep_run_id: &str,
         events: &[EpisodeEvent],
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let tx = conn.unchecked_transaction()?;
 
         let count: i64 = tx.query_row(
@@ -1425,7 +1425,7 @@ impl Database {
         ripple_min: Option<i64>,
         limit: i64,
     ) -> Result<Vec<EpisodeEvent>, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let mut sql = String::from(
             "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
                     ripple_strength, certainty, sleep_run_id, source_refs_json,
@@ -1451,7 +1451,7 @@ impl Database {
         let params: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         stmt.query_map(params.as_slice(), row_to_episode_event)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -1459,7 +1459,7 @@ impl Database {
 
     /// Counts total events for an agent.
     pub(crate) fn count_episode_events(&self, agent_id: &str) -> Result<i64, StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         conn.query_row(
             "SELECT COUNT(*) FROM episode_events WHERE agent_id = ?1",
             params![agent_id],
@@ -1473,8 +1473,8 @@ impl Database {
         &self,
         sleep_run_id: &str,
     ) -> Result<Vec<EpisodeEvent>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
                     ripple_strength, certainty, sleep_run_id, source_refs_json,
                     created_at, updated_at
@@ -1494,8 +1494,8 @@ impl Database {
         &self,
         chat_id: i64,
     ) -> Result<Vec<ToolCall>, StorageError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
              FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
         )?;
@@ -1521,7 +1521,7 @@ impl Database {
         _since: Option<&str>,
         _request_kind: Option<&str>,
     ) -> Result<(i64, i64, i64, i64), StorageError> {
-        let conn = self.lock_conn()?;
+        let conn = self.get_conn()?;
         let mut sql = String::from(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0)
              FROM llm_usage_logs WHERE 1=1",
@@ -1550,7 +1550,7 @@ mod tests {
     }
 
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1809,7 +1809,7 @@ mod tests {
         db.update_tool_call_output_for_message(chat_id, "message-1", "tool-1", "done")
             .expect("update tool call");
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let output: String = conn
             .query_row(
                 "SELECT tool_output FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 AND id = ?3",
@@ -1847,7 +1847,7 @@ mod tests {
         db.update_tool_call_output_for_message(chat_id, "message-2", "tool-1", "done")
             .expect("update scoped output");
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM tool_calls WHERE chat_id = ?1",
@@ -1873,7 +1873,7 @@ mod tests {
         })
         .expect("log usage");
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let (total_tokens, created_at): (i64, String) = conn
             .query_row(
                 "SELECT total_tokens, created_at FROM llm_usage_logs WHERE chat_id = 100",
@@ -1922,7 +1922,7 @@ mod tests {
             .expect("log usage");
         }
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         let kinds: Vec<String> = conn
             .prepare("SELECT request_kind FROM llm_usage_logs ORDER BY rowid")
             .expect("prepare")
@@ -2031,7 +2031,7 @@ mod tests {
     }
 
     fn ensure_sleep_runs_table(db: &Database) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sleep_runs (
                 id TEXT PRIMARY KEY,
@@ -2246,7 +2246,7 @@ mod tests {
     }
 
     fn ensure_memory_snapshots_table(db: &Database) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_snapshots (
                 id TEXT PRIMARY KEY,
@@ -2263,7 +2263,7 @@ mod tests {
 
     fn ensure_sleep_run_exists(db: &Database, run_id: &str, agent_id: &str) {
         ensure_sleep_runs_table(db);
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT OR IGNORE INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
              VALUES (?1, ?2, 'running', 'manual', ?3)",
@@ -2878,7 +2878,7 @@ mod tests {
             .resolve_or_create_chat_id("web", "web:sender-id", None, "web", "default")
             .expect("create chat");
 
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES ('m1', ?1, 'user:cli:alice', 'hello', 'user', '2024-01-01T00:00:00Z', 'message')",

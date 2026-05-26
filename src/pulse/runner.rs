@@ -1,5 +1,7 @@
 //! Pulse Activation runner — executes the Pulse Capsule through the LLM with tool support.
 
+use std::sync::Arc;
+
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{
     format_tool_result, summarize_tool_calls_with_content, tool_message_content,
@@ -102,12 +104,16 @@ pub(crate) async fn run_activation(
 
     let system_prompt = build_system_prompt(state, &context);
     let tool_defs = state.tools.definitions_async().await;
-    let mut messages = vec![Message::text("user", &capsule.prompt)];
+    let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let response = channel_llm
-            .send_message(&system_prompt, messages.clone(), Some(tool_defs.clone()))
+            .send_message(
+                &system_prompt,
+                Arc::clone(&messages),
+                Some(Arc::clone(&tool_defs)),
+            )
             .await
             .inspect_err(|e| {
                 warn!(error = %e, iteration, "pulse LLM send_message failed");
@@ -173,8 +179,11 @@ pub(crate) async fn run_activation(
             summarize_tool_calls_with_content(&response.content, &valid_tool_calls);
         let tool_result_preview = summarize_tool_result_messages(&tool_messages);
 
-        messages.push(assistant_message.clone());
-        messages.extend(tool_messages.clone());
+        {
+            let messages_mut = Arc::make_mut(&mut messages);
+            messages_mut.push(assistant_message.clone());
+            messages_mut.extend(tool_messages.clone());
+        }
         tool_phases.push(ToolPhase {
             assistant_message_id,
             assistant_message,
@@ -483,7 +492,7 @@ mod tests {
 
         for _ in 0..20 {
             let row: Option<(String, i64, i64)> = {
-                let conn = state.db.conn.lock().expect("lock");
+                let conn = state.db.get_conn().expect("pool");
                 conn.query_row(
                     "SELECT request_kind, input_tokens, output_tokens FROM llm_usage_logs",
                     [],

@@ -407,7 +407,7 @@ mod tests {
     }
 
     fn ensure_sleep_runs_table(db: &Database) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sleep_runs (
                 id TEXT PRIMARY KEY,
@@ -428,7 +428,7 @@ mod tests {
     }
 
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

@@ -803,9 +803,9 @@ mod integration_tests {
         ));
         let registry = crate::tools::ToolRegistry::new(&config, skills);
 
-        assert!(registry.is_read_only("read"));
-        assert!(registry.is_read_only("grep"));
-        assert!(!registry.is_read_only("bash"));
-        assert!(!registry.is_read_only("write"));
+        assert!(registry.is_read_only("read").await);
+        assert!(registry.is_read_only("grep").await);
+        assert!(!registry.is_read_only("bash").await);
+        assert!(!registry.is_read_only("write").await);
     }
 }

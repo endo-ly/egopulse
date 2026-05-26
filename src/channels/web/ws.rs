@@ -20,6 +20,21 @@ use super::auth;
 use super::stream::{SendRequest, start_stream_run};
 use super::{RunEvent, WEB_ACTOR, WebState};
 
+#[derive(Deserialize)]
+struct DeltaData {
+    delta: String,
+}
+
+#[derive(Deserialize, Default)]
+struct DoneData {
+    response: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ErrorData {
+    error: Option<String>,
+}
+
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_WS_CONNECTIONS: usize = 64;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
@@ -36,6 +51,13 @@ enum ClientFrame {
         #[serde(default)]
         params: serde_json::Value,
     },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChallengePayload {
+    protocol: u64,
+    conn_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,10 +214,10 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     if send_event(
         &out_tx,
         "connect.challenge",
-        serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "connId": conn_id,
-        }),
+        ChallengePayload {
+            protocol: PROTOCOL_VERSION,
+            conn_id: conn_id.clone(),
+        },
     )
     .is_err()
     {
@@ -496,17 +518,12 @@ fn forward_run_event(
     sequence: &AtomicU64,
     event: RunEvent,
 ) -> bool {
-    // WebSocket では UI が必要とする chat イベントだけに射影して forward する。
     match event.event.as_str() {
         "delta" => {
-            let payload =
-                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
-            let text = payload
-                .get("delta")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if text.is_empty() {
+            let Ok(data) = serde_json::from_str::<DeltaData>(&event.data) else {
+                return false;
+            };
+            if data.delta.is_empty() {
                 return false;
             }
             let seq = sequence.fetch_add(1, Ordering::SeqCst);
@@ -517,34 +534,33 @@ fn forward_run_event(
                 state: "delta",
                 message: Some(GatewayChatMessage {
                     role: "assistant",
-                    content: vec![GatewayChatContent { kind: "text", text }],
+                    content: vec![GatewayChatContent {
+                        kind: "text",
+                        text: data.delta,
+                    }],
                 }),
                 error_message: None,
             };
             send_event(tx, "chat", gateway_event).is_err()
         }
         "done" => {
-            let payload =
-                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
-            let text = payload
-                .get("response")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let data = serde_json::from_str::<DoneData>(&event.data).unwrap_or_default();
             let seq = sequence.fetch_add(1, Ordering::SeqCst);
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
                 seq,
                 state: "done",
-                message: if text.is_empty() {
-                    None
-                } else {
-                    Some(GatewayChatMessage {
-                        role: "assistant",
-                        content: vec![GatewayChatContent { kind: "text", text }],
-                    })
-                },
+                message: data.response.and_then(|text| {
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(GatewayChatMessage {
+                            role: "assistant",
+                            content: vec![GatewayChatContent { kind: "text", text }],
+                        })
+                    }
+                }),
                 error_message: None,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
@@ -553,13 +569,7 @@ fn forward_run_event(
             true
         }
         "error" => {
-            let payload =
-                serde_json::from_str::<serde_json::Value>(&event.data).unwrap_or_default();
-            let message = payload
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("stream error")
-                .to_string();
+            let data = serde_json::from_str::<ErrorData>(&event.data).unwrap_or_default();
             let seq = sequence.fetch_add(1, Ordering::SeqCst);
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
@@ -567,7 +577,7 @@ fn forward_run_event(
                 seq,
                 state: "error",
                 message: None,
-                error_message: Some(message),
+                error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
@@ -602,7 +612,7 @@ fn send_error(
     code: &'static str,
     message: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let frame: ResponseFrame<serde_json::Value> = ResponseFrame {
+    let frame: ResponseFrame<()> = ResponseFrame {
         kind: "res",
         id: id.to_string(),
         ok: false,
@@ -664,5 +674,149 @@ impl InFlightChatPermit {
 impl Drop for InFlightChatPermit {
     fn drop(&mut self) {
         self.in_flight_chat_sends.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::ws::Message;
+
+    fn collect_text_messages(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<String> {
+        let mut result = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Text(text) = msg {
+                result.push(text.to_string());
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn ws_delta_without_intermediate_value() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let delta_event = RunEvent {
+            id: 1,
+            event: "delta".to_string(),
+            data: r#"{"delta":"hello world"}"#.to_string(),
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
+        assert!(!should_stop, "delta event should not terminate the stream");
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["type"], "event");
+        assert_eq!(parsed["event"], "chat");
+
+        let payload = &parsed["payload"];
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["sessionKey"], "sess-1");
+        assert_eq!(payload["seq"], 1);
+        assert_eq!(payload["state"], "delta");
+        assert_eq!(payload["message"]["role"], "assistant");
+        assert_eq!(payload["message"]["content"][0]["type"], "text");
+        assert_eq!(payload["message"]["content"][0]["text"], "hello world");
+        assert!(payload.get("errorMessage").is_none());
+
+        assert_eq!(seq.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn ws_delta_with_empty_text_is_skipped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let delta_event = RunEvent {
+            id: 1,
+            event: "delta".to_string(),
+            data: r#"{"delta":""}"#.to_string(),
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
+        assert!(!should_stop);
+        let messages = collect_text_messages(&mut rx);
+        assert!(messages.is_empty());
+        assert_eq!(seq.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ws_done_event_structure() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(5);
+
+        let done_event = RunEvent {
+            id: 10,
+            event: "done".to_string(),
+            data: r#"{"response":"final answer"}"#.to_string(),
+        };
+
+        let should_stop = forward_run_event(&tx, "run-42", "sess-done", &seq, done_event);
+        assert!(should_stop, "done event should terminate the stream");
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["type"], "event");
+        assert_eq!(parsed["event"], "chat");
+
+        let payload = &parsed["payload"];
+        assert_eq!(payload["runId"], "run-42");
+        assert_eq!(payload["sessionKey"], "sess-done");
+        assert_eq!(payload["seq"], 5);
+        assert_eq!(payload["state"], "done");
+        assert_eq!(payload["message"]["role"], "assistant");
+        assert_eq!(payload["message"]["content"][0]["text"], "final answer");
+    }
+
+    #[test]
+    fn ws_done_without_response_has_no_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let done_event = RunEvent {
+            id: 1,
+            event: "done".to_string(),
+            data: r#"{"response":""}"#.to_string(),
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, done_event);
+        assert!(should_stop);
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        let payload = &parsed["payload"];
+        assert!(payload.get("message").is_none());
+    }
+
+    #[test]
+    fn ws_error_event_structure() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let error_event = RunEvent {
+            id: 1,
+            event: "error".to_string(),
+            data: r#"{"error":"something went wrong"}"#.to_string(),
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, error_event);
+        assert!(should_stop, "error event should terminate the stream");
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        let payload = &parsed["payload"];
+        assert_eq!(payload["state"], "error");
+        assert_eq!(payload["errorMessage"], "something went wrong");
+        assert!(payload.get("message").is_none());
     }
 }

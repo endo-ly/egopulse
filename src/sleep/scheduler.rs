@@ -615,8 +615,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<crate::llm::Message>,
-            _tools: Option<Vec<crate::llm::ToolDefinition>>,
+            _messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             Ok(crate::llm::MessagesResponse {
                 content: self.response.clone(),

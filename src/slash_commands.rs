@@ -822,8 +822,8 @@ mod tests {
         async fn send_message(
             &self,
             _system: &str,
-            _messages: Vec<Message>,
-            _tools: Option<Vec<crate::llm::ToolDefinition>>,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<MessagesResponse, LlmError> {
             Ok(MessagesResponse {
                 content: "summary".to_string(),

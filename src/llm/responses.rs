@@ -234,8 +234,8 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
         return Ok(parsed);
     }
     let mut last_response: Option<ResponsesApiResponse> = None;
-    let mut streamed_text = String::new();
-    let mut streamed_items = Vec::new();
+    let mut streamed_text = String::with_capacity(8192);
+    let mut streamed_items = Vec::with_capacity(32);
 
     for line in text.lines() {
         let line = line.trim();
@@ -246,19 +246,19 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
         if payload.is_empty() || payload == "[DONE]" {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
 
-        if let Some(item_value) = value.get("item")
-            && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.clone())
+        if let Some(item_value) = value.get_mut("item")
+            && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.take())
             && !matches!(item, ResponsesOutputItem::Ignored)
         {
             streamed_items.push(item);
         }
 
-        let event_type = value.get("type").and_then(|v| v.as_str());
-        match event_type {
+        let event_type = value.get("type").and_then(|v| v.as_str()).map(String::from);
+        match event_type.as_deref() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
                     streamed_text.push_str(delta);
@@ -268,18 +268,21 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
                 if let Some(done_text) = value.get("text").and_then(|v| v.as_str())
                     && !done_text.is_empty()
                 {
-                    streamed_text = done_text.to_string();
+                    streamed_text.clear();
+                    streamed_text.push_str(done_text);
                 }
             }
             _ => {}
         }
 
-        if let Some(response_value) = value.get("response") {
+        if let Some(response_value) = value.get_mut("response") {
             if let Ok(parsed) =
-                serde_json::from_value::<ResponsesApiResponse>(response_value.clone())
+                serde_json::from_value::<ResponsesApiResponse>(response_value.take())
             {
                 last_response = Some(parsed);
-                if event_type == Some("response.done") || event_type == Some("response.completed") {
+                if event_type.as_deref() == Some("response.done")
+                    || event_type.as_deref() == Some("response.completed")
+                {
                     break;
                 }
             }
@@ -743,5 +746,88 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
         assert!(text.contains("output_items=0"), "{text}");
         assert!(text.contains("output_tokens=20"), "{text}");
         assert!(text.contains("reasoning_tokens=20"), "{text}");
+    }
+
+    #[test]
+    fn sse_parse_avoids_value_clone() {
+        let payload = r#"
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-text"}]}}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","text":"done-text"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":10}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.content, "item-text");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 5,
+                output_tokens: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn sse_parse_preserves_correctness() {
+        let completed = r#"
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-response"}]}],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+        let parsed = parse_codex_responses_payload(completed).expect("completed");
+        let resp = parse_responses_response(parsed).expect("resp");
+        assert_eq!(resp.content, "from-response");
+
+        let streamed = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"abc"}
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"def"}
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
+"#;
+        let parsed = parse_codex_responses_payload(streamed).expect("streamed");
+        let resp = parse_responses_response(parsed).expect("resp");
+        assert_eq!(resp.content, "abcdef");
+
+        let item = r#"
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-content"}]}}
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
+"#;
+        let parsed = parse_codex_responses_payload(item).expect("item");
+        let resp = parse_responses_response(parsed).expect("resp");
+        assert_eq!(resp.content, "item-content");
+    }
+
+    #[test]
+    fn sse_streamed_text_capacity() {
+        let mut payload = String::with_capacity(65536);
+        let segment = "ABCDEFGHIJ";
+        let segments = 2000;
+
+        for _ in 0..segments {
+            payload.push_str("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"");
+            payload.push_str(segment);
+            payload.push_str("\"}\n\n");
+        }
+
+        payload.push_str(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":null}}\n",
+        );
+
+        let parsed = parse_codex_responses_payload(&payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        let expected: String = segment.repeat(segments);
+        assert_eq!(response.content, expected);
+        assert!(response.content.len() > 8192);
     }
 }

@@ -241,8 +241,8 @@ impl ToolRegistry {
         self.mcp_manager = Some(mcp_manager);
     }
 
-    /// Collect tool definitions asynchronously.
-    pub(crate) async fn definitions_async(&self) -> Vec<ToolDefinition> {
+    /// Collect tool definitions asynchronously, wrapped in `Arc` for cheap sharing.
+    pub(crate) async fn definitions_async(&self) -> Arc<Vec<ToolDefinition>> {
         let mut definitions: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
 
@@ -251,7 +251,7 @@ impl ToolRegistry {
             definitions.extend(guard.all_tool_definitions());
         }
 
-        definitions
+        Arc::new(definitions)
     }
 
     /// Find and execute a tool by name. Returns an error result for unknown tools.
@@ -303,11 +303,17 @@ impl ToolRegistry {
         secrets
     }
 
-    /// Returns `true` if the named tool is a read-only tool safe for parallel execution.
-    pub(crate) fn is_read_only(&self, name: &str) -> bool {
-        self.tool_index
-            .get(name)
-            .is_some_and(|&idx| self.tools[idx].is_read_only())
+    pub(crate) async fn is_read_only(&self, name: &str) -> bool {
+        if let Some(&idx) = self.tool_index.get(name) {
+            return self.tools[idx].is_read_only();
+        }
+        if name.starts_with("mcp_") {
+            if let Some(mcp_manager) = &self.mcp_manager {
+                let guard = mcp_manager.read().await;
+                return guard.is_tool_read_only(name);
+            }
+        }
+        false
     }
 }
 
@@ -870,48 +876,48 @@ mod tests {
         assert!(!find_result.content.contains(".ssh/id_rsa"));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn read_only_tools_report_true() {
+    async fn read_only_tools_report_true() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        assert!(registry.is_read_only("read"));
-        assert!(registry.is_read_only("grep"));
-        assert!(registry.is_read_only("find"));
-        assert!(registry.is_read_only("ls"));
-        assert!(registry.is_read_only("activate_skill"));
+        assert!(registry.is_read_only("read").await);
+        assert!(registry.is_read_only("grep").await);
+        assert!(registry.is_read_only("find").await);
+        assert!(registry.is_read_only("ls").await);
+        assert!(registry.is_read_only("activate_skill").await);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn write_tools_report_false() {
+    async fn write_tools_report_false() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        assert!(!registry.is_read_only("bash"));
-        assert!(!registry.is_read_only("write"));
-        assert!(!registry.is_read_only("edit"));
+        assert!(!registry.is_read_only("bash").await);
+        assert!(!registry.is_read_only("write").await);
+        assert!(!registry.is_read_only("edit").await);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn unknown_tool_is_not_read_only() {
+    async fn unknown_tool_is_not_read_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        assert!(!registry.is_read_only("nonexistent_tool"));
+        assert!(!registry.is_read_only("nonexistent_tool").await);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn registered_custom_tool_defaults_to_not_read_only() {
+    async fn registered_custom_tool_defaults_to_not_read_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
@@ -921,7 +927,21 @@ mod tests {
             result: ToolResult::success("ok".to_string()),
         }));
 
-        assert!(!registry.is_read_only("custom"));
+        assert!(!registry.is_read_only("custom").await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mcp_tool_without_manager_defaults_to_not_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        assert!(
+            !registry.is_read_only("mcp_some_read_tool").await,
+            "MCP tools without an active manager should default to not read-only"
+        );
     }
 
     /// Backward-compatibility: activate_skill in the same turn still works.
@@ -1329,6 +1349,54 @@ mod tests {
         assert!(
             env_after.is_empty(),
             "skill_env must be cleared when injected map is empty"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn definitions_async_returns_arc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        let defs = registry.definitions_async().await;
+
+        let ptr = Arc::as_ptr(&defs);
+        assert!(!defs.is_empty(), "should have at least one tool definition");
+        let defs2 = registry.definitions_async().await;
+        let ptr2 = Arc::as_ptr(&defs2);
+        assert_ne!(ptr, ptr2, "each call should produce a distinct Arc");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn no_tool_def_clone_per_iteration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let registry = test_registry(&config);
+
+        let tool_defs = registry.definitions_async().await;
+
+        let iterations = 10;
+        let mut arc_clones = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            arc_clones.push(Arc::clone(&tool_defs));
+        }
+
+        let base_ptr = Arc::as_ptr(&tool_defs);
+        for clone in &arc_clones {
+            assert_eq!(
+                Arc::as_ptr(clone),
+                base_ptr,
+                "Arc::clone must share the same allocation (no deep clone)"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&tool_defs),
+            iterations + 1,
+            "all Arc::clones must reference-count the same allocation"
         );
     }
 }

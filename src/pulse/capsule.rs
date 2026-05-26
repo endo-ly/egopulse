@@ -266,7 +266,7 @@ mod tests {
         let chat_id = db
             .resolve_or_create_chat_id(channel, external_chat_id, None, chat_type, agent_id)
             .expect("create chat");
-        let conn = db.conn.lock().expect("lock");
+        let conn = db.get_conn().expect("pool");
         conn.execute(
             "UPDATE chats SET last_message_time = ?1 WHERE chat_id = ?2",
             rusqlite::params![last_message_time, chat_id],

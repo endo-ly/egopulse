@@ -5,6 +5,8 @@
 //! latest user message, recent context, and tool call/result blocks are always
 //! preserved verbatim.
 
+use std::sync::Arc;
+
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::error::{EgoPulseError, LlmError};
@@ -328,7 +330,7 @@ async fn send_summary_request(
         std::time::Duration::from_secs(timeout_secs),
         llm.send_message(
             SUMMARIZER_SYSTEM_PROMPT,
-            vec![Message::text("user", summary_input)],
+            Arc::new(vec![Message::text("user", summary_input)]),
             None,
         ),
     )
