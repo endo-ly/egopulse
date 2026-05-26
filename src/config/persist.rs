@@ -72,8 +72,6 @@ struct SerializableSleepBatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     schedule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    timezone: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     agents: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry: Option<SerializableRetry>,
@@ -104,6 +102,8 @@ struct SerializableConfig {
     default_agent: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     agents: HashMap<String, SerializableAgent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timezone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sleep_batch: Option<SerializableSleepBatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,13 +350,16 @@ impl From<&Config> for SerializableConfig {
             channels,
             default_agent: Some(config.default_agent.to_string()),
             agents,
+            timezone: {
+                let tz = &config.timezone;
+                if tz == "UTC" { None } else { Some(tz.clone()) }
+            },
             sleep_batch: {
                 let sb = &config.sleep_batch;
                 let has_content = sb.provider.is_some()
                     || sb.model.is_some()
                     || sb.enabled
                     || sb.schedule.is_some()
-                    || sb.timezone.is_some()
                     || sb.agents.is_some()
                     || sb.retry_max_attempts != 3
                     || sb.retry_interval_minutes != 5;
@@ -368,7 +371,6 @@ impl From<&Config> for SerializableConfig {
                         model: sb.model.clone(),
                         enabled: sb.enabled,
                         schedule: sb.schedule.clone(),
-                        timezone: sb.timezone.clone(),
                         agents: sb
                             .agents
                             .as_ref()
@@ -661,6 +663,7 @@ mod tests {
             channels,
             default_agent: AgentId::new("default"),
             agents,
+            timezone: "UTC".to_string(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),

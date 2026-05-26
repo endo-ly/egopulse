@@ -12,6 +12,7 @@ LLM に送信される system prompt の構築方法を定義する。
 6. [Tool / MCP Tool 定義の注入](#6-tool--mcp-tool-定義の注入)
 7. [Compaction 用プロンプト](#7-compaction-用プロンプト)
 8. [Channel Context 注入（Multi-Agent Room）](#8-channel-context-注入multi-agent-room)
+9. [Current Time 注入（全ターン共通）](#9-current-time-注入全ターン共通)
 
 ---
 
@@ -449,3 +450,26 @@ Channel Context は `request_messages` にのみ追加され、Agent Session の
 ### SystemEvent の扱い
 
 Channel Log に記録された `MessageKind::SystemEvent` メッセージは Channel Context 注入の対象外。SystemEvent は停止理由の記録用であり、LLM のコンテキストには含まれない。
+
+---
+
+## 9. Current Time 注入（全ターン共通）
+
+毎ターンの user message 先頭に、現在時刻が以下の形式で注入される。
+
+```text
+[Current time: 2026-05-25 (Mon) 14:32:19 Asia/Tokyo]
+```
+
+### 注入位置
+
+system prompt には含めず、`process_turn` で user message の先頭に挿入される。
+これにより:
+
+- system prompt は完全静的に保たれ、prompt cache が最大効率で hit する
+- user message は毎ターン必ず変わるため、15トークン程度の追加コストは無視できる
+
+### タイムゾーン
+
+グローバル設定 `timezone`（IANA 形式、デフォルト `UTC`）が使用される。
+`sleep batch` および `pulse` のトリガー評価も同じグローバル `timezone` を参照する。

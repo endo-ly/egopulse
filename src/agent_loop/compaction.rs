@@ -1005,13 +1005,18 @@ mod tests {
         let summary_text = seen_messages[1][0].content.as_text_lossy();
         assert!(summary_text.contains("[CONTEXT COMPACTION — REFERENCE ONLY]"));
         assert!(summary_text.contains("summary text"));
-        assert_eq!(
-            seen_messages[1]
-                .last()
-                .expect("final request")
-                .content
-                .as_text_lossy(),
-            "fresh question"
+        let final_request = seen_messages[1]
+            .last()
+            .expect("final request")
+            .content
+            .as_text_lossy();
+        assert!(
+            final_request.starts_with("[Current time: "),
+            "expected last message to include timestamp prefix, got: {final_request}",
+        );
+        assert!(
+            final_request.ends_with("fresh question"),
+            "expected last message to end with 'fresh question', got: {final_request}",
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
@@ -1105,13 +1110,18 @@ mod tests {
                 .contains("[CONTEXT COMPACTION — REFERENCE ONLY]")
         }));
         assert_eq!(seen_messages[1][0].content.as_text_lossy(), "old-user-1");
-        assert_eq!(
-            seen_messages[1]
-                .last()
-                .expect("final request")
-                .content
-                .as_text_lossy(),
-            "fresh question"
+        let final_request = seen_messages[1]
+            .last()
+            .expect("final request")
+            .content
+            .as_text_lossy();
+        assert!(
+            final_request.starts_with("[Current time: "),
+            "expected last message to include timestamp prefix, got: {final_request}",
+        );
+        assert!(
+            final_request.ends_with("fresh question"),
+            "expected last message to end with 'fresh question', got: {final_request}",
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)

@@ -106,7 +106,6 @@ struct FileSleepBatchConfig {
     model: Option<String>,
     enabled: Option<bool>,
     schedule: Option<String>,
-    timezone: Option<String>,
     agents: Option<Vec<String>>,
     retry: Option<FileRetryConfig>,
 }
@@ -121,7 +120,6 @@ struct FileRetryConfig {
 struct FilePulseConfig {
     enabled: Option<bool>,
     tick_interval: Option<String>,
-    timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -158,6 +156,7 @@ struct FileConfig {
     channels: Option<HashMap<String, FileChannelConfig>>,
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
+    timezone: Option<String>,
     sleep_batch: Option<FileSleepBatchConfig>,
     pulse: Option<FilePulseConfig>,
     web_fetch: Option<FileWebFetchConfig>,
@@ -188,6 +187,7 @@ pub(super) fn build_config(
         channels: file_channels,
         default_agent: file_default_agent,
         agents: file_agents,
+        timezone: file_timezone,
         sleep_batch: file_sleep_batch,
         pulse: file_pulse,
         web_fetch: file_web_fetch,
@@ -252,6 +252,9 @@ pub(super) fn build_config(
 
     let pulse = normalize_pulse(file_pulse)?;
 
+    let timezone = normalize_string(file_timezone).unwrap_or_else(|| "UTC".to_string());
+    validate_timezone(&timezone)?;
+
     let web_fetch = normalize_web_fetch(file_web_fetch);
 
     let config = Config {
@@ -269,6 +272,7 @@ pub(super) fn build_config(
         channels,
         default_agent,
         agents,
+        timezone,
         sleep_batch,
         pulse,
         web_fetch,
@@ -613,20 +617,13 @@ fn normalize_sleep_batch(
 
     let enabled = fb.enabled.unwrap_or(false);
     let schedule = normalize_string(fb.schedule);
-    let timezone = normalize_string(fb.timezone);
 
     if enabled && schedule.is_none() {
         return Err(ConfigError::SleepBatchEnabledRequiresSchedule);
     }
-    if enabled && timezone.is_none() {
-        return Err(ConfigError::SleepBatchEnabledRequiresTimezone);
-    }
 
     if let Some(ref sched) = schedule {
         validate_schedule(sched)?;
-    }
-    if let Some(ref tz) = timezone {
-        validate_timezone(tz)?;
     }
 
     let mut resolved_agents = normalize_agent_list(fb.agents, agents)?;
@@ -648,7 +645,6 @@ fn normalize_sleep_batch(
         model: normalize_string(fb.model),
         enabled,
         schedule,
-        timezone,
         agents: resolved_agents,
         retry_max_attempts,
         retry_interval_minutes,
@@ -682,7 +678,7 @@ fn validate_schedule(schedule: &str) -> Result<(), ConfigError> {
 
 fn validate_timezone(tz: &str) -> Result<(), ConfigError> {
     tz.parse::<chrono_tz::Tz>()
-        .map_err(|_| ConfigError::SleepBatchInvalidTimezone {
+        .map_err(|_| ConfigError::InvalidTimezone {
             timezone: tz.to_string(),
         })?;
     Ok(())
@@ -693,14 +689,6 @@ fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigE
         return Ok(PulseConfig::default());
     };
 
-    let timezone = normalize_string(fp.timezone);
-    if let Some(ref tz) = timezone {
-        tz.parse::<chrono_tz::Tz>()
-            .map_err(|_| ConfigError::PulseInvalidTimezone {
-                timezone: tz.clone(),
-            })?;
-    }
-
     let tick_interval_secs = match fp.tick_interval {
         Some(ref s) => super::types::parse_duration(s)
             .map_err(|e| ConfigError::PulseInvalidTickInterval { reason: e })?,
@@ -710,7 +698,6 @@ fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigE
     Ok(PulseConfig {
         enabled: fp.enabled.unwrap_or(false),
         tick_interval_secs,
-        timezone,
     })
 }
 

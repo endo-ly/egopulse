@@ -24,7 +24,7 @@ pub(crate) async fn run_pulse_scan(state: &AppState) {
         return;
     }
 
-    let timezone = pulse_cfg.timezone.as_deref().unwrap_or("UTC");
+    let timezone = state.config.timezone.as_str();
 
     let state_root = Path::new(&state.config.state_root);
     let now = Utc::now();
@@ -351,7 +351,6 @@ mod tests {
         PulseConfig {
             enabled: true,
             tick_interval_secs: 60,
-            timezone: Some("UTC".to_string()),
         }
     }
 

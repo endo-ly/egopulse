@@ -255,7 +255,6 @@ pub(crate) struct SleepBatchConfig {
     pub model: Option<String>,
     pub enabled: bool,
     pub schedule: Option<String>,
-    pub timezone: Option<String>,
     pub agents: Option<Vec<AgentId>>,
     pub retry_max_attempts: u32,
     pub retry_interval_minutes: u32,
@@ -268,7 +267,6 @@ impl Default for SleepBatchConfig {
             model: None,
             enabled: false,
             schedule: None,
-            timezone: None,
             agents: None,
             retry_max_attempts: 3,
             retry_interval_minutes: 5,
@@ -287,7 +285,6 @@ impl SleepBatchConfig {
 pub(crate) struct PulseConfig {
     pub enabled: bool,
     pub tick_interval_secs: u64,
-    pub timezone: Option<String>,
 }
 
 impl Default for PulseConfig {
@@ -295,7 +292,6 @@ impl Default for PulseConfig {
         Self {
             enabled: false,
             tick_interval_secs: 60,
-            timezone: None,
         }
     }
 }
@@ -395,6 +391,7 @@ pub struct Config {
     pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
+    pub(crate) timezone: String,
     pub(crate) sleep_batch: SleepBatchConfig,
     pub(crate) pulse: PulseConfig,
     pub(crate) web_fetch: super::web_fetch::WebFetchConfig,
@@ -423,6 +420,7 @@ impl std::fmt::Debug for Config {
             .field("channels", &self.channels)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)
+            .field("timezone", &self.timezone)
             .field("sleep_batch", &self.sleep_batch)
             .field("pulse", &self.pulse)
             .field("web_fetch", &self.web_fetch)

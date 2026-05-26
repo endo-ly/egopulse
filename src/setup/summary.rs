@@ -272,6 +272,10 @@ pub(crate) fn save_config(
         channels,
         default_agent: crate::config::AgentId::new("default"),
         agents,
+        timezone: existing_config
+            .as_ref()
+            .map(|c| c.timezone.clone())
+            .unwrap_or_else(|| "UTC".to_string()),
         sleep_batch: existing_config
             .as_ref()
             .map(|c| c.sleep_batch.clone())

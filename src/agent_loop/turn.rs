@@ -21,6 +21,8 @@ use crate::llm::{Message, ToolCall};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{SenderKind, StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
+use chrono::{Datelike, Utc};
+use chrono_tz::Tz;
 use futures_util::future::join_all;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -124,6 +126,31 @@ pub(crate) async fn send_turn(
     }
 }
 
+/// Formats the current time as a human-readable string with weekday and IANA timezone.
+///
+/// Example: `2026-05-25 (Mon) 14:32:19 Asia/Tokyo`
+fn format_current_time(tz: &str) -> String {
+    let tz: Tz = tz.parse().unwrap_or(chrono_tz::UTC);
+    let now = Utc::now().with_timezone(&tz);
+    let weekday = match now.weekday().number_from_monday() {
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        7 => "Sun",
+        _ => "???",
+    };
+    format!(
+        "{} ({}) {} {}",
+        now.format("%Y-%m-%d"),
+        weekday,
+        now.format("%H:%M:%S"),
+        tz,
+    )
+}
+
 /// Processes one user turn against the persisted session state.
 pub(crate) async fn process_turn(
     state: &AppState,
@@ -206,7 +233,11 @@ async fn process_turn_inner(
             );
         })?;
 
-        let user_message = Message::text("user", user_input);
+        let timestamp_line = format!(
+            "[Current time: {}]\n",
+            format_current_time(&state.config.timezone)
+        );
+        let user_message = Message::text("user", format!("{timestamp_line}{user_input}"));
 
         let tool_defs = state.tools.definitions_async().await;
         let tools_json = serde_json::to_string(&tool_defs).ok();
@@ -1930,10 +1961,14 @@ mod tests {
             user_msgs.len()
         );
         let last_user = user_msgs.last().expect("last user message");
-        assert_eq!(
-            last_user.content.as_text_lossy(),
-            "my direct question",
-            "expected the user's actual input as the last user message"
+        let last_user_text = last_user.content.as_text_lossy();
+        assert!(
+            last_user_text.starts_with("[Current time: "),
+            "expected timestamp prefix in last user message, got: {last_user_text}",
+        );
+        assert!(
+            last_user_text.ends_with("my direct question"),
+            "expected the user's actual input as the last user message, got: {last_user_text}",
         );
     }
 
@@ -1992,10 +2027,14 @@ mod tests {
                 1,
                 "[{label}] should have exactly one user message"
             );
-            assert_eq!(
-                user_msgs[0].content.as_text_lossy(),
-                "hello",
-                "[{label}] user message should be the plain input"
+            let user_text = user_msgs[0].content.as_text_lossy();
+            assert!(
+                user_text.starts_with("[Current time: "),
+                "[{label}] user message should include timestamp prefix, got: {user_text}",
+            );
+            assert!(
+                user_text.ends_with("hello"),
+                "[{label}] user message should end with the plain input, got: {user_text}",
             );
             for msg in &seen[0] {
                 assert!(

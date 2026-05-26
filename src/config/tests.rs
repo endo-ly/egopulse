@@ -554,6 +554,7 @@ fn persists_agents_without_discord_config_surface() {
         channels: std::collections::HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
+        timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
@@ -1348,6 +1349,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         channels,
         default_agent: super::AgentId::new("assistant"),
         agents,
+        timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
@@ -2169,6 +2171,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                 ..Default::default()
             },
         )]),
+        timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
@@ -2431,6 +2434,7 @@ fn persist_preserves_sleep_batch_config() {
                 ..Default::default()
             },
         )]),
+        timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig {
             provider: Some(super::ProviderId::new("deepseek")),
             model: Some("deepseek-chat-v3".to_string()),
@@ -2451,6 +2455,10 @@ fn persist_preserves_sleep_batch_config() {
 // --- Step 2: Sleep Batch Scheduler Config tests ---
 
 fn sleep_batch_scheduler_yml(sleep_batch_section: &str) -> String {
+    sleep_batch_scheduler_yml_with_tz("UTC", sleep_batch_section)
+}
+
+fn sleep_batch_scheduler_yml_with_tz(timezone: &str, sleep_batch_section: &str) -> String {
     format!(
         r#"default_provider: openai
 providers:
@@ -2464,6 +2472,7 @@ channels:
     enabled: true
     auth_token: web-secret
 default_agent: alice
+timezone: "{timezone}"
 agents:
   alice:
     label: Alice
@@ -2486,7 +2495,7 @@ fn loads_sleep_batch_enabled() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2515,7 +2524,7 @@ fn loads_sleep_batch_schedule() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2525,20 +2534,21 @@ fn loads_sleep_batch_schedule() {
 
 #[test]
 #[serial]
-fn loads_sleep_batch_timezone() {
+fn loads_global_timezone() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
         &temp_dir,
-        &sleep_batch_scheduler_yml(
+        &sleep_batch_scheduler_yml_with_tz(
+            "Asia/Tokyo",
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.sleep_batch.timezone.as_deref(), Some("Asia/Tokyo"));
+    assert_eq!(config.timezone, "Asia/Tokyo");
 }
 
 #[test]
@@ -2550,7 +2560,7 @@ fn sleep_batch_enabled_requires_schedule() {
         &temp_dir,
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2563,7 +2573,7 @@ fn sleep_batch_enabled_requires_schedule() {
 
 #[test]
 #[serial]
-fn sleep_batch_enabled_requires_timezone() {
+fn global_timezone_defaults_to_utc() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
@@ -2574,16 +2584,13 @@ fn sleep_batch_enabled_requires_timezone() {
         ),
     );
 
-    let error = Config::load(Some(&file_path)).expect_err("should fail");
-    assert!(
-        matches!(error, ConfigError::SleepBatchEnabledRequiresTimezone),
-        "expected SleepBatchEnabledRequiresTimezone, got {error:?}"
-    );
+    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(config.timezone, "UTC");
 }
 
 #[test]
 #[serial]
-fn sleep_batch_disabled_allows_missing_schedule_timezone() {
+fn sleep_batch_disabled_allows_missing_schedule() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(&temp_dir, &sleep_batch_scheduler_yml(r#"  enabled: false"#));
@@ -2591,7 +2598,6 @@ fn sleep_batch_disabled_allows_missing_schedule_timezone() {
     let config = Config::load(Some(&file_path)).expect("load config");
     assert!(!config.sleep_batch.enabled);
     assert!(config.sleep_batch.schedule.is_none());
-    assert!(config.sleep_batch.timezone.is_none());
 }
 
 #[test]
@@ -2604,7 +2610,6 @@ fn loads_sleep_batch_agents() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   agents:
     - alice
     - bob"#,
@@ -2628,7 +2633,7 @@ fn sleep_batch_agents_defaults_to_none_when_unset() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2646,7 +2651,6 @@ fn sleep_batch_agents_empty_means_no_agents() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   agents: []"#,
         ),
     );
@@ -2666,7 +2670,6 @@ fn sleep_batch_agent_order_puts_default_first() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   agents:
     - carol
     - alice
@@ -2691,7 +2694,6 @@ fn sleep_batch_agents_deduplicates_duplicates() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   agents:
     - alice
     - bob
@@ -2716,7 +2718,6 @@ fn loads_sleep_batch_retry_config() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   retry:
     max_attempts: 5
     interval_minutes: 10"#,
@@ -2738,7 +2739,6 @@ fn rejects_unknown_sleep_batch_agent() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Asia/Tokyo"
   agents:
     - nonexistent"#,
         ),
@@ -2761,7 +2761,7 @@ fn rejects_invalid_sleep_batch_schedule() {
         &sleep_batch_scheduler_yml(
             r#"  enabled: true
   schedule: "25:00"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2774,22 +2774,23 @@ fn rejects_invalid_sleep_batch_schedule() {
 
 #[test]
 #[serial]
-fn rejects_invalid_sleep_batch_timezone() {
+fn rejects_invalid_global_timezone() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
         &temp_dir,
-        &sleep_batch_scheduler_yml(
+        &sleep_batch_scheduler_yml_with_tz(
+            "Invalid/Zone",
             r#"  enabled: true
   schedule: "04:00"
-  timezone: "Invalid/Zone""#,
+"#,
         ),
     );
 
     let error = Config::load(Some(&file_path)).expect_err("should fail");
     assert!(
-        matches!(error, ConfigError::SleepBatchInvalidTimezone { ref timezone } if timezone == "Invalid/Zone"),
-        "expected SleepBatchInvalidTimezone, got {error:?}"
+        matches!(error, ConfigError::InvalidTimezone { ref timezone } if timezone == "Invalid/Zone"),
+        "expected InvalidTimezone, got {error:?}"
     );
 }
 
@@ -2840,10 +2841,10 @@ fn persist_preserves_sleep_batch_scheduler_config() {
         channels: HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
+        timezone: "Asia/Tokyo".to_string(),
         sleep_batch: super::SleepBatchConfig {
             enabled: true,
             schedule: Some("04:00".to_string()),
-            timezone: Some("Asia/Tokyo".to_string()),
             agents: Some(vec![super::AgentId::new("alice")]),
             retry_max_attempts: 5,
             retry_interval_minutes: 10,
@@ -2912,7 +2913,7 @@ fn pulse_config_loads_runtime_fields() {
         &pulse_config_yml(
             r#"  enabled: true
   tick_interval: "2m"
-  timezone: "Asia/Tokyo""#,
+"#,
         ),
     );
 
@@ -2922,31 +2923,6 @@ fn pulse_config_loads_runtime_fields() {
     // Assert
     assert!(config.pulse().enabled);
     assert_eq!(config.pulse().tick_interval_secs, 120);
-    assert_eq!(config.pulse().timezone.as_deref(), Some("Asia/Tokyo"));
-}
-
-#[test]
-#[serial]
-fn pulse_config_rejects_invalid_timezone() {
-    // Arrange
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &pulse_config_yml(
-            r#"  enabled: true
-  timezone: "Invalid/Zone""#,
-        ),
-    );
-
-    // Act
-    let error = Config::load(Some(&file_path)).expect_err("should fail");
-
-    // Assert
-    assert!(
-        matches!(error, ConfigError::PulseInvalidTimezone { ref timezone } if timezone == "Invalid/Zone"),
-        "expected PulseInvalidTimezone, got {error:?}"
-    );
 }
 
 #[test]
@@ -3425,6 +3401,7 @@ fn minimal_config_with_channels(
         channels,
         default_agent: super::AgentId::new("default"),
         agents,
+        timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
