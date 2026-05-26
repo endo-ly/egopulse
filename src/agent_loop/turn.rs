@@ -810,7 +810,9 @@ async fn persist_user_turn_with_compaction(
     );
 
     for attempt in 0..2 {
-        let mut candidate_messages = (*loaded.messages).clone();
+        let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
+        let mut candidate_messages =
+            Arc::try_unwrap(current_messages).unwrap_or_else(|arc| (*arc).clone());
         candidate_messages.push(user_message.clone());
         let candidate_messages = maybe_compact_messages(
             state,
