@@ -5,7 +5,9 @@
 //! detection rule can be unit-tested with plain data.
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use tracing::warn;
 
 use crate::storage::RollupGranularity;
 
@@ -385,6 +387,325 @@ fn make_month_request(
         reason: reason.to_string(),
         previous_summary_md,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Call2 LLM Integration — Input Builder, Output Parser, Validation, Security
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed length for `summary_md` in characters.
+const SUMMARY_MD_MAX_LEN: usize = 10_000;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during Call2 LLM output parsing and validation.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Call2Error {
+    #[error("json parse failed: {0}")]
+    JsonParse(String),
+    #[error("validation failed: {0}")]
+    Validation(String),
+}
+
+// ---------------------------------------------------------------------------
+// Call2 Input / Output types
+// ---------------------------------------------------------------------------
+
+/// Call2 LLM input JSON structure.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2Input {
+    pub run: Call2RunInfo,
+    pub rollup_requests: Vec<Call2RollupRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2RunInfo {
+    pub agent_id: String,
+    pub sleep_run_id: String,
+    pub now: String,
+    pub timezone: String,
+    pub current_week: Call2CurrentWeek,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2CurrentWeek {
+    pub week_key: String,
+    pub period_start: String,
+    pub period_end_exclusive: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2RollupRequest {
+    pub granularity: String,
+    pub period_key: String,
+    pub period_start: String,
+    pub period_end_exclusive: String,
+    pub reason: String,
+    pub previous_summary_md: Option<String>,
+    pub events: Vec<Call2Event>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2Event {
+    pub id: String,
+    pub experienced_at: String,
+    pub kind: String,
+    pub title: String,
+    pub body_md: String,
+    pub ripple_strength: i64,
+    pub certainty: String,
+}
+
+/// Call2 LLM output JSON structure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Call2Output {
+    pub rollups: Vec<Call2RollupOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Call2RollupOutput {
+    pub granularity: String,
+    pub period_key: String,
+    pub summary_md: String,
+    pub max_ripple: i64,
+    pub event_count: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Input builder
+// ---------------------------------------------------------------------------
+
+/// Builds the Call2 input from rollup requests and their associated events.
+///
+/// The caller populates `events_map` from DB queries keyed by `period_key`.
+pub(crate) fn build_call2_input(
+    agent_id: &str,
+    sleep_run_id: &str,
+    now: &DateTime<FixedOffset>,
+    timezone: &str,
+    current_week: &WeekPeriod,
+    rollup_requests: &[RollupRequest],
+    events_map: &HashMap<String, Vec<Call2Event>>,
+) -> Call2Input {
+    Call2Input {
+        run: Call2RunInfo {
+            agent_id: agent_id.to_string(),
+            sleep_run_id: sleep_run_id.to_string(),
+            now: now.to_rfc3339(),
+            timezone: timezone.to_string(),
+            current_week: Call2CurrentWeek {
+                week_key: current_week.week_key.clone(),
+                period_start: current_week.period_start.to_rfc3339(),
+                period_end_exclusive: current_week.period_end_exclusive.to_rfc3339(),
+            },
+        },
+        rollup_requests: rollup_requests
+            .iter()
+            .map(|req| {
+                let events = events_map.get(&req.period_key).cloned().unwrap_or_default();
+                Call2RollupRequest {
+                    granularity: granularity_to_str(req.granularity),
+                    period_key: req.period_key.clone(),
+                    period_start: req.period_start.clone(),
+                    period_end_exclusive: req.period_end_exclusive.clone(),
+                    reason: req.reason.clone(),
+                    previous_summary_md: req.previous_summary_md.clone(),
+                    events,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn granularity_to_str(g: RollupGranularity) -> String {
+    match g {
+        RollupGranularity::Week => "week".to_string(),
+        RollupGranularity::Month => "month".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output parser + validator
+// ---------------------------------------------------------------------------
+
+/// Parse and validate Call2 LLM output.
+///
+/// Returns valid rollups. Rollups with empty `summary_md` are skipped
+/// with a warning. All other validation failures produce an error.
+///
+/// # Errors
+///
+/// Returns [`Call2Error::JsonParse`] when the input is not valid JSON or
+/// the structure does not match [`Call2Output`].
+/// Returns [`Call2Error::Validation`] when a rollup field violates constraints.
+pub(crate) fn parse_call2_output(
+    json_str: &str,
+    valid_period_keys: &HashSet<String>,
+) -> Result<Vec<Call2RollupOutput>, Call2Error> {
+    let output: Call2Output = serde_json::from_str(json_str)
+        .map_err(|e| Call2Error::JsonParse(format!("failed to parse Call2 output JSON: {e}")))?;
+
+    let mut valid_rollups = Vec::with_capacity(output.rollups.len());
+
+    for rollup in output.rollups {
+        validate_granularity(&rollup.granularity)?;
+        validate_period_key(&rollup.period_key, valid_period_keys)?;
+        if skip_empty_summary(&rollup) {
+            continue;
+        }
+        validate_summary_length(&rollup.summary_md)?;
+        validate_no_event_ids(&rollup.summary_md)?;
+        validate_max_ripple(rollup.max_ripple)?;
+        validate_event_count(rollup.event_count)?;
+        valid_rollups.push(rollup);
+    }
+
+    Ok(valid_rollups)
+}
+
+fn validate_granularity(g: &str) -> Result<(), Call2Error> {
+    if g != "week" && g != "month" {
+        return Err(Call2Error::Validation(format!(
+            "invalid granularity: {g:?} (expected \"week\" or \"month\")"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_period_key(key: &str, valid: &HashSet<String>) -> Result<(), Call2Error> {
+    if !valid.contains(key) {
+        return Err(Call2Error::Validation(format!(
+            "unknown period_key: {key:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Returns `true` if the rollup should be silently skipped.
+fn skip_empty_summary(rollup: &Call2RollupOutput) -> bool {
+    if rollup.summary_md.trim().is_empty() {
+        warn!(period_key = %rollup.period_key, "skipping rollup with empty summary_md");
+        true
+    } else {
+        false
+    }
+}
+
+fn validate_summary_length(summary: &str) -> Result<(), Call2Error> {
+    if summary.len() > SUMMARY_MD_MAX_LEN {
+        return Err(Call2Error::Validation(format!(
+            "summary_md too long: {} chars (max {SUMMARY_MD_MAX_LEN})",
+            summary.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_no_event_ids(summary: &str) -> Result<(), Call2Error> {
+    if summary.contains("evt_") {
+        return Err(Call2Error::Validation(
+            "summary_md must not contain event ID references (evt_ prefix)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_max_ripple(v: i64) -> Result<(), Call2Error> {
+    if !(1..=5).contains(&v) {
+        return Err(Call2Error::Validation(format!(
+            "max_ripple out of range: {v} (expected 1-5)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_count(v: i64) -> Result<(), Call2Error> {
+    if v < 0 {
+        return Err(Call2Error::Validation(format!("negative event_count: {v}")));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Security redaction
+// ---------------------------------------------------------------------------
+
+/// Redacts potential secrets from text.
+///
+/// Detects and replaces common secret patterns:
+/// - OpenAI-style API keys (`sk-...`)
+/// - Bearer tokens (`Bearer ...`)
+/// - Key-value secrets (`api_key=...`, `token=...`, `password=...`)
+pub(crate) fn redact_secrets(text: &str) -> String {
+    let mut result = text.to_string();
+    result = redact_prefixed_values(&result, "sk-", is_secret_value_char);
+    result = redact_prefixed_values(&result, "Bearer ", |c| !c.is_whitespace());
+    for key in ["api_key", "token", "password"] {
+        for sep in ["=", ":"] {
+            let pattern = format!("{key}{sep}");
+            result = redact_prefixed_values(&result, &pattern, |c| {
+                !c.is_whitespace() && c != ',' && c != '"' && c != '\'' && c != ')' && c != ']'
+            });
+        }
+    }
+    result
+}
+
+/// Returns `true` for characters that may appear in a secret value.
+fn is_secret_value_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+/// Replaces the value portion after each occurrence of `prefix` with `[REDACTED]`.
+fn redact_prefixed_values(
+    text: &str,
+    prefix: &str,
+    is_value_char: impl Fn(char) -> bool,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(pos) = remaining.find(prefix) {
+        result.push_str(&remaining[..pos]);
+        result.push_str(prefix);
+        let after_prefix = &remaining[pos + prefix.len()..];
+        let value_end = after_prefix
+            .char_indices()
+            .find(|(_, c)| !is_value_char(*c))
+            .map(|(i, _)| i)
+            .unwrap_or(after_prefix.len());
+        if value_end > 0 {
+            result.push_str("[REDACTED]");
+        }
+        remaining = &after_prefix[value_end..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Prompt builders
+// ---------------------------------------------------------------------------
+
+/// Builds the Call2 system prompt from the embedded prompt template.
+pub(crate) fn build_call2_system_prompt(agent_id: &str) -> String {
+    include_str!("sleep_batch_prompt_2.md").replace("{AGENT_NAME}", agent_id)
+}
+
+/// Builds the Call2 user prompt with the input JSON.
+pub(crate) fn build_call2_user_prompt(input_json: &str) -> String {
+    format!(
+        "以下の Call2 入力 JSON に基づいて、必要な episode_rollups を生成してください。\n\n\
+         重要:\n\
+         - 出力は JSON のみです。\n\
+         - rollups 以外のトップレベルキーを出してはいけません。\n\
+         - summary_md は Markdown bullet のみです。\n\
+         - episodic.md 全文は生成しないでください。\n\n\
+         入力 JSON:\n{input_json}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +1152,293 @@ mod tests {
         assert!(
             bg.is_none(),
             "current week events should NOT trigger background_candidate month rollup"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Call2 LLM Integration Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_call2_input_json_structure() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let cw = current_week(now);
+        let req = RollupRequest {
+            granularity: RollupGranularity::Week,
+            period_key: "2026-W21".to_string(),
+            period_start: "2026-05-18T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-25T00:00:00+09:00".to_string(),
+            reason: "closed_week".to_string(),
+            previous_summary_md: None,
+        };
+        let input = build_call2_input(
+            "agent-1",
+            "run-1",
+            &now,
+            "Asia/Tokyo",
+            &cw,
+            &[req],
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&input).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse back");
+        assert!(parsed.get("run").is_some(), "should have 'run' key");
+        assert!(
+            parsed.get("rollup_requests").is_some(),
+            "should have 'rollup_requests' key"
+        );
+        assert!(parsed["rollup_requests"].is_array());
+        assert_eq!(parsed["rollup_requests"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_call2_input_includes_previous_summary() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let cw = current_week(now);
+        let req = RollupRequest {
+            granularity: RollupGranularity::Week,
+            period_key: "2026-W21".to_string(),
+            period_start: "2026-05-18T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-25T00:00:00+09:00".to_string(),
+            reason: "delayed_events".to_string(),
+            previous_summary_md: Some("old summary".to_string()),
+        };
+        let input = build_call2_input(
+            "agent-1",
+            "run-1",
+            &now,
+            "Asia/Tokyo",
+            &cw,
+            &[req],
+            &HashMap::new(),
+        );
+        assert_eq!(
+            input.rollup_requests[0].previous_summary_md.as_deref(),
+            Some("old summary")
+        );
+    }
+
+    #[test]
+    fn test_build_call2_input_includes_events() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let cw = current_week(now);
+        let req = RollupRequest {
+            granularity: RollupGranularity::Week,
+            period_key: "2026-W21".to_string(),
+            period_start: "2026-05-18T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-25T00:00:00+09:00".to_string(),
+            reason: "closed_week".to_string(),
+            previous_summary_md: None,
+        };
+        let events = vec![Call2Event {
+            id: "evt-001".to_string(),
+            experienced_at: "2026-05-20T14:00:00+09:00".to_string(),
+            kind: "decision".to_string(),
+            title: "Test event".to_string(),
+            body_md: "Body text".to_string(),
+            ripple_strength: 3,
+            certainty: "stated".to_string(),
+        }];
+        let mut events_map = HashMap::new();
+        events_map.insert("2026-W21".to_string(), events);
+        let input = build_call2_input(
+            "agent-1",
+            "run-1",
+            &now,
+            "Asia/Tokyo",
+            &cw,
+            &[req],
+            &events_map,
+        );
+        assert_eq!(input.rollup_requests[0].events.len(), 1);
+        assert_eq!(input.rollup_requests[0].events[0].id, "evt-001");
+    }
+
+    #[test]
+    fn test_parse_call2_output_valid_json() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid).expect("should parse");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period_key, "2026-W21");
+        assert_eq!(result[0].max_ripple, 3);
+    }
+
+    #[test]
+    fn test_parse_call2_output_missing_rollups_key() {
+        let json = r#"{"events":[]}"#;
+        let result = parse_call2_output(json, &HashSet::new());
+        assert!(
+            result.is_err(),
+            "should error when 'rollups' key is missing"
+        );
+        match result.unwrap_err() {
+            Call2Error::JsonParse(msg) => assert!(
+                msg.contains("unknown field") || msg.contains("missing field"),
+                "unexpected error: {msg}"
+            ),
+            other => panic!("expected JsonParse, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_call2_output_invalid_granularity() {
+        let json = r#"{"rollups":[{"granularity":"quarter","period_key":"2026-W21","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::Validation(msg) => assert!(msg.contains("granularity"), "{msg}"),
+            other => panic!("expected Validation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_call2_output_unknown_period_key() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W99","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::Validation(msg) => assert!(msg.contains("period_key"), "{msg}"),
+            other => panic!("expected Validation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_summary_md_empty() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"","max_ripple":3,"event_count":5}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid).expect("should succeed");
+        assert!(
+            result.is_empty(),
+            "empty summary_md should be filtered out, not error"
+        );
+    }
+
+    #[test]
+    fn test_validate_summary_md_too_long() {
+        let long_summary = "x".repeat(10_001);
+        let json = format!(
+            r#"{{"rollups":[{{"granularity":"week","period_key":"2026-W21","summary_md":"{long_summary}","max_ripple":3,"event_count":5}}]}}"#
+        );
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(&json, &valid);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::Validation(msg) => assert!(msg.contains("too long"), "{msg}"),
+            other => panic!("expected Validation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_no_event_ids_in_output() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- Something evt_abc123 happened","max_ripple":3,"event_count":5}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::Validation(msg) => assert!(msg.contains("evt_"), "{msg}"),
+            other => panic!("expected Validation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_max_ripple_range() {
+        for invalid_ripple in [0, 6, -1, 10] {
+            let json = format!(
+                r#"{{"rollups":[{{"granularity":"week","period_key":"2026-W21","summary_md":"- S","max_ripple":{invalid_ripple},"event_count":1}}]}}"#
+            );
+            let mut valid = HashSet::new();
+            valid.insert("2026-W21".to_string());
+            let result = parse_call2_output(&json, &valid);
+            assert!(
+                result.is_err(),
+                "max_ripple={invalid_ripple} should be invalid"
+            );
+            match result.unwrap_err() {
+                Call2Error::Validation(msg) => assert!(msg.contains("max_ripple"), "{msg}"),
+                other => panic!("expected Validation, got: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_event_count_non_negative() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- S","max_ripple":3,"event_count":-1}]}"#;
+        let mut valid = HashSet::new();
+        valid.insert("2026-W21".to_string());
+        let result = parse_call2_output(json, &valid);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::Validation(msg) => assert!(msg.contains("event_count"), "{msg}"),
+            other => panic!("expected Validation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_call2_retry_on_json_parse_failure() {
+        let bad_json = "this is not json";
+        let result = parse_call2_output(bad_json, &HashSet::new());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::JsonParse(_) => {}
+            other => panic!("expected JsonParse, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_call2_retry_on_missing_field() {
+        let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- S","event_count":1}]}"#;
+        let result = parse_call2_output(json, &HashSet::new());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Call2Error::JsonParse(msg) => assert!(msg.contains("missing field"), "{msg}"),
+            other => panic!("expected JsonParse, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_call2_fallback_on_retry_exhaustion() {
+        let bad_json = "not valid json at all";
+        let result = parse_call2_output(bad_json, &HashSet::new());
+        assert!(
+            result.is_err(),
+            "parse should fail, triggering retry/fallback in batch.rs"
+        );
+    }
+
+    #[test]
+    fn test_security_redaction_in_input() {
+        let body = "User said: my key is sk-abc123def456ghi789";
+        let redacted = redact_secrets(body);
+        assert!(
+            !redacted.contains("abc123def456ghi789"),
+            "secret should be redacted"
+        );
+        assert!(
+            redacted.contains("sk-[REDACTED]"),
+            "should show sk- prefix with REDACTED"
+        );
+    }
+
+    #[test]
+    fn test_security_redaction_in_output() {
+        let body = "The header was Bearer token123xyz";
+        let redacted = redact_secrets(body);
+        assert!(
+            !redacted.contains("token123xyz"),
+            "bearer token should be redacted"
+        );
+        assert!(
+            redacted.contains("Bearer [REDACTED]"),
+            "should show Bearer with REDACTED"
         );
     }
 }
