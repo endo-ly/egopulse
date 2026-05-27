@@ -694,7 +694,7 @@ fn redact_prefixed_values(
 
 /// Builds the Call2 system prompt from the embedded prompt template.
 pub(crate) fn build_call2_system_prompt(agent_id: &str) -> String {
-    include_str!("sleep_batch_prompt_2.md").replace("{AGENT_NAME}", agent_id)
+    include_str!("rollup_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
 /// Builds the Call2 user prompt with the input JSON.
