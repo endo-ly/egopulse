@@ -25,15 +25,16 @@ egopulse.db (SQLite / WAL mode)
 ├── sleep_runs           — スリープバッチ実行履歴
 ├── pulse_runs           — Pulse（注意活性化）実行履歴
 ├── episode_events       — エピソード記憶台帳（Event Extraction で蓄積）
+├── episode_rollups      — エピソード記憶の週次/月次派生要約（Call2 で生成）
 └── memory_snapshots     — スリープ実行中のメモリファイル更新履歴
 ```
 
 | 項目 | 値 |
 |------|----|
-| テーブル数 | 11（データテーブル 9 + マイグレーション基盤テーブル 2） |
-| インデックス数 | 17 |
+| テーブル数 | 12（データテーブル 10 + マイグレーション基盤テーブル 2） |
+| インデックス数 | 19 |
 | 外部キー制約 | 1（tool_calls.chat_id → chats.chat_id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v3） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v6） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -120,6 +121,19 @@ egopulse.db (SQLite / WAL mode)
         │ sleep_run_id     │
         │ (agent_id,       │
         │  experienced_at) │
+        └──────────────────┘
+
+        ┌──────────────────┐
+        │ episode_rollups  │
+        │──────────────────│
+        │ id (PK)          │
+        │ agent_id         │
+        │ granularity      │
+        │ period_key       │
+        │ summary_md       │
+        │ (agent_id,       │
+        │  granularity,    │
+        │  period_key) UQ  │
         └──────────────────┘
 
         ┌──────────────────┐
@@ -604,6 +618,66 @@ CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
 
 ---
 
+### episode_rollups
+
+Call2 (Episodic View Materialization) で生成される週次・月次の派生要約。
+`episode_events` から再生成可能な派生キャッシュ。正本は `episode_events`。
+
+```sql
+CREATE TABLE IF NOT EXISTS episode_rollups (
+    id                   TEXT PRIMARY KEY,
+    agent_id             TEXT NOT NULL,
+    granularity          TEXT NOT NULL,
+    period_key           TEXT NOT NULL,
+    period_start         TEXT NOT NULL,
+    period_end_exclusive TEXT NOT NULL,
+    summary_md           TEXT NOT NULL,
+    max_ripple           INTEGER NOT NULL DEFAULT 3,
+    event_count          INTEGER NOT NULL DEFAULT 0,
+    generated_run_id     TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    CHECK (granularity IN ('week', 'month')),
+    CHECK (max_ripple BETWEEN 1 AND 5),
+    UNIQUE(agent_id, granularity, period_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_period
+    ON episode_rollups(agent_id, granularity, period_start);
+
+CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
+    ON episode_rollups(agent_id, granularity, max_ripple, period_start);
+```
+
+| カラム | 型 | 制約 | 説明 |
+|--------|-----|------|------|
+| id | TEXT | PK | UUID v4 |
+| agent_id | TEXT | NOT NULL | 対象エージェント |
+| granularity | TEXT | NOT NULL, CHECK | `week` / `month` |
+| period_key | TEXT | NOT NULL, UNIQUE* | `2026-W22` / `2026-04` |
+| period_start | TEXT | NOT NULL | 期間開始（RFC3339 または日付文字列） |
+| period_end_exclusive | TEXT | NOT NULL | 期間終了の排他的境界 |
+| summary_md | TEXT | NOT NULL | 要約本文 Markdown |
+| max_ripple | INTEGER | NOT NULL, CHECK(1-5) | 期間内 Event の最大 ripple |
+| event_count | INTEGER | NOT NULL | 要約対象 Event 数 |
+| generated_run_id | TEXT | NOT NULL | 生成した Sleep Run ID |
+| created_at | TEXT | NOT NULL | 作成時刻 |
+| updated_at | TEXT | NOT NULL | 更新時刻 |
+
+*UNIQUE 制約は `(agent_id, granularity, period_key)` の複合。
+
+**Rust 構造体**: `EpisodeRollup`, `RollupGranularity`
+
+**クエリ関数**:
+- `upsert_episode_rollup(rollup)` — INSERT ... ON CONFLICT DO UPDATE
+- `list_episode_rollups(agent_id, granularity, limit)` — granularity フィルタ + period_start DESC
+- `get_episode_rollup(agent_id, granularity, period_key)` — 複合キーで1件取得
+- `list_episode_rollups_in_range(agent_id, granularity, start, end_exclusive)` — 期間範囲
+- `list_background_episode_rollups(agent_id, min_ripple, before_period_start)` — Background Months 用
+- `list_episode_events_in_range(agent_id, start, end_exclusive)` — Event 期間範囲取得
+
+---
+
 ### db_meta
 
 スキーマバージョンの key-value ストア。現在は `schema_version` のみ格納。
@@ -668,6 +742,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | `EpisodeEvent` | episode_events | id, agent_id, experienced_at, encoded_at, kind, title, body_md, ripple_strength, certainty, sleep_run_id, source_refs_json, created_at, updated_at |
 | `EpisodeEventKind` | — | 8種の enum: `Self_`, `Relationship`, `World`, `Feat`, `Anomaly`, `Decision`, `Insight`, `Rhythm`（SQL: `self`, `relationship`, `world`, `feat`, `anomaly`, `decision`, `insight`, `rhythm`） |
 | `EpisodeEventCertainty` | — | 3種の enum: `Stated`, `Derived`, `Tentative`（SQL: `stated`, `derived`, `tentative`） |
+| `EpisodeRollup` | episode_rollups | id, agent_id, granularity, period_key, period_start, period_end_exclusive, summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at |
 
 ---
 
@@ -812,6 +887,11 @@ CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
 - CHECK 制約で kind（8種）、ripple_strength（1-5）、certainty（3種）を DB レベルで検証
 - 4 つの複合インデックスでクエリパターン（agent_id + kind/ripple + time ソート）をカバー
 - append-only 設計だが、同一 sleep_run_id の再実行時は冪等に全削除→再挿入
+
+#### v6: add episode_rollups table + 2 indexes
+
+Call2 Episodic View Materialization 用の `episode_rollups` テーブルを新規追加。
+CHECK 制約（granularity、max_ripple）と 2 つの複合インデックスを含む。
 
 ### 外部キー制約が最小限
 
