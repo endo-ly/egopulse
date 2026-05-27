@@ -648,7 +648,10 @@ Output the raw JSON object and nothing else.";
                 tz_name: tz_str.clone(),
                 week_key: cw.week_key.clone(),
                 week_start: extract_date_only(&cw.period_start.to_rfc3339()),
-                week_end: extract_date_only(&cw.period_end_exclusive.to_rfc3339()),
+                week_end: {
+                    let end = cw.period_end_exclusive.date_naive() - chrono::Duration::days(1);
+                    end.format("%Y-%m-%d").to_string()
+                },
             };
 
             let episodic_md = episodic_renderer::render_episodic_md(
