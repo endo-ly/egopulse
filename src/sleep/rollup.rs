@@ -4,10 +4,14 @@
 //! This module is intentionally free of DB/LLM dependencies so that every
 //! detection rule can be unit-tested with plain data.
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Offset, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
+
+fn to_fixed(dt: DateTime<chrono_tz::Tz>) -> DateTime<FixedOffset> {
+    dt.with_timezone(&dt.offset().fix())
+}
 
 use crate::storage::RollupGranularity;
 
@@ -64,16 +68,18 @@ pub(crate) struct RollupPlannerInput {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-pub(crate) fn current_week(now: DateTime<FixedOffset>) -> WeekPeriod {
-    let tz = *now.offset();
+pub(crate) fn current_week(now: DateTime<FixedOffset>, tz: chrono_tz::Tz) -> WeekPeriod {
     let monday = monday_of(now.date_naive());
     week_for_date_inner(monday, tz)
 }
 
 /// Closed weeks before current, most-recent first (W-1, W-2, ...).
-pub(crate) fn recent_weeks(now: DateTime<FixedOffset>, count: usize) -> Vec<WeekPeriod> {
-    let cur = current_week(now);
-    let tz = *cur.period_start.offset();
+pub(crate) fn recent_weeks(
+    now: DateTime<FixedOffset>,
+    count: usize,
+    tz: chrono_tz::Tz,
+) -> Vec<WeekPeriod> {
+    let cur = current_week(now, tz);
     let mut weeks = Vec::with_capacity(count);
     let mut monday = cur.period_start.date_naive();
     for _ in 0..count {
@@ -87,12 +93,12 @@ pub(crate) fn recent_weeks(now: DateTime<FixedOffset>, count: usize) -> Vec<Week
 pub(crate) fn recent_months_from_weeks(
     recent_weeks: &[WeekPeriod],
     count: usize,
+    tz: chrono_tz::Tz,
 ) -> Vec<MonthPeriod> {
     if recent_weeks.is_empty() {
         return Vec::new();
     }
     let oldest = &recent_weeks[recent_weeks.len() - 1];
-    let tz = *oldest.period_start.offset();
     let start_date = oldest.period_start.date_naive();
     let mut y = start_date.year();
     let mut m = start_date.month();
@@ -106,28 +112,36 @@ pub(crate) fn recent_months_from_weeks(
                 y -= 1;
             }
         }
-        months.push(month_for_ym(y, m, tz));
+        let mut mp = month_for_ym(y, m, tz);
+        if i == 0 && mp.period_end_exclusive > oldest.period_start {
+            mp.period_end_exclusive = oldest.period_start;
+        }
+        months.push(mp);
     }
     months
 }
 
-fn week_for_date_inner(monday: NaiveDate, tz: FixedOffset) -> WeekPeriod {
-    let iso = monday.iso_week();
-    let week_key = format!("{}-W{:02}", iso.year(), iso.week());
-    let period_start =
+fn week_for_date_inner(monday: NaiveDate, tz: chrono_tz::Tz) -> WeekPeriod {
+    let ps: DateTime<chrono_tz::Tz> =
         tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid"));
-    let period_end_exclusive = period_start + Duration::days(7);
+    let next_monday = monday + Duration::days(7);
+    let pe: DateTime<chrono_tz::Tz> =
+        tz.from_utc_datetime(&next_monday.and_hms_opt(0, 0, 0).expect("midnight is valid"));
     WeekPeriod {
-        week_key,
-        period_start,
-        period_end_exclusive,
+        week_key: format!(
+            "{}-W{:02}",
+            monday.iso_week().year(),
+            monday.iso_week().week()
+        ),
+        period_start: to_fixed(ps),
+        period_end_exclusive: to_fixed(pe),
     }
 }
 
-fn month_for_ym(year: i32, month: u32, tz: FixedOffset) -> MonthPeriod {
+fn month_for_ym(year: i32, month: u32, tz: chrono_tz::Tz) -> MonthPeriod {
     let month_key = format!("{year}-{month:02}");
     let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid year/month");
-    let period_start =
+    let ps: DateTime<chrono_tz::Tz> =
         tz.from_utc_datetime(&first.and_hms_opt(0, 0, 0).expect("midnight is valid"));
     let (ny, nm) = if month == 12 {
         (year + 1, 1)
@@ -135,16 +149,16 @@ fn month_for_ym(year: i32, month: u32, tz: FixedOffset) -> MonthPeriod {
         (year, month + 1)
     };
     let next_first = NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid year/month");
-    let period_end_exclusive =
+    let pe: DateTime<chrono_tz::Tz> =
         tz.from_utc_datetime(&next_first.and_hms_opt(0, 0, 0).expect("midnight is valid"));
     MonthPeriod {
         month_key,
-        period_start,
-        period_end_exclusive,
+        period_start: to_fixed(ps),
+        period_end_exclusive: to_fixed(pe),
     }
 }
 
-pub(crate) fn month_period_from_key(key: &str, tz: FixedOffset) -> Option<MonthPeriod> {
+pub(crate) fn month_period_from_key(key: &str, tz: chrono_tz::Tz) -> Option<MonthPeriod> {
     let (year, month) = parse_ym_key(key)?;
     Some(month_for_ym(year, month, tz))
 }
@@ -191,13 +205,14 @@ fn count_events_in_period(
 pub(crate) fn plan_rollup_updates(
     _agent_id: &str,
     now: DateTime<FixedOffset>,
+    tz: chrono_tz::Tz,
     input: &RollupPlannerInput,
 ) -> Vec<RollupRequest> {
     let mut requests: Vec<RollupRequest> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
 
-    let cur_week = current_week(now);
-    let recent = recent_weeks(now, 4);
+    let cur_week = current_week(now, tz);
+    let recent = recent_weeks(now, 4, tz);
 
     let existing_week_keys: HashSet<&str> = input
         .existing_week_rollups
@@ -304,7 +319,6 @@ pub(crate) fn plan_rollup_updates(
     // -----------------------------------------------------------------------
     // 5. Week rolling out (W-5 → its month needs update)
     // -----------------------------------------------------------------------
-    let tz = *cur_week.period_start.offset();
     let rolling_out_monday = recent
         .last()
         .map(|w| w.period_start.date_naive() - Duration::days(7));
@@ -324,7 +338,7 @@ pub(crate) fn plan_rollup_updates(
     // -----------------------------------------------------------------------
     // 6. Recent months from weeks — missing month rollups
     // -----------------------------------------------------------------------
-    let recent_months = recent_months_from_weeks(&recent, 2);
+    let recent_months = recent_months_from_weeks(&recent, 2, tz);
     for mp in &recent_months {
         let key = format!("month:{}", mp.month_key);
         if !existing_month_map.contains_key(mp.month_key.as_str()) && seen_keys.insert(key) {
@@ -657,17 +671,18 @@ mod tests {
     use chrono::{TimeZone, Weekday};
 
     /// JST (UTC+9) — the timezone used throughout these tests.
-    fn jst() -> FixedOffset {
-        FixedOffset::east_opt(9 * 3600).unwrap()
+    fn jst() -> chrono_tz::Tz {
+        chrono_tz::Asia::Tokyo
     }
 
-    /// Helper: create a `DateTime` in JST from `(year, month, day, hour, min)`.
+    /// Helper: create a `DateTime<FixedOffset>` in JST from `(year, month, day, hour, min)`.
     fn jst_dt(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> DateTime<FixedOffset> {
         let naive = chrono::NaiveDate::from_ymd_opt(y, m, d)
             .unwrap()
             .and_hms_opt(hh, mm, 0)
             .unwrap();
-        jst().from_utc_datetime(&naive)
+        let tz_dt: DateTime<chrono_tz::Tz> = jst().from_utc_datetime(&naive);
+        to_fixed(tz_dt)
     }
 
     // -----------------------------------------------------------------------
@@ -677,7 +692,7 @@ mod tests {
     fn test_current_week_monday_start() {
         // Wednesday 2026-05-27 10:00 JST
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let cw = current_week(now);
+        let cw = current_week(now, jst());
 
         assert_eq!(cw.period_start.weekday(), Weekday::Mon);
         assert_eq!(cw.period_start.day(), 25); // Monday 2026-05-25
@@ -692,13 +707,13 @@ mod tests {
     #[test]
     fn test_recent_weeks_identifies_4_closed() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let weeks = recent_weeks(now, 4);
+        let weeks = recent_weeks(now, 4, jst());
 
         assert_eq!(weeks.len(), 4);
         // Most recent first.
         assert_eq!(
             weeks[0].period_end_exclusive,
-            current_week(now).period_start
+            current_week(now, jst()).period_start
         );
         // Each is 7 days long.
         for w in &weeks {
@@ -717,8 +732,8 @@ mod tests {
     #[test]
     fn test_recent_months_identifies_2() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let weeks = recent_weeks(now, 4);
-        let months = recent_months_from_weeks(&weeks, 2);
+        let weeks = recent_weeks(now, 4, jst());
+        let months = recent_months_from_weeks(&weeks, 2, jst());
 
         assert_eq!(months.len(), 2);
         assert!(months[0].period_start > months[1].period_start);
@@ -729,6 +744,10 @@ mod tests {
         );
         assert!(months[0].month_key.starts_with("2026-04"));
         assert!(months[1].month_key.starts_with("2026-03"));
+        assert!(
+            months[0].period_end_exclusive <= oldest_week.period_start,
+            "first recent month end should be capped to oldest week start"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -737,7 +756,7 @@ mod tests {
     #[test]
     fn test_detects_new_closed_week() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         // No week rollups at all → W-1 should be detected as closed_week.
         let input = RollupPlannerInput {
@@ -745,7 +764,7 @@ mod tests {
             existing_month_rollups: vec![],
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let w1_key = &recent[0].week_key;
         let closed = reqs
@@ -763,7 +782,7 @@ mod tests {
     #[test]
     fn test_detects_missing_week_rollup() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         // Only W-1 has a rollup; W-2 is missing.
         let input = RollupPlannerInput {
@@ -776,7 +795,7 @@ mod tests {
             existing_month_rollups: vec![],
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let w2_key = &recent[1].week_key;
         let missing = reqs
@@ -794,7 +813,7 @@ mod tests {
     #[test]
     fn test_detects_delayed_events_in_closed_week() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
         let w2 = &recent[1];
 
         // Event experienced in W-2 but encoded recently (delayed).
@@ -813,7 +832,7 @@ mod tests {
                 ripple_strength: 5,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let delayed = reqs
             .iter()
@@ -831,7 +850,7 @@ mod tests {
     #[test]
     fn test_detects_event_count_mismatch() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
         let w1 = &recent[0];
 
         // Rollup says 5 events, but we provide 7 events in W-1.
@@ -855,7 +874,7 @@ mod tests {
             existing_month_rollups: vec![],
             events,
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let mismatch = reqs
             .iter()
@@ -872,7 +891,7 @@ mod tests {
     #[test]
     fn test_detects_week_rolling_out() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         // All recent weeks have rollups so closed_week/missing_week don't fire.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
@@ -890,7 +909,7 @@ mod tests {
             existing_month_rollups: vec![],
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let rolling = reqs.iter().find(|r| r.reason == "week_rolling_out");
         assert!(
@@ -906,7 +925,7 @@ mod tests {
     #[test]
     fn test_detects_missing_month_rollup() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         // All weeks present, but months are missing.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
@@ -924,7 +943,7 @@ mod tests {
             existing_month_rollups: vec![],
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let missing_months: Vec<_> = reqs
             .iter()
@@ -945,7 +964,7 @@ mod tests {
     #[test]
     fn test_planner_does_not_detect_background_candidates() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
         for w in &recent {
@@ -968,7 +987,7 @@ mod tests {
                 ripple_strength: 5,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let bg = reqs.iter().find(|r| r.reason == "background_candidate");
         assert!(
@@ -983,8 +1002,8 @@ mod tests {
     #[test]
     fn test_returns_empty_when_no_updates_needed() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
-        let recent_months = recent_months_from_weeks(&recent, 2);
+        let recent = recent_weeks(now, 4, jst());
+        let recent_months = recent_months_from_weeks(&recent, 2, jst());
 
         // Build one event per recent week so event counts match.
         let mut events = vec![];
@@ -1036,7 +1055,7 @@ mod tests {
             existing_month_rollups: month_rollups,
             events,
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         assert!(
             reqs.is_empty(),
@@ -1050,8 +1069,8 @@ mod tests {
     #[test]
     fn test_excludes_current_week_events_from_month_rollup() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let cur = current_week(now);
-        let recent = recent_weeks(now, 4);
+        let cur = current_week(now, jst());
+        let recent = recent_weeks(now, 4, jst());
 
         // All recent weeks have rollups with matching counts.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
@@ -1076,7 +1095,7 @@ mod tests {
                 ripple_strength: 8,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         // Should NOT produce a background_candidate for current week's month.
         let bg = reqs.iter().find(|r| {
@@ -1348,7 +1367,7 @@ mod tests {
     #[test]
     fn test_week_rolling_out_suppressed_when_month_exists() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let recent = recent_weeks(now, 4);
+        let recent = recent_weeks(now, 4, jst());
 
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
         for w in &recent {
@@ -1379,7 +1398,7 @@ mod tests {
             }],
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, &input);
+        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
         let rolling = reqs
             .iter()
@@ -1396,10 +1415,10 @@ mod tests {
     #[test]
     fn test_recent_months_includes_oldest_week_month() {
         let now = jst_dt(2026, 5, 27, 10, 0);
-        let weeks = recent_weeks(now, 4);
+        let weeks = recent_weeks(now, 4, jst());
         let oldest = &weeks[weeks.len() - 1];
 
-        let months = recent_months_from_weeks(&weeks, 2);
+        let months = recent_months_from_weeks(&weeks, 2, jst());
 
         assert_eq!(months.len(), 2);
 
@@ -1425,6 +1444,28 @@ mod tests {
         };
         let prev_key = format!("{}-{:02}", prev_year, prev_month);
         assert_eq!(months[1].month_key, prev_key);
+
+        assert!(
+            months[0].period_end_exclusive <= oldest.period_start,
+            "first recent month end should be capped to oldest week start"
+        );
+    }
+
+    #[test]
+    fn test_recent_months_no_cap_when_month_ends_before_oldest_week() {
+        // When the oldest week starts on the 1st of a month, the month ends
+        // exactly at the week start — no cap needed (equality is fine).
+        // Use a date where Monday falls on the 1st.
+        let now = jst_dt(2026, 6, 4, 10, 0); // Thursday 2026-06-04
+        let weeks = recent_weeks(now, 4, jst());
+        let oldest = &weeks[weeks.len() - 1];
+        let months = recent_months_from_weeks(&weeks, 2, jst());
+
+        assert!(!months.is_empty());
+        assert!(
+            months[0].period_end_exclusive <= oldest.period_start,
+            "month end should not exceed oldest week start"
+        );
     }
 
     #[test]

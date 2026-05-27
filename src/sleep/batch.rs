@@ -271,10 +271,11 @@ async fn execute_batch(
         let rendered_episodic;
         {
             let tz_str = &state.config.timezone;
+            let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
             let tz = resolve_fixed_offset(tz_str);
             let now = chrono::Utc::now().with_timezone(&tz);
 
-            let cw = rollup::current_week(now);
+            let cw = rollup::current_week(now, tz_chrono);
 
             let cw_start = cw.period_start.to_rfc3339();
             let cw_end = cw.period_end_exclusive.to_rfc3339();
@@ -329,7 +330,7 @@ async fn execute_batch(
                     .map(|r| r.period_key.clone())
                     .collect();
 
-                let recent = rollup::recent_weeks(now, 4);
+                let recent = rollup::recent_weeks(now, 4, tz_chrono);
                 let earliest_start = recent
                     .last()
                     .map(|w| w.period_start.to_rfc3339())
@@ -361,13 +362,13 @@ async fn execute_batch(
                 };
 
                 let mut rollup_requests =
-                    rollup::plan_rollup_updates(agent_id, now, &planner_input);
+                    rollup::plan_rollup_updates(agent_id, now, tz_chrono, &planner_input);
 
                 // Background candidates: old high-ripple events whose month has no rollup.
                 // This was removed from the Planner because the Planner only sees events
                 // within the recent-week window, missing truly old events.
                 {
-                    let recent_months = rollup::recent_months_from_weeks(&recent, 2);
+                    let recent_months = rollup::recent_months_from_weeks(&recent, 2, tz_chrono);
                     let planner_month_keys: HashSet<String> = rollup_requests
                         .iter()
                         .filter(|r| r.granularity == RollupGranularity::Month)
@@ -378,18 +379,13 @@ async fn execute_batch(
 
                     let agent_for_bg = agent_id.to_string();
                     let bg_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
-                        db.list_episode_events_in_range(
-                            &agent_for_bg,
-                            "1970-01-01T00:00:00Z",
-                            &bg_end,
-                        )
+                        db.list_high_ripple_episode_events_before(&agent_for_bg, 4, &bg_end)
                     })
                     .await
                     .unwrap_or_default();
 
                     let bg_month_keys: HashSet<String> = bg_events
                         .iter()
-                        .filter(|e| e.ripple_strength >= 4)
                         .filter_map(|e| e.experienced_at.get(..7).map(|s| s.to_string()))
                         .collect();
 
@@ -398,7 +394,7 @@ async fn execute_batch(
                             && !recent_month_keys.contains(mk.as_str())
                             && !planner_month_keys.contains(mk.as_str())
                         {
-                            if let Some(mp) = rollup::month_period_from_key(mk, tz) {
+                            if let Some(mp) = rollup::month_period_from_key(mk, tz_chrono) {
                                 rollup_requests.push(rollup::RollupRequest {
                                     granularity: RollupGranularity::Month,
                                     period_key: mk.clone(),
