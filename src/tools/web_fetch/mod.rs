@@ -21,6 +21,7 @@ const PARTIAL_CONTENT_WARNING: &str =
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to build reqwest client")
