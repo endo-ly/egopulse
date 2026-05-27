@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 5;
+pub(super) const SCHEMA_VERSION: i64 = 6;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -470,6 +470,38 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 5;
     }
 
+    if version < 6 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS episode_rollups (
+                id                   TEXT PRIMARY KEY,
+                agent_id             TEXT NOT NULL,
+                granularity          TEXT NOT NULL,
+                period_key           TEXT NOT NULL,
+                period_start         TEXT NOT NULL,
+                period_end_exclusive TEXT NOT NULL,
+                summary_md           TEXT NOT NULL,
+                max_ripple           INTEGER NOT NULL DEFAULT 3,
+                event_count          INTEGER NOT NULL DEFAULT 0,
+                generated_run_id     TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                CHECK (granularity IN ('week', 'month')),
+                CHECK (max_ripple BETWEEN 1 AND 5),
+                UNIQUE(agent_id, granularity, period_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_period
+                ON episode_rollups(agent_id, granularity, period_start);
+
+            CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
+                ON episode_rollups(agent_id, granularity, max_ripple, period_start);",
+        )?;
+        set_schema_version_in_tx(&tx, 6, "add episode_rollups table")?;
+        tx.commit()?;
+        version = 6;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -494,6 +526,7 @@ mod tests {
             "memory_snapshots",
             "pulse_runs",
             "episode_events",
+            "episode_rollups",
         ];
         for name in &expected_tables {
             let exists: bool = conn

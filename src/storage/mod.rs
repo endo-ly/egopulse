@@ -534,6 +534,51 @@ pub(crate) struct EpisodeEvent {
     pub updated_at: String,
 }
 
+/// Granularity for episode rollup periods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollupGranularity {
+    Week,
+    Month,
+}
+
+impl fmt::Display for RollupGranularity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Week => write!(f, "week"),
+            Self::Month => write!(f, "month"),
+        }
+    }
+}
+
+impl FromStr for RollupGranularity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "week" => Ok(Self::Week),
+            "month" => Ok(Self::Month),
+            other => Err(format!("invalid rollup granularity: {other}")),
+        }
+    }
+}
+
+/// A derived summary rollup over a week or month of episode events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EpisodeRollup {
+    pub id: String,
+    pub agent_id: String,
+    pub granularity: RollupGranularity,
+    pub period_key: String,
+    pub period_start: String,
+    pub period_end_exclusive: String,
+    pub summary_md: String,
+    pub max_ripple: i64,
+    pub event_count: i64,
+    pub generated_run_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 pub(crate) struct LlmUsageLogEntry<'a> {
     pub chat_id: i64,
     pub caller_channel: &'a str,
@@ -572,6 +617,9 @@ const _: () = {
     assert_from_str::<EpisodeEventKind>();
     assert_display::<EpisodeEventCertainty>();
     assert_from_str::<EpisodeEventCertainty>();
+
+    assert_display::<RollupGranularity>();
+    assert_from_str::<RollupGranularity>();
 };
 
 impl fmt::Display for SleepRun {
