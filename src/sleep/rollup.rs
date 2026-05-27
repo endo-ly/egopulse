@@ -83,7 +83,7 @@ pub(crate) fn recent_weeks(now: DateTime<FixedOffset>, count: usize) -> Vec<Week
     weeks
 }
 
-/// Calendar months *before* the oldest recent week, most-recent first.
+/// Calendar months starting from the month of the oldest recent week, most-recent first.
 pub(crate) fn recent_months_from_weeks(
     recent_weeks: &[WeekPeriod],
     count: usize,
@@ -93,21 +93,18 @@ pub(crate) fn recent_months_from_weeks(
     }
     let oldest = &recent_weeks[recent_weeks.len() - 1];
     let tz = *oldest.period_start.offset();
-    // The month of the oldest week is excluded — we want months *before* it.
     let start_date = oldest.period_start.date_naive();
-    let first_month = start_date.month();
-    let first_year = start_date.year();
+    let mut y = start_date.year();
+    let mut m = start_date.month();
 
     let mut months = Vec::with_capacity(count);
-    let mut y = first_year;
-    let mut m = first_month;
-
-    for _ in 0..count {
-        // Step back one month.
-        m = m.saturating_sub(1);
-        if m == 0 {
-            m = 12;
-            y -= 1;
+    for i in 0..count {
+        if i > 0 {
+            m = m.saturating_sub(1);
+            if m == 0 {
+                m = 12;
+                y -= 1;
+            }
         }
         months.push(month_for_ym(y, m, tz));
     }
@@ -145,6 +142,21 @@ fn month_for_ym(year: i32, month: u32, tz: FixedOffset) -> MonthPeriod {
         period_start,
         period_end_exclusive,
     }
+}
+
+pub(crate) fn month_period_from_key(key: &str, tz: FixedOffset) -> Option<MonthPeriod> {
+    let (year, month) = parse_ym_key(key)?;
+    Some(month_for_ym(year, month, tz))
+}
+
+fn parse_ym_key(key: &str) -> Option<(i32, u32)> {
+    let (year_str, month_str) = key.split_once('-')?;
+    let year: i32 = year_str.parse().ok()?;
+    let month: u32 = month_str.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((year, month))
 }
 
 fn monday_of(date: NaiveDate) -> NaiveDate {
@@ -304,15 +316,8 @@ pub(crate) fn plan_rollup_updates(
             tz,
         );
         let key = format!("month:{}", month.month_key);
-        if seen_keys.insert(key) {
-            let previous_summary_md = existing_month_map
-                .get(month.month_key.as_str())
-                .map(|r| r.summary_md.clone());
-            requests.push(make_month_request(
-                &month,
-                "week_rolling_out",
-                previous_summary_md,
-            ));
+        if !existing_month_map.contains_key(month.month_key.as_str()) && seen_keys.insert(key) {
+            requests.push(make_month_request(&month, "week_rolling_out", None));
         }
     }
 
@@ -324,33 +329,6 @@ pub(crate) fn plan_rollup_updates(
         let key = format!("month:{}", mp.month_key);
         if !existing_month_map.contains_key(mp.month_key.as_str()) && seen_keys.insert(key) {
             requests.push(make_month_request(mp, "missing_month", None));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 7. Background candidates: old months with high ripple but no rollup
-    // -----------------------------------------------------------------------
-    for ev in &input.events {
-        let Some(exp) = parse_rfc3339(&ev.experienced_at) else {
-            continue;
-        };
-        if ev.ripple_strength < 4 {
-            continue;
-        }
-        // Only consider events in months that are NOT in recent weeks or current week.
-        if exp >= cur_week.period_start {
-            continue;
-        }
-        let in_recent = recent
-            .iter()
-            .any(|w| exp >= w.period_start && exp < w.period_end_exclusive);
-        if in_recent {
-            continue;
-        }
-        let month = month_for_ym(exp.year(), exp.month(), tz);
-        let key = format!("month:{}", month.month_key);
-        if !existing_month_map.contains_key(month.month_key.as_str()) && seen_keys.insert(key) {
-            requests.push(make_month_request(&month, "background_candidate", None));
         }
     }
 
@@ -743,11 +721,14 @@ mod tests {
         let months = recent_months_from_weeks(&weeks, 2);
 
         assert_eq!(months.len(), 2);
-        // Most recent first.
         assert!(months[0].period_start > months[1].period_start);
-        // Months are before the oldest week.
         let oldest_week = &weeks[weeks.len() - 1];
-        assert!(months[0].period_end_exclusive <= oldest_week.period_start);
+        assert!(
+            months[0].period_start <= oldest_week.period_start,
+            "first recent month should include the oldest week's month"
+        );
+        assert!(months[0].month_key.starts_with("2026-04"));
+        assert!(months[1].month_key.starts_with("2026-03"));
     }
 
     // -----------------------------------------------------------------------
@@ -959,14 +940,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 10: detects background candidates
+    // Test 10: planner no longer detects background candidates (moved to batch.rs)
     // -----------------------------------------------------------------------
     #[test]
-    fn test_detects_background_candidates() {
+    fn test_planner_does_not_detect_background_candidates() {
         let now = jst_dt(2026, 5, 27, 10, 0);
         let recent = recent_weeks(now, 4);
 
-        // All recent weeks have rollups.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
         for w in &recent {
             week_rollups.push(ExistingRollupInfo {
@@ -977,7 +957,6 @@ mod tests {
             });
         }
 
-        // Event in a much older month with high ripple and no rollup.
         let old_ts = jst_dt(2026, 1, 15, 12, 0);
 
         let input = RollupPlannerInput {
@@ -993,11 +972,9 @@ mod tests {
 
         let bg = reqs.iter().find(|r| r.reason == "background_candidate");
         assert!(
-            bg.is_some(),
-            "should detect background candidate for old month with high ripple"
+            bg.is_none(),
+            "planner should not detect background_candidate after rule 7 removal"
         );
-        assert_eq!(bg.unwrap().granularity, RollupGranularity::Month);
-        assert!(bg.unwrap().period_key.starts_with("2026-01"));
     }
 
     // -----------------------------------------------------------------------
@@ -1061,12 +1038,10 @@ mod tests {
         };
         let reqs = plan_rollup_updates("test-agent", now, &input);
 
-        for r in &reqs {
-            assert_eq!(
-                r.reason, "week_rolling_out",
-                "unexpected request when everything is up to date: {r:?}"
-            );
-        }
+        assert!(
+            reqs.is_empty(),
+            "should have no requests when everything is up to date: {reqs:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1365,5 +1340,124 @@ mod tests {
             redacted.contains("Bearer [REDACTED]"),
             "should show Bearer with REDACTED"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1 test: week_rolling_out suppressed when month rollup exists
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_week_rolling_out_suppressed_when_month_exists() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let recent = recent_weeks(now, 4);
+
+        let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
+        for w in &recent {
+            week_rollups.push(ExistingRollupInfo {
+                period_key: w.week_key.clone(),
+                event_count: 0,
+                max_ripple: 0,
+                summary_md: String::new(),
+            });
+        }
+
+        let tz = jst();
+        let ro_monday = recent.last().unwrap().period_start.date_naive() - Duration::days(7);
+        let ro_week = week_for_date_inner(ro_monday, tz);
+        let ro_month = month_for_ym(
+            ro_week.period_start.year(),
+            ro_week.period_start.month(),
+            tz,
+        );
+
+        let input = RollupPlannerInput {
+            existing_week_rollups: week_rollups,
+            existing_month_rollups: vec![ExistingRollupInfo {
+                period_key: ro_month.month_key.clone(),
+                event_count: 0,
+                max_ripple: 0,
+                summary_md: "existing summary".to_string(),
+            }],
+            events: vec![],
+        };
+        let reqs = plan_rollup_updates("test-agent", now, &input);
+
+        let rolling = reqs
+            .iter()
+            .find(|r| r.reason == "week_rolling_out" && r.period_key == ro_month.month_key);
+        assert!(
+            rolling.is_none(),
+            "week_rolling_out should NOT fire when month rollup already exists"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2 test: recent_months includes the month of the oldest week
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_recent_months_includes_oldest_week_month() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let weeks = recent_weeks(now, 4);
+        let oldest = &weeks[weeks.len() - 1];
+
+        let months = recent_months_from_weeks(&weeks, 2);
+
+        assert_eq!(months.len(), 2);
+
+        let oldest_month_key = format!(
+            "{}-{:02}",
+            oldest.period_start.year(),
+            oldest.period_start.month()
+        );
+        assert_eq!(
+            months[0].month_key, oldest_month_key,
+            "first recent month should be the month of the oldest week"
+        );
+
+        let prev_year = if oldest.period_start.month() == 1 {
+            oldest.period_start.year() - 1
+        } else {
+            oldest.period_start.year()
+        };
+        let prev_month = if oldest.period_start.month() == 1 {
+            12
+        } else {
+            oldest.period_start.month() - 1
+        };
+        let prev_key = format!("{}-{:02}", prev_year, prev_month);
+        assert_eq!(months[1].month_key, prev_key);
+    }
+
+    #[test]
+    fn test_month_period_from_key_valid() {
+        let tz = jst();
+        let mp = month_period_from_key("2026-03", tz).expect("should parse");
+        assert_eq!(mp.month_key, "2026-03");
+        assert_eq!(mp.period_start.day(), 1);
+        assert_eq!(mp.period_start.month(), 3);
+        assert_eq!(mp.period_end_exclusive.month(), 4);
+    }
+
+    #[test]
+    fn test_month_period_from_key_december_wraps() {
+        let tz = jst();
+        let mp = month_period_from_key("2025-12", tz).expect("should parse");
+        assert_eq!(mp.month_key, "2025-12");
+        assert_eq!(mp.period_end_exclusive.year(), 2026);
+        assert_eq!(mp.period_end_exclusive.month(), 1);
+    }
+
+    #[test]
+    fn test_month_period_from_key_invalid_month() {
+        let tz = jst();
+        assert!(month_period_from_key("2026-13", tz).is_none());
+        assert!(month_period_from_key("2026-00", tz).is_none());
+    }
+
+    #[test]
+    fn test_month_period_from_key_invalid_format() {
+        let tz = jst();
+        assert!(month_period_from_key("invalid", tz).is_none());
+        assert!(month_period_from_key("2026", tz).is_none());
+        assert!(month_period_from_key("", tz).is_none());
     }
 }

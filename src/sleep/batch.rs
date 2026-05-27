@@ -1,8 +1,10 @@
 //! Sleep batch orchestrator — coordinates Call 1 (extract), Call 2 (rollup), and Call 3 (memory update).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use chrono_tz::OffsetComponents;
 
 use thiserror::Error;
 use tracing::{info, warn};
@@ -41,43 +43,74 @@ pub enum SleepBatchError {
     Llm(String),
 }
 
-fn parse_timezone_offset_seconds(tz_str: &str) -> i32 {
-    if let Some(offset_part) = tz_str.strip_prefix("UTC") {
-        if let Ok(seconds) = parse_hhmm_offset(offset_part) {
-            return seconds;
-        }
+/// Resolve a timezone string to a [`chrono::FixedOffset`] for the current moment.
+///
+/// Accepts IANA timezone names (e.g. `America/Los_Angeles`, `Asia/Tokyo`),
+/// `UTC`, `Z`, and `UTC±HH:MM` offset literals. Falls back to UTC on
+/// unrecognised input.
+fn resolve_fixed_offset(tz_str: &str) -> chrono::FixedOffset {
+    if let Ok(tz) = tz_str.parse::<chrono_tz::Tz>() {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let offset_secs = now.offset().base_utc_offset().num_seconds() as i32;
+        return chrono::FixedOffset::east_opt(offset_secs)
+            .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC+0 is valid"));
     }
-    match tz_str {
-        "Asia/Tokyo" => 9 * 3600,
+    let seconds = match tz_str {
         "UTC" | "Z" => 0,
-        _ => 9 * 3600,
-    }
+        _ => {
+            let offset_part = tz_str.strip_prefix("UTC").unwrap_or(tz_str);
+            parse_hhmm_offset(offset_part).unwrap_or(0)
+        }
+    };
+    chrono::FixedOffset::east_opt(seconds)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC+0 is valid"))
 }
 
-fn parse_hhmm_offset(s: &str) -> Result<i32, ()> {
+fn parse_hhmm_offset(s: &str) -> Option<i32> {
     let s = s.trim();
     let sign = if s.starts_with('-') { -1 } else { 1 };
     let s = s.trim_start_matches(['+', '-']);
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() == 2 {
-        let hours: i32 = parts[0].parse().map_err(|_| ())?;
-        let minutes: i32 = parts[1].parse().map_err(|_| ())?;
-        Ok(sign * (hours * 60 + minutes) * 60)
+        let hours: i32 = parts[0].parse().ok()?;
+        let minutes: i32 = parts[1].parse().ok()?;
+        Some(sign * (hours * 60 + minutes) * 60)
     } else if s.len() >= 2 {
-        let hours: i32 = s[..2].parse().map_err(|_| ())?;
+        let hours: i32 = s[..2].parse().ok()?;
         let minutes: i32 = if s.len() >= 4 {
-            s[2..4].parse().map_err(|_| ())?
+            s[2..4].parse().ok()?
         } else {
             0
         };
-        Ok(sign * (hours * 60 + minutes) * 60)
+        Some(sign * (hours * 60 + minutes) * 60)
     } else {
-        Err(())
+        None
     }
 }
 
 fn extract_date_only(dt_str: &str) -> String {
     dt_str.get(..10).unwrap_or(dt_str).to_string()
+}
+
+fn deduplicate_background_months(
+    recent_months: &[episodic_renderer::RendererRollup],
+    background: Vec<episodic_renderer::RendererRollup>,
+) -> Vec<episodic_renderer::RendererRollup> {
+    let recent_keys: HashSet<&str> = recent_months
+        .iter()
+        .map(|r| r.period_key.as_str())
+        .collect();
+    background
+        .into_iter()
+        .filter(|r| !recent_keys.contains(r.period_key.as_str()))
+        .collect()
+}
+
+fn compute_rollup_stats(events: Option<&Vec<rollup::Call2Event>>) -> (i64, i64) {
+    let slice = events.map(|v| v.as_slice()).unwrap_or(&[]);
+    let max_ripple = slice.iter().map(|e| e.ripple_strength).max().unwrap_or(3);
+    let event_count = i64::try_from(slice.len()).unwrap_or(0);
+    (max_ripple, event_count)
 }
 
 pub async fn run_sleep_batch(
@@ -238,9 +271,7 @@ async fn execute_batch(
         let rendered_episodic;
         {
             let tz_str = &state.config.timezone;
-            let tz_seconds: i32 = parse_timezone_offset_seconds(tz_str);
-            let tz = chrono::FixedOffset::east_opt(tz_seconds)
-                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC+0 is valid"));
+            let tz = resolve_fixed_offset(tz_str);
             let now = chrono::Utc::now().with_timezone(&tz);
 
             let cw = rollup::current_week(now);
@@ -293,11 +324,17 @@ async fn execute_batch(
                     })
                     .collect();
 
+                let existing_month_key_set: HashSet<String> = existing_month_rollups
+                    .iter()
+                    .map(|r| r.period_key.clone())
+                    .collect();
+
                 let recent = rollup::recent_weeks(now, 4);
                 let earliest_start = recent
                     .last()
                     .map(|w| w.period_start.to_rfc3339())
                     .unwrap_or_else(|| cw.period_start.to_rfc3339());
+                let bg_end = earliest_start.clone();
                 let agent_for_all = agent_id.to_string();
                 let all_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
                     db.list_episode_events_in_range(
@@ -323,7 +360,57 @@ async fn execute_batch(
                     events: planner_events,
                 };
 
-                let rollup_requests = rollup::plan_rollup_updates(agent_id, now, &planner_input);
+                let mut rollup_requests =
+                    rollup::plan_rollup_updates(agent_id, now, &planner_input);
+
+                // Background candidates: old high-ripple events whose month has no rollup.
+                // This was removed from the Planner because the Planner only sees events
+                // within the recent-week window, missing truly old events.
+                {
+                    let recent_months = rollup::recent_months_from_weeks(&recent, 2);
+                    let planner_month_keys: HashSet<String> = rollup_requests
+                        .iter()
+                        .filter(|r| r.granularity == RollupGranularity::Month)
+                        .map(|r| r.period_key.clone())
+                        .collect();
+                    let recent_month_keys: HashSet<&str> =
+                        recent_months.iter().map(|m| m.month_key.as_str()).collect();
+
+                    let agent_for_bg = agent_id.to_string();
+                    let bg_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
+                        db.list_episode_events_in_range(
+                            &agent_for_bg,
+                            "1970-01-01T00:00:00Z",
+                            &bg_end,
+                        )
+                    })
+                    .await
+                    .unwrap_or_default();
+
+                    let bg_month_keys: HashSet<String> = bg_events
+                        .iter()
+                        .filter(|e| e.ripple_strength >= 4)
+                        .filter_map(|e| e.experienced_at.get(..7).map(|s| s.to_string()))
+                        .collect();
+
+                    for mk in &bg_month_keys {
+                        if !existing_month_key_set.contains(mk.as_str())
+                            && !recent_month_keys.contains(mk.as_str())
+                            && !planner_month_keys.contains(mk.as_str())
+                        {
+                            if let Some(mp) = rollup::month_period_from_key(mk, tz) {
+                                rollup_requests.push(rollup::RollupRequest {
+                                    granularity: RollupGranularity::Month,
+                                    period_key: mk.clone(),
+                                    period_start: mp.period_start.to_rfc3339(),
+                                    period_end_exclusive: mp.period_end_exclusive.to_rfc3339(),
+                                    reason: "background_candidate".to_string(),
+                                    previous_summary_md: None,
+                                });
+                            }
+                        }
+                    }
+                }
 
                 if !rollup_requests.is_empty() {
                     let mut events_map: HashMap<String, Vec<rollup::Call2Event>> = HashMap::new();
@@ -451,6 +538,8 @@ Output the raw JSON object and nothing else.";
                             "month" => RollupGranularity::Month,
                             _ => continue,
                         };
+                        let (computed_max_ripple, computed_event_count) =
+                            compute_rollup_stats(events_map.get(&rollup_output.period_key));
                         let rollup = crate::storage::EpisodeRollup {
                             id: uuid::Uuid::new_v4().to_string(),
                             agent_id: agent_id.to_string(),
@@ -459,8 +548,8 @@ Output the raw JSON object and nothing else.";
                             period_start: request.period_start.clone(),
                             period_end_exclusive: request.period_end_exclusive.clone(),
                             summary_md: rollup_output.summary_md.clone(),
-                            max_ripple: rollup_output.max_ripple,
-                            event_count: rollup_output.event_count,
+                            max_ripple: computed_max_ripple,
+                            event_count: computed_event_count,
                             generated_run_id: run_id.clone(),
                             created_at: now.to_rfc3339(),
                             updated_at: now.to_rfc3339(),
@@ -539,7 +628,7 @@ Output the raw JSON object and nothing else.";
                 })
                 .await
                 .unwrap_or_default();
-            let bg_renderer: Vec<episodic_renderer::RendererRollup> = background_rollups
+            let bg_renderer_raw: Vec<episodic_renderer::RendererRollup> = background_rollups
                 .iter()
                 .map(|r| episodic_renderer::RendererRollup {
                     period_key: r.period_key.clone(),
@@ -550,6 +639,9 @@ Output the raw JSON object and nothing else.";
                     granularity: r.granularity,
                 })
                 .collect();
+
+            // Deduplicate: remove background months that also appear in recent months
+            let bg_renderer = deduplicate_background_months(&rm_renderer, bg_renderer_raw);
 
             let ctx = episodic_renderer::WeekContext {
                 now,
@@ -1792,5 +1884,135 @@ mod tests {
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert!(runs[0].input_tokens > 0);
         assert!(runs[0].output_tokens > 0);
+    }
+
+    #[test]
+    fn inclusive_week_end_subtracts_one_day_from_exclusive_end() {
+        use chrono::TimeZone;
+        let tz = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let period_end_exclusive = tz.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let week_end_date = period_end_exclusive.date_naive() - chrono::Duration::days(1);
+        let week_end = week_end_date.format("%Y-%m-%d").to_string();
+        assert_eq!(week_end, "2026-05-31");
+    }
+
+    #[test]
+    fn deduplicate_background_months_removes_overlap() {
+        let recent = vec![episodic_renderer::RendererRollup {
+            period_key: "2026-04".to_string(),
+            period_start: "2026-04-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+            summary_md: "- April".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let background = vec![
+            episodic_renderer::RendererRollup {
+                period_key: "2026-04".to_string(),
+                period_start: "2026-04-01T00:00:00+09:00".to_string(),
+                period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+                summary_md: "- April bg".to_string(),
+                max_ripple: 5,
+                granularity: RollupGranularity::Month,
+            },
+            episodic_renderer::RendererRollup {
+                period_key: "2026-03".to_string(),
+                period_start: "2026-03-01T00:00:00+09:00".to_string(),
+                period_end_exclusive: "2026-04-01T00:00:00+09:00".to_string(),
+                summary_md: "- March bg".to_string(),
+                max_ripple: 4,
+                granularity: RollupGranularity::Month,
+            },
+        ];
+        let result = deduplicate_background_months(&recent, background);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period_key, "2026-03");
+    }
+
+    #[test]
+    fn deduplicate_background_months_no_overlap() {
+        let recent = vec![episodic_renderer::RendererRollup {
+            period_key: "2026-04".to_string(),
+            period_start: "2026-04-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+            summary_md: "- April".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let background = vec![episodic_renderer::RendererRollup {
+            period_key: "2026-02".to_string(),
+            period_start: "2026-02-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-03-01T00:00:00+09:00".to_string(),
+            summary_md: "- Feb bg".to_string(),
+            max_ripple: 4,
+            granularity: RollupGranularity::Month,
+        }];
+        let result = deduplicate_background_months(&recent, background);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period_key, "2026-02");
+    }
+
+    #[test]
+    fn deduplicate_background_months_empty_recent() {
+        let background = vec![episodic_renderer::RendererRollup {
+            period_key: "2026-01".to_string(),
+            period_start: "2026-01-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-02-01T00:00:00+09:00".to_string(),
+            summary_md: "- Jan".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let result = deduplicate_background_months(&[], background);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn compute_rollup_stats_from_actual_events() {
+        let events = vec![
+            rollup::Call2Event {
+                id: "e1".to_string(),
+                experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
+                kind: "decision".to_string(),
+                title: "t1".to_string(),
+                body_md: "b1".to_string(),
+                ripple_strength: 3,
+                certainty: "stated".to_string(),
+            },
+            rollup::Call2Event {
+                id: "e2".to_string(),
+                experienced_at: "2026-05-21T10:00:00+09:00".to_string(),
+                kind: "insight".to_string(),
+                title: "t2".to_string(),
+                body_md: "b2".to_string(),
+                ripple_strength: 5,
+                certainty: "derived".to_string(),
+            },
+        ];
+        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
+        assert_eq!(max_ripple, 5);
+        assert_eq!(event_count, 2);
+    }
+
+    #[test]
+    fn compute_rollup_stats_defaults_when_empty() {
+        let (max_ripple, event_count) = compute_rollup_stats(None);
+        assert_eq!(max_ripple, 3);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn compute_rollup_stats_single_event() {
+        let events = vec![rollup::Call2Event {
+            id: "e1".to_string(),
+            experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
+            kind: "feat".to_string(),
+            title: "t".to_string(),
+            body_md: "b".to_string(),
+            ripple_strength: 4,
+            certainty: "stated".to_string(),
+        }];
+        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
+        assert_eq!(max_ripple, 4);
+        assert_eq!(event_count, 1);
     }
 }
