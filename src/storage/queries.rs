@@ -6,9 +6,9 @@ use crate::error::StorageError;
 
 use super::{
     AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
-    LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind, PulseRun,
-    PulseRunStatus, SenderKind, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus,
-    SleepRunTrigger, StoredMessage, ToolCall,
+    EpisodeRollup, LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind,
+    PulseRun, PulseRunStatus, RollupGranularity, SenderKind, SessionSnapshot, SessionSummary,
+    SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -1485,6 +1485,162 @@ impl Database {
         stmt.query_map(params![sleep_run_id], row_to_episode_event)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Episode rollups
+// ---------------------------------------------------------------------------
+
+fn row_to_episode_rollup(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRollup> {
+    let granularity_str: String = row.get(2)?;
+    let granularity = RollupGranularity::from_str(&granularity_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(EpisodeRollup {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        granularity,
+        period_key: row.get(3)?,
+        period_start: row.get(4)?,
+        period_end_exclusive: row.get(5)?,
+        summary_md: row.get(6)?,
+        max_ripple: row.get(7)?,
+        event_count: row.get(8)?,
+        generated_run_id: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 1 episode rollup queries; exercised by unit tests below, wired into runtime in Phase 2+"
+    )
+)]
+impl Database {
+    pub(crate) fn upsert_episode_rollup(&self, rollup: &EpisodeRollup) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "INSERT INTO episode_rollups
+                 (id, agent_id, granularity, period_key, period_start, period_end_exclusive,
+                  summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(agent_id, granularity, period_key) DO UPDATE SET
+                 summary_md = excluded.summary_md,
+                 max_ripple = excluded.max_ripple,
+                 event_count = excluded.event_count,
+                 generated_run_id = excluded.generated_run_id,
+                 updated_at = excluded.updated_at",
+            params![
+                rollup.id,
+                rollup.agent_id,
+                rollup.granularity.to_string(),
+                rollup.period_key,
+                rollup.period_start,
+                rollup.period_end_exclusive,
+                rollup.summary_md,
+                rollup.max_ripple,
+                rollup.event_count,
+                rollup.generated_run_id,
+                rollup.created_at,
+                rollup.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_episode_rollups(
+        &self,
+        agent_id: &str,
+        granularity: RollupGranularity,
+        limit: i64,
+    ) -> Result<Vec<EpisodeRollup>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, granularity, period_key, period_start, period_end_exclusive,
+                    summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at
+             FROM episode_rollups
+             WHERE agent_id = ?1 AND granularity = ?2
+             ORDER BY period_start DESC
+             LIMIT ?3",
+        )?;
+        stmt.query_map(
+            params![agent_id, granularity.to_string(), limit],
+            row_to_episode_rollup,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_episode_rollup(
+        &self,
+        agent_id: &str,
+        granularity: RollupGranularity,
+        period_key: &str,
+    ) -> Result<Option<EpisodeRollup>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT id, agent_id, granularity, period_key, period_start, period_end_exclusive,
+                    summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at
+             FROM episode_rollups
+             WHERE agent_id = ?1 AND granularity = ?2 AND period_key = ?3",
+            params![agent_id, granularity.to_string(), period_key],
+            row_to_episode_rollup,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn list_episode_rollups_in_range(
+        &self,
+        agent_id: &str,
+        granularity: RollupGranularity,
+        start: &str,
+        end_exclusive: &str,
+    ) -> Result<Vec<EpisodeRollup>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, granularity, period_key, period_start, period_end_exclusive,
+                    summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at
+             FROM episode_rollups
+             WHERE agent_id = ?1 AND granularity = ?2 AND period_start >= ?3 AND period_start < ?4
+             ORDER BY period_start DESC",
+        )?;
+        stmt.query_map(
+            params![agent_id, granularity.to_string(), start, end_exclusive],
+            row_to_episode_rollup,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn list_background_episode_rollups(
+        &self,
+        agent_id: &str,
+        min_ripple: i64,
+        before_period_start: &str,
+    ) -> Result<Vec<EpisodeRollup>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, granularity, period_key, period_start, period_end_exclusive,
+                    summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at
+             FROM episode_rollups
+             WHERE agent_id = ?1 AND granularity = 'month' AND max_ripple >= ?2 AND period_start < ?3
+             ORDER BY period_start DESC",
+        )?;
+        stmt.query_map(
+            params![agent_id, min_ripple, before_period_start],
+            row_to_episode_rollup,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 }
 
@@ -3517,5 +3673,371 @@ mod tests {
 
         let empty = db.list_episode_events_by_run("run-999").expect("list");
         assert!(empty.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Episode rollups
+    // ---------------------------------------------------------------------------
+
+    fn make_test_rollup(
+        id: &str,
+        agent_id: &str,
+        granularity: RollupGranularity,
+        period_key: &str,
+        period_start: &str,
+        period_end_exclusive: &str,
+        max_ripple: i64,
+    ) -> EpisodeRollup {
+        EpisodeRollup {
+            id: id.to_string(),
+            agent_id: agent_id.to_string(),
+            granularity,
+            period_key: period_key.to_string(),
+            period_start: period_start.to_string(),
+            period_end_exclusive: period_end_exclusive.to_string(),
+            summary_md: format!("summary for {period_key}"),
+            max_ripple,
+            event_count: 5,
+            generated_run_id: "run-test".to_string(),
+            created_at: "2025-01-15T00:00:00Z".to_string(),
+            updated_at: "2025-01-15T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_migration_v6_creates_episode_rollups() {
+        let (db, _dir) = test_db();
+        let conn = db.get_conn().expect("pool");
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episode_rollups'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(exists, "episode_rollups table should exist after migration");
+
+        let expected_columns = [
+            "id",
+            "agent_id",
+            "granularity",
+            "period_key",
+            "period_start",
+            "period_end_exclusive",
+            "summary_md",
+            "max_ripple",
+            "event_count",
+            "generated_run_id",
+            "created_at",
+            "updated_at",
+        ];
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(episode_rollups)")
+            .expect("prepare pragma");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .map(|r| r.expect("col"))
+            .collect();
+
+        for name in &expected_columns {
+            assert!(columns.iter().any(|c| c == *name), "missing column: {name}");
+        }
+
+        let expected_indexes = [
+            "idx_episode_rollups_agent_period",
+            "idx_episode_rollups_agent_ripple",
+        ];
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_episode_rollups%'",
+            )
+            .expect("prepare");
+        let indexes: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .map(|r| r.expect("idx"))
+            .collect();
+
+        for name in &expected_indexes {
+            assert!(indexes.iter().any(|i| i == *name), "missing index: {name}");
+        }
+    }
+
+    #[test]
+    fn test_upsert_episode_rollup_insert_new() {
+        let (db, _dir) = test_db();
+
+        let rollup = EpisodeRollup {
+            id: "r-1".to_string(),
+            agent_id: "agent-a".to_string(),
+            granularity: RollupGranularity::Week,
+            period_key: "2025-W02".to_string(),
+            period_start: "2025-01-06T00:00:00Z".to_string(),
+            period_end_exclusive: "2025-01-13T00:00:00Z".to_string(),
+            summary_md: "# Summary\nEvents this week".to_string(),
+            max_ripple: 4,
+            event_count: 7,
+            generated_run_id: "run-1".to_string(),
+            created_at: "2025-01-15T00:00:00Z".to_string(),
+            updated_at: "2025-01-15T00:00:00Z".to_string(),
+        };
+
+        db.upsert_episode_rollup(&rollup).expect("upsert");
+
+        let retrieved = db
+            .get_episode_rollup("agent-a", RollupGranularity::Week, "2025-W02")
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(retrieved.id, "r-1");
+        assert_eq!(retrieved.agent_id, "agent-a");
+        assert_eq!(retrieved.granularity, RollupGranularity::Week);
+        assert_eq!(retrieved.period_key, "2025-W02");
+        assert_eq!(retrieved.period_start, "2025-01-06T00:00:00Z");
+        assert_eq!(retrieved.period_end_exclusive, "2025-01-13T00:00:00Z");
+        assert_eq!(retrieved.summary_md, "# Summary\nEvents this week");
+        assert_eq!(retrieved.max_ripple, 4);
+        assert_eq!(retrieved.event_count, 7);
+        assert_eq!(retrieved.generated_run_id, "run-1");
+        assert_eq!(retrieved.created_at, "2025-01-15T00:00:00Z");
+        assert_eq!(retrieved.updated_at, "2025-01-15T00:00:00Z");
+    }
+
+    #[test]
+    fn test_upsert_episode_rollup_update_existing() {
+        let (db, _dir) = test_db();
+
+        let rollup = make_test_rollup(
+            "r-1",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W02",
+            "2025-01-06T00:00:00Z",
+            "2025-01-13T00:00:00Z",
+            3,
+        );
+
+        db.upsert_episode_rollup(&rollup).expect("initial upsert");
+
+        let updated = EpisodeRollup {
+            id: "r-2".to_string(),
+            summary_md: "updated summary".to_string(),
+            max_ripple: 5,
+            event_count: 10,
+            generated_run_id: "run-2".to_string(),
+            updated_at: "2025-01-16T00:00:00Z".to_string(),
+            ..rollup
+        };
+
+        db.upsert_episode_rollup(&updated).expect("update upsert");
+
+        let retrieved = db
+            .get_episode_rollup("agent-a", RollupGranularity::Week, "2025-W02")
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(retrieved.summary_md, "updated summary");
+        assert_eq!(retrieved.max_ripple, 5);
+        assert_eq!(retrieved.event_count, 10);
+        assert_eq!(retrieved.generated_run_id, "run-2");
+        assert_eq!(retrieved.updated_at, "2025-01-16T00:00:00Z");
+        assert_eq!(
+            retrieved.created_at, "2025-01-15T00:00:00Z",
+            "created_at should be preserved from original insert"
+        );
+    }
+
+    #[test]
+    fn test_list_episode_rollups_by_granularity() {
+        let (db, _dir) = test_db();
+
+        let week1 = make_test_rollup(
+            "r-w1",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W01",
+            "2024-12-30T00:00:00Z",
+            "2025-01-06T00:00:00Z",
+            3,
+        );
+        let week2 = make_test_rollup(
+            "r-w2",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W02",
+            "2025-01-06T00:00:00Z",
+            "2025-01-13T00:00:00Z",
+            4,
+        );
+        let month1 = make_test_rollup(
+            "r-m1",
+            "agent-a",
+            RollupGranularity::Month,
+            "2025-01",
+            "2025-01-01T00:00:00Z",
+            "2025-02-01T00:00:00Z",
+            5,
+        );
+
+        db.upsert_episode_rollup(&week1).expect("insert w1");
+        db.upsert_episode_rollup(&week2).expect("insert w2");
+        db.upsert_episode_rollup(&month1).expect("insert m1");
+
+        let weeks = db
+            .list_episode_rollups("agent-a", RollupGranularity::Week, 10)
+            .expect("list weeks");
+        assert_eq!(weeks.len(), 2);
+        assert_eq!(weeks[0].period_key, "2025-W02", "newest first");
+        assert_eq!(weeks[1].period_key, "2025-W01");
+
+        let months = db
+            .list_episode_rollups("agent-a", RollupGranularity::Month, 10)
+            .expect("list months");
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].period_key, "2025-01");
+    }
+
+    #[test]
+    fn test_get_episode_rollup_by_period_key() {
+        let (db, _dir) = test_db();
+
+        let rollup = make_test_rollup(
+            "r-1",
+            "agent-a",
+            RollupGranularity::Month,
+            "2025-01",
+            "2025-01-01T00:00:00Z",
+            "2025-02-01T00:00:00Z",
+            4,
+        );
+        db.upsert_episode_rollup(&rollup).expect("insert");
+
+        let found = db
+            .get_episode_rollup("agent-a", RollupGranularity::Month, "2025-01")
+            .expect("get")
+            .expect("should exist");
+        assert_eq!(found.id, "r-1");
+
+        let missing = db
+            .get_episode_rollup("agent-a", RollupGranularity::Month, "2025-02")
+            .expect("get");
+        assert!(missing.is_none());
+
+        let missing_agent = db
+            .get_episode_rollup("agent-b", RollupGranularity::Month, "2025-01")
+            .expect("get");
+        assert!(missing_agent.is_none());
+    }
+
+    #[test]
+    fn test_list_episode_rollups_period_range() {
+        let (db, _dir) = test_db();
+
+        let w1 = make_test_rollup(
+            "r-w1",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W01",
+            "2024-12-30T00:00:00Z",
+            "2025-01-06T00:00:00Z",
+            3,
+        );
+        let w2 = make_test_rollup(
+            "r-w2",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W02",
+            "2025-01-06T00:00:00Z",
+            "2025-01-13T00:00:00Z",
+            4,
+        );
+        let w3 = make_test_rollup(
+            "r-w3",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W03",
+            "2025-01-13T00:00:00Z",
+            "2025-01-20T00:00:00Z",
+            2,
+        );
+
+        db.upsert_episode_rollup(&w1).expect("insert w1");
+        db.upsert_episode_rollup(&w2).expect("insert w2");
+        db.upsert_episode_rollup(&w3).expect("insert w3");
+
+        let range = db
+            .list_episode_rollups_in_range(
+                "agent-a",
+                RollupGranularity::Week,
+                "2025-01-06T00:00:00Z",
+                "2025-01-20T00:00:00Z",
+            )
+            .expect("range");
+
+        assert_eq!(range.len(), 2, "should include w2 and w3 but not w1");
+        assert_eq!(range[0].period_key, "2025-W03", "newest first");
+        assert_eq!(range[1].period_key, "2025-W02");
+    }
+
+    #[test]
+    fn test_list_episode_rollups_for_background() {
+        let (db, _dir) = test_db();
+
+        let m1 = make_test_rollup(
+            "r-m1",
+            "agent-a",
+            RollupGranularity::Month,
+            "2024-11",
+            "2024-11-01T00:00:00Z",
+            "2024-12-01T00:00:00Z",
+            5,
+        );
+        let m2 = make_test_rollup(
+            "r-m2",
+            "agent-a",
+            RollupGranularity::Month,
+            "2024-12",
+            "2024-12-01T00:00:00Z",
+            "2025-01-01T00:00:00Z",
+            3,
+        );
+        let m3 = make_test_rollup(
+            "r-m3",
+            "agent-a",
+            RollupGranularity::Month,
+            "2025-01",
+            "2025-01-01T00:00:00Z",
+            "2025-02-01T00:00:00Z",
+            4,
+        );
+        let w1 = make_test_rollup(
+            "r-w1",
+            "agent-a",
+            RollupGranularity::Week,
+            "2025-W01",
+            "2024-12-30T00:00:00Z",
+            "2025-01-06T00:00:00Z",
+            5,
+        );
+
+        db.upsert_episode_rollup(&m1).expect("insert m1");
+        db.upsert_episode_rollup(&m2).expect("insert m2");
+        db.upsert_episode_rollup(&m3).expect("insert m3");
+        db.upsert_episode_rollup(&w1).expect("insert w1");
+
+        let background = db
+            .list_background_episode_rollups("agent-a", 4, "2025-02-01T00:00:00Z")
+            .expect("background");
+
+        assert_eq!(
+            background.len(),
+            2,
+            "m1 (ripple=5) and m3 (ripple=4), both months, before Feb"
+        );
+        assert_eq!(background[0].period_key, "2025-01");
+        assert_eq!(background[1].period_key, "2024-11");
     }
 }
