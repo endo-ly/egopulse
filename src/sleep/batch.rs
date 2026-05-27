@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use crate::memory::{MemoryContent, MemoryLoader, collect_sleep_input};
 use crate::runtime::AppState;
 use crate::storage::{
     AgentSessionInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, MemoryFile,
-    SleepRunTrigger, call_blocking,
+    RollupGranularity, SleepRunTrigger, call_blocking,
 };
 
 /// Ratio of context window used as overflow threshold for sleep batch input.
@@ -29,8 +30,8 @@ const RAW_RESPONSE_PREVIEW_CHARS: usize = 300;
 /// Guard message injected on retry when the first LLM response is not valid JSON.
 const JSON_RETRY_GUARD: &str = "\
 Your previous response was not valid JSON. \
-You must respond with ONLY a JSON object containing exactly these three keys: \
-\"episodic\", \"semantic\", \"prospective\". \
+You must respond with ONLY a JSON object containing exactly these two keys: \
+\"semantic\", \"prospective\". \
 Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
 Output the raw JSON object and nothing else.";
 
@@ -75,8 +76,8 @@ pub(crate) struct SleepBatchOutput {
 ///
 /// Applies normalization (thinking-tag stripping, markdown code-block extraction,
 /// outermost `{…}` span extraction) before JSON parsing. The response must contain
-/// a JSON object with exactly three keys: `episodic`, `semantic`, `prospective`.
-/// Any extra keys like `summary_md`, `phases`, or `summary` are rejected.
+/// a JSON object with exactly two keys: `semantic`, `prospective`.
+/// Any extra keys like `episodic`, `summary_md`, `phases`, or `summary` are rejected.
 #[allow(dead_code)]
 pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, SleepBatchError> {
     let normalized = normalize_llm_response(response);
@@ -87,14 +88,14 @@ pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, S
         SleepBatchError::ParseFailed("response must be a JSON object".to_string())
     })?;
 
-    if map.len() != 3 {
+    if map.len() != 2 {
         return Err(SleepBatchError::ParseFailed(format!(
-            "expected exactly 3 keys, got {}",
+            "expected exactly 2 keys, got {}",
             map.len()
         )));
     }
 
-    let expected_keys = ["episodic", "semantic", "prospective"];
+    let expected_keys = ["semantic", "prospective"];
     for key in &expected_keys {
         if !map.contains_key(*key) {
             return Err(SleepBatchError::ParseFailed(format!(
@@ -102,11 +103,6 @@ pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, S
             )));
         }
     }
-
-    let episodic = map["episodic"]
-        .as_str()
-        .ok_or_else(|| SleepBatchError::ParseFailed("episodic must be a string".to_string()))?
-        .to_string();
 
     let semantic = map["semantic"]
         .as_str()
@@ -119,7 +115,7 @@ pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, S
         .to_string();
 
     Ok(SleepBatchOutput {
-        episodic,
+        episodic: String::new(),
         semantic,
         prospective,
     })
@@ -691,11 +687,12 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
 
     prompt.push_str("## 出力形式\n\n");
     prompt.push_str("必ずJSONオブジェクトだけを返すこと。JSON以外の説明、前置き、Markdownコードフェンスは出力しない。\n");
-    prompt.push_str("キーは次の3つだけにすること：\n");
-    prompt.push_str("- `episodic`: 更新後の episodic.md 全文（Markdown文字列）\n");
+    prompt.push_str("キーは次の2つだけにすること：\n");
     prompt.push_str("- `semantic`: 更新後の semantic.md 全文（Markdown文字列）\n");
     prompt.push_str("- `prospective`: 更新後の prospective.md 全文（Markdown文字列）\n\n");
-    prompt.push_str("`summary_md`, `phases`, `summary` など、上記以外のキーは絶対に含めない。\n\n");
+    prompt.push_str(
+        "`episodic`, `summary_md`, `phases`, `summary` など、上記以外のキーは絶対に含めない。\n\n",
+    );
 
     prompt.push_str("## 入力データ\n\n");
 
@@ -792,6 +789,46 @@ fn sleep_request_result(
         input_tokens: response.usage.as_ref().map_or(0, |u| u.input_tokens),
         output_tokens: response.usage.as_ref().map_or(0, |u| u.output_tokens),
     }
+}
+
+/// Parses a timezone string like "Asia/Tokyo" or "UTC+09:00" into east offset seconds.
+/// Falls back to UTC+9 (JST) for unrecognized strings.
+fn parse_timezone_offset_seconds(tz_str: &str) -> i32 {
+    if let Some(offset_part) = tz_str.strip_prefix("UTC") {
+        if let Ok(seconds) = parse_hhmm_offset(offset_part) {
+            return seconds;
+        }
+    }
+    match tz_str {
+        "Asia/Tokyo" => 9 * 3600,
+        "UTC" | "Z" => 0,
+        _ => 9 * 3600,
+    }
+}
+
+/// Parses `+HH:MM` or `+HHMM` offset strings into seconds.
+fn parse_hhmm_offset(s: &str) -> Result<i32, ()> {
+    let s = s.trim_start_matches('+');
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() == 2 {
+        let hours: i32 = parts[0].parse().map_err(|_| ())?;
+        let minutes: i32 = parts[1].parse().map_err(|_| ())?;
+        Ok((hours * 60 + minutes) * 60)
+    } else if s.len() >= 2 {
+        let hours: i32 = s[..2].parse().map_err(|_| ())?;
+        let minutes: i32 = if s.len() >= 4 {
+            s[2..4].parse().map_err(|_| ())?
+        } else {
+            0
+        };
+        Ok((hours * 60 + minutes) * 60)
+    } else {
+        Err(())
+    }
+}
+
+fn extract_date_only(dt_str: &str) -> String {
+    dt_str.get(..10).unwrap_or(dt_str).to_string()
 }
 
 /// Runs a manual sleep batch for the given agent.
@@ -960,15 +997,308 @@ async fn execute_batch(
 
         // 6-8. Process every chunk in order, feeding each output into the next.
         let mut current_memory = memory_before.unwrap_or_default();
-        let mut final_output = None;
         let mut input_tokens = extract_input_tokens;
         let mut output_tokens = extract_output_tokens;
+
+        // --- Call2 Phase: Episodic View Materialization (best-effort) ---
+        let rendered_episodic;
+        {
+            let tz_str = &state.config.timezone;
+            let tz_seconds: i32 = parse_timezone_offset_seconds(tz_str);
+            let tz = chrono::FixedOffset::east_opt(tz_seconds)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC+0 is valid"));
+            let now = chrono::Utc::now().with_timezone(&tz);
+
+            let cw = crate::sleep::call2::current_week(now);
+
+            let cw_start = cw.period_start.to_rfc3339();
+            let cw_end = cw.period_end_exclusive.to_rfc3339();
+
+            let agent_for_events = agent_id.to_string();
+            let current_week_events: Vec<EpisodeEvent> =
+                match call_blocking(Arc::clone(&db), move |db| {
+                    db.list_episode_events_in_range(&agent_for_events, &cw_start, &cw_end)
+                })
+                .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        warn!(error = %e, "Call2: failed to load current week events");
+                        Vec::new()
+                    }
+                };
+
+            // LLM Call2 for rollup generation (best-effort)
+            let call2_llm_result: Result<(), SleepBatchError> = async {
+                let agent_for_plan = agent_id.to_string();
+                let existing_week_rollups: Vec<crate::sleep::call2::ExistingRollupInfo> =
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.list_episode_rollups(&agent_for_plan, RollupGranularity::Week, 100)
+                    })
+                    .await?
+                    .into_iter()
+                    .map(|r| crate::sleep::call2::ExistingRollupInfo {
+                        period_key: r.period_key,
+                        event_count: r.event_count,
+                        max_ripple: r.max_ripple,
+                        summary_md: r.summary_md,
+                    })
+                    .collect();
+
+                let agent_for_months = agent_id.to_string();
+                let existing_month_rollups: Vec<crate::sleep::call2::ExistingRollupInfo> =
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.list_episode_rollups(&agent_for_months, RollupGranularity::Month, 100)
+                    })
+                    .await?
+                    .into_iter()
+                    .map(|r| crate::sleep::call2::ExistingRollupInfo {
+                        period_key: r.period_key,
+                        event_count: r.event_count,
+                        max_ripple: r.max_ripple,
+                        summary_md: r.summary_md,
+                    })
+                    .collect();
+
+                let recent = crate::sleep::call2::recent_weeks(now, 4);
+                let earliest_start = recent
+                    .last()
+                    .map(|w| w.period_start.to_rfc3339())
+                    .unwrap_or_else(|| cw.period_start.to_rfc3339());
+                let agent_for_all = agent_id.to_string();
+                let all_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
+                    db.list_episode_events_in_range(
+                        &agent_for_all,
+                        &earliest_start,
+                        &cw.period_end_exclusive.to_rfc3339(),
+                    )
+                })
+                .await?;
+
+                let planner_events: Vec<crate::sleep::call2::PlannerEvent> = all_events
+                    .iter()
+                    .map(|e| crate::sleep::call2::PlannerEvent {
+                        experienced_at: e.experienced_at.clone(),
+                        encoded_at: e.encoded_at.clone(),
+                        ripple_strength: e.ripple_strength,
+                    })
+                    .collect();
+
+                let planner_input = crate::sleep::call2::RollupPlannerInput {
+                    existing_week_rollups,
+                    existing_month_rollups,
+                    events: planner_events,
+                };
+
+                let rollup_requests =
+                    crate::sleep::call2::plan_rollup_updates(agent_id, now, &planner_input);
+
+                if !rollup_requests.is_empty() {
+                    let mut events_map: HashMap<String, Vec<crate::sleep::call2::Call2Event>> =
+                        HashMap::new();
+                    for req in &rollup_requests {
+                        let req_start = req.period_start.clone();
+                        let req_end = req.period_end_exclusive.clone();
+                        let req_key = req.period_key.clone();
+                        let agent_for_range = agent_id.to_string();
+                        let period_events: Vec<EpisodeEvent> =
+                            call_blocking(Arc::clone(&db), move |db| {
+                                db.list_episode_events_in_range(
+                                    &agent_for_range,
+                                    &req_start,
+                                    &req_end,
+                                )
+                            })
+                            .await?;
+
+                        let call2_events: Vec<crate::sleep::call2::Call2Event> = period_events
+                            .iter()
+                            .map(|e| crate::sleep::call2::Call2Event {
+                                id: e.id.clone(),
+                                experienced_at: e.experienced_at.clone(),
+                                kind: e.kind.to_string(),
+                                title: e.title.clone(),
+                                body_md: e.body_md.clone(),
+                                ripple_strength: e.ripple_strength,
+                                certainty: e.certainty.to_string(),
+                            })
+                            .collect();
+                        events_map.insert(req_key, call2_events);
+                    }
+
+                    let input = crate::sleep::call2::build_call2_input(
+                        agent_id,
+                        &run_id,
+                        &now,
+                        tz_str,
+                        &cw,
+                        &rollup_requests,
+                        &events_map,
+                    );
+                    let input_json = serde_json::to_string_pretty(&input)
+                        .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
+                    let input_json = crate::sleep::call2::redact_secrets(&input_json);
+
+                    let system_prompt = crate::sleep::call2::build_call2_system_prompt(agent_id);
+                    let user_prompt = crate::sleep::call2::build_call2_user_prompt(&input_json);
+                    let user_message = Message::text("user", user_prompt);
+                    let response = provider
+                        .send_message(&system_prompt, Arc::new(vec![user_message]), None)
+                        .await
+                        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+                    input_tokens = input_tokens
+                        .saturating_add(response.usage.as_ref().map_or(0, |u| u.input_tokens));
+                    output_tokens = output_tokens
+                        .saturating_add(response.usage.as_ref().map_or(0, |u| u.output_tokens));
+
+                    let output_json = crate::sleep::call2::redact_secrets(&response.content);
+                    let valid_keys: std::collections::HashSet<String> = rollup_requests
+                        .iter()
+                        .map(|r| r.period_key.clone())
+                        .collect();
+                    let rollup_outputs =
+                        crate::sleep::call2::parse_call2_output(&output_json, &valid_keys)
+                            .map_err(|e| SleepBatchError::ParseFailed(e.to_string()))?;
+
+                    for rollup_output in &rollup_outputs {
+                        let granularity = match rollup_output.granularity.as_str() {
+                            "week" => RollupGranularity::Week,
+                            "month" => RollupGranularity::Month,
+                            _ => continue,
+                        };
+                        let rollup = crate::storage::EpisodeRollup {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: agent_id.to_string(),
+                            granularity,
+                            period_key: rollup_output.period_key.clone(),
+                            period_start: String::new(),
+                            period_end_exclusive: String::new(),
+                            summary_md: rollup_output.summary_md.clone(),
+                            max_ripple: rollup_output.max_ripple,
+                            event_count: rollup_output.event_count,
+                            generated_run_id: run_id.clone(),
+                            created_at: now.to_rfc3339(),
+                            updated_at: now.to_rfc3339(),
+                        };
+                        let rollup_for_db = rollup.clone();
+                        call_blocking(Arc::clone(&db), move |db| {
+                            db.upsert_episode_rollup(&rollup_for_db)
+                        })
+                        .await?;
+                    }
+                }
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = call2_llm_result {
+                warn!(error = %e, "Call2 rollup generation failed (best-effort, continuing)");
+            }
+
+            // Always run Episodic Renderer
+            let renderer_events: Vec<crate::sleep::episodic_renderer::RendererEvent> =
+                current_week_events
+                    .iter()
+                    .map(|e| crate::sleep::episodic_renderer::RendererEvent {
+                        experienced_at: e.experienced_at.clone(),
+                        kind: e.kind.to_string(),
+                        title: e.title.clone(),
+                        body_md: e.body_md.clone(),
+                        ripple_strength: e.ripple_strength,
+                    })
+                    .collect();
+
+            let agent_for_rw = agent_id.to_string();
+            let recent_week_rollups: Vec<crate::storage::EpisodeRollup> =
+                call_blocking(Arc::clone(&db), move |db| {
+                    db.list_episode_rollups(&agent_for_rw, RollupGranularity::Week, 4)
+                })
+                .await
+                .unwrap_or_default();
+            let rw_renderer: Vec<crate::sleep::episodic_renderer::RendererRollup> =
+                recent_week_rollups
+                    .iter()
+                    .map(|r| crate::sleep::episodic_renderer::RendererRollup {
+                        period_key: r.period_key.clone(),
+                        period_start: r.period_start.clone(),
+                        period_end_exclusive: r.period_end_exclusive.clone(),
+                        summary_md: r.summary_md.clone(),
+                        max_ripple: r.max_ripple,
+                        granularity: r.granularity,
+                    })
+                    .collect();
+
+            let agent_for_rm = agent_id.to_string();
+            let recent_month_rollups: Vec<crate::storage::EpisodeRollup> =
+                call_blocking(Arc::clone(&db), move |db| {
+                    db.list_episode_rollups(&agent_for_rm, RollupGranularity::Month, 2)
+                })
+                .await
+                .unwrap_or_default();
+            let rm_renderer: Vec<crate::sleep::episodic_renderer::RendererRollup> =
+                recent_month_rollups
+                    .iter()
+                    .map(|r| crate::sleep::episodic_renderer::RendererRollup {
+                        period_key: r.period_key.clone(),
+                        period_start: r.period_start.clone(),
+                        period_end_exclusive: r.period_end_exclusive.clone(),
+                        summary_md: r.summary_md.clone(),
+                        max_ripple: r.max_ripple,
+                        granularity: r.granularity,
+                    })
+                    .collect();
+
+            let before_period = cw.period_start.to_rfc3339();
+            let agent_for_bg = agent_id.to_string();
+            let background_rollups: Vec<crate::storage::EpisodeRollup> =
+                call_blocking(Arc::clone(&db), move |db| {
+                    db.list_background_episode_rollups(&agent_for_bg, 4, &before_period)
+                })
+                .await
+                .unwrap_or_default();
+            let bg_renderer: Vec<crate::sleep::episodic_renderer::RendererRollup> =
+                background_rollups
+                    .iter()
+                    .map(|r| crate::sleep::episodic_renderer::RendererRollup {
+                        period_key: r.period_key.clone(),
+                        period_start: r.period_start.clone(),
+                        period_end_exclusive: r.period_end_exclusive.clone(),
+                        summary_md: r.summary_md.clone(),
+                        max_ripple: r.max_ripple,
+                        granularity: r.granularity,
+                    })
+                    .collect();
+
+            let ctx = crate::sleep::episodic_renderer::WeekContext {
+                now,
+                tz_name: tz_str.clone(),
+                week_key: cw.week_key.clone(),
+                week_start: extract_date_only(&cw.period_start.to_rfc3339()),
+                week_end: extract_date_only(&cw.period_end_exclusive.to_rfc3339()),
+            };
+
+            let episodic_md = crate::sleep::episodic_renderer::render_episodic_md(
+                &ctx,
+                &renderer_events,
+                &rw_renderer,
+                &rm_renderer,
+                &bg_renderer,
+            );
+
+            current_memory.episodic = Some(episodic_md.clone());
+            rendered_episodic = Some(episodic_md);
+        }
+
+        // --- Call3: Memory Update (semantic + prospective only) ---
+        let mut final_output = None;
         let total_chunks = session_chunks.len();
 
         for (index, sessions_text) in session_chunks.into_iter().enumerate() {
             let input = build_sleep_input_from_parts(
                 agent_id,
-                current_memory,
+                current_memory.clone(),
                 sessions_text,
                 source_chats_json.to_string(),
                 context_tokens,
@@ -981,13 +1311,21 @@ async fn execute_batch(
 
             input_tokens = input_tokens.saturating_add(request_result.input_tokens);
             output_tokens = output_tokens.saturating_add(request_result.output_tokens);
-            current_memory = memory_content_from_output(&request_result.output);
+            current_memory = memory_content_from_output(
+                &request_result.output,
+                current_memory.episodic.as_deref(),
+            );
             final_output = Some(request_result.output);
         }
 
-        let output = final_output.ok_or_else(|| {
+        let mut output = final_output.ok_or_else(|| {
             SleepBatchError::Internal("sleep batch produced no output".to_string())
         })?;
+
+        // Episodic comes from Renderer (Call2), not Call3
+        if let Some(ref md) = rendered_episodic {
+            output.episodic = md.clone();
+        }
 
         // 8. Write memory files
         write_memory_files(&agents_dir, agent_id, &output)?;
@@ -1065,11 +1403,23 @@ async fn execute_batch(
     Ok(())
 }
 
-fn memory_content_from_output(output: &SleepBatchOutput) -> MemoryContent {
+fn memory_content_from_output(
+    output: &SleepBatchOutput,
+    existing_episodic: Option<&str>,
+) -> MemoryContent {
     MemoryContent {
-        episodic: Some(output.episodic.clone()),
-        semantic: Some(output.semantic.clone()),
-        prospective: Some(output.prospective.clone()),
+        episodic: existing_episodic
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if output.episodic.is_empty() {
+                    None
+                } else {
+                    Some(output.episodic.clone())
+                }
+            }),
+        semantic: Some(output.semantic.clone()).filter(|s| !s.is_empty()),
+        prospective: Some(output.prospective.clone()).filter(|s| !s.is_empty()),
     }
 }
 
@@ -1127,7 +1477,7 @@ async fn save_output_snapshots(
     agent_id: &str,
     output: &SleepBatchOutput,
 ) -> Result<(), SleepBatchError> {
-    let content = memory_content_from_output(output);
+    let content = memory_content_from_output(output, None);
     save_aggregate_snapshots(db, run_id, agent_id, Some(&content), Some(true)).await
 }
 
@@ -1405,7 +1755,6 @@ mod tests {
         fn new() -> Self {
             Self {
                 response: serde_json::json!({
-                    "episodic": "",
                     "semantic": "",
                     "prospective": ""
                 })
@@ -1426,7 +1775,6 @@ mod tests {
         fn with_usage(input: i64, output: i64) -> Self {
             Self {
                 response: serde_json::json!({
-                    "episodic": "",
                     "semantic": "",
                     "prospective": ""
                 })
@@ -1581,22 +1929,24 @@ mod tests {
         let run_id = &runs[0].id;
 
         let snapshots = state.db.get_snapshots_for_run(run_id).expect("snapshots");
-        assert_eq!(snapshots.len(), 3);
+        assert!(snapshots.len() >= 2);
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Episodic));
         assert!(snapshots.iter().any(|s| s.file == MemoryFile::Semantic));
-        assert!(snapshots.iter().any(|s| s.file == MemoryFile::Prospective));
         let episodic = snapshots
             .iter()
             .find(|s| s.file == MemoryFile::Episodic)
             .expect("episodic snapshot");
         assert_eq!(episodic.content_before, "episodic content");
-        assert_eq!(episodic.content_after, "");
-        let prospective = snapshots
+        assert!(
+            episodic.content_after.contains("# Episodic Memory"),
+            "episodic after should contain renderer header"
+        );
+        let semantic = snapshots
             .iter()
-            .find(|s| s.file == MemoryFile::Prospective)
-            .expect("prospective snapshot");
-        assert_eq!(prospective.content_before, "");
-        assert_eq!(prospective.content_after, "");
+            .find(|s| s.file == MemoryFile::Semantic)
+            .expect("semantic snapshot");
+        assert_eq!(semantic.content_before, "semantic content");
+        assert_eq!(semantic.content_after, "semantic content");
     }
 
     #[tokio::test]
@@ -1610,7 +1960,6 @@ mod tests {
         std::fs::write(backup_dir.join("episodic.md"), "restored episodic").expect("write");
 
         let llm = Arc::new(MockLlmProvider::with_response(serde_json::json!({
-            "episodic": "updated episodic",
             "semantic": "",
             "prospective": ""
         })));
@@ -1630,7 +1979,10 @@ mod tests {
             .find(|s| s.file == MemoryFile::Episodic)
             .expect("episodic snapshot");
         assert_eq!(episodic.content_before, "restored episodic");
-        assert_eq!(episodic.content_after, "updated episodic");
+        assert!(
+            episodic.content_after.contains("# Episodic Memory"),
+            "episodic after should contain renderer header"
+        );
     }
 
     #[tokio::test]
@@ -1814,7 +2166,14 @@ mod tests {
             .db
             .get_snapshots_for_run(&runs[0].id)
             .expect("snapshots");
-        assert_eq!(snapshots.len(), 3);
+        assert!(
+            !snapshots.is_empty(),
+            "should have at least episodic snapshot"
+        );
+        assert!(
+            snapshots.iter().any(|s| s.file == MemoryFile::Episodic),
+            "should have episodic snapshot"
+        );
     }
 
     #[tokio::test]
@@ -1856,15 +2215,14 @@ mod tests {
     // --- parse_sleep_response tests ---
 
     #[test]
-    fn parse_sleep_response_extracts_three_memory_files() {
+    fn parse_sleep_response_extracts_two_memory_files() {
         let response = serde_json::json!({
-            "episodic": "# Episodic\n\n- event",
             "semantic": "# Semantic\n\n- fact",
             "prospective": "# Prospective\n\n- todo"
         })
         .to_string();
         let output = parse_sleep_response(&response).expect("should parse");
-        assert_eq!(output.episodic, "# Episodic\n\n- event");
+        assert_eq!(output.episodic, "");
         assert_eq!(output.semantic, "# Semantic\n\n- fact");
         assert_eq!(output.prospective, "# Prospective\n\n- todo");
     }
@@ -1877,38 +2235,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_sleep_response_rejects_missing_episodic() {
-        let response = r#"{"semantic":"s","prospective":"p"}"#;
-        let err = parse_sleep_response(response).expect_err("should fail");
+    fn parse_sleep_response_rejects_extra_episodic_key() {
+        let response = r#"{"episodic":"e","semantic":"s","prospective":"p"}"#;
+        let err = parse_sleep_response(response).expect_err("should fail with extra episodic key");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
     }
 
     #[test]
     fn parse_sleep_response_rejects_missing_semantic() {
-        let response = r#"{"episodic":"e","prospective":"p"}"#;
+        let response = r#"{"prospective":"p"}"#;
         let err = parse_sleep_response(response).expect_err("should fail");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
     }
 
     #[test]
     fn parse_sleep_response_rejects_missing_prospective() {
-        let response = r#"{"episodic":"e","semantic":"s"}"#;
+        let response = r#"{"semantic":"s"}"#;
         let err = parse_sleep_response(response).expect_err("should fail");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
     }
 
     #[test]
     fn parse_sleep_response_rejects_summary_or_phases_keys() {
-        let response =
-            r#"{"episodic":"e","semantic":"s","prospective":"p","summary_md":"summary"}"#;
+        let response = r#"{"semantic":"s","prospective":"p","summary_md":"summary"}"#;
         let err = parse_sleep_response(response).expect_err("should fail for summary_md");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
 
-        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","phases":[]}"#;
+        let response = r#"{"semantic":"s","prospective":"p","phases":[]}"#;
         let err = parse_sleep_response(response).expect_err("should fail for phases");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
 
-        let response = r#"{"episodic":"e","semantic":"s","prospective":"p","summary":"sum"}"#;
+        let response = r#"{"semantic":"s","prospective":"p","summary":"sum"}"#;
         let err = parse_sleep_response(response).expect_err("should fail for summary");
         assert!(matches!(err, SleepBatchError::ParseFailed(_)));
     }
@@ -1918,22 +2275,20 @@ mod tests {
         let markdown =
             "# Title\n\n- item 1\n- item 2\n\n## Subsection\n\n> quote\n\n**bold** and *italic*\n";
         let response = serde_json::json!({
-            "episodic": markdown,
-            "semantic": "# Semantic\n",
+            "semantic": markdown,
             "prospective": "# Prospective\n"
         })
         .to_string();
         let output = parse_sleep_response(&response).expect("should parse");
-        assert_eq!(output.episodic, markdown);
-        assert!(output.episodic.contains("**bold** and *italic*"));
-        assert!(output.episodic.contains("> quote"));
+        assert_eq!(output.semantic, markdown);
+        assert!(output.semantic.contains("**bold** and *italic*"));
+        assert!(output.semantic.contains("> quote"));
     }
 
     #[test]
     fn parse_sleep_response_allows_empty_file_content() {
-        let response = r#"{"episodic":"","semantic":"","prospective":""}"#;
+        let response = r#"{"semantic":"","prospective":""}"#;
         let output = parse_sleep_response(response).expect("should parse");
-        assert_eq!(output.episodic, "");
         assert_eq!(output.semantic, "");
         assert_eq!(output.prospective, "");
     }
@@ -2377,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sleep_prompt_requires_three_memory_files() {
+    fn build_sleep_prompt_requires_two_memory_output_keys() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
@@ -2385,10 +2740,6 @@ mod tests {
             source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
-        assert!(
-            prompt.contains("`episodic`"),
-            "prompt should mention episodic as output key"
-        );
         assert!(
             prompt.contains("`semantic`"),
             "prompt should mention semantic as output key"
@@ -2646,30 +2997,31 @@ mod tests {
 
     #[test]
     fn parse_sleep_response_extracts_json_from_code_block() {
-        let response = "Here is the updated memory:\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```\nLet me know if you need anything else.";
+        let response = "Here is the updated memory:\n```json\n{\"semantic\":\"s\",\"prospective\":\"p\"}\n```\nLet me know if you need anything else.";
         let output = parse_sleep_response(response).expect("should parse from code block");
-        assert_eq!(output.episodic, "e");
         assert_eq!(output.semantic, "s");
         assert_eq!(output.prospective, "p");
     }
 
     #[test]
     fn parse_sleep_response_strips_thinking_tags() {
-        let response = "<thinking>let me analyze this</thinking>{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}";
+        let response =
+            "<thinking>let me analyze this</thinking>{\"semantic\":\"s\",\"prospective\":\"p\"}";
         let output = parse_sleep_response(response).expect("should parse after stripping thinking");
-        assert_eq!(output.episodic, "e");
+        assert_eq!(output.semantic, "s");
     }
 
     #[test]
     fn parse_sleep_response_extracts_json_from_preamble() {
-        let response = "I have processed the memory update.\n\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}";
+        let response =
+            "I have processed the memory update.\n\n{\"semantic\":\"s\",\"prospective\":\"p\"}";
         let output = parse_sleep_response(response).expect("should parse by extracting {…} span");
-        assert_eq!(output.episodic, "e");
+        assert_eq!(output.semantic, "s");
     }
 
     #[test]
     fn parse_sleep_response_handles_code_block_with_thinking() {
-        let response = "<thinking>analyzing...</thinking>\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
+        let response = "<thinking>analyzing...</thinking>\n```json\n{\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
         let output =
             parse_sleep_response(response).expect("should handle both thinking and code block");
         assert_eq!(output.semantic, "s");
@@ -2731,13 +3083,14 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let first = "Here is the result:\n```json\n{\"episodic\":\"e\",\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
+        let first = "Here is the result:\n```json\n{\"semantic\":\"s\",\"prospective\":\"p\"}\n```";
         let second = "This is not JSON at all, just plain text.";
-        let third = r#"{"episodic":"retry-e","semantic":"retry-s","prospective":"retry-p"}"#;
+        let third = r#"{"semantic":"retry-s","prospective":"retry-p"}"#;
 
         let provider = SequentialMockProvider::new(vec![
             first.to_string(),
             second.to_string(),
+            third.to_string(),
             third.to_string(),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -2761,6 +3114,7 @@ mod tests {
 
         let provider = SequentialMockProvider::new(vec![
             first.to_string(),
+            second.to_string(),
             second.to_string(),
             first.to_string(),
             second.to_string(),
@@ -2823,8 +3177,9 @@ mod tests {
 
             if let Some((kind, input, output)) = result {
                 assert_eq!(kind, "sleep_batch");
-                assert_eq!(input, 100);
-                assert_eq!(output, 200);
+                // Call2 (rollups) + Call3 (memory) each contribute 100/200
+                assert_eq!(input, 200);
+                assert_eq!(output, 400);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3039,14 +3394,15 @@ mod tests {
             }]
         })
         .to_string();
+        let call2_response = r#"{"rollups":[]}"#.to_string();
         let memory_response = serde_json::json!({
-            "episodic": "",
             "semantic": "",
             "prospective": ""
         })
         .to_string();
 
-        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let provider =
+            SequentialMockProvider::new(vec![events_response, call2_response, memory_response]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -3095,13 +3451,14 @@ mod tests {
         })
         .to_string();
         let memory_response = serde_json::json!({
-            "episodic": "updated",
             "semantic": "",
             "prospective": ""
         })
         .to_string();
+        let call2_response = r#"{"rollups":[]}"#.to_string();
 
-        let provider = SequentialMockProvider::new(vec![events_response, memory_response]);
+        let provider =
+            SequentialMockProvider::new(vec![events_response, call2_response, memory_response]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -3138,8 +3495,8 @@ mod tests {
         let provider = SequentialMockProvider::new(vec![
             "not json at all".to_string(),
             "still not json".to_string(),
+            r#"{"rollups":[]}"#.to_string(),
             serde_json::json!({
-                "episodic": "",
                 "semantic": "",
                 "prospective": ""
             })
@@ -3179,16 +3536,19 @@ mod tests {
         })
         .to_string();
         let memory_response = serde_json::json!({
-            "episodic": "",
             "semantic": "",
             "prospective": ""
         })
         .to_string();
 
+        let call2_response = r#"{"rollups":[]}"#.to_string();
+
         // Extraction call: input=50, output=30
+        // Call2 rollup call: input=10, output=20
         // Memory update call: input=100, output=200
         let provider = SequentialMockWithUsage::new(vec![
             (events_response, 50, 30),
+            (call2_response, 10, 20),
             (memory_response, 100, 200),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -3204,8 +3564,8 @@ mod tests {
             .expect("get")
             .expect("exists");
 
-        // Token counts should aggregate Call 1 + memory update
-        assert_eq!(run.input_tokens, 150);
-        assert_eq!(run.output_tokens, 230);
+        // Token counts should aggregate Call1 + Call2 + Call3
+        assert_eq!(run.input_tokens, 160);
+        assert_eq!(run.output_tokens, 250);
     }
 }

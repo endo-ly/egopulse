@@ -1486,6 +1486,31 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    /// Lists events for an agent within a time range `[start, end)`, ordered by
+    /// `experienced_at ASC`.
+    pub(crate) fn list_episode_events_in_range(
+        &self,
+        agent_id: &str,
+        start: &str,
+        end_exclusive: &str,
+    ) -> Result<Vec<EpisodeEvent>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                    ripple_strength, certainty, sleep_run_id, source_refs_json,
+                    created_at, updated_at
+             FROM episode_events
+             WHERE agent_id = ?1 AND experienced_at >= ?2 AND experienced_at < ?3
+             ORDER BY experienced_at ASC",
+        )?;
+        stmt.query_map(
+            params![agent_id, start, end_exclusive],
+            row_to_episode_event,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
 }
 
 // ---------------------------------------------------------------------------
