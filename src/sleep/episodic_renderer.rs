@@ -136,7 +136,7 @@ fn render_rollup_section_week(rollups: &[RendererRollup]) -> String {
 
     for rollup in rollups {
         let start = extract_date_only(&rollup.period_start);
-        let end = extract_date_only(&rollup.period_end_exclusive);
+        let end = adjust_exclusive_end_to_inclusive(&rollup.period_end_exclusive);
         out.push_str(&format!(
             "\n\n### {} ({}..{}) r{}\n{}",
             rollup.period_key, start, end, rollup.max_ripple, rollup.summary_md
@@ -181,7 +181,11 @@ fn render_background_months(rollups: &[&RendererRollup]) -> String {
 /// Appends "…" if the body was truncated.
 fn truncate_body(body: &str, max_chars: usize) -> String {
     let newline_pos = body.find('\n').unwrap_or(usize::MAX);
-    let cut = newline_pos.min(max_chars).min(body.len());
+    let max_char_cut = body
+        .char_indices()
+        .nth(max_chars)
+        .map_or(body.len(), |(idx, _)| idx);
+    let cut = newline_pos.min(max_char_cut);
 
     if cut < body.len() {
         format!("{}…", &body[..cut])
@@ -196,6 +200,18 @@ fn extract_date(rfc3339: &str) -> String {
 
 fn extract_date_only(dt_str: &str) -> String {
     dt_str.get(..10).unwrap_or(dt_str).to_string()
+}
+
+fn adjust_exclusive_end_to_inclusive(dt_str: &str) -> String {
+    let date_str = extract_date_only(dt_str);
+    let parsed = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d");
+    match parsed {
+        Ok(date) => {
+            let prev = date - chrono::Duration::days(1);
+            prev.format("%Y-%m-%d").to_string()
+        }
+        Err(_) => date_str,
+    }
 }
 
 #[cfg(test)]
@@ -373,7 +389,7 @@ mod tests {
         let rollups = vec![make_rollup(
             "2026-W21",
             "2026-05-18",
-            "2026-05-24",
+            "2026-05-25",
             "- Summary of week 21.",
             5,
             RollupGranularity::Week,
@@ -551,7 +567,7 @@ mod tests {
         let week_rollups = vec![make_rollup(
             "2026-W21",
             "2026-05-18",
-            "2026-05-24",
+            "2026-05-25",
             "- episode_events established as primary source.",
             5,
             RollupGranularity::Week,

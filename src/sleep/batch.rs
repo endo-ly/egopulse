@@ -808,12 +808,14 @@ fn parse_timezone_offset_seconds(tz_str: &str) -> i32 {
 
 /// Parses `+HH:MM` or `+HHMM` offset strings into seconds.
 fn parse_hhmm_offset(s: &str) -> Result<i32, ()> {
-    let s = s.trim_start_matches('+');
+    let s = s.trim();
+    let sign = if s.starts_with('-') { -1 } else { 1 };
+    let s = s.trim_start_matches(['+', '-']);
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() == 2 {
         let hours: i32 = parts[0].parse().map_err(|_| ())?;
         let minutes: i32 = parts[1].parse().map_err(|_| ())?;
-        Ok((hours * 60 + minutes) * 60)
+        Ok(sign * (hours * 60 + minutes) * 60)
     } else if s.len() >= 2 {
         let hours: i32 = s[..2].parse().map_err(|_| ())?;
         let minutes: i32 = if s.len() >= 4 {
@@ -821,7 +823,7 @@ fn parse_hhmm_offset(s: &str) -> Result<i32, ()> {
         } else {
             0
         };
-        Ok((hours * 60 + minutes) * 60)
+        Ok(sign * (hours * 60 + minutes) * 60)
     } else {
         Err(())
     }
@@ -1161,7 +1163,19 @@ async fn execute_batch(
                         crate::sleep::call2::parse_call2_output(&output_json, &valid_keys)
                             .map_err(|e| SleepBatchError::ParseFailed(e.to_string()))?;
 
+                    let requests_by_key: std::collections::HashMap<
+                        &str,
+                        &crate::sleep::call2::RollupRequest,
+                    > = rollup_requests
+                        .iter()
+                        .map(|r| (r.period_key.as_str(), r))
+                        .collect();
+
                     for rollup_output in &rollup_outputs {
+                        let Some(request) = requests_by_key.get(rollup_output.period_key.as_str())
+                        else {
+                            continue;
+                        };
                         let granularity = match rollup_output.granularity.as_str() {
                             "week" => RollupGranularity::Week,
                             "month" => RollupGranularity::Month,
@@ -1172,8 +1186,8 @@ async fn execute_batch(
                             agent_id: agent_id.to_string(),
                             granularity,
                             period_key: rollup_output.period_key.clone(),
-                            period_start: String::new(),
-                            period_end_exclusive: String::new(),
+                            period_start: request.period_start.clone(),
+                            period_end_exclusive: request.period_end_exclusive.clone(),
                             summary_md: rollup_output.summary_md.clone(),
                             max_ripple: rollup_output.max_ripple,
                             event_count: rollup_output.event_count,

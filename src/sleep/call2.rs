@@ -114,11 +114,6 @@ pub(crate) fn recent_months_from_weeks(
     months
 }
 
-fn week_for_date(date: NaiveDate, tz: FixedOffset) -> WeekPeriod {
-    let monday = monday_of(date);
-    week_for_date_inner(monday, tz)
-}
-
 fn week_for_date_inner(monday: NaiveDate, tz: FixedOffset) -> WeekPeriod {
     let iso = monday.iso_week();
     let week_key = format!("{}-W{:02}", iso.year(), iso.week());
@@ -309,8 +304,15 @@ pub(crate) fn plan_rollup_updates(
             tz,
         );
         let key = format!("month:{}", month.month_key);
-        if !existing_month_map.contains_key(month.month_key.as_str()) && seen_keys.insert(key) {
-            requests.push(make_month_request(&month, "week_rolling_out", None));
+        if seen_keys.insert(key) {
+            let previous_summary_md = existing_month_map
+                .get(month.month_key.as_str())
+                .map(|r| r.summary_md.clone());
+            requests.push(make_month_request(
+                &month,
+                "week_rolling_out",
+                previous_summary_md,
+            ));
         }
     }
 
@@ -731,11 +733,6 @@ mod tests {
         jst().from_utc_datetime(&naive)
     }
 
-    /// Helper: RFC 3339 string for a JST datetime.
-    fn jst_rfc3339(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> String {
-        jst_dt(y, m, d, hh, mm).to_rfc3339()
-    }
-
     // -----------------------------------------------------------------------
     // Test 1: current_week — Monday start
     // -----------------------------------------------------------------------
@@ -1105,10 +1102,12 @@ mod tests {
         };
         let reqs = plan_rollup_updates("test-agent", now, &input);
 
-        assert!(
-            reqs.is_empty(),
-            "should return empty when everything is up to date, got: {reqs:?}"
-        );
+        for r in &reqs {
+            assert_eq!(
+                r.reason, "week_rolling_out",
+                "unexpected request when everything is up to date: {r:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
