@@ -357,39 +357,83 @@ async fn execute_batch(
                         events_map.insert(req_key, call2_events);
                     }
 
-                    let input = rollup::build_call2_input(
-                        agent_id,
-                        &run_id,
-                        &now,
-                        tz_str,
-                        &cw,
-                        &rollup_requests,
-                        &events_map,
-                    );
-                    let input_json = serde_json::to_string_pretty(&input)
-                        .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
+                    let input = rollup::build_call2_input(&rollup_requests, &events_map);
+                    let input_json = serde_json::to_string_pretty(&serde_json::json!({
+                        "rollup_requests": input
+                    }))
+                    .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
                     let input_json = rollup::redact_secrets(&input_json);
 
                     let system_prompt = rollup::build_call2_system_prompt(agent_id);
                     let user_prompt = rollup::build_call2_user_prompt(&input_json);
                     let user_message = Message::text("user", user_prompt);
+
                     let response = provider
-                        .send_message(&system_prompt, Arc::new(vec![user_message]), None)
+                        .send_message(&system_prompt, Arc::new(vec![user_message.clone()]), None)
                         .await
                         .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
-                    input_tokens = input_tokens
-                        .saturating_add(response.usage.as_ref().map_or(0, |u| u.input_tokens));
-                    output_tokens = output_tokens
-                        .saturating_add(response.usage.as_ref().map_or(0, |u| u.output_tokens));
+                    let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+                    let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
 
                     let output_json = rollup::redact_secrets(&response.content);
                     let valid_keys: std::collections::HashSet<String> = rollup_requests
                         .iter()
                         .map(|r| r.period_key.clone())
                         .collect();
-                    let rollup_outputs = rollup::parse_call2_output(&output_json, &valid_keys)
-                        .map_err(|e| SleepBatchError::ParseFailed(e.to_string()))?;
+
+                    let (rollup_outputs, call2_in, call2_out) =
+                        match rollup::parse_call2_output(&output_json, &valid_keys) {
+                            Ok(outputs) => (outputs, first_input, first_output),
+                            Err(first_error) => {
+                                warn!(
+                                    agent_id = %agent_id,
+                                    error = %first_error,
+                                    "Call2 parse failed; retrying once"
+                                );
+                                const CALL2_RETRY_GUARD: &str = "\
+Your previous response was not valid JSON according to the expected schema. \
+You must respond with ONLY a JSON object containing exactly one key: \
+\"rollups\" (an array of rollup objects). \
+Each rollup must have: granularity, period_key, summary_md, max_ripple, event_count. \
+Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
+Output the raw JSON object and nothing else.";
+                                let retry_messages = vec![
+                                    user_message,
+                                    Message::text("assistant", &response.content),
+                                    Message::text("user", CALL2_RETRY_GUARD),
+                                ];
+                                let retry_response = provider
+                                    .send_message(&system_prompt, Arc::new(retry_messages), None)
+                                    .await
+                                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+                                let retry_input =
+                                    retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
+                                let retry_output =
+                                    retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
+                                let combined_input = first_input.saturating_add(retry_input);
+                                let combined_output = first_output.saturating_add(retry_output);
+
+                                let retry_json = rollup::redact_secrets(&retry_response.content);
+                                match rollup::parse_call2_output(&retry_json, &valid_keys) {
+                                    Ok(outputs) => (outputs, combined_input, combined_output),
+                                    Err(retry_error) => {
+                                        warn!(
+                                            agent_id = %agent_id,
+                                            error = %retry_error,
+                                            "Call2 retry also failed"
+                                        );
+                                        return Err(SleepBatchError::ParseFailed(
+                                            retry_error.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        };
+
+                    input_tokens = input_tokens.saturating_add(call2_in);
+                    output_tokens = output_tokens.saturating_add(call2_out);
 
                     let requests_by_key: std::collections::HashMap<&str, &rollup::RollupRequest> =
                         rollup_requests

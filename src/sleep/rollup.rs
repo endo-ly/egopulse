@@ -415,29 +415,6 @@ pub(crate) enum Call2Error {
 // Call2 Input / Output types
 // ---------------------------------------------------------------------------
 
-/// Call2 LLM input JSON structure.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2Input {
-    pub run: Call2RunInfo,
-    pub rollup_requests: Vec<Call2RollupRequest>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2RunInfo {
-    pub agent_id: String,
-    pub sleep_run_id: String,
-    pub now: String,
-    pub timezone: String,
-    pub current_week: Call2CurrentWeek,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2CurrentWeek {
-    pub week_key: String,
-    pub period_start: String,
-    pub period_end_exclusive: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Call2RollupRequest {
     pub granularity: String,
@@ -484,42 +461,24 @@ pub(crate) struct Call2RollupOutput {
 ///
 /// The caller populates `events_map` from DB queries keyed by `period_key`.
 pub(crate) fn build_call2_input(
-    agent_id: &str,
-    sleep_run_id: &str,
-    now: &DateTime<FixedOffset>,
-    timezone: &str,
-    current_week: &WeekPeriod,
     rollup_requests: &[RollupRequest],
     events_map: &HashMap<String, Vec<Call2Event>>,
-) -> Call2Input {
-    Call2Input {
-        run: Call2RunInfo {
-            agent_id: agent_id.to_string(),
-            sleep_run_id: sleep_run_id.to_string(),
-            now: now.to_rfc3339(),
-            timezone: timezone.to_string(),
-            current_week: Call2CurrentWeek {
-                week_key: current_week.week_key.clone(),
-                period_start: current_week.period_start.to_rfc3339(),
-                period_end_exclusive: current_week.period_end_exclusive.to_rfc3339(),
-            },
-        },
-        rollup_requests: rollup_requests
-            .iter()
-            .map(|req| {
-                let events = events_map.get(&req.period_key).cloned().unwrap_or_default();
-                Call2RollupRequest {
-                    granularity: granularity_to_str(req.granularity),
-                    period_key: req.period_key.clone(),
-                    period_start: req.period_start.clone(),
-                    period_end_exclusive: req.period_end_exclusive.clone(),
-                    reason: req.reason.clone(),
-                    previous_summary_md: req.previous_summary_md.clone(),
-                    events,
-                }
-            })
-            .collect(),
-    }
+) -> Vec<Call2RollupRequest> {
+    rollup_requests
+        .iter()
+        .map(|req| {
+            let events = events_map.get(&req.period_key).cloned().unwrap_or_default();
+            Call2RollupRequest {
+                granularity: granularity_to_str(req.granularity),
+                period_key: req.period_key.clone(),
+                period_start: req.period_start.clone(),
+                period_end_exclusive: req.period_end_exclusive.clone(),
+                reason: req.reason.clone(),
+                previous_summary_md: req.previous_summary_md.clone(),
+                events,
+            }
+        })
+        .collect()
 }
 
 fn granularity_to_str(g: RollupGranularity) -> String {
@@ -1160,8 +1119,6 @@ mod tests {
 
     #[test]
     fn test_build_call2_input_json_structure() {
-        let now = jst_dt(2026, 5, 27, 10, 0);
-        let cw = current_week(now);
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1170,18 +1127,10 @@ mod tests {
             reason: "closed_week".to_string(),
             previous_summary_md: None,
         };
-        let input = build_call2_input(
-            "agent-1",
-            "run-1",
-            &now,
-            "Asia/Tokyo",
-            &cw,
-            &[req],
-            &HashMap::new(),
-        );
-        let json = serde_json::to_string(&input).expect("serialize");
+        let input = build_call2_input(&[req], &HashMap::new());
+        let wrapped = serde_json::json!({"rollup_requests": input});
+        let json = serde_json::to_string(&wrapped).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse back");
-        assert!(parsed.get("run").is_some(), "should have 'run' key");
         assert!(
             parsed.get("rollup_requests").is_some(),
             "should have 'rollup_requests' key"
@@ -1192,8 +1141,6 @@ mod tests {
 
     #[test]
     fn test_build_call2_input_includes_previous_summary() {
-        let now = jst_dt(2026, 5, 27, 10, 0);
-        let cw = current_week(now);
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1202,25 +1149,12 @@ mod tests {
             reason: "delayed_events".to_string(),
             previous_summary_md: Some("old summary".to_string()),
         };
-        let input = build_call2_input(
-            "agent-1",
-            "run-1",
-            &now,
-            "Asia/Tokyo",
-            &cw,
-            &[req],
-            &HashMap::new(),
-        );
-        assert_eq!(
-            input.rollup_requests[0].previous_summary_md.as_deref(),
-            Some("old summary")
-        );
+        let input = build_call2_input(&[req], &HashMap::new());
+        assert_eq!(input[0].previous_summary_md.as_deref(), Some("old summary"));
     }
 
     #[test]
     fn test_build_call2_input_includes_events() {
-        let now = jst_dt(2026, 5, 27, 10, 0);
-        let cw = current_week(now);
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1240,17 +1174,9 @@ mod tests {
         }];
         let mut events_map = HashMap::new();
         events_map.insert("2026-W21".to_string(), events);
-        let input = build_call2_input(
-            "agent-1",
-            "run-1",
-            &now,
-            "Asia/Tokyo",
-            &cw,
-            &[req],
-            &events_map,
-        );
-        assert_eq!(input.rollup_requests[0].events.len(), 1);
-        assert_eq!(input.rollup_requests[0].events[0].id, "evt-001");
+        let input = build_call2_input(&[req], &events_map);
+        assert_eq!(input[0].events.len(), 1);
+        assert_eq!(input[0].events[0].id, "evt-001");
     }
 
     #[test]
