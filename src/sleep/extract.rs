@@ -9,7 +9,7 @@ use crate::llm::{LlmProvider, Message};
 use crate::storage::{EpisodeEventCertainty, EpisodeEventKind};
 
 use super::batch::SleepBatchError;
-use super::prompt::{escape_xml_content, normalize_llm_response, preview_raw_response};
+use super::prompt::{escape_xml_content, normalize_llm_response};
 
 /// Guard message injected on retry when the event extraction response is not valid JSON.
 const EVENTS_RETRY_GUARD: &str = "\
@@ -158,7 +158,6 @@ pub(crate) async fn send_extract_events_request(
                 chunk_index,
                 total_chunks,
                 error = %first_error,
-                raw_preview = %preview_raw_response(&response.content),
                 "event extraction parse failed; retrying once with events guard"
             );
             let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
@@ -189,7 +188,6 @@ pub(crate) async fn send_extract_events_request(
                         chunk_index,
                         total_chunks,
                         error = %retry_error,
-                        raw_preview = %preview_raw_response(&retry_response.content),
                         "event extraction retry also failed"
                     );
                     return Err(retry_error);

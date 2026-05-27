@@ -37,6 +37,7 @@ pub(crate) fn extract_json_object_span(text: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn preview_raw_response(raw: &str) -> String {
     let truncated: String = raw.chars().take(RAW_RESPONSE_PREVIEW_CHARS).collect();
     if raw.chars().count() > RAW_RESPONSE_PREVIEW_CHARS {

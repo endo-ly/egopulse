@@ -10,7 +10,7 @@ use crate::memory::{MemoryContent, MemoryLoader};
 use crate::storage::{AgentSessionInfo, Database};
 
 use super::batch::SleepBatchError;
-use super::prompt::{escape_xml_content, normalize_llm_response, preview_raw_response};
+use super::prompt::{escape_xml_content, normalize_llm_response};
 
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
 const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
@@ -386,9 +386,11 @@ pub(crate) async fn send_sleep_request(
                 chunk_index,
                 total_chunks,
                 error = %first_error,
-                raw_preview = %preview_raw_response(&response.content),
                 "sleep batch parse failed; retrying once with JSON guard"
             );
+
+            let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
 
             let retry_messages = vec![
                 user_message,
@@ -400,15 +402,21 @@ pub(crate) async fn send_sleep_request(
                 .await
                 .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
+            let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
+            let combined_input = first_input.saturating_add(retry_input);
+            let combined_output = first_output.saturating_add(retry_output);
+
             match parse_sleep_response(&retry_response.content) {
-                Ok(output) => (output, retry_response),
+                Ok(output) => {
+                    return Ok((output, combined_input, combined_output));
+                }
                 Err(retry_error) => {
                     warn!(
                         agent_id = %agent_id,
                         chunk_index,
                         total_chunks,
                         error = %retry_error,
-                        raw_preview = %preview_raw_response(&retry_response.content),
                         "sleep batch retry also failed"
                     );
                     return Err(retry_error);
