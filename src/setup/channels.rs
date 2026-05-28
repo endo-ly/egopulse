@@ -3,7 +3,7 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rand::Rng;
+use rand::RngExt;
 
 use super::Field;
 
