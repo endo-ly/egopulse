@@ -77,4 +77,3 @@ Discord / Telegram の設定は [channels.md](./docs/channels.md) を参照。
 | デプロイ | [deploy.md](./docs/deploy.md) |
 | DB スキーマ | [db.md](./docs/db.md) |
 | WebUI API | [api.md](./docs/api.md) |
-| 開発セットアップ | [development.md](./docs/development.md) |

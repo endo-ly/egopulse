@@ -263,6 +263,29 @@ egopulse update
 
 内部で最新リリースを検証して `$HOME/.local/bin/egopulse` に配置後、systemd ユーザーサービスを再起動する。
 
+#### バイナリ配置とインストール方法
+
+インストール方法によってバイナリの配置場所が異なる。`gateway install` は **起動中のバイナリパス（`current_exe`）** を systemd ユニットの `ExecStart` に埋め込む。
+
+| インストール方法 | バイナリパス | 備考 |
+|---|---|---|
+| `install-egopulse.sh` | `~/.local/bin/egopulse` | `egopulse update` の更新対象 |
+| `cargo build --release` | `{project}/target/release/egopulse` | 手動 cp するまで systemd には反映されない |
+| `cargo run` で `gateway install` | `{project}/target/debug/egopulse` | ⚠️ デバッグバイナリが登録される |
+
+#### systemd 運用中の差し替え
+
+リリースビルドで手動差し替えする場合:
+
+```bash
+cargo build --release -p egopulse
+systemctl --user stop egopulse
+install -m 0755 target/release/egopulse "$HOME/.local/bin/egopulse"
+systemctl --user start egopulse
+```
+
+リリースバイナリへ戻す場合は `egopulse update` で再ダウンロード → 自動再起動。
+
 ### 4.6 Tailscale Serve（オプション）
 
 WebUI を Tailnet 内に HTTPS 公開する。
