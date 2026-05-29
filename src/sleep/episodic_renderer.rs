@@ -122,8 +122,7 @@ fn render_current_week(
                 event.kind, event.ripple_strength, event.title
             ));
             if !event.body_md.is_empty() {
-                let body = truncate_body(&event.body_md, 200);
-                out.push_str(&format!("\n  {}", body));
+                out.push_str(&format!("\n  {}", event.body_md));
             }
         }
     }
@@ -173,25 +172,6 @@ fn render_background_months(rollups: &[&RendererRollup]) -> String {
     }
 
     out
-}
-
-/// Truncates body text to approximately 2 lines.
-///
-/// Cuts at the first newline or `max_chars`, whichever comes first.
-/// Appends "…" if the body was truncated.
-fn truncate_body(body: &str, max_chars: usize) -> String {
-    let newline_pos = body.find('\n').unwrap_or(usize::MAX);
-    let max_char_cut = body
-        .char_indices()
-        .nth(max_chars)
-        .map_or(body.len(), |(idx, _)| idx);
-    let cut = newline_pos.min(max_char_cut);
-
-    if cut < body.len() {
-        format!("{}…", &body[..cut])
-    } else {
-        body.to_string()
-    }
 }
 
 fn extract_date(rfc3339: &str) -> String {
@@ -335,24 +315,21 @@ mod tests {
     }
 
     #[test]
-    fn test_render_current_week_body_truncation() {
+    fn test_render_current_week_body_full_output() {
         // Arrange
         let long_body = "A".repeat(300);
         let events = vec![make_event(
             "2026-05-25T10:00:00+09:00",
             "insight",
-            "Truncation test",
+            "Full body test",
             &long_body,
             3,
         )];
         // Act
         let output = render_with(&events, &[], &[], &[]);
-        // Assert
-        let expected_body = format!("  {}…", "A".repeat(200));
-        assert!(
-            output.contains(&expected_body),
-            "expected truncated body in output"
-        );
+        // Assert — body_md is rendered in full without truncation.
+        assert!(output.contains(&long_body), "body_md should appear in full");
+        assert!(!output.contains('…'), "truncation marker should not appear");
     }
 
     #[test]
