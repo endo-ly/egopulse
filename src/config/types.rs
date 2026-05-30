@@ -391,7 +391,7 @@ pub struct Config {
     pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
-    pub(crate) timezone: String,
+    pub timezone: String,
     pub(crate) sleep_batch: SleepBatchConfig,
     pub(crate) pulse: PulseConfig,
     pub(crate) web_fetch: super::web_fetch::WebFetchConfig,

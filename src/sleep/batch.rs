@@ -251,28 +251,25 @@ pub async fn run_events_extract(
             )
             .await?;
 
-        if !extracted_events.is_empty() {
-            let episode_events =
-                extract::to_episode_events(extracted_events, &resolved_agent, &run_id);
-            let event_count = episode_events.len();
+        let episode_events = extract::to_episode_events(extracted_events, &resolved_agent, &run_id);
+        let event_count = episode_events.len();
 
-            let agent_for_replace = resolved_agent.clone();
-            let run_id_for_replace = run_id.clone();
-            let from_for_replace = from_owned.clone();
-            let to_for_replace = to_owned.clone();
-            call_blocking(Arc::clone(&db), move |db| {
-                db.replace_backfill_episode_events(
-                    &agent_for_replace,
-                    from_for_replace.as_deref(),
-                    to_for_replace.as_deref(),
-                    &run_id_for_replace,
-                    &episode_events,
-                )
-            })
-            .await?;
+        let agent_for_replace = resolved_agent.clone();
+        let run_id_for_replace = run_id.clone();
+        let from_for_replace = from_owned.clone();
+        let to_for_replace = to_owned.clone();
+        call_blocking(Arc::clone(&db), move |db| {
+            db.replace_backfill_episode_events(
+                &agent_for_replace,
+                from_for_replace.as_deref(),
+                to_for_replace.as_deref(),
+                &run_id_for_replace,
+                &episode_events,
+            )
+        })
+        .await?;
 
-            info!(count = event_count, "backfilled episode events");
-        }
+        info!(count = event_count, "backfilled episode events");
 
         let run_id_owned = run_id.clone();
         let source_chats_json =
