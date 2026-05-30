@@ -281,6 +281,8 @@ pub enum SleepRunTrigger {
     Manual,
     /// Triggered by the automatic scheduler.
     Scheduled,
+    /// Backfill run for re-extracting events from historical messages.
+    Backfill,
 }
 
 impl fmt::Display for SleepRunTrigger {
@@ -288,6 +290,7 @@ impl fmt::Display for SleepRunTrigger {
         match self {
             Self::Manual => write!(f, "manual"),
             Self::Scheduled => write!(f, "scheduled"),
+            Self::Backfill => write!(f, "backfill"),
         }
     }
 }
@@ -299,6 +302,7 @@ impl FromStr for SleepRunTrigger {
         match s {
             "manual" => Ok(Self::Manual),
             "scheduled" => Ok(Self::Scheduled),
+            "backfill" => Ok(Self::Backfill),
             other => Err(format!("invalid sleep run trigger: {other}")),
         }
     }
@@ -760,6 +764,7 @@ mod tests {
     fn sleep_run_trigger_display() {
         assert_eq!(SleepRunTrigger::Manual.to_string(), "manual");
         assert_eq!(SleepRunTrigger::Scheduled.to_string(), "scheduled");
+        assert_eq!(SleepRunTrigger::Backfill.to_string(), "backfill");
     }
 
     #[test]
@@ -799,6 +804,10 @@ mod tests {
         assert_eq!(
             SleepRunTrigger::from_str("scheduled").unwrap(),
             SleepRunTrigger::Scheduled
+        );
+        assert_eq!(
+            SleepRunTrigger::from_str("backfill").unwrap(),
+            SleepRunTrigger::Backfill
         );
         assert!(SleepRunTrigger::from_str("invalid").is_err());
     }

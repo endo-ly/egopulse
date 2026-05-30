@@ -5,10 +5,14 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use crate::agent_loop::formatting::{strip_thinking, truncate_summary_text};
 use crate::llm::{LlmProvider, Message};
-use crate::storage::{EpisodeEventCertainty, EpisodeEventKind};
+use crate::storage::{
+    EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, SenderKind, StoredMessage,
+};
 
 use super::batch::SleepBatchError;
+use super::memory_update;
 use super::prompt::{escape_xml_content, normalize_llm_response};
 
 /// Guard message injected on retry when the event extraction response is not valid JSON.
@@ -242,6 +246,97 @@ pub(crate) async fn run_extract_events_for_chunks(
     Ok((all_events, total_input, total_output))
 }
 
+pub(crate) fn messages_to_extract_text(messages: &[StoredMessage]) -> String {
+    messages
+        .iter()
+        .map(|msg| {
+            let role = match msg.sender_kind {
+                SenderKind::User => "user",
+                SenderKind::Assistant => "assistant",
+                SenderKind::System => "system",
+                SenderKind::Tool => "tool",
+            };
+            let content = if msg.sender_kind == SenderKind::Tool {
+                truncate_summary_text(&msg.content, 200)
+            } else {
+                msg.content.clone()
+            };
+            let content = strip_thinking(&content);
+            format!("{} [{}]: {}", msg.timestamp, role, content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn build_extract_chunks(
+    db: &crate::storage::Database,
+    sources: &[(i64, &str, &str)],
+    from: Option<&str>,
+    to: Option<&str>,
+    max_tokens: usize,
+) -> Result<Vec<String>, SleepBatchError> {
+    let max_chars = max_tokens.saturating_mul(3);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for &(chat_id, channel, external_chat_id) in sources {
+        let messages = db
+            .get_messages_between(chat_id, from, to)
+            .map_err(SleepBatchError::Storage)?;
+        if messages.is_empty() {
+            continue;
+        }
+        let text = messages_to_extract_text(&messages);
+        let session_info = crate::storage::AgentSessionInfo {
+            chat_id,
+            channel: channel.to_string(),
+            external_chat_id: external_chat_id.to_string(),
+            updated_at: String::new(),
+            message_count: 0,
+            estimated_tokens: 0,
+        };
+        let blocks = memory_update::session_blocks(&session_info, &text, max_chars);
+        for block in blocks {
+            memory_update::append_chunk_block(&mut chunks, &mut current, block, max_chars);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+
+    Ok(chunks)
+}
+
+pub(crate) fn to_episode_events(
+    events: Vec<ExtractedEvent>,
+    agent_id: &str,
+    run_id: &str,
+) -> Vec<EpisodeEvent> {
+    let now = chrono::Utc::now().to_rfc3339();
+    events
+        .into_iter()
+        .map(|e| EpisodeEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            experienced_at: e.experienced_at,
+            encoded_at: now.clone(),
+            kind: e.kind,
+            title: e.title,
+            body_md: e.body_md,
+            ripple_strength: e.ripple_strength,
+            certainty: e.certainty,
+            sleep_run_id: run_id.to_string(),
+            source_refs_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +407,240 @@ mod tests {
         assert!(
             prompt.contains("decision") || prompt.contains("insight") || prompt.contains("anomaly")
         );
+    }
+
+    // --- messages_to_extract_text ---
+
+    #[test]
+    fn messages_to_extract_text_formats_user_message() {
+        let messages = vec![StoredMessage {
+            id: "m1".to_string(),
+            chat_id: 1,
+            sender_id: "alice".to_string(),
+            content: "hello world".to_string(),
+            sender_kind: SenderKind::User,
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            message_kind: crate::storage::MessageKind::Message,
+            recipient_agent_id: None,
+        }];
+        let text = messages_to_extract_text(&messages);
+        assert!(text.contains("2025-01-01T00:00:00Z [user]: hello world"));
+    }
+
+    #[test]
+    fn messages_to_extract_text_formats_assistant_message() {
+        let messages = vec![StoredMessage {
+            id: "m2".to_string(),
+            chat_id: 1,
+            sender_id: "lyre".to_string(),
+            content: "hi there".to_string(),
+            sender_kind: SenderKind::Assistant,
+            timestamp: "2025-01-01T00:00:01Z".to_string(),
+            message_kind: crate::storage::MessageKind::Message,
+            recipient_agent_id: None,
+        }];
+        let text = messages_to_extract_text(&messages);
+        assert!(text.contains("[assistant]: hi there"));
+    }
+
+    #[test]
+    fn messages_to_extract_text_truncates_long_tool_content() {
+        let long_content = "A".repeat(300);
+        let messages = vec![StoredMessage {
+            id: "m3".to_string(),
+            chat_id: 1,
+            sender_id: "tool-1".to_string(),
+            content: long_content.clone(),
+            sender_kind: SenderKind::Tool,
+            timestamp: "2025-01-01T00:00:02Z".to_string(),
+            message_kind: crate::storage::MessageKind::Message,
+            recipient_agent_id: Some("lyre".to_string()),
+        }];
+        let text = messages_to_extract_text(&messages);
+        assert!(text.contains("[tool]:"));
+        assert!(text.contains("..."));
+        assert!(text.contains(&"A".repeat(50)));
+    }
+
+    #[test]
+    fn messages_to_extract_text_keeps_short_tool_content() {
+        let messages = vec![StoredMessage {
+            id: "m4".to_string(),
+            chat_id: 1,
+            sender_id: "tool-1".to_string(),
+            content: "short".to_string(),
+            sender_kind: SenderKind::Tool,
+            timestamp: "2025-01-01T00:00:03Z".to_string(),
+            message_kind: crate::storage::MessageKind::Message,
+            recipient_agent_id: Some("lyre".to_string()),
+        }];
+        let text = messages_to_extract_text(&messages);
+        assert!(text.contains("[tool]: short"));
+        assert!(!text.contains("..."));
+    }
+
+    #[test]
+    fn messages_to_extract_text_strips_thinking_tags() {
+        let messages = vec![StoredMessage {
+            id: "m5".to_string(),
+            chat_id: 1,
+            sender_id: "lyre".to_string(),
+            content: "<thinking>internal</thinking>visible".to_string(),
+            sender_kind: SenderKind::Assistant,
+            timestamp: "2025-01-01T00:00:04Z".to_string(),
+            message_kind: crate::storage::MessageKind::Message,
+            recipient_agent_id: None,
+        }];
+        let text = messages_to_extract_text(&messages);
+        assert!(text.contains("visible"));
+        assert!(!text.contains("thinking"));
+        assert!(!text.contains("internal"));
+    }
+
+    #[test]
+    fn messages_to_extract_text_joins_multiple_messages() {
+        let messages = vec![
+            StoredMessage {
+                id: "a".to_string(),
+                chat_id: 1,
+                sender_id: "u".to_string(),
+                content: "first".to_string(),
+                sender_kind: SenderKind::User,
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                message_kind: crate::storage::MessageKind::Message,
+                recipient_agent_id: None,
+            },
+            StoredMessage {
+                id: "b".to_string(),
+                chat_id: 1,
+                sender_id: "a".to_string(),
+                content: "second".to_string(),
+                sender_kind: SenderKind::Assistant,
+                timestamp: "2025-01-01T00:00:01Z".to_string(),
+                message_kind: crate::storage::MessageKind::Message,
+                recipient_agent_id: None,
+            },
+        ];
+        let text = messages_to_extract_text(&messages);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("[user]: first"));
+        assert!(lines[1].contains("[assistant]: second"));
+    }
+
+    // --- build_extract_chunks ---
+
+    fn test_db() -> (crate::storage::Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = crate::storage::Database::new(&db_path).expect("db");
+        (db, dir)
+    }
+
+    fn create_chat(db: &crate::storage::Database, agent_id: &str, suffix: &str) -> i64 {
+        db.resolve_or_create_chat_id(
+            "test",
+            &format!("test:chat{suffix}"),
+            Some(&format!("chat{suffix}")),
+            "direct",
+            agent_id,
+        )
+        .expect("create chat")
+    }
+
+    fn store_msg(db: &crate::storage::Database, id: &str, chat_id: i64, content: &str, ts: &str) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
+        )
+        .expect("store message");
+    }
+
+    #[test]
+    fn build_extract_chunks_returns_empty_chunk_when_no_messages() {
+        let (db, _dir) = test_db();
+        let sources: Vec<(i64, &str, &str)> = vec![];
+        let chunks = build_extract_chunks(&db, &sources, None, None, 1000).expect("chunks");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn build_extract_chunks_includes_messages_from_source() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "1");
+        store_msg(&db, "m1", chat_id, "hello", "2025-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "world", "2025-01-01T00:00:01Z");
+
+        let sources = vec![(chat_id, "test", "test:chat1")];
+        let chunks = build_extract_chunks(&db, &sources, None, None, 10000).expect("chunks");
+        let combined = chunks.join("\n");
+        assert!(combined.contains("hello"));
+        assert!(combined.contains("world"));
+    }
+
+    #[test]
+    fn build_extract_chunks_respects_from_cutoff() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "2");
+        store_msg(&db, "old", chat_id, "old message", "2025-01-01T00:00:00Z");
+        store_msg(&db, "new", chat_id, "new message", "2025-01-02T00:00:00Z");
+
+        let sources = vec![(chat_id, "test", "test:chat2")];
+        let chunks = build_extract_chunks(&db, &sources, Some("2025-01-01T12:00:00Z"), None, 10000)
+            .expect("chunks");
+        let combined = chunks.join("\n");
+        assert!(!combined.contains("old message"));
+        assert!(combined.contains("new message"));
+    }
+
+    #[test]
+    fn build_extract_chunks_respects_to_cutoff() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "3");
+        store_msg(&db, "early", chat_id, "early msg", "2025-01-01T00:00:00Z");
+        store_msg(&db, "late", chat_id, "late msg", "2025-01-03T00:00:00Z");
+
+        let sources = vec![(chat_id, "test", "test:chat3")];
+        let chunks = build_extract_chunks(&db, &sources, None, Some("2025-01-02T00:00:00Z"), 10000)
+            .expect("chunks");
+        let combined = chunks.join("\n");
+        assert!(combined.contains("early msg"));
+        assert!(!combined.contains("late msg"));
+    }
+
+    #[test]
+    fn build_extract_chunks_skips_sources_with_no_matching_messages() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "4");
+        store_msg(&db, "m1", chat_id, "old", "2025-01-01T00:00:00Z");
+
+        let sources = vec![(chat_id, "test", "test:chat4")];
+        let chunks = build_extract_chunks(&db, &sources, Some("2025-12-31T00:00:00Z"), None, 10000)
+            .expect("chunks");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn build_extract_chunks_splits_large_sessions() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "5");
+        let long_content = "X".repeat(500);
+        for i in 0..10 {
+            store_msg(
+                &db,
+                &format!("m{i}"),
+                chat_id,
+                &long_content,
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+
+        let sources = vec![(chat_id, "test", "test:chat5")];
+        let chunks = build_extract_chunks(&db, &sources, None, None, 200).expect("chunks");
+        assert!(chunks.len() > 1, "should split into multiple chunks");
     }
 }

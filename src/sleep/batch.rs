@@ -161,6 +161,152 @@ pub async fn run_sleep_batch(
     }
 }
 
+pub async fn run_events_extract(
+    state: &AppState,
+    agent_id: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(), SleepBatchError> {
+    let resolved_agent = match agent_id {
+        Some(id) => id.to_string(),
+        None => state.config.default_agent.as_str().to_string(),
+    };
+
+    let from_owned = from.map(str::to_string);
+    let to_owned = to.map(str::to_string);
+
+    let db = Arc::clone(&state.db);
+
+    let agent_for_run = resolved_agent.clone();
+    let run_id = call_blocking(Arc::clone(&db), move |db| {
+        db.try_create_sleep_run(&agent_for_run, SleepRunTrigger::Backfill)
+    })
+    .await?;
+
+    let run_id = match run_id {
+        Some(id) => id,
+        None => {
+            return Err(SleepBatchError::AlreadyRunning {
+                agent_id: resolved_agent,
+            });
+        }
+    };
+
+    let result = async {
+        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
+        recover_memory_write(&agents_dir, &resolved_agent)?;
+
+        let resolved = state
+            .config
+            .resolve_sleep_batch_llm()
+            .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+        let provider: Arc<dyn LlmProvider> =
+            if let Some(override_provider) = state.llm_override.clone() {
+                override_provider
+            } else {
+                state
+                    .cached_provider(&resolved)
+                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?
+            };
+
+        let context_tokens = state.config.resolve_context_window_tokens(
+            &crate::config::ProviderId::new(&resolved.provider),
+            &resolved.model,
+        );
+        let chunk_session_tokens = memory_update::sleep_chunk_session_tokens(context_tokens);
+
+        let agent_for_chats = resolved_agent.clone();
+        let from_for_chats = from_owned.clone();
+        let to_for_chats = to_owned.clone();
+        let chats: Vec<(i64, String, String)> = call_blocking(Arc::clone(&db), move |db| {
+            db.get_agent_chats_with_messages_between(
+                &agent_for_chats,
+                from_for_chats.as_deref(),
+                to_for_chats.as_deref(),
+            )
+        })
+        .await?;
+
+        let sources: Vec<(i64, &str, &str)> = chats
+            .iter()
+            .map(|(chat_id, channel, ext_id)| (*chat_id, channel.as_str(), ext_id.as_str()))
+            .collect();
+
+        let chunks = extract::build_extract_chunks(
+            &db,
+            &sources,
+            from_owned.as_deref(),
+            to_owned.as_deref(),
+            chunk_session_tokens,
+        )?;
+
+        let total_chunks = chunks.len();
+        let (extracted_events, input_tokens, output_tokens) =
+            extract::run_extract_events_for_chunks(
+                &provider,
+                &resolved_agent,
+                chunks,
+                total_chunks,
+            )
+            .await?;
+
+        if !extracted_events.is_empty() {
+            let episode_events =
+                extract::to_episode_events(extracted_events, &resolved_agent, &run_id);
+            let event_count = episode_events.len();
+
+            let agent_for_replace = resolved_agent.clone();
+            let run_id_for_replace = run_id.clone();
+            let from_for_replace = from_owned.clone();
+            let to_for_replace = to_owned.clone();
+            call_blocking(Arc::clone(&db), move |db| {
+                db.replace_backfill_episode_events(
+                    &agent_for_replace,
+                    from_for_replace.as_deref(),
+                    to_for_replace.as_deref(),
+                    &run_id_for_replace,
+                    &episode_events,
+                )
+            })
+            .await?;
+
+            info!(count = event_count, "backfilled episode events");
+        }
+
+        let run_id_owned = run_id.clone();
+        let source_chats_json =
+            serde_json::to_string(&sources).unwrap_or_else(|_| "[]".to_string());
+        call_blocking(Arc::clone(&db), move |db| {
+            db.update_sleep_run_success(
+                &run_id_owned,
+                &source_chats_json,
+                None,
+                input_tokens,
+                output_tokens,
+            )
+        })
+        .await?;
+
+        Ok::<(), SleepBatchError>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        warn!(error = %error, "events extract failed");
+        let run_id_owned = run_id.clone();
+        let error_message = error.to_string();
+        call_blocking(db, move |db| {
+            db.update_sleep_run_failed(&run_id_owned, &error_message)
+        })
+        .await?;
+        return Err(error);
+    }
+
+    info!(agent_id = %resolved_agent, run_id = %run_id, "events extract completed");
+    Ok(())
+}
+
 async fn execute_batch(
     state: &AppState,
     db: Arc<Database>,
@@ -210,16 +356,37 @@ async fn execute_batch(
         let session_chunks =
             memory_update::build_session_text_chunks(&db, sessions, chunk_session_tokens)?;
 
+        // Build extract chunks from messages table (Call 1)
+        let cutoff = {
+            let agent_for_cutoff = agent_id.to_string();
+            call_blocking(Arc::clone(&db), move |db| {
+                let latest_run = db.get_latest_successful_run(&agent_for_cutoff)?;
+                Ok(latest_run.and_then(|r| r.finished_at))
+            })
+            .await?
+        };
+        let sources: Vec<(i64, &str, &str)> = sessions
+            .iter()
+            .map(|s| (s.chat_id, s.channel.as_str(), s.external_chat_id.as_str()))
+            .collect();
+        let extract_chunks = extract::build_extract_chunks(
+            &db,
+            &sources,
+            cutoff.as_deref(),
+            None,
+            chunk_session_tokens,
+        )?;
+
         let memory_before = state.memory_loader.load(agent_id);
         save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
 
         // Call 1: Event Extraction (best-effort)
         let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
-            let total_chunks = session_chunks.len();
+            let total_chunks = extract_chunks.len();
             extract::run_extract_events_for_chunks(
                 &provider,
                 agent_id,
-                session_chunks.clone(),
+                extract_chunks,
                 total_chunks,
             )
             .await
@@ -229,28 +396,10 @@ async fn execute_batch(
         let (mut input_tokens, mut output_tokens) = match extract_result {
             Ok((extracted_events, inp, out)) => {
                 if !extracted_events.is_empty() {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let agent_for_events = agent_id.to_string();
-                    let run_id_for_insert = run_id.clone();
-                    let episode_events: Vec<EpisodeEvent> = extracted_events
-                        .into_iter()
-                        .map(|e| EpisodeEvent {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            agent_id: agent_for_events.clone(),
-                            experienced_at: e.experienced_at,
-                            encoded_at: now.clone(),
-                            kind: e.kind,
-                            title: e.title,
-                            body_md: e.body_md,
-                            ripple_strength: e.ripple_strength,
-                            certainty: e.certainty,
-                            sleep_run_id: run_id_for_insert.clone(),
-                            source_refs_json: None,
-                            created_at: now.clone(),
-                            updated_at: now.clone(),
-                        })
-                        .collect();
+                    let episode_events =
+                        extract::to_episode_events(extracted_events, agent_id, &run_id);
                     let event_count = episode_events.len();
+                    let run_id_for_insert = run_id.clone();
                     call_blocking(Arc::clone(&db), move |db| {
                         db.insert_episode_events(&run_id_for_insert, &episode_events)
                     })

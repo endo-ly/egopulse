@@ -9,4 +9,4 @@ mod memory_update;
 mod prompt;
 mod rollup;
 
-pub use batch::{SleepBatchError, run_sleep_batch};
+pub use batch::{SleepBatchError, run_events_extract, run_sleep_batch};

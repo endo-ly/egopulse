@@ -56,6 +56,27 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Event extraction operations.
+    Events {
+        #[command(subcommand)]
+        action: EventsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsAction {
+    /// Extract episode events from past sessions.
+    Extract {
+        /// Agent ID (defaults to config's default_agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Start date (RFC3339 or YYYY-MM-DD).
+        #[arg(long)]
+        from: Option<String>,
+        /// End date (RFC3339 or YYYY-MM-DD).
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 /// Parses the CLI, runs the requested command, and exits with status 1 on failure.
@@ -161,6 +182,28 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                 Err(error) => Err(EgoPulseError::Internal(error.to_string())),
             }
         }
+        Some(Command::Events { action }) => match action {
+            EventsAction::Extract { agent, from, to } => {
+                let state = runtime::build_sleep_app_state_with_path(config, resolved_config_path)?;
+                let from = from.as_deref().map(normalize_date_input_from);
+                let to = to.as_deref().map(normalize_date_input_to);
+                match egopulse::sleep::run_events_extract(
+                    &state,
+                    agent.as_deref(),
+                    from.as_deref(),
+                    to.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(egopulse::sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
+                        eprintln!("sleep batch already running for agent '{agent_id}'");
+                        std::process::exit(1);
+                    }
+                    Err(error) => Err(EgoPulseError::Internal(error.to_string())),
+                }
+            }
+        },
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
@@ -168,6 +211,43 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         None => runtime::run_tui(config, resolved_config_path).await,
     }
+}
+
+/// Normalizes a `--from` date input to UTC RFC3339.
+///
+/// Date-only (`YYYY-MM-DD`) → `YYYY-MM-DDT00:00:00Z`.
+/// RFC3339 inputs are passed through unchanged.
+fn normalize_date_input_from(input: &str) -> String {
+    if is_date_only(input) {
+        format!("{input}T00:00:00Z")
+    } else {
+        input.to_string()
+    }
+}
+
+/// Normalizes a `--to` date input to exclusive UTC RFC3339 boundary.
+///
+/// Date-only (`YYYY-MM-DD`) → next day `YYYY-MM-DD+1T00:00:00Z` (exclusive),
+/// so that `--to 2025-06-01` includes all of June 1.
+/// RFC3339 inputs are passed through unchanged.
+fn normalize_date_input_to(input: &str) -> String {
+    if is_date_only(input) {
+        let date = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d")
+            .unwrap_or_else(|e| panic!("invalid date format '{input}': {e}"));
+        let next = date + chrono::Duration::days(1);
+        format!("{next}T00:00:00Z")
+    } else {
+        input.to_string()
+    }
+}
+
+/// Returns `true` if the input looks like a date-only string (`YYYY-MM-DD`)
+/// without time or timezone components.
+fn is_date_only(input: &str) -> bool {
+    input.len() == 10
+        && input.chars().nth(4) == Some('-')
+        && input.chars().nth(7) == Some('-')
+        && !input.contains('T')
 }
 
 #[cfg(test)]
@@ -209,5 +289,53 @@ mod tests {
     fn status_command_removed_from_clap() {
         let result = Cli::try_parse_from(["egopulse", "status"]);
         assert!(result.is_err(), "`egopulse status` should no longer parse");
+    }
+
+    #[test]
+    fn normalize_from_date_only() {
+        assert_eq!(
+            normalize_date_input_from("2025-01-15"),
+            "2025-01-15T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_from_rfc3339_passthrough() {
+        assert_eq!(
+            normalize_date_input_from("2025-01-15T10:00:00Z"),
+            "2025-01-15T10:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_date_only() {
+        assert_eq!(
+            normalize_date_input_to("2025-01-15"),
+            "2025-01-16T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_month_boundary() {
+        assert_eq!(
+            normalize_date_input_to("2025-01-31"),
+            "2025-02-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_year_boundary() {
+        assert_eq!(
+            normalize_date_input_to("2025-12-31"),
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_rfc3339_passthrough() {
+        assert_eq!(
+            normalize_date_input_to("2025-06-01T23:59:59Z"),
+            "2025-06-01T23:59:59Z"
+        );
     }
 }
