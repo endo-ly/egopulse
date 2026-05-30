@@ -96,13 +96,14 @@ const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram"];
 fn validate_delivery_raw(
     agent_id: &str,
     raw: &DeliveryRaw,
+    source: &str,
 ) -> Result<DeliverySpec, PulseParseError> {
     let channel = raw.channel.trim().to_ascii_lowercase();
     if !VALID_DELIVERY_CHANNELS.contains(&channel.as_str()) {
         return Err(PulseParseError::InvalidDelivery {
             agent_id: agent_id.to_string(),
             detail: format!(
-                "invalid delivery channel: {channel}, expected one of {}",
+                "{source}: invalid delivery channel: {channel}, expected one of {}",
                 VALID_DELIVERY_CHANNELS.join(", ")
             ),
         });
@@ -111,7 +112,7 @@ fn validate_delivery_raw(
     if external_chat_id.is_empty() {
         return Err(PulseParseError::InvalidDelivery {
             agent_id: agent_id.to_string(),
-            detail: "delivery external_chat_id must not be empty".to_string(),
+            detail: format!("{source}: delivery external_chat_id must not be empty"),
         });
     }
     Ok(DeliverySpec {
@@ -176,7 +177,7 @@ fn parse_pulse_definition_inner(
     let default_delivery = fm
         .default_delivery
         .as_ref()
-        .map(|raw| validate_delivery_raw(agent_id, raw))
+        .map(|raw| validate_delivery_raw(agent_id, raw, "default_delivery"))
         .transpose()?;
 
     let mut intentions = Vec::with_capacity(fm.intentions.len());
@@ -195,7 +196,7 @@ fn parse_pulse_definition_inner(
         let delivery = raw
             .delivery
             .as_ref()
-            .map(|d| validate_delivery_raw(agent_id, d))
+            .map(|d| validate_delivery_raw(agent_id, d, &format!("intention '{}'", raw.id)))
             .transpose()?;
         intentions.push(TemporalIntention {
             id: raw.id,

@@ -213,15 +213,16 @@ impl Database {
         }
     }
 
-    pub(crate) fn get_chat_by_channel_external(
+    pub(crate) fn get_chat_by_channel_external_and_agent(
         &self,
         channel: &str,
         external_chat_id: &str,
+        agent_id: &str,
     ) -> Result<Option<ChatInfo>, StorageError> {
         let conn = self.get_conn()?;
         match conn.query_row(
-            "SELECT chat_id, chat_type, agent_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
-            params![channel, external_chat_id],
+            "SELECT chat_id, chat_type, agent_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 AND agent_id = ?3 LIMIT 1",
+            params![channel, external_chat_id, agent_id],
             |row| {
                 Ok(ChatInfo {
                     chat_id: row.get(0)?,

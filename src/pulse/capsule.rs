@@ -92,7 +92,14 @@ pub(crate) async fn resolve_home_surface(
     explicit_delivery: Option<&DeliverySpec>,
 ) -> Result<Option<HomeSurface>, crate::error::StorageError> {
     if let Some(spec) = explicit_delivery {
-        return resolve_explicit(db, spec, available_channels).await;
+        if let Some(surface) = resolve_explicit(db, agent_id, spec, available_channels).await? {
+            return Ok(Some(surface));
+        }
+        tracing::warn!(
+            channel = %spec.channel,
+            external_chat_id = %spec.external_chat_id,
+            "explicit delivery not found, falling back to auto resolve"
+        );
     }
 
     resolve_auto(db, agent_id, available_channels).await
@@ -100,6 +107,7 @@ pub(crate) async fn resolve_home_surface(
 
 async fn resolve_explicit(
     db: &Arc<Database>,
+    agent_id: &str,
     spec: &DeliverySpec,
     available_channels: &[&str],
 ) -> Result<Option<HomeSurface>, crate::error::StorageError> {
@@ -109,9 +117,10 @@ async fn resolve_explicit(
 
     let channel = spec.channel.clone();
     let external_chat_id = spec.external_chat_id.clone();
+    let agent_id = agent_id.to_string();
 
     let chat = crate::storage::call_blocking(db.clone(), move |db| {
-        db.get_chat_by_channel_external(&channel, &external_chat_id)
+        db.get_chat_by_channel_external_and_agent(&channel, &external_chat_id, &agent_id)
     })
     .await?;
 
@@ -477,8 +486,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_delivery_returns_none_when_chat_not_found() {
+    async fn explicit_delivery_falls_back_to_auto_when_chat_not_found() {
         let (db, _dir) = test_db();
+
+        let auto_chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:auto",
+            "dm",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
 
         let spec = DeliverySpec {
             channel: "discord".to_string(),
@@ -487,13 +505,14 @@ mod tests {
 
         let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
             .await
-            .expect("resolve");
+            .expect("resolve")
+            .expect("should fall back to auto");
 
-        assert!(surface.is_none());
+        assert_eq!(surface.chat_id, auto_chat_id);
     }
 
     #[tokio::test]
-    async fn explicit_delivery_returns_none_when_adapter_missing() {
+    async fn explicit_delivery_falls_back_to_auto_when_adapter_missing() {
         let (db, _dir) = test_db();
 
         let _chat_id = insert_chat(
@@ -505,6 +524,15 @@ mod tests {
             "2024-01-01T00:00:00Z",
         );
 
+        let telegram_chat_id = insert_chat(
+            &db,
+            "telegram",
+            "telegram:auto",
+            "dm",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
+
         let spec = DeliverySpec {
             channel: "discord".to_string(),
             external_chat_id: "discord:111".to_string(),
@@ -512,9 +540,48 @@ mod tests {
 
         let surface = resolve_home_surface(&db, "agent-a", &["telegram"], Some(&spec))
             .await
-            .expect("resolve");
+            .expect("resolve")
+            .expect("should fall back to auto");
 
-        assert!(surface.is_none());
+        assert_eq!(surface.chat_id, telegram_chat_id);
+    }
+
+    #[tokio::test]
+    async fn explicit_delivery_scoped_to_agent() {
+        let (db, _dir) = test_db();
+
+        let _other_agent_chat = insert_chat(
+            &db,
+            "discord",
+            "discord:999",
+            "dm",
+            "agent-b",
+            "2024-01-01T00:00:00Z",
+        );
+
+        let auto_chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:auto",
+            "dm",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
+
+        let spec = DeliverySpec {
+            channel: "discord".to_string(),
+            external_chat_id: "discord:999".to_string(),
+        };
+
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
+            .await
+            .expect("resolve")
+            .expect("should fall back to auto");
+
+        assert_eq!(
+            surface.chat_id, auto_chat_id,
+            "should not resolve to another agent's chat"
+        );
     }
 
     #[tokio::test]
