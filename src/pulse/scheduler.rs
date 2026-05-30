@@ -59,7 +59,16 @@ async fn scan_agent(
     }
 
     for intention in &definition.intentions {
-        process_intention(state, agent_id, intention, &definition.body, timezone, now).await;
+        process_intention(
+            state,
+            agent_id,
+            intention,
+            definition.default_delivery.as_ref(),
+            &definition.body,
+            timezone,
+            now,
+        )
+        .await;
     }
 }
 
@@ -69,6 +78,7 @@ async fn process_intention(
     state: &AppState,
     agent_id: &AgentId,
     intention: &super::definition::TemporalIntention,
+    default_delivery: Option<&super::definition::DeliverySpec>,
     pulse_body: &str,
     timezone: &str,
     now: chrono::DateTime<Utc>,
@@ -138,8 +148,9 @@ async fn process_intention(
 
     // 5. Resolve home surface
     let available_channels = state.channels.names();
+    let explicit_delivery = intention.delivery.as_ref().or(default_delivery);
     let home_surface =
-        match super::capsule::resolve_home_surface(&state.db, agent_id_str, &available_channels)
+        match super::capsule::resolve_home_surface(&state.db, agent_id_str, &available_channels, explicit_delivery)
             .await
         {
             Ok(Some(surface)) => surface,

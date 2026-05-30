@@ -74,14 +74,56 @@ pub(crate) struct HomeSurface {
 
 const SENDABLE_CHANNELS: &[&str] = &["discord", "telegram"];
 
+use crate::pulse::definition::DeliverySpec;
+
 /// Resolve the home surface for an agent.
 ///
-/// Queries the database for the agent's chats ordered by recency,
-/// then returns the first chat on a sendable channel (Discord or Telegram).
+/// Resolution order:
+/// 1. `explicit_delivery` — if provided, look up the exact chat from DB
+/// 2. Auto-resolve — find the agent's most recent chat on a sendable channel
+/// 3. `None` — no sendable surface found
 ///
 /// # Errors
 /// Returns `StorageError` when the database query fails.
 pub(crate) async fn resolve_home_surface(
+    db: &Arc<Database>,
+    agent_id: &str,
+    available_channels: &[&str],
+    explicit_delivery: Option<&DeliverySpec>,
+) -> Result<Option<HomeSurface>, crate::error::StorageError> {
+    if let Some(spec) = explicit_delivery {
+        return resolve_explicit(db, spec, available_channels).await;
+    }
+
+    resolve_auto(db, agent_id, available_channels).await
+}
+
+async fn resolve_explicit(
+    db: &Arc<Database>,
+    spec: &DeliverySpec,
+    available_channels: &[&str],
+) -> Result<Option<HomeSurface>, crate::error::StorageError> {
+    if !available_channels.contains(&spec.channel.as_str()) {
+        return Ok(None);
+    }
+
+    let channel = spec.channel.clone();
+    let external_chat_id = spec.external_chat_id.clone();
+
+    let chat = crate::storage::call_blocking(db.clone(), move |db| {
+        db.get_chat_by_channel_external(&channel, &external_chat_id)
+    })
+    .await?;
+
+    Ok(chat.map(|c| HomeSurface {
+        chat_id: c.chat_id,
+        channel: c.channel,
+        external_chat_id: c.external_chat_id,
+        chat_type: c.chat_type,
+    }))
+}
+
+async fn resolve_auto(
     db: &Arc<Database>,
     agent_id: &str,
     available_channels: &[&str],
@@ -297,7 +339,7 @@ mod tests {
             "2024-06-01T00:00:00Z",
         );
 
-        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"], None)
             .await
             .expect("resolve")
             .expect("should find surface");
@@ -328,7 +370,7 @@ mod tests {
             "2024-06-01T00:00:00Z",
         );
 
-        let surface = resolve_home_surface(&db, "agent-a", &["discord"])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"], None)
             .await
             .expect("resolve")
             .expect("should find surface");
@@ -350,7 +392,7 @@ mod tests {
             "2024-06-01T00:00:00Z",
         );
 
-        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"], None)
             .await
             .expect("resolve");
 
@@ -378,7 +420,7 @@ mod tests {
             "2024-06-01T00:00:00Z",
         );
 
-        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"])
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram"], None)
             .await
             .expect("resolve");
 
@@ -397,11 +439,104 @@ mod tests {
             "2024-06-01T00:00:00Z",
         );
 
-        let surface = resolve_home_surface(&db, "agent-a", &["telegram"])
+        let surface = resolve_home_surface(&db, "agent-a", &["telegram"], None)
             .await
             .expect("resolve");
 
         assert!(surface.is_none());
+    }
+
+    // --- explicit delivery tests ---
+
+    #[tokio::test]
+    async fn explicit_delivery_resolves_from_db() {
+        let (db, _dir) = test_db();
+
+        let chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:999",
+            "dm",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+
+        let spec = DeliverySpec {
+            channel: "discord".to_string(),
+            external_chat_id: "discord:999".to_string(),
+        };
+
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
+            .await
+            .expect("resolve")
+            .expect("should find surface");
+
+        assert_eq!(surface.chat_id, chat_id);
+        assert_eq!(surface.channel, "discord");
+        assert_eq!(surface.external_chat_id, "discord:999");
+    }
+
+    #[tokio::test]
+    async fn explicit_delivery_returns_none_when_chat_not_found() {
+        let (db, _dir) = test_db();
+
+        let spec = DeliverySpec {
+            channel: "discord".to_string(),
+            external_chat_id: "discord:nonexistent".to_string(),
+        };
+
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
+            .await
+            .expect("resolve");
+
+        assert!(surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_delivery_returns_none_when_adapter_missing() {
+        let (db, _dir) = test_db();
+
+        let _chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:111",
+            "dm",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+
+        let spec = DeliverySpec {
+            channel: "discord".to_string(),
+            external_chat_id: "discord:111".to_string(),
+        };
+
+        let surface = resolve_home_surface(&db, "agent-a", &["telegram"], Some(&spec))
+            .await
+            .expect("resolve");
+
+        assert!(surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_delivery_falls_back_to_auto_resolve() {
+        let (db, _dir) = test_db();
+
+        let chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:auto",
+            "dm",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
+
+        let surface = resolve_home_surface(&db, "agent-a", &["discord"], None)
+            .await
+            .expect("resolve")
+            .expect("should find surface");
+
+        assert_eq!(surface.chat_id, chat_id);
+        assert_eq!(surface.channel, "discord");
     }
 
     // --- Capsule tests ---
