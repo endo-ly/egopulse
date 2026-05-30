@@ -414,6 +414,7 @@ mod tests {
                 at: "09:00".to_string(),
             },
             attention: "Check today's schedule and unresolved items.".to_string(),
+            delivery: None,
         }
     }
 

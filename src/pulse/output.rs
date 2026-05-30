@@ -366,6 +366,7 @@ mod tests {
                 at: "08:00".to_string(),
             },
             attention: "Check today's schedule.\n".to_string(),
+            delivery: None,
         };
         let content = format_synthetic_content(&intention);
         assert_eq!(
@@ -384,6 +385,7 @@ mod tests {
                 at: "21:00".to_string(),
             },
             attention: "Reflect on the week.".to_string(),
+            delivery: None,
         };
         let content = format_synthetic_content(&intention);
         assert!(content.starts_with("[Pulse: weekly_reflection]"));
@@ -400,6 +402,7 @@ mod tests {
                 at: "09:00".to_string(),
             },
             attention: "  hello world  \n\n".to_string(),
+            delivery: None,
         };
         let content = format_synthetic_content(&intention);
         assert!(content.contains("Attention:\nhello world"));
@@ -445,6 +448,7 @@ mod tests {
                 at: "09:00".to_string(),
             },
             attention: "Check today's schedule and unresolved items.".to_string(),
+            delivery: None,
         }
     }
 
