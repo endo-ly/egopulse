@@ -932,6 +932,27 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Returns the latest successful non-backfill run for an agent.
+    pub(crate) fn get_latest_successful_non_backfill_run(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<SleepRun>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             WHERE agent_id = ?1 AND status = 'success' AND trigger_type != 'backfill'
+             ORDER BY finished_at DESC
+             LIMIT 1",
+            params![agent_id],
+            row_to_sleep_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub(crate) fn count_agent_messages_since(
         &self,
         agent_id: &str,
@@ -1530,6 +1551,126 @@ impl Database {
         )?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+    }
+
+    pub(crate) fn get_messages_between(
+        &self,
+        chat_id: i64,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                    message_kind, recipient_agent_id
+             FROM messages
+             WHERE chat_id = ?1
+               AND (?2 IS NULL OR timestamp >= ?2)
+               AND (?3 IS NULL OR timestamp < ?3)
+             ORDER BY timestamp ASC",
+        )?;
+        stmt.query_map(params![chat_id, from, to], row_to_stored_message)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn get_agent_chats_with_messages_between(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<(i64, String, String)>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.chat_id, c.channel, c.external_chat_id
+             FROM chats c
+             WHERE c.agent_id = ?1
+               AND c.chat_type != 'channel_log'
+               AND EXISTS (
+                   SELECT 1 FROM messages m
+                   WHERE m.chat_id = c.chat_id
+                     AND (?2 IS NULL OR m.timestamp >= ?2)
+                     AND (?3 IS NULL OR m.timestamp < ?3)
+               )
+             ORDER BY c.last_message_time ASC",
+        )?;
+        stmt.query_map(params![agent_id, from, to], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn replace_backfill_episode_events(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        sleep_run_id: &str,
+        events: &[EpisodeEvent],
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let tx = conn.unchecked_transaction()?;
+
+        let is_backfill: bool = tx.query_row(
+            "SELECT trigger_type = 'backfill' FROM sleep_runs WHERE id = ?1 AND agent_id = ?2",
+            params![sleep_run_id, agent_id],
+            |row| row.get(0),
+        )?;
+        if !is_backfill {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep run '{sleep_run_id}' is not a backfill run"
+            )));
+        }
+
+        tx.execute(
+            "DELETE FROM episode_events
+             WHERE agent_id = ?1
+               AND (?2 IS NULL OR experienced_at >= ?2)
+               AND (?3 IS NULL OR experienced_at < ?3)
+               AND sleep_run_id IN (
+                   SELECT id FROM sleep_runs
+                   WHERE agent_id = ?1
+                     AND trigger_type = 'backfill'
+               )",
+            params![agent_id, from, to],
+        )?;
+
+        for event in events {
+            if event.sleep_run_id != sleep_run_id {
+                tx.rollback()?;
+                return Err(StorageError::Conflict(format!(
+                    "event sleep_run_id '{}' does not match expected '{sleep_run_id}'",
+                    event.sleep_run_id,
+                )));
+            }
+            tx.execute(
+                "INSERT INTO episode_events
+                     (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                      ripple_strength, certainty, sleep_run_id, source_refs_json,
+                      created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    event.id,
+                    event.agent_id,
+                    event.experienced_at,
+                    event.encoded_at,
+                    event.kind.to_string(),
+                    event.title,
+                    event.body_md,
+                    event.ripple_strength,
+                    event.certainty.to_string(),
+                    event.sleep_run_id,
+                    event.source_refs_json,
+                    event.created_at,
+                    event.updated_at,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -3223,6 +3364,221 @@ mod tests {
 
         let runs = db.list_all_sleep_runs(10).expect("list all");
         assert!(runs.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Message range queries (event extract refactor)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn get_messages_between_returns_all_without_cutoff() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:between-1", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "m1", chat_id, "first", "2025-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "second", "2025-01-02T00:00:00Z");
+        store_msg(&db, "m3", chat_id, "third", "2025-01-03T00:00:00Z");
+
+        let msgs = db.get_messages_between(chat_id, None, None).expect("query");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "first");
+        assert_eq!(msgs[2].content, "third");
+    }
+
+    #[test]
+    fn get_messages_between_filters_by_from() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:between-2", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "m1", chat_id, "old", "2025-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "mid", "2025-01-02T00:00:00Z");
+        store_msg(&db, "m3", chat_id, "new", "2025-01-03T00:00:00Z");
+
+        let msgs = db
+            .get_messages_between(chat_id, Some("2025-01-02T00:00:00Z"), None)
+            .expect("query");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "mid");
+        assert_eq!(msgs[1].content, "new");
+    }
+
+    #[test]
+    fn get_messages_between_filters_by_to() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:between-3", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "m1", chat_id, "old", "2025-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "mid", "2025-01-02T00:00:00Z");
+        store_msg(&db, "m3", chat_id, "new", "2025-01-03T00:00:00Z");
+
+        let msgs = db
+            .get_messages_between(chat_id, None, Some("2025-01-02T00:00:00Z"))
+            .expect("query");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "old");
+    }
+
+    #[test]
+    fn get_messages_between_filters_by_range() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:between-4", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "m1", chat_id, "old", "2025-01-01T00:00:00Z");
+        store_msg(&db, "m2", chat_id, "mid", "2025-01-02T00:00:00Z");
+        store_msg(&db, "m3", chat_id, "new", "2025-01-03T00:00:00Z");
+
+        let msgs = db
+            .get_messages_between(
+                chat_id,
+                Some("2025-01-02T00:00:00Z"),
+                Some("2025-01-03T00:00:00Z"),
+            )
+            .expect("query");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "mid");
+    }
+
+    #[test]
+    fn get_messages_between_returns_empty_for_wrong_chat() {
+        let (db, _dir) = test_db();
+        let _chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:between-5", None, "cli", "agent-a")
+            .expect("create chat");
+
+        let msgs = db.get_messages_between(999, None, None).expect("query");
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn get_agent_chats_with_messages_between_returns_chats_with_messages() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:chats-1", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "m1", chat_id, "hello", "2025-01-01T00:00:00Z");
+
+        let chats = db
+            .get_agent_chats_with_messages_between("agent-a", None, None)
+            .expect("query");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].0, chat_id);
+    }
+
+    #[test]
+    fn get_agent_chats_with_messages_between_excludes_channel_log() {
+        let (db, _dir) = test_db();
+        let log_id = db.resolve_channel_log_chat_id(42).expect("create log");
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+             VALUES ('cl-1', ?1, 'system', 'event', 'system', '2025-01-01T00:00:00Z', 'system_event')",
+            rusqlite::params![log_id],
+        )
+        .expect("store msg");
+        drop(conn);
+
+        let chats = db
+            .get_agent_chats_with_messages_between("", None, None)
+            .expect("query");
+        assert!(chats.is_empty(), "channel_log should be excluded");
+    }
+
+    #[test]
+    fn get_agent_chats_with_messages_between_filters_by_time_range() {
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:chats-2", None, "cli", "agent-a")
+            .expect("create chat");
+        store_msg(&db, "old", chat_id, "old", "2025-01-01T00:00:00Z");
+        store_msg(&db, "new", chat_id, "new", "2025-06-01T00:00:00Z");
+
+        let chats = db
+            .get_agent_chats_with_messages_between("agent-a", Some("2025-03-01T00:00:00Z"), None)
+            .expect("query");
+        assert_eq!(
+            chats.len(),
+            1,
+            "should find chat with messages after cutoff"
+        );
+    }
+
+    #[test]
+    fn replace_backfill_episode_events_removes_only_backfill_events() {
+        let (db, _dir) = test_db();
+
+        let backfill_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Backfill)
+            .expect("create")
+            .expect("id");
+        db.update_sleep_run_success(&backfill_id, "[]", None, 0, 0)
+            .expect("success backfill");
+
+        let manual_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("id");
+        db.update_sleep_run_success(&manual_id, "[]", None, 0, 0)
+            .expect("success manual");
+
+        let events_backfill = vec![make_event(
+            "evt-bf1",
+            "agent-a",
+            "2025-01-10T10:00:00Z",
+            EpisodeEventKind::Self_,
+            3,
+            EpisodeEventCertainty::Stated,
+            &backfill_id,
+        )];
+        let events_manual = vec![make_event(
+            "evt-man1",
+            "agent-a",
+            "2025-01-11T10:00:00Z",
+            EpisodeEventKind::World,
+            4,
+            EpisodeEventCertainty::Derived,
+            &manual_id,
+        )];
+
+        db.insert_episode_events(&backfill_id, &events_backfill)
+            .expect("insert backfill");
+        db.insert_episode_events(&manual_id, &events_manual)
+            .expect("insert manual");
+
+        let new_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Backfill)
+            .expect("create")
+            .expect("id");
+        db.update_sleep_run_success(&new_id, "[]", None, 0, 0)
+            .expect("success new");
+
+        let new_events = vec![make_event(
+            "evt-new",
+            "agent-a",
+            "2025-01-12T10:00:00Z",
+            EpisodeEventKind::Insight,
+            5,
+            EpisodeEventCertainty::Stated,
+            &new_id,
+        )];
+
+        db.replace_backfill_episode_events("agent-a", None, None, &new_id, &new_events)
+            .expect("replace");
+
+        let remaining = db.count_episode_events("agent-a").expect("count");
+        assert_eq!(remaining, 2, "manual + new backfill event should remain");
+        let all = db
+            .list_episode_events("agent-a", None, None, 10)
+            .expect("list");
+        let ids: Vec<&str> = all.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"evt-man1"),
+            "manual event should be preserved"
+        );
+        assert!(ids.contains(&"evt-new"), "new backfill event should exist");
     }
 
     // ---------------------------------------------------------------------------

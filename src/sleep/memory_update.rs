@@ -203,7 +203,11 @@ pub(crate) fn build_session_text_chunks(
     Ok(chunks)
 }
 
-fn session_blocks(session: &AgentSessionInfo, messages: &str, max_chars: usize) -> Vec<String> {
+pub(super) fn session_blocks(
+    session: &AgentSessionInfo,
+    messages: &str,
+    max_chars: usize,
+) -> Vec<String> {
     let open = format!(
         "<session channel=\"{}\" chat=\"{}\">",
         session.channel, session.external_chat_id
@@ -234,7 +238,7 @@ fn session_blocks(session: &AgentSessionInfo, messages: &str, max_chars: usize) 
         .collect()
 }
 
-fn append_chunk_block(
+pub(super) fn append_chunk_block(
     chunks: &mut Vec<String>,
     current: &mut String,
     block: String,
@@ -246,7 +250,7 @@ fn append_chunk_block(
     current.push_str(&block);
 }
 
-fn split_text_by_chars(text: &str, max_chars: usize) -> Vec<String> {
+pub(super) fn split_text_by_chars(text: &str, max_chars: usize) -> Vec<String> {
     if text.is_empty() || text.chars().count() <= max_chars {
         return vec![text.to_string()];
     }

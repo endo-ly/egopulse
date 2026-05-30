@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use chrono::Datelike;
+use chrono::TimeZone;
 use clap::{Parser, Subcommand};
 use egopulse::agent_loop;
 use egopulse::channels::cli;
@@ -55,6 +57,27 @@ enum Command {
         /// Agent to run the sleep batch for (defaults to config's default_agent).
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Event extraction operations.
+    Events {
+        #[command(subcommand)]
+        action: EventsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsAction {
+    /// Extract episode events from past sessions.
+    Extract {
+        /// Agent ID (defaults to config's default_agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Start date (RFC3339 or YYYY-MM-DD).
+        #[arg(long)]
+        from: Option<String>,
+        /// End date (RFC3339 or YYYY-MM-DD).
+        #[arg(long)]
+        to: Option<String>,
     },
 }
 
@@ -161,6 +184,35 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                 Err(error) => Err(EgoPulseError::Internal(error.to_string())),
             }
         }
+        Some(Command::Events { action }) => match action {
+            EventsAction::Extract { agent, from, to } => {
+                let tz: chrono_tz::Tz = config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
+                let state = runtime::build_sleep_app_state_with_path(config, resolved_config_path)?;
+                let from = from
+                    .as_deref()
+                    .map(|d| normalize_date_input_from(d, tz))
+                    .transpose()?;
+                let to = to
+                    .as_deref()
+                    .map(|d| normalize_date_input_to(d, tz))
+                    .transpose()?;
+                match egopulse::sleep::run_events_extract(
+                    &state,
+                    agent.as_deref(),
+                    from.as_deref(),
+                    to.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(egopulse::sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
+                        eprintln!("sleep batch already running for agent '{agent_id}'");
+                        std::process::exit(1);
+                    }
+                    Err(error) => Err(EgoPulseError::Internal(error.to_string())),
+                }
+            }
+        },
         Some(Command::Run) => unreachable!("handled without standard config flow"),
         Some(Command::Setup) => unreachable!("handled before config loading"),
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
@@ -168,6 +220,62 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         None => runtime::run_tui(config, resolved_config_path).await,
     }
+}
+
+/// Normalizes a `--from` date input to UTC RFC3339.
+///
+/// Date-only (`YYYY-MM-DD`) is interpreted in the given timezone as 00:00:00
+/// local time, then converted to UTC. RFC3339 inputs are also normalized to UTC.
+fn normalize_date_input_from(input: &str, tz: chrono_tz::Tz) -> Result<String, EgoPulseError> {
+    if is_date_only(input) {
+        let date = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d")
+            .map_err(|e| EgoPulseError::Internal(format!("invalid --from date '{input}': {e}")))?;
+        let local = tz
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+            .single()
+            .ok_or_else(|| {
+                EgoPulseError::Internal(format!(
+                    "ambiguous or non-existent local time for --from date '{input}' in timezone {tz}"
+                ))
+            })?;
+        Ok(local.naive_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    } else {
+        let dt = chrono::DateTime::parse_from_rfc3339(input).map_err(|e| {
+            EgoPulseError::Internal(format!("invalid --from datetime '{input}': {e}"))
+        })?;
+        Ok(dt.naive_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    }
+}
+
+fn normalize_date_input_to(input: &str, tz: chrono_tz::Tz) -> Result<String, EgoPulseError> {
+    if is_date_only(input) {
+        let date = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d")
+            .map_err(|e| EgoPulseError::Internal(format!("invalid --to date '{input}': {e}")))?;
+        let next = date + chrono::Duration::days(1);
+        let local = tz
+            .with_ymd_and_hms(next.year(), next.month(), next.day(), 0, 0, 0)
+            .single()
+            .ok_or_else(|| {
+                EgoPulseError::Internal(format!(
+                    "ambiguous or non-existent local time for --to date '{input}' in timezone {tz}"
+                ))
+            })?;
+        Ok(local.naive_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    } else {
+        let dt = chrono::DateTime::parse_from_rfc3339(input).map_err(|e| {
+            EgoPulseError::Internal(format!("invalid --to datetime '{input}': {e}"))
+        })?;
+        Ok(dt.naive_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    }
+}
+
+/// Returns `true` if the input looks like a date-only string (`YYYY-MM-DD`)
+/// without time or timezone components.
+fn is_date_only(input: &str) -> bool {
+    input.len() == 10
+        && input.chars().nth(4) == Some('-')
+        && input.chars().nth(7) == Some('-')
+        && !input.contains('T')
 }
 
 #[cfg(test)]
@@ -209,5 +317,53 @@ mod tests {
     fn status_command_removed_from_clap() {
         let result = Cli::try_parse_from(["egopulse", "status"]);
         assert!(result.is_err(), "`egopulse status` should no longer parse");
+    }
+
+    #[test]
+    fn normalize_from_date_only() {
+        assert_eq!(
+            normalize_date_input_from("2025-01-15", chrono_tz::Tz::UTC).unwrap(),
+            "2025-01-15T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_from_rfc3339_passthrough() {
+        assert_eq!(
+            normalize_date_input_from("2025-01-15T10:00:00Z", chrono_tz::Tz::UTC).unwrap(),
+            "2025-01-15T10:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_date_only() {
+        assert_eq!(
+            normalize_date_input_to("2025-01-15", chrono_tz::Tz::UTC).unwrap(),
+            "2025-01-16T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_month_boundary() {
+        assert_eq!(
+            normalize_date_input_to("2025-01-31", chrono_tz::Tz::UTC).unwrap(),
+            "2025-02-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_year_boundary() {
+        assert_eq!(
+            normalize_date_input_to("2025-12-31", chrono_tz::Tz::UTC).unwrap(),
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_to_rfc3339_passthrough() {
+        assert_eq!(
+            normalize_date_input_to("2025-06-01T23:59:59Z", chrono_tz::Tz::UTC).unwrap(),
+            "2025-06-01T23:59:59Z"
+        );
     }
 }

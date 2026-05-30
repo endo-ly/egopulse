@@ -416,7 +416,7 @@ CREATE INDEX idx_sleep_runs_agent_status
 | id | TEXT | PK | UUID v4 |
 | agent_id | TEXT | NOT NULL | エージェント識別子 |
 | status | TEXT | NOT NULL | 実行状態（running/success/failed/skipped） |
-| trigger_type | TEXT | NOT NULL | 起動トリガー（manual/scheduled） |
+| trigger_type | TEXT | NOT NULL | 起動トリガー（manual/scheduled/backfill） |
 | started_at | TEXT | NOT NULL | 開始時刻（RFC3339） |
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
 | source_chats_json | TEXT | NOT NULL DEFAULT '[]' | 対象チャットID一覧（JSON配列） |
