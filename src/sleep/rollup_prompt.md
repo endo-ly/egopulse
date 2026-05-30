@@ -75,7 +75,7 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
     {
       "granularity": "week",
       "period_key": "2026-W21",
-      "summary_md": "- 決定事項\n- 新たな制約\n- 未解決の論点",
+      "summary_md": "- [decision] 決定事項\n- [relationship] 関係性の変化\n- [insight] 新たな知見\n- [feat] 達成内容",
       "max_ripple": 5,
       "event_count": 12
     }
@@ -87,9 +87,48 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
 
 ## 要約方針
 
-summary_md は Markdown bullet のみ。週 1〜3 bullet、月 1〜3 bullet。
+summary_md は Markdown bullet のみ。各 bullet の先頭に `[kind]` タグを付ける。
 
-previous_summary_md がある場合の更新ルール:
+### 週要約
+
+イベントを個別に書き出すのではなく、共通の主題・因果関係を抽出して集約し、凝縮された bullet として構成する。
+kind が出現しなかった場合は書かない。
+全体として4 ~ 8 bullet 程度とする。
+
+#### 独立 bullet（必ず1 bullet 確保）
+
+以下の kind は、その週に1件でも出現していれば、必ず独立した bullet を1つ以上書く。
+他の kind と統合してはいけない。
+
+- `decision` — 意思決定・方針転換
+- `relationship` — 人間関係・信頼関係
+- `self` — 自己認識・自己評価
+
+#### 統合可能 bullet
+
+以下の kind は同種イベントを集約して 1〜3 bullet にする。複数 kind を同一 bullet に統合してもよい。
+
+- `insight` — 洞察・学習
+- `feat` — 達成・技術的進歩
+- `anomaly` — 異常事態・予期しない出来事
+- `world` — 世界の状態・環境
+- `rhythm` — 習慣・パターン
+
+
+#### 優先度
+
+decision > relationship > self > insight > feat > anomaly > world > rhythm
+
+高い優先度の kind から先に bullet を書く。
+
+### 月要約
+
+1〜3 bullet。週要約ほどの細分は不要だが、主要な決定・関係性の変化は反映する。
+`[kind]` タグは付けなくてよい。
+
+### 更新ルール
+
+previous_summary_md がある場合:
 - 前回 bullet のうち依然有効なものはそのまま残す（書き換えない）
 - 新イベントから重要な事実を新しい bullet として末尾に追加
 - 重要度が明らかに下がった bullet は削除

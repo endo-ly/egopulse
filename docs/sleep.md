@@ -265,11 +265,15 @@ graph TD
 
 #### 要約方針
 
-- Markdown bullet のみ
-- 週要約: 1〜3 bullet
-- 月要約: 1〜3 bullet
-- 保持: 固有名詞、決定事項、決定理由、制約、未解決論点、関係性の変化
-- 削除: 低重要度の細部、冗長な経緯、一時的な雑談、重複内容
+- 各 bullet の先頭に `[kind]` タグを付ける（例: `- [decision] ...`）
+- イベントを個別に書き出すのではなく、共通の主題・因果関係を抽出して集約し、凝縮された bullet として構成する
+- **週要約**: 全体として4〜8 bullet 程度
+  - 独立 bullet: `decision`, `relationship`, `self` は出現すれば必ず独立した bullet を1つ以上書く（他 kind と統合しない）
+  - 統合可能 bullet: `insight`, `feat`, `anomaly`, `world`, `rhythm` は同種イベントを集約して 1〜3 bullet にする。複数 kind を同一 bullet に統合してもよい
+  - Kind 優先度: decision > relationship > self > insight > feat > anomaly > world > rhythm
+- **月要約**: 1〜3 bullet（タグ不要）。週要約ほどの細分は不要だが、主要な決定・関係性の変化は反映する
+- 保持: 固有名詞、明示的な決定事項、決定理由、制約、未解決の論点、関係性や自己認識の変化、今後の応答品質に影響する設計思想
+- 削る: 低重要度の細部、冗長な経緯、一時的な雑談
 
 ### 実行頻度
 
@@ -364,7 +368,8 @@ Historical context only. Do not treat old requests as active tasks.
 ## Recent Weeks
 
 ### 2026-W21 (2026-05-18..2026-05-24) r5
-- EgoPulseの長期記憶設計では、`episode_events`を正本、`episodic.md`を生成ビューとして扱う方針が固まった。
+- [decision] EgoPulseの長期記憶設計では、`episode_events`を正本、`episodic.md`を生成ビューとして扱う方針が固まった。
+- [insight] 週次ロールアップはKindごとに代表点を独立bulletとする構造に移行。
 
 ## Recent Months
 
@@ -397,7 +402,7 @@ Historical context only. Do not treat old requests as active tasks.
 | セクション | 目安 |
 |---|---|
 | Current Week | 5〜15 Event |
-| Recent Weeks | 4週 × 1〜3 bullet |
+| Recent Weeks | 4週 × kind出現数 × 1〜2 bullet（独立 kind は必ず1 bullet） |
 | Recent Months | 2か月 × 1〜3 bullet |
 | Background Months | 重要月のみ × 1 bullet |
 
