@@ -932,6 +932,27 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Returns the latest successful non-backfill run for an agent.
+    pub(crate) fn get_latest_successful_non_backfill_run(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<SleepRun>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             WHERE agent_id = ?1 AND status = 'success' AND trigger_type != 'backfill'
+             ORDER BY finished_at DESC
+             LIMIT 1",
+            params![agent_id],
+            row_to_sleep_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub(crate) fn count_agent_messages_since(
         &self,
         agent_id: &str,
@@ -1590,6 +1611,18 @@ impl Database {
     ) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
         let tx = conn.unchecked_transaction()?;
+
+        let is_backfill: bool = tx.query_row(
+            "SELECT trigger_type = 'backfill' FROM sleep_runs WHERE id = ?1 AND agent_id = ?2",
+            params![sleep_run_id, agent_id],
+            |row| row.get(0),
+        )?;
+        if !is_backfill {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep run '{sleep_run_id}' is not a backfill run"
+            )));
+        }
 
         tx.execute(
             "DELETE FROM episode_events

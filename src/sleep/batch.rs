@@ -161,6 +161,25 @@ pub async fn run_sleep_batch(
     }
 }
 
+/// Extracts episode events from past conversation history for backfilling.
+///
+/// Unlike normal sleep batch (which runs Call 1/2/3), this only runs Call 1
+/// (Event Extraction) using the messages table. Old backfill events in the
+/// same period are replaced in a single transaction with new results.
+///
+/// # Parameters
+/// - `state`: Application state with DB and config.
+/// - `agent_id`: Target agent; defaults to config's `default_agent`.
+/// - `from` / `to`: UTC RFC3339 timestamp range `[from, to)` for messages.
+///   `None` means no boundary.
+///
+/// # Errors
+/// Returns [`SleepBatchError`] on database, I/O, or LLM failures.
+/// Returns [`SleepBatchError::AlreadyRunning`] if a backfill is already in
+/// progress for the same agent.
+///
+/// # Panics
+/// None.
 pub async fn run_events_extract(
     state: &AppState,
     agent_id: Option<&str>,
@@ -357,7 +376,7 @@ async fn execute_batch(
         let cutoff = {
             let agent_for_cutoff = agent_id.to_string();
             call_blocking(Arc::clone(&db), move |db| {
-                let latest_run = db.get_latest_successful_run(&agent_for_cutoff)?;
+                let latest_run = db.get_latest_successful_non_backfill_run(&agent_for_cutoff)?;
                 Ok(latest_run.and_then(|r| r.finished_at))
             })
             .await?

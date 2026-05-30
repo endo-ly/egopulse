@@ -261,7 +261,7 @@ pub(crate) fn messages_to_extract_text(messages: &[StoredMessage]) -> String {
             } else {
                 msg.content.clone()
             };
-            let content = strip_thinking(&content);
+            let content = strip_thinking(&content).replace('\n', "\\n");
             format!("{} [{}]: {}", msg.timestamp, role, content)
         })
         .collect::<Vec<_>>()
