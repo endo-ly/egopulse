@@ -15,14 +15,9 @@ mod search;
 mod send_message;
 mod shell;
 mod text;
-#[allow(dead_code)]
 mod web_fetch;
 
-#[allow(unused_imports)] // re-export for future use from other modules
-pub(crate) use command_guard::*;
 pub(crate) use files::*;
-#[allow(unused_imports)] // re-export for future use from other modules
-pub(crate) use path_guard::*;
 pub(crate) use sanitizer::*;
 pub(crate) use search::*;
 pub(crate) use send_message::*;

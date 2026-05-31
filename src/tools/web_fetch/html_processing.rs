@@ -59,6 +59,7 @@ pub(crate) fn process_response_body_with_metadata(
 }
 
 /// Processes an HTTP response body according to its content type.
+#[cfg(test)]
 pub(crate) fn process_response_body(body: &str, content_type: Option<&str>) -> String {
     process_response_body_with_metadata(body, content_type, "").text
 }

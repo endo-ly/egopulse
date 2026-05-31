@@ -31,7 +31,6 @@ pub(crate) struct RuntimeStatus {
 
 /// Immutable point-in-time copy suitable for serialization.
 ///
-#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct StatusSnapshot {
     pub version: String,
@@ -46,7 +45,6 @@ pub(crate) struct StatusSnapshot {
 /// Operational state of a single channel (web / discord / telegram / …).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
 pub(crate) enum ChannelState {
     Starting,
     Running,
@@ -99,7 +97,6 @@ pub(crate) struct TurnRecord {
 // Internal mutable state
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 struct RuntimeStatusInner {
     started_at: chrono::DateTime<Utc>,
     pid: u32,
@@ -116,7 +113,6 @@ struct RuntimeStatusInner {
 // Implementation
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 impl RuntimeStatus {
     /// Creates a new `RuntimeStatus` initialized with the current timestamp,
     /// process ID, and crate version.
@@ -159,6 +155,7 @@ impl RuntimeStatus {
 
     /// Marks the named channel as [`ChannelState::Failed`] and records the
     /// error message.
+    #[cfg(test)]
     pub(crate) fn update_channel_error(&self, name: &str, error_msg: &str) {
         let mut guard = self.inner.write().expect("runtime_status lock");
         guard
@@ -196,6 +193,7 @@ impl RuntimeStatus {
     }
 
     /// Toggles the database health flag.
+    #[cfg(test)]
     pub(crate) fn set_db_healthy(&self, healthy: bool) {
         let mut guard = self.inner.write().expect("runtime_status lock");
         guard.db_healthy = healthy;
@@ -284,6 +282,7 @@ impl RuntimeStatus {
 
     /// Returns the health record for the named channel, or `None` if the
     /// channel has never been registered.
+    #[cfg(test)]
     pub(crate) fn channel_health(&self, name: &str) -> Option<ChannelHealth> {
         let guard = self.inner.read().expect("runtime_status lock");
         guard.channels.get(name).cloned()

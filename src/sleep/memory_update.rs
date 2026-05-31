@@ -6,7 +6,9 @@ use tracing::warn;
 
 use crate::agent_loop::formatting::message_to_text;
 use crate::llm::{LlmProvider, Message};
-use crate::memory::{MemoryContent, MemoryLoader};
+use crate::memory::MemoryContent;
+#[cfg(test)]
+use crate::memory::MemoryLoader;
 use crate::storage::{AgentSessionInfo, Database};
 
 use super::batch::SleepBatchError;
@@ -78,17 +80,15 @@ pub(crate) struct SleepPromptInput {
     pub agent_id: String,
     pub memory: MemoryContent,
     pub sessions_text: String,
-    #[allow(dead_code)]
-    pub source_chats_json: String,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_sleep_input(
     db: &Database,
     memory_loader: &MemoryLoader,
     agent_id: &str,
     sessions: &[AgentSessionInfo],
-    source_chats_json: &str,
+    _source_chats_json: &str,
     context_window_tokens: usize,
 ) -> Result<SleepPromptInput, SleepBatchError> {
     let trimmed = agent_id.trim();
@@ -114,7 +114,6 @@ pub(crate) fn build_sleep_input(
         agent_id,
         memory,
         sessions_text,
-        source_chats_json.to_string(),
         context_window_tokens,
         estimated_session_tokens,
     )
@@ -124,7 +123,6 @@ pub(crate) fn build_sleep_input_from_parts(
     agent_id: &str,
     memory: MemoryContent,
     sessions_text: String,
-    source_chats_json: String,
     context_window_tokens: usize,
     minimum_session_tokens: usize,
 ) -> Result<SleepPromptInput, SleepBatchError> {
@@ -153,11 +151,10 @@ pub(crate) fn build_sleep_input_from_parts(
         agent_id: agent_id.to_string(),
         memory,
         sessions_text,
-        source_chats_json,
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_sessions_text(
     db: &Database,
     sessions: &[AgentSessionInfo],
@@ -619,17 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn build_sleep_input_preserves_source_chats_json() {
-        let (db, dir) = test_db();
-        let loader = make_memory_loader(dir.path());
-        let sessions = vec![];
-        let source_json = r#"[{"chat_id":1}]"#;
-        let result = build_sleep_input(&db, &loader, "test-agent", &sessions, source_json, 200_000);
-        let input = result.expect("should succeed");
-        assert_eq!(input.source_chats_json, source_json);
-    }
-
-    #[test]
     fn build_sleep_input_handles_missing_memory() {
         let (db, dir) = test_db();
         let loader = make_memory_loader(dir.path());
@@ -773,7 +759,6 @@ mod tests {
             agent_id: "lyre".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("あなたは lyre の海馬です。"));
@@ -786,7 +771,6 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("## 睡眠の仕組み"));
@@ -799,7 +783,6 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("大脳皮質へ転送する"));
@@ -812,7 +795,6 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("記憶を圧縮する"));
@@ -825,7 +807,7 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("秘密情報"));
@@ -840,7 +822,7 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("参照データ"));
@@ -857,7 +839,7 @@ mod tests {
                 prospective: Some("pro data".to_string()),
             },
             sessions_text: "session data".to_string(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("<memory-episodic>"));
@@ -880,7 +862,7 @@ mod tests {
                 prospective: None,
             },
             sessions_text: "<script>alert(1)</script>".to_string(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(!prompt.contains("<script>"), "raw XML should be escaped");
@@ -894,7 +876,7 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("JSON"));
@@ -906,7 +888,7 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(prompt.contains("`semantic`"));
@@ -919,7 +901,7 @@ mod tests {
             agent_id: "test".to_string(),
             memory: MemoryContent::default(),
             sessions_text: String::new(),
-            source_chats_json: "[]".to_string(),
+
         };
         let prompt = build_sleep_system_prompt(&input);
         assert!(

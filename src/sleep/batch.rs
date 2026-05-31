@@ -836,7 +836,6 @@ Output the raw JSON object and nothing else.";
                 agent_id,
                 current_memory.clone(),
                 sessions_text,
-                source_chats_json.to_string(),
                 context_tokens,
                 0,
             )?;

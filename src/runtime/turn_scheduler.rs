@@ -60,7 +60,7 @@ pub(crate) enum StopReason {
     TurnCountExceeded,
     AgentNotFound,
     LlmFailure,
-    #[allow(dead_code)]
+    #[cfg(test)]
     SessionUnprocessable,
 }
 
@@ -96,7 +96,7 @@ impl TurnTracker {
         reasons.get(origin_id).cloned()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn remove_origin(&self, origin_id: &str) {
         {
             let mut counts = self.counts.lock().expect("turn_tracker lock");
