@@ -22,10 +22,7 @@ const BINARY_NAME: &str = "egopulse";
 /// Minimum time (seconds) the service must remain `active` before declaring startup success.
 const SERVICE_START_MIN_OBSERVE_SECS: u64 = 2;
 /// Maximum time (seconds) to wait for the service to become active after start/restart.
-///
-/// Must exceed `RestartSec` in the systemd unit (currently 10 s) to allow at least one
-/// automatic restart cycle before declaring failure.
-const SERVICE_START_TIMEOUT_SECS: u64 = 25;
+const SERVICE_START_TIMEOUT_SECS: u64 = 10;
 /// Interval (milliseconds) between `is-active` polls during startup verification.
 const SERVICE_START_POLL_INTERVAL_MS: u64 = 500;
 /// Number of journal log lines to show on startup failure.
@@ -266,7 +263,7 @@ ExecStart={exe_path} --config \"{escaped_config}\" run
 {env_lines}\
 Restart=always
 RestartSec=10
-KillMode=mixed
+KillMode=process
 
 [Install]
 WantedBy=default.target
@@ -315,9 +312,8 @@ fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoP
 ///
 /// # Errors
 ///
-/// Returns an error with recent journal logs if the service does not become
-/// active within the timeout. Transient `failed` states (caused by systemd
-/// `Restart=` retrying) are tolerated until the deadline.
+/// Returns an error with recent journal logs if the service enters `failed`
+/// state or does not become active within the timeout.
 fn verify_service_started(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
     let start = std::time::Instant::now();
     let min_observe = std::time::Duration::from_secs(SERVICE_START_MIN_OBSERVE_SECS);
@@ -332,6 +328,7 @@ fn verify_service_started(runtime_dir: Option<&str>) -> Result<(), EgoPulseError
 
         match state.as_str() {
             "active" if start.elapsed() >= min_observe => return Ok(()),
+            "failed" => return Err(format_start_failure(runtime_dir)),
             _ if start.elapsed() >= timeout => {
                 return Err(format_start_failure(runtime_dir));
             }
@@ -1340,7 +1337,7 @@ mod tests {
         ));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=10"));
-        assert!(unit.contains("KillMode=mixed"));
+        assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("Environment=HOME=/home/user"));
         assert!(unit.contains("Environment=PATH="));
