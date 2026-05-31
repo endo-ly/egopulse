@@ -1779,7 +1779,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-        username: my_bot
+    
     telegram_channels:
       "123": {}"#,
     );
@@ -1814,7 +1814,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-        username: my_bot
+    
     telegram_channels:
       "456":
         require_mention: true"#,
@@ -1879,7 +1879,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-        username: my_bot
+    
     telegram_channels:
       "not_a_number": {}"#,
     );
@@ -3001,7 +3001,6 @@ fn channel_config_accepts_telegram_bots() {
         super::TelegramBotConfig {
             token: None,
             file_token: None,
-            username: Some("my_bot".to_string()),
         },
     );
 
@@ -3080,12 +3079,12 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-        username: my_bot
+    
       secondary:
         token:
           source: env
           id: TG_BOT_2_TOKEN
-        username: my_other_bot
+    
 "#;
     let env_path = temp_dir.path().join(".env");
     std::fs::write(&env_path, "TG_BOT_2_TOKEN=999:ZZZ\n").expect("write dotenv");
@@ -3131,7 +3130,7 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-        username: my_bot
+    
     telegram_channels:
       "-100123456":
         require_mention: true
@@ -3173,7 +3172,7 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-        username: my_bot
+    
     telegram_channels:
       "-100999":
         require_mention: false
@@ -3212,7 +3211,7 @@ channels:
         token:
           source: env
           id: TG_TOKEN_SECRET
-        username: my_bot
+    
 "#;
     std::fs::write(&yaml_path, yaml).expect("write yaml");
 
@@ -3249,7 +3248,7 @@ channels:
         token:
           source: env
           id: TG_BOT_TOKEN
-        username: my_bot
+    
     telegram_channels:
       "-100111":
         require_mention: true
@@ -3295,7 +3294,6 @@ fn telegram_bots_returns_only_bots_with_token() {
                 "TG_TOKEN", "123:abc",
             )),
             file_token: None,
-            username: Some("bot1".to_string()),
         },
     );
     bots.insert(
@@ -3303,7 +3301,6 @@ fn telegram_bots_returns_only_bots_with_token() {
         super::TelegramBotConfig {
             token: None,
             file_token: None,
-            username: Some("bot2".to_string()),
         },
     );
 
@@ -3333,7 +3330,6 @@ fn telegram_bots_disabled_channel_returns_empty() {
                 "TG_TOKEN", "tok",
             )),
             file_token: None,
-            username: Some("bot1".to_string()),
         },
     );
 

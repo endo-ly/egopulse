@@ -406,29 +406,17 @@ pub(crate) struct TelegramAdapter {
     bot_tokens: std::collections::HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
     agent_bot_map: std::collections::HashMap<String, String>,
-    /// フォールバック用トークン（単一Bot 構成やマッピングなし時）。
-    default_token: String,
     http_client: reqwest::Client,
 }
 
 impl TelegramAdapter {
-    /// Creates a multi-bot Telegram adapter with token routing.
-    ///
-    /// `default_bot_id` determines which token is used when agent resolution
-    /// fails (e.g. DM with default_agent that has no explicit telegram_bot binding).
-    /// Panics if `default_bot_id` is not present in `bot_tokens`.
     pub(crate) fn new_multi(
         bot_tokens: std::collections::HashMap<String, String>,
         agent_bot_map: std::collections::HashMap<String, String>,
-        default_bot_id: &str,
     ) -> Self {
-        let default_token = bot_tokens.get(default_bot_id).cloned().unwrap_or_else(|| {
-            panic!("TelegramAdapter: default_bot_id '{default_bot_id}' not found in bot_tokens")
-        });
         Self {
             bot_tokens,
             agent_bot_map,
-            default_token,
             http_client: reqwest::Client::new(),
         }
     }
@@ -436,8 +424,7 @@ impl TelegramAdapter {
     /// Resolve the bot token for a given external_chat_id.
     ///
     /// Extracts agent_id from the `:agent:` segment, maps agent → bot_id → token.
-    /// Falls back to `default_token` if no mapping is found.
-    fn select_token(&self, external_chat_id: &str) -> &str {
+    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
         let agent_id = external_chat_id
             .find(":agent:")
             .map(|pos| &external_chat_id[pos + ":agent:".len()..])
@@ -445,11 +432,13 @@ impl TelegramAdapter {
         if !agent_id.is_empty() {
             if let Some(bot_id) = self.agent_bot_map.get(agent_id) {
                 if let Some(token) = self.bot_tokens.get(bot_id) {
-                    return token;
+                    return Ok(token);
                 }
             }
         }
-        &self.default_token
+        Err(format!(
+            "no Telegram bot binding found for external_chat_id '{external_chat_id}'"
+        ))
     }
 }
 
@@ -474,7 +463,7 @@ impl ChannelAdapter for TelegramAdapter {
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
-        let token = self.select_token(external_chat_id);
+        let token = self.select_token(external_chat_id)?;
 
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
             send_telegram_api(
@@ -500,7 +489,7 @@ impl ChannelAdapter for TelegramAdapter {
         caption: Option<&str>,
     ) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
-        let token = self.select_token(external_chat_id);
+        let token = self.select_token(external_chat_id)?;
 
         let filename = file_path
             .file_name()
@@ -978,7 +967,6 @@ pub(crate) async fn start_telegram_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
-    bot_username: &str,
     default_agent: &crate::config::AgentId,
     channels: &HashMap<i64, TelegramChatConfig>,
     chain_state: Arc<BotChainState>,
@@ -989,22 +977,13 @@ pub(crate) async fn start_telegram_bot_for_bot(
         error!("Telegram: failed to delete webhook: {e}");
     })?;
 
-    {
-        use teloxide::types::BotCommand;
-
-        let commands: Vec<BotCommand> = slash_commands::all_commands()
-            .iter()
-            .map(|c| BotCommand::new(c.name, c.description))
-            .collect();
-        if let Err(e) = bot.set_my_commands(commands).await {
-            warn!("Telegram: failed to set bot commands: {e}");
-        }
-    }
+    let me = bot.get_me().await?;
+    let bot_username = me.username.clone().unwrap_or_default();
 
     let telegram_handler = Arc::new(TelegramHandler {
         app_state: state,
         bot_id: bot_id.to_string(),
-        bot_username: bot_username.to_string(),
+        bot_username: bot_username.clone(),
         default_agent: default_agent.to_string(),
         channels: channels.clone(),
         chain_state,
@@ -1199,7 +1178,6 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
-            "main",
         );
         assert_eq!(adapter.name(), "telegram");
     }
@@ -1209,7 +1187,6 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
-            "main",
         );
         let routes = adapter.chat_type_routes();
         assert!(routes.len() >= 6);
@@ -1247,29 +1224,24 @@ mod tests {
                 ("alice".to_string(), "main".to_string()),
                 ("bob".to_string(), "other".to_string()),
             ]),
-            "main",
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:alice"),
-            "token-main"
+            Ok("token-main")
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:bob"),
-            "token-other"
+            Ok("token-other")
         );
     }
 
     #[test]
-    fn select_token_falls_back_to_default() {
+    fn select_token_returns_error_for_unknown_agent() {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
             std::collections::HashMap::new(),
-            "main",
         );
-        assert_eq!(
-            adapter.select_token("telegram:-100:agent:unknown"),
-            "token-main"
-        );
+        assert!(adapter.select_token("telegram:-100:agent:unknown").is_err());
     }
 
     /// Telegram BotCommand リストが all_commands() レジストリと整合することを確認。

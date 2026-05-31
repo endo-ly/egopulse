@@ -134,7 +134,6 @@ Telegram は Discord と同一の Multi-Agent 仕様をサポートする。
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `token` | `string \| SecretRef` | 必須 | なし | Telegram Bot トークン。SecretRef 使用可能。環境変数 `TELEGRAM_BOT_TOKEN` でも指定可能。秘匿フィールド |
-| `username` | `string` | 推奨 | なし | Bot のユーザー名。グループ内で `@botname` メンション検知に使用 |
 
 #### `TelegramChatConfig` のフィールド
 
@@ -293,7 +292,6 @@ channels:
         token:
           source: env
           id: TELEGRAM_BOT_TOKEN
-        username: my_egopulse_bot
     telegram_channels:
       "-1001234567890":
       "-1009876543210":

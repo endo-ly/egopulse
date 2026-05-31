@@ -193,9 +193,7 @@ pub async fn build_app_state_with_path(
             })
             .collect();
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(
-                bot_tokens, agent_bots, "default",
-            ),
+            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
         ));
     }
 
@@ -674,14 +672,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             .config
             .telegram_bots()
             .into_iter()
-            .map(|b| {
-                (
-                    b.bot_id.clone(),
-                    b.token.to_string(),
-                    b.username.to_string(),
-                    default_agent.clone(),
-                )
-            })
+            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
             .collect();
 
         if !bot_configs.is_empty() {
@@ -689,12 +680,10 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let rs = Arc::clone(&state.runtime_status);
             rs.update_channel("telegram", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
-            for (bot_id, token, bot_username, default_agent) in bot_configs {
+            for (bot_id, token, default_agent) in bot_configs {
                 let telegram_state = Arc::new(state.clone());
                 let handle_name = format!("telegram[{bot_id}]");
-                info!(
-                    "Starting Telegram bot '{bot_id}' (agent {default_agent}) as @{bot_username}..."
-                );
+                info!("Starting Telegram bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
                 let channels = shared_channels.clone();
@@ -703,7 +692,6 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
                         telegram_state,
                         &token,
                         &bid,
-                        &bot_username,
                         &default_agent,
                         &channels,
                         chain_state,
