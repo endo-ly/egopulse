@@ -5,19 +5,17 @@
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
-use crate::agent_loop::formatting::{
-    message_to_text, preview_text, sanitize_assistant_response_text, strip_thinking,
-    summarize_tool_calls_with_content,
-};
+use crate::agent_loop::formatting::{preview_text, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
     persist_phase_once, resolve_chat_id,
 };
-use crate::agent_loop::tool_loop::{
-    ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks, filter_valid_tool_calls,
-    log_llm_usage,
+use crate::agent_loop::tool_phase::{
+    AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks,
+    ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
+    send_tool_phase_request,
 };
 use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
@@ -82,12 +80,6 @@ enum TurnAction {
         final_content: String,
         reasoning_content: Option<String>,
     },
-}
-
-struct ToolAssistantDraft {
-    content: String,
-    reasoning_content: Option<String>,
-    valid_tool_calls: Vec<ToolCall>,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -285,101 +277,90 @@ async fn process_turn_inner(
                 }
             }
 
-            let response = channel_llm
-                .send_message(
-                    &system_prompt,
-                    request_messages,
-                    Some(Arc::clone(&tool_defs)),
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(error = %e, iteration, "LLM send_message failed");
-                })?;
-
-            if let Some(usage) = &response.usage {
-                log_llm_usage(
-                    state,
-                    chat_id,
-                    &context.channel,
-                    channel_llm.as_ref(),
-                    usage,
-                    "agent_loop",
-                    "llm usage logging failed",
-                );
-            }
-
-            if response.tool_calls.is_empty() {
-                match evaluate_end_turn(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut empty_reply_retry_attempted,
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )? {
-                    TurnAction::Retry(msgs) => retry_messages = msgs,
-                    TurnAction::Done {
-                        final_content,
-                        reasoning_content,
-                    } => {
-                        return persist_and_finalize(
-                            state,
-                            chat_id,
-                            &context.agent_id,
-                            &mut messages,
-                            session_updated_at.clone(),
-                            &on_event,
-                            (final_content, reasoning_content),
-                        )
-                        .await;
-                    }
-                }
-                continue;
-            }
-
-            let valid_tool_calls = filter_valid_tool_calls(response.tool_calls, "agent_loop");
-
-            if valid_tool_calls.is_empty() {
-                match evaluate_malformed_response(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut declarative_retry_attempted,
-                    &messages,
-                )? {
-                    TurnAction::Retry(msgs) => retry_messages = msgs,
-                    TurnAction::Done {
-                        final_content,
-                        reasoning_content,
-                    } => {
-                        return persist_and_finalize(
-                            state,
-                            chat_id,
-                            &context.agent_id,
-                            &mut messages,
-                            session_updated_at.clone(),
-                            &on_event,
-                            (final_content, reasoning_content),
-                        )
-                        .await;
-                    }
-                }
-                continue;
-            }
-
-            let (updated_messages, updated_at) = execute_and_persist_tools(
+            let phase_response = send_tool_phase_request(ToolPhaseRequest {
                 state,
-                &on_event,
-                &tool_context,
-                messages,
-                session_updated_at,
-                ToolAssistantDraft {
-                    content: response.content,
-                    reasoning_content: response.reasoning_content,
-                    valid_tool_calls,
-                },
-            )
+                llm: channel_llm.as_ref(),
+                system_prompt: &system_prompt,
+                messages: request_messages,
+                tools: Some(Arc::clone(&tool_defs)),
+                chat_id,
+                caller_channel: &context.channel,
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration,
+            })
             .await?;
-            messages = updated_messages;
-            session_updated_at = updated_at;
+
+            match phase_response {
+                ToolPhaseResponse::Final(response) => {
+                    match evaluate_end_turn(
+                        &response.content,
+                        response.reasoning_content.as_deref(),
+                        &mut empty_reply_retry_attempted,
+                        &mut declarative_retry_attempted,
+                        &messages,
+                    )? {
+                        TurnAction::Retry(msgs) => retry_messages = msgs,
+                        TurnAction::Done {
+                            final_content,
+                            reasoning_content,
+                        } => {
+                            return persist_and_finalize(
+                                state,
+                                chat_id,
+                                &context.agent_id,
+                                &mut messages,
+                                session_updated_at.clone(),
+                                &on_event,
+                                (final_content, reasoning_content),
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
+                }
+                ToolPhaseResponse::MalformedToolCalls(response) => {
+                    match evaluate_malformed_response(
+                        &response.content,
+                        response.reasoning_content.as_deref(),
+                        &mut declarative_retry_attempted,
+                        &messages,
+                    )? {
+                        TurnAction::Retry(msgs) => retry_messages = msgs,
+                        TurnAction::Done {
+                            final_content,
+                            reasoning_content,
+                        } => {
+                            return persist_and_finalize(
+                                state,
+                                chat_id,
+                                &context.agent_id,
+                                &mut messages,
+                                session_updated_at.clone(),
+                                &on_event,
+                                (final_content, reasoning_content),
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
+                }
+                ToolPhaseResponse::ToolCalls(assistant_phase) => {
+                    let (updated_messages, updated_at) = execute_and_persist_tools(
+                        state,
+                        &on_event,
+                        &tool_context,
+                        messages,
+                        session_updated_at,
+                        assistant_phase,
+                    )
+                    .await?;
+                    messages = updated_messages;
+                    session_updated_at = updated_at;
+                }
+            }
             empty_reply_retry_attempted = false;
             declarative_retry_attempted = false;
 
@@ -522,7 +503,7 @@ async fn execute_and_persist_tools(
     tool_context: &ToolExecutionContext,
     messages: Arc<Vec<Message>>,
     session_updated_at: Option<String>,
-    assistant_draft: ToolAssistantDraft,
+    assistant_phase: AssistantToolPhase,
 ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
     let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
@@ -531,7 +512,7 @@ async fn execute_and_persist_tools(
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
-        &assistant_draft,
+        &assistant_phase,
         messages_vec,
         session_updated_at,
     )
@@ -539,23 +520,21 @@ async fn execute_and_persist_tools(
     let mut messages = persisted.messages;
     let session_updated_at = Some(persisted.updated_at);
 
-    let tool_messages = execute_tool_calls(
+    let tool_outcomes = execute_tool_calls(
         state,
         on_event,
         tool_context,
         &assistant_message_id,
-        assistant_draft.valid_tool_calls,
+        assistant_phase.tool_calls,
     )
-    .await?
-    .into_iter()
-    .map(|outcome| outcome.message)
-    .collect();
+    .await?;
+    let tool_result_phase = build_tool_result_phase(tool_outcomes);
     let persisted = persist_tool_result_messages(
         state,
         tool_context.chat_id,
         &tool_context.agent_id,
         messages,
-        tool_messages,
+        tool_result_phase,
         session_updated_at,
     )
     .await?;
@@ -570,28 +549,22 @@ async fn persist_tool_call_assistant_message(
     chat_id: i64,
     agent_id: &str,
     assistant_message_id: &str,
-    assistant_draft: &ToolAssistantDraft,
+    assistant_phase: &AssistantToolPhase,
     mut messages: Vec<Message>,
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    let assistant_text = sanitize_assistant_response_text(&assistant_draft.content);
-    let assistant_preview =
-        summarize_tool_calls_with_content(&assistant_text, &assistant_draft.valid_tool_calls);
-    let assistant_message = Message {
-        role: "assistant".to_string(),
-        content: crate::llm::MessageContent::text(assistant_text),
-        reasoning_content: assistant_draft.reasoning_content.clone(),
-        tool_calls: assistant_draft.valid_tool_calls.clone(),
-        tool_call_id: None,
-    };
-
+    let assistant_message = assistant_phase.assistant_message.clone();
     messages.push(assistant_message.clone());
 
     persist_phase(
         state,
         StoredMessage {
             id: assistant_message_id.to_string(),
-            ..StoredMessage::assistant(chat_id, agent_id.to_string(), assistant_preview)
+            ..StoredMessage::assistant(
+                chat_id,
+                agent_id.to_string(),
+                assistant_phase.assistant_preview.clone(),
+            )
         },
         assistant_message,
         &messages,
@@ -605,9 +578,13 @@ async fn persist_tool_result_messages(
     chat_id: i64,
     agent_id: &str,
     messages: Vec<Message>,
-    tool_messages: Vec<Message>,
+    tool_result_phase: ToolResultPhase,
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
+    let ToolResultPhase {
+        tool_messages,
+        tool_result_preview,
+    } = tool_result_phase;
     if tool_messages.is_empty() {
         return Ok(PersistedTurn {
             updated_at: session_updated_at.unwrap_or_default(),
@@ -617,24 +594,14 @@ async fn persist_tool_result_messages(
 
     let mut messages_with_tools = messages;
     messages_with_tools.extend(tool_messages.iter().cloned());
-    let preview = summarize_tool_result_messages(&tool_messages);
     persist_phase_messages(
         state,
-        StoredMessage::assistant(chat_id, agent_id.to_string(), preview),
+        StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview),
         tool_messages,
         &messages_with_tools,
         session_updated_at,
     )
     .await
-}
-
-fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
-    let joined = tool_messages
-        .iter()
-        .map(message_to_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    preview_text(&joined, 160)
 }
 
 async fn execute_tool_calls(
@@ -672,7 +639,7 @@ async fn execute_tool_calls(
         })),
     };
 
-    let outcomes = crate::agent_loop::tool_loop::execute_tool_calls(
+    let outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
         state,
         tool_context,
         valid_tool_calls,

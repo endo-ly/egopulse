@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::formatting::summarize_tool_calls_with_content;
 use crate::agent_loop::prompt_builder::build_system_prompt;
-use crate::agent_loop::tool_loop::{
-    MAX_TOOL_ITERATIONS, ToolExecutionHooks, filter_valid_tool_calls, log_llm_usage,
+use crate::agent_loop::tool_phase::{
+    MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
+    build_tool_result_phase, send_tool_phase_request,
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
@@ -107,53 +107,52 @@ pub(crate) async fn run_activation(
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        let response = channel_llm
-            .send_message(
-                &system_prompt,
-                Arc::clone(&messages),
-                Some(Arc::clone(&tool_defs)),
-            )
-            .await
-            .inspect_err(|e| {
-                warn!(error = %e, iteration, "pulse LLM send_message failed");
-            })?;
+        let phase_response = send_tool_phase_request(ToolPhaseRequest {
+            state,
+            llm: channel_llm.as_ref(),
+            system_prompt: &system_prompt,
+            messages: Arc::clone(&messages),
+            tools: Some(Arc::clone(&tool_defs)),
+            chat_id,
+            caller_channel: &context.channel,
+            request_kind: "pulse",
+            usage_log_failure: "pulse llm usage logging failed",
+            log_scope: "pulse",
+            send_failure_log: "pulse LLM send_message failed",
+            iteration,
+        })
+        .await?;
 
-        if let Some(usage) = &response.usage {
-            log_llm_usage(
-                state,
-                chat_id,
-                &context.channel,
-                channel_llm.as_ref(),
-                usage,
-                "pulse",
-                "pulse llm usage logging failed",
-            );
-        }
-
-        if response.tool_calls.is_empty() {
-            let output_text = response.content.trim().to_string();
-            let output_kind = classify_output(&output_text);
-            return Ok(ActivationResult {
-                output_text,
-                output_kind,
-                tool_phases,
-            });
-        }
-
-        let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone(), "pulse");
+        let assistant_phase = match phase_response {
+            ToolPhaseResponse::Final(response) => {
+                let output_text = response.content.trim().to_string();
+                let output_kind = classify_output(&output_text);
+                return Ok(ActivationResult {
+                    output_text,
+                    output_kind,
+                    tool_phases,
+                });
+            }
+            ToolPhaseResponse::MalformedToolCalls(response) => {
+                let output_text = response.content.trim().to_string();
+                let output_kind = classify_output(&output_text);
+                return Ok(ActivationResult {
+                    output_text,
+                    output_kind,
+                    tool_phases,
+                });
+            }
+            ToolPhaseResponse::ToolCalls(assistant_phase) => assistant_phase,
+        };
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
-        let tool_outcomes = crate::agent_loop::tool_loop::execute_tool_calls(
+        let tool_outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
             state,
             &tool_context,
-            valid_tool_calls.clone(),
+            assistant_phase.tool_calls.clone(),
             ToolExecutionHooks::none(),
         )
         .await?;
-        let tool_messages = tool_outcomes
-            .iter()
-            .map(|outcome| outcome.message.clone())
-            .collect::<Vec<_>>();
         let stored_tool_calls = tool_outcomes
             .iter()
             .map(|outcome| StoredToolCall {
@@ -166,29 +165,19 @@ pub(crate) async fn run_activation(
                 timestamp: outcome.timestamp.clone(),
             })
             .collect::<Vec<_>>();
-
-        let assistant_message = Message {
-            role: "assistant".to_string(),
-            content: crate::llm::MessageContent::text(response.content.clone()),
-            reasoning_content: response.reasoning_content.clone(),
-            tool_calls: valid_tool_calls.clone(),
-            tool_call_id: None,
-        };
-        let assistant_preview =
-            summarize_tool_calls_with_content(&response.content, &valid_tool_calls);
-        let tool_result_preview = summarize_tool_result_messages(&tool_messages);
+        let tool_result_phase = build_tool_result_phase(tool_outcomes);
 
         {
             let messages_mut = Arc::make_mut(&mut messages);
-            messages_mut.push(assistant_message.clone());
-            messages_mut.extend(tool_messages.clone());
+            messages_mut.push(assistant_phase.assistant_message.clone());
+            messages_mut.extend(tool_result_phase.tool_messages.clone());
         }
         tool_phases.push(ToolPhase {
             assistant_message_id,
-            assistant_message,
-            assistant_preview,
-            tool_messages,
-            tool_result_preview,
+            assistant_message: assistant_phase.assistant_message,
+            assistant_preview: assistant_phase.assistant_preview,
+            tool_messages: tool_result_phase.tool_messages,
+            tool_result_preview: tool_result_phase.tool_result_preview,
             stored_tool_calls,
         });
     }
@@ -205,15 +194,6 @@ fn classify_output(text: &str) -> PulseOutputKind {
     } else {
         PulseOutputKind::Notify
     }
-}
-
-fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
-    let joined = tool_messages
-        .iter()
-        .map(|message| message.content.as_text_lossy())
-        .collect::<Vec<_>>()
-        .join("\n");
-    crate::agent_loop::formatting::preview_text(&joined, 160)
 }
 
 #[cfg(test)]
