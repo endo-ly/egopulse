@@ -1,6 +1,7 @@
 //! メッセージのフォーマット、サニタイズ、表示用テキスト変換。
 
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
+use crate::storage::{SenderKind, StoredMessage};
 
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
@@ -300,6 +301,15 @@ pub(crate) fn strip_thinking(text: &str) -> String {
     no_reasoning.trim().to_string()
 }
 
+pub(crate) fn format_channel_log_message(msg: &StoredMessage) -> String {
+    match msg.sender_kind {
+        SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
+        SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
+        SenderKind::System => format!("[system] {}", msg.content),
+        SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +508,29 @@ mod tests {
             strip_thinking("<thought>a</thought><thinking>b</thinking>final"),
             "final"
         );
+    }
+
+    #[test]
+    fn format_channel_log_message_user() {
+        let msg = StoredMessage::user(1, "Alice".to_string(), "hello".to_string());
+        assert_eq!(format_channel_log_message(&msg), "[Alice] hello");
+    }
+
+    #[test]
+    fn format_channel_log_message_assistant() {
+        let msg = StoredMessage::assistant(1, "lyre".to_string(), "response".to_string());
+        assert_eq!(format_channel_log_message(&msg), "[lyre] response");
+    }
+
+    #[test]
+    fn format_channel_log_message_system() {
+        let msg = StoredMessage::system(1, "boot complete".to_string());
+        assert_eq!(format_channel_log_message(&msg), "[system] boot complete");
+    }
+
+    #[test]
+    fn format_channel_log_message_tool() {
+        let msg = StoredMessage::tool(1, "lyre".to_string(), "vega".to_string(), "sent".to_string());
+        assert_eq!(format_channel_log_message(&msg), "[tool/lyre] sent");
     }
 }
