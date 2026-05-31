@@ -144,6 +144,54 @@ channels:
 
 #[test]
 #[serial]
+fn rejects_unknown_top_level_config_fields() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"model: gpt-4o-mini
+base_url: https://api.openai.com/v1
+api_key: sk-old-shape"#,
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("unknown top-level fields");
+
+    assert!(
+        matches!(error, ConfigError::ConfigParseFailed { .. }),
+        "expected ConfigParseFailed, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn rejects_unknown_channel_config_fields() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  telegram:
+    enabled: true
+    bot_token: old-token"#,
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("unknown channel field");
+
+    assert!(
+        matches!(error, ConfigError::ConfigParseFailed { .. }),
+        "expected ConfigParseFailed, got {error:?}"
+    );
+}
+
+#[test]
+#[serial]
 fn rejects_unknown_agent_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -782,8 +830,7 @@ fn loads_discord_bots_with_default_agent() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "111222333": {}
       "444555666":
@@ -826,8 +873,7 @@ fn discord_bots_validate_channel_agents_exist() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "999":
             agents: [ghost_agent]"#,
@@ -864,8 +910,7 @@ fn validation_rejects_multi_agent_with_single_agent() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "100":
             agents: [assistant]
@@ -902,8 +947,7 @@ fn validation_rejects_single_mode_with_multiple_agents() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "200":
             agents: [assistant, reviewer]
@@ -940,8 +984,7 @@ fn validation_accepts_single_agent() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "300":
             agents: [assistant]"#,
@@ -977,8 +1020,7 @@ fn validation_accepts_multi_agent() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "400":
             agents: [assistant, reviewer]
@@ -1021,8 +1063,7 @@ fn validation_agents_reference_must_exist() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "500":
             agents: [unknown_agent]"#,
@@ -1058,8 +1099,7 @@ fn validation_empty_agents_after_normalization() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "600":
             agents: []
@@ -1095,8 +1135,7 @@ fn validation_rejects_multi_agent_with_empty_agents_after_defaulting() {
       main:
         token:
           source: env
-          id: MY_DISCORD_TOKEN
-        default_agent: assistant"#,
+          id: MY_DISCORD_TOKEN"#,
             Some(
                 r#"      "700":
             agents: []
@@ -1137,8 +1176,7 @@ fn parse_agent_config_with_discord_bot() {
               main:
                 token:
                   source: env
-                  id: MY_DISCORD_TOKEN
-                default_agent: assistant"#,
+                  id: MY_DISCORD_TOKEN"#,
             None,
         )
         .replace(
@@ -1168,8 +1206,7 @@ fn parse_agent_config_without_discord_bot() {
               main:
                 token:
                   source: env
-                  id: MY_DISCORD_TOKEN
-                default_agent: assistant"#,
+                  id: MY_DISCORD_TOKEN"#,
             None,
         ),
     );
@@ -1195,8 +1232,7 @@ fn validation_discord_bot_must_exist() {
               main:
                 token:
                   source: env
-                  id: MY_DISCORD_TOKEN
-                default_agent: assistant"#,
+                  id: MY_DISCORD_TOKEN"#,
             None,
         )
         .replace(
@@ -1230,8 +1266,7 @@ fn validation_discord_bot_null_is_ok() {
               main:
                 token:
                   source: env
-                  id: MY_DISCORD_TOKEN
-                default_agent: assistant"#,
+                  id: MY_DISCORD_TOKEN"#,
             None,
         )
         .replace(
@@ -1385,9 +1420,7 @@ fn discord_bots_returns_only_channel_bots_with_token() {
                 token:
                   source: env
                   id: MY_TOKEN
-                default_agent: assistant
-              no_token_bot:
-                default_agent: reviewer"#,
+              no_token_bot: {}"#,
             None,
         ),
     );
@@ -1414,12 +1447,10 @@ fn discord_bots_sort_by_bot_id() {
                 token:
                   source: env
                   id: T1
-                default_agent: assistant
               alpha:
                 token:
                   source: env
-                  id: T2
-                default_agent: assistant"#,
+                  id: T2"#,
             None,
         ),
     );
@@ -1458,8 +1489,7 @@ channels:
       main:
         token:
           source: env
-          id: MY_TOKEN
-        default_agent: assistant"#,
+          id: MY_TOKEN"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
@@ -1481,8 +1511,7 @@ fn discord_bot_channels_defaults_to_none() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             None,
         ),
     );
@@ -1507,8 +1536,7 @@ fn discord_bot_channel_agents_are_preserved() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             Some(
                 r#"      "42":
           agents: [reviewer]"#,
@@ -1618,8 +1646,7 @@ fn discord_channels_parses_null_value() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             Some(
                 r#"      "123":
 "#,
@@ -1649,8 +1676,7 @@ fn discord_channels_parses_require_mention() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             Some(
                 r#"      "123":
           require_mention: true"#,
@@ -1682,8 +1708,7 @@ fn discord_channels_parses_agent_override() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             Some(
                 r#"      "123":
           agents: [reviewer]"#,
@@ -1715,8 +1740,7 @@ fn discord_channels_empty_means_no_guild_allowed() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             None,
         ),
     );
@@ -1752,7 +1776,7 @@ agents:
 channels:
   telegram:
     enabled: true
-    bots:
+    telegram_bots:
       main:
         token: test-token
         username: my_bot
@@ -1787,7 +1811,7 @@ agents:
 channels:
   telegram:
     enabled: true
-    bots:
+    telegram_bots:
       main:
         token: test-token
         username: my_bot
@@ -1815,8 +1839,7 @@ fn discord_channels_invalid_key_not_u64() {
               main:
                 token:
                   source: env
-                  id: MY_TOKEN
-                default_agent: assistant"#,
+                  id: MY_TOKEN"#,
             Some(r#"      "not_a_number": {}"#),
         ),
     );
@@ -1853,7 +1876,7 @@ agents:
 channels:
   telegram:
     enabled: true
-    bots:
+    telegram_bots:
       main:
         token: test-token
         username: my_bot

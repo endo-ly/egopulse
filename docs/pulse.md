@@ -258,7 +258,8 @@ Pulse は agent 配下の `PULSE.md` を使う。
             └── prospective.md
 ```
 
-`PULSE.md` は二層構造にする。
+`PULSE.md` は二層構造にする。ファイルに内容を書く場合は YAML front matter を必須とし、
+front matter なしの Markdown 本文だけの定義はパースエラーとして扱う。
 
 ```md
 ---

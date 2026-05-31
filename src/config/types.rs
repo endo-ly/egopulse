@@ -91,11 +91,11 @@ pub(crate) struct TelegramChatConfig {
     pub multi_agent: bool,
 }
 
-/// Per-bot Telegram configuration stored under `channels.telegram.bots.<bot_id>`.
+/// Per-bot Telegram configuration stored under `channels.telegram.telegram_bots.<bot_id>`.
 ///
 /// Each bot connects to Telegram with its own token and routes messages to agents
 /// based on shared channel config or falls back to the global `default_agent`.
-/// Channel-to-agent mappings live at the Telegram level (`channels.telegram.channels`).
+/// Channel-to-agent mappings live at the Telegram level (`channels.telegram.telegram_channels`).
 #[derive(Clone)]
 pub(crate) struct TelegramBotConfig {
     pub token: Option<ResolvedValue>,
@@ -145,9 +145,9 @@ pub(crate) struct ChannelConfig {
     /// Each bot determines channel membership by checking which agents in each
     /// channel's `agents` list have `discord_bot` set to the bot's ID.
     pub discord_channels: Option<HashMap<u64, DiscordChannelConfig>>,
-    /// Telegram bot configs under `channels.telegram.bots`.
+    /// Telegram bot configs under `channels.telegram.telegram_bots`.
     pub telegram_bots: Option<HashMap<BotId, TelegramBotConfig>>,
-    /// Telegram channel (group/supergroup) configs under `channels.telegram.channels`.
+    /// Telegram channel (group/supergroup) configs under `channels.telegram.telegram_channels`.
     pub telegram_channels: Option<HashMap<i64, TelegramChatConfig>>,
 }
 

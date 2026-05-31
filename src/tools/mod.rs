@@ -944,8 +944,6 @@ mod tests {
         );
     }
 
-    /// Backward-compatibility: activate_skill in the same turn still works.
-    ///
     /// After auto-hydration, activate_skill is no longer the primary injection
     /// path — bash resolves required_env keys independently. This test verifies
     /// that calling activate_skill first does not break injection or redaction.

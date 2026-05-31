@@ -302,7 +302,7 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Returns runtime info for every bot under `channels.telegram.bots` that has
+    /// Returns runtime info for every bot under `channels.telegram.telegram_bots` that has
     /// a resolved token.
     ///
     /// Sorted by `bot_id` for deterministic startup. Empty when Telegram is disabled.

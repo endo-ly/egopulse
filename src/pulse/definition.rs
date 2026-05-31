@@ -56,6 +56,7 @@ pub(crate) enum PulseParseError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PulseFrontMatter {
     #[allow(dead_code)]
     version: u32,
@@ -65,6 +66,7 @@ struct PulseFrontMatter {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IntentionRaw {
     id: String,
     #[serde(default = "default_true")]
@@ -79,6 +81,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScheduleRaw {
     kind: String,
     at: String,
@@ -86,6 +89,7 @@ struct ScheduleRaw {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeliveryRaw {
     channel: String,
     external_chat_id: String,
@@ -142,26 +146,24 @@ fn parse_pulse_definition_inner(
     }
 
     let Some(rest) = trimmed.strip_prefix("---") else {
-        return Ok(PulseDefinition {
-            default_delivery: None,
-            intentions: Vec::new(),
-            body: trimmed.to_string(),
+        return Err(PulseParseError::ParseFailed {
+            agent_id: agent_id.to_string(),
+            detail: "PULSE.md content must start with YAML front matter".to_string(),
         });
     };
 
     let Some(rest) = rest.strip_prefix('\n') else {
-        return Ok(PulseDefinition {
-            default_delivery: None,
-            intentions: Vec::new(),
-            body: trimmed.to_string(),
+        return Err(PulseParseError::ParseFailed {
+            agent_id: agent_id.to_string(),
+            detail: "PULSE.md front matter opening marker must be followed by a newline"
+                .to_string(),
         });
     };
 
     let Some(end) = rest.find("\n---") else {
-        return Ok(PulseDefinition {
-            default_delivery: None,
-            intentions: Vec::new(),
-            body: trimmed.to_string(),
+        return Err(PulseParseError::ParseFailed {
+            agent_id: agent_id.to_string(),
+            detail: "PULSE.md front matter closing marker is missing".to_string(),
         });
     };
 
@@ -732,9 +734,11 @@ body
         assert!(result.intentions.is_empty());
 
         let no_frontmatter = "# Just a heading\nSome text without front matter";
-        let result = parse_pulse_definition(no_frontmatter).unwrap();
-        assert!(result.intentions.is_empty());
-        assert!(result.body.contains("# Just a heading"));
+        let result = parse_pulse_definition(no_frontmatter);
+        assert!(
+            result.is_err(),
+            "non-empty PULSE.md without front matter should be rejected"
+        );
     }
 
     // --- Due Resolver tests ---
@@ -1116,10 +1120,12 @@ body
     }
 
     #[test]
-    fn parse_delivery_without_front_matter_backward_compat() {
+    fn parse_delivery_without_front_matter_is_rejected() {
         let content = "# Just a heading\nSome text without front matter";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert!(result.default_delivery.is_none());
-        assert!(result.intentions.is_empty());
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::ParseFailed { .. }),
+            "expected ParseFailed, got: {err}"
+        );
     }
 }

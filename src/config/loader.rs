@@ -26,24 +26,18 @@ where
     Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
 }
 
-/// Deserialization helper that accepts both old list format and new map format for models.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum FileModels {
-    List(Vec<String>),
-    Map(HashMap<String, Option<ModelConfig>>),
-}
-
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileProviderConfig {
     label: Option<String>,
     base_url: Option<String>,
     api_key: Option<StringOrRef>,
     default_model: Option<String>,
-    models: Option<FileModels>,
+    models: Option<HashMap<String, Option<ModelConfig>>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileChannelConfig {
     enabled: Option<bool>,
     port: Option<u16>,
@@ -54,18 +48,20 @@ struct FileChannelConfig {
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
     /// Discord channel configs (`channels.discord.channels`).
     channels: Option<HashMap<String, FileDiscordChannelConfig>>,
-    /// Telegram bot configs (`channels.telegram.bots`).
+    /// Telegram bot configs (`channels.telegram.telegram_bots`).
     telegram_bots: Option<HashMap<String, FileTelegramBotConfig>>,
-    /// Telegram channel (group/supergroup) configs (`channels.telegram.channels`).
+    /// Telegram channel (group/supergroup) configs (`channels.telegram.telegram_channels`).
     telegram_channels: Option<HashMap<String, FileTelegramChatConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileDiscordBotConfig {
     token: Option<StringOrRef>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileDiscordChannelConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     require_mention: bool,
@@ -76,6 +72,7 @@ struct FileDiscordChannelConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileTelegramChatConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     require_mention: bool,
@@ -86,12 +83,14 @@ struct FileTelegramChatConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileTelegramBotConfig {
     token: Option<StringOrRef>,
     username: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
@@ -101,6 +100,7 @@ struct FileAgentConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileSleepBatchConfig {
     provider: Option<String>,
     model: Option<String>,
@@ -111,18 +111,21 @@ struct FileSleepBatchConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileRetryConfig {
     max_attempts: Option<u32>,
     interval_minutes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FilePulseConfig {
     enabled: Option<bool>,
     tick_interval: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileWebFetchConfig {
     allowed_schemes: Option<Vec<String>>,
     timeout_secs: Option<u64>,
@@ -135,6 +138,7 @@ struct FileWebFetchConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileWebFetchContentValidationConfig {
     enabled: Option<bool>,
     strict_mode: Option<bool>,
@@ -142,7 +146,9 @@ struct FileWebFetchContentValidationConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
+    state_root: Option<String>,
     default_provider: Option<String>,
     default_model: Option<String>,
     providers: Option<HashMap<String, FileProviderConfig>>,
@@ -174,6 +180,7 @@ pub(super) fn build_config(
     let dotenv = load_dotenv(resolved_config_path.as_deref());
 
     let FileConfig {
+        state_root: file_state_root,
         default_provider: file_default_provider,
         default_model: file_default_model,
         providers: file_providers,
@@ -209,9 +216,11 @@ pub(super) fn build_config(
 
     let default_model = normalize_string(file_default_model);
 
-    let state_root = super::resolve::default_state_root()?
-        .to_string_lossy()
-        .into_owned();
+    let state_root = normalize_string(file_state_root).unwrap_or(
+        super::resolve::default_state_root()?
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     let log_level = first_non_empty([env_var("LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -759,17 +768,12 @@ fn normalize_provider_map(
         })?;
 
         let models = match file_provider.models {
-            Some(FileModels::Map(map)) => map
+            Some(map) => map
                 .into_iter()
                 .filter_map(|(k, v)| {
                     let model = normalize_string(Some(k))?;
                     Some((model, v.unwrap_or_default()))
                 })
-                .collect(),
-            Some(FileModels::List(list)) => list
-                .into_iter()
-                .filter_map(|model| normalize_string(Some(model)))
-                .map(|m| (m, ModelConfig::default()))
                 .collect(),
             None => HashMap::new(),
         };

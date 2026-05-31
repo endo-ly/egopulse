@@ -45,30 +45,8 @@ pub(crate) fn load_channel_fields(
     insert_channel_bool(ch_map, "discord", "enabled", result, "DISCORD_ENABLED");
     insert_channel_bool(ch_map, "telegram", "enabled", result, "TELEGRAM_ENABLED");
 
-    // Read from new bots map first, fall back to legacy fields
-    let telegram_token_loaded =
-        insert_telegram_bot_field(ch_map, "token", result, "TELEGRAM_BOT_TOKEN");
-    if !telegram_token_loaded {
-        insert_channel_string(
-            ch_map,
-            "telegram",
-            "bot_token",
-            result,
-            "TELEGRAM_BOT_TOKEN",
-        );
-    }
-
-    let telegram_username_loaded =
-        insert_telegram_bot_field(ch_map, "username", result, "TELEGRAM_BOT_USERNAME");
-    if !telegram_username_loaded {
-        insert_channel_string(
-            ch_map,
-            "telegram",
-            "bot_username",
-            result,
-            "TELEGRAM_BOT_USERNAME",
-        );
-    }
+    insert_telegram_bot_field(ch_map, "token", result, "TELEGRAM_BOT_TOKEN");
+    insert_telegram_bot_field(ch_map, "username", result, "TELEGRAM_BOT_USERNAME");
 }
 
 pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<String> {
@@ -191,7 +169,7 @@ fn insert_channel_bool(
     result.insert(result_key.into(), value.to_string());
 }
 
-/// Try to read a field from `channels.telegram.bots.default.<field>`.
+/// Try to read a field from `channels.telegram.telegram_bots.default.<field>`.
 /// Returns `true` if the value was found and inserted.
 fn insert_telegram_bot_field(
     channels: &yaml_serde::Mapping,

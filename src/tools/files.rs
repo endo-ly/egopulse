@@ -363,40 +363,11 @@ impl Tool for EditTool {
 }
 
 pub(crate) fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, String> {
-    let has_edits_array = input
-        .get("edits")
-        .and_then(|value| value.as_array())
-        .is_some();
-    let has_legacy_fields = input
-        .get("oldText")
-        .and_then(|value| value.as_str())
-        .is_some()
-        || input
-            .get("newText")
-            .and_then(|value| value.as_str())
-            .is_some();
-
-    if has_edits_array && has_legacy_fields {
-        return Err(
-            "Edit tool input is ambiguous: provide either 'edits' array or 'oldText'/'newText' pair, not both.".to_string(),
-        );
-    }
-
     let mut parsed = Vec::new();
     if let Some(edits) = input.get("edits").and_then(|value| value.as_array()) {
         for edit in edits {
             parsed.push(parse_edit_spec(edit)?);
         }
-    }
-
-    if let (Some(old_text), Some(new_text)) = (
-        input.get("oldText").and_then(|value| value.as_str()),
-        input.get("newText").and_then(|value| value.as_str()),
-    ) {
-        parsed.push(EditSpec {
-            old_text: old_text.to_string(),
-            new_text: new_text.to_string(),
-        });
     }
 
     if parsed.is_empty() {
@@ -515,4 +486,41 @@ fn parse_edit_spec(edit: &serde_json::Value) -> Result<EditSpec, String> {
         old_text: old_text.to_string(),
         new_text: new_text.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_edits_rejects_top_level_replacement_fields() {
+        let input = json!({
+            "oldText": "before",
+            "newText": "after",
+        });
+
+        let error = parse_edits(&input).expect_err("top-level replacement fields are invalid");
+
+        assert_eq!(
+            error,
+            "Edit tool input is invalid. edits must contain at least one replacement."
+        );
+    }
+
+    #[test]
+    fn parse_edits_accepts_edits_array() {
+        let input = json!({
+            "edits": [{
+                "oldText": "before",
+                "newText": "after",
+            }],
+        });
+
+        let edits = parse_edits(&input).expect("edits array");
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].old_text, "before");
+        assert_eq!(edits[0].new_text, "after");
+    }
 }

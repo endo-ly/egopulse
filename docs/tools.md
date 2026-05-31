@@ -132,7 +132,6 @@ MCP の詳細は以下を参照。
 - 入力:
   - `path: string` 必須
   - `edits: array` 必須
-  - legacy 互換として top-level `oldText` / `newText` も受け取り、内部で `edits[]` に畳み込む
   - 各 edit は:
     - `oldText: string`
     - `newText: string`
