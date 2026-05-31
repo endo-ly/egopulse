@@ -213,6 +213,32 @@ impl Database {
         }
     }
 
+    pub(crate) fn get_chat_by_channel_external_and_agent(
+        &self,
+        channel: &str,
+        external_chat_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<ChatInfo>, StorageError> {
+        let conn = self.get_conn()?;
+        match conn.query_row(
+            "SELECT chat_id, chat_type, agent_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 AND agent_id = ?3 LIMIT 1",
+            params![channel, external_chat_id, agent_id],
+            |row| {
+                Ok(ChatInfo {
+                    chat_id: row.get(0)?,
+                    channel: channel.to_string(),
+                    external_chat_id: external_chat_id.to_string(),
+                    chat_type: row.get(1)?,
+                    agent_id: row.get(2)?,
+                })
+            },
+        ) {
+            Ok(info) => Ok(Some(info)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn resolve_or_create_chat_id(
         &self,
         channel: &str,

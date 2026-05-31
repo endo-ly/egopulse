@@ -308,6 +308,7 @@ mod tests {
                 at: "09:00".to_string(),
             },
             attention: "Check today's schedule.".to_string(),
+            delivery: None,
         }
     }
 

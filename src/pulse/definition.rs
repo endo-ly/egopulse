@@ -4,9 +4,17 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Explicit delivery destination for pulse notifications.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeliverySpec {
+    pub channel: String,
+    pub external_chat_id: String,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct PulseDefinition {
+    pub default_delivery: Option<DeliverySpec>,
     pub intentions: Vec<TemporalIntention>,
     pub body: String,
 }
@@ -18,6 +26,7 @@ pub(crate) struct TemporalIntention {
     pub enabled: bool,
     pub schedule: TemporalSchedule,
     pub attention: String,
+    pub delivery: Option<DeliverySpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +51,8 @@ pub(crate) enum PulseParseError {
         intention_id: String,
         detail: String,
     },
+    #[error("pulse_invalid_delivery: {agent_id}: {detail}")]
+    InvalidDelivery { agent_id: String, detail: String },
 }
 
 #[derive(Deserialize)]
@@ -50,6 +61,7 @@ struct PulseFrontMatter {
     version: u32,
     #[serde(default)]
     intentions: Vec<IntentionRaw>,
+    default_delivery: Option<DeliveryRaw>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +71,7 @@ struct IntentionRaw {
     enabled: bool,
     schedule: ScheduleRaw,
     attention: String,
+    delivery: Option<DeliveryRaw>,
 }
 
 fn default_true() -> bool {
@@ -70,6 +83,42 @@ struct ScheduleRaw {
     kind: String,
     at: String,
     day: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeliveryRaw {
+    channel: String,
+    external_chat_id: String,
+}
+
+const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram"];
+
+fn validate_delivery_raw(
+    agent_id: &str,
+    raw: &DeliveryRaw,
+    source: &str,
+) -> Result<DeliverySpec, PulseParseError> {
+    let channel = raw.channel.trim().to_ascii_lowercase();
+    if !VALID_DELIVERY_CHANNELS.contains(&channel.as_str()) {
+        return Err(PulseParseError::InvalidDelivery {
+            agent_id: agent_id.to_string(),
+            detail: format!(
+                "{source}: invalid delivery channel: {channel}, expected one of {}",
+                VALID_DELIVERY_CHANNELS.join(", ")
+            ),
+        });
+    }
+    let external_chat_id = raw.external_chat_id.trim().to_string();
+    if external_chat_id.is_empty() {
+        return Err(PulseParseError::InvalidDelivery {
+            agent_id: agent_id.to_string(),
+            detail: format!("{source}: delivery external_chat_id must not be empty"),
+        });
+    }
+    Ok(DeliverySpec {
+        channel,
+        external_chat_id,
+    })
 }
 
 #[cfg(test)]
@@ -86,6 +135,7 @@ fn parse_pulse_definition_inner(
 
     if trimmed.is_empty() {
         return Ok(PulseDefinition {
+            default_delivery: None,
             intentions: Vec::new(),
             body: String::new(),
         });
@@ -93,6 +143,7 @@ fn parse_pulse_definition_inner(
 
     let Some(rest) = trimmed.strip_prefix("---") else {
         return Ok(PulseDefinition {
+            default_delivery: None,
             intentions: Vec::new(),
             body: trimmed.to_string(),
         });
@@ -100,6 +151,7 @@ fn parse_pulse_definition_inner(
 
     let Some(rest) = rest.strip_prefix('\n') else {
         return Ok(PulseDefinition {
+            default_delivery: None,
             intentions: Vec::new(),
             body: trimmed.to_string(),
         });
@@ -107,6 +159,7 @@ fn parse_pulse_definition_inner(
 
     let Some(end) = rest.find("\n---") else {
         return Ok(PulseDefinition {
+            default_delivery: None,
             intentions: Vec::new(),
             body: trimmed.to_string(),
         });
@@ -121,6 +174,12 @@ fn parse_pulse_definition_inner(
             detail: e.to_string(),
         })?;
 
+    let default_delivery = fm
+        .default_delivery
+        .as_ref()
+        .map(|raw| validate_delivery_raw(agent_id, raw, "default_delivery"))
+        .transpose()?;
+
     let mut intentions = Vec::with_capacity(fm.intentions.len());
     let mut seen_ids = HashSet::new();
 
@@ -134,15 +193,25 @@ fn parse_pulse_definition_inner(
         seen_ids.insert(raw.id.clone());
 
         let schedule = validate_and_build_schedule(agent_id, &raw)?;
+        let delivery = raw
+            .delivery
+            .as_ref()
+            .map(|d| validate_delivery_raw(agent_id, d, &format!("intention '{}'", raw.id)))
+            .transpose()?;
         intentions.push(TemporalIntention {
             id: raw.id,
             enabled: raw.enabled,
             schedule,
             attention: raw.attention,
+            delivery,
         });
     }
 
-    Ok(PulseDefinition { intentions, body })
+    Ok(PulseDefinition {
+        default_delivery,
+        intentions,
+        body,
+    })
 }
 
 fn validate_and_build_schedule(
@@ -252,6 +321,7 @@ pub(crate) fn load_pulse_definition(
 
     if !path.exists() {
         return Ok(PulseDefinition {
+            default_delivery: None,
             intentions: Vec::new(),
             body: String::new(),
         });
@@ -675,6 +745,7 @@ body
             enabled: true,
             schedule: TemporalSchedule::Daily { at: at.to_string() },
             attention: String::new(),
+            delivery: None,
         }
     }
 
@@ -687,6 +758,7 @@ body
                 at: at.to_string(),
             },
             attention: String::new(),
+            delivery: None,
         }
     }
 
@@ -728,6 +800,7 @@ body
                 at: "09:00".to_string(),
             },
             attention: String::new(),
+            delivery: None,
         };
         let now = utc(2026, 5, 10, 0, 0, 0);
         let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo");
@@ -744,6 +817,7 @@ body
                 at: "21:00".to_string(),
             },
             attention: String::new(),
+            delivery: None,
         };
         let now = utc(2026, 5, 10, 12, 0, 0);
         let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo");
@@ -873,5 +947,179 @@ body
         let result = parse_pulse_definition(content).expect("should parse");
         assert_eq!(result.intentions.len(), 1);
         assert!(result.intentions[0].enabled);
+    }
+
+    // --- delivery tests ---
+
+    #[test]
+    fn parse_intention_delivery() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: discord
+      external_chat_id: \"123456789\"
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        let delivery = result.intentions[0].delivery.as_ref().expect("delivery");
+        assert_eq!(delivery.channel, "discord");
+        assert_eq!(delivery.external_chat_id, "123456789");
+    }
+
+    #[test]
+    fn parse_default_delivery() {
+        let content = "\
+---
+version: 1
+default_delivery:
+  channel: telegram
+  external_chat_id: \"987654321\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        let dd = result.default_delivery.as_ref().expect("default_delivery");
+        assert_eq!(dd.channel, "telegram");
+        assert_eq!(dd.external_chat_id, "987654321");
+        assert!(result.intentions[0].delivery.is_none());
+    }
+
+    #[test]
+    fn parse_delivery_optional_on_intention() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert!(result.intentions[0].delivery.is_none());
+    }
+
+    #[test]
+    fn parse_default_delivery_optional() {
+        let content = valid_pulse_md();
+        let result = parse_pulse_definition(&content).expect("should parse");
+        assert!(result.default_delivery.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_channel() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: web
+      external_chat_id: \"abc\"
+---
+
+body
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidDelivery { .. }),
+            "expected InvalidDelivery, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty_external_chat_id() {
+        let content = "\
+---
+version: 1
+default_delivery:
+  channel: discord
+  external_chat_id: \"\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidDelivery { .. }),
+            "expected InvalidDelivery, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_both_delivery_sources() {
+        let content = "\
+---
+version: 1
+default_delivery:
+  channel: discord
+  external_chat_id: \"111\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: telegram
+      external_chat_id: \"222\"
+  - id: evening_review
+    schedule:
+      kind: daily
+      at: \"21:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        let dd = result.default_delivery.as_ref().expect("default_delivery");
+        assert_eq!(dd.channel, "discord");
+
+        let first = &result.intentions[0];
+        let d = first.delivery.as_ref().expect("intention delivery");
+        assert_eq!(d.channel, "telegram");
+        assert_eq!(d.external_chat_id, "222");
+
+        assert!(result.intentions[1].delivery.is_none());
+    }
+
+    #[test]
+    fn parse_delivery_without_front_matter_backward_compat() {
+        let content = "# Just a heading\nSome text without front matter";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert!(result.default_delivery.is_none());
+        assert!(result.intentions.is_empty());
     }
 }

@@ -122,23 +122,21 @@ agent_id
 
 ### 解決順序
 
-Phase 1 の Home Surface 解決順序は以下とする。
+Home Surface 解決順序は以下とする。
 
 ```text
-1. agent が最後に会話した chat
-2. 見つからなければ skipped
+1. intention.delivery（明示指定）
+2. default_delivery（agent レベルのデフォルト）
+3. agent が最後に会話した chat（自動解決）
+4. 見つからなければ skipped
 ```
 
 将来的には、以下を追加できる。
 
 ```text
-- intention 単位の delivery override
-- agent 単位の home_surface 明示設定
 - Pulse Inbox
 - Lyre Router
 ```
-
-ただし Phase 1 では、まず **最後に会話した場所** を優先する。
 
 ---
 
@@ -265,6 +263,9 @@ Pulse は agent 配下の `PULSE.md` を使う。
 ```md
 ---
 version: 1
+default_delivery:
+  channel: discord
+  external_chat_id: "1234567890123456789"
 intentions:
   - id: morning_review
     schedule:
@@ -272,6 +273,16 @@ intentions:
       at: "09:00"
     attention: |
       今日の予定、未解決事項、昨日から持ち越している設計論点を確認する。
+    delivery:
+      channel: telegram
+      external_chat_id: "987654321"
+  - id: weekly_reflection
+    schedule:
+      kind: weekly
+      day: sun
+      at: "21:00"
+    attention: |
+      週の振り返り。
 ---
 
 # PULSE
@@ -339,15 +350,21 @@ schedule:
 
 ## validation
 
-| 項目              | 仕様                          |
-| --------------- | --------------------------- |
-| `id`            | agent 内で一意                  |
-| `enabled`       | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
-| `schedule.kind` | `daily` / `weekly` |
-| `daily.at`      | `HH:MM`                     |
-| `weekly.day`    | `mon`〜`sun`                 |
-| `weekly.at`     | `HH:MM`                     |
-| `attention`     | LLM に渡す注意対象。実行命令ではない        |
+| 項目                          | 仕様                          |
+| --------------------------- | --------------------------- |
+| `id`                        | agent 内で一意                  |
+| `enabled`                   | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
+| `schedule.kind`             | `daily` / `weekly` |
+| `daily.at`                  | `HH:MM`                     |
+| `weekly.day`                | `mon`〜`sun`                 |
+| `weekly.at`                 | `HH:MM`                     |
+| `attention`                 | LLM に渡す注意対象。実行命令ではない        |
+| `default_delivery`          | 省略可能。agent レベルのデフォルト配送先     |
+| `default_delivery.channel`  | `discord` / `telegram` のみ   |
+| `default_delivery.external_chat_id` | 空不可                    |
+| `delivery`（intention 内）     | 省略可能。`default_delivery` をオーバーライド |
+| `delivery.channel`          | `discord` / `telegram` のみ   |
+| `delivery.external_chat_id` | 空不可                         |
 
 `attention` は `task` ではない。
 「この時間に、この対象へ注意を向ける」という意味を持つ。
@@ -465,14 +482,16 @@ Pulse は agent 単位で発火するが、結果はユーザーが普段その 
 
 そのため、Pulse は Home Surface を解決してから通知する。
 
-## 8.2 Phase 1 の解決ルール
+## 8.2 解決ルール
 
 ```text
-resolve_home_surface(agent_id):
+resolve_home_surface(agent_id, delivery):
 
-1. chats から agent_id に一致する最新 chat を探す
-2. channel adapter が存在し、送信可能なら採用
-3. それも無ければ skipped
+1. delivery が明示指定されていれば、その channel:external_chat_id を DB から検索
+2. 見つからなければ、default_delivery を同様に検索
+3. どちらも指定されていなければ、chats から agent_id に一致する最新 chat を探す
+4. channel adapter が存在し、送信可能なら採用
+5. すべて見つからなければ skipped
 ```
 
 ## 8.3 注意点
@@ -686,22 +705,23 @@ src/
 | Pulse Inbox           | 通知が増えてから                      |
 | Lyre Router           | multi-agent 通知設計の後            |
 | 自律探索                  | 最終段階                          |
-| 複雑な delivery override | Home Surface 優先で開始            |
+| 複雑な delivery override | —                             |
 
 ## Phase 1 Implementation Decisions
 
 実装判断による元仕様との差分。実装者が迷わないよう明示する。
 
-### `default_delivery` 未実装
-- Phase 1 では `default_delivery` は実装しない
-- Home Surface が見つからない場合は `skipped` になる
-- 将来フェーズで実装予定
+### Home Surface の解決順序
+- `intention.delivery` → `default_delivery` → 自動解決（最新 chat）→ skipped
+- 明示指定時は `get_chat_by_channel_external()` で DB ルックアップ
+- channel adapter が存在するか `state.channels` で確認
+- 指定先が見つからない場合はその intention のみ skipped + 警告ログ
 
 ### Home Surface の送信可能 chat 探索
 - `resolve_home_surface()` は Discord/Telegram チャネルのみ対応
-- agent_id に紐づく最新の chat を `get_agent_chats_by_recent()` で取得
+- 自動解決時は agent_id に紐づく最新の chat を `get_agent_chats_by_recent()` で取得
 - channel adapter が存在するか `state.channels` で確認
-- Web/CLI は Phase 1 では対象外
+- Web/CLI は対象外
 
 ### Tools 使用可能
 - Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能
@@ -881,7 +901,7 @@ User
 | ユーザー自由記述      | `PULSE.md` body                |
 | 内部契約          | バイナリ埋め込み                       |
 | Config        | runtime 設定のみ                   |
-| 出力先           | agent が最後に会話した Home Surface    |
+| 出力先           | delivery → default_delivery → 最新 Home Surface → skipped |
 | 実行文脈          | Pulse Capsule                  |
 | 通常 session 保存 | 通知本文だけ assistant message として保存 |
 | `PULSE_OK`    | 通知せず、通常 session にも保存しない        |
