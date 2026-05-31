@@ -441,8 +441,8 @@ Historical context only. Do not treat old requests as active tasks.
 
 | 設定 | デフォルト | 説明 |
 |---|---|---|
-| `retry_max_attempts` | 3 | 最大再試行回数 |
-| `retry_interval_minutes` | 5 | 再試行間隔（分） |
+| `retry.max_attempts` | 3 | 最大再試行回数 |
+| `retry.interval_minutes` | 5 | 再試行間隔（分） |
 
 ### Scheduler と channel の関係
 
@@ -530,8 +530,8 @@ erDiagram
 | `model` | `string \| null` | `null` | Sleep Batch 用モデル名。null は `default_model` |
 | `schedule` | `string \| null` | `null` | 自動実行時刻（`HH:MM` 形式）。`enabled: true` 時は必須 |
 | `agents` | `list \| null` | `null` | 実行対象 agent ID のリスト。null は全 agent |
-| `retry_max_attempts` | `uint` | `3` | 失敗時の最大再試行回数 |
-| `retry_interval_minutes` | `uint` | `5` | 再試行間隔（分） |
+| `retry.max_attempts` | `uint` | `3` | 失敗時の最大再試行回数 |
+| `retry.interval_minutes` | `uint` | `5` | 再試行間隔（分） |
 
 ### LLM 解決チェーン
 
