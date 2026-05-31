@@ -3,20 +3,19 @@
 use std::sync::Arc;
 
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::formatting::{
-    format_tool_result, summarize_tool_calls_with_content, tool_message_content,
-};
+use crate::agent_loop::formatting::summarize_tool_calls_with_content;
 use crate::agent_loop::prompt_builder::build_system_prompt;
+use crate::agent_loop::tool_loop::{
+    MAX_TOOL_ITERATIONS, ToolExecutionHooks, filter_valid_tool_calls, log_llm_usage,
+};
 use crate::error::EgoPulseError;
-use crate::llm::{Message, MessagesResponse, ToolCall};
+use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
 use crate::pulse::capsule::PulseCapsule;
 use crate::runtime::AppState;
 use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall};
 use crate::tools::ToolExecutionContext;
 use tracing::warn;
-
-const MAX_TOOL_ITERATIONS: usize = 50;
 
 /// RAII guard that decrements the active turn counter on drop.
 struct PulseTurnGuard<'a> {
@@ -120,29 +119,15 @@ pub(crate) async fn run_activation(
             })?;
 
         if let Some(usage) = &response.usage {
-            let db = std::sync::Arc::clone(&state.db);
-            let channel = context.channel.clone();
-            let provider = channel_llm.provider_name().to_string();
-            let model = channel_llm.model_name().to_string();
-            let input_tokens = usage.input_tokens;
-            let output_tokens = usage.output_tokens;
-            crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
-            crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
-            tokio::spawn(async move {
-                let _ = crate::storage::call_blocking(db, move |db| {
-                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                        chat_id,
-                        caller_channel: &channel,
-                        provider: &provider,
-                        model: &model,
-                        input_tokens,
-                        output_tokens,
-                        request_kind: "pulse",
-                    })
-                })
-                .await
-                .inspect_err(|e| warn!(error = %e, "pulse llm usage logging failed"));
-            });
+            log_llm_usage(
+                state,
+                chat_id,
+                &context.channel,
+                channel_llm.as_ref(),
+                usage,
+                "pulse",
+                "pulse llm usage logging failed",
+            );
         }
 
         if response.tool_calls.is_empty() {
@@ -155,18 +140,32 @@ pub(crate) async fn run_activation(
             });
         }
 
-        let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone());
+        let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone(), "pulse");
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
-        let (tool_messages, stored_tool_calls) = execute_tool_calls(
+        let tool_outcomes = crate::agent_loop::tool_loop::execute_tool_calls(
             state,
             &tool_context,
-            &response,
-            &valid_tool_calls,
-            &assistant_message_id,
-            chat_id,
+            valid_tool_calls.clone(),
+            ToolExecutionHooks::none(),
         )
         .await?;
+        let tool_messages = tool_outcomes
+            .iter()
+            .map(|outcome| outcome.message.clone())
+            .collect::<Vec<_>>();
+        let stored_tool_calls = tool_outcomes
+            .iter()
+            .map(|outcome| StoredToolCall {
+                id: outcome.tool_call.id.clone(),
+                chat_id,
+                message_id: assistant_message_id.clone(),
+                tool_name: outcome.tool_call.name.clone(),
+                tool_input: outcome.tool_call.arguments.to_string(),
+                tool_output: Some(outcome.payload.clone()),
+                timestamp: outcome.timestamp.clone(),
+            })
+            .collect::<Vec<_>>();
 
         let assistant_message = Message {
             role: "assistant".to_string(),
@@ -206,82 +205,6 @@ fn classify_output(text: &str) -> PulseOutputKind {
     } else {
         PulseOutputKind::Notify
     }
-}
-
-fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
-    let mut index_by_id = std::collections::HashMap::new();
-    let mut valid = Vec::new();
-
-    for tool_call in tool_calls {
-        if tool_call.name.trim().is_empty() || tool_call.id.trim().is_empty() {
-            warn!(
-                "pulse: skipping malformed tool call (empty name or id): id='{}' name='{}'",
-                tool_call.id, tool_call.name
-            );
-            continue;
-        }
-
-        if let Some(index) = index_by_id.get(&tool_call.id).copied() {
-            warn!(
-                "pulse: replacing duplicate tool call id: id='{}' name='{}'",
-                tool_call.id, tool_call.name
-            );
-            valid[index] = tool_call;
-        } else {
-            index_by_id.insert(tool_call.id.clone(), valid.len());
-            valid.push(tool_call);
-        }
-    }
-
-    valid
-}
-
-async fn execute_tool_calls(
-    state: &AppState,
-    tool_context: &ToolExecutionContext,
-    response: &MessagesResponse,
-    valid_tool_calls: &[ToolCall],
-    assistant_message_id: &str,
-    chat_id: i64,
-) -> Result<(Vec<Message>, Vec<StoredToolCall>), EgoPulseError> {
-    let mut tool_messages = Vec::with_capacity(valid_tool_calls.len());
-    let mut stored_tool_calls = Vec::with_capacity(valid_tool_calls.len());
-
-    for tool_call in valid_tool_calls {
-        let result = state
-            .tools
-            .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
-            .await;
-
-        let tool_payload = format_tool_result(tool_call, &result);
-
-        tool_messages.push(Message {
-            role: "tool".to_string(),
-            content: tool_message_content(&tool_payload, &result),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call.id.clone()),
-        });
-        stored_tool_calls.push(StoredToolCall {
-            id: tool_call.id.clone(),
-            chat_id,
-            message_id: assistant_message_id.to_string(),
-            tool_name: tool_call.name.clone(),
-            tool_input: tool_call.arguments.to_string(),
-            tool_output: Some(tool_payload),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        });
-
-        if !response.content.trim().is_empty() {
-            tracing::debug!(
-                tool = %tool_call.name,
-                is_error = result.is_error,
-                "pulse tool executed"
-            );
-        }
-    }
-
-    Ok((tool_messages, stored_tool_calls))
 }
 
 fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {

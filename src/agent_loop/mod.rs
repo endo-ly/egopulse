@@ -9,6 +9,7 @@ pub(crate) mod guards;
 pub(crate) mod prompt_builder;
 pub(crate) mod session;
 pub(crate) mod soul_agents;
+pub(crate) mod tool_loop;
 pub(crate) mod turn;
 
 pub(crate) use session::{list_sessions, load_session_messages};

@@ -6,14 +6,18 @@
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::formatting::{
-    format_tool_result, message_to_text, preview_text, sanitize_assistant_response_text,
-    strip_thinking, summarize_tool_calls_with_content, tool_message_content,
+    message_to_text, preview_text, sanitize_assistant_response_text, strip_thinking,
+    summarize_tool_calls_with_content,
 };
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
     persist_phase_once, resolve_chat_id,
+};
+use crate::agent_loop::tool_loop::{
+    ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks, filter_valid_tool_calls,
+    log_llm_usage,
 };
 use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
@@ -23,12 +27,9 @@ use crate::storage::{SenderKind, StoredMessage, ToolCall as StoredToolCall, call
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
-use futures_util::future::join_all;
 use std::sync::Arc;
 use tracing::Instrument;
 use tracing::warn;
-
-const MAX_TOOL_ITERATIONS: usize = 50;
 
 /// Maximum number of Channel Log messages to inject as Channel Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
@@ -296,29 +297,15 @@ async fn process_turn_inner(
                 })?;
 
             if let Some(usage) = &response.usage {
-                let db = Arc::clone(&state.db);
-                let channel = context.channel.clone();
-                let provider = channel_llm.provider_name().to_string();
-                let model = channel_llm.model_name().to_string();
-                let input_tokens = usage.input_tokens;
-                let output_tokens = usage.output_tokens;
-                crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
-                crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
-                tokio::spawn(async move {
-                    let _ = call_blocking(db, move |db| {
-                        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                            chat_id,
-                            caller_channel: &channel,
-                            provider: &provider,
-                            model: &model,
-                            input_tokens,
-                            output_tokens,
-                            request_kind: "agent_loop",
-                        })
-                    })
-                    .await
-                    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
-                });
+                log_llm_usage(
+                    state,
+                    chat_id,
+                    &context.channel,
+                    channel_llm.as_ref(),
+                    usage,
+                    "agent_loop",
+                    "llm usage logging failed",
+                );
             }
 
             if response.tool_calls.is_empty() {
@@ -349,7 +336,7 @@ async fn process_turn_inner(
                 continue;
             }
 
-            let valid_tool_calls = filter_valid_tool_calls(response.tool_calls);
+            let valid_tool_calls = filter_valid_tool_calls(response.tool_calls, "agent_loop");
 
             if valid_tool_calls.is_empty() {
                 match evaluate_malformed_response(
@@ -416,34 +403,6 @@ async fn process_turn_inner(
     }
     .instrument(span)
     .await
-}
-
-fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
-    let mut index_by_id = std::collections::HashMap::new();
-    let mut valid = Vec::new();
-
-    for tool_call in tool_calls {
-        if tool_call.name.trim().is_empty() || tool_call.id.trim().is_empty() {
-            warn!(
-                "skipping malformed tool call (empty name or id): id='{}' name='{}'",
-                tool_call.id, tool_call.name
-            );
-            continue;
-        }
-
-        if let Some(index) = index_by_id.get(&tool_call.id).copied() {
-            warn!(
-                "replacing duplicate tool call id in assistant response with latest item: id='{}' name='{}'",
-                tool_call.id, tool_call.name
-            );
-            valid[index] = tool_call;
-        } else {
-            index_by_id.insert(tool_call.id.clone(), valid.len());
-            valid.push(tool_call);
-        }
-    }
-
-    valid
 }
 
 fn evaluate_end_turn(
@@ -587,7 +546,10 @@ async fn execute_and_persist_tools(
         &assistant_message_id,
         assistant_draft.valid_tool_calls,
     )
-    .await?;
+    .await?
+    .into_iter()
+    .map(|outcome| outcome.message)
+    .collect();
     let persisted = persist_tool_result_messages(
         state,
         tool_context.chat_id,
@@ -681,110 +643,55 @@ async fn execute_tool_calls(
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<Message>, EgoPulseError> {
+) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
     if valid_tool_calls.is_empty() {
         return Ok(Vec::new());
     }
 
-    let read_only_flags: Vec<bool> = {
-        let mut flags = Vec::with_capacity(valid_tool_calls.len());
-        for tc in &valid_tool_calls {
-            flags.push(state.tools.is_read_only(&tc.name).await);
-        }
-        flags
-    };
-
-    let mut messages = Vec::with_capacity(valid_tool_calls.len());
-    let mut cursor = 0;
-
-    while cursor < valid_tool_calls.len() {
-        if read_only_flags[cursor] {
-            let block_start = cursor;
-            while cursor < valid_tool_calls.len() && read_only_flags[cursor] {
-                cursor += 1;
-            }
-            let block_futures: Vec<_> = valid_tool_calls[block_start..cursor]
-                .iter()
-                .cloned()
-                .map(|tc| {
-                    execute_tool_call(state, on_event, tool_context, assistant_message_id, tc)
-                })
-                .collect();
-            let block_results = join_all(block_futures).await;
-            for result in block_results {
-                messages.push(result?);
-            }
-        } else {
-            messages.push(
-                execute_tool_call(
-                    state,
-                    on_event,
-                    tool_context,
-                    assistant_message_id,
-                    valid_tool_calls[cursor].clone(),
-                )
-                .await?,
-            );
-            cursor += 1;
-        }
+    for tool_call in &valid_tool_calls {
+        store_pending_tool_call(state, tool_context.chat_id, assistant_message_id, tool_call)
+            .await?;
     }
 
-    Ok(messages)
-}
+    let start_emitter = on_event.clone();
+    let result_emitter = on_event.clone();
+    let hooks = ToolExecutionHooks {
+        on_start: Some(Arc::new(move |tool_call: &ToolCall| {
+            start_emitter.emit(AgentEvent::ToolStart {
+                name: tool_call.name.clone(),
+                input: tool_call.arguments.clone(),
+            });
+        })),
+        on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
+            result_emitter.emit(AgentEvent::ToolResult {
+                name: outcome.tool_call.name.clone(),
+                is_error: outcome.result.is_error,
+                preview: preview_text(&outcome.payload, 160),
+                duration_ms: outcome.duration_ms,
+            });
+        })),
+    };
 
-async fn execute_tool_call(
-    state: &AppState,
-    on_event: &EventEmitter,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    tool_call: ToolCall,
-) -> Result<Message, EgoPulseError> {
-    on_event.emit(AgentEvent::ToolStart {
-        name: tool_call.name.clone(),
-        input: tool_call.arguments.clone(),
-    });
-
-    store_pending_tool_call(
+    let outcomes = crate::agent_loop::tool_loop::execute_tool_calls(
         state,
-        tool_context.chat_id,
-        assistant_message_id,
-        &tool_call,
-    )
-    .await?;
-    let tool_start = std::time::Instant::now();
-    let result = state
-        .tools
-        .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
-        .await;
-    let duration_ms = tool_start.elapsed().as_millis();
-    let tool_payload = format_tool_result(&tool_call, &result);
-    crate::runtime::metrics::inc_tool_calls_total(
-        &tool_call.name,
-        if result.is_error { "error" } else { "ok" },
-    );
-    update_tool_call_output(
-        state,
-        tool_context.chat_id,
-        assistant_message_id,
-        &tool_call.id,
-        &tool_payload,
+        tool_context,
+        valid_tool_calls,
+        hooks,
     )
     .await?;
 
-    on_event.emit(AgentEvent::ToolResult {
-        name: tool_call.name.clone(),
-        is_error: result.is_error,
-        preview: preview_text(&tool_payload, 160),
-        duration_ms,
-    });
+    for outcome in &outcomes {
+        update_tool_call_output(
+            state,
+            tool_context.chat_id,
+            assistant_message_id,
+            &outcome.tool_call.id,
+            &outcome.payload,
+        )
+        .await?;
+    }
 
-    Ok(Message {
-        role: "tool".to_string(),
-        content: tool_message_content(&tool_payload, &result),
-        reasoning_content: None,
-        tool_calls: Vec::new(),
-        tool_call_id: Some(tool_call.id),
-    })
+    Ok(outcomes)
 }
 
 async fn store_pending_tool_call(
