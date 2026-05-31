@@ -35,7 +35,6 @@ pub(crate) enum InputDecision {
 /// # Errors
 ///
 /// Returns [`StorageError`] if DB queries fail.
-#[allow(dead_code)]
 pub(crate) fn collect_sleep_input(
     db: &Database,
     agent_id: &str,
@@ -66,7 +65,6 @@ pub(crate) fn collect_sleep_input(
 
 /// Agent long-term memory content loaded from markdown files.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)]
 pub(crate) struct MemoryContent {
     pub episodic: Option<String>,
     pub semantic: Option<String>,
@@ -83,7 +81,6 @@ struct CachedContent {
 ///
 /// Follows the same caching pattern as `SoulAgentsLoader` — tracks file mtime
 /// and re-reads only when changed.
-#[allow(dead_code)]
 pub(crate) struct MemoryLoader {
     agents_dir: PathBuf,
     // TODO: Phase 2 で HashMap<PathBuf, CachedContent> に移行（マルチエージェント時にスラッシュ防止）
@@ -92,7 +89,6 @@ pub(crate) struct MemoryLoader {
     prospective_cache: Mutex<Option<CachedContent>>,
 }
 
-#[allow(dead_code)]
 impl MemoryLoader {
     pub(crate) fn new(agents_dir: PathBuf) -> Self {
         Self {
@@ -157,7 +153,6 @@ impl MemoryLoader {
     }
 }
 
-#[allow(dead_code)]
 fn safe_agent_id(id: &str) -> bool {
     let id = id.trim();
     !id.is_empty()
@@ -167,7 +162,6 @@ fn safe_agent_id(id: &str) -> bool {
         && !id.contains(':')
 }
 
-#[allow(dead_code)]
 fn read_trimmed(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim();

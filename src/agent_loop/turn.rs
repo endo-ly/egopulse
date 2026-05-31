@@ -1998,5 +1998,4 @@ mod tests {
             "execute_scheduled_turn must generate a non-empty trace_id"
         );
     }
-
 }

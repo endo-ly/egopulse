@@ -530,7 +530,12 @@ mod tests {
 
     #[test]
     fn format_channel_log_message_tool() {
-        let msg = StoredMessage::tool(1, "lyre".to_string(), "vega".to_string(), "sent".to_string());
+        let msg = StoredMessage::tool(
+            1,
+            "lyre".to_string(),
+            "vega".to_string(),
+            "sent".to_string(),
+        );
         assert_eq!(format_channel_log_message(&msg), "[tool/lyre] sent");
     }
 }

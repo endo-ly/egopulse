@@ -31,7 +31,6 @@ pub(crate) struct RuntimeStatus {
 
 /// Immutable point-in-time copy suitable for serialization.
 ///
-#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct StatusSnapshot {
     pub version: String,
@@ -46,7 +45,6 @@ pub(crate) struct StatusSnapshot {
 /// Operational state of a single channel (web / discord / telegram / …).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
 pub(crate) enum ChannelState {
     Starting,
     Running,
@@ -99,7 +97,6 @@ pub(crate) struct TurnRecord {
 // Internal mutable state
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 struct RuntimeStatusInner {
     started_at: chrono::DateTime<Utc>,
     pid: u32,
@@ -116,7 +113,6 @@ struct RuntimeStatusInner {
 // Implementation
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 impl RuntimeStatus {
     /// Creates a new `RuntimeStatus` initialized with the current timestamp,
     /// process ID, and crate version.
@@ -157,24 +153,6 @@ impl RuntimeStatus {
             });
     }
 
-    /// Marks the named channel as [`ChannelState::Failed`] and records the
-    /// error message.
-    pub(crate) fn update_channel_error(&self, name: &str, error_msg: &str) {
-        let mut guard = self.inner.write().expect("runtime_status lock");
-        guard
-            .channels
-            .entry(name.to_string())
-            .and_modify(|ch| {
-                ch.state = ChannelState::Failed;
-                ch.last_error = Some(error_msg.to_string());
-            })
-            .or_insert_with(|| ChannelHealth {
-                state: ChannelState::Failed,
-                last_error: Some(error_msg.to_string()),
-                last_activity: None,
-            });
-    }
-
     /// Updates the `last_activity` timestamp of the named channel to now.
     ///
     /// If the channel has not been registered yet it is inserted with state
@@ -193,12 +171,6 @@ impl RuntimeStatus {
                 last_error: None,
                 last_activity: Some(now),
             });
-    }
-
-    /// Toggles the database health flag.
-    pub(crate) fn set_db_healthy(&self, healthy: bool) {
-        let mut guard = self.inner.write().expect("runtime_status lock");
-        guard.db_healthy = healthy;
     }
 
     /// Appends an error to the ring buffer.
@@ -281,12 +253,13 @@ impl RuntimeStatus {
         let guard = self.inner.read().expect("runtime_status lock");
         guard.recent_turns.iter().cloned().collect()
     }
+}
 
-    /// Returns the health record for the named channel, or `None` if the
-    /// channel has never been registered.
-    pub(crate) fn channel_health(&self, name: &str) -> Option<ChannelHealth> {
-        let guard = self.inner.read().expect("runtime_status lock");
-        guard.channels.get(name).cloned()
+#[cfg(test)]
+impl RuntimeStatus {
+    pub(crate) fn set_db_healthy(&self, healthy: bool) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        guard.db_healthy = healthy;
     }
 }
 
@@ -328,65 +301,6 @@ mod tests {
             snapshot.recent_turns.is_empty(),
             "recent_turns should start empty"
         );
-    }
-
-    // 2. update_channel_sets_state
-    #[test]
-    fn update_channel_sets_state() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        status.update_channel("web", ChannelState::Running);
-
-        // Assert
-        let health = status.channel_health("web").expect("web channel");
-        assert!(matches!(health.state, ChannelState::Running));
-    }
-
-    // 3. update_channel_error_sets_failed
-    #[test]
-    fn update_channel_error_sets_failed() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        status.update_channel_error("discord", "timeout");
-
-        // Assert
-        let health = status.channel_health("discord").expect("discord channel");
-        assert!(matches!(health.state, ChannelState::Failed));
-        assert_eq!(health.last_error.as_deref(), Some("timeout"));
-    }
-
-    // 4. touch_channel_activity_updates_timestamp
-    #[test]
-    fn touch_channel_activity_updates_timestamp() {
-        // Arrange
-        let status = RuntimeStatus::new();
-        status.update_channel("web", ChannelState::Running);
-
-        // Act
-        status.touch_channel_activity("web");
-
-        // Assert
-        let health = status.channel_health("web").expect("web channel");
-        let activity = health.last_activity.expect("last_activity should be set");
-        // Verify it parses as valid RFC3339
-        chrono::DateTime::parse_from_rfc3339(&activity).expect("should be valid rfc3339");
-    }
-
-    // 5. set_db_healthy_toggles
-    #[test]
-    fn set_db_healthy_toggles() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        status.set_db_healthy(false);
-
-        // Assert
-        assert!(!status.snapshot().db_healthy);
     }
 
     // 6. push_error_appends_to_ring_buffer
@@ -457,41 +371,6 @@ mod tests {
         assert_eq!(err.summary, "rate limited");
         // Verify `at` is valid RFC3339
         chrono::DateTime::parse_from_rfc3339(&err.at).expect("at should be rfc3339");
-    }
-
-    // 9. snapshot_returns_independent_copy
-    #[test]
-    fn snapshot_returns_independent_copy() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        let snap = status.snapshot();
-        status.set_db_healthy(false);
-        status.update_channel("web", ChannelState::Running);
-
-        // Assert — snapshot was taken before the mutations
-        assert!(
-            snap.db_healthy,
-            "snapshot should reflect original db_healthy"
-        );
-        assert!(
-            snap.channels.is_empty(),
-            "snapshot should not reflect later channel additions"
-        );
-    }
-
-    // 10. channel_health_returns_none_for_unknown
-    #[test]
-    fn channel_health_returns_none_for_unknown() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        let result = status.channel_health("nonexistent");
-
-        // Assert
-        assert!(result.is_none());
     }
 
     // 11. push_turn_appends_to_ring_buffer

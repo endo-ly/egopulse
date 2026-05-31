@@ -1,8 +1,5 @@
 //! LLM response normalization and JSON extraction utilities.
 
-/// Maximum characters of raw LLM response to include in error messages and logs.
-const RAW_RESPONSE_PREVIEW_CHARS: usize = 300;
-
 /// Normalizes a raw LLM response into a string that is more likely to parse as JSON.
 ///
 /// Applies in order:
@@ -34,16 +31,6 @@ pub(crate) fn extract_json_object_span(text: &str) -> Option<String> {
         Some(text[first..=last].to_string())
     } else {
         None
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn preview_raw_response(raw: &str) -> String {
-    let truncated: String = raw.chars().take(RAW_RESPONSE_PREVIEW_CHARS).collect();
-    if raw.chars().count() > RAW_RESPONSE_PREVIEW_CHARS {
-        format!("{truncated}...")
-    } else {
-        truncated
     }
 }
 

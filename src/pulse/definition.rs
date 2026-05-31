@@ -12,7 +12,6 @@ pub(crate) struct DeliverySpec {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct PulseDefinition {
     pub default_delivery: Option<DeliverySpec>,
     pub intentions: Vec<TemporalIntention>,
@@ -20,7 +19,6 @@ pub(crate) struct PulseDefinition {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct TemporalIntention {
     pub id: String,
     pub enabled: bool,
@@ -30,14 +28,12 @@ pub(crate) struct TemporalIntention {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum TemporalSchedule {
     Daily { at: String },
     Weekly { day: String, at: String },
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub(crate) enum PulseParseError {
     #[error("pulse_parse_error: {agent_id}: {detail}")]
     ParseFailed { agent_id: String, detail: String },

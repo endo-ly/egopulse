@@ -259,6 +259,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::runtime_status::ChannelState;
+
     fn test_state() -> WebState {
         let dir = tempfile::TempDir::new().unwrap();
         let state_root = dir.path().to_string_lossy().to_string();
@@ -277,6 +278,10 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // health endpoint
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
     async fn health_returns_full_status() {
         let state = test_state();
@@ -284,7 +289,6 @@ mod tests {
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
-        state.app_state.runtime_status.set_db_healthy(true);
 
         let Json(resp) = health(State(state)).await;
 
@@ -306,7 +310,6 @@ mod tests {
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
-        state.app_state.runtime_status.set_db_healthy(true);
 
         let Json(resp) = health(State(state)).await;
 
@@ -338,7 +341,6 @@ mod tests {
             .app_state
             .runtime_status
             .update_channel("discord", ChannelState::Failed);
-        state.app_state.runtime_status.set_db_healthy(true);
 
         let Json(resp) = health(State(state)).await;
 
@@ -352,7 +354,6 @@ mod tests {
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
-        state.app_state.runtime_status.set_db_healthy(true);
 
         let Json(resp) = health(State(state)).await;
         let json = serde_json::to_value(&resp).unwrap();

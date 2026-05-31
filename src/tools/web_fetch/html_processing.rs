@@ -58,11 +58,6 @@ pub(crate) fn process_response_body_with_metadata(
     }
 }
 
-/// Processes an HTTP response body according to its content type.
-pub(crate) fn process_response_body(body: &str, content_type: Option<&str>) -> String {
-    process_response_body_with_metadata(body, content_type, "").text
-}
-
 fn is_html_content(content_type: Option<&str>) -> bool {
     match content_type {
         Some(ct) => ct.to_ascii_lowercase().contains("text/html"),
@@ -298,42 +293,6 @@ mod tests {
         let result = extract_primary_html(html);
 
         assert!(result.contains("just a paragraph"), "got: {result}");
-    }
-
-    #[test]
-    fn content_type_html_routes_to_markdown() {
-        let html = "<html><body><h1>Title</h1></body></html>";
-
-        let result = process_response_body(html, Some("text/html"));
-
-        assert!(result.contains("Title"), "got: {result}");
-    }
-
-    #[test]
-    fn content_type_plain_returns_as_is() {
-        let text = "Hello, world!";
-
-        let result = process_response_body(text, Some("text/plain"));
-
-        assert_eq!(result, "Hello, world!");
-    }
-
-    #[test]
-    fn content_type_json_returns_as_is() {
-        let json = r#"{"key": "value"}"#;
-
-        let result = process_response_body(json, Some("application/json"));
-
-        assert_eq!(result, json);
-    }
-
-    #[test]
-    fn content_type_missing_routes_to_markdown() {
-        let html = "<html><body><h1>No content type</h1></body></html>";
-
-        let result = process_response_body(html, None);
-
-        assert!(result.contains("No content type"), "got: {result}");
     }
 
     #[test]

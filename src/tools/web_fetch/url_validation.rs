@@ -25,8 +25,6 @@ pub(crate) enum UrlValidationError {
     PrivateIpBlocked(String),
     #[error("dns resolution failed for '{0}'")]
     DnsResolutionFailed(String),
-    #[error("too many redirects")]
-    TooManyRedirects,
 }
 
 /// Normalizes a single host string: lowercase, trim whitespace, remove
@@ -39,15 +37,6 @@ pub(crate) fn normalize_host(host: &str) -> String {
         .strip_prefix("*.")
         .unwrap_or(no_trailing_dot)
         .to_string()
-}
-
-/// Applies [`normalize_host`] to a slice, deduplicates, and removes empty entries.
-pub(crate) fn normalize_host_list(hosts: &[String]) -> Vec<String> {
-    let mut normalized: Vec<String> = hosts.iter().map(|h| normalize_host(h)).collect();
-    normalized.retain(|h| !h.is_empty());
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
 }
 
 /// Returns `true` when `ip` is a loopback, private, link-local, or

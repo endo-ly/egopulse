@@ -3136,21 +3136,6 @@ mod tests {
     }
 
     #[test]
-    fn store_system_event_sender_kind_is_system() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db.resolve_channel_log_chat_id(303).expect("create");
-        db.store_system_event(
-            chat_id,
-            &crate::runtime::turn_scheduler::StopReason::SessionUnprocessable,
-        )
-        .expect("store");
-
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs[0].sender_kind, SenderKind::System);
-    }
-
-    #[test]
     fn store_message_with_sender_kind() {
         let (db, _dir) = test_db();
 

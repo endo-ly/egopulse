@@ -60,8 +60,6 @@ pub(crate) enum StopReason {
     TurnCountExceeded,
     AgentNotFound,
     LlmFailure,
-    #[allow(dead_code)]
-    SessionUnprocessable,
 }
 
 /// Per-origin turn counter and terminal stop reason tracker for runaway prevention.
@@ -94,18 +92,6 @@ impl TurnTracker {
     pub(crate) fn terminal_reason(&self, origin_id: &str) -> Option<StopReason> {
         let reasons = self.terminal_reasons.lock().expect("turn_tracker lock");
         reasons.get(origin_id).cloned()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn remove_origin(&self, origin_id: &str) {
-        {
-            let mut counts = self.counts.lock().expect("turn_tracker lock");
-            counts.remove(origin_id);
-        }
-        {
-            let mut reasons = self.terminal_reasons.lock().expect("turn_tracker lock");
-            reasons.remove(origin_id);
-        }
     }
 }
 
@@ -389,16 +375,6 @@ mod tests {
             tracker.terminal_reason("orig-1"),
             Some(StopReason::ChainDepthExceeded)
         );
-    }
-
-    #[test]
-    fn turn_tracker_remove_origin_clears_all_state() {
-        let tracker = TurnTracker::new();
-        tracker.increment("orig-1");
-        tracker.set_terminal_reason("orig-1", StopReason::LlmFailure);
-        tracker.remove_origin("orig-1");
-        assert_eq!(tracker.count("orig-1"), 0);
-        assert!(tracker.terminal_reason("orig-1").is_none());
     }
 
     // -----------------------------------------------------------------------
