@@ -12,8 +12,11 @@ use crate::error::StorageError;
 mod migration;
 mod queries;
 
-/// Connection factory that opens a SQLite database file with WAL mode and
-/// busy_timeout configured on every new connection.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connection factory that opens a SQLite database file with connection-local
+/// SQLite settings. Database-file settings such as WAL mode are initialized
+/// once before the pool is built.
 #[derive(Debug)]
 pub(crate) struct SqliteConnectionManager {
     path: PathBuf,
@@ -31,8 +34,7 @@ impl ManageConnection for SqliteConnectionManager {
 
     fn connect(&self) -> Result<Connection, Self::Error> {
         let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        configure_connection(&conn)?;
         Ok(conn)
     }
 
@@ -48,11 +50,29 @@ impl ManageConnection for SqliteConnectionManager {
 type Pool = r2d2::Pool<SqliteConnectionManager>;
 type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
+fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    Ok(())
+}
+
+fn initialize_database_file(db_path: &Path) -> Result<(), StorageError> {
+    let conn = Connection::open(db_path)?;
+    configure_connection(&conn)?;
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(StorageError::InitFailed(format!(
+            "failed to enable sqlite wal mode for {}: journal_mode={journal_mode}",
+            db_path.display(),
+        )));
+    }
+    Ok(())
+}
+
 /// Thread-safe SQLite database wrapper backed by a connection pool.
 ///
-/// Each connection in the pool is created with `PRAGMA journal_mode=WAL`
-/// and `busy_timeout = 5 s`.  Read-heavy workloads benefit from concurrent
-/// access because WAL mode allows simultaneous readers.
+/// The database file is initialized in WAL mode before pooling starts, and
+/// each pooled connection receives connection-local settings such as
+/// `busy_timeout = 5 s`.
 pub struct Database {
     pool: Pool,
 }
@@ -676,6 +696,8 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
+        initialize_database_file(db_path)?;
+
         let manager = SqliteConnectionManager::new(db_path.to_path_buf());
         let pool = r2d2::Pool::builder()
             .max_size(4)
@@ -702,6 +724,11 @@ impl Database {
     /// Used by migration tests that need a specific schema version.
     #[cfg(test)]
     pub(crate) fn new_unchecked(db_path: &Path) -> Result<Self, StorageError> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        initialize_database_file(db_path)?;
+
         let manager = SqliteConnectionManager::new(db_path.to_path_buf());
         let pool = r2d2::Pool::builder()
             .max_size(4)
@@ -715,6 +742,68 @@ impl Database {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::{Arc, Barrier};
+
+    fn temp_db_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("runtime").join("egopulse.db")
+    }
+
+    #[test]
+    fn database_new_initializes_wal_before_pooling_and_configures_busy_timeout() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_db_path(&dir);
+
+        // Act
+        let db = Database::new(&db_path).expect("db");
+        let conn = db.get_conn().expect("conn");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .expect("journal_mode");
+        let busy_timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .expect("busy_timeout");
+
+        // Assert
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn database_unchecked_concurrent_pool_initialization_shares_existing_wal() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_db_path(&dir);
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        // Act
+        let handles = (0..threads)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let db = Database::new_unchecked(&db_path).expect("db");
+                    let conn = db.get_conn().expect("conn");
+                    conn.query_row("PRAGMA journal_mode;", [], |row| row.get::<_, String>(0))
+                        .expect("journal_mode")
+                })
+            })
+            .collect::<Vec<_>>();
+        let journal_modes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert!(
+            journal_modes
+                .iter()
+                .all(|mode| mode.eq_ignore_ascii_case("wal")),
+            "all concurrent pools should observe WAL mode: {journal_modes:?}"
+        );
+    }
 
     #[test]
     fn sleep_run_status_display() {
