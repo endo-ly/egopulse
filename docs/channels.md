@@ -196,9 +196,8 @@ Agent Session の LLM 呼び出し時に、Channel Log の直近 30 件を一時
 1. [@BotFather](https://t.me/BotFather) とチャットし `/newbot` を実行
 2. 表示名とユーザー名（末尾 `bot` 必須）を設定
 3. 発行されたトークンを `bots.<bot_id>.token` に設定
-4. ユーザー名（`@` なし）を `bots.<bot_id>.username` に設定
-5. グループに追加する場合は Bot のプライバシーモードを無効化（`/setprivacy` → Disable）
-6. `agents.<id>.telegram_bot` でエージェントと Bot を紐付け
+4. グループに追加する場合は Bot のプライバシーモードを無効化（`/setprivacy` → Disable）
+5. `agents.<id>.telegram_bot` でエージェントと Bot を紐付け
 
 ---
 

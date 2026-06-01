@@ -100,15 +100,12 @@ pub(crate) struct TelegramChatConfig {
 pub(crate) struct TelegramBotConfig {
     pub token: Option<ResolvedValue>,
     pub file_token: Option<yaml_serde::Value>,
-    /// Telegram bot username (required — cannot be auto-detected from API like Discord).
-    pub username: Option<String>,
 }
 
 impl std::fmt::Debug for TelegramBotConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelegramBotConfig")
             .field("token", &debug_secret(self.token.as_ref()))
-            .field("username", &self.username)
             .finish()
     }
 }

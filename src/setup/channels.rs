@@ -46,7 +46,6 @@ pub(crate) fn load_channel_fields(
     insert_channel_bool(ch_map, "telegram", "enabled", result, "TELEGRAM_ENABLED");
 
     insert_telegram_bot_field(ch_map, "token", result, "TELEGRAM_BOT_TOKEN");
-    insert_telegram_bot_field(ch_map, "username", result, "TELEGRAM_BOT_USERNAME");
 }
 
 pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<String> {
@@ -78,7 +77,6 @@ pub(crate) fn build_channel_configs(
     discord_enabled: bool,
     telegram_enabled: bool,
     telegram_bot_token: String,
-    telegram_bot_username: String,
 ) -> HashMap<crate::config::ChannelName, crate::config::ChannelConfig> {
     use crate::config::secret_ref::{
         TELEGRAM_BOT_TOKEN_ENV_NAME, WEB_AUTH_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value,
@@ -119,7 +117,6 @@ pub(crate) fn build_channel_configs(
                     telegram_bot_token,
                 )),
                 file_token: Some(env_yaml_value(TELEGRAM_BOT_TOKEN_ENV_NAME)),
-                username: (!telegram_bot_username.is_empty()).then_some(telegram_bot_username),
             },
         );
         channels.insert(
@@ -219,7 +216,6 @@ mod tests {
             true,
             true,
             "telegram-token".to_string(),
-            "botname".to_string(),
         );
 
         let web = channels.get("web").expect("web");
@@ -240,6 +236,5 @@ mod tests {
             yaml_serde::to_string(default_bot.file_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");
         assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
-        assert_eq!(default_bot.username.as_deref(), Some("botname"));
     }
 }
