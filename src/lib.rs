@@ -2,7 +2,11 @@
 //!
 //! 永続セッションを共有する AI エージェントランタイムとして、TUI / Web / Discord / Telegram
 //! の各チャネルと設定・ストレージ・エージェント実行基盤をまとめて提供する。
+//!
+//! 公開 API は [`app`] モジュールに集約されている。バイナリ以外の利用者は
+//! そこから必要なアイテムだけを参照すること。
 
+pub mod app;
 pub mod agent_loop;
 pub(crate) mod assets;
 pub(crate) mod builtin_skills;
