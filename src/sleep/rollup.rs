@@ -60,7 +60,6 @@ pub(crate) struct PlannerEvent {
 
 pub(crate) struct RollupPlannerInput {
     pub existing_week_rollups: Vec<ExistingRollupInfo>,
-    pub existing_month_rollups: Vec<ExistingRollupInfo>,
     pub events: Vec<PlannerEvent>,
 }
 
@@ -89,34 +88,29 @@ pub(crate) fn recent_weeks(
     weeks
 }
 
-/// Calendar months starting from the month of the oldest recent week, most-recent first.
-pub(crate) fn recent_months_from_weeks(
-    recent_weeks: &[WeekPeriod],
+/// Complete calendar months ending before `now`, most-recent first.
+///
+/// Returns full calendar months suitable for end-of-month detection.
+pub(crate) fn complete_months_recent(
+    now: DateTime<FixedOffset>,
     count: usize,
     tz: chrono_tz::Tz,
 ) -> Vec<MonthPeriod> {
-    if recent_weeks.is_empty() {
-        return Vec::new();
-    }
-    let oldest = &recent_weeks[recent_weeks.len() - 1];
-    let start_date = oldest.period_start.date_naive();
-    let mut y = start_date.year();
-    let mut m = start_date.month();
-
+    let (prev_y, prev_m) = if now.month() == 1 {
+        (now.year() - 1, 12)
+    } else {
+        (now.year(), now.month() - 1)
+    };
     let mut months = Vec::with_capacity(count);
-    for i in 0..count {
-        if i > 0 {
-            m = m.saturating_sub(1);
-            if m == 0 {
-                m = 12;
-                y -= 1;
-            }
+    let mut y = prev_y;
+    let mut m = prev_m;
+    for _ in 0..count {
+        months.push(month_for_ym(y, m, tz));
+        m = m.saturating_sub(1);
+        if m == 0 {
+            m = 12;
+            y -= 1;
         }
-        let mut mp = month_for_ym(y, m, tz);
-        if i == 0 && mp.period_end_exclusive > oldest.period_start {
-            mp.period_end_exclusive = oldest.period_start;
-        }
-        months.push(mp);
     }
     months
 }
@@ -202,7 +196,7 @@ fn count_events_in_period(
 // Main planner
 // ---------------------------------------------------------------------------
 
-pub(crate) fn plan_rollup_updates(
+pub(crate) fn plan_week_rollup_updates(
     _agent_id: &str,
     now: DateTime<FixedOffset>,
     tz: chrono_tz::Tz,
@@ -218,12 +212,6 @@ pub(crate) fn plan_rollup_updates(
         .existing_week_rollups
         .iter()
         .map(|r| r.period_key.as_str())
-        .collect();
-
-    let existing_month_map: HashMap<&str, &ExistingRollupInfo> = input
-        .existing_month_rollups
-        .iter()
-        .map(|r| (r.period_key.as_str(), r))
         .collect();
 
     // -----------------------------------------------------------------------
@@ -316,37 +304,83 @@ pub(crate) fn plan_rollup_updates(
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 5. Week rolling out (W-5 → its month needs update)
-    // -----------------------------------------------------------------------
-    let rolling_out_monday = recent
-        .last()
-        .map(|w| w.period_start.date_naive() - Duration::days(7));
-    if let Some(ro_monday) = rolling_out_monday {
-        let ro_week = week_for_date_inner(ro_monday, tz);
-        let month = month_for_ym(
-            ro_week.period_start.year(),
-            ro_week.period_start.month(),
-            tz,
-        );
-        let key = format!("month:{}", month.month_key);
-        if !existing_month_map.contains_key(month.month_key.as_str()) && seen_keys.insert(key) {
-            requests.push(make_month_request(&month, "week_rolling_out", None));
-        }
-    }
+    requests
+}
 
-    // -----------------------------------------------------------------------
-    // 6. Recent months from weeks — missing month rollups
-    // -----------------------------------------------------------------------
-    let recent_months = recent_months_from_weeks(&recent, 2, tz);
-    for mp in &recent_months {
-        let key = format!("month:{}", mp.month_key);
-        if !existing_month_map.contains_key(mp.month_key.as_str()) && seen_keys.insert(key) {
-            requests.push(make_month_request(mp, "missing_month", None));
+/// Plan month rollup updates based on the new trigger:
+/// month has ended AND at least one week rollup exists for that month AND no existing month rollup.
+pub(crate) fn plan_month_rollup_updates(
+    _agent_id: &str,
+    now: DateTime<FixedOffset>,
+    tz: chrono_tz::Tz,
+    existing_month_rollups: &[ExistingRollupInfo],
+    existing_week_rollups: &[ExistingRollupInfo],
+) -> Vec<RollupRequest> {
+    let mut requests = Vec::new();
+
+    let existing_month_map: HashMap<&str, &ExistingRollupInfo> = existing_month_rollups
+        .iter()
+        .map(|r| (r.period_key.as_str(), r))
+        .collect();
+
+    let complete_months = complete_months_recent(now, 2, tz);
+
+    for mp in &complete_months {
+        if now < mp.period_end_exclusive {
+            continue;
+        }
+
+        let month_weeks: Vec<&ExistingRollupInfo> = existing_week_rollups
+            .iter()
+            .filter(|wr| week_in_month(&wr.period_key, &mp.month_key, tz))
+            .collect();
+
+        if month_weeks.is_empty() {
+            continue;
+        }
+
+        if let Some(existing) = existing_month_map.get(mp.month_key.as_str()) {
+            let (computed_max, computed_count) = compute_month_rollup_stats(&month_weeks);
+            if computed_count == existing.event_count && computed_max == existing.max_ripple {
+                continue;
+            }
+            requests.push(make_month_request(
+                mp,
+                "month_stale",
+                Some(existing.summary_md.clone()),
+            ));
+        } else {
+            requests.push(make_month_request(mp, "month_end", None));
         }
     }
 
     requests
+}
+
+/// Check if a week (ISO week key like "2026-W14") belongs to a month (key like "2026-04").
+/// A week belongs to a month if the week's Monday falls within the month period.
+pub(crate) fn week_in_month(week_key: &str, month_key: &str, tz: chrono_tz::Tz) -> bool {
+    let Some(mp) = month_period_from_key(month_key, tz) else {
+        return false;
+    };
+    let (year, week_num) = parse_iso_week_key(week_key);
+    let Some(monday) = NaiveDate::from_isoywd_opt(year, week_num, chrono::Weekday::Mon) else {
+        return false;
+    };
+    let week_start: DateTime<FixedOffset> =
+        to_fixed(tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid")));
+    week_start >= mp.period_start && week_start < mp.period_end_exclusive
+}
+
+fn parse_iso_week_key(key: &str) -> (i32, u32) {
+    let parts: Vec<&str> = key.split('-').collect();
+    if parts.len() != 2 {
+        return (0, 0);
+    }
+    let year: i32 = parts[0].parse().unwrap_or(0);
+    let week_str = parts[1].strip_prefix('W').unwrap_or(parts[1]);
+    let week_num: u32 = week_str.parse().unwrap_or(0);
+    (year, week_num)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +450,8 @@ pub(crate) struct Call2RollupRequest {
     pub reason: String,
     pub previous_summary_md: Option<String>,
     pub events: Vec<Call2Event>,
+    pub week_rollups: Vec<Call2WeekRollupSummary>,
+    pub previous_month_summary_md: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -427,6 +463,15 @@ pub(crate) struct Call2Event {
     pub body_md: String,
     pub ripple_strength: i64,
     pub certainty: String,
+}
+
+/// A week rollup summary used as input for month rollup generation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2WeekRollupSummary {
+    pub period_key: String,
+    pub summary_md: String,
+    pub max_ripple: i64,
+    pub event_count: i64,
 }
 
 /// Call2 LLM output JSON structure.
@@ -468,6 +513,8 @@ pub(crate) fn build_call2_input(
                 reason: req.reason.clone(),
                 previous_summary_md: req.previous_summary_md.clone(),
                 events,
+                week_rollups: Vec::new(),
+                previous_month_summary_md: None,
             }
         })
         .collect()
@@ -478,6 +525,53 @@ fn granularity_to_str(g: RollupGranularity) -> String {
         RollupGranularity::Week => "week".to_string(),
         RollupGranularity::Month => "month".to_string(),
     }
+}
+
+/// Builds the Call2 input for month rollup requests using week rollup summaries.
+///
+/// Unlike `build_call2_input` which uses raw events, this uses week rollup
+/// summaries as input for month-level summarization.
+pub(crate) fn build_call2_input_month(
+    rollup_requests: &[RollupRequest],
+    week_rollups_map: &HashMap<String, Vec<Call2WeekRollupSummary>>,
+    previous_month_map: &HashMap<String, String>,
+) -> Vec<Call2RollupRequest> {
+    rollup_requests
+        .iter()
+        .map(|req| {
+            let week_rollups = week_rollups_map
+                .get(&req.period_key)
+                .cloned()
+                .unwrap_or_default();
+            let previous_month_summary_md = previous_month_map.get(&req.period_key).cloned();
+            Call2RollupRequest {
+                granularity: granularity_to_str(req.granularity),
+                period_key: req.period_key.clone(),
+                period_start: req.period_start.clone(),
+                period_end_exclusive: req.period_end_exclusive.clone(),
+                reason: req.reason.clone(),
+                previous_summary_md: req.previous_summary_md.clone(),
+                events: Vec::new(),
+                week_rollups,
+                previous_month_summary_md,
+            }
+        })
+        .collect()
+}
+
+/// Computes month rollup statistics (max_ripple, event_count) by aggregating
+/// the statistics of the week rollups belonging to that month.
+///
+/// Uses the maximum `max_ripple` and the sum of `event_count` from all
+/// provided week rollups.
+pub(crate) fn compute_month_rollup_stats(week_rollups: &[&ExistingRollupInfo]) -> (i64, i64) {
+    let max_ripple = week_rollups
+        .iter()
+        .map(|wr| wr.max_ripple)
+        .max()
+        .unwrap_or(3);
+    let event_count = week_rollups.iter().map(|wr| wr.event_count).sum();
+    (max_ripple, event_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -643,9 +737,14 @@ fn redact_prefixed_values(
 // Prompt builders
 // ---------------------------------------------------------------------------
 
-/// Builds the Call2 system prompt from the embedded prompt template.
-pub(crate) fn build_call2_system_prompt(agent_id: &str) -> String {
-    include_str!("rollup_prompt.md").replace("{AGENT_NAME}", agent_id)
+/// Builds the Call2 system prompt for week rollups from the embedded week prompt template.
+pub(crate) fn build_call2_system_prompt_week(agent_id: &str) -> String {
+    include_str!("rollup_week_prompt.md").replace("{AGENT_NAME}", agent_id)
+}
+
+/// Builds the Call2 system prompt for month rollups from the embedded month prompt template.
+pub(crate) fn build_call2_system_prompt_month(agent_id: &str) -> String {
+    include_str!("rollup_month_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
 /// Builds the Call2 user prompt with the input JSON.
@@ -727,30 +826,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 3: recent_months — identifies 2 months before recent weeks
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_recent_months_identifies_2() {
-        let now = jst_dt(2026, 5, 27, 10, 0);
-        let weeks = recent_weeks(now, 4, jst());
-        let months = recent_months_from_weeks(&weeks, 2, jst());
-
-        assert_eq!(months.len(), 2);
-        assert!(months[0].period_start > months[1].period_start);
-        let oldest_week = &weeks[weeks.len() - 1];
-        assert!(
-            months[0].period_start <= oldest_week.period_start,
-            "first recent month should include the oldest week's month"
-        );
-        assert!(months[0].month_key.starts_with("2026-04"));
-        assert!(months[1].month_key.starts_with("2026-03"));
-        assert!(
-            months[0].period_end_exclusive <= oldest_week.period_start,
-            "first recent month end should be capped to oldest week start"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Test 4: detects new closed week (W-1 has no rollup)
     // -----------------------------------------------------------------------
     #[test]
@@ -761,10 +836,10 @@ mod tests {
         // No week rollups at all → W-1 should be detected as closed_week.
         let input = RollupPlannerInput {
             existing_week_rollups: vec![],
-            existing_month_rollups: vec![],
+
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         let w1_key = &recent[0].week_key;
         let closed = reqs
@@ -792,10 +867,10 @@ mod tests {
                 max_ripple: 0,
                 summary_md: String::new(),
             }],
-            existing_month_rollups: vec![],
+
             events: vec![],
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         let w2_key = &recent[1].week_key;
         let missing = reqs
@@ -825,14 +900,14 @@ mod tests {
                 max_ripple: 3,
                 summary_md: "old summary".to_string(),
             }],
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: exp_in_w2.to_rfc3339(),
                 encoded_at: now.to_rfc3339(), // encoded now
                 ripple_strength: 5,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         let delayed = reqs
             .iter()
@@ -871,10 +946,10 @@ mod tests {
                 max_ripple: 3,
                 summary_md: String::new(),
             }],
-            existing_month_rollups: vec![],
+
             events,
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         let mismatch = reqs
             .iter()
@@ -886,12 +961,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: detects week rolling out (W-5 → month update)
+    // Test 8: month planner detects completed month with week rollups
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_week_rolling_out() {
         let now = jst_dt(2026, 5, 27, 10, 0);
         let recent = recent_weeks(now, 4, jst());
+        let tz = jst();
 
         // All recent weeks have rollups so closed_week/missing_week don't fire.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
@@ -904,28 +980,26 @@ mod tests {
             });
         }
 
-        let input = RollupPlannerInput {
-            existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
-            events: vec![],
-        };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_month_rollup_updates("test-agent", now, tz, &[], &week_rollups);
 
-        let rolling = reqs.iter().find(|r| r.reason == "week_rolling_out");
+        // April should be detected because W-18 (Apr 27) belongs to April
+        let april = reqs.iter().find(|r| r.period_key == "2026-04");
         assert!(
-            rolling.is_some(),
-            "should detect month update for week rolling out"
+            april.is_some(),
+            "should detect month update for April: {reqs:?}"
         );
-        assert_eq!(rolling.unwrap().granularity, RollupGranularity::Month);
+        assert_eq!(april.unwrap().granularity, RollupGranularity::Month);
+        assert_eq!(april.unwrap().reason, "month_end");
     }
 
     // -----------------------------------------------------------------------
-    // Test 9: detects missing month rollup
+    // Test 9: month planner detects missing month rollups
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_missing_month_rollup() {
         let now = jst_dt(2026, 5, 27, 10, 0);
         let recent = recent_weeks(now, 4, jst());
+        let tz = jst();
 
         // All weeks present, but months are missing.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
@@ -938,23 +1012,15 @@ mod tests {
             });
         }
 
-        let input = RollupPlannerInput {
-            existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
-            events: vec![],
-        };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_month_rollup_updates("test-agent", now, tz, &[], &week_rollups);
 
-        let missing_months: Vec<_> = reqs
-            .iter()
-            .filter(|r| r.reason == "missing_month")
-            .collect();
         assert!(
-            !missing_months.is_empty(),
-            "should detect missing month rollups"
+            !reqs.is_empty(),
+            "should detect missing month rollups: {reqs:?}"
         );
-        for m in &missing_months {
+        for m in &reqs {
             assert_eq!(m.granularity, RollupGranularity::Month);
+            assert_eq!(m.reason, "month_end");
         }
     }
 
@@ -980,14 +1046,14 @@ mod tests {
 
         let input = RollupPlannerInput {
             existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: old_ts.to_rfc3339(),
                 encoded_at: old_ts.to_rfc3339(),
                 ripple_strength: 5,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         let bg = reqs.iter().find(|r| r.reason == "background_candidate");
         assert!(
@@ -997,15 +1063,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 11: returns empty when no updates needed
+    // Test 11: returns empty when no updates needed (both planners)
     // -----------------------------------------------------------------------
     #[test]
     fn test_returns_empty_when_no_updates_needed() {
         let now = jst_dt(2026, 5, 27, 10, 0);
         let recent = recent_weeks(now, 4, jst());
-        let recent_months = recent_months_from_weeks(&recent, 2, jst());
+        let tz = jst();
 
-        // Build one event per recent week so event counts match.
         let mut events = vec![];
         for w in &recent {
             events.push(PlannerEvent {
@@ -1015,7 +1080,6 @@ mod tests {
             });
         }
 
-        // Populate all rollups with matching event counts.
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
         for w in &recent {
             week_rollups.push(ExistingRollupInfo {
@@ -1025,41 +1089,40 @@ mod tests {
                 summary_md: String::new(),
             });
         }
-        let mut month_rollups: Vec<ExistingRollupInfo> = vec![];
-        for m in &recent_months {
-            month_rollups.push(ExistingRollupInfo {
-                period_key: m.month_key.clone(),
-                event_count: 0,
-                max_ripple: 0,
-                summary_md: String::new(),
-            });
-        }
-        // Also add the rolling-out month.
-        let tz = jst();
-        let ro_monday = recent.last().unwrap().period_start.date_naive() - Duration::days(7);
-        let ro_week = week_for_date_inner(ro_monday, tz);
-        let ro_month = month_for_ym(
-            ro_week.period_start.year(),
-            ro_week.period_start.month(),
-            tz,
-        );
-        month_rollups.push(ExistingRollupInfo {
-            period_key: ro_month.month_key.clone(),
-            event_count: 0,
-            max_ripple: 0,
-            summary_md: String::new(),
-        });
 
         let input = RollupPlannerInput {
-            existing_week_rollups: week_rollups,
-            existing_month_rollups: month_rollups,
+            existing_week_rollups: week_rollups.clone(),
+
             events,
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
-
+        let week_reqs = plan_week_rollup_updates("test-agent", now, tz, &input);
         assert!(
-            reqs.is_empty(),
-            "should have no requests when everything is up to date: {reqs:?}"
+            week_reqs.is_empty(),
+            "week planner should have no requests when all weeks are up to date: {week_reqs:?}"
+        );
+
+        let complete_months = complete_months_recent(now, 2, tz);
+        let month_rollups: Vec<ExistingRollupInfo> = complete_months
+            .iter()
+            .map(|m| {
+                let month_weeks: Vec<&ExistingRollupInfo> = week_rollups
+                    .iter()
+                    .filter(|wr| week_in_month(&wr.period_key, &m.month_key, tz))
+                    .collect();
+                let (max_ripple, event_count) = compute_month_rollup_stats(&month_weeks);
+                ExistingRollupInfo {
+                    period_key: m.month_key.clone(),
+                    event_count,
+                    max_ripple,
+                    summary_md: String::new(),
+                }
+            })
+            .collect();
+        let month_reqs =
+            plan_month_rollup_updates("test-agent", now, tz, &month_rollups, &week_rollups);
+        assert!(
+            month_reqs.is_empty(),
+            "month planner should have no requests when months exist: {month_reqs:?}"
         );
     }
 
@@ -1088,14 +1151,14 @@ mod tests {
 
         let input = RollupPlannerInput {
             existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: cur_event_ts.to_rfc3339(),
                 encoded_at: cur_event_ts.to_rfc3339(),
                 ripple_strength: 8,
             }],
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
+        let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
 
         // Should NOT produce a background_candidate for current week's month.
         let bg = reqs.iter().find(|r| {
@@ -1362,12 +1425,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix 1 test: week_rolling_out suppressed when month rollup exists
+    // Fix 1 test: month planner skips month when rollup already exists
     // -----------------------------------------------------------------------
     #[test]
     fn test_week_rolling_out_suppressed_when_month_exists() {
         let now = jst_dt(2026, 5, 27, 10, 0);
         let recent = recent_weeks(now, 4, jst());
+        let tz = jst();
 
         let mut week_rollups: Vec<ExistingRollupInfo> = vec![];
         for w in &recent {
@@ -1379,7 +1443,6 @@ mod tests {
             });
         }
 
-        let tz = jst();
         let ro_monday = recent.last().unwrap().period_start.date_naive() - Duration::days(7);
         let ro_week = week_for_date_inner(ro_monday, tz);
         let ro_month = month_for_ym(
@@ -1388,83 +1451,20 @@ mod tests {
             tz,
         );
 
-        let input = RollupPlannerInput {
-            existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![ExistingRollupInfo {
-                period_key: ro_month.month_key.clone(),
-                event_count: 0,
-                max_ripple: 0,
-                summary_md: "existing summary".to_string(),
-            }],
-            events: vec![],
+        let existing_month = ExistingRollupInfo {
+            period_key: ro_month.month_key.clone(),
+            event_count: 0,
+            max_ripple: 0,
+            summary_md: "existing summary".to_string(),
         };
-        let reqs = plan_rollup_updates("test-agent", now, jst(), &input);
 
-        let rolling = reqs
-            .iter()
-            .find(|r| r.reason == "week_rolling_out" && r.period_key == ro_month.month_key);
+        let reqs =
+            plan_month_rollup_updates("test-agent", now, tz, &[existing_month], &week_rollups);
+
+        let rolling = reqs.iter().find(|r| r.period_key == ro_month.month_key);
         assert!(
             rolling.is_none(),
-            "week_rolling_out should NOT fire when month rollup already exists"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Fix 2 test: recent_months includes the month of the oldest week
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_recent_months_includes_oldest_week_month() {
-        let now = jst_dt(2026, 5, 27, 10, 0);
-        let weeks = recent_weeks(now, 4, jst());
-        let oldest = &weeks[weeks.len() - 1];
-
-        let months = recent_months_from_weeks(&weeks, 2, jst());
-
-        assert_eq!(months.len(), 2);
-
-        let oldest_month_key = format!(
-            "{}-{:02}",
-            oldest.period_start.year(),
-            oldest.period_start.month()
-        );
-        assert_eq!(
-            months[0].month_key, oldest_month_key,
-            "first recent month should be the month of the oldest week"
-        );
-
-        let prev_year = if oldest.period_start.month() == 1 {
-            oldest.period_start.year() - 1
-        } else {
-            oldest.period_start.year()
-        };
-        let prev_month = if oldest.period_start.month() == 1 {
-            12
-        } else {
-            oldest.period_start.month() - 1
-        };
-        let prev_key = format!("{}-{:02}", prev_year, prev_month);
-        assert_eq!(months[1].month_key, prev_key);
-
-        assert!(
-            months[0].period_end_exclusive <= oldest.period_start,
-            "first recent month end should be capped to oldest week start"
-        );
-    }
-
-    #[test]
-    fn test_recent_months_no_cap_when_month_ends_before_oldest_week() {
-        // When the oldest week starts on the 1st of a month, the month ends
-        // exactly at the week start — no cap needed (equality is fine).
-        // Use a date where Monday falls on the 1st.
-        let now = jst_dt(2026, 6, 4, 10, 0); // Thursday 2026-06-04
-        let weeks = recent_weeks(now, 4, jst());
-        let oldest = &weeks[weeks.len() - 1];
-        let months = recent_months_from_weeks(&weeks, 2, jst());
-
-        assert!(!months.is_empty());
-        assert!(
-            months[0].period_end_exclusive <= oldest.period_start,
-            "month end should not exceed oldest week start"
+            "month should NOT be requested when rollup already exists"
         );
     }
 
@@ -1500,5 +1500,263 @@ mod tests {
         assert!(month_period_from_key("invalid", tz).is_none());
         assert!(month_period_from_key("2026", tz).is_none());
         assert!(month_period_from_key("", tz).is_none());
+    }
+
+    #[test]
+    fn test_complete_months_recent_returns_full_months() {
+        let tz = jst();
+        let now = jst_dt(2026, 7, 15, 10, 0);
+
+        let months = complete_months_recent(now, 2, tz);
+
+        assert_eq!(months.len(), 2);
+        assert_eq!(months[0].month_key, "2026-06");
+        assert_eq!(months[1].month_key, "2026-05");
+        assert_eq!(months[0].period_start.day(), 1);
+        assert_eq!(months[0].period_end_exclusive.month(), 7);
+        assert_eq!(months[1].period_start.day(), 1);
+        assert_eq!(months[1].period_end_exclusive.month(), 6);
+    }
+
+    #[test]
+    fn test_month_trigger_conditions() {
+        let tz = jst();
+        let now = jst_dt(2026, 7, 15, 10, 0);
+
+        let june_week_rollup = ExistingRollupInfo {
+            period_key: "2026-W25".to_string(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: "test summary".to_string(),
+        };
+
+        // No existing month rollups → June should trigger
+        let reqs = plan_month_rollup_updates(
+            "test-agent",
+            now,
+            tz,
+            &[],
+            std::slice::from_ref(&june_week_rollup),
+        );
+
+        let june_req = reqs.iter().find(|r| r.period_key == "2026-06");
+        assert!(june_req.is_some(), "should trigger for June: {reqs:?}");
+        assert_eq!(june_req.unwrap().reason, "month_end");
+
+        let july_req = reqs.iter().find(|r| r.period_key == "2026-07");
+        assert!(
+            july_req.is_none(),
+            "should NOT trigger for July (not ended): {reqs:?}"
+        );
+
+        // With existing June month rollup with matching stats → June should be skipped
+        let existing_june = ExistingRollupInfo {
+            period_key: "2026-06".to_string(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: "existing".to_string(),
+        };
+        let reqs2 =
+            plan_month_rollup_updates("test-agent", now, tz, &[existing_june], &[june_week_rollup]);
+        let june_req2 = reqs2.iter().find(|r| r.period_key == "2026-06");
+        assert!(june_req2.is_none(), "should skip existing month rollup");
+    }
+
+    // -----------------------------------------------------------------------
+    // Split prompt template tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_prompt_reads_split_templates() {
+        // Arrange
+        let agent_id = "test-agent";
+
+        // Act
+        let week_prompt = build_call2_system_prompt_week(agent_id);
+        let month_prompt = build_call2_system_prompt_month(agent_id);
+
+        // Assert — both should start with the role description
+        assert!(
+            week_prompt.starts_with("あなたは test-agent の海馬です"),
+            "week prompt should start with agent name: {}",
+            &week_prompt[..week_prompt.len().min(100)]
+        );
+        assert!(
+            month_prompt.starts_with("あなたは test-agent の海馬です"),
+            "month prompt should start with agent name: {}",
+            &month_prompt[..month_prompt.len().min(100)]
+        );
+
+        // Assert — week prompt should contain week-specific content
+        assert!(
+            week_prompt.contains("週要約"),
+            "week prompt should contain 週要約 section"
+        );
+        assert!(
+            week_prompt.contains("独立bullet") || week_prompt.contains("独立 bullet"),
+            "week prompt should contain 独立 bullet instruction"
+        );
+
+        // Assert — month prompt should contain month-specific content
+        assert!(
+            month_prompt.contains("月要約"),
+            "month prompt should contain 月要約 section"
+        );
+        assert!(
+            month_prompt.contains("week_rollups"),
+            "month prompt should mention week_rollups in input schema"
+        );
+        assert!(
+            month_prompt.contains("previous_month_summary_md"),
+            "month prompt should mention previous_month_summary_md"
+        );
+    }
+
+    #[test]
+    fn test_build_month_input_with_week_rollups_and_stats() {
+        // Arrange
+        let month_req = RollupRequest {
+            granularity: RollupGranularity::Month,
+            period_key: "2026-07".to_string(),
+            period_start: "2026-07-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-08-01T00:00:00+09:00".to_string(),
+            reason: "month_end".to_string(),
+            previous_summary_md: None,
+        };
+
+        let week_rollup_w27 = Call2WeekRollupSummary {
+            period_key: "2026-W27".to_string(),
+            summary_md: "W27 summary".to_string(),
+            max_ripple: 3,
+            event_count: 5,
+        };
+        let week_rollup_w28 = Call2WeekRollupSummary {
+            period_key: "2026-W28".to_string(),
+            summary_md: "W28 summary".to_string(),
+            max_ripple: 4,
+            event_count: 8,
+        };
+
+        let mut week_rollups_map = HashMap::new();
+        week_rollups_map.insert(
+            "2026-07".to_string(),
+            vec![week_rollup_w27, week_rollup_w28],
+        );
+
+        let mut previous_month_map = HashMap::new();
+        previous_month_map.insert("2026-07".to_string(), "Previous June summary".to_string());
+
+        // Act — Input builder
+        let input = build_call2_input_month(&[month_req], &week_rollups_map, &previous_month_map);
+
+        // Assert — Input builder
+        assert_eq!(input.len(), 1);
+        let req = &input[0];
+        assert_eq!(req.granularity, "month");
+        assert_eq!(req.period_key, "2026-07");
+        assert_eq!(req.week_rollups.len(), 2);
+        assert_eq!(req.week_rollups[0].period_key, "2026-W27");
+        assert_eq!(req.week_rollups[1].period_key, "2026-W28");
+        assert_eq!(
+            req.previous_month_summary_md.as_deref(),
+            Some("Previous June summary")
+        );
+        assert!(
+            req.events.is_empty(),
+            "month input should not have raw events"
+        );
+
+        // Act — Stats computation
+        let existing_w27 = ExistingRollupInfo {
+            period_key: "2026-W27".to_string(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: String::new(),
+        };
+        let existing_w28 = ExistingRollupInfo {
+            period_key: "2026-W28".to_string(),
+            event_count: 8,
+            max_ripple: 4,
+            summary_md: String::new(),
+        };
+        let (max_ripple, event_count) = compute_month_rollup_stats(&[&existing_w27, &existing_w28]);
+
+        // Assert — Stats
+        assert_eq!(max_ripple, 4, "should be max of week max_ripples");
+        assert_eq!(event_count, 13, "should be sum of week event_counts");
+    }
+
+    #[test]
+    fn test_batch_executes_week_then_month_calls() {
+        let tz = jst();
+        let now = jst_dt(2026, 7, 15, 10, 0);
+        let recent = recent_weeks(now, 4, tz);
+
+        let w1 = &recent[0];
+
+        let week_rollup_for_w2 = ExistingRollupInfo {
+            period_key: recent[1].week_key.clone(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: "W-2 summary".to_string(),
+        };
+        let week_rollup_for_w3 = ExistingRollupInfo {
+            period_key: recent[2].week_key.clone(),
+            event_count: 3,
+            max_ripple: 2,
+            summary_md: "W-3 summary".to_string(),
+        };
+        let week_rollup_for_w4 = ExistingRollupInfo {
+            period_key: recent[3].week_key.clone(),
+            event_count: 2,
+            max_ripple: 4,
+            summary_md: "W-4 summary".to_string(),
+        };
+
+        let input = RollupPlannerInput {
+            existing_week_rollups: vec![
+                week_rollup_for_w2.clone(),
+                week_rollup_for_w3.clone(),
+                week_rollup_for_w4.clone(),
+            ],
+
+            events: vec![],
+        };
+
+        let week_reqs = plan_week_rollup_updates("test-agent", now, tz, &input);
+        for req in &week_reqs {
+            assert_eq!(
+                req.granularity,
+                RollupGranularity::Week,
+                "week planner should only return week requests: {:?}",
+                req
+            );
+        }
+        assert!(
+            week_reqs.iter().any(|r| r.period_key == w1.week_key),
+            "W-1 should be requested by week planner: {week_reqs:?}"
+        );
+
+        let month_reqs = plan_month_rollup_updates(
+            "test-agent",
+            now,
+            tz,
+            &[],
+            &[week_rollup_for_w2, week_rollup_for_w3, week_rollup_for_w4],
+        );
+        for req in &month_reqs {
+            assert_eq!(
+                req.granularity,
+                RollupGranularity::Month,
+                "month planner should only return month requests: {:?}",
+                req
+            );
+        }
+
+        let june = month_reqs.iter().find(|r| r.period_key == "2026-06");
+        assert!(
+            june.is_some(),
+            "June should be triggered by month planner: {month_reqs:?}"
+        );
     }
 }

@@ -40,8 +40,8 @@
 
 | フィールド | 意味 |
 |---|---|
-| `granularity` | 要約の時間単位。`week` または `month` |
-| `period_key` | `2026-W21`（ISO週）または `2026-04`（年月） |
+| `granularity` | `"week"` |
+| `period_key` | `2026-W21`（ISO週） |
 | `period_start` / `period_end_exclusive` | 対象期間の開始・終了（RFC 3339） |
 | `reason` | この rollup が要求された理由（`closed_week`, `missing_week`, `delayed_events` など）。参照用。 |
 | `previous_summary_md` | 前回この期間に対して生成された要約。存在しない場合は `null`。**新イベントを反映して上書き更新する** |
@@ -120,11 +120,6 @@ kind が出現しなかった場合は書かない。
 decision > relationship > self > insight > feat > anomaly > world > rhythm
 
 高い優先度の kind から先に bullet を書く。
-
-### 月要約
-
-1〜3 bullet。週要約ほどの細分は不要だが、主要な決定・関係性の変化は反映する。
-`[kind]` タグは付けなくてよい。
 
 ### 更新ルール
 
