@@ -795,16 +795,17 @@ async fn execute_batch(
                             continue;
                         };
 
-                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> = existing_week_rollups
-                            .iter()
-                            .filter(|wr| {
-                                rollup::week_in_month(
-                                    &wr.period_key,
-                                    &rollup_output.period_key,
-                                    tz_chrono,
-                                )
-                            })
-                            .collect();
+                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> =
+                            existing_week_rollups
+                                .iter()
+                                .filter(|wr| {
+                                    rollup::week_in_month(
+                                        &wr.period_key,
+                                        &rollup_output.period_key,
+                                        tz_chrono,
+                                    )
+                                })
+                                .collect();
                         let (computed_max_ripple, computed_event_count) =
                             rollup::compute_month_rollup_stats(&month_week_rollups);
 

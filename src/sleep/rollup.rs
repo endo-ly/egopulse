@@ -318,9 +318,9 @@ pub(crate) fn plan_month_rollup_updates(
 ) -> Vec<RollupRequest> {
     let mut requests = Vec::new();
 
-    let existing_month_keys: HashSet<&str> = existing_month_rollups
+    let existing_month_map: HashMap<&str, &ExistingRollupInfo> = existing_month_rollups
         .iter()
-        .map(|r| r.period_key.as_str())
+        .map(|r| (r.period_key.as_str(), r))
         .collect();
 
     let complete_months = complete_months_recent(now, 2, tz);
@@ -330,19 +330,28 @@ pub(crate) fn plan_month_rollup_updates(
             continue;
         }
 
-        if existing_month_keys.contains(mp.month_key.as_str()) {
-            continue;
-        }
-
-        let has_week_rollup = existing_week_rollups
+        let month_weeks: Vec<&ExistingRollupInfo> = existing_week_rollups
             .iter()
-            .any(|wr| week_in_month(&wr.period_key, &mp.month_key, tz));
+            .filter(|wr| week_in_month(&wr.period_key, &mp.month_key, tz))
+            .collect();
 
-        if !has_week_rollup {
+        if month_weeks.is_empty() {
             continue;
         }
 
-        requests.push(make_month_request(mp, "month_end", None));
+        if let Some(existing) = existing_month_map.get(mp.month_key.as_str()) {
+            let (computed_max, computed_count) = compute_month_rollup_stats(&month_weeks);
+            if computed_count == existing.event_count && computed_max == existing.max_ripple {
+                continue;
+            }
+            requests.push(make_month_request(
+                mp,
+                "month_stale",
+                Some(existing.summary_md.clone()),
+            ));
+        } else {
+            requests.push(make_month_request(mp, "month_end", None));
+        }
     }
 
     requests
@@ -1093,15 +1102,22 @@ mod tests {
         );
 
         let complete_months = complete_months_recent(now, 2, tz);
-        let mut month_rollups: Vec<ExistingRollupInfo> = vec![];
-        for m in &complete_months {
-            month_rollups.push(ExistingRollupInfo {
-                period_key: m.month_key.clone(),
-                event_count: 0,
-                max_ripple: 0,
-                summary_md: String::new(),
-            });
-        }
+        let month_rollups: Vec<ExistingRollupInfo> = complete_months
+            .iter()
+            .map(|m| {
+                let month_weeks: Vec<&ExistingRollupInfo> = week_rollups
+                    .iter()
+                    .filter(|wr| week_in_month(&wr.period_key, &m.month_key, tz))
+                    .collect();
+                let (max_ripple, event_count) = compute_month_rollup_stats(&month_weeks);
+                ExistingRollupInfo {
+                    period_key: m.month_key.clone(),
+                    event_count,
+                    max_ripple,
+                    summary_md: String::new(),
+                }
+            })
+            .collect();
         let month_reqs =
             plan_month_rollup_updates("test-agent", now, tz, &month_rollups, &week_rollups);
         assert!(
@@ -1533,11 +1549,11 @@ mod tests {
             "should NOT trigger for July (not ended): {reqs:?}"
         );
 
-        // With existing June month rollup → June should be skipped
+        // With existing June month rollup with matching stats → June should be skipped
         let existing_june = ExistingRollupInfo {
             period_key: "2026-06".to_string(),
-            event_count: 10,
-            max_ripple: 4,
+            event_count: 5,
+            max_ripple: 3,
             summary_md: "existing".to_string(),
         };
         let reqs2 =

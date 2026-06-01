@@ -406,6 +406,7 @@ pub(crate) struct TelegramAdapter {
     bot_tokens: std::collections::HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
     agent_bot_map: std::collections::HashMap<String, String>,
+    default_bot_id: Option<String>,
     http_client: reqwest::Client,
 }
 
@@ -413,10 +414,12 @@ impl TelegramAdapter {
     pub(crate) fn new_multi(
         bot_tokens: std::collections::HashMap<String, String>,
         agent_bot_map: std::collections::HashMap<String, String>,
+        default_bot_id: Option<String>,
     ) -> Self {
         Self {
             bot_tokens,
             agent_bot_map,
+            default_bot_id,
             http_client: reqwest::Client::new(),
         }
     }
@@ -434,6 +437,11 @@ impl TelegramAdapter {
                 if let Some(token) = self.bot_tokens.get(bot_id) {
                     return Ok(token);
                 }
+            }
+        }
+        if let Some(default_id) = &self.default_bot_id {
+            if let Some(token) = self.bot_tokens.get(default_id) {
+                return Ok(token);
             }
         }
         Err(format!(
@@ -1178,6 +1186,7 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(adapter.name(), "telegram");
     }
@@ -1187,6 +1196,7 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
             std::collections::HashMap::new(),
+            None,
         );
         let routes = adapter.chat_type_routes();
         assert!(routes.len() >= 6);
@@ -1224,6 +1234,7 @@ mod tests {
                 ("alice".to_string(), "main".to_string()),
                 ("bob".to_string(), "other".to_string()),
             ]),
+            None,
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:alice"),
@@ -1240,8 +1251,36 @@ mod tests {
         let adapter = TelegramAdapter::new_multi(
             std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
             std::collections::HashMap::new(),
+            None,
         );
         assert!(adapter.select_token("telegram:-100:agent:unknown").is_err());
+    }
+
+    #[test]
+    fn select_token_falls_back_to_default_bot() {
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
+            std::collections::HashMap::new(),
+            Some("main".to_string()),
+        );
+        assert_eq!(
+            adapter.select_token("telegram:-100:agent:unmapped"),
+            Ok("token-main")
+        );
+    }
+
+    #[test]
+    fn select_token_error_when_no_default_and_unmapped() {
+        let adapter = TelegramAdapter::new_multi(
+            std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
+            std::collections::HashMap::new(),
+            None,
+        );
+        assert!(
+            adapter
+                .select_token("telegram:-100:agent:unmapped")
+                .is_err()
+        );
     }
 
     /// Telegram BotCommand リストが all_commands() レジストリと整合することを確認。
