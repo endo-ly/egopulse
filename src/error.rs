@@ -153,6 +153,8 @@ pub enum ConfigError {
     TelegramBotChannelMultiAgentMismatch { channel_id: i64, reason: String },
     #[error("agent_telegram_bot_not_found: agent={agent_id} bot={bot_id}")]
     AgentTelegramBotNotFound { agent_id: String, bot_id: String },
+    #[error("telegram_bot_username_missing: bot={bot_id}")]
+    TelegramBotUsernameMissing { bot_id: String },
     #[error("pulse_invalid_timezone: {timezone}")]
     PulseInvalidTimezone { timezone: String },
     #[error("pulse_invalid_tick_interval: {reason}")]

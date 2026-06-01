@@ -86,6 +86,7 @@ struct FileTelegramChatConfig {
 #[serde(deny_unknown_fields)]
 struct FileTelegramBotConfig {
     token: Option<StringOrRef>,
+    username: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -530,6 +531,7 @@ fn normalize_telegram_bots(
             TelegramBotConfig {
                 token: resolved_token,
                 file_token,
+                username: fb.username,
             },
         );
     }
@@ -935,6 +937,19 @@ fn validate_telegram_bot_references(config: &Config) -> Result<(), ConfigError> 
 
     for bot_id in bots.keys() {
         validate_bot_id(bot_id)?;
+    }
+
+    for (bot_id, bot_cfg) in bots {
+        let username_ok = bot_cfg
+            .username
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|u| !u.is_empty());
+        if !username_ok {
+            return Err(ConfigError::TelegramBotUsernameMissing {
+                bot_id: bot_id.to_string(),
+            });
+        }
     }
 
     let telegram = config.channels.get("telegram");

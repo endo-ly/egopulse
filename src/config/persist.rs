@@ -30,6 +30,8 @@ struct SerializableTelegramBot {
         serialize_with = "serialize_optional_yaml_value"
     )]
     token: Option<yaml_serde::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -286,6 +288,7 @@ impl From<&Config> for SerializableConfig {
                                         bot_id.to_string(),
                                         SerializableTelegramBot {
                                             token: bot.file_token.clone(),
+                                            username: bot.username.clone(),
                                         },
                                     )
                                 })

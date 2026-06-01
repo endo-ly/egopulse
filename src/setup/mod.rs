@@ -187,6 +187,17 @@ impl SetupApp {
                 secret: true,
                 help: Some("From @BotFather on Telegram".into()),
             },
+            Field {
+                key: "TELEGRAM_BOT_USERNAME".into(),
+                label: "Telegram bot username".into(),
+                value: existing
+                    .get("TELEGRAM_BOT_USERNAME")
+                    .cloned()
+                    .unwrap_or_default(),
+                required: false,
+                secret: false,
+                help: Some("Without @, e.g. my_egopulse_bot".into()),
+            },
         ];
 
         update_field_visibility(&mut fields);
@@ -286,7 +297,7 @@ impl SetupApp {
                     .find(|f| f.key == "DISCORD_ENABLED")
                     .map(|f| parse_bool(&f.value).unwrap_or(false))
                     .unwrap_or(false),
-                "TELEGRAM_BOT_TOKEN" => !self
+                "TELEGRAM_BOT_TOKEN" | "TELEGRAM_BOT_USERNAME" => !self
                     .fields
                     .iter()
                     .find(|f| f.key == "TELEGRAM_ENABLED")

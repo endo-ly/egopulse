@@ -85,6 +85,12 @@ pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), String> {
         "TELEGRAM_BOT_TOKEN",
         "Telegram bot token is required when Telegram is enabled",
     )?;
+    validate_enabled_token(
+        fields,
+        "TELEGRAM_ENABLED",
+        "TELEGRAM_BOT_USERNAME",
+        "Telegram bot username is required when Telegram is enabled",
+    )?;
 
     Ok(())
 }
@@ -123,6 +129,7 @@ pub(crate) fn save_config(
     let discord_bot_token = field_value(fields, "DISCORD_BOT_TOKEN").to_string();
     let telegram_enabled = field_bool(fields, "TELEGRAM_ENABLED");
     let telegram_bot_token = field_value(fields, "TELEGRAM_BOT_TOKEN").to_string();
+    let telegram_bot_username = field_value(fields, "TELEGRAM_BOT_USERNAME").to_string();
 
     if let Some(config_dir) = config_path.parent() {
         fs::create_dir_all(config_dir)
@@ -207,6 +214,7 @@ pub(crate) fn save_config(
         discord_enabled,
         telegram_enabled,
         telegram_bot_token,
+        telegram_bot_username,
     );
 
     if let Some(bots) = discord_bots {

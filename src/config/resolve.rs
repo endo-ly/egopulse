@@ -325,6 +325,7 @@ impl Config {
                 Some(TelegramBotRuntime {
                     bot_id,
                     token: token.value(),
+                    username: bot.username.as_deref().unwrap_or(""),
                 })
             })
             .collect();
@@ -355,6 +356,7 @@ pub(crate) struct DiscordBotRuntime<'a> {
 pub(crate) struct TelegramBotRuntime<'a> {
     pub bot_id: &'a BotId,
     pub token: &'a str,
+    pub username: &'a str,
 }
 
 /// Default config file path: `~/.egopulse/egopulse.config.yaml`.
