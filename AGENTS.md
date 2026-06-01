@@ -7,7 +7,8 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 ```
 src/
 ├── main.rs              # CLI エントリポイント
-├── lib.rs               # モジュール公開インターフェース
+├── lib.rs               # モジュール宣言（内部モジュールは全て pub(crate)）
+├── app.rs               # バイナリ用公開 API ファサード（main.rs が参照）
 ├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
 ├── builtin_skills.rs    # ビルトインスキルのコンパイル時埋め込み
 │
