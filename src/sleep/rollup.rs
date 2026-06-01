@@ -121,6 +121,34 @@ pub(crate) fn recent_months_from_weeks(
     months
 }
 
+/// Complete calendar months ending before `now`, most-recent first.
+///
+/// Unlike `recent_months_from_weeks` which caps months to the oldest week boundary,
+/// this returns full calendar months suitable for end-of-month detection.
+pub(crate) fn complete_months_recent(
+    now: DateTime<FixedOffset>,
+    count: usize,
+    tz: chrono_tz::Tz,
+) -> Vec<MonthPeriod> {
+    let (prev_y, prev_m) = if now.month() == 1 {
+        (now.year() - 1, 12)
+    } else {
+        (now.year(), now.month() - 1)
+    };
+    let mut months = Vec::with_capacity(count);
+    let mut y = prev_y;
+    let mut m = prev_m;
+    for _ in 0..count {
+        months.push(month_for_ym(y, m, tz));
+        m = m.saturating_sub(1);
+        if m == 0 {
+            m = 12;
+            y -= 1;
+        }
+    }
+    months
+}
+
 fn week_for_date_inner(monday: NaiveDate, tz: chrono_tz::Tz) -> WeekPeriod {
     let ps: DateTime<chrono_tz::Tz> =
         tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid"));
@@ -347,6 +375,74 @@ pub(crate) fn plan_rollup_updates(
     }
 
     requests
+}
+
+/// Plan month rollup updates based on the new trigger:
+/// month has ended AND at least one week rollup exists for that month AND no existing month rollup.
+pub(crate) fn plan_month_rollup_updates(
+    _agent_id: &str,
+    now: DateTime<FixedOffset>,
+    tz: chrono_tz::Tz,
+    existing_month_rollups: &[ExistingRollupInfo],
+    existing_week_rollups: &[ExistingRollupInfo],
+) -> Vec<RollupRequest> {
+    let mut requests = Vec::new();
+
+    let existing_month_keys: HashSet<&str> = existing_month_rollups
+        .iter()
+        .map(|r| r.period_key.as_str())
+        .collect();
+
+    let complete_months = complete_months_recent(now, 2, tz);
+
+    for mp in &complete_months {
+        if now < mp.period_end_exclusive {
+            continue;
+        }
+
+        if existing_month_keys.contains(mp.month_key.as_str()) {
+            continue;
+        }
+
+        let has_week_rollup = existing_week_rollups
+            .iter()
+            .any(|wr| week_in_month(&wr.period_key, &mp.month_key, tz));
+
+        if !has_week_rollup {
+            continue;
+        }
+
+        requests.push(make_month_request(mp, "month_end", None));
+    }
+
+    requests
+}
+
+/// Check if a week (ISO week key like "2026-W14") belongs to a month (key like "2026-04").
+/// A week belongs to a month if the week's Monday falls within the month period.
+fn week_in_month(week_key: &str, month_key: &str, tz: chrono_tz::Tz) -> bool {
+    let Some(mp) = month_period_from_key(month_key, tz) else {
+        return false;
+    };
+    let (year, week_num) = parse_iso_week_key(week_key);
+    let Some(monday) = NaiveDate::from_isoywd_opt(year, week_num, chrono::Weekday::Mon) else {
+        return false;
+    };
+    let week_start: DateTime<FixedOffset> = to_fixed(
+        tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid")),
+    );
+    week_start >= mp.period_start && week_start < mp.period_end_exclusive
+}
+
+fn parse_iso_week_key(key: &str) -> (i32, u32) {
+    let parts: Vec<&str> = key.split('-').collect();
+    if parts.len() != 2 {
+        return (0, 0);
+    }
+    let year: i32 = parts[0].parse().unwrap_or(0);
+    let week_str = parts[1].strip_prefix('W').unwrap_or(parts[1]);
+    let week_num: u32 = week_str.parse().unwrap_or(0);
+    (year, week_num)
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +742,16 @@ fn redact_prefixed_values(
 /// Builds the Call2 system prompt from the embedded prompt template.
 pub(crate) fn build_call2_system_prompt(agent_id: &str) -> String {
     include_str!("rollup_prompt.md").replace("{AGENT_NAME}", agent_id)
+}
+
+/// Builds the Call2 system prompt for week rollups from the embedded week prompt template.
+pub(crate) fn build_call2_system_prompt_week(agent_id: &str) -> String {
+    include_str!("rollup_week_prompt.md").replace("{AGENT_NAME}", agent_id)
+}
+
+/// Builds the Call2 system prompt for month rollups from the embedded month prompt template.
+pub(crate) fn build_call2_system_prompt_month(agent_id: &str) -> String {
+    include_str!("rollup_month_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
 /// Builds the Call2 user prompt with the input JSON.
@@ -1500,5 +1606,123 @@ mod tests {
         assert!(month_period_from_key("invalid", tz).is_none());
         assert!(month_period_from_key("2026", tz).is_none());
         assert!(month_period_from_key("", tz).is_none());
+    }
+
+    #[test]
+    fn test_complete_months_recent_returns_full_months() {
+        let tz = jst();
+        let now = jst_dt(2026, 7, 15, 10, 0);
+
+        let months = complete_months_recent(now, 2, tz);
+
+        assert_eq!(months.len(), 2);
+        assert_eq!(months[0].month_key, "2026-06");
+        assert_eq!(months[1].month_key, "2026-05");
+        assert_eq!(months[0].period_start.day(), 1);
+        assert_eq!(months[0].period_end_exclusive.month(), 7);
+        assert_eq!(months[1].period_start.day(), 1);
+        assert_eq!(months[1].period_end_exclusive.month(), 6);
+    }
+
+    #[test]
+    fn test_month_trigger_conditions() {
+        let tz = jst();
+        let now = jst_dt(2026, 7, 15, 10, 0);
+
+        let june_week_rollup = ExistingRollupInfo {
+            period_key: "2026-W25".to_string(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: "test summary".to_string(),
+        };
+
+        // No existing month rollups → June should trigger
+        let reqs = plan_month_rollup_updates(
+            "test-agent",
+            now,
+            tz,
+            &[],
+            &[june_week_rollup.clone()],
+        );
+
+        let june_req = reqs.iter().find(|r| r.period_key == "2026-06");
+        assert!(june_req.is_some(), "should trigger for June: {reqs:?}");
+        assert_eq!(june_req.unwrap().reason, "month_end");
+
+        let july_req = reqs.iter().find(|r| r.period_key == "2026-07");
+        assert!(
+            july_req.is_none(),
+            "should NOT trigger for July (not ended): {reqs:?}"
+        );
+
+        // With existing June month rollup → June should be skipped
+        let existing_june = ExistingRollupInfo {
+            period_key: "2026-06".to_string(),
+            event_count: 10,
+            max_ripple: 4,
+            summary_md: "existing".to_string(),
+        };
+        let reqs2 = plan_month_rollup_updates(
+            "test-agent",
+            now,
+            tz,
+            &[existing_june],
+            &[june_week_rollup],
+        );
+        let june_req2 = reqs2.iter().find(|r| r.period_key == "2026-06");
+        assert!(
+            june_req2.is_none(),
+            "should skip existing month rollup"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Split prompt template tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_prompt_reads_split_templates() {
+        // Arrange
+        let agent_id = "test-agent";
+
+        // Act
+        let week_prompt = build_call2_system_prompt_week(agent_id);
+        let month_prompt = build_call2_system_prompt_month(agent_id);
+
+        // Assert — both should start with the role description
+        assert!(
+            week_prompt.starts_with("あなたは test-agent の海馬です"),
+            "week prompt should start with agent name: {}",
+            &week_prompt[..week_prompt.len().min(100)]
+        );
+        assert!(
+            month_prompt.starts_with("あなたは test-agent の海馬です"),
+            "month prompt should start with agent name: {}",
+            &month_prompt[..month_prompt.len().min(100)]
+        );
+
+        // Assert — week prompt should contain week-specific content
+        assert!(
+            week_prompt.contains("週要約"),
+            "week prompt should contain 週要約 section"
+        );
+        assert!(
+            week_prompt.contains("独立bullet") || week_prompt.contains("独立 bullet"),
+            "week prompt should contain 独立 bullet instruction"
+        );
+
+        // Assert — month prompt should contain month-specific content
+        assert!(
+            month_prompt.contains("月要約"),
+            "month prompt should contain 月要約 section"
+        );
+        assert!(
+            month_prompt.contains("week_rollups"),
+            "month prompt should mention week_rollups in input schema"
+        );
+        assert!(
+            month_prompt.contains("previous_month_summary_md"),
+            "month prompt should mention previous_month_summary_md"
+        );
     }
 }
