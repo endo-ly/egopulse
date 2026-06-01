@@ -395,26 +395,6 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
-
-    pub(crate) fn list_high_ripple_episode_events_before(
-        &self,
-        agent_id: &str,
-        min_ripple: i64,
-        before: &str,
-    ) -> Result<Vec<EpisodeEvent>, StorageError> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
-                    ripple_strength, certainty, sleep_run_id, source_refs_json,
-                    created_at, updated_at
-             FROM episode_events
-             WHERE agent_id = ?1 AND ripple_strength >= ?2 AND experienced_at < ?3
-             ORDER BY experienced_at ASC",
-        )?;
-        stmt.query_map(params![agent_id, min_ripple, before], row_to_episode_event)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4451,68 +4431,5 @@ mod tests {
         );
         assert_eq!(background[0].period_key, "2025-01");
         assert_eq!(background[1].period_key, "2024-11");
-    }
-
-    #[test]
-    fn test_list_high_ripple_episode_events_before_filters_correctly() {
-        let (db, _dir) = test_db();
-
-        let events = vec![
-            EpisodeEvent {
-                id: "evt-h1".to_string(),
-                agent_id: "agent-a".to_string(),
-                experienced_at: "2024-11-15T10:00:00Z".to_string(),
-                encoded_at: "2024-11-15T10:00:00Z".to_string(),
-                kind: EpisodeEventKind::Decision,
-                title: "high ripple 1".to_string(),
-                body_md: "body".to_string(),
-                ripple_strength: 5,
-                certainty: EpisodeEventCertainty::Stated,
-                sleep_run_id: "run-1".to_string(),
-                source_refs_json: None,
-                created_at: "2024-11-15T10:00:00Z".to_string(),
-                updated_at: "2024-11-15T10:00:00Z".to_string(),
-            },
-            EpisodeEvent {
-                id: "evt-h2".to_string(),
-                agent_id: "agent-a".to_string(),
-                experienced_at: "2024-12-10T12:00:00Z".to_string(),
-                encoded_at: "2024-12-10T12:00:00Z".to_string(),
-                kind: EpisodeEventKind::Insight,
-                title: "low ripple".to_string(),
-                body_md: "body".to_string(),
-                ripple_strength: 2,
-                certainty: EpisodeEventCertainty::Derived,
-                sleep_run_id: "run-1".to_string(),
-                source_refs_json: None,
-                created_at: "2024-12-10T12:00:00Z".to_string(),
-                updated_at: "2024-12-10T12:00:00Z".to_string(),
-            },
-            EpisodeEvent {
-                id: "evt-h3".to_string(),
-                agent_id: "agent-a".to_string(),
-                experienced_at: "2025-01-05T08:00:00Z".to_string(),
-                encoded_at: "2025-01-05T08:00:00Z".to_string(),
-                kind: EpisodeEventKind::Feat,
-                title: "high ripple 2".to_string(),
-                body_md: "body".to_string(),
-                ripple_strength: 4,
-                certainty: EpisodeEventCertainty::Stated,
-                sleep_run_id: "run-1".to_string(),
-                source_refs_json: None,
-                created_at: "2025-01-05T08:00:00Z".to_string(),
-                updated_at: "2025-01-05T08:00:00Z".to_string(),
-            },
-        ];
-
-        db.insert_episode_events("run-1", &events)
-            .expect("insert events");
-
-        let result = db
-            .list_high_ripple_episode_events_before("agent-a", 4, "2025-01-01T00:00:00Z")
-            .expect("query");
-
-        assert_eq!(result.len(), 1, "only evt-h1 (ripple=5, before Jan) passes");
-        assert_eq!(result[0].id, "evt-h1");
     }
 }

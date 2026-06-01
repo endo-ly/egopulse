@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::Datelike;
 use chrono_tz::OffsetComponents;
 
 use thiserror::Error;
@@ -323,6 +324,71 @@ pub async fn run_events_extract(
     Ok(())
 }
 
+async fn call_rollup_llm_with_retry(
+    provider: &Arc<dyn LlmProvider>,
+    system_prompt: &str,
+    input_json: &str,
+    valid_keys: &HashSet<String>,
+    agent_id: &str,
+) -> Result<(Vec<rollup::Call2RollupOutput>, i64, i64), SleepBatchError> {
+    let user_prompt = rollup::build_call2_user_prompt(input_json);
+    let user_message = Message::text("user", user_prompt);
+
+    let response = provider
+        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
+        .await
+        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+    let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
+    let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
+    let output_json = rollup::redact_secrets(&response.content);
+
+    match rollup::parse_call2_output(&output_json, valid_keys) {
+        Ok(outputs) => Ok((outputs, first_input, first_output)),
+        Err(first_error) => {
+            warn!(
+                agent_id = %agent_id,
+                error = %first_error,
+                "Call2 parse failed; retrying once"
+            );
+            const CALL2_RETRY_GUARD: &str = "\
+Your previous response was not valid JSON according to the expected schema. \
+You must respond with ONLY a JSON object containing exactly one key: \
+\"rollups\" (an array of rollup objects). \
+Each rollup must have: granularity, period_key, summary_md, max_ripple, event_count. \
+Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
+Output the raw JSON object and nothing else.";
+            let retry_messages = vec![
+                user_message,
+                Message::text("assistant", &response.content),
+                Message::text("user", CALL2_RETRY_GUARD),
+            ];
+            let retry_response = provider
+                .send_message(system_prompt, Arc::new(retry_messages), None)
+                .await
+                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+            let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
+            let combined_input = first_input.saturating_add(retry_input);
+            let combined_output = first_output.saturating_add(retry_output);
+            let retry_json = rollup::redact_secrets(&retry_response.content);
+
+            match rollup::parse_call2_output(&retry_json, valid_keys) {
+                Ok(outputs) => Ok((outputs, combined_input, combined_output)),
+                Err(retry_error) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        error = %retry_error,
+                        "Call2 retry also failed"
+                    );
+                    Err(SleepBatchError::ParseFailed(retry_error.to_string()))
+                }
+            }
+        }
+    }
+}
+
 async fn execute_batch(
     state: &AppState,
     db: Arc<Database>,
@@ -490,17 +556,11 @@ async fn execute_batch(
                     })
                     .collect();
 
-                let existing_month_key_set: HashSet<String> = existing_month_rollups
-                    .iter()
-                    .map(|r| r.period_key.clone())
-                    .collect();
-
                 let recent = rollup::recent_weeks(now, 4, tz_chrono);
                 let earliest_start = recent
                     .last()
                     .map(|w| w.period_start.to_rfc3339())
                     .unwrap_or_else(|| cw.period_start.to_rfc3339());
-                let bg_end = earliest_start.clone();
                 let agent_for_all = agent_id.to_string();
                 let all_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
                     db.list_episode_events_in_range(
@@ -520,62 +580,28 @@ async fn execute_batch(
                     })
                     .collect();
 
+                let month_requests = rollup::plan_month_rollup_updates(
+                    agent_id,
+                    now,
+                    tz_chrono,
+                    &existing_month_rollups,
+                    &existing_week_rollups,
+                );
+
                 let planner_input = rollup::RollupPlannerInput {
                     existing_week_rollups,
                     existing_month_rollups,
                     events: planner_events,
                 };
 
-                let mut rollup_requests =
-                    rollup::plan_rollup_updates(agent_id, now, tz_chrono, &planner_input);
+                let week_requests =
+                    rollup::plan_week_rollup_updates(agent_id, now, tz_chrono, &planner_input);
 
-                // Background candidates: old high-ripple events whose month has no rollup.
-                // This was removed from the Planner because the Planner only sees events
-                // within the recent-week window, missing truly old events.
-                {
-                    let recent_months = rollup::recent_months_from_weeks(&recent, 2, tz_chrono);
-                    let planner_month_keys: HashSet<String> = rollup_requests
-                        .iter()
-                        .filter(|r| r.granularity == RollupGranularity::Month)
-                        .map(|r| r.period_key.clone())
-                        .collect();
-                    let recent_month_keys: HashSet<&str> =
-                        recent_months.iter().map(|m| m.month_key.as_str()).collect();
-
-                    let agent_for_bg = agent_id.to_string();
-                    let bg_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
-                        db.list_high_ripple_episode_events_before(&agent_for_bg, 4, &bg_end)
-                    })
-                    .await
-                    .unwrap_or_default();
-
-                    let bg_month_keys: HashSet<String> = bg_events
-                        .iter()
-                        .filter_map(|e| e.experienced_at.get(..7).map(|s| s.to_string()))
-                        .collect();
-
-                    for mk in &bg_month_keys {
-                        if !existing_month_key_set.contains(mk.as_str())
-                            && !recent_month_keys.contains(mk.as_str())
-                            && !planner_month_keys.contains(mk.as_str())
-                        {
-                            if let Some(mp) = rollup::month_period_from_key(mk, tz_chrono) {
-                                rollup_requests.push(rollup::RollupRequest {
-                                    granularity: RollupGranularity::Month,
-                                    period_key: mk.clone(),
-                                    period_start: mp.period_start.to_rfc3339(),
-                                    period_end_exclusive: mp.period_end_exclusive.to_rfc3339(),
-                                    reason: "background_candidate".to_string(),
-                                    previous_summary_md: None,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                if !rollup_requests.is_empty() {
-                    let mut events_map: HashMap<String, Vec<rollup::Call2Event>> = HashMap::new();
-                    for req in &rollup_requests {
+                // Call 2a: Week rollup generation
+                if !week_requests.is_empty() {
+                    let mut week_events_map: HashMap<String, Vec<rollup::Call2Event>> =
+                        HashMap::new();
+                    for req in &week_requests {
                         let req_start = req.period_start.clone();
                         let req_end = req.period_end_exclusive.clone();
                         let req_key = req.period_key.clone();
@@ -602,109 +628,171 @@ async fn execute_batch(
                                 certainty: e.certainty.to_string(),
                             })
                             .collect();
-                        events_map.insert(req_key, call2_events);
+                        week_events_map.insert(req_key, call2_events);
                     }
 
-                    let input = rollup::build_call2_input(&rollup_requests, &events_map);
-                    let input_json = serde_json::to_string_pretty(&serde_json::json!({
-                        "rollup_requests": input
+                    let week_input = rollup::build_call2_input(&week_requests, &week_events_map);
+                    let week_input_json = serde_json::to_string_pretty(&serde_json::json!({
+                        "rollup_requests": week_input
                     }))
                     .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
-                    let input_json = rollup::redact_secrets(&input_json);
+                    let week_input_json = rollup::redact_secrets(&week_input_json);
 
-                    let system_prompt = rollup::build_call2_system_prompt(agent_id);
-                    let user_prompt = rollup::build_call2_user_prompt(&input_json);
-                    let user_message = Message::text("user", user_prompt);
+                    let week_system_prompt = rollup::build_call2_system_prompt_week(agent_id);
+                    let valid_keys: HashSet<String> =
+                        week_requests.iter().map(|r| r.period_key.clone()).collect();
 
-                    let response = provider
-                        .send_message(&system_prompt, Arc::new(vec![user_message.clone()]), None)
-                        .await
-                        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
-
-                    let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
-                    let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
-
-                    let output_json = rollup::redact_secrets(&response.content);
-                    let valid_keys: std::collections::HashSet<String> = rollup_requests
-                        .iter()
-                        .map(|r| r.period_key.clone())
-                        .collect();
-
-                    let (rollup_outputs, call2_in, call2_out) =
-                        match rollup::parse_call2_output(&output_json, &valid_keys) {
-                            Ok(outputs) => (outputs, first_input, first_output),
-                            Err(first_error) => {
-                                warn!(
-                                    agent_id = %agent_id,
-                                    error = %first_error,
-                                    "Call2 parse failed; retrying once"
-                                );
-                                const CALL2_RETRY_GUARD: &str = "\
-Your previous response was not valid JSON according to the expected schema. \
-You must respond with ONLY a JSON object containing exactly one key: \
-\"rollups\" (an array of rollup objects). \
-Each rollup must have: granularity, period_key, summary_md, max_ripple, event_count. \
-Do not include any other keys, markdown formatting, code blocks, or explanatory text. \
-Output the raw JSON object and nothing else.";
-                                let retry_messages = vec![
-                                    user_message,
-                                    Message::text("assistant", &response.content),
-                                    Message::text("user", CALL2_RETRY_GUARD),
-                                ];
-                                let retry_response = provider
-                                    .send_message(&system_prompt, Arc::new(retry_messages), None)
-                                    .await
-                                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
-
-                                let retry_input =
-                                    retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
-                                let retry_output =
-                                    retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
-                                let combined_input = first_input.saturating_add(retry_input);
-                                let combined_output = first_output.saturating_add(retry_output);
-
-                                let retry_json = rollup::redact_secrets(&retry_response.content);
-                                match rollup::parse_call2_output(&retry_json, &valid_keys) {
-                                    Ok(outputs) => (outputs, combined_input, combined_output),
-                                    Err(retry_error) => {
-                                        warn!(
-                                            agent_id = %agent_id,
-                                            error = %retry_error,
-                                            "Call2 retry also failed"
-                                        );
-                                        return Err(SleepBatchError::ParseFailed(
-                                            retry_error.to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                        };
+                    let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+                        &provider,
+                        &week_system_prompt,
+                        &week_input_json,
+                        &valid_keys,
+                        agent_id,
+                    )
+                    .await?;
 
                     input_tokens = input_tokens.saturating_add(call2_in);
                     output_tokens = output_tokens.saturating_add(call2_out);
 
-                    let requests_by_key: std::collections::HashMap<&str, &rollup::RollupRequest> =
-                        rollup_requests
-                            .iter()
-                            .map(|r| (r.period_key.as_str(), r))
-                            .collect();
+                    let requests_by_key: HashMap<&str, &rollup::RollupRequest> = week_requests
+                        .iter()
+                        .map(|r| (r.period_key.as_str(), r))
+                        .collect();
 
                     for rollup_output in &rollup_outputs {
                         let Some(request) = requests_by_key.get(rollup_output.period_key.as_str())
                         else {
                             continue;
                         };
-                        let granularity = match rollup_output.granularity.as_str() {
-                            "week" => RollupGranularity::Week,
-                            "month" => RollupGranularity::Month,
-                            _ => continue,
-                        };
                         let (computed_max_ripple, computed_event_count) =
-                            compute_rollup_stats(events_map.get(&rollup_output.period_key));
+                            compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
                         let rollup = crate::storage::EpisodeRollup {
                             id: uuid::Uuid::new_v4().to_string(),
                             agent_id: agent_id.to_string(),
-                            granularity,
+                            granularity: RollupGranularity::Week,
+                            period_key: rollup_output.period_key.clone(),
+                            period_start: request.period_start.clone(),
+                            period_end_exclusive: request.period_end_exclusive.clone(),
+                            summary_md: rollup_output.summary_md.clone(),
+                            max_ripple: computed_max_ripple,
+                            event_count: computed_event_count,
+                            generated_run_id: run_id.clone(),
+                            created_at: now.to_rfc3339(),
+                            updated_at: now.to_rfc3339(),
+                        };
+                        let rollup_for_db = rollup.clone();
+                        call_blocking(Arc::clone(&db), move |db| {
+                            db.upsert_episode_rollup(&rollup_for_db)
+                        })
+                        .await?;
+                    }
+                }
+
+                // Call 2b: Month rollup generation
+                if !month_requests.is_empty() {
+                    let mut week_rollups_map: HashMap<String, Vec<rollup::Call2WeekRollupSummary>> =
+                        HashMap::new();
+                    for req in &month_requests {
+                        let summaries: Vec<rollup::Call2WeekRollupSummary> = planner_input
+                            .existing_week_rollups
+                            .iter()
+                            .filter(|wr| {
+                                rollup::week_in_month(&wr.period_key, &req.period_key, tz_chrono)
+                            })
+                            .map(|wr| rollup::Call2WeekRollupSummary {
+                                period_key: wr.period_key.clone(),
+                                summary_md: wr.summary_md.clone(),
+                                max_ripple: wr.max_ripple,
+                                event_count: wr.event_count,
+                            })
+                            .collect();
+                        week_rollups_map.insert(req.period_key.clone(), summaries);
+                    }
+
+                    let mut previous_month_map: HashMap<String, String> = HashMap::new();
+                    for req in &month_requests {
+                        if let Some(mp) = rollup::month_period_from_key(&req.period_key, tz_chrono)
+                        {
+                            let prev_year = if mp.period_start.month() == 1 {
+                                mp.period_start.year() - 1
+                            } else {
+                                mp.period_start.year()
+                            };
+                            let prev_month = if mp.period_start.month() == 1 {
+                                12
+                            } else {
+                                mp.period_start.month() - 1
+                            };
+                            let prev_key = format!("{}-{:02}", prev_year, prev_month);
+                            if let Some(prev_rollup) = planner_input
+                                .existing_month_rollups
+                                .iter()
+                                .find(|r| r.period_key == prev_key)
+                            {
+                                previous_month_map
+                                    .insert(req.period_key.clone(), prev_rollup.summary_md.clone());
+                            }
+                        }
+                    }
+
+                    let month_input = rollup::build_call2_input_month(
+                        &month_requests,
+                        &week_rollups_map,
+                        &previous_month_map,
+                    );
+                    let month_input_json = serde_json::to_string_pretty(&serde_json::json!({
+                        "rollup_requests": month_input
+                    }))
+                    .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
+                    let month_input_json = rollup::redact_secrets(&month_input_json);
+
+                    let month_system_prompt = rollup::build_call2_system_prompt_month(agent_id);
+                    let valid_keys: HashSet<String> = month_requests
+                        .iter()
+                        .map(|r| r.period_key.clone())
+                        .collect();
+
+                    let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+                        &provider,
+                        &month_system_prompt,
+                        &month_input_json,
+                        &valid_keys,
+                        agent_id,
+                    )
+                    .await?;
+
+                    input_tokens = input_tokens.saturating_add(call2_in);
+                    output_tokens = output_tokens.saturating_add(call2_out);
+
+                    let requests_by_key: HashMap<&str, &rollup::RollupRequest> = month_requests
+                        .iter()
+                        .map(|r| (r.period_key.as_str(), r))
+                        .collect();
+
+                    for rollup_output in &rollup_outputs {
+                        let Some(request) = requests_by_key.get(rollup_output.period_key.as_str())
+                        else {
+                            continue;
+                        };
+
+                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> = planner_input
+                            .existing_week_rollups
+                            .iter()
+                            .filter(|wr| {
+                                rollup::week_in_month(
+                                    &wr.period_key,
+                                    &rollup_output.period_key,
+                                    tz_chrono,
+                                )
+                            })
+                            .collect();
+                        let (computed_max_ripple, computed_event_count) =
+                            rollup::compute_month_rollup_stats(&month_week_rollups);
+
+                        let rollup = crate::storage::EpisodeRollup {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: agent_id.to_string(),
+                            granularity: RollupGranularity::Month,
                             period_key: rollup_output.period_key.clone(),
                             period_start: request.period_start.clone(),
                             period_end_exclusive: request.period_end_exclusive.clone(),
