@@ -9,14 +9,16 @@ use std::path::PathBuf;
 use chrono::Datelike;
 use chrono::TimeZone;
 use clap::{Parser, Subcommand};
-use egopulse::agent_loop;
-use egopulse::channels::cli;
-use egopulse::config::{Config, default_config_path};
-use egopulse::error::{ConfigError, EgoPulseError};
-use egopulse::runtime;
-use egopulse::runtime::gateway::{self, GatewayAction};
-use egopulse::runtime::logging::init_logging;
-use egopulse::setup;
+use egopulse::app::agent_loop;
+use egopulse::app::channels::cli;
+use egopulse::app::config::{default_config_path, Config};
+use egopulse::app::error::{ConfigError, EgoPulseError};
+use egopulse::app::runtime;
+use egopulse::app::runtime::gateway::{self, GatewayAction};
+use egopulse::app::runtime::logging::init_logging;
+use egopulse::app::setup;
+use egopulse::app::sleep;
+use egopulse::app::storage::SleepRunTrigger;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -169,15 +171,15 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         Some(Command::Sleep { agent }) => {
             let state = runtime::build_sleep_app_state_with_path(config, resolved_config_path)?;
-            match egopulse::sleep::run_sleep_batch(
+            match sleep::run_sleep_batch(
                 &state,
                 agent.as_deref(),
-                egopulse::storage::SleepRunTrigger::Manual,
+                SleepRunTrigger::Manual,
             )
             .await
             {
                 Ok(()) => Ok(()),
-                Err(egopulse::sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
+                Err(sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
                     eprintln!("sleep batch already running for agent '{agent_id}'");
                     std::process::exit(1);
                 }
@@ -196,7 +198,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                     .as_deref()
                     .map(|d| normalize_date_input_to(d, tz))
                     .transpose()?;
-                match egopulse::sleep::run_events_extract(
+                match sleep::run_events_extract(
                     &state,
                     agent.as_deref(),
                     from.as_deref(),
@@ -205,7 +207,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
                 .await
                 {
                     Ok(()) => Ok(()),
-                    Err(egopulse::sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
+                    Err(sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
                         eprintln!("sleep batch already running for agent '{agent_id}'");
                         std::process::exit(1);
                     }

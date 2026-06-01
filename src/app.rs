@@ -42,7 +42,7 @@ pub mod runtime {
     /// Gateway command actions and CLI config path resolution.
     pub mod gateway {
         pub use crate::runtime::gateway::{
-            resolve_cli_config_path, run_gateway, GatewayAction,
+            resolve_cli_config_path, run_gateway, run_update, GatewayAction,
         };
     }
 
