@@ -1779,7 +1779,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-    
+
     telegram_channels:
       "123": {}"#,
     );
@@ -1814,7 +1814,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-    
+
     telegram_channels:
       "456":
         require_mention: true"#,
@@ -1879,7 +1879,7 @@ channels:
     telegram_bots:
       main:
         token: test-token
-    
+
     telegram_channels:
       "not_a_number": {}"#,
     );
@@ -3079,12 +3079,12 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-    
+
       secondary:
         token:
           source: env
           id: TG_BOT_2_TOKEN
-    
+
 "#;
     let env_path = temp_dir.path().join(".env");
     std::fs::write(&env_path, "TG_BOT_2_TOKEN=999:ZZZ\n").expect("write dotenv");
@@ -3130,7 +3130,7 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-    
+
     telegram_channels:
       "-100123456":
         require_mention: true
@@ -3172,7 +3172,7 @@ channels:
     telegram_bots:
       main:
         token: 123456:ABC-DEF
-    
+
     telegram_channels:
       "-100999":
         require_mention: false
@@ -3211,7 +3211,7 @@ channels:
         token:
           source: env
           id: TG_TOKEN_SECRET
-    
+
 "#;
     std::fs::write(&yaml_path, yaml).expect("write yaml");
 
@@ -3248,7 +3248,7 @@ channels:
         token:
           source: env
           id: TG_BOT_TOKEN
-    
+
     telegram_channels:
       "-100111":
         require_mention: true

@@ -192,17 +192,8 @@ pub async fn build_app_state_with_path(
                 Some((agent_id.to_string(), bot_id.to_string()))
             })
             .collect();
-        let default_bot_id = config
-            .agents
-            .get(&config.default_agent)
-            .and_then(|a| a.telegram_bot.as_ref())
-            .map(|b| b.to_string());
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(
-                bot_tokens,
-                agent_bots,
-                default_bot_id,
-            ),
+            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
         ));
     }
 
