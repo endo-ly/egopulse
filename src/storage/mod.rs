@@ -14,17 +14,6 @@ mod queries;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Process-wide lock that serializes SQLite file-level initialization.
-///
-/// `Connection::open` plus `PRAGMA journal_mode=WAL` is not safe to run
-/// concurrently on the same path: the WAL setup needs transient exclusive
-/// access to the database file, and SQLite can return `SQLITE_BUSY` even
-/// with a generous `busy_timeout`. The non-test entry point initializes
-/// the database exactly once, so this lock only exists for tests that
-/// exercise the `new_unchecked` concurrent-initialization path.
-#[cfg(test)]
-static DB_FILE_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Connection factory that opens a SQLite database file with connection-local
 /// SQLite settings. Database-file settings such as WAL mode are initialized
 /// once before the pool is built.
@@ -732,13 +721,12 @@ impl Database {
     }
 
     /// Creates a pool-backed Database without running migrations.
-    /// Used by migration tests that need a specific schema version.
+    /// Not safe to call concurrently on the same path: callers must serialize.
     #[cfg(test)]
     pub(crate) fn new_unchecked(db_path: &Path) -> Result<Self, StorageError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _init_guard = DB_FILE_INIT_LOCK.lock().expect("db init lock poisoned");
         initialize_database_file(db_path)?;
 
         let manager = SqliteConnectionManager::new(db_path.to_path_buf());
@@ -754,7 +742,6 @@ impl Database {
 mod tests {
     use super::*;
     use std::str::FromStr;
-    use std::sync::{Arc, Barrier};
 
     fn temp_db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("runtime").join("egopulse.db")
@@ -779,42 +766,6 @@ mod tests {
         // Assert
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
-    }
-
-    #[test]
-    fn database_unchecked_concurrent_pool_initialization_shares_existing_wal() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_db_path(&dir);
-        let threads = 8;
-        let barrier = Arc::new(Barrier::new(threads));
-
-        // Act
-        let handles = (0..threads)
-            .map(|_| {
-                let db_path = db_path.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let db = Database::new_unchecked(&db_path).expect("db");
-                    let conn = db.get_conn().expect("conn");
-                    conn.query_row("PRAGMA journal_mode;", [], |row| row.get::<_, String>(0))
-                        .expect("journal_mode")
-                })
-            })
-            .collect::<Vec<_>>();
-        let journal_modes = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("thread"))
-            .collect::<Vec<_>>();
-
-        // Assert
-        assert!(
-            journal_modes
-                .iter()
-                .all(|mode| mode.eq_ignore_ascii_case("wal")),
-            "all concurrent pools should observe WAL mode: {journal_modes:?}"
-        );
     }
 
     #[test]
