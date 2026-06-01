@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use thiserror::Error;
-use tracing;
 
 /// メディア処理に関するエラー型。
 #[derive(Error, Debug)]
