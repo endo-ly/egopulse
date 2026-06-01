@@ -6,8 +6,8 @@
 //! 公開 API は [`app`] モジュールに集約されている。バイナリ以外の利用者は
 //! そこから必要なアイテムだけを参照すること。
 
-pub mod app;
 pub(crate) mod agent_loop;
+pub mod app;
 pub(crate) mod assets;
 pub(crate) mod builtin_skills;
 pub(crate) mod channels;

@@ -24,7 +24,7 @@ pub mod channels {
 
 /// Configuration types and helpers.
 pub mod config {
-    pub use crate::config::{default_config_path, Config};
+    pub use crate::config::{Config, default_config_path};
 }
 
 /// Top-level error types and config error variants.
@@ -35,14 +35,13 @@ pub mod error {
 /// Runtime building blocks (AppState assembly, channel startup).
 pub mod runtime {
     pub use crate::runtime::{
-        ask, build_app_state_with_path, build_sleep_app_state_with_path, run_tui,
-        start_channels,
+        ask, build_app_state_with_path, build_sleep_app_state_with_path, run_tui, start_channels,
     };
 
     /// Gateway command actions and CLI config path resolution.
     pub mod gateway {
         pub use crate::runtime::gateway::{
-            resolve_cli_config_path, run_gateway, run_update, GatewayAction,
+            GatewayAction, resolve_cli_config_path, run_gateway, run_update,
         };
     }
 
@@ -59,7 +58,7 @@ pub mod setup {
 
 /// Sleep batch entrypoints and error type.
 pub mod sleep {
-    pub use crate::sleep::{run_events_extract, run_sleep_batch, SleepBatchError};
+    pub use crate::sleep::{SleepBatchError, run_events_extract, run_sleep_batch};
 }
 
 /// Storage types consumed directly by the CLI binary.

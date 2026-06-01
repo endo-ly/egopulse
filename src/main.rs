@@ -11,7 +11,7 @@ use chrono::TimeZone;
 use clap::{Parser, Subcommand};
 use egopulse::app::agent_loop;
 use egopulse::app::channels::cli;
-use egopulse::app::config::{default_config_path, Config};
+use egopulse::app::config::{Config, default_config_path};
 use egopulse::app::error::{ConfigError, EgoPulseError};
 use egopulse::app::runtime;
 use egopulse::app::runtime::gateway::{self, GatewayAction};
@@ -171,13 +171,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), EgoPulseError> {
         }
         Some(Command::Sleep { agent }) => {
             let state = runtime::build_sleep_app_state_with_path(config, resolved_config_path)?;
-            match sleep::run_sleep_batch(
-                &state,
-                agent.as_deref(),
-                SleepRunTrigger::Manual,
-            )
-            .await
-            {
+            match sleep::run_sleep_batch(&state, agent.as_deref(), SleepRunTrigger::Manual).await {
                 Ok(()) => Ok(()),
                 Err(sleep::SleepBatchError::AlreadyRunning { agent_id }) => {
                     eprintln!("sleep batch already running for agent '{agent_id}'");
