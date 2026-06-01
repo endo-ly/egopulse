@@ -14,6 +14,17 @@ mod queries;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Process-wide lock that serializes SQLite file-level initialization.
+///
+/// `Connection::open` plus `PRAGMA journal_mode=WAL` is not safe to run
+/// concurrently on the same path: the WAL setup needs transient exclusive
+/// access to the database file, and SQLite can return `SQLITE_BUSY` even
+/// with a generous `busy_timeout`. The non-test entry point initializes
+/// the database exactly once, so this lock only exists for tests that
+/// exercise the `new_unchecked` concurrent-initialization path.
+#[cfg(test)]
+static DB_FILE_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Connection factory that opens a SQLite database file with connection-local
 /// SQLite settings. Database-file settings such as WAL mode are initialized
 /// once before the pool is built.
@@ -727,6 +738,7 @@ impl Database {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _init_guard = DB_FILE_INIT_LOCK.lock().expect("db init lock poisoned");
         initialize_database_file(db_path)?;
 
         let manager = SqliteConnectionManager::new(db_path.to_path_buf());
