@@ -116,7 +116,13 @@ async fn resolve_explicit(
     }
 
     let channel = spec.channel.clone();
-    let external_chat_id = spec.external_chat_id.clone();
+    // Users specify raw channel IDs (e.g. "1486391580586672158") but the DB
+    // stores them in session-key format (e.g. "discord:1486391580586672158:agent:musa").
+    // Build the full key so the query matches.
+    let external_chat_id = format!(
+        "{}:{}:agent:{}",
+        spec.channel, spec.external_chat_id, agent_id
+    );
     let agent_id = agent_id.to_string();
 
     let chat = crate::storage::call_blocking(db.clone(), move |db| {
@@ -464,7 +470,7 @@ mod tests {
         let chat_id = insert_chat(
             &db,
             "discord",
-            "discord:999",
+            "discord:999:agent:agent-a",
             "dm",
             "agent-a",
             "2024-01-01T00:00:00Z",
@@ -472,7 +478,7 @@ mod tests {
 
         let spec = DeliverySpec {
             channel: "discord".to_string(),
-            external_chat_id: "discord:999".to_string(),
+            external_chat_id: "999".to_string(),
         };
 
         let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
@@ -482,7 +488,7 @@ mod tests {
 
         assert_eq!(surface.chat_id, chat_id);
         assert_eq!(surface.channel, "discord");
-        assert_eq!(surface.external_chat_id, "discord:999");
+        assert_eq!(surface.external_chat_id, "discord:999:agent:agent-a");
     }
 
     #[tokio::test]
@@ -492,7 +498,7 @@ mod tests {
         let auto_chat_id = insert_chat(
             &db,
             "discord",
-            "discord:auto",
+            "discord:auto:agent:agent-a",
             "dm",
             "agent-a",
             "2024-06-01T00:00:00Z",
@@ -500,7 +506,7 @@ mod tests {
 
         let spec = DeliverySpec {
             channel: "discord".to_string(),
-            external_chat_id: "discord:nonexistent".to_string(),
+            external_chat_id: "nonexistent".to_string(),
         };
 
         let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
@@ -518,7 +524,7 @@ mod tests {
         let _chat_id = insert_chat(
             &db,
             "discord",
-            "discord:111",
+            "discord:111:agent:agent-a",
             "dm",
             "agent-a",
             "2024-01-01T00:00:00Z",
@@ -527,7 +533,7 @@ mod tests {
         let telegram_chat_id = insert_chat(
             &db,
             "telegram",
-            "telegram:auto",
+            "telegram:auto:agent:agent-a",
             "dm",
             "agent-a",
             "2024-06-01T00:00:00Z",
@@ -535,7 +541,7 @@ mod tests {
 
         let spec = DeliverySpec {
             channel: "discord".to_string(),
-            external_chat_id: "discord:111".to_string(),
+            external_chat_id: "111".to_string(),
         };
 
         let surface = resolve_home_surface(&db, "agent-a", &["telegram"], Some(&spec))
@@ -553,7 +559,7 @@ mod tests {
         let _other_agent_chat = insert_chat(
             &db,
             "discord",
-            "discord:999",
+            "discord:999:agent:agent-b",
             "dm",
             "agent-b",
             "2024-01-01T00:00:00Z",
@@ -562,7 +568,7 @@ mod tests {
         let auto_chat_id = insert_chat(
             &db,
             "discord",
-            "discord:auto",
+            "discord:auto:agent:agent-a",
             "dm",
             "agent-a",
             "2024-06-01T00:00:00Z",
@@ -570,7 +576,7 @@ mod tests {
 
         let spec = DeliverySpec {
             channel: "discord".to_string(),
-            external_chat_id: "discord:999".to_string(),
+            external_chat_id: "999".to_string(),
         };
 
         let surface = resolve_home_surface(&db, "agent-a", &["discord"], Some(&spec))
@@ -591,7 +597,7 @@ mod tests {
         let chat_id = insert_chat(
             &db,
             "discord",
-            "discord:auto",
+            "discord:auto:agent:agent-a",
             "dm",
             "agent-a",
             "2024-06-01T00:00:00Z",
