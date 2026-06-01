@@ -143,11 +143,11 @@ pub(crate) fn load_and_merge_mcp_configs(
 }
 
 fn read_mcp_config_file(path: &Path) -> Result<McpConfigFile, McpError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| McpError::ConfigReadFailed {
+    let contents = std::fs::read_to_string(path).map_err(|source| McpError::ConfigRead {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_json::from_str(&contents).map_err(|detail| McpError::ConfigParseFailed {
+    serde_json::from_str(&contents).map_err(|detail| McpError::ConfigParse {
         path: path.to_path_buf(),
         detail: detail.to_string(),
     })
@@ -396,7 +396,7 @@ impl McpManager {
         let server = self
             .servers
             .get(server_idx)
-            .ok_or_else(|| McpError::ToolCallFailed {
+            .ok_or_else(|| McpError::ToolCall {
                 server: "unknown".to_string(),
                 tool: original_tool_name.clone(),
                 detail: "server index not found".to_string(),
@@ -406,7 +406,7 @@ impl McpManager {
         let arguments = match input {
             serde_json::Value::Object(map) => map,
             other => {
-                return Err(McpError::ToolCallFailed {
+                return Err(McpError::ToolCall {
                     server: server.name.clone(),
                     tool: original_tool_name.clone(),
                     detail: format!("expected JSON object for arguments, got {}", other),
@@ -419,14 +419,14 @@ impl McpManager {
         let result = match timeout(request_timeout, server.client.peer().call_tool(params)).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
-                return Err(McpError::ToolCallFailed {
+                return Err(McpError::ToolCall {
                     server: server.name.clone(),
                     tool: original_tool_name.clone(),
                     detail: error.to_string(),
                 });
             }
             Err(_) => {
-                return Err(McpError::ToolCallFailed {
+                return Err(McpError::ToolCall {
                     server: server.name.clone(),
                     tool: original_tool_name.clone(),
                     detail: format!("timed out after {}s", request_timeout_secs),
@@ -549,7 +549,7 @@ async fn connect_stdio(
     let command_str = config
         .command
         .as_deref()
-        .ok_or_else(|| McpError::ConnectionFailed {
+        .ok_or_else(|| McpError::Connection {
             server: name.to_string(),
             detail: "stdio transport requires 'command' field".to_string(),
         })?;
@@ -559,7 +559,7 @@ async fn connect_stdio(
     cmd.current_dir(workspace_dir);
     cmd.envs(&config.env);
 
-    let child = TokioChildProcess::new(cmd).map_err(|error| McpError::ConnectionFailed {
+    let child = TokioChildProcess::new(cmd).map_err(|error| McpError::Connection {
         server: name.to_string(),
         detail: error.to_string(),
     })?;
@@ -573,28 +573,28 @@ async fn connect_stdio(
 
     let client = timeout(connect_timeout, client_info.into_dyn().serve(child))
         .await
-        .map_err(|_| McpError::ConnectionFailed {
+        .map_err(|_| McpError::Connection {
             server: name.to_string(),
             detail: format!(
                 "connection timed out after {}s",
                 DEFAULT_CONNECTION_TIMEOUT_SECS
             ),
         })?
-        .map_err(|error| McpError::ConnectionFailed {
+        .map_err(|error| McpError::Connection {
             server: name.to_string(),
             detail: error.to_string(),
         })?;
 
     let tools = timeout(connect_timeout, client.list_all_tools())
         .await
-        .map_err(|_| McpError::ToolListFailed {
+        .map_err(|_| McpError::ToolList {
             server: name.to_string(),
             detail: format!(
                 "tool listing timed out after {}s",
                 DEFAULT_CONNECTION_TIMEOUT_SECS
             ),
         })?
-        .map_err(|error| McpError::ToolListFailed {
+        .map_err(|error| McpError::ToolList {
             server: name.to_string(),
             detail: error.to_string(),
         })?;
@@ -609,7 +609,7 @@ async fn connect_http(
     let endpoint = config
         .endpoint
         .as_deref()
-        .ok_or_else(|| McpError::ConnectionFailed {
+        .ok_or_else(|| McpError::Connection {
             server: name.to_string(),
             detail: "streamable_http transport requires 'endpoint' field".to_string(),
         })?;
@@ -646,28 +646,28 @@ async fn connect_http(
 
     let client = timeout(connect_timeout, client_info.into_dyn().serve(transport))
         .await
-        .map_err(|_| McpError::ConnectionFailed {
+        .map_err(|_| McpError::Connection {
             server: name.to_string(),
             detail: format!(
                 "connection timed out after {}s",
                 DEFAULT_CONNECTION_TIMEOUT_SECS
             ),
         })?
-        .map_err(|error| McpError::ConnectionFailed {
+        .map_err(|error| McpError::Connection {
             server: name.to_string(),
             detail: error.to_string(),
         })?;
 
     let tools = timeout(connect_timeout, client.list_all_tools())
         .await
-        .map_err(|_| McpError::ToolListFailed {
+        .map_err(|_| McpError::ToolList {
             server: name.to_string(),
             detail: format!(
                 "tool listing timed out after {}s",
                 DEFAULT_CONNECTION_TIMEOUT_SECS
             ),
         })?
-        .map_err(|error| McpError::ToolListFailed {
+        .map_err(|error| McpError::ToolList {
             server: name.to_string(),
             detail: error.to_string(),
         })?;

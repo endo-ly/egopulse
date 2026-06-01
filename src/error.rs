@@ -165,11 +165,11 @@ pub enum ConfigError {
 #[derive(Debug, Error)]
 pub enum TuiError {
     #[error("tui_init_failed: {0}")]
-    InitFailed(String),
+    Init(String),
     #[error("tui_render_failed: {0}")]
-    RenderFailed(String),
+    Render(String),
     #[error("tui_event_failed: {0}")]
-    EventFailed(String),
+    Event(String),
 }
 
 /// LLM provider request and response errors.
@@ -235,21 +235,21 @@ pub enum ChannelError {
 #[derive(Debug, Error)]
 pub enum McpError {
     #[error("mcp_config_read_failed: {path}: {source}")]
-    ConfigReadFailed {
+    ConfigRead {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     #[error("mcp_config_parse_failed: {path}: {detail}")]
-    ConfigParseFailed { path: PathBuf, detail: String },
+    ConfigParse { path: PathBuf, detail: String },
     #[error("mcp_connection_failed: server={server} {detail}")]
-    ConnectionFailed { server: String, detail: String },
+    Connection { server: String, detail: String },
     #[error("mcp_tool_call_failed: server={server} tool={tool} {detail}")]
-    ToolCallFailed {
+    ToolCall {
         server: String,
         tool: String,
         detail: String,
     },
     #[error("mcp_tool_list_failed: server={server} {detail}")]
-    ToolListFailed { server: String, detail: String },
+    ToolList { server: String, detail: String },
 }

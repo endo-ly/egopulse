@@ -35,18 +35,18 @@ struct TuiSession {
 
 impl TuiSession {
     fn new() -> Result<Self, TuiError> {
-        enable_raw_mode().map_err(|error| TuiError::InitFailed(error.to_string()))?;
+        enable_raw_mode().map_err(|error| TuiError::Init(error.to_string()))?;
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
-            return Err(TuiError::InitFailed(error.to_string()));
+            return Err(TuiError::Init(error.to_string()));
         }
         let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 let _ = disable_raw_mode();
-                return Err(TuiError::InitFailed(error.to_string()));
+                return Err(TuiError::Init(error.to_string()));
             }
         };
         Ok(Self { terminal })
@@ -266,7 +266,7 @@ async fn run_loop(
         poll_pending_send(app).await;
         terminal
             .draw(|frame| draw(frame, app))
-            .map_err(|error| TuiError::RenderFailed(error.to_string()))?;
+            .map_err(|error| TuiError::Render(error.to_string()))?;
 
         let Some(key) = read_pressed_key()? else {
             continue;
@@ -286,14 +286,12 @@ async fn run_loop(
 
 fn read_pressed_key() -> Result<Option<KeyEvent>, EgoPulseError> {
     if !event::poll(Duration::from_millis(200))
-        .map_err(|error| TuiError::EventFailed(error.to_string()))?
+        .map_err(|error| TuiError::Event(error.to_string()))?
     {
         return Ok(None);
     }
 
-    let Event::Key(key) =
-        event::read().map_err(|error| TuiError::EventFailed(error.to_string()))?
-    else {
+    let Event::Key(key) = event::read().map_err(|error| TuiError::Event(error.to_string()))? else {
         return Ok(None);
     };
 
@@ -527,7 +525,7 @@ async fn poll_pending_send(app: &mut TuiApp) {
 
     let result = match handle.await {
         Ok(result) => result,
-        Err(error) => Err(EgoPulseError::Tui(TuiError::EventFailed(error.to_string()))),
+        Err(error) => Err(EgoPulseError::Tui(TuiError::Event(error.to_string()))),
     };
 
     match result {
