@@ -512,6 +512,8 @@ pub(crate) struct Call2RollupRequest {
     pub reason: String,
     pub previous_summary_md: Option<String>,
     pub events: Vec<Call2Event>,
+    pub week_rollups: Vec<Call2WeekRollupSummary>,
+    pub previous_month_summary_md: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -523,6 +525,15 @@ pub(crate) struct Call2Event {
     pub body_md: String,
     pub ripple_strength: i64,
     pub certainty: String,
+}
+
+/// A week rollup summary used as input for month rollup generation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Call2WeekRollupSummary {
+    pub period_key: String,
+    pub summary_md: String,
+    pub max_ripple: i64,
+    pub event_count: i64,
 }
 
 /// Call2 LLM output JSON structure.
@@ -564,6 +575,8 @@ pub(crate) fn build_call2_input(
                 reason: req.reason.clone(),
                 previous_summary_md: req.previous_summary_md.clone(),
                 events,
+                week_rollups: Vec::new(),
+                previous_month_summary_md: None,
             }
         })
         .collect()
@@ -574,6 +587,49 @@ fn granularity_to_str(g: RollupGranularity) -> String {
         RollupGranularity::Week => "week".to_string(),
         RollupGranularity::Month => "month".to_string(),
     }
+}
+
+/// Builds the Call2 input for month rollup requests using week rollup summaries.
+///
+/// Unlike `build_call2_input` which uses raw events, this uses week rollup
+/// summaries as input for month-level summarization.
+pub(crate) fn build_call2_input_month(
+    rollup_requests: &[RollupRequest],
+    week_rollups_map: &HashMap<String, Vec<Call2WeekRollupSummary>>,
+    previous_month_map: &HashMap<String, String>,
+) -> Vec<Call2RollupRequest> {
+    rollup_requests
+        .iter()
+        .map(|req| {
+            let week_rollups = week_rollups_map
+                .get(&req.period_key)
+                .cloned()
+                .unwrap_or_default();
+            let previous_month_summary_md = previous_month_map.get(&req.period_key).cloned();
+            Call2RollupRequest {
+                granularity: granularity_to_str(req.granularity),
+                period_key: req.period_key.clone(),
+                period_start: req.period_start.clone(),
+                period_end_exclusive: req.period_end_exclusive.clone(),
+                reason: req.reason.clone(),
+                previous_summary_md: req.previous_summary_md.clone(),
+                events: Vec::new(),
+                week_rollups,
+                previous_month_summary_md,
+            }
+        })
+        .collect()
+}
+
+/// Computes month rollup statistics (max_ripple, event_count) by aggregating
+/// the statistics of the week rollups belonging to that month.
+///
+/// Uses the maximum `max_ripple` and the sum of `event_count` from all
+/// provided week rollups.
+pub(crate) fn compute_month_rollup_stats(week_rollups: &[&ExistingRollupInfo]) -> (i64, i64) {
+    let max_ripple = week_rollups.iter().map(|wr| wr.max_ripple).max().unwrap_or(3);
+    let event_count = week_rollups.iter().map(|wr| wr.event_count).sum();
+    (max_ripple, event_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,5 +1780,75 @@ mod tests {
             month_prompt.contains("previous_month_summary_md"),
             "month prompt should mention previous_month_summary_md"
         );
+    }
+
+    #[test]
+    fn test_build_month_input_with_week_rollups_and_stats() {
+        // Arrange
+        let month_req = RollupRequest {
+            granularity: RollupGranularity::Month,
+            period_key: "2026-07".to_string(),
+            period_start: "2026-07-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-08-01T00:00:00+09:00".to_string(),
+            reason: "month_end".to_string(),
+            previous_summary_md: None,
+        };
+
+        let week_rollup_w27 = Call2WeekRollupSummary {
+            period_key: "2026-W27".to_string(),
+            summary_md: "W27 summary".to_string(),
+            max_ripple: 3,
+            event_count: 5,
+        };
+        let week_rollup_w28 = Call2WeekRollupSummary {
+            period_key: "2026-W28".to_string(),
+            summary_md: "W28 summary".to_string(),
+            max_ripple: 4,
+            event_count: 8,
+        };
+
+        let mut week_rollups_map = HashMap::new();
+        week_rollups_map.insert("2026-07".to_string(), vec![week_rollup_w27, week_rollup_w28]);
+
+        let mut previous_month_map = HashMap::new();
+        previous_month_map.insert("2026-07".to_string(), "Previous June summary".to_string());
+
+        // Act — Input builder
+        let input =
+            build_call2_input_month(&[month_req], &week_rollups_map, &previous_month_map);
+
+        // Assert — Input builder
+        assert_eq!(input.len(), 1);
+        let req = &input[0];
+        assert_eq!(req.granularity, "month");
+        assert_eq!(req.period_key, "2026-07");
+        assert_eq!(req.week_rollups.len(), 2);
+        assert_eq!(req.week_rollups[0].period_key, "2026-W27");
+        assert_eq!(req.week_rollups[1].period_key, "2026-W28");
+        assert_eq!(
+            req.previous_month_summary_md.as_deref(),
+            Some("Previous June summary")
+        );
+        assert!(req.events.is_empty(), "month input should not have raw events");
+
+        // Act — Stats computation
+        let existing_w27 = ExistingRollupInfo {
+            period_key: "2026-W27".to_string(),
+            event_count: 5,
+            max_ripple: 3,
+            summary_md: String::new(),
+        };
+        let existing_w28 = ExistingRollupInfo {
+            period_key: "2026-W28".to_string(),
+            event_count: 8,
+            max_ripple: 4,
+            summary_md: String::new(),
+        };
+        let (max_ripple, event_count) =
+            compute_month_rollup_stats(&[&existing_w27, &existing_w28]);
+
+        // Assert — Stats
+        assert_eq!(max_ripple, 4, "should be max of week max_ripples");
+        assert_eq!(event_count, 13, "should be sum of week event_counts");
     }
 }
