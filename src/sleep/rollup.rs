@@ -60,7 +60,6 @@ pub(crate) struct PlannerEvent {
 
 pub(crate) struct RollupPlannerInput {
     pub existing_week_rollups: Vec<ExistingRollupInfo>,
-    pub existing_month_rollups: Vec<ExistingRollupInfo>,
     pub events: Vec<PlannerEvent>,
 }
 
@@ -828,7 +827,7 @@ mod tests {
         // No week rollups at all → W-1 should be detected as closed_week.
         let input = RollupPlannerInput {
             existing_week_rollups: vec![],
-            existing_month_rollups: vec![],
+
             events: vec![],
         };
         let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
@@ -859,7 +858,7 @@ mod tests {
                 max_ripple: 0,
                 summary_md: String::new(),
             }],
-            existing_month_rollups: vec![],
+
             events: vec![],
         };
         let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
@@ -892,7 +891,7 @@ mod tests {
                 max_ripple: 3,
                 summary_md: "old summary".to_string(),
             }],
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: exp_in_w2.to_rfc3339(),
                 encoded_at: now.to_rfc3339(), // encoded now
@@ -938,7 +937,7 @@ mod tests {
                 max_ripple: 3,
                 summary_md: String::new(),
             }],
-            existing_month_rollups: vec![],
+
             events,
         };
         let reqs = plan_week_rollup_updates("test-agent", now, jst(), &input);
@@ -1038,7 +1037,7 @@ mod tests {
 
         let input = RollupPlannerInput {
             existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: old_ts.to_rfc3339(),
                 encoded_at: old_ts.to_rfc3339(),
@@ -1084,7 +1083,7 @@ mod tests {
 
         let input = RollupPlannerInput {
             existing_week_rollups: week_rollups.clone(),
-            existing_month_rollups: vec![],
+
             events,
         };
         let week_reqs = plan_week_rollup_updates("test-agent", now, tz, &input);
@@ -1136,7 +1135,7 @@ mod tests {
 
         let input = RollupPlannerInput {
             existing_week_rollups: week_rollups,
-            existing_month_rollups: vec![],
+
             events: vec![PlannerEvent {
                 experienced_at: cur_event_ts.to_rfc3339(),
                 encoded_at: cur_event_ts.to_rfc3339(),
@@ -1704,7 +1703,7 @@ mod tests {
                 week_rollup_for_w3.clone(),
                 week_rollup_for_w4.clone(),
             ],
-            existing_month_rollups: vec![],
+
             events: vec![],
         };
 

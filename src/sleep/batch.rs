@@ -580,22 +580,17 @@ async fn execute_batch(
                     })
                     .collect();
 
-                let month_requests = rollup::plan_month_rollup_updates(
+                let mut existing_week_rollups = existing_week_rollups;
+
+                let week_requests = rollup::plan_week_rollup_updates(
                     agent_id,
                     now,
                     tz_chrono,
-                    &existing_month_rollups,
-                    &existing_week_rollups,
+                    &rollup::RollupPlannerInput {
+                        existing_week_rollups: existing_week_rollups.clone(),
+                        events: planner_events,
+                    },
                 );
-
-                let planner_input = rollup::RollupPlannerInput {
-                    existing_week_rollups,
-                    existing_month_rollups,
-                    events: planner_events,
-                };
-
-                let week_requests =
-                    rollup::plan_week_rollup_updates(agent_id, now, tz_chrono, &planner_input);
 
                 // Call 2a: Week rollup generation
                 if !week_requests.is_empty() {
@@ -686,15 +681,41 @@ async fn execute_batch(
                         })
                         .await?;
                     }
+
+                    for rollup_output in &rollup_outputs {
+                        let (computed_max_ripple, computed_event_count) =
+                            compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
+                        let updated = rollup::ExistingRollupInfo {
+                            period_key: rollup_output.period_key.clone(),
+                            event_count: computed_event_count,
+                            max_ripple: computed_max_ripple,
+                            summary_md: rollup_output.summary_md.clone(),
+                        };
+                        if let Some(idx) = existing_week_rollups
+                            .iter()
+                            .position(|r| r.period_key == rollup_output.period_key)
+                        {
+                            existing_week_rollups[idx] = updated;
+                        } else {
+                            existing_week_rollups.push(updated);
+                        }
+                    }
                 }
+
+                let month_requests = rollup::plan_month_rollup_updates(
+                    agent_id,
+                    now,
+                    tz_chrono,
+                    &existing_month_rollups,
+                    &existing_week_rollups,
+                );
 
                 // Call 2b: Month rollup generation
                 if !month_requests.is_empty() {
                     let mut week_rollups_map: HashMap<String, Vec<rollup::Call2WeekRollupSummary>> =
                         HashMap::new();
                     for req in &month_requests {
-                        let summaries: Vec<rollup::Call2WeekRollupSummary> = planner_input
-                            .existing_week_rollups
+                        let summaries: Vec<rollup::Call2WeekRollupSummary> = existing_week_rollups
                             .iter()
                             .filter(|wr| {
                                 rollup::week_in_month(&wr.period_key, &req.period_key, tz_chrono)
@@ -724,8 +745,7 @@ async fn execute_batch(
                                 mp.period_start.month() - 1
                             };
                             let prev_key = format!("{}-{:02}", prev_year, prev_month);
-                            if let Some(prev_rollup) = planner_input
-                                .existing_month_rollups
+                            if let Some(prev_rollup) = existing_month_rollups
                                 .iter()
                                 .find(|r| r.period_key == prev_key)
                             {
@@ -775,8 +795,7 @@ async fn execute_batch(
                             continue;
                         };
 
-                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> = planner_input
-                            .existing_week_rollups
+                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> = existing_week_rollups
                             .iter()
                             .filter(|wr| {
                                 rollup::week_in_month(
