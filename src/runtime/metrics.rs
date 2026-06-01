@@ -19,7 +19,7 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// # Panics
 ///
 /// Panics if the recorder cannot be built (should never happen outside of OOM).
-pub fn init_metrics() -> &'static PrometheusHandle {
+pub(crate) fn init_metrics() -> &'static PrometheusHandle {
     HANDLE.get_or_init(|| {
         let handle = PrometheusBuilder::new()
             .install_recorder()
@@ -41,7 +41,7 @@ pub fn init_metrics() -> &'static PrometheusHandle {
 /// Renders the current Prometheus text exposition.
 ///
 /// Idempotent — initializes the recorder if not yet installed.
-pub fn metrics_output() -> String {
+pub(crate) fn metrics_output() -> String {
     init_metrics().render()
 }
 

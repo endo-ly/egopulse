@@ -73,7 +73,7 @@ fn initialize_database_file(db_path: &Path) -> Result<(), StorageError> {
 /// The database file is initialized in WAL mode before pooling starts, and
 /// each pooled connection receives connection-local settings such as
 /// `busy_timeout = 5 s`.
-pub struct Database {
+pub(crate) struct Database {
     pool: Pool,
 }
 
