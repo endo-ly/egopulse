@@ -4,7 +4,7 @@
 //! 各入力面を共通の agent runtime に接続する。
 
 pub(crate) mod adapter;
-pub mod cli;
+pub(crate) mod cli;
 #[cfg(feature = "channel-discord")]
 pub(crate) mod discord;
 #[cfg(feature = "channel-telegram")]

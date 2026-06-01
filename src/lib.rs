@@ -7,21 +7,21 @@
 //! そこから必要なアイテムだけを参照すること。
 
 pub mod app;
-pub mod agent_loop;
+pub(crate) mod agent_loop;
 pub(crate) mod assets;
 pub(crate) mod builtin_skills;
-pub mod channels;
-pub mod config;
-pub mod error;
+pub(crate) mod channels;
+pub(crate) mod config;
+pub(crate) mod error;
 pub(crate) mod llm;
 pub(crate) mod memory;
 pub(crate) mod pulse;
-pub mod runtime;
-pub mod setup;
+pub(crate) mod runtime;
+pub(crate) mod setup;
 pub(crate) mod skills;
 pub(crate) mod slash_commands;
-pub mod sleep;
-pub mod storage;
+pub(crate) mod sleep;
+pub(crate) mod storage;
 pub(crate) mod tools;
 
 #[cfg(test)]

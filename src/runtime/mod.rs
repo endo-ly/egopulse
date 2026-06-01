@@ -2,11 +2,11 @@
 //!
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
-pub mod gateway;
-pub mod logging;
+pub(crate) mod gateway;
+pub(crate) mod logging;
 pub(crate) mod metrics;
 pub(crate) mod runtime_status;
-pub mod status;
+pub(crate) mod status;
 pub(crate) mod turn_scheduler;
 
 pub(crate) use runtime_status::ChannelState;
