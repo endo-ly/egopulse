@@ -606,4 +606,85 @@ mod tests {
         assert!(recent_weeks_pos < recent_months_pos);
         assert!(recent_months_pos < bg_pos);
     }
+
+    #[test]
+    fn test_episodic_renderer_after_split() {
+        // Test that the renderer works correctly after the week/month rollup split.
+        // It should handle the new data flow where week and month rollups are
+        // generated independently via separate batch steps.
+
+        // Arrange
+        let events = vec![make_event(
+            "2026-05-25T10:00:00+09:00",
+            "decision",
+            "Feature design",
+            "Split rollups into week and month steps.",
+            4,
+        )];
+
+        let week_rollups = vec![
+            make_rollup(
+                "2026-W21",
+                "2026-05-18",
+                "2026-05-25",
+                "- Week 21 summary.",
+                5,
+                RollupGranularity::Week,
+            ),
+            make_rollup(
+                "2026-W20",
+                "2026-05-11",
+                "2026-05-18",
+                "- Week 20 summary.",
+                4,
+                RollupGranularity::Week,
+            ),
+        ];
+
+        let month_rollups = vec![make_rollup(
+            "2026-04",
+            "2026-04-01",
+            "2026-05-01",
+            "- April summary.",
+            4,
+            RollupGranularity::Month,
+        )];
+
+        // Act
+        let output = render_with(&events, &week_rollups, &month_rollups, &[]);
+
+        // Assert — output is non-empty
+        assert!(!output.is_empty(), "rendered markdown should not be empty");
+
+        // Assert — all sections present
+        assert!(output.contains("# Episodic Memory"));
+        assert!(output.contains("## Current Week: 2026-W22 (2026-05-25..2026-05-31)"));
+        assert!(output.contains("## Recent Weeks"));
+        assert!(output.contains("## Recent Months"));
+
+        // Assert — event content
+        assert!(output.contains("- [decision r4] Feature design"));
+
+        // Assert — week rollup content
+        assert!(output.contains("### 2026-W21 (2026-05-18..2026-05-24) r5"));
+        assert!(output.contains("- Week 21 summary."));
+        assert!(output.contains("### 2026-W20 (2026-05-11..2026-05-17) r4"));
+        assert!(output.contains("- Week 20 summary."));
+
+        // Assert — month rollup content (the key concern after split)
+        assert!(output.contains("### 2026-04 r4"));
+        assert!(output.contains("- April summary."));
+
+        // Assert — no background months section (none provided)
+        assert!(!output.contains("## Background Months"));
+
+        // Assert — section order
+        let header_pos = output.find("# Episodic Memory").unwrap();
+        let current_pos = output.find("## Current Week").unwrap();
+        let recent_weeks_pos = output.find("## Recent Weeks").unwrap();
+        let recent_months_pos = output.find("## Recent Months").unwrap();
+        assert!(header_pos < current_pos);
+        assert!(current_pos < recent_weeks_pos);
+        assert!(recent_weeks_pos < recent_months_pos);
+    }
 }
