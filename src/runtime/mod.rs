@@ -560,6 +560,18 @@ async fn execute_turn_with_retry(
                 tokio::time::sleep(delay).await;
                 last_error = Some(error);
             }
+            Err(error) if error.is_codex_auth_error() && attempt == 0 => {
+                tracing::warn!(
+                    error = %error,
+                    "codex 401 detected, attempting token refresh"
+                );
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_default();
+                crate::llm::codex_auth::force_refresh_codex_token(&http).await;
+                last_error = Some(error);
+            }
             Err(error) => return Err(error),
         }
     }

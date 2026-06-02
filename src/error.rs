@@ -107,6 +107,14 @@ impl EgoPulseError {
             _ => None,
         }
     }
+
+    pub(crate) fn is_codex_auth_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Llm(LlmError::ApiError { status, .. })
+                if status.as_u16() == 401
+        )
+    }
 }
 
 impl LlmError {
