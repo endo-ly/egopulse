@@ -206,6 +206,42 @@ pub(crate) fn clear_auth_cache() {
 /// auth.json の競合書き込みを防ぐ。更新に成功すると一時ファイル経由で原子的に
 /// auth.json を上書きする。失敗した場合はサイレントに戻る（起動をブロックしない）。
 pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
+    let auth_path = default_codex_auth_path();
+    if !auth_path.exists() {
+        return;
+    }
+
+    let content = match std::fs::read_to_string(&auth_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let access = match parsed
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+    {
+        Some(a) if !a.is_empty() => a,
+        _ => return,
+    };
+
+    if !is_jwt_expired(access) {
+        return;
+    }
+
+    force_refresh_codex_token(http).await;
+}
+
+/// refresh_token を使って access_token を強制的に更新する。
+///
+/// `refresh_if_needed` と異なり JWT の有効期限チェックをバイパスする。
+/// OpenAI 側でトークンが無効化された (401) 場合のフォールバックとして使用する。
+pub(crate) async fn force_refresh_codex_token(http: &reqwest::Client) {
     let _guard = REFRESH_LOCK.lock().await;
 
     let auth_path = default_codex_auth_path();
@@ -227,14 +263,6 @@ pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
         None => return,
     };
 
-    let access = match tokens
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-    {
-        Some(a) if !a.is_empty() => a.to_string(),
-        _ => return,
-    };
     let refresh = match tokens
         .get("refresh_token")
         .and_then(|v| v.as_str())
@@ -244,11 +272,7 @@ pub(crate) async fn refresh_if_needed(http: &reqwest::Client) {
         _ => return,
     };
 
-    if !is_jwt_expired(&access) {
-        return;
-    }
-
-    tracing::debug!("codex access_token expired, refreshing");
+    tracing::info!("codex: forcing token refresh (current token invalidated)");
 
     let body = serde_json::json!({
         "grant_type": "refresh_token",

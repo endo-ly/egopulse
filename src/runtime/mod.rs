@@ -431,7 +431,7 @@ pub(crate) fn execute_scheduled_turn(
         let started_at = chrono::Utc::now().to_rfc3339();
         let started = std::time::Instant::now();
 
-        let turn_result = crate::agent_loop::process_turn(state, &turn.context, &turn.input).await;
+        let turn_result = execute_turn_with_retry(state, &turn.context, &turn.input).await;
         let duration = started.elapsed().as_secs_f64();
 
         match turn_result {
@@ -519,6 +519,7 @@ pub(crate) fn execute_scheduled_turn(
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                     }
                 }
+                send_turn_failure_to_channel(adapter, &external_chat_id, &error).await;
                 if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
                     execute_scheduled_turn(state, next).await;
                 }
@@ -530,6 +531,63 @@ pub(crate) fn execute_scheduled_turn(
             execute_scheduled_turn(state, next).await;
         }
     })
+}
+
+const MAX_TURN_RETRIES: u32 = 2;
+
+async fn execute_turn_with_retry(
+    state: &AppState,
+    context: &crate::agent_loop::SurfaceContext,
+    input: &str,
+) -> Result<String, EgoPulseError> {
+    for attempt in 0..=MAX_TURN_RETRIES {
+        let result = crate::agent_loop::process_turn(state, context, input).await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) if error.is_retryable() && attempt < MAX_TURN_RETRIES => {
+                let delay = error
+                    .retry_after_secs()
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_secs(2u64.pow(attempt)));
+                tracing::warn!(
+                    attempt,
+                    max_retries = MAX_TURN_RETRIES,
+                    delay_secs = delay.as_secs(),
+                    error = %error,
+                    "turn failed with retryable error, retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) if error.is_codex_auth_error() && attempt == 0 => {
+                tracing::warn!(
+                    error = %error,
+                    "codex 401 detected, attempting token refresh"
+                );
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_default();
+                crate::llm::codex_auth::force_refresh_codex_token(&http).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("loop always returns via match arms on final iteration")
+}
+
+async fn send_turn_failure_to_channel(
+    adapter: Option<&Arc<dyn crate::channels::adapter::ChannelAdapter>>,
+    external_chat_id: &str,
+    error: &EgoPulseError,
+) {
+    let Some(adapter) = adapter else { return };
+    let message = format!("⚠️ {}", error.user_facing_summary());
+    if let Err(send_err) = adapter.send_text(external_chat_id, &message).await {
+        tracing::warn!(
+            error = %send_err,
+            "failed to send turn failure message to channel"
+        );
+    }
 }
 
 fn spawn_mcp_reconnect_loop(

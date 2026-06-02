@@ -54,6 +54,78 @@ impl EgoPulseError {
     pub(crate) fn user_message(&self) -> String {
         format!("Error: {self}")
     }
+
+    /// Returns a short, user-facing error summary suitable for chat channels.
+    pub(crate) fn user_facing_summary(&self) -> String {
+        match self {
+            Self::Llm(LlmError::ApiError {
+                status,
+                retry_after_secs: Some(secs),
+                ..
+            }) if status.as_u16() == 429 => {
+                format!("LLM API rate limited. Available in {secs}s.")
+            }
+            Self::Llm(LlmError::ApiError { status, .. }) => {
+                if status.is_server_error() {
+                    "LLM API server error. Please try again later.".to_string()
+                } else if status.as_u16() == 429 {
+                    "LLM API rate limited. Please try again later.".to_string()
+                } else if status.is_client_error() {
+                    "LLM API request error. Please check your configuration.".to_string()
+                } else {
+                    format!("LLM API error (HTTP {status})")
+                }
+            }
+            Self::Llm(LlmError::RequestFailed(_)) => {
+                "LLM API connection failed. Please try again later.".to_string()
+            }
+            Self::Llm(LlmError::InvalidResponse(_)) => {
+                "LLM returned an invalid response.".to_string()
+            }
+            Self::Storage(_) => "Internal storage error.".to_string(),
+            _ => "An unexpected error occurred.".to_string(),
+        }
+    }
+
+    /// Returns `true` if the error represents a transient failure that may succeed on retry.
+    ///
+    /// Covers:
+    /// - LLM API 5xx (server error) and 429 (rate limit)
+    /// - LLM network / connection failures (`RequestFailed`)
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Llm(llm) => llm.is_retryable(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Llm(LlmError::ApiError {
+                retry_after_secs, ..
+            }) => *retry_after_secs,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_codex_auth_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Llm(LlmError::ApiError { status, .. })
+                if status.as_u16() == 401
+        )
+    }
+}
+
+impl LlmError {
+    /// Returns `true` if this LLM error may succeed on retry.
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::ApiError { status, .. } => status.is_server_error() || status.as_u16() == 429,
+            Self::RequestFailed(_) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Configuration loading and validation errors.
@@ -183,6 +255,7 @@ pub enum LlmError {
     ApiError {
         status: reqwest::StatusCode,
         body_preview: String,
+        retry_after_secs: Option<u64>,
     },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
