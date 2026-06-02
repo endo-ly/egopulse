@@ -94,9 +94,11 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
             return Err(Self::api_error(
                 status,
                 response.text().await.unwrap_or_default(),
+                retry_after,
             ));
         }
 
@@ -133,16 +135,19 @@ impl OpenAiProvider {
 
             if status.as_u16() == 429 && retries < max_retries {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                let retry_after = parse_retry_after(response.headers())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| std::time::Duration::from_secs(2u64.pow(retries)));
                 tracing::warn!(
-                    "Codex rate limited, retrying in {delay:?} (attempt {retries}/{max_retries})"
+                    "Codex rate limited, retrying in {retry_after:?} (attempt {retries}/{max_retries})"
                 );
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(retry_after).await;
                 continue;
             }
 
+            let retry_after = parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(Self::structured_api_error(status, &text));
+            return Err(Self::structured_api_error(status, &text, retry_after));
         }
     }
 
@@ -172,25 +177,39 @@ impl OpenAiProvider {
         Ok(headers)
     }
 
-    fn api_error(status: StatusCode, body: String) -> LlmError {
+    fn api_error(status: StatusCode, body: String, retry_after_secs: Option<u64>) -> LlmError {
         LlmError::ApiError {
             status,
             body_preview: preview_body(&body),
+            retry_after_secs,
         }
     }
 
-    fn structured_api_error(status: StatusCode, body: &str) -> LlmError {
+    fn structured_api_error(
+        status: StatusCode,
+        body: &str,
+        retry_after_secs: Option<u64>,
+    ) -> LlmError {
         if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(body) {
             return LlmError::ApiError {
                 status,
                 body_preview: err.error.message,
+                retry_after_secs,
             };
         }
         LlmError::ApiError {
             status,
             body_preview: preview_body(body),
+            retry_after_secs,
         }
     }
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 #[async_trait]
@@ -242,9 +261,11 @@ impl LlmProvider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
             return Err(Self::api_error(
                 status,
                 response.text().await.unwrap_or_default(),
+                retry_after,
             ));
         }
 
