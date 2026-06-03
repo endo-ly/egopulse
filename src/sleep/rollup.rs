@@ -4,7 +4,7 @@
 //! This module is intentionally free of DB/LLM dependencies so that every
 //! detection rule can be unit-tested with plain data.
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Offset, TimeZone};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Offset};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -116,11 +116,17 @@ pub(crate) fn complete_months_recent(
 }
 
 fn week_for_date_inner(monday: NaiveDate, tz: chrono_tz::Tz) -> WeekPeriod {
-    let ps: DateTime<chrono_tz::Tz> =
-        tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid"));
+    let ps: DateTime<chrono_tz::Tz> = monday
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_local_timezone(tz)
+        .unwrap();
     let next_monday = monday + Duration::days(7);
-    let pe: DateTime<chrono_tz::Tz> =
-        tz.from_utc_datetime(&next_monday.and_hms_opt(0, 0, 0).expect("midnight is valid"));
+    let pe: DateTime<chrono_tz::Tz> = next_monday
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_local_timezone(tz)
+        .unwrap();
     WeekPeriod {
         week_key: format!(
             "{}-W{:02}",
@@ -135,16 +141,22 @@ fn week_for_date_inner(monday: NaiveDate, tz: chrono_tz::Tz) -> WeekPeriod {
 fn month_for_ym(year: i32, month: u32, tz: chrono_tz::Tz) -> MonthPeriod {
     let month_key = format!("{year}-{month:02}");
     let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid year/month");
-    let ps: DateTime<chrono_tz::Tz> =
-        tz.from_utc_datetime(&first.and_hms_opt(0, 0, 0).expect("midnight is valid"));
+    let ps: DateTime<chrono_tz::Tz> = first
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_local_timezone(tz)
+        .unwrap();
     let (ny, nm) = if month == 12 {
         (year + 1, 1)
     } else {
         (year, month + 1)
     };
     let next_first = NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid year/month");
-    let pe: DateTime<chrono_tz::Tz> =
-        tz.from_utc_datetime(&next_first.and_hms_opt(0, 0, 0).expect("midnight is valid"));
+    let pe: DateTime<chrono_tz::Tz> = next_first
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_local_timezone(tz)
+        .unwrap();
     MonthPeriod {
         month_key,
         period_start: to_fixed(ps),
@@ -367,8 +379,13 @@ pub(crate) fn week_in_month(week_key: &str, month_key: &str, tz: chrono_tz::Tz) 
     let Some(monday) = NaiveDate::from_isoywd_opt(year, week_num, chrono::Weekday::Mon) else {
         return false;
     };
-    let week_start: DateTime<FixedOffset> =
-        to_fixed(tz.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("midnight is valid")));
+    let week_start: DateTime<FixedOffset> = to_fixed(
+        monday
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_local_timezone(tz)
+            .unwrap(),
+    );
     week_start >= mp.period_start && week_start < mp.period_end_exclusive
 }
 
@@ -767,7 +784,7 @@ pub(crate) fn build_call2_user_prompt(input_json: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Weekday};
+    use chrono::Weekday;
 
     /// JST (UTC+9) — the timezone used throughout these tests.
     fn jst() -> chrono_tz::Tz {
@@ -780,7 +797,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(hh, mm, 0)
             .unwrap();
-        let tz_dt: DateTime<chrono_tz::Tz> = jst().from_utc_datetime(&naive);
+        let tz_dt: DateTime<chrono_tz::Tz> = naive.and_local_timezone(jst()).unwrap();
         to_fixed(tz_dt)
     }
 
@@ -798,6 +815,55 @@ mod tests {
         assert_eq!(cw.period_end_exclusive.weekday(), Weekday::Mon);
         assert_eq!(cw.period_end_exclusive.day(), 1); // 2026-06-01
         assert!(cw.week_key.starts_with("2026-W"));
+    }
+
+    #[test]
+    fn test_current_week_starts_at_local_midnight() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let cw = current_week(now, jst());
+
+        assert_eq!(
+            cw.period_start,
+            jst_dt(2026, 5, 25, 0, 0),
+            "current week should start at Monday 00:00 local time"
+        );
+        assert_eq!(
+            cw.period_end_exclusive,
+            jst_dt(2026, 6, 1, 0, 0),
+            "current week should end at next Monday 00:00 local time"
+        );
+    }
+
+    #[test]
+    fn test_monday_morning_event_in_current_week() {
+        let now = jst_dt(2026, 5, 27, 10, 0);
+        let cw = current_week(now, jst());
+
+        let monday_morning = jst_dt(2026, 5, 25, 8, 0);
+        assert!(
+            monday_morning >= cw.period_start,
+            "Monday 08:00 should be >= week start"
+        );
+        assert!(
+            monday_morning < cw.period_end_exclusive,
+            "Monday 08:00 should be < week end"
+        );
+    }
+
+    #[test]
+    fn test_month_for_ym_starts_at_local_midnight() {
+        let mp = month_for_ym(2026, 5, jst());
+
+        assert_eq!(
+            mp.period_start,
+            jst_dt(2026, 5, 1, 0, 0),
+            "May 2026 should start at 2026-05-01T00:00:00+09:00"
+        );
+        assert_eq!(
+            mp.period_end_exclusive,
+            jst_dt(2026, 6, 1, 0, 0),
+            "May 2026 should end at 2026-06-01T00:00:00+09:00"
+        );
     }
 
     // -----------------------------------------------------------------------
