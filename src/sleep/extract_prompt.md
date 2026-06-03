@@ -97,8 +97,8 @@ Markdown、コードブロック、説明文、余計なキーは一切出力し
 |---|---|---|
 | `experienced_at` | string (RFC3339) | 出来事が起きた日時 |
 | `kind` | string | イベント種別（後述） |
-| `title` | string | エピソード記憶の見出し |
-| `body_md` | string | エピソード記憶本文（Markdown） |
+| `title` | string | エピソード記憶の見出し, 日本語必須 |
+| `body_md` | string | エピソード記憶本文（Markdown）, 日本語必須 |
 | `ripple_strength` | integer | 1（弱）〜 5（強） |
 | `certainty` | string | `stated` / `derived` / `tentative` |
 | `source_message_ids` | array of string | 実際に存在する `<message id="...">` の `id` 属性値のみ。推測で id を作ってはいけない。該当なしは `[]` |
