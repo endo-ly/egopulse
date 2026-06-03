@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::agent_loop::formatting::{strip_thinking, truncate_summary_text};
+use crate::agent_loop::formatting::strip_thinking;
+use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
+use crate::channels::utils::text::truncate_by_chars;
 use crate::llm::{LlmProvider, Message};
 use crate::storage::{
     EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, SenderKind, StoredMessage,
@@ -257,7 +259,7 @@ pub(crate) fn messages_to_extract_text(messages: &[StoredMessage]) -> String {
                 SenderKind::Tool => "tool",
             };
             let content = if msg.sender_kind == SenderKind::Tool {
-                truncate_summary_text(&msg.content, 200)
+                truncate_by_chars(&msg.content, MAX_TOOL_RESULT_TEXT_CHARS)
             } else {
                 msg.content.clone()
             };

@@ -1,11 +1,10 @@
 //! メッセージのフォーマット、サニタイズ、表示用テキスト変換。
 
+use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 use crate::storage::{SenderKind, StoredMessage};
 
 const MAX_TOOL_RESULT_CHARS: usize = 16_000;
-const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
-
 pub(crate) fn format_tool_result(
     tool_call: &ToolCall,
     result: &crate::tools::ToolResult,
@@ -95,13 +94,6 @@ pub(crate) fn summarize_tool_calls_with_content(content: &str, tool_calls: &[Too
     }
 }
 
-pub(crate) fn preview_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    format!("{}...", value.chars().take(max_chars).collect::<String>())
-}
-
 pub(crate) fn message_to_text(message: &Message) -> String {
     if message.tool_call_id.is_some() {
         return render_tool_message_text(message, true);
@@ -167,7 +159,7 @@ fn render_tool_message_text(message: &Message, truncate: bool) -> String {
 
 fn render_tool_body(payload: &str, truncate: bool) -> String {
     if truncate {
-        return truncate_summary_text(
+        return crate::channels::utils::text::truncate_by_chars(
             &strip_thinking(&tool_result_body(payload)),
             MAX_TOOL_RESULT_TEXT_CHARS,
         );
@@ -259,15 +251,6 @@ pub(crate) fn tool_result_payload(message: &Message) -> Option<&str> {
             | crate::llm::MessageContentPart::InputImageRef { .. } => None,
         }),
     }
-}
-
-pub(crate) fn truncate_summary_text(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
-    let truncated = text.chars().take(max_chars).collect::<String>();
-    format!("{truncated}...")
 }
 
 /// `<think`>`...`</think`>` や `<thought`>`...`</thought`>` などの
@@ -423,8 +406,8 @@ mod tests {
 
         let body = &rendered[prefix.len()..];
         assert!(body.ends_with("..."));
-        assert_eq!(body.chars().count(), 203);
-        assert_eq!(body[..body.len() - 3].chars().count(), 200);
+        assert_eq!(body.chars().count(), 200);
+        assert_eq!(body[..body.len() - 3].chars().count(), 197);
     }
 
     #[test]

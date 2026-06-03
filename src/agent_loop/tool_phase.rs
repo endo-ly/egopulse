@@ -6,9 +6,10 @@ use futures_util::future::join_all;
 use tracing::warn;
 
 use crate::agent_loop::formatting::{
-    format_tool_result, message_to_text, preview_text, sanitize_assistant_response_text,
+    format_tool_result, message_to_text, sanitize_assistant_response_text,
     summarize_tool_calls_with_content, tool_message_content,
 };
+use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::runtime::AppState;
@@ -16,6 +17,7 @@ use crate::storage::call_blocking;
 use crate::tools::{ToolExecutionContext, ToolResult};
 
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
+pub(crate) const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
 
 type ToolStartHook<'a> = Arc<dyn Fn(&ToolCall) + Send + Sync + 'a>;
 type ToolResultHook<'a> = Arc<dyn Fn(&ExecutedToolCall) + Send + Sync + 'a>;
@@ -189,7 +191,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
         .map(message_to_text)
         .collect::<Vec<_>>()
         .join("\n");
-    preview_text(&joined, 160)
+    truncate_by_chars(&joined, MAX_TOOL_RESULT_TEXT_CHARS)
 }
 
 pub(crate) fn log_llm_usage(

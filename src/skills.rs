@@ -204,7 +204,10 @@ impl SkillManager {
                 out.push_str(&format!(
                     "- {}: {}\n",
                     skill.name,
-                    truncate_chars(&skill.description, MAX_SKILL_DESCRIPTION_CHARS)
+                    crate::channels::utils::text::truncate_by_chars(
+                        &skill.description,
+                        MAX_SKILL_DESCRIPTION_CHARS
+                    )
                 ));
             }
         }
@@ -339,14 +342,6 @@ fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, Stri
         },
         body,
     ))
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let truncated = value.chars().take(max_chars).collect::<String>();
-    format!("{truncated}...")
 }
 
 fn current_platform() -> &'static str {

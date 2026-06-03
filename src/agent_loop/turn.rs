@@ -5,18 +5,20 @@
 
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
-use crate::agent_loop::formatting::{format_channel_log_message, preview_text, strip_thinking};
+use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
     persist_phase_once, resolve_chat_id,
 };
+use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
     AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks,
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
     send_tool_phase_request,
 };
+use crate::channels::utils::text::truncate_by_chars;
 use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, ToolCall};
@@ -633,7 +635,7 @@ async fn execute_tool_calls(
             result_emitter.emit(AgentEvent::ToolResult {
                 name: outcome.tool_call.name.clone(),
                 is_error: outcome.result.is_error,
-                preview: preview_text(&outcome.payload, 160),
+                preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
                 duration_ms: outcome.duration_ms,
             });
         })),

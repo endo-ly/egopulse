@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::agent_loop::formatting::preview_text;
 use crate::agent_loop::session::{
     PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once,
 };
+use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
+use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
@@ -303,7 +304,10 @@ async fn persist_notification_with_session(
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
                     chat_id,
                     sender_id: agent_id.to_string(),
-                    content: preview_text(&phase.tool_result_preview, 160),
+                    content: truncate_by_chars(
+                        &phase.tool_result_preview,
+                        MAX_TOOL_RESULT_TEXT_CHARS,
+                    ),
                     sender_kind: SenderKind::Assistant,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     message_kind: MessageKind::Message,
