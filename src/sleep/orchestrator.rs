@@ -7,41 +7,79 @@ use std::sync::Arc;
 use chrono::Datelike;
 use chrono_tz::OffsetComponents;
 
-use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
 use crate::llm::{LlmProvider, Message};
-use crate::memory::{MemoryContent, collect_sleep_input};
+use crate::memory::MemoryContent;
 use crate::runtime::AppState;
 use crate::storage::{
     AgentSessionInfo, Database, EpisodeEvent, MemoryFile, RollupGranularity, SleepRunTrigger,
     call_blocking,
 };
 
+use super::SleepBatchError;
 use super::episodic_renderer;
-use super::extract::{self, ExtractedEvent};
+use super::event_extraction::{self, ExtractedEvent};
+use super::event_rollup;
 use super::memory_update;
-use super::rollup;
 
-#[derive(Debug, Error)]
-pub enum SleepBatchError {
-    #[error("already running for agent '{agent_id}'")]
-    AlreadyRunning { agent_id: String },
-    #[error(transparent)]
-    Storage(#[from] crate::error::StorageError),
-    #[error("internal error: {0}")]
-    Internal(String),
-    #[error("parse failed: {0}")]
-    ParseFailed(String),
-    #[error("context overflow for agent '{agent_id}'")]
-    ContextOverflow { agent_id: String },
-    #[error("I/O error: {0}")]
-    Io(String),
-    #[error("unsafe agent_id: {0}")]
-    UnsafeAgentId(String),
-    #[error("LLM error: {0}")]
-    Llm(String),
+/// Threshold (≤ 4) at which sleep is skipped due to too few new messages.
+const SKIP_THRESHOLD: i64 = 4;
+/// Maximum number of source sessions included in sleep input.
+const MAX_SOURCE_SESSIONS: usize = 20;
+
+/// Decision from checking whether enough new messages exist for a sleep run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputDecision {
+    /// Not enough new messages → skip the sleep run.
+    Skip {
+        /// Human-readable reason for the skip.
+        reason: String,
+        /// Number of new messages found (≤ SKIP_THRESHOLD).
+        new_message_count: i64,
+    },
+    /// Enough new messages → proceed with sleep run.
+    Proceed {
+        /// Source sessions (limited to MAX_SOURCE_SESSIONS).
+        sessions: Vec<AgentSessionInfo>,
+        /// JSON array of source chat metadata (for sleep_runs.source_chats_json).
+        source_chats_json: String,
+    },
+}
+
+/// Collects sleep input from the database: counts new messages since the last
+/// successful sleep run, and if above threshold, fetches source session info.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if DB queries fail.
+pub(crate) fn collect_sleep_input(
+    db: &Database,
+    agent_id: &str,
+) -> Result<InputDecision, crate::error::StorageError> {
+    let latest_run = db.get_latest_successful_run(agent_id)?;
+    let cutoff = latest_run.as_ref().and_then(|r| r.finished_at.as_deref());
+
+    let new_message_count = db.count_agent_messages_since(agent_id, cutoff)?;
+
+    if new_message_count <= SKIP_THRESHOLD {
+        let reason =
+            format!("new messages ({new_message_count}) at or below threshold ({SKIP_THRESHOLD})");
+        return Ok(InputDecision::Skip {
+            reason,
+            new_message_count,
+        });
+    }
+
+    let sessions = db.get_agent_sessions_since(agent_id, cutoff, MAX_SOURCE_SESSIONS)?;
+    let source_chats_json =
+        serde_json::to_string(&sessions).map_err(crate::error::StorageError::SessionSerialize)?;
+
+    Ok(InputDecision::Proceed {
+        sessions,
+        source_chats_json,
+    })
 }
 
 /// Resolve a timezone string to a [`chrono::FixedOffset`] for the current moment.
@@ -49,7 +87,7 @@ pub enum SleepBatchError {
 /// Accepts IANA timezone names (e.g. `America/Los_Angeles`, `Asia/Tokyo`),
 /// `UTC`, `Z`, and `UTC±HH:MM` offset literals. Falls back to UTC on
 /// unrecognised input.
-fn resolve_fixed_offset(tz_str: &str) -> chrono::FixedOffset {
+pub(crate) fn resolve_fixed_offset(tz_str: &str) -> chrono::FixedOffset {
     if let Ok(tz) = tz_str.parse::<chrono_tz::Tz>() {
         let now = chrono::Utc::now().with_timezone(&tz);
         let offset_secs = now.offset().base_utc_offset().num_seconds() as i32;
@@ -89,31 +127,6 @@ fn parse_hhmm_offset(s: &str) -> Option<i32> {
     }
 }
 
-fn extract_date_only(dt_str: &str) -> String {
-    dt_str.get(..10).unwrap_or(dt_str).to_string()
-}
-
-fn deduplicate_background_months(
-    recent_months: &[episodic_renderer::RendererRollup],
-    background: Vec<episodic_renderer::RendererRollup>,
-) -> Vec<episodic_renderer::RendererRollup> {
-    let recent_keys: HashSet<&str> = recent_months
-        .iter()
-        .map(|r| r.period_key.as_str())
-        .collect();
-    background
-        .into_iter()
-        .filter(|r| !recent_keys.contains(r.period_key.as_str()))
-        .collect()
-}
-
-fn compute_rollup_stats(events: Option<&Vec<rollup::Call2Event>>) -> (i64, i64) {
-    let slice = events.map(|v| v.as_slice()).unwrap_or(&[]);
-    let max_ripple = slice.iter().map(|e| e.ripple_strength).max().unwrap_or(3);
-    let event_count = i64::try_from(slice.len()).unwrap_or(0);
-    (max_ripple, event_count)
-}
-
 pub async fn run_sleep_batch(
     state: &AppState,
     agent_id: Option<&str>,
@@ -133,7 +146,7 @@ pub async fn run_sleep_batch(
     .await?;
 
     match decision {
-        crate::memory::InputDecision::Skip {
+        InputDecision::Skip {
             reason,
             new_message_count,
         } => {
@@ -145,7 +158,7 @@ pub async fn run_sleep_batch(
             );
             Ok(())
         }
-        crate::memory::InputDecision::Proceed {
+        InputDecision::Proceed {
             sessions,
             source_chats_json,
         } => {
@@ -253,7 +266,7 @@ pub async fn run_events_extract(
             .map(|(chat_id, channel, ext_id)| (*chat_id, channel.as_str(), ext_id.as_str()))
             .collect();
 
-        let chunks = extract::build_extract_chunks(
+        let chunks = event_extraction::build_extract_chunks(
             &db,
             &sources,
             from_owned.as_deref(),
@@ -263,7 +276,7 @@ pub async fn run_events_extract(
 
         let total_chunks = chunks.len();
         let (extracted_events, input_tokens, output_tokens) =
-            extract::run_extract_events_for_chunks(
+            event_extraction::run_extract_events_for_chunks(
                 &provider,
                 &resolved_agent,
                 chunks,
@@ -271,7 +284,8 @@ pub async fn run_events_extract(
             )
             .await?;
 
-        let episode_events = extract::to_episode_events(extracted_events, &resolved_agent, &run_id);
+        let episode_events =
+            event_extraction::to_episode_events(extracted_events, &resolved_agent, &run_id);
         let event_count = episode_events.len();
 
         let agent_for_replace = resolved_agent.clone();
@@ -330,8 +344,8 @@ async fn call_rollup_llm_with_retry(
     input_json: &str,
     valid_keys: &HashSet<String>,
     agent_id: &str,
-) -> Result<(Vec<rollup::Call2RollupOutput>, i64, i64), SleepBatchError> {
-    let user_prompt = rollup::build_call2_user_prompt(input_json);
+) -> Result<(Vec<event_rollup::Call2RollupOutput>, i64, i64), SleepBatchError> {
+    let user_prompt = event_rollup::build_call2_user_prompt(input_json);
     let user_message = Message::text("user", user_prompt);
 
     let response = provider
@@ -341,9 +355,9 @@ async fn call_rollup_llm_with_retry(
 
     let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
     let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
-    let output_json = rollup::redact_secrets(&response.content);
+    let output_json = event_rollup::redact_secrets(&response.content);
 
-    match rollup::parse_call2_output(&output_json, valid_keys) {
+    match event_rollup::parse_call2_output(&output_json, valid_keys) {
         Ok(outputs) => Ok((outputs, first_input, first_output)),
         Err(first_error) => {
             warn!(
@@ -372,9 +386,9 @@ Output the raw JSON object and nothing else.";
             let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
             let combined_input = first_input.saturating_add(retry_input);
             let combined_output = first_output.saturating_add(retry_output);
-            let retry_json = rollup::redact_secrets(&retry_response.content);
+            let retry_json = event_rollup::redact_secrets(&retry_response.content);
 
-            match rollup::parse_call2_output(&retry_json, valid_keys) {
+            match event_rollup::parse_call2_output(&retry_json, valid_keys) {
                 Ok(outputs) => Ok((outputs, combined_input, combined_output)),
                 Err(retry_error) => {
                     warn!(
@@ -389,6 +403,19 @@ Output the raw JSON object and nothing else.";
     }
 }
 
+/// Batch execution context — holds state across Call 1, 2, 3.
+struct BatchContext {
+    run_id: String,
+    agents_dir: PathBuf,
+    provider: Arc<dyn LlmProvider>,
+    context_tokens: usize,
+    session_chunks: Vec<String>,
+    extract_chunks: Vec<String>,
+    current_memory: MemoryContent,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
 async fn execute_batch(
     state: &AppState,
     db: Arc<Database>,
@@ -397,637 +424,30 @@ async fn execute_batch(
     source_chats_json: &str,
     trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
-    let agent_for_run = agent_id.to_string();
-    let run_id = call_blocking(Arc::clone(&db), move |db| {
-        db.try_create_sleep_run(&agent_for_run, trigger)
-    })
-    .await?;
-
-    let run_id = match run_id {
-        Some(id) => id,
-        None => {
-            return Err(SleepBatchError::AlreadyRunning {
-                agent_id: agent_id.to_string(),
-            });
-        }
-    };
+    let run_id = create_sleep_run(&db, agent_id, trigger).await?;
 
     let result = async {
-        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
-        recover_memory_write(&agents_dir, agent_id)?;
-
-        let resolved = state
-            .config
-            .resolve_sleep_batch_llm()
-            .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
-
-        let provider: Arc<dyn LlmProvider> =
-            if let Some(override_provider) = state.llm_override.clone() {
-                override_provider
-            } else {
-                state
-                    .cached_provider(&resolved)
-                    .map_err(|e| SleepBatchError::Llm(e.to_string()))?
-            };
-
-        let context_tokens = state.config.resolve_context_window_tokens(
-            &crate::config::ProviderId::new(&resolved.provider),
-            &resolved.model,
-        );
-        let chunk_session_tokens = memory_update::sleep_chunk_session_tokens(context_tokens);
-        let session_chunks =
-            memory_update::build_session_text_chunks(&db, sessions, chunk_session_tokens)?;
-
-        // Build extract chunks from messages table (Call 1)
-        let cutoff = {
-            let agent_for_cutoff = agent_id.to_string();
-            call_blocking(Arc::clone(&db), move |db| {
-                let latest_run = db.get_latest_successful_non_backfill_run(&agent_for_cutoff)?;
-                Ok(latest_run.and_then(|r| r.finished_at))
-            })
-            .await?
-        };
-        let sources: Vec<(i64, &str, &str)> = sessions
-            .iter()
-            .map(|s| (s.chat_id, s.channel.as_str(), s.external_chat_id.as_str()))
-            .collect();
-        let extract_chunks = extract::build_extract_chunks(
-            &db,
-            &sources,
-            cutoff.as_deref(),
-            None,
-            chunk_session_tokens,
-        )?;
-
-        let memory_before = state.memory_loader.load(agent_id);
-        save_aggregate_snapshots(&db, &run_id, agent_id, memory_before.as_ref(), None).await?;
+        let mut ctx = prepare_batch_context(state, &db, agent_id, sessions, &run_id).await?;
 
         // Call 1: Event Extraction (best-effort)
-        let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
-            let total_chunks = extract_chunks.len();
-            extract::run_extract_events_for_chunks(
-                &provider,
-                agent_id,
-                extract_chunks,
-                total_chunks,
-            )
-            .await
-        }
-        .await;
-
-        let (mut input_tokens, mut output_tokens) = match extract_result {
-            Ok((extracted_events, inp, out)) => {
-                if !extracted_events.is_empty() {
-                    let episode_events =
-                        extract::to_episode_events(extracted_events, agent_id, &run_id);
-                    let event_count = episode_events.len();
-                    let run_id_for_insert = run_id.clone();
-                    call_blocking(Arc::clone(&db), move |db| {
-                        db.insert_episode_events(&run_id_for_insert, &episode_events)
-                    })
-                    .await?;
-                    info!(count = event_count, "extracted episode events");
-                }
-                (inp, out)
-            }
-            Err(e) => {
-                warn!(error = %e, "event extraction failed, continuing with memory update");
-                (0, 0)
-            }
-        };
-
-        let mut current_memory = memory_before.unwrap_or_default();
+        run_event_extraction_call(&mut ctx, &db, agent_id).await;
 
         // Call 2: Episodic View Materialization (best-effort)
-        let rendered_episodic;
-        {
-            let tz_str = &state.config.timezone;
-            let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
-            let tz = resolve_fixed_offset(tz_str);
-            let now = chrono::Utc::now().with_timezone(&tz);
-
-            let cw = rollup::current_week(now, tz_chrono);
-
-            let cw_start = cw.period_start.to_rfc3339();
-            let cw_end = cw.period_end_exclusive.to_rfc3339();
-
-            let agent_for_events = agent_id.to_string();
-            let current_week_events: Vec<EpisodeEvent> =
-                match call_blocking(Arc::clone(&db), move |db| {
-                    db.list_episode_events_in_range(&agent_for_events, &cw_start, &cw_end)
-                })
-                .await
-                {
-                    Ok(events) => events,
-                    Err(e) => {
-                        warn!(error = %e, "Call2: failed to load current week events");
-                        Vec::new()
-                    }
-                };
-
-            let call2_llm_result: Result<(), SleepBatchError> = async {
-                let agent_for_plan = agent_id.to_string();
-                let existing_week_rollups: Vec<rollup::ExistingRollupInfo> =
-                    call_blocking(Arc::clone(&db), move |db| {
-                        db.list_episode_rollups(&agent_for_plan, RollupGranularity::Week, 100)
-                    })
-                    .await?
-                    .into_iter()
-                    .map(|r| rollup::ExistingRollupInfo {
-                        period_key: r.period_key,
-                        event_count: r.event_count,
-                        max_ripple: r.max_ripple,
-                        summary_md: r.summary_md,
-                    })
-                    .collect();
-
-                let agent_for_months = agent_id.to_string();
-                let existing_month_rollups: Vec<rollup::ExistingRollupInfo> =
-                    call_blocking(Arc::clone(&db), move |db| {
-                        db.list_episode_rollups(&agent_for_months, RollupGranularity::Month, 100)
-                    })
-                    .await?
-                    .into_iter()
-                    .map(|r| rollup::ExistingRollupInfo {
-                        period_key: r.period_key,
-                        event_count: r.event_count,
-                        max_ripple: r.max_ripple,
-                        summary_md: r.summary_md,
-                    })
-                    .collect();
-
-                let recent = rollup::recent_weeks(now, 4, tz_chrono);
-                let earliest_start = recent
-                    .last()
-                    .map(|w| w.period_start.to_rfc3339())
-                    .unwrap_or_else(|| cw.period_start.to_rfc3339());
-                let agent_for_all = agent_id.to_string();
-                let all_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(&db), move |db| {
-                    db.list_episode_events_in_range(
-                        &agent_for_all,
-                        &earliest_start,
-                        &cw.period_end_exclusive.to_rfc3339(),
-                    )
-                })
-                .await?;
-
-                let planner_events: Vec<rollup::PlannerEvent> = all_events
-                    .iter()
-                    .map(|e| rollup::PlannerEvent {
-                        experienced_at: e.experienced_at.clone(),
-                        encoded_at: e.encoded_at.clone(),
-                        ripple_strength: e.ripple_strength,
-                    })
-                    .collect();
-
-                let mut existing_week_rollups = existing_week_rollups;
-
-                let week_requests = rollup::plan_week_rollup_updates(
-                    agent_id,
-                    now,
-                    tz_chrono,
-                    &rollup::RollupPlannerInput {
-                        existing_week_rollups: existing_week_rollups.clone(),
-                        events: planner_events,
-                    },
-                );
-
-                // Call 2a: Week rollup generation
-                if !week_requests.is_empty() {
-                    let mut week_events_map: HashMap<String, Vec<rollup::Call2Event>> =
-                        HashMap::new();
-                    for req in &week_requests {
-                        let req_start = req.period_start.clone();
-                        let req_end = req.period_end_exclusive.clone();
-                        let req_key = req.period_key.clone();
-                        let agent_for_range = agent_id.to_string();
-                        let period_events: Vec<EpisodeEvent> =
-                            call_blocking(Arc::clone(&db), move |db| {
-                                db.list_episode_events_in_range(
-                                    &agent_for_range,
-                                    &req_start,
-                                    &req_end,
-                                )
-                            })
-                            .await?;
-
-                        let call2_events: Vec<rollup::Call2Event> = period_events
-                            .iter()
-                            .map(|e| rollup::Call2Event {
-                                id: e.id.clone(),
-                                experienced_at: e.experienced_at.clone(),
-                                kind: e.kind.to_string(),
-                                title: e.title.clone(),
-                                body_md: e.body_md.clone(),
-                                ripple_strength: e.ripple_strength,
-                                certainty: e.certainty.to_string(),
-                            })
-                            .collect();
-                        week_events_map.insert(req_key, call2_events);
-                    }
-
-                    let week_input = rollup::build_call2_input(&week_requests, &week_events_map);
-                    let week_input_json = serde_json::to_string_pretty(&serde_json::json!({
-                        "rollup_requests": week_input
-                    }))
-                    .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
-                    let week_input_json = rollup::redact_secrets(&week_input_json);
-
-                    let week_system_prompt = rollup::build_call2_system_prompt_week(agent_id);
-                    let valid_keys: HashSet<String> =
-                        week_requests.iter().map(|r| r.period_key.clone()).collect();
-
-                    let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
-                        &provider,
-                        &week_system_prompt,
-                        &week_input_json,
-                        &valid_keys,
-                        agent_id,
-                    )
-                    .await?;
-
-                    input_tokens = input_tokens.saturating_add(call2_in);
-                    output_tokens = output_tokens.saturating_add(call2_out);
-
-                    let requests_by_key: HashMap<&str, &rollup::RollupRequest> = week_requests
-                        .iter()
-                        .map(|r| (r.period_key.as_str(), r))
-                        .collect();
-
-                    for rollup_output in &rollup_outputs {
-                        let Some(request) = requests_by_key.get(rollup_output.period_key.as_str())
-                        else {
-                            continue;
-                        };
-                        let (computed_max_ripple, computed_event_count) =
-                            compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
-                        let rollup = crate::storage::EpisodeRollup {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            agent_id: agent_id.to_string(),
-                            granularity: RollupGranularity::Week,
-                            period_key: rollup_output.period_key.clone(),
-                            period_start: request.period_start.clone(),
-                            period_end_exclusive: request.period_end_exclusive.clone(),
-                            summary_md: rollup_output.summary_md.clone(),
-                            max_ripple: computed_max_ripple,
-                            event_count: computed_event_count,
-                            generated_run_id: run_id.clone(),
-                            created_at: now.to_rfc3339(),
-                            updated_at: now.to_rfc3339(),
-                        };
-                        let rollup_for_db = rollup.clone();
-                        call_blocking(Arc::clone(&db), move |db| {
-                            db.upsert_episode_rollup(&rollup_for_db)
-                        })
-                        .await?;
-                    }
-
-                    for rollup_output in &rollup_outputs {
-                        let (computed_max_ripple, computed_event_count) =
-                            compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
-                        let updated = rollup::ExistingRollupInfo {
-                            period_key: rollup_output.period_key.clone(),
-                            event_count: computed_event_count,
-                            max_ripple: computed_max_ripple,
-                            summary_md: rollup_output.summary_md.clone(),
-                        };
-                        if let Some(idx) = existing_week_rollups
-                            .iter()
-                            .position(|r| r.period_key == rollup_output.period_key)
-                        {
-                            existing_week_rollups[idx] = updated;
-                        } else {
-                            existing_week_rollups.push(updated);
-                        }
-                    }
-                }
-
-                let month_requests = rollup::plan_month_rollup_updates(
-                    agent_id,
-                    now,
-                    tz_chrono,
-                    &existing_month_rollups,
-                    &existing_week_rollups,
-                );
-
-                // Call 2b: Month rollup generation
-                if !month_requests.is_empty() {
-                    let mut week_rollups_map: HashMap<String, Vec<rollup::Call2WeekRollupSummary>> =
-                        HashMap::new();
-                    for req in &month_requests {
-                        let summaries: Vec<rollup::Call2WeekRollupSummary> = existing_week_rollups
-                            .iter()
-                            .filter(|wr| {
-                                rollup::week_in_month(&wr.period_key, &req.period_key, tz_chrono)
-                            })
-                            .map(|wr| rollup::Call2WeekRollupSummary {
-                                period_key: wr.period_key.clone(),
-                                summary_md: wr.summary_md.clone(),
-                                max_ripple: wr.max_ripple,
-                                event_count: wr.event_count,
-                            })
-                            .collect();
-                        week_rollups_map.insert(req.period_key.clone(), summaries);
-                    }
-
-                    let mut previous_month_map: HashMap<String, String> = HashMap::new();
-                    for req in &month_requests {
-                        if let Some(mp) = rollup::month_period_from_key(&req.period_key, tz_chrono)
-                        {
-                            let prev_year = if mp.period_start.month() == 1 {
-                                mp.period_start.year() - 1
-                            } else {
-                                mp.period_start.year()
-                            };
-                            let prev_month = if mp.period_start.month() == 1 {
-                                12
-                            } else {
-                                mp.period_start.month() - 1
-                            };
-                            let prev_key = format!("{}-{:02}", prev_year, prev_month);
-                            if let Some(prev_rollup) = existing_month_rollups
-                                .iter()
-                                .find(|r| r.period_key == prev_key)
-                            {
-                                previous_month_map
-                                    .insert(req.period_key.clone(), prev_rollup.summary_md.clone());
-                            }
-                        }
-                    }
-
-                    let month_input = rollup::build_call2_input_month(
-                        &month_requests,
-                        &week_rollups_map,
-                        &previous_month_map,
-                    );
-                    let month_input_json = serde_json::to_string_pretty(&serde_json::json!({
-                        "rollup_requests": month_input
-                    }))
-                    .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
-                    let month_input_json = rollup::redact_secrets(&month_input_json);
-
-                    let month_system_prompt = rollup::build_call2_system_prompt_month(agent_id);
-                    let valid_keys: HashSet<String> = month_requests
-                        .iter()
-                        .map(|r| r.period_key.clone())
-                        .collect();
-
-                    let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
-                        &provider,
-                        &month_system_prompt,
-                        &month_input_json,
-                        &valid_keys,
-                        agent_id,
-                    )
-                    .await?;
-
-                    input_tokens = input_tokens.saturating_add(call2_in);
-                    output_tokens = output_tokens.saturating_add(call2_out);
-
-                    let requests_by_key: HashMap<&str, &rollup::RollupRequest> = month_requests
-                        .iter()
-                        .map(|r| (r.period_key.as_str(), r))
-                        .collect();
-
-                    for rollup_output in &rollup_outputs {
-                        let Some(request) = requests_by_key.get(rollup_output.period_key.as_str())
-                        else {
-                            continue;
-                        };
-
-                        let month_week_rollups: Vec<&rollup::ExistingRollupInfo> =
-                            existing_week_rollups
-                                .iter()
-                                .filter(|wr| {
-                                    rollup::week_in_month(
-                                        &wr.period_key,
-                                        &rollup_output.period_key,
-                                        tz_chrono,
-                                    )
-                                })
-                                .collect();
-                        let (computed_max_ripple, computed_event_count) =
-                            rollup::compute_month_rollup_stats(&month_week_rollups);
-
-                        let rollup = crate::storage::EpisodeRollup {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            agent_id: agent_id.to_string(),
-                            granularity: RollupGranularity::Month,
-                            period_key: rollup_output.period_key.clone(),
-                            period_start: request.period_start.clone(),
-                            period_end_exclusive: request.period_end_exclusive.clone(),
-                            summary_md: rollup_output.summary_md.clone(),
-                            max_ripple: computed_max_ripple,
-                            event_count: computed_event_count,
-                            generated_run_id: run_id.clone(),
-                            created_at: now.to_rfc3339(),
-                            updated_at: now.to_rfc3339(),
-                        };
-                        let rollup_for_db = rollup.clone();
-                        call_blocking(Arc::clone(&db), move |db| {
-                            db.upsert_episode_rollup(&rollup_for_db)
-                        })
-                        .await?;
-                    }
-                }
-
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = call2_llm_result {
-                warn!(error = %e, "Call2 rollup generation failed (best-effort, continuing)");
-            }
-
-            // Episodic Renderer
-            let renderer_events: Vec<episodic_renderer::RendererEvent> = current_week_events
-                .iter()
-                .map(|e| episodic_renderer::RendererEvent {
-                    experienced_at: e.experienced_at.clone(),
-                    kind: e.kind.to_string(),
-                    title: e.title.clone(),
-                    body_md: e.body_md.clone(),
-                    ripple_strength: e.ripple_strength,
-                })
-                .collect();
-
-            let agent_for_rw = agent_id.to_string();
-            let recent_week_rollups: Vec<crate::storage::EpisodeRollup> =
-                call_blocking(Arc::clone(&db), move |db| {
-                    db.list_episode_rollups(&agent_for_rw, RollupGranularity::Week, 4)
-                })
-                .await
-                .unwrap_or_default();
-            let rw_renderer: Vec<episodic_renderer::RendererRollup> = recent_week_rollups
-                .iter()
-                .map(|r| episodic_renderer::RendererRollup {
-                    period_key: r.period_key.clone(),
-                    period_start: r.period_start.clone(),
-                    period_end_exclusive: r.period_end_exclusive.clone(),
-                    summary_md: r.summary_md.clone(),
-                    max_ripple: r.max_ripple,
-                    granularity: r.granularity,
-                })
-                .collect();
-
-            let agent_for_rm = agent_id.to_string();
-            let recent_month_rollups: Vec<crate::storage::EpisodeRollup> =
-                call_blocking(Arc::clone(&db), move |db| {
-                    db.list_episode_rollups(&agent_for_rm, RollupGranularity::Month, 2)
-                })
-                .await
-                .unwrap_or_default();
-            let rm_renderer: Vec<episodic_renderer::RendererRollup> = recent_month_rollups
-                .iter()
-                .map(|r| episodic_renderer::RendererRollup {
-                    period_key: r.period_key.clone(),
-                    period_start: r.period_start.clone(),
-                    period_end_exclusive: r.period_end_exclusive.clone(),
-                    summary_md: r.summary_md.clone(),
-                    max_ripple: r.max_ripple,
-                    granularity: r.granularity,
-                })
-                .collect();
-
-            let before_period = cw.period_start.to_rfc3339();
-            let agent_for_bg = agent_id.to_string();
-            let background_rollups: Vec<crate::storage::EpisodeRollup> =
-                call_blocking(Arc::clone(&db), move |db| {
-                    db.list_background_episode_rollups(&agent_for_bg, 4, &before_period)
-                })
-                .await
-                .unwrap_or_default();
-            let bg_renderer_raw: Vec<episodic_renderer::RendererRollup> = background_rollups
-                .iter()
-                .map(|r| episodic_renderer::RendererRollup {
-                    period_key: r.period_key.clone(),
-                    period_start: r.period_start.clone(),
-                    period_end_exclusive: r.period_end_exclusive.clone(),
-                    summary_md: r.summary_md.clone(),
-                    max_ripple: r.max_ripple,
-                    granularity: r.granularity,
-                })
-                .collect();
-
-            // Deduplicate: remove background months that also appear in recent months
-            let bg_renderer = deduplicate_background_months(&rm_renderer, bg_renderer_raw);
-
-            let ctx = episodic_renderer::WeekContext {
-                now,
-                tz_name: tz_str.clone(),
-                week_key: cw.week_key.clone(),
-                week_start: extract_date_only(&cw.period_start.to_rfc3339()),
-                week_end: {
-                    let end = cw.period_end_exclusive.date_naive() - chrono::Duration::days(1);
-                    end.format("%Y-%m-%d").to_string()
-                },
-            };
-
-            let episodic_md = episodic_renderer::render_episodic_md(
-                &ctx,
-                &renderer_events,
-                &rw_renderer,
-                &rm_renderer,
-                &bg_renderer,
-            );
-
-            current_memory.episodic = Some(episodic_md.clone());
-            rendered_episodic = Some(episodic_md);
-        }
+        let rendered_episodic = run_rollup_call(&mut ctx, state, &db, agent_id).await;
 
         // Call 3: Memory Update (semantic + prospective)
-        let mut final_output = None;
-        let total_chunks = session_chunks.len();
+        let output =
+            run_memory_update_call(&mut ctx, state, &db, agent_id, rendered_episodic).await?;
 
-        for (index, sessions_text) in session_chunks.into_iter().enumerate() {
-            let input = memory_update::build_sleep_input_from_parts(
-                agent_id,
-                current_memory.clone(),
-                sessions_text,
-                context_tokens,
-                0,
-            )?;
-            let system_prompt = memory_update::build_sleep_system_prompt(&input);
-            let (output, in_tok, out_tok) = memory_update::send_sleep_request(
-                &provider,
-                agent_id,
-                &system_prompt,
-                index + 1,
-                total_chunks,
-            )
-            .await?;
-
-            input_tokens = input_tokens.saturating_add(in_tok);
-            output_tokens = output_tokens.saturating_add(out_tok);
-            current_memory =
-                memory_content_from_output(&output, current_memory.episodic.as_deref());
-            final_output = Some(output);
-        }
-
-        let mut output = final_output.ok_or_else(|| {
-            SleepBatchError::Internal("sleep batch produced no output".to_string())
-        })?;
-
-        if let Some(ref md) = rendered_episodic {
-            output.episodic = md.clone();
-        }
-
-        // Write memory files
-        write_memory_files(&agents_dir, agent_id, &output)?;
-
-        // Archive sessions
-        let groups_dir = state.config.groups_dir();
-        let secrets = crate::tools::collect_config_secrets(&state.config);
-        for session in sessions {
-            if let Err(e) = archive_and_clear_session(&db, &groups_dir, session, &secrets) {
-                warn!(
-                    agent_id = %agent_id,
-                    chat_id = session.chat_id,
-                    error = %e,
-                    "failed to archive/clear session (continuing)"
-                );
-            }
-        }
-
-        // Save AFTER snapshots
-        save_output_snapshots(&db, &run_id, agent_id, &output).await?;
-
-        // Log LLM usage
-        if input_tokens > 0 || output_tokens > 0 {
-            let provider_name = provider.provider_name().to_string();
-            let model_name = provider.model_name().to_string();
-            crate::runtime::metrics::inc_llm_tokens_total("input", &provider_name, input_tokens);
-            crate::runtime::metrics::inc_llm_tokens_total("output", &provider_name, output_tokens);
-            let db_for_usage = Arc::clone(&db);
-            tokio::spawn(async move {
-                let _ = crate::storage::call_blocking(db_for_usage, move |db| {
-                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                        chat_id: 0,
-                        caller_channel: "sleep_batch",
-                        provider: &provider_name,
-                        model: &model_name,
-                        input_tokens,
-                        output_tokens,
-                        request_kind: "sleep_batch",
-                    })
-                })
-                .await
-                .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
-            });
-        }
-
-        // Update run success
-        let run_id_owned = run_id.clone();
-        let source_chats = source_chats_json.to_string();
-        call_blocking(Arc::clone(&db), move |db| {
-            db.update_sleep_run_success(
-                &run_id_owned,
-                &source_chats,
-                None,
-                input_tokens,
-                output_tokens,
-            )
-        })
+        finalize_batch(
+            &ctx,
+            state,
+            &db,
+            agent_id,
+            sessions,
+            source_chats_json,
+            &output,
+        )
         .await?;
 
         Ok::<(), SleepBatchError>(())
@@ -1045,6 +465,600 @@ async fn execute_batch(
     }
 
     info!(agent_id = %agent_id, run_id = %run_id, "sleep batch completed");
+    Ok(())
+}
+
+/// Creates a sleep run record and returns the run ID.
+async fn create_sleep_run(
+    db: &Arc<Database>,
+    agent_id: &str,
+    trigger: SleepRunTrigger,
+) -> Result<String, SleepBatchError> {
+    let agent_for_run = agent_id.to_string();
+    let run_id = call_blocking(Arc::clone(db), move |db| {
+        db.try_create_sleep_run(&agent_for_run, trigger)
+    })
+    .await?;
+
+    run_id.ok_or_else(|| SleepBatchError::AlreadyRunning {
+        agent_id: agent_id.to_string(),
+    })
+}
+
+/// Prepares batch context: LLM provider, chunks, memory state.
+async fn prepare_batch_context(
+    state: &AppState,
+    db: &Arc<Database>,
+    agent_id: &str,
+    sessions: &[AgentSessionInfo],
+    run_id: &str,
+) -> Result<BatchContext, SleepBatchError> {
+    let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
+    recover_memory_write(&agents_dir, agent_id)?;
+
+    let resolved = state
+        .config
+        .resolve_sleep_batch_llm()
+        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+
+    let provider: Arc<dyn LlmProvider> = if let Some(override_provider) = state.llm_override.clone()
+    {
+        override_provider
+    } else {
+        state
+            .cached_provider(&resolved)
+            .map_err(|e| SleepBatchError::Llm(e.to_string()))?
+    };
+
+    let context_tokens = state.config.resolve_context_window_tokens(
+        &crate::config::ProviderId::new(&resolved.provider),
+        &resolved.model,
+    );
+    let chunk_session_tokens = memory_update::sleep_chunk_session_tokens(context_tokens);
+    let session_chunks =
+        memory_update::build_session_text_chunks(db, sessions, chunk_session_tokens)?;
+
+    // Build extract chunks from messages table (Call 1)
+    let cutoff = {
+        let agent_for_cutoff = agent_id.to_string();
+        call_blocking(Arc::clone(db), move |db| {
+            let latest_run = db.get_latest_successful_non_backfill_run(&agent_for_cutoff)?;
+            Ok(latest_run.and_then(|r| r.finished_at))
+        })
+        .await?
+    };
+    let sources: Vec<(i64, &str, &str)> = sessions
+        .iter()
+        .map(|s| (s.chat_id, s.channel.as_str(), s.external_chat_id.as_str()))
+        .collect();
+    let extract_chunks = event_extraction::build_extract_chunks(
+        db,
+        &sources,
+        cutoff.as_deref(),
+        None,
+        chunk_session_tokens,
+    )?;
+
+    let memory_before = state.memory_loader.load(agent_id);
+    save_aggregate_snapshots(db, run_id, agent_id, memory_before.as_ref(), None).await?;
+
+    Ok(BatchContext {
+        run_id: run_id.to_string(),
+        agents_dir,
+        provider,
+        context_tokens,
+        session_chunks,
+        extract_chunks,
+        current_memory: memory_before.unwrap_or_default(),
+        input_tokens: 0,
+        output_tokens: 0,
+    })
+}
+
+/// Call 1: Event Extraction — extracts episode events from session chunks.
+async fn run_event_extraction_call(ctx: &mut BatchContext, db: &Arc<Database>, agent_id: &str) {
+    let extract_chunks = std::mem::take(&mut ctx.extract_chunks);
+    let total_chunks = extract_chunks.len();
+
+    let extract_result: Result<(Vec<ExtractedEvent>, i64, i64), SleepBatchError> = async {
+        event_extraction::run_extract_events_for_chunks(
+            &ctx.provider,
+            agent_id,
+            extract_chunks,
+            total_chunks,
+        )
+        .await
+    }
+    .await;
+
+    match extract_result {
+        Ok((extracted_events, inp, out)) => {
+            if !extracted_events.is_empty() {
+                let episode_events =
+                    event_extraction::to_episode_events(extracted_events, agent_id, &ctx.run_id);
+                let event_count = episode_events.len();
+                let run_id_for_insert = ctx.run_id.clone();
+                if let Err(e) = call_blocking(Arc::clone(db), move |db| {
+                    db.insert_episode_events(&run_id_for_insert, &episode_events)
+                })
+                .await
+                {
+                    warn!(error = %e, "failed to insert episode events");
+                } else {
+                    info!(count = event_count, "extracted episode events");
+                }
+            }
+            ctx.input_tokens = inp;
+            ctx.output_tokens = out;
+        }
+        Err(e) => {
+            warn!(error = %e, "event extraction failed, continuing with memory update");
+        }
+    }
+}
+
+/// Call 2: Episodic View Materialization — rollup generation and episodic.md rendering.
+async fn run_rollup_call(
+    ctx: &mut BatchContext,
+    state: &AppState,
+    db: &Arc<Database>,
+    agent_id: &str,
+) -> Option<String> {
+    let tz_str = &state.config.timezone;
+    let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+    let tz = resolve_fixed_offset(tz_str);
+    let now = chrono::Utc::now().with_timezone(&tz);
+
+    let cw = event_rollup::current_week(now, tz_chrono);
+    let cw_start = cw.period_start.to_rfc3339();
+    let cw_end = cw.period_end_exclusive.to_rfc3339();
+
+    let agent_for_events = agent_id.to_string();
+    let current_week_events: Vec<EpisodeEvent> = match call_blocking(Arc::clone(db), move |db| {
+        db.list_episode_events_in_range(&agent_for_events, &cw_start, &cw_end)
+    })
+    .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            warn!(error = %e, "Call2: failed to load current week events");
+            Vec::new()
+        }
+    };
+
+    let call2_result = run_rollup_llm_calls(ctx, db, agent_id, now, tz_chrono, &cw).await;
+
+    if let Err(e) = call2_result {
+        warn!(error = %e, "Call2 rollup generation failed (best-effort, continuing)");
+    }
+
+    // Episodic Renderer
+    episodic_renderer::render_episodic_view(db, agent_id, tz_str, &cw, &current_week_events).await
+}
+
+/// Internal: Run rollup LLM calls for week and month rollups.
+async fn run_rollup_llm_calls(
+    ctx: &mut BatchContext,
+    db: &Arc<Database>,
+    agent_id: &str,
+    now: chrono::DateTime<chrono::FixedOffset>,
+    tz_chrono: chrono_tz::Tz,
+    cw: &event_rollup::WeekPeriod,
+) -> Result<(), SleepBatchError> {
+    let agent_for_plan = agent_id.to_string();
+    let existing_week_rollups: Vec<event_rollup::ExistingRollupInfo> =
+        call_blocking(Arc::clone(db), move |db| {
+            db.list_episode_rollups(&agent_for_plan, RollupGranularity::Week, 100)
+        })
+        .await?
+        .into_iter()
+        .map(|r| event_rollup::ExistingRollupInfo {
+            period_key: r.period_key,
+            event_count: r.event_count,
+            max_ripple: r.max_ripple,
+            summary_md: r.summary_md,
+        })
+        .collect();
+
+    let agent_for_months = agent_id.to_string();
+    let existing_month_rollups: Vec<event_rollup::ExistingRollupInfo> =
+        call_blocking(Arc::clone(db), move |db| {
+            db.list_episode_rollups(&agent_for_months, RollupGranularity::Month, 100)
+        })
+        .await?
+        .into_iter()
+        .map(|r| event_rollup::ExistingRollupInfo {
+            period_key: r.period_key,
+            event_count: r.event_count,
+            max_ripple: r.max_ripple,
+            summary_md: r.summary_md,
+        })
+        .collect();
+
+    let recent = event_rollup::recent_weeks(now, 4, tz_chrono);
+    let earliest_start = recent
+        .last()
+        .map(|w| w.period_start.to_rfc3339())
+        .unwrap_or_else(|| cw.period_start.to_rfc3339());
+    let cw_end = cw.period_end_exclusive.to_rfc3339();
+    let agent_for_all = agent_id.to_string();
+    let all_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(db), move |db| {
+        db.list_episode_events_in_range(&agent_for_all, &earliest_start, &cw_end)
+    })
+    .await?;
+
+    let planner_events: Vec<event_rollup::PlannerEvent> = all_events
+        .iter()
+        .map(|e| event_rollup::PlannerEvent {
+            experienced_at: e.experienced_at.clone(),
+            encoded_at: e.encoded_at.clone(),
+            ripple_strength: e.ripple_strength,
+        })
+        .collect();
+
+    let mut existing_week_rollups = existing_week_rollups;
+
+    let week_requests = event_rollup::plan_week_rollup_updates(
+        agent_id,
+        now,
+        tz_chrono,
+        &event_rollup::RollupPlannerInput {
+            existing_week_rollups: existing_week_rollups.clone(),
+            events: planner_events,
+        },
+    );
+
+    // Call 2a: Week rollup generation
+    if !week_requests.is_empty() {
+        let mut week_events_map: HashMap<String, Vec<event_rollup::Call2Event>> = HashMap::new();
+        for req in &week_requests {
+            let req_start = req.period_start.clone();
+            let req_end = req.period_end_exclusive.clone();
+            let req_key = req.period_key.clone();
+            let agent_for_range = agent_id.to_string();
+            let period_events: Vec<EpisodeEvent> = call_blocking(Arc::clone(db), move |db| {
+                db.list_episode_events_in_range(&agent_for_range, &req_start, &req_end)
+            })
+            .await?;
+
+            let call2_events: Vec<event_rollup::Call2Event> = period_events
+                .iter()
+                .map(|e| event_rollup::Call2Event {
+                    id: e.id.clone(),
+                    experienced_at: e.experienced_at.clone(),
+                    kind: e.kind.to_string(),
+                    title: e.title.clone(),
+                    body_md: e.body_md.clone(),
+                    ripple_strength: e.ripple_strength,
+                    certainty: e.certainty.to_string(),
+                })
+                .collect();
+            week_events_map.insert(req_key, call2_events);
+        }
+
+        let week_input = event_rollup::build_call2_input(&week_requests, &week_events_map);
+        let week_input_json = serde_json::to_string_pretty(&serde_json::json!({
+            "rollup_requests": week_input
+        }))
+        .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
+        let week_input_json = event_rollup::redact_secrets(&week_input_json);
+
+        let week_system_prompt = event_rollup::build_call2_system_prompt_week(agent_id);
+        let valid_keys: HashSet<String> =
+            week_requests.iter().map(|r| r.period_key.clone()).collect();
+
+        let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+            &ctx.provider,
+            &week_system_prompt,
+            &week_input_json,
+            &valid_keys,
+            agent_id,
+        )
+        .await?;
+
+        ctx.input_tokens = ctx.input_tokens.saturating_add(call2_in);
+        ctx.output_tokens = ctx.output_tokens.saturating_add(call2_out);
+
+        let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = week_requests
+            .iter()
+            .map(|r| (r.period_key.as_str(), r))
+            .collect();
+
+        for rollup_output in &rollup_outputs {
+            let Some(request) = requests_by_key.get(rollup_output.period_key.as_str()) else {
+                continue;
+            };
+            let (computed_max_ripple, computed_event_count) =
+                event_rollup::compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
+            let rollup = crate::storage::EpisodeRollup {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: agent_id.to_string(),
+                granularity: RollupGranularity::Week,
+                period_key: rollup_output.period_key.clone(),
+                period_start: request.period_start.clone(),
+                period_end_exclusive: request.period_end_exclusive.clone(),
+                summary_md: rollup_output.summary_md.clone(),
+                max_ripple: computed_max_ripple,
+                event_count: computed_event_count,
+                generated_run_id: ctx.run_id.clone(),
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            };
+            let rollup_for_db = rollup.clone();
+            call_blocking(Arc::clone(db), move |db| {
+                db.upsert_episode_rollup(&rollup_for_db)
+            })
+            .await?;
+        }
+
+        for rollup_output in &rollup_outputs {
+            let (computed_max_ripple, computed_event_count) =
+                event_rollup::compute_rollup_stats(week_events_map.get(&rollup_output.period_key));
+            let updated = event_rollup::ExistingRollupInfo {
+                period_key: rollup_output.period_key.clone(),
+                event_count: computed_event_count,
+                max_ripple: computed_max_ripple,
+                summary_md: rollup_output.summary_md.clone(),
+            };
+            if let Some(idx) = existing_week_rollups
+                .iter()
+                .position(|r| r.period_key == rollup_output.period_key)
+            {
+                existing_week_rollups[idx] = updated;
+            } else {
+                existing_week_rollups.push(updated);
+            }
+        }
+    }
+
+    let month_requests = event_rollup::plan_month_rollup_updates(
+        agent_id,
+        now,
+        tz_chrono,
+        &existing_month_rollups,
+        &existing_week_rollups,
+    );
+
+    // Call 2b: Month rollup generation
+    if !month_requests.is_empty() {
+        let mut week_rollups_map: HashMap<String, Vec<event_rollup::Call2WeekRollupSummary>> =
+            HashMap::new();
+        for req in &month_requests {
+            let summaries: Vec<event_rollup::Call2WeekRollupSummary> = existing_week_rollups
+                .iter()
+                .filter(|wr| {
+                    event_rollup::week_in_month(&wr.period_key, &req.period_key, tz_chrono)
+                })
+                .map(|wr| event_rollup::Call2WeekRollupSummary {
+                    period_key: wr.period_key.clone(),
+                    summary_md: wr.summary_md.clone(),
+                    max_ripple: wr.max_ripple,
+                    event_count: wr.event_count,
+                })
+                .collect();
+            week_rollups_map.insert(req.period_key.clone(), summaries);
+        }
+
+        let mut previous_month_map: HashMap<String, String> = HashMap::new();
+        for req in &month_requests {
+            if let Some(mp) = event_rollup::month_period_from_key(&req.period_key, tz_chrono) {
+                let prev_year = if mp.period_start.month() == 1 {
+                    mp.period_start.year() - 1
+                } else {
+                    mp.period_start.year()
+                };
+                let prev_month = if mp.period_start.month() == 1 {
+                    12
+                } else {
+                    mp.period_start.month() - 1
+                };
+                let prev_key = format!("{}-{:02}", prev_year, prev_month);
+                if let Some(prev_rollup) = existing_month_rollups
+                    .iter()
+                    .find(|r| r.period_key == prev_key)
+                {
+                    previous_month_map
+                        .insert(req.period_key.clone(), prev_rollup.summary_md.clone());
+                }
+            }
+        }
+
+        let month_input = event_rollup::build_call2_input_month(
+            &month_requests,
+            &week_rollups_map,
+            &previous_month_map,
+        );
+        let month_input_json = serde_json::to_string_pretty(&serde_json::json!({
+            "rollup_requests": month_input
+        }))
+        .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
+        let month_input_json = event_rollup::redact_secrets(&month_input_json);
+
+        let month_system_prompt = event_rollup::build_call2_system_prompt_month(agent_id);
+        let valid_keys: HashSet<String> = month_requests
+            .iter()
+            .map(|r| r.period_key.clone())
+            .collect();
+
+        let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+            &ctx.provider,
+            &month_system_prompt,
+            &month_input_json,
+            &valid_keys,
+            agent_id,
+        )
+        .await?;
+
+        ctx.input_tokens = ctx.input_tokens.saturating_add(call2_in);
+        ctx.output_tokens = ctx.output_tokens.saturating_add(call2_out);
+
+        let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = month_requests
+            .iter()
+            .map(|r| (r.period_key.as_str(), r))
+            .collect();
+
+        for rollup_output in &rollup_outputs {
+            let Some(request) = requests_by_key.get(rollup_output.period_key.as_str()) else {
+                continue;
+            };
+
+            let month_week_rollups: Vec<&event_rollup::ExistingRollupInfo> = existing_week_rollups
+                .iter()
+                .filter(|wr| {
+                    event_rollup::week_in_month(
+                        &wr.period_key,
+                        &rollup_output.period_key,
+                        tz_chrono,
+                    )
+                })
+                .collect();
+            let (computed_max_ripple, computed_event_count) =
+                event_rollup::compute_month_rollup_stats(&month_week_rollups);
+
+            let rollup = crate::storage::EpisodeRollup {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: agent_id.to_string(),
+                granularity: RollupGranularity::Month,
+                period_key: rollup_output.period_key.clone(),
+                period_start: request.period_start.clone(),
+                period_end_exclusive: request.period_end_exclusive.clone(),
+                summary_md: rollup_output.summary_md.clone(),
+                max_ripple: computed_max_ripple,
+                event_count: computed_event_count,
+                generated_run_id: ctx.run_id.clone(),
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            };
+            let rollup_for_db = rollup.clone();
+            call_blocking(Arc::clone(db), move |db| {
+                db.upsert_episode_rollup(&rollup_for_db)
+            })
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Call 3: Memory Update — updates semantic and prospective memory via LLM.
+async fn run_memory_update_call(
+    ctx: &mut BatchContext,
+    _state: &AppState,
+    db: &Arc<Database>,
+    agent_id: &str,
+    rendered_episodic: Option<String>,
+) -> Result<memory_update::SleepBatchOutput, SleepBatchError> {
+    let mut final_output = None;
+    let total_chunks = ctx.session_chunks.len();
+
+    for (index, sessions_text) in ctx.session_chunks.clone().into_iter().enumerate() {
+        let input = memory_update::build_sleep_input_from_parts(
+            agent_id,
+            ctx.current_memory.clone(),
+            sessions_text,
+            ctx.context_tokens,
+            0,
+        )?;
+        let system_prompt = memory_update::build_sleep_system_prompt(&input);
+        let (output, in_tok, out_tok) = memory_update::send_sleep_request(
+            &ctx.provider,
+            agent_id,
+            &system_prompt,
+            index + 1,
+            total_chunks,
+        )
+        .await?;
+
+        ctx.input_tokens = ctx.input_tokens.saturating_add(in_tok);
+        ctx.output_tokens = ctx.output_tokens.saturating_add(out_tok);
+        ctx.current_memory =
+            memory_content_from_output(&output, ctx.current_memory.episodic.as_deref());
+        final_output = Some(output);
+    }
+
+    let mut output = final_output
+        .ok_or_else(|| SleepBatchError::Internal("sleep batch produced no output".to_string()))?;
+
+    if let Some(ref md) = rendered_episodic {
+        ctx.current_memory.episodic = Some(md.clone());
+        output.episodic = md.clone();
+    }
+
+    // Save output snapshots
+    save_output_snapshots(db, &ctx.run_id, agent_id, &output).await?;
+
+    Ok(output)
+}
+
+/// Finalizes batch: writes memory files, archives sessions, logs usage.
+async fn finalize_batch(
+    ctx: &BatchContext,
+    state: &AppState,
+    db: &Arc<Database>,
+    agent_id: &str,
+    sessions: &[AgentSessionInfo],
+    source_chats_json: &str,
+    output: &memory_update::SleepBatchOutput,
+) -> Result<(), SleepBatchError> {
+    // Write memory files
+    write_memory_files(&ctx.agents_dir, agent_id, output)?;
+
+    // Archive sessions
+    let groups_dir = state.config.groups_dir();
+    let secrets = crate::tools::collect_config_secrets(&state.config);
+    for session in sessions {
+        if let Err(e) = archive_and_clear_session(db, &groups_dir, session, &secrets) {
+            warn!(
+                agent_id = %agent_id,
+                chat_id = session.chat_id,
+                error = %e,
+                "failed to archive/clear session (continuing)"
+            );
+        }
+    }
+
+    // Log LLM usage
+    if ctx.input_tokens > 0 || ctx.output_tokens > 0 {
+        let provider_name = ctx.provider.provider_name().to_string();
+        let model_name = ctx.provider.model_name().to_string();
+        crate::runtime::metrics::inc_llm_tokens_total("input", &provider_name, ctx.input_tokens);
+        crate::runtime::metrics::inc_llm_tokens_total("output", &provider_name, ctx.output_tokens);
+        let db_for_usage = Arc::clone(db);
+        let input_tokens = ctx.input_tokens;
+        let output_tokens = ctx.output_tokens;
+        tokio::spawn(async move {
+            let _ = crate::storage::call_blocking(db_for_usage, move |db| {
+                db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                    chat_id: 0,
+                    caller_channel: "sleep_batch",
+                    provider: &provider_name,
+                    model: &model_name,
+                    input_tokens,
+                    output_tokens,
+                    request_kind: "sleep_batch",
+                })
+            })
+            .await
+            .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
+        });
+    }
+
+    // Update run success
+    let run_id_owned = ctx.run_id.clone();
+    let source_chats = source_chats_json.to_string();
+    let input_tokens = ctx.input_tokens;
+    let output_tokens = ctx.output_tokens;
+    call_blocking(Arc::clone(db), move |db| {
+        db.update_sleep_run_success(
+            &run_id_owned,
+            &source_chats,
+            None,
+            input_tokens,
+            output_tokens,
+        )
+    })
+    .await?;
+
     Ok(())
 }
 
@@ -2167,123 +2181,313 @@ mod tests {
         assert_eq!(week_end, "2026-05-31");
     }
 
-    #[test]
-    fn deduplicate_background_months_removes_overlap() {
-        let recent = vec![episodic_renderer::RendererRollup {
-            period_key: "2026-04".to_string(),
-            period_start: "2026-04-01T00:00:00+09:00".to_string(),
-            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
-            summary_md: "- April".to_string(),
-            max_ripple: 5,
-            granularity: RollupGranularity::Month,
-        }];
-        let background = vec![
-            episodic_renderer::RendererRollup {
-                period_key: "2026-04".to_string(),
-                period_start: "2026-04-01T00:00:00+09:00".to_string(),
-                period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
-                summary_md: "- April bg".to_string(),
-                max_ripple: 5,
-                granularity: RollupGranularity::Month,
-            },
-            episodic_renderer::RendererRollup {
-                period_key: "2026-03".to_string(),
-                period_start: "2026-03-01T00:00:00+09:00".to_string(),
-                period_end_exclusive: "2026-04-01T00:00:00+09:00".to_string(),
-                summary_md: "- March bg".to_string(),
-                max_ripple: 4,
-                granularity: RollupGranularity::Month,
-            },
-        ];
-        let result = deduplicate_background_months(&recent, background);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].period_key, "2026-03");
+    // -----------------------------------------------------------------------
+    // collect_sleep_input tests
+    // -----------------------------------------------------------------------
+
+    use crate::storage::SleepRunTrigger;
+
+    fn ensure_sleep_runs_table(db: &Database) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sleep_runs (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                trigger_type TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                source_chats_json TEXT NOT NULL DEFAULT '[]',
+                source_digest_md TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT
+            )",
+        )
+        .expect("create sleep_runs table");
+    }
+
+    fn create_completed_sleep_run(db: &Database, agent_id: &str) -> String {
+        ensure_sleep_runs_table(db);
+        let run_id = db
+            .create_sleep_run(agent_id, SleepRunTrigger::Manual)
+            .expect("create sleep run");
+        db.update_sleep_run_success(&run_id, "[]", None, 10, 5)
+            .expect("complete sleep run");
+        run_id
     }
 
     #[test]
-    fn deduplicate_background_months_no_overlap() {
-        let recent = vec![episodic_renderer::RendererRollup {
-            period_key: "2026-04".to_string(),
-            period_start: "2026-04-01T00:00:00+09:00".to_string(),
-            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
-            summary_md: "- April".to_string(),
-            max_ripple: 5,
-            granularity: RollupGranularity::Month,
-        }];
-        let background = vec![episodic_renderer::RendererRollup {
-            period_key: "2026-02".to_string(),
-            period_start: "2026-02-01T00:00:00+09:00".to_string(),
-            period_end_exclusive: "2026-03-01T00:00:00+09:00".to_string(),
-            summary_md: "- Feb bg".to_string(),
-            max_ripple: 4,
-            granularity: RollupGranularity::Month,
-        }];
-        let result = deduplicate_background_months(&recent, background);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].period_key, "2026-02");
+    fn collect_returns_skip_when_no_messages() {
+        let (db, _dir) = test_db();
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        match result {
+            InputDecision::Skip {
+                reason,
+                new_message_count,
+            } => {
+                assert_eq!(new_message_count, 0);
+                assert!(reason.contains("0"));
+                assert!(reason.contains("threshold"));
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
     }
 
     #[test]
-    fn deduplicate_background_months_empty_recent() {
-        let background = vec![episodic_renderer::RendererRollup {
-            period_key: "2026-01".to_string(),
-            period_start: "2026-01-01T00:00:00+09:00".to_string(),
-            period_end_exclusive: "2026-02-01T00:00:00+09:00".to_string(),
-            summary_md: "- Jan".to_string(),
-            max_ripple: 5,
-            granularity: RollupGranularity::Month,
-        }];
-        let result = deduplicate_background_months(&[], background);
-        assert_eq!(result.len(), 1);
+    fn collect_returns_skip_when_below_threshold() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        store_msg(&db, "m-1", chat_id, "hi", "2025-01-01T00:00:01Z");
+        store_msg(&db, "m-2", chat_id, "hi", "2025-01-01T00:00:02Z");
+        store_msg(&db, "m-3", chat_id, "hi", "2025-01-01T00:00:03Z");
+        store_msg(&db, "m-4", chat_id, "hi", "2025-01-01T00:00:04Z");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        match result {
+            InputDecision::Skip {
+                reason: _,
+                new_message_count,
+            } => {
+                assert_eq!(new_message_count, 4);
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
     }
 
     #[test]
-    fn compute_rollup_stats_from_actual_events() {
-        let events = vec![
-            rollup::Call2Event {
-                id: "e1".to_string(),
-                experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
-                kind: "decision".to_string(),
-                title: "t1".to_string(),
-                body_md: "b1".to_string(),
-                ripple_strength: 3,
-                certainty: "stated".to_string(),
-            },
-            rollup::Call2Event {
-                id: "e2".to_string(),
-                experienced_at: "2026-05-21T10:00:00+09:00".to_string(),
-                kind: "insight".to_string(),
-                title: "t2".to_string(),
-                body_md: "b2".to_string(),
-                ripple_strength: 5,
-                certainty: "derived".to_string(),
-            },
-        ];
-        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
-        assert_eq!(max_ripple, 5);
-        assert_eq!(event_count, 2);
+    fn collect_returns_proceed_above_threshold() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        for i in 1..=5 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        match result {
+            InputDecision::Proceed {
+                sessions,
+                source_chats_json,
+            } => {
+                assert!(!sessions.is_empty());
+                assert!(!source_chats_json.is_empty());
+                assert!(source_chats_json.starts_with('['));
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
     }
 
     #[test]
-    fn compute_rollup_stats_defaults_when_empty() {
-        let (max_ripple, event_count) = compute_rollup_stats(None);
-        assert_eq!(max_ripple, 3);
-        assert_eq!(event_count, 0);
+    fn collect_returns_proceed_with_many_messages() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        for i in 1..=10 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        assert!(matches!(result, InputDecision::Proceed { .. }));
     }
 
     #[test]
-    fn compute_rollup_stats_single_event() {
-        let events = vec![rollup::Call2Event {
-            id: "e1".to_string(),
-            experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
-            kind: "feat".to_string(),
-            title: "t".to_string(),
-            body_md: "b".to_string(),
-            ripple_strength: 4,
-            certainty: "stated".to_string(),
-        }];
-        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
-        assert_eq!(max_ripple, 4);
-        assert_eq!(event_count, 1);
+    fn collect_since_last_successful_run() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+
+        let run_id = create_completed_sleep_run(&db, "test-agent");
+        let run = db.get_sleep_run(&run_id).expect("get run").expect("exists");
+        let _finished_at = run.finished_at.expect("has finished_at");
+
+        store_msg(&db, "old-1", chat_id, "old", "2020-01-01T00:00:01Z");
+        store_msg(&db, "old-2", chat_id, "old", "2020-01-01T00:00:02Z");
+        store_msg(&db, "old-3", chat_id, "old", "2020-01-01T00:00:03Z");
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let after_cutoff = chrono::Utc::now().to_rfc3339();
+        store_msg(&db, "new-1", chat_id, "new", &after_cutoff);
+        store_msg(&db, "new-2", chat_id, "new", &after_cutoff);
+        store_msg(&db, "new-3", chat_id, "new", &after_cutoff);
+        store_msg(&db, "new-4", chat_id, "new", &after_cutoff);
+        store_msg(&db, "new-5", chat_id, "new", &after_cutoff);
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        assert!(
+            matches!(result, InputDecision::Proceed { .. }),
+            "5 new messages (> 4 threshold) should trigger Proceed"
+        );
+    }
+
+    #[test]
+    fn collect_first_run_no_previous_run() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        for i in 1..=8 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        assert!(
+            matches!(result, InputDecision::Proceed { .. }),
+            "8 messages with no previous run should trigger Proceed"
+        );
+    }
+
+    #[test]
+    fn collect_respects_max_sessions_limit() {
+        let (db, _dir) = test_db();
+        for i in 0..25 {
+            let cid = create_chat(&db, "test-agent", &format!("-{i}"));
+            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
+                .expect("save session");
+            store_msg(&db, &format!("m{i}"), cid, "hi", "2025-06-01T00:00:00Z");
+        }
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        match result {
+            InputDecision::Proceed { sessions, .. } => {
+                assert_eq!(sessions.len(), MAX_SOURCE_SESSIONS);
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_source_chats_json_format() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        for i in 1..=6 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        let json_str = match &result {
+            InputDecision::Proceed {
+                source_chats_json, ..
+            } => source_chats_json,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(json_str).expect("valid JSON array");
+        assert!(!parsed.is_empty(), "should contain at least one entry");
+
+        let entry = &parsed[0];
+        assert!(entry.get("chat_id").is_some(), "missing chat_id");
+        assert!(entry.get("channel").is_some(), "missing channel");
+        assert!(
+            entry.get("external_chat_id").is_some(),
+            "missing external_chat_id"
+        );
+        assert!(entry.get("updated_at").is_some(), "missing updated_at");
+        assert!(
+            entry.get("message_count").is_some(),
+            "missing message_count"
+        );
+        assert!(
+            entry.get("estimated_tokens").is_some(),
+            "missing estimated_tokens"
+        );
+    }
+
+    #[test]
+    fn collect_source_chats_json_sorted_newest_first() {
+        let (db, _dir) = test_db();
+        for i in 0..8 {
+            let cid = create_chat(&db, "test-agent", &format!("-{i}"));
+            store_msg(&db, &format!("m{i}"), cid, "hi", "2025-06-01T00:00:00Z");
+            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
+                .expect("save session");
+        }
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        let json_str = match &result {
+            InputDecision::Proceed {
+                source_chats_json, ..
+            } => source_chats_json,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(json_str).expect("valid JSON array");
+        assert!(
+            parsed.len() >= 2,
+            "need at least 2 entries to check ordering"
+        );
+
+        let timestamps: Vec<String> = parsed
+            .iter()
+            .map(|v| v["updated_at"].as_str().unwrap_or("").to_string())
+            .collect();
+
+        for i in 0..timestamps.len() - 1 {
+            assert!(
+                timestamps[i] >= timestamps[i + 1],
+                "expected newest first: {i}='{}' < {j}='{}'",
+                timestamps[i],
+                timestamps[i + 1],
+                j = i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn collect_skip_includes_reason_and_count() {
+        let (db, _dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        store_msg(&db, "m-1", chat_id, "hi", "2025-01-01T00:00:01Z");
+        store_msg(&db, "m-2", chat_id, "hi", "2025-01-01T00:00:02Z");
+        store_msg(&db, "m-3", chat_id, "hi", "2025-01-01T00:00:03Z");
+
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+        match result {
+            InputDecision::Skip {
+                reason,
+                new_message_count,
+            } => {
+                assert!(!reason.is_empty(), "reason should not be empty");
+                assert!(reason.contains("3"), "reason should mention count");
+                assert!(
+                    reason.contains("threshold"),
+                    "reason should mention threshold"
+                );
+                assert_eq!(new_message_count, 3);
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
     }
 }

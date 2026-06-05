@@ -9,7 +9,7 @@ use crate::llm::{LlmProvider, Message};
 use crate::memory::MemoryContent;
 use crate::storage::{AgentSessionInfo, Database};
 
-use super::batch::SleepBatchError;
+use super::SleepBatchError;
 use super::prompt::{escape_xml_content, normalize_llm_response};
 
 const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
@@ -263,7 +263,7 @@ fn extract_messages_text(messages_json: &Option<String>) -> String {
 pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
     let mut prompt = String::new();
 
-    prompt.push_str(&include_str!("prompt.md").replace("{AGENT_NAME}", &input.agent_id));
+    prompt.push_str(&include_str!("prompts/prompt.md").replace("{AGENT_NAME}", &input.agent_id));
     prompt.push_str("\n\n## セキュリティ\n\n");
     prompt.push_str("- 秘密情報、トークン、パスワード、APIキーは記憶に保存しない。\n");
     prompt.push_str("- 入力に秘密らしき値が含まれていても、出力からは必ず除外する。\n");

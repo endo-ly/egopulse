@@ -3,11 +3,15 @@
 //! Pure Rust template-based generation of `episodic.md` from episode events
 //! and rollups. No LLM involved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset};
 
-use crate::storage::RollupGranularity;
+use crate::storage::{Database, EpisodeEvent, EpisodeRollup, RollupGranularity, call_blocking};
+
+use super::event_rollup;
+use super::orchestrator::resolve_fixed_offset;
 
 /// Temporal context for the current rendering cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +42,118 @@ pub(crate) struct RendererRollup {
     pub summary_md: String,
     pub max_ripple: i64,
     pub granularity: RollupGranularity,
+}
+
+pub(crate) fn deduplicate_background_months(
+    recent_months: &[RendererRollup],
+    background: Vec<RendererRollup>,
+) -> Vec<RendererRollup> {
+    let recent_keys: HashSet<&str> = recent_months
+        .iter()
+        .map(|r| r.period_key.as_str())
+        .collect();
+    background
+        .into_iter()
+        .filter(|r| !recent_keys.contains(r.period_key.as_str()))
+        .collect()
+}
+
+pub(crate) async fn render_episodic_view(
+    db: &Arc<Database>,
+    agent_id: &str,
+    tz_str: &str,
+    cw: &event_rollup::WeekPeriod,
+    current_week_events: &[EpisodeEvent],
+) -> Option<String> {
+    let tz = resolve_fixed_offset(tz_str);
+    let now = chrono::Utc::now().with_timezone(&tz);
+
+    let renderer_events: Vec<RendererEvent> = current_week_events
+        .iter()
+        .map(|e| RendererEvent {
+            experienced_at: e.experienced_at.clone(),
+            kind: e.kind.to_string(),
+            title: e.title.clone(),
+            body_md: e.body_md.clone(),
+            ripple_strength: e.ripple_strength,
+        })
+        .collect();
+
+    let agent_for_rw = agent_id.to_string();
+    let recent_week_rollups: Vec<EpisodeRollup> = call_blocking(Arc::clone(db), move |db| {
+        db.list_episode_rollups(&agent_for_rw, RollupGranularity::Week, 4)
+    })
+    .await
+    .unwrap_or_default();
+    let rw_renderer: Vec<RendererRollup> = recent_week_rollups
+        .iter()
+        .map(|r| RendererRollup {
+            period_key: r.period_key.clone(),
+            period_start: r.period_start.clone(),
+            period_end_exclusive: r.period_end_exclusive.clone(),
+            summary_md: r.summary_md.clone(),
+            max_ripple: r.max_ripple,
+            granularity: r.granularity,
+        })
+        .collect();
+
+    let agent_for_rm = agent_id.to_string();
+    let recent_month_rollups: Vec<EpisodeRollup> = call_blocking(Arc::clone(db), move |db| {
+        db.list_episode_rollups(&agent_for_rm, RollupGranularity::Month, 2)
+    })
+    .await
+    .unwrap_or_default();
+    let rm_renderer: Vec<RendererRollup> = recent_month_rollups
+        .iter()
+        .map(|r| RendererRollup {
+            period_key: r.period_key.clone(),
+            period_start: r.period_start.clone(),
+            period_end_exclusive: r.period_end_exclusive.clone(),
+            summary_md: r.summary_md.clone(),
+            max_ripple: r.max_ripple,
+            granularity: r.granularity,
+        })
+        .collect();
+
+    let before_period = cw.period_start.to_rfc3339();
+    let agent_for_bg = agent_id.to_string();
+    let background_rollups: Vec<EpisodeRollup> = call_blocking(Arc::clone(db), move |db| {
+        db.list_background_episode_rollups(&agent_for_bg, 4, &before_period)
+    })
+    .await
+    .unwrap_or_default();
+    let bg_renderer_raw: Vec<RendererRollup> = background_rollups
+        .iter()
+        .map(|r| RendererRollup {
+            period_key: r.period_key.clone(),
+            period_start: r.period_start.clone(),
+            period_end_exclusive: r.period_end_exclusive.clone(),
+            summary_md: r.summary_md.clone(),
+            max_ripple: r.max_ripple,
+            granularity: r.granularity,
+        })
+        .collect();
+
+    let bg_renderer = deduplicate_background_months(&rm_renderer, bg_renderer_raw);
+
+    let ctx = WeekContext {
+        now,
+        tz_name: tz_str.to_string(),
+        week_key: cw.week_key.clone(),
+        week_start: extract_date_only(&cw.period_start.to_rfc3339()),
+        week_end: {
+            let end = cw.period_end_exclusive.date_naive() - chrono::Duration::days(1);
+            end.format("%Y-%m-%d").to_string()
+        },
+    };
+
+    Some(render_episodic_md(
+        &ctx,
+        &renderer_events,
+        &rw_renderer,
+        &rm_renderer,
+        &bg_renderer,
+    ))
 }
 
 /// Renders the complete episodic.md content.
@@ -686,5 +802,75 @@ mod tests {
         assert!(header_pos < current_pos);
         assert!(current_pos < recent_weeks_pos);
         assert!(recent_weeks_pos < recent_months_pos);
+    }
+
+    #[test]
+    fn deduplicate_background_months_removes_overlap() {
+        let recent = vec![RendererRollup {
+            period_key: "2026-04".to_string(),
+            period_start: "2026-04-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+            summary_md: "- April".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let background = vec![
+            RendererRollup {
+                period_key: "2026-04".to_string(),
+                period_start: "2026-04-01T00:00:00+09:00".to_string(),
+                period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+                summary_md: "- April bg".to_string(),
+                max_ripple: 5,
+                granularity: RollupGranularity::Month,
+            },
+            RendererRollup {
+                period_key: "2026-03".to_string(),
+                period_start: "2026-03-01T00:00:00+09:00".to_string(),
+                period_end_exclusive: "2026-04-01T00:00:00+09:00".to_string(),
+                summary_md: "- March bg".to_string(),
+                max_ripple: 4,
+                granularity: RollupGranularity::Month,
+            },
+        ];
+        let result = deduplicate_background_months(&recent, background);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period_key, "2026-03");
+    }
+
+    #[test]
+    fn deduplicate_background_months_no_overlap() {
+        let recent = vec![RendererRollup {
+            period_key: "2026-04".to_string(),
+            period_start: "2026-04-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-05-01T00:00:00+09:00".to_string(),
+            summary_md: "- April".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let background = vec![RendererRollup {
+            period_key: "2026-02".to_string(),
+            period_start: "2026-02-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-03-01T00:00:00+09:00".to_string(),
+            summary_md: "- Feb bg".to_string(),
+            max_ripple: 4,
+            granularity: RollupGranularity::Month,
+        }];
+        let result = deduplicate_background_months(&recent, background);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period_key, "2026-02");
+    }
+
+    #[test]
+    fn deduplicate_background_months_empty_recent() {
+        let background = vec![RendererRollup {
+            period_key: "2026-01".to_string(),
+            period_start: "2026-01-01T00:00:00+09:00".to_string(),
+            period_end_exclusive: "2026-02-01T00:00:00+09:00".to_string(),
+            summary_md: "- Jan".to_string(),
+            max_ripple: 5,
+            granularity: RollupGranularity::Month,
+        }];
+        let result = deduplicate_background_months(&[], background);
+        assert_eq!(result.len(), 1);
     }
 }

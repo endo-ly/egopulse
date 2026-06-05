@@ -13,7 +13,7 @@ use crate::storage::{
     EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind, SenderKind, StoredMessage,
 };
 
-use super::batch::SleepBatchError;
+use super::SleepBatchError;
 use super::memory_update;
 use super::prompt::{escape_xml_content, normalize_llm_response};
 
@@ -129,7 +129,7 @@ pub(crate) fn parse_extract_events_response(
 }
 
 pub(crate) fn build_extract_system_prompt(agent_id: &str, sessions_text: &str) -> String {
-    let mut prompt = include_str!("extract_prompt.md").replace("{AGENT_NAME}", agent_id);
+    let mut prompt = include_str!("prompts/extract_prompt.md").replace("{AGENT_NAME}", agent_id);
 
     if !sessions_text.is_empty() {
         prompt.push_str("\n\n## 入力データ\n\n<sessions>\n");

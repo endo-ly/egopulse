@@ -591,6 +591,13 @@ pub(crate) fn compute_month_rollup_stats(week_rollups: &[&ExistingRollupInfo]) -
     (max_ripple, event_count)
 }
 
+pub(crate) fn compute_rollup_stats(events: Option<&Vec<Call2Event>>) -> (i64, i64) {
+    let slice = events.map(|v| v.as_slice()).unwrap_or(&[]);
+    let max_ripple = slice.iter().map(|e| e.ripple_strength).max().unwrap_or(3);
+    let event_count = i64::try_from(slice.len()).unwrap_or(0);
+    (max_ripple, event_count)
+}
+
 // ---------------------------------------------------------------------------
 // Output parser + validator
 // ---------------------------------------------------------------------------
@@ -756,12 +763,12 @@ fn redact_prefixed_values(
 
 /// Builds the Call2 system prompt for week rollups from the embedded week prompt template.
 pub(crate) fn build_call2_system_prompt_week(agent_id: &str) -> String {
-    include_str!("rollup_week_prompt.md").replace("{AGENT_NAME}", agent_id)
+    include_str!("prompts/rollup_week_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
 /// Builds the Call2 system prompt for month rollups from the embedded month prompt template.
 pub(crate) fn build_call2_system_prompt_month(agent_id: &str) -> String {
-    include_str!("rollup_month_prompt.md").replace("{AGENT_NAME}", agent_id)
+    include_str!("prompts/rollup_month_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
 /// Builds the Call2 user prompt with the input JSON.
@@ -1824,5 +1831,55 @@ mod tests {
             june.is_some(),
             "June should be triggered by month planner: {month_reqs:?}"
         );
+    }
+
+    #[test]
+    fn compute_rollup_stats_from_actual_events() {
+        let events = vec![
+            Call2Event {
+                id: "e1".to_string(),
+                experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
+                kind: "decision".to_string(),
+                title: "t1".to_string(),
+                body_md: "b1".to_string(),
+                ripple_strength: 3,
+                certainty: "stated".to_string(),
+            },
+            Call2Event {
+                id: "e2".to_string(),
+                experienced_at: "2026-05-21T10:00:00+09:00".to_string(),
+                kind: "insight".to_string(),
+                title: "t2".to_string(),
+                body_md: "b2".to_string(),
+                ripple_strength: 5,
+                certainty: "derived".to_string(),
+            },
+        ];
+        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
+        assert_eq!(max_ripple, 5);
+        assert_eq!(event_count, 2);
+    }
+
+    #[test]
+    fn compute_rollup_stats_defaults_when_empty() {
+        let (max_ripple, event_count) = compute_rollup_stats(None);
+        assert_eq!(max_ripple, 3);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn compute_rollup_stats_single_event() {
+        let events = vec![Call2Event {
+            id: "e1".to_string(),
+            experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
+            kind: "feat".to_string(),
+            title: "t".to_string(),
+            body_md: "b".to_string(),
+            ripple_strength: 4,
+            certainty: "stated".to_string(),
+        }];
+        let (max_ripple, event_count) = compute_rollup_stats(Some(&events));
+        assert_eq!(max_ripple, 4);
+        assert_eq!(event_count, 1);
     }
 }
