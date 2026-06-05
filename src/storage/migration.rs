@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 6;
+pub(super) const SCHEMA_VERSION: i64 = 7;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -218,7 +218,24 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 ON pulse_runs(agent_id, started_at);
 
             CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
-                ON pulse_runs(chat_id);",
+                ON pulse_runs(chat_id);
+
+            CREATE TABLE IF NOT EXISTS sleep_run_steps (
+                sleep_run_id    TEXT NOT NULL,
+                step_name       TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update', 'prospective_update')),
+                status          TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
+                started_at      TEXT,
+                finished_at     TEXT,
+                input_tokens    INTEGER NOT NULL DEFAULT 0,
+                output_tokens   INTEGER NOT NULL DEFAULT 0,
+                error_message   TEXT,
+                metadata_json   TEXT,
+                PRIMARY KEY (sleep_run_id, step_name),
+                FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
+                ON sleep_run_steps(step_name, status, started_at);",
         )?;
         set_schema_version(
             conn,
@@ -502,6 +519,35 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 6;
     }
 
+    if version < 7 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sleep_run_steps (
+                sleep_run_id    TEXT NOT NULL,
+                step_name       TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update', 'prospective_update')),
+                status          TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
+                started_at      TEXT,
+                finished_at     TEXT,
+                input_tokens    INTEGER NOT NULL DEFAULT 0,
+                output_tokens   INTEGER NOT NULL DEFAULT 0,
+                error_message   TEXT,
+                metadata_json   TEXT,
+                PRIMARY KEY (sleep_run_id, step_name),
+                FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
+                ON sleep_run_steps(step_name, status, started_at);",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            7,
+            "add sleep_run_steps table for per-step execution log",
+        )?;
+        tx.commit()?;
+        version = 7;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -527,6 +573,7 @@ mod tests {
             "pulse_runs",
             "episode_events",
             "episode_rollups",
+            "sleep_run_steps",
         ];
         for name in &expected_tables {
             let exists: bool = conn
@@ -1098,5 +1145,411 @@ mod tests {
             .expect("row");
         assert_eq!(sender_id, "lyre");
         assert_eq!(sender_kind, "tool");
+    }
+
+    // --- v7: sleep_run_steps ---------------------------------------------------
+
+    /// Creates a Database with v6 schema (all tables through episode_rollups) for testing v7 migration.
+    fn create_v6_db(dir: &tempfile::TempDir) -> super::super::Database {
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT,
+                    chat_type TEXT NOT NULL DEFAULT 'private',
+                    last_message_time TEXT NOT NULL,
+                    channel TEXT,
+                    external_chat_id TEXT,
+                    agent_id TEXT NOT NULL DEFAULT 'default'
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
+                    ON chats(channel, external_chat_id);
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    sender_kind TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    message_kind TEXT NOT NULL DEFAULT 'message',
+                    recipient_agent_id TEXT,
+                    PRIMARY KEY (id, chat_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+                    ON messages(chat_id, timestamp);
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    chat_id INTEGER PRIMARY KEY,
+                    messages_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS tool_calls (
+                    id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    tool_input TEXT NOT NULL,
+                    tool_output TEXT,
+                    timestamp TEXT NOT NULL,
+                    PRIMARY KEY (id, chat_id, message_id),
+                    FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+                    ON tool_calls(chat_id);
+
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+                    ON tool_calls(chat_id, message_id);
+
+                CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    caller_channel TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
+                    ON llm_usage_logs(chat_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+                    ON llm_usage_logs(created_at);
+
+                CREATE TABLE IF NOT EXISTS sleep_runs (
+                    id                  TEXT PRIMARY KEY,
+                    agent_id            TEXT NOT NULL,
+                    status              TEXT NOT NULL,
+                    trigger_type        TEXT NOT NULL,
+                    started_at          TEXT NOT NULL,
+                    finished_at         TEXT,
+                    source_chats_json   TEXT NOT NULL DEFAULT '[]',
+                    source_digest_md    TEXT,
+                    input_tokens        INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL DEFAULT 0,
+                    total_tokens        INTEGER NOT NULL DEFAULT 0,
+                    error_message       TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_started
+                    ON sleep_runs(agent_id, started_at);
+
+                CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status
+                    ON sleep_runs(agent_id, status);
+
+                CREATE TABLE IF NOT EXISTS memory_snapshots (
+                    id              TEXT PRIMARY KEY,
+                    run_id          TEXT NOT NULL,
+                    agent_id        TEXT NOT NULL,
+                    file            TEXT NOT NULL,
+                    content_before  TEXT NOT NULL,
+                    content_after   TEXT NOT NULL,
+                    created_at      TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
+                    ON memory_snapshots(run_id);
+
+                CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
+                    ON memory_snapshots(agent_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS pulse_runs (
+                    id            TEXT PRIMARY KEY,
+                    agent_id      TEXT NOT NULL,
+                    intention_id  TEXT NOT NULL,
+                    due_key       TEXT NOT NULL,
+                    chat_id       INTEGER,
+                    message_id    TEXT,
+                    status        TEXT NOT NULL,
+                    started_at    TEXT NOT NULL,
+                    finished_at   TEXT,
+                    output_kind   TEXT,
+                    output_text   TEXT,
+                    error_message TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pulse_runs_due
+                    ON pulse_runs(agent_id, intention_id, due_key);
+
+                CREATE INDEX IF NOT EXISTS idx_pulse_runs_agent_started
+                    ON pulse_runs(agent_id, started_at);
+
+                CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
+                    ON pulse_runs(chat_id);
+
+                CREATE TABLE IF NOT EXISTS episode_events (
+                    id               TEXT PRIMARY KEY,
+                    agent_id         TEXT NOT NULL,
+                    experienced_at   TEXT NOT NULL,
+                    encoded_at       TEXT NOT NULL,
+                    kind             TEXT NOT NULL,
+                    title            TEXT NOT NULL,
+                    body_md          TEXT NOT NULL,
+                    ripple_strength  INTEGER NOT NULL DEFAULT 3,
+                    certainty        TEXT NOT NULL DEFAULT 'stated',
+                    sleep_run_id     TEXT NOT NULL,
+                    source_refs_json TEXT,
+                    created_at       TEXT NOT NULL,
+                    updated_at       TEXT NOT NULL,
+                    CHECK (kind IN (
+                        'self', 'relationship', 'world', 'feat',
+                        'anomaly', 'decision', 'insight', 'rhythm'
+                    )),
+                    CHECK (ripple_strength BETWEEN 1 AND 5),
+                    CHECK (certainty IN ('stated', 'derived', 'tentative'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
+                    ON episode_events(agent_id, experienced_at);
+
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced
+                    ON episode_events(agent_id, kind, experienced_at);
+
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced
+                    ON episode_events(agent_id, ripple_strength, experienced_at);
+
+                CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
+                    ON episode_events(sleep_run_id);
+
+                CREATE TABLE IF NOT EXISTS episode_rollups (
+                    id                   TEXT PRIMARY KEY,
+                    agent_id             TEXT NOT NULL,
+                    granularity          TEXT NOT NULL,
+                    period_key           TEXT NOT NULL,
+                    period_start         TEXT NOT NULL,
+                    period_end_exclusive TEXT NOT NULL,
+                    summary_md           TEXT NOT NULL,
+                    max_ripple           INTEGER NOT NULL DEFAULT 3,
+                    event_count          INTEGER NOT NULL DEFAULT 0,
+                    generated_run_id     TEXT NOT NULL,
+                    created_at           TEXT NOT NULL,
+                    updated_at           TEXT NOT NULL,
+                    CHECK (granularity IN ('week', 'month')),
+                    CHECK (max_ripple BETWEEN 1 AND 5),
+                    UNIQUE(agent_id, granularity, period_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_period
+                    ON episode_rollups(agent_id, granularity, period_start);
+
+                CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
+                    ON episode_rollups(agent_id, granularity, max_ripple, period_start);",
+            )
+            .unwrap();
+
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS db_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+
+            super::set_schema_version(&conn, 6, "test v6 baseline").unwrap();
+        }
+
+        super::super::Database::new_unchecked(&db_path).unwrap()
+    }
+
+    fn run_v7_migration(db: &super::super::Database) {
+        let conn = db.get_conn().expect("pool");
+        super::run_migrations(&conn).expect("re-run migrations");
+    }
+
+    #[test]
+    fn migration_v6_to_v7_creates_sleep_run_steps() {
+        // Arrange: v6 DB with an existing sleep run
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v6_db(&dir);
+        {
+            let conn = db.get_conn().expect("pool");
+            conn.execute(
+                "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+                 VALUES ('existing-run-1', 'agent-a', 'success', 'manual', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert existing run");
+        }
+
+        // Act: run v7 migration
+        run_v7_migration(&db);
+
+        // Assert: schema version advanced
+        let conn = db.get_conn().expect("pool");
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema version");
+        assert_eq!(version.parse::<i64>().unwrap(), 7);
+
+        // Assert: sleep_run_steps table exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_run_steps'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(
+            exists,
+            "sleep_run_steps table should exist after v7 migration"
+        );
+
+        // Assert: all expected columns exist
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sleep_run_steps)")
+            .expect("prepare pragma");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .map(|r| r.expect("col"))
+            .collect();
+        for expected in &[
+            "sleep_run_id",
+            "step_name",
+            "status",
+            "started_at",
+            "finished_at",
+            "input_tokens",
+            "output_tokens",
+            "error_message",
+            "metadata_json",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == *expected),
+                "missing column: {expected}"
+            );
+        }
+
+        // Assert: CHECK constraint rejects invalid step_name
+        let invalid_step = conn.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES ('existing-run-1', 'invalid_step', 'pending')",
+            [],
+        );
+        assert!(invalid_step.is_err(), "should reject invalid step_name");
+
+        // Assert: CHECK constraint rejects invalid status
+        let invalid_status = conn.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES ('existing-run-1', 'event_extraction', 'invalid_status')",
+            [],
+        );
+        assert!(invalid_status.is_err(), "should reject invalid status");
+
+        // Assert: valid step rows can be inserted
+        conn.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES ('existing-run-1', 'event_extraction', 'pending')",
+            [],
+        )
+        .expect("insert valid step");
+
+        // Assert: composite PK prevents duplicate (sleep_run_id, step_name)
+        let duplicate = conn.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES ('existing-run-1', 'event_extraction', 'running')",
+            [],
+        );
+        assert!(duplicate.is_err(), "should reject duplicate composite PK");
+
+        // Assert: FK cascade — deleting sleep_run deletes its steps
+        conn.execute("DELETE FROM sleep_runs WHERE id = 'existing-run-1'", [])
+            .expect("delete run");
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sleep_run_steps WHERE sleep_run_id = 'existing-run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count steps");
+        assert_eq!(step_count, 0, "FK cascade should delete child steps");
+
+        // Assert: search index exists
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_sleep_run_steps_step_status'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check index");
+        assert!(
+            index_exists,
+            "idx_sleep_run_steps_step_status index should exist"
+        );
+    }
+
+    #[test]
+    fn fresh_database_contains_sleep_run_steps_schema() {
+        // Arrange & Act: fresh DB applies all migrations including v7
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("all migrations succeed");
+
+        // Assert: schema version is current
+        let conn = db.get_conn().expect("pool");
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema version");
+        assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
+
+        // Assert: sleep_run_steps table exists with correct structure
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sleep_run_steps'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check table");
+        assert!(exists, "sleep_run_steps should exist on fresh DB");
+
+        // Assert: can insert a valid run + step
+        conn.execute(
+            "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+             VALUES ('fresh-run', 'agent-a', 'running', 'manual', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert run");
+        conn.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES ('fresh-run', 'event_extraction', 'pending')",
+            [],
+        )
+        .expect("insert step");
+
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sleep_run_steps WHERE sleep_run_id = 'fresh-run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(step_count, 1);
     }
 }
