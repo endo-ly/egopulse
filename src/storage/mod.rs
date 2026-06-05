@@ -328,6 +328,48 @@ impl FromStr for SleepRunTrigger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SleepStepName {
+    EventExtraction,
+    EpisodicUpdate,
+    SemanticUpdate,
+    ProspectiveUpdate,
+}
+
+impl SleepStepName {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::EventExtraction,
+        Self::EpisodicUpdate,
+        Self::SemanticUpdate,
+        Self::ProspectiveUpdate,
+    ];
+}
+
+impl fmt::Display for SleepStepName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EventExtraction => write!(f, "event_extraction"),
+            Self::EpisodicUpdate => write!(f, "episodic_update"),
+            Self::SemanticUpdate => write!(f, "semantic_update"),
+            Self::ProspectiveUpdate => write!(f, "prospective_update"),
+        }
+    }
+}
+
+impl FromStr for SleepStepName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "event_extraction" => Ok(Self::EventExtraction),
+            "episodic_update" => Ok(Self::EpisodicUpdate),
+            "semantic_update" => Ok(Self::SemanticUpdate),
+            "prospective_update" => Ok(Self::ProspectiveUpdate),
+            other => Err(format!("invalid sleep step name: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SleepRun {
     pub id: String,
@@ -621,10 +663,12 @@ const _: () = {
     assert_from_str::<SenderKind>();
     assert_display::<SleepRunStatus>();
     assert_display::<SleepRunTrigger>();
+    assert_display::<SleepStepName>();
     assert_display::<MemoryFile>();
     assert_display::<MessageKind>();
     assert_from_str::<SleepRunStatus>();
     assert_from_str::<SleepRunTrigger>();
+    assert_from_str::<SleepStepName>();
     assert_from_str::<MemoryFile>();
     assert_from_str::<MessageKind>();
 
