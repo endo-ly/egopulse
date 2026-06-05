@@ -1134,6 +1134,100 @@ impl Database {
         .map_err(Into::into)
     }
 
+    pub(crate) fn finalize_sleep_run(
+        &self,
+        sleep_run_id: &str,
+    ) -> Result<SleepRunStatus, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let steps: Vec<SleepRunStep> = {
+            let mut stmt = tx.prepare(
+                "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                        input_tokens, output_tokens, error_message, metadata_json
+                 FROM sleep_run_steps
+                 WHERE sleep_run_id = ?1",
+            )?;
+            stmt.query_map(params![sleep_run_id], row_to_sleep_run_step)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut success_count = 0;
+        let mut failed_count = 0;
+        let mut skipped_count = 0;
+        let mut pending_or_running = false;
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        for step in &steps {
+            match step.status {
+                SleepStepStatus::Success => success_count += 1,
+                SleepStepStatus::Failed => {
+                    failed_count += 1;
+                    if let Some(ref err) = step.error_message {
+                        errors.push(format!("{}: {}", step.step_name, err));
+                    }
+                }
+                SleepStepStatus::Skipped => skipped_count += 1,
+                SleepStepStatus::Pending | SleepStepStatus::Running => {
+                    pending_or_running = true;
+                }
+            }
+            total_input_tokens = total_input_tokens.saturating_add(step.input_tokens);
+            total_output_tokens = total_output_tokens.saturating_add(step.output_tokens);
+        }
+
+        let derived_status = if pending_or_running {
+            SleepRunStatus::Failed
+        } else if success_count == 0 && failed_count == 0 && skipped_count > 0 {
+            SleepRunStatus::Skipped
+        } else if success_count > 0 && failed_count == 0 {
+            SleepRunStatus::Success
+        } else if success_count > 0 && failed_count > 0 {
+            SleepRunStatus::PartialFailure
+        } else {
+            SleepRunStatus::Failed
+        };
+
+        let error_message = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let total_tokens = total_input_tokens.saturating_add(total_output_tokens);
+        let running = SleepRunStatus::Running.to_string();
+
+        let changed = tx.execute(
+            "UPDATE sleep_runs
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4, total_tokens = ?5,
+                 error_message = ?6
+             WHERE id = ?7 AND status = ?8",
+            params![
+                derived_status.to_string(),
+                now,
+                total_input_tokens,
+                total_output_tokens,
+                total_tokens,
+                error_message,
+                sleep_run_id,
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{sleep_run_id} is not running"
+            )));
+        }
+
+        tx.commit()?;
+        Ok(derived_status)
+    }
+
     // ---------------------------------------------------------------------------
     // Sleep step checkpoints
     // ---------------------------------------------------------------------------
@@ -2896,6 +2990,145 @@ mod tests {
             matches!(result, Err(StorageError::Conflict(_))),
             "should reject re-starting a completed step"
         );
+    }
+
+    fn finish_step_success(
+        db: &Database,
+        run_id: &str,
+        step: SleepStepName,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens,
+                output_tokens,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    fn finish_step_failed(db: &Database, run_id: &str, step: SleepStepName, error: &str) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Failed,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: Some(error),
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    fn skip_step(db: &Database, run_id: &str, step: SleepStepName) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Skipped,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    #[test]
+    fn finalize_sleep_run_derives_status_matrix() {
+        // Arrange & Act & Assert: all success → success
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            finish_step_success(&db, &run_id, step, 10, 5);
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Success);
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert_eq!(run.status, SleepRunStatus::Success);
+
+        // Arrange & Act & Assert: mixed success + failed → partial_failure
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 10, 5);
+        finish_step_failed(&db, &run_id, SleepStepName::EpisodicUpdate, "LLM error");
+        skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
+        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::PartialFailure);
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert!(run.error_message.as_deref().unwrap().contains("LLM error"));
+
+        // Arrange & Act & Assert: all failed → failed
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            finish_step_failed(&db, &run_id, step, "error");
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Failed);
+
+        // Arrange & Act & Assert: all skipped → skipped
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            skip_step(&db, &run_id, step);
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Skipped);
+
+        // Arrange & Act & Assert: pending remaining → failed
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 10, 5);
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Failed);
+    }
+
+    #[test]
+    fn finalize_sleep_run_sums_step_tokens() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 100, 50);
+        finish_step_success(&db, &run_id, SleepStepName::EpisodicUpdate, 200, 80);
+        skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
+        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
+
+        // Act
+        db.finalize_sleep_run(&run_id).expect("finalize");
+
+        // Assert: tokens are summed from steps
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert_eq!(run.input_tokens, 300);
+        assert_eq!(run.output_tokens, 130);
+        assert_eq!(run.total_tokens, 430);
     }
 
     #[test]

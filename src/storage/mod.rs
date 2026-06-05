@@ -265,6 +265,7 @@ impl FromStr for SenderKind {
 pub(crate) enum SleepRunStatus {
     Running,
     Success,
+    PartialFailure,
     Failed,
     Skipped,
 }
@@ -274,6 +275,7 @@ impl fmt::Display for SleepRunStatus {
         match self {
             Self::Running => write!(f, "running"),
             Self::Success => write!(f, "success"),
+            Self::PartialFailure => write!(f, "partial_failure"),
             Self::Failed => write!(f, "failed"),
             Self::Skipped => write!(f, "skipped"),
         }
@@ -287,6 +289,7 @@ impl FromStr for SleepRunStatus {
         match s {
             "running" => Ok(Self::Running),
             "success" => Ok(Self::Success),
+            "partial_failure" => Ok(Self::PartialFailure),
             "failed" => Ok(Self::Failed),
             "skipped" => Ok(Self::Skipped),
             other => Err(format!("invalid sleep run status: {other}")),
