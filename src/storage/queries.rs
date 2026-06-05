@@ -8,7 +8,8 @@ use super::{
     AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
     EpisodeRollup, LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind,
     PulseRun, PulseRunStatus, RollupGranularity, SenderKind, SessionSnapshot, SessionSummary,
-    SleepRun, SleepRunStatus, SleepRunTrigger, SleepStepName, StoredMessage, ToolCall,
+    SleepRun, SleepRunStatus, SleepRunStep, SleepRunTrigger, SleepStepName, SleepStepResult,
+    SleepStepStatus, StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -186,6 +187,36 @@ fn insert_pending_steps(
         )?;
     }
     Ok(())
+}
+
+fn row_to_sleep_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRunStep> {
+    let step_name_str: String = row.get(1)?;
+    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let status_str: String = row.get(2)?;
+    let status = SleepStepStatus::from_str(&status_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(SleepRunStep {
+        sleep_run_id: row.get(0)?,
+        step_name,
+        status,
+        started_at: row.get(3)?,
+        finished_at: row.get(4)?,
+        input_tokens: row.get(5)?,
+        output_tokens: row.get(6)?,
+        error_message: row.get(7)?,
+        metadata_json: row.get(8)?,
+    })
 }
 
 impl Database {
@@ -972,6 +1003,103 @@ impl Database {
              LIMIT 1",
             params![agent_id],
             row_to_sleep_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn start_sleep_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+        let pending = SleepStepStatus::Pending.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, started_at = ?2
+             WHERE sleep_run_id = ?3 AND step_name = ?4 AND status = ?5",
+            params![running, now, sleep_run_id, step_name.to_string(), pending],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not pending",
+                step_name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_sleep_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+        result: SleepStepResult<'_>,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4,
+                 error_message = ?5, metadata_json = ?6
+             WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
+            params![
+                result.status.to_string(),
+                now,
+                result.input_tokens,
+                result.output_tokens,
+                result.error_message,
+                result.metadata_json,
+                sleep_run_id,
+                step_name.to_string(),
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not running",
+                step_name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_sleep_run_steps(
+        &self,
+        sleep_run_id: &str,
+    ) -> Result<Vec<SleepRunStep>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                    input_tokens, output_tokens, error_message, metadata_json
+             FROM sleep_run_steps
+             WHERE sleep_run_id = ?1
+             ORDER BY step_name",
+        )?;
+        stmt.query_map(params![sleep_run_id], row_to_sleep_run_step)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn get_sleep_run_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+    ) -> Result<Option<SleepRunStep>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                    input_tokens, output_tokens, error_message, metadata_json
+             FROM sleep_run_steps
+             WHERE sleep_run_id = ?1 AND step_name = ?2",
+            params![sleep_run_id, step_name.to_string()],
+            row_to_sleep_run_step,
         )
         .optional()
         .map_err(Into::into)
@@ -2507,41 +2635,18 @@ mod tests {
             .expect("should insert");
 
         // Assert: 4 step rows created with pending status
-        let conn = db.get_conn().expect("pool");
-        let mut stmt = conn
-            .prepare(
-                "SELECT step_name, status, started_at, finished_at, input_tokens, output_tokens
-                 FROM sleep_run_steps
-                 WHERE sleep_run_id = ?1
-                 ORDER BY step_name",
-            )
-            .expect("prepare");
-        let steps: Vec<(String, String, Option<String>, Option<String>, i64, i64)> = stmt
-            .query_map(rusqlite::params![id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
+        let steps = db.list_sleep_run_steps(&id).expect("list steps");
         assert_eq!(steps.len(), 4, "should have 4 step rows");
-        assert_eq!(steps[0].0, "episodic_update");
-        assert_eq!(steps[1].0, "event_extraction");
-        assert_eq!(steps[2].0, "prospective_update");
-        assert_eq!(steps[3].0, "semantic_update");
-        for (_, status, started_at, finished_at, input_tokens, output_tokens) in &steps {
-            assert_eq!(status, "pending");
-            assert!(started_at.is_none(), "started_at should be NULL");
-            assert!(finished_at.is_none(), "finished_at should be NULL");
-            assert_eq!(*input_tokens, 0);
-            assert_eq!(*output_tokens, 0);
+        assert_eq!(steps[0].step_name, SleepStepName::EpisodicUpdate);
+        assert_eq!(steps[1].step_name, SleepStepName::EventExtraction);
+        assert_eq!(steps[2].step_name, SleepStepName::ProspectiveUpdate);
+        assert_eq!(steps[3].step_name, SleepStepName::SemanticUpdate);
+        for step in &steps {
+            assert_eq!(step.status, SleepStepStatus::Pending);
+            assert!(step.started_at.is_none(), "started_at should be NULL");
+            assert!(step.finished_at.is_none(), "finished_at should be NULL");
+            assert_eq!(step.input_tokens, 0);
+            assert_eq!(step.output_tokens, 0);
         }
 
         // Assert: second call returns None (existing exclusion)
@@ -2578,6 +2683,112 @@ mod tests {
             )
             .expect("count");
         assert_eq!(step_count, 0, "cascade should remove all step rows");
+    }
+
+    #[test]
+    fn sleep_step_lifecycle_persists_terminal_result() {
+        // Arrange: run with 4 pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Act: start event_extraction, then finish with success + tokens + metadata
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start step");
+        db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 150,
+                output_tokens: 80,
+                error_message: None,
+                metadata_json: Some(r#"{"events_extracted": 12}"#),
+            },
+        )
+        .expect("finish step");
+
+        // Assert: step has terminal state
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EventExtraction)
+            .expect("get step")
+            .expect("step exists");
+        assert_eq!(step.status, SleepStepStatus::Success);
+        assert!(step.started_at.is_some());
+        assert!(step.finished_at.is_some());
+        assert_eq!(step.input_tokens, 150);
+        assert_eq!(step.output_tokens, 80);
+        assert!(step.error_message.is_none());
+        assert_eq!(
+            step.metadata_json.as_deref(),
+            Some(r#"{"events_extracted": 12}"#)
+        );
+
+        // Assert: other steps remain pending
+        let pending_step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EpisodicUpdate)
+            .expect("get step")
+            .expect("step exists");
+        assert_eq!(pending_step.status, SleepStepStatus::Pending);
+        assert!(pending_step.started_at.is_none());
+
+        // Assert: list returns all 4 steps
+        let steps = db.list_sleep_run_steps(&run_id).expect("list steps");
+        assert_eq!(steps.len(), 4);
+    }
+
+    #[test]
+    fn sleep_step_lifecycle_rejects_invalid_transition() {
+        // Arrange: run with 4 pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Act: try to finish a pending step (should fail - must be running first)
+        let result = db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        );
+
+        // Assert: conflict error
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject finishing a pending step"
+        );
+
+        // Act: start then finish, then try to start again
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start step");
+        db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish step");
+        let result = db.start_sleep_step(&run_id, SleepStepName::EventExtraction);
+
+        // Assert: cannot re-start a completed step
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject re-starting a completed step"
+        );
     }
 
     #[test]
