@@ -163,6 +163,7 @@ describe("RunList", () => {
       makeRun({ id: "r2", status: "failed" }),
       makeRun({ id: "r3", status: "skipped" }),
       makeRun({ id: "r4", status: "running" }),
+      makeRun({ id: "r5", status: "partial_failure" }),
     ];
 
     // Act
@@ -175,6 +176,7 @@ describe("RunList", () => {
     expect(screen.getByText("\u274C")).toBeDefined(); // ❌
     expect(screen.getByText("\u23ED")).toBeDefined(); // ⏭
     expect(screen.getByText("\uD83D\uDD04")).toBeDefined(); // 🔄
+    expect(screen.getByText("\u26A0\uFE0F")).toBeDefined(); // ⚠️
   });
 });
 
