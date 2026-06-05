@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 8;
+pub(super) const SCHEMA_VERSION: i64 = 9;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -187,7 +187,10 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 file            TEXT NOT NULL,
                 content_before  TEXT NOT NULL,
                 content_after   TEXT NOT NULL,
-                created_at      TEXT NOT NULL
+                created_at      TEXT NOT NULL,
+                UNIQUE (run_id, file),
+                FOREIGN KEY (run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE,
+                CHECK (file IN ('episodic', 'semantic', 'prospective'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
@@ -575,6 +578,43 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         )?;
         tx.commit()?;
         version = 8;
+    }
+
+    if version < 9 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE memory_snapshots_v9 (
+                id              TEXT PRIMARY KEY,
+                run_id          TEXT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                file            TEXT NOT NULL,
+                content_before  TEXT NOT NULL,
+                content_after   TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                UNIQUE (run_id, file),
+                FOREIGN KEY (run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE,
+                CHECK (file IN ('episodic', 'semantic', 'prospective'))
+            );
+
+            INSERT INTO memory_snapshots_v9
+                SELECT id, run_id, agent_id, file, content_before, content_after, created_at
+                FROM memory_snapshots;
+
+            DROP TABLE memory_snapshots;
+            ALTER TABLE memory_snapshots_v9 RENAME TO memory_snapshots;
+
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
+                ON memory_snapshots(run_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
+                ON memory_snapshots(agent_id, created_at);",
+        )?;
+        set_schema_version_in_tx(
+            &tx,
+            9,
+            "enforce memory_snapshot uniqueness, FK, and file CHECK",
+        )?;
+        tx.commit()?;
+        version = 9;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -1750,7 +1790,7 @@ mod tests {
         let conn = db.get_conn().expect("pool");
         super::run_migrations(&conn).expect("re-run migrations");
 
-        // Assert: schema version advanced
+        // Assert: schema version advanced past v8
         let version: String = conn
             .query_row(
                 "SELECT value FROM db_meta WHERE key = 'schema_version'",
@@ -1758,7 +1798,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version");
-        assert_eq!(version.parse::<i64>().unwrap(), 8);
+        assert!(
+            version.parse::<i64>().unwrap() >= 8,
+            "schema version should be at least 8"
+        );
 
         // Assert: table exists
         let exists: bool = conn
@@ -1843,5 +1886,259 @@ mod tests {
             [],
         )
         .expect("semantic_update + episode_events should be valid");
+    }
+
+    // --- v9: memory_snapshots constraints -------------------------------------
+
+    fn create_v8_db(dir: &tempfile::TempDir) -> super::super::Database {
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY, chat_title TEXT,
+                    chat_type TEXT NOT NULL DEFAULT 'private', last_message_time TEXT NOT NULL,
+                    channel TEXT, external_chat_id TEXT, agent_id TEXT NOT NULL DEFAULT 'default'
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id ON chats(channel, external_chat_id);
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT NOT NULL, chat_id INTEGER NOT NULL, sender_id TEXT NOT NULL,
+                    content TEXT NOT NULL, sender_kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+                    message_kind TEXT NOT NULL DEFAULT 'message', recipient_agent_id TEXT,
+                    PRIMARY KEY (id, chat_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages(chat_id, timestamp);
+                CREATE TABLE IF NOT EXISTS sessions (
+                    chat_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tool_calls (
+                    id TEXT NOT NULL, chat_id INTEGER NOT NULL, message_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL, tool_input TEXT NOT NULL, tool_output TEXT,
+                    timestamp TEXT NOT NULL, PRIMARY KEY (id, chat_id, message_id),
+                    FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id ON tool_calls(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id ON tool_calls(chat_id, message_id);
+                CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                    caller_channel TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL, request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created ON llm_usage_logs(chat_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage_logs(created_at);
+                CREATE TABLE IF NOT EXISTS sleep_runs (
+                    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, status TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+                    source_chats_json TEXT NOT NULL DEFAULT '[]', source_digest_md TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0, error_message TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_started ON sleep_runs(agent_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_sleep_runs_agent_status ON sleep_runs(agent_id, status);
+                CREATE TABLE IF NOT EXISTS memory_snapshots (
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                    file TEXT NOT NULL, content_before TEXT NOT NULL, content_after TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id ON memory_snapshots(run_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created ON memory_snapshots(agent_id, created_at);
+                CREATE TABLE IF NOT EXISTS pulse_runs (
+                    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, intention_id TEXT NOT NULL,
+                    due_key TEXT NOT NULL, chat_id INTEGER, message_id TEXT, status TEXT NOT NULL,
+                    started_at TEXT NOT NULL, finished_at TEXT, output_kind TEXT, output_text TEXT,
+                    error_message TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pulse_runs_due ON pulse_runs(agent_id, intention_id, due_key);
+                CREATE INDEX IF NOT EXISTS idx_pulse_runs_agent_started ON pulse_runs(agent_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id ON pulse_runs(chat_id);
+                CREATE TABLE IF NOT EXISTS episode_events (
+                    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, experienced_at TEXT NOT NULL,
+                    encoded_at TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL,
+                    body_md TEXT NOT NULL, ripple_strength INTEGER NOT NULL DEFAULT 3,
+                    certainty TEXT NOT NULL DEFAULT 'stated', sleep_run_id TEXT NOT NULL,
+                    source_refs_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    CHECK (kind IN ('self', 'relationship', 'world', 'feat', 'anomaly', 'decision', 'insight', 'rhythm')),
+                    CHECK (ripple_strength BETWEEN 1 AND 5),
+                    CHECK (certainty IN ('stated', 'derived', 'tentative'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced ON episode_events(agent_id, experienced_at);
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced ON episode_events(agent_id, kind, experienced_at);
+                CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced ON episode_events(agent_id, ripple_strength, experienced_at);
+                CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run ON episode_events(sleep_run_id);
+                CREATE TABLE IF NOT EXISTS episode_rollups (
+                    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, granularity TEXT NOT NULL,
+                    period_key TEXT NOT NULL, period_start TEXT NOT NULL, period_end_exclusive TEXT NOT NULL,
+                    summary_md TEXT NOT NULL, max_ripple INTEGER NOT NULL DEFAULT 3,
+                    event_count INTEGER NOT NULL DEFAULT 0, generated_run_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    CHECK (granularity IN ('week', 'month')), CHECK (max_ripple BETWEEN 1 AND 5),
+                    UNIQUE(agent_id, granularity, period_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_period ON episode_rollups(agent_id, granularity, period_start);
+                CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple ON episode_rollups(agent_id, granularity, max_ripple, period_start);
+                CREATE TABLE IF NOT EXISTS sleep_run_steps (
+                    sleep_run_id TEXT NOT NULL,
+                    step_name TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update', 'prospective_update')),
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
+                    started_at TEXT, finished_at TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT, metadata_json TEXT,
+                    PRIMARY KEY (sleep_run_id, step_name),
+                    FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status ON sleep_run_steps(step_name, status, started_at);
+                CREATE TABLE IF NOT EXISTS sleep_step_checkpoints (
+                    agent_id TEXT NOT NULL, step_name TEXT NOT NULL, source_kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL, cursor_at TEXT NOT NULL, cursor_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, step_name, source_kind, source_id),
+                    CHECK (step_name IN ('event_extraction', 'semantic_update', 'prospective_update')),
+                    CHECK (source_kind IN ('messages', 'episode_events')),
+                    CHECK (
+                        (step_name IN ('event_extraction', 'prospective_update') AND source_kind = 'messages')
+                        OR (step_name = 'semantic_update' AND source_kind = 'episode_events')
+                    )
+                );",
+            )
+            .unwrap();
+
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+
+            super::set_schema_version(&conn, 8, "test v8 baseline").unwrap();
+        }
+
+        super::super::Database::new_unchecked(&db_path).unwrap()
+    }
+
+    #[test]
+    fn migration_v8_to_v9_rebuilds_memory_snapshots_with_constraints() {
+        // Arrange: v8 DB with existing snapshots
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v8_db(&dir);
+        {
+            let conn = db.get_conn().expect("pool");
+            conn.execute(
+                "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+                 VALUES ('run-1', 'agent-a', 'success', 'manual', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert run");
+            conn.execute(
+                "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+                 VALUES ('snap-1', 'run-1', 'agent-a', 'episodic', 'before', 'after', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert snapshot");
+        }
+
+        // Act: run v9 migration
+        let conn = db.get_conn().expect("pool");
+        super::run_migrations(&conn).expect("migrations");
+
+        // Assert: schema version advanced
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version");
+        assert_eq!(version.parse::<i64>().unwrap(), 9);
+
+        // Assert: existing snapshot preserved
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 1, "existing snapshot should be preserved");
+
+        // Assert: UNIQUE constraint rejects duplicate (run_id, file)
+        let duplicate = conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES ('snap-2', 'run-1', 'agent-a', 'episodic', 'b2', 'a2', '2024-01-01T00:00:01Z')",
+            [],
+        );
+        assert!(duplicate.is_err(), "should reject duplicate run_id+file");
+
+        // Assert: CHECK constraint rejects invalid file
+        let invalid_file = conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES ('snap-3', 'run-1', 'agent-a', 'invalid_file', 'b', 'a', '2024-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(invalid_file.is_err(), "should reject invalid file value");
+
+        // Assert: FK constraint rejects non-existent run
+        let invalid_run = conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES ('snap-4', 'nonexistent-run', 'agent-a', 'semantic', 'b', 'a', '2024-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(invalid_run.is_err(), "should reject non-existent run_id");
+    }
+
+    #[test]
+    fn sleep_storage_migrations_are_idempotent_through_v9() {
+        // Arrange: v8 DB
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v8_db(&dir);
+        {
+            let conn = db.get_conn().expect("pool");
+            conn.execute(
+                "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+                 VALUES ('run-1', 'agent-a', 'success', 'manual', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert run");
+            conn.execute(
+                "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+                 VALUES ('snap-1', 'run-1', 'agent-a', 'episodic', 'before', 'after', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert snapshot");
+        }
+
+        // Act: run migrations twice
+        {
+            let conn = db.get_conn().expect("pool");
+            super::run_migrations(&conn).expect("first run");
+        }
+        {
+            let conn = db.get_conn().expect("pool");
+            super::run_migrations(&conn).expect("second run");
+        }
+
+        // Assert: data preserved after re-run
+        let conn = db.get_conn().expect("pool");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 1, "snapshot should survive idempotent re-run");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version");
+        assert_eq!(version.parse::<i64>().unwrap(), 9);
     }
 }
