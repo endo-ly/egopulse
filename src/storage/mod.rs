@@ -427,6 +427,44 @@ pub(crate) struct SleepStepResult<'a> {
     pub metadata_json: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointSourceKind {
+    Messages,
+    EpisodeEvents,
+}
+
+impl fmt::Display for CheckpointSourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Messages => write!(f, "messages"),
+            Self::EpisodeEvents => write!(f, "episode_events"),
+        }
+    }
+}
+
+impl FromStr for CheckpointSourceKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "messages" => Ok(Self::Messages),
+            "episode_events" => Ok(Self::EpisodeEvents),
+            other => Err(format!("invalid checkpoint source kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SleepStepCheckpoint {
+    pub agent_id: String,
+    pub step_name: SleepStepName,
+    pub source_kind: CheckpointSourceKind,
+    pub source_id: String,
+    pub cursor_at: String,
+    pub cursor_id: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SleepRun {
     pub id: String,
@@ -722,12 +760,14 @@ const _: () = {
     assert_display::<SleepRunTrigger>();
     assert_display::<SleepStepName>();
     assert_display::<SleepStepStatus>();
+    assert_display::<CheckpointSourceKind>();
     assert_display::<MemoryFile>();
     assert_display::<MessageKind>();
     assert_from_str::<SleepRunStatus>();
     assert_from_str::<SleepRunTrigger>();
     assert_from_str::<SleepStepName>();
     assert_from_str::<SleepStepStatus>();
+    assert_from_str::<CheckpointSourceKind>();
     assert_from_str::<MemoryFile>();
     assert_from_str::<MessageKind>();
 

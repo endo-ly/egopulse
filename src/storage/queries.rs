@@ -5,11 +5,12 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use crate::error::StorageError;
 
 use super::{
-    AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
-    EpisodeRollup, LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind,
-    PulseRun, PulseRunStatus, RollupGranularity, SenderKind, SessionSnapshot, SessionSummary,
-    SleepRun, SleepRunStatus, SleepRunStep, SleepRunTrigger, SleepStepName, SleepStepResult,
-    SleepStepStatus, StoredMessage, ToolCall,
+    AgentSessionInfo, ChatInfo, CheckpointSourceKind, Database, EpisodeEvent,
+    EpisodeEventCertainty, EpisodeEventKind, EpisodeRollup, LlmUsageLogEntry, MemoryFile,
+    MemorySnapshot, MessageKind, PulseOutputKind, PulseRun, PulseRunStatus, RollupGranularity,
+    SenderKind, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunStep,
+    SleepRunTrigger, SleepStepCheckpoint, SleepStepName, SleepStepResult, SleepStepStatus,
+    StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -216,6 +217,34 @@ fn row_to_sleep_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRunSt
         output_tokens: row.get(6)?,
         error_message: row.get(7)?,
         metadata_json: row.get(8)?,
+    })
+}
+
+fn row_to_sleep_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepStepCheckpoint> {
+    let step_name_str: String = row.get(1)?;
+    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let source_kind_str: String = row.get(2)?;
+    let source_kind = CheckpointSourceKind::from_str(&source_kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(SleepStepCheckpoint {
+        agent_id: row.get(0)?,
+        step_name,
+        source_kind,
+        source_id: row.get(3)?,
+        cursor_at: row.get(4)?,
+        cursor_id: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -1102,6 +1131,84 @@ impl Database {
             row_to_sleep_run_step,
         )
         .optional()
+        .map_err(Into::into)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Sleep step checkpoints
+    // ---------------------------------------------------------------------------
+
+    pub(crate) fn get_sleep_checkpoint(
+        &self,
+        agent_id: &str,
+        step_name: SleepStepName,
+        source_kind: CheckpointSourceKind,
+        source_id: &str,
+    ) -> Result<Option<SleepStepCheckpoint>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT agent_id, step_name, source_kind, source_id,
+                    cursor_at, cursor_id, updated_at
+             FROM sleep_step_checkpoints
+             WHERE agent_id = ?1 AND step_name = ?2
+               AND source_kind = ?3 AND source_id = ?4",
+            params![
+                agent_id,
+                step_name.to_string(),
+                source_kind.to_string(),
+                source_id
+            ],
+            row_to_sleep_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn upsert_sleep_checkpoint(
+        &self,
+        checkpoint: &SleepStepCheckpoint,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "INSERT INTO sleep_step_checkpoints
+                (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
+                cursor_at = ?5,
+                cursor_id = ?6,
+                updated_at = ?7",
+            params![
+                checkpoint.agent_id,
+                checkpoint.step_name.to_string(),
+                checkpoint.source_kind.to_string(),
+                checkpoint.source_id,
+                checkpoint.cursor_at,
+                checkpoint.cursor_id,
+                checkpoint.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_sleep_checkpoints(
+        &self,
+        agent_id: &str,
+        step_name: SleepStepName,
+        source_kind: CheckpointSourceKind,
+    ) -> Result<Vec<SleepStepCheckpoint>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT agent_id, step_name, source_kind, source_id,
+                    cursor_at, cursor_id, updated_at
+             FROM sleep_step_checkpoints
+             WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3
+             ORDER BY source_id",
+        )?;
+        stmt.query_map(
+            params![agent_id, step_name.to_string(), source_kind.to_string()],
+            row_to_sleep_checkpoint,
+        )?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
     }
 
@@ -4745,5 +4852,175 @@ mod tests {
         );
         assert_eq!(background[0].period_key, "2025-01");
         assert_eq!(background[1].period_key, "2024-11");
+    }
+
+    #[test]
+    fn sleep_checkpoint_preserves_composite_cursor_per_source() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: upsert checkpoints for 2 chats (messages) and 1 semantic (episode_events)
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert chat-1");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-2".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert chat-2");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::SemanticUpdate,
+            source_kind: CheckpointSourceKind::EpisodeEvents,
+            source_id: "agent-a".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "evt-50".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert semantic");
+
+        // Assert: each source has its own cursor (no cross-contamination)
+        let chat1 = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(chat1.cursor_id, "msg-100");
+
+        let chat2 = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-2",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(chat2.cursor_id, "msg-200");
+
+        let semantic = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "agent-a",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(semantic.cursor_id, "evt-50");
+
+        // Assert: same timestamp but different cursor_id preserved
+        assert_eq!(chat1.cursor_at, chat2.cursor_at);
+        assert_ne!(chat1.cursor_id, chat2.cursor_id);
+
+        // Assert: non-existent source returns None
+        let missing = db.get_sleep_checkpoint(
+            "agent-a",
+            SleepStepName::EventExtraction,
+            CheckpointSourceKind::Messages,
+            "chat-999",
+        );
+        assert!(missing.expect("query ok").is_none());
+    }
+
+    #[test]
+    fn sleep_checkpoint_upsert_advances_cursor() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: upsert initial cursor, then advance it
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert initial");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert advance");
+
+        // Assert: cursor advanced to new position
+        let checkpoint = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(checkpoint.cursor_at, "2024-01-01T00:01:00Z");
+        assert_eq!(checkpoint.cursor_id, "msg-200");
+    }
+
+    #[test]
+    fn sleep_checkpoint_list_returns_all_sources_for_step() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-a".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-1".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-b".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-2".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert");
+
+        // Act
+        let checkpoints = db
+            .list_sleep_checkpoints(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+            )
+            .expect("list");
+
+        // Assert
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].source_id, "chat-a");
+        assert_eq!(checkpoints[1].source_id, "chat-b");
     }
 }
