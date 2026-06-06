@@ -1,5 +1,5 @@
 //! Rollup Planner — pure Rust logic that determines which week/month rollups
-//! need updating for the Call 2 episodic-view system.
+//! need updating for the episodic_update step.
 //!
 //! This module is intentionally free of DB/LLM dependencies so that every
 //! detection rule can be unit-tested with plain data.

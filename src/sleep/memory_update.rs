@@ -4,10 +4,9 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::agent_loop::formatting::message_to_text;
 use crate::llm::{LlmProvider, Message};
 use crate::memory::MemoryContent;
-use crate::storage::{AgentSessionInfo, Database};
+use crate::storage::AgentSessionInfo;
 
 use super::SleepBatchError;
 use super::prompt::{escape_xml_content, normalize_llm_response};
@@ -115,35 +114,6 @@ pub(crate) fn build_sleep_input_from_parts(
     })
 }
 
-pub(crate) fn build_session_text_chunks(
-    db: &Database,
-    sessions: &[AgentSessionInfo],
-    max_session_tokens: usize,
-) -> Result<Vec<String>, SleepBatchError> {
-    let max_chars = max_session_tokens.saturating_mul(ESTIMATED_CHARS_PER_TOKEN);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for session in sessions {
-        let snapshot = db.load_session_snapshot(session.chat_id, 100)?;
-        let messages = extract_messages_text(&snapshot.messages_json);
-        let blocks = session_blocks(session, &messages, max_chars);
-
-        for block in blocks {
-            append_chunk_block(&mut chunks, &mut current, block, max_chars);
-        }
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
-    Ok(chunks)
-}
-
 pub(super) fn session_blocks(
     session: &AgentSessionInfo,
     messages: &str,
@@ -244,20 +214,6 @@ fn estimate_memory_tokens(memory: &MemoryContent) -> usize {
 
 fn estimate_text_tokens(text: &str) -> usize {
     text.len().div_ceil(ESTIMATED_CHARS_PER_TOKEN)
-}
-
-fn extract_messages_text(messages_json: &Option<String>) -> String {
-    let Some(json_str) = messages_json else {
-        return String::new();
-    };
-    let Ok(messages) = serde_json::from_str::<Vec<Message>>(json_str) else {
-        return String::new();
-    };
-    messages
-        .iter()
-        .map(message_to_text)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
@@ -378,41 +334,6 @@ pub(crate) async fn send_sleep_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{AgentSessionInfo, Database};
-
-    fn test_db() -> (Database, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = Database::new(&db_path).expect("db");
-        (db, dir)
-    }
-
-    fn create_chat(db: &Database, agent_id: &str, suffix: &str) -> i64 {
-        db.resolve_or_create_chat_id(
-            "test",
-            &format!("test:chat{suffix}"),
-            Some(&format!("chat{suffix}")),
-            "direct",
-            agent_id,
-        )
-        .expect("create chat")
-    }
-
-    fn make_session_info(
-        chat_id: i64,
-        channel: &str,
-        external_chat_id: &str,
-        estimated_tokens: i64,
-    ) -> AgentSessionInfo {
-        AgentSessionInfo {
-            chat_id,
-            channel: channel.to_string(),
-            external_chat_id: external_chat_id.to_string(),
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            message_count: 5,
-            estimated_tokens,
-        }
-    }
 
     // --- parse_sleep_response ---
 
@@ -493,60 +414,6 @@ mod tests {
         let output = parse_sleep_response(response).expect("should parse");
         assert_eq!(output.semantic, "");
         assert_eq!(output.prospective, "");
-    }
-
-    // --- build_session_text_chunks ---
-
-    #[test]
-    fn build_session_text_chunks_splits_large_single_session_without_dropping_text() {
-        let (db, _dir) = test_db();
-        let chat_id = create_chat(&db, "test-agent", "large");
-        let first = "A".repeat(120);
-        let second = "B".repeat(120);
-        let messages_json = serde_json::json!([
-            {"role": "user", "content": first},
-            {"role": "assistant", "content": second}
-        ])
-        .to_string();
-        db.save_session(chat_id, &messages_json)
-            .expect("save session");
-        let sessions = vec![make_session_info(chat_id, "test", "test:large", 100)];
-
-        let chunks = build_session_text_chunks(&db, &sessions, 60).expect("chunks");
-
-        assert!(chunks.len() > 1);
-        let combined = chunks.join("\n");
-        assert!(combined.contains(&"A".repeat(50)));
-        assert!(combined.contains(&"B".repeat(50)));
-        assert!(combined.contains("chunk=\"1\""));
-    }
-
-    #[test]
-    fn build_session_text_chunks_keeps_all_sessions_in_current_run() {
-        let (db, _dir) = test_db();
-        let mut sessions = Vec::new();
-        for i in 0..3 {
-            let chat_id = create_chat(&db, "test-agent", &format!("chunk-{i}"));
-            db.save_session(
-                chat_id,
-                &serde_json::json!([{"role": "user", "content": format!("message-{i}")}])
-                    .to_string(),
-            )
-            .expect("save session");
-            sessions.push(make_session_info(
-                chat_id,
-                "test",
-                &format!("test:chunk-{i}"),
-                10,
-            ));
-        }
-
-        let chunks = build_session_text_chunks(&db, &sessions, 100).expect("chunks");
-        let combined = chunks.join("\n");
-
-        assert!(combined.contains("message-0"));
-        assert!(combined.contains("message-1"));
-        assert!(combined.contains("message-2"));
     }
 
     // --- build_sleep_system_prompt ---
