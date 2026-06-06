@@ -830,6 +830,13 @@ async fn run_episodic_update_step(
     {
         let _ = write_memory_content(&ctx.agents_dir, agent_id, &before);
         warn!(error = %error, "failed to commit episodic update");
+        finish_step_failed(
+            db,
+            &ctx.run_id,
+            SleepStepName::EpisodicUpdate,
+            error.to_string(),
+        )
+        .await;
         return None;
     }
 
@@ -1384,7 +1391,22 @@ async fn run_memory_update_step(
     .await
     {
         let _ = write_memory_content(&ctx.agents_dir, agent_id, &before);
-        return Err(error.into());
+        let run_id = ctx.run_id.clone();
+        let error_message = error.to_string();
+        call_blocking(Arc::clone(db), move |db| {
+            db.finish_memory_update_steps(
+                &run_id,
+                SleepStepResult {
+                    status: SleepStepStatus::Failed,
+                    input_tokens: total_input,
+                    output_tokens: total_output,
+                    error_message: Some(&error_message),
+                    metadata_json: None,
+                },
+            )
+        })
+        .await?;
+        return Ok(());
     }
 
     ctx.current_memory = working_memory;
