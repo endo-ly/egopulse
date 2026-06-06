@@ -228,19 +228,20 @@ channels:
 
 ## stackchan-bridge Integration
 
-bridge 側は固定文生成をやめ、EgoPulse に問い合わせる。
+bridge 側は固定文生成をやめ、agent runtime に 1 turn の処理を依頼する。
+初期接続先は EgoPulse だが、bridge の型名と設定名には EgoPulse 固有名を含めない。
 
 ```text
 SpokenReplyPipeline
   input: TranscriptionResult
   deps:
-    - EgopulseClient
+    - AgentClient
     - VoiceGatewayClient
     - DeviceTransport
   behavior:
     - source filter
     - busy guard
-    - EgopulseClient.createVoiceTurn(result.text)
+    - AgentClient.createTurn(result.text)
     - VoiceGatewayClient.synthesizeSpeech(response)
     - DeviceTransport.playWav(wav)
 ```
@@ -248,11 +249,12 @@ SpokenReplyPipeline
 bridge config 例:
 
 ```yaml
-egopulse:
-  base_url: "http://127.0.0.1:10961"
+agent_runtime:
+  endpoint: "http://127.0.0.1:10961/api/voice/turn"
   auth_token:
     source: env
-    id: EGOPULSE_VOICE_AUTH_TOKEN
+    id: AGENT_RUNTIME_AUTH_TOKEN
+  agent_id: "default"
   surface: "stackchan"
   session_key: "main"
   user_id: "local-speaker"
@@ -266,7 +268,9 @@ spoken_reply:
   busy_policy: "ignore"
 ```
 
-bridge は EgoPulse の応答が空の場合、TTS を実行しない。EgoPulse 呼び出しに失敗した場合は `/spoken-reply/status` の `lastError` に残し、必要なら短いフォールバック音声を別途検討する。ただし初期実装ではフォールバック文は入れない。
+`AgentClient` の契約は、STT 済みテキストと会話面の識別情報を送り、agent runtime が生成した応答テキストを受け取ることに限定する。LLM Provider、memory、tools、EgoPulse の内部構造は公開しない。
+
+bridge は agent runtime の応答が空の場合、TTS を実行しない。呼び出しに失敗した場合は `/spoken-reply/status` の `lastError` に残し、必要なら短いフォールバック音声を別途検討する。ただし初期実装ではフォールバック文は入れない。
 
 ## Security
 
@@ -293,7 +297,7 @@ voice turn では以下を構造化ログに含める。
 
 既存の `/telemetry` の `recent_turns` には `channel: "voice"` として出る。
 
-bridge 側の `/spoken-reply/status` には、EgoPulse 呼び出し時間、TTS 生成時間、再生完了までの合計時間を追加すると運用しやすい。
+bridge 側の `/spoken-reply/status` には、agent runtime 呼び出し時間、TTS 生成時間、再生完了までの合計時間を追加すると運用しやすい。
 
 ## 実装 Plan
 
@@ -307,12 +311,12 @@ bridge 側の `/spoken-reply/status` には、EgoPulse 呼び出し時間、TTS 
 6. request から `SurfaceContext(channel="voice")` を作り、`process_turn()` を呼ぶ。
 7. unit test で surface/session 正規化、auth、empty text、allowed_surfaces を確認する。
 
-### Phase 2: stackchan-bridge を EgoPulse に接続
+### Phase 2: stackchan-bridge を agent runtime に接続
 
-1. bridge config に `egopulse` を追加する。
-2. `EgopulseClient` を追加し、`POST /api/voice/turn` を呼ぶ。
-3. `SpokenReplyPipeline` の `buildReplyText()` を `EgopulseClient.createVoiceTurn()` に置き換える。
-4. `/spoken-reply/status` に Egopulse/TTS/playback timing を追加する。
+1. bridge config に `agent_runtime` を追加する。
+2. `AgentClient` を追加し、設定された `endpoint` を呼ぶ。初期接続先は EgoPulse の `POST /api/voice/turn` とする。
+3. `SpokenReplyPipeline` の `buildReplyText()` を `AgentClient.createTurn()` に置き換える。
+4. `/spoken-reply/status` に agent runtime/TTS/playback timing を追加する。
 5. 固定文依存の docs を更新する。
 
 ### Phase 3: End-to-end verification
