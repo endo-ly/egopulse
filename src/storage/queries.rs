@@ -920,6 +920,19 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn update_sleep_run_source_chats(
+        &self,
+        id: &str,
+        source_chats_json: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE sleep_runs SET source_chats_json = ?1 WHERE id = ?2",
+            params![source_chats_json, id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn update_sleep_run_skipped(&self, id: &str) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
         let finished_at = chrono::Utc::now().to_rfc3339();

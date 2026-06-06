@@ -1,4 +1,5 @@
-//! Sleep batch orchestrator — coordinates Call 1 (extract), Call 2 (rollup), and Call 3 (memory update).
+//! Sleep batch orchestrator — coordinates 4 independent steps:
+//! event_extraction, episodic_update, semantic_update, prospective_update.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use crate::memory::MemoryContent;
 use crate::runtime::AppState;
 use crate::storage::{
     AgentSessionInfo, Database, EpisodeEvent, MemoryFile, RollupGranularity, SleepRunTrigger,
-    call_blocking,
+    SleepStepName, SleepStepResult, SleepStepStatus, call_blocking,
 };
 
 use super::SleepBatchError;
@@ -403,17 +404,20 @@ Output the raw JSON object and nothing else.";
     }
 }
 
-/// Batch execution context — holds state across Call 1, 2, 3.
+/// Batch execution context — holds shared state for step execution.
 struct BatchContext {
     run_id: String,
     agents_dir: PathBuf,
     provider: Arc<dyn LlmProvider>,
-    context_tokens: usize,
     session_chunks: Vec<String>,
     extract_chunks: Vec<String>,
     current_memory: MemoryContent,
-    input_tokens: i64,
-    output_tokens: i64,
+}
+
+struct StepOutputs {
+    episodic_md: Option<String>,
+    semantic_md: Option<String>,
+    prospective_md: Option<String>,
 }
 
 async fn execute_batch(
@@ -428,16 +432,16 @@ async fn execute_batch(
 
     let result = async {
         let mut ctx = prepare_batch_context(state, &db, agent_id, sessions, &run_id).await?;
+        let mut outputs = StepOutputs {
+            episodic_md: None,
+            semantic_md: None,
+            prospective_md: None,
+        };
 
-        // Call 1: Event Extraction (best-effort)
-        run_event_extraction_call(&mut ctx, &db, agent_id).await;
-
-        // Call 2: Episodic View Materialization (best-effort)
-        let rendered_episodic = run_rollup_call(&mut ctx, state, &db, agent_id).await;
-
-        // Call 3: Memory Update (semantic + prospective)
-        let output =
-            run_memory_update_call(&mut ctx, state, &db, agent_id, rendered_episodic).await?;
+        run_event_extraction_step(&mut ctx, &db, agent_id).await;
+        outputs.episodic_md = run_episodic_update_step(&mut ctx, state, &db, agent_id).await;
+        outputs.semantic_md = run_semantic_update_step(&mut ctx, &db, agent_id).await;
+        outputs.prospective_md = run_prospective_update_step(&mut ctx, &db, agent_id).await;
 
         finalize_batch(
             &ctx,
@@ -446,7 +450,7 @@ async fn execute_batch(
             agent_id,
             sessions,
             source_chats_json,
-            &output,
+            &outputs,
         )
         .await?;
 
@@ -546,17 +550,21 @@ async fn prepare_batch_context(
         run_id: run_id.to_string(),
         agents_dir,
         provider,
-        context_tokens,
         session_chunks,
         extract_chunks,
         current_memory: memory_before.unwrap_or_default(),
-        input_tokens: 0,
-        output_tokens: 0,
     })
 }
 
-/// Call 1: Event Extraction — extracts episode events from session chunks.
-async fn run_event_extraction_call(ctx: &mut BatchContext, db: &Arc<Database>, agent_id: &str) {
+/// Step 1: Event Extraction — extracts episode events from session chunks.
+async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, agent_id: &str) {
+    let run_id = ctx.run_id.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+    })
+    .await
+    .ok();
+
     let extract_chunks = std::mem::take(&mut ctx.extract_chunks);
     let total_chunks = extract_chunks.len();
 
@@ -571,6 +579,7 @@ async fn run_event_extraction_call(ctx: &mut BatchContext, db: &Arc<Database>, a
     }
     .await;
 
+    let run_id = ctx.run_id.clone();
     match extract_result {
         Ok((extracted_events, inp, out)) => {
             if !extracted_events.is_empty() {
@@ -588,27 +597,64 @@ async fn run_event_extraction_call(ctx: &mut BatchContext, db: &Arc<Database>, a
                     info!(count = event_count, "extracted episode events");
                 }
             }
-            ctx.input_tokens = inp;
-            ctx.output_tokens = out;
+            let rid = run_id.clone();
+            call_blocking(Arc::clone(db), move |db| {
+                db.finish_sleep_step(
+                    &rid,
+                    SleepStepName::EventExtraction,
+                    SleepStepResult {
+                        status: SleepStepStatus::Success,
+                        input_tokens: inp,
+                        output_tokens: out,
+                        error_message: None,
+                        metadata_json: None,
+                    },
+                )
+            })
+            .await
+            .ok();
         }
         Err(e) => {
-            warn!(error = %e, "event extraction failed, continuing with memory update");
+            warn!(error = %e, "event extraction failed, continuing");
+            let rid = run_id.clone();
+            let err_msg = e.to_string();
+            call_blocking(Arc::clone(db), move |db| {
+                db.finish_sleep_step(
+                    &rid,
+                    SleepStepName::EventExtraction,
+                    SleepStepResult {
+                        status: SleepStepStatus::Failed,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        error_message: Some(&err_msg),
+                        metadata_json: None,
+                    },
+                )
+            })
+            .await
+            .ok();
         }
     }
 }
 
-/// Call 2: Episodic View Materialization — rollup generation and episodic.md rendering.
-async fn run_rollup_call(
+/// Step 2: Episodic Update — rollup generation and episodic.md rendering.
+async fn run_episodic_update_step(
     ctx: &mut BatchContext,
     state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
 ) -> Option<String> {
+    let run_id = ctx.run_id.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.start_sleep_step(&run_id, SleepStepName::EpisodicUpdate)
+    })
+    .await
+    .ok();
+
     let tz_str = &state.config.timezone;
     let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
     let tz = resolve_fixed_offset(tz_str);
     let now = chrono::Utc::now().with_timezone(&tz);
-
     let cw = event_rollup::current_week(now, tz_chrono);
     let cw_start = cw.period_start.to_rfc3339();
     let cw_end = cw.period_end_exclusive.to_rfc3339();
@@ -621,30 +667,74 @@ async fn run_rollup_call(
     {
         Ok(events) => events,
         Err(e) => {
-            warn!(error = %e, "Call2: failed to load current week events");
+            warn!(error = %e, "episodic: failed to load current week events");
             Vec::new()
         }
     };
 
-    let call2_result = run_rollup_llm_calls(ctx, db, agent_id, now, tz_chrono, &cw).await;
+    let rollup_result = run_rollup_logic(ctx, db, agent_id, now, tz_chrono, &cw).await;
 
-    if let Err(e) = call2_result {
-        warn!(error = %e, "Call2 rollup generation failed (best-effort, continuing)");
+    let rendered =
+        episodic_renderer::render_episodic_view(db, agent_id, tz_str, &cw, &current_week_events)
+            .await;
+
+    let run_id = ctx.run_id.clone();
+    match &rollup_result {
+        Ok((rollup_in, rollup_out)) => {
+            let step_in = *rollup_in;
+            let step_out = *rollup_out;
+            call_blocking(Arc::clone(db), move |db| {
+                db.finish_sleep_step(
+                    &run_id,
+                    SleepStepName::EpisodicUpdate,
+                    SleepStepResult {
+                        status: SleepStepStatus::Success,
+                        input_tokens: step_in,
+                        output_tokens: step_out,
+                        error_message: None,
+                        metadata_json: None,
+                    },
+                )
+            })
+            .await
+            .ok();
+        }
+        Err(e) => {
+            warn!(error = %e, "episodic update failed");
+            let rid = run_id.clone();
+            let err_msg = e.to_string();
+            call_blocking(Arc::clone(db), move |db| {
+                db.finish_sleep_step(
+                    &rid,
+                    SleepStepName::EpisodicUpdate,
+                    SleepStepResult {
+                        status: SleepStepStatus::Failed,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        error_message: Some(&err_msg),
+                        metadata_json: None,
+                    },
+                )
+            })
+            .await
+            .ok();
+        }
     }
 
-    // Episodic Renderer
-    episodic_renderer::render_episodic_view(db, agent_id, tz_str, &cw, &current_week_events).await
+    rendered
 }
 
 /// Internal: Run rollup LLM calls for week and month rollups.
-async fn run_rollup_llm_calls(
+async fn run_rollup_logic(
     ctx: &mut BatchContext,
     db: &Arc<Database>,
     agent_id: &str,
     now: chrono::DateTime<chrono::FixedOffset>,
     tz_chrono: chrono_tz::Tz,
     cw: &event_rollup::WeekPeriod,
-) -> Result<(), SleepBatchError> {
+) -> Result<(i64, i64), SleepBatchError> {
+    let mut total_input: i64 = 0;
+    let mut total_output: i64 = 0;
     let agent_for_plan = agent_id.to_string();
     let existing_week_rollups: Vec<event_rollup::ExistingRollupInfo> =
         call_blocking(Arc::clone(db), move |db| {
@@ -756,8 +846,8 @@ async fn run_rollup_llm_calls(
         )
         .await?;
 
-        ctx.input_tokens = ctx.input_tokens.saturating_add(call2_in);
-        ctx.output_tokens = ctx.output_tokens.saturating_add(call2_out);
+        total_input = total_input.saturating_add(call2_in);
+        total_output = total_output.saturating_add(call2_out);
 
         let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = week_requests
             .iter()
@@ -889,8 +979,8 @@ async fn run_rollup_llm_calls(
         )
         .await?;
 
-        ctx.input_tokens = ctx.input_tokens.saturating_add(call2_in);
-        ctx.output_tokens = ctx.output_tokens.saturating_add(call2_out);
+        total_input = total_input.saturating_add(call2_in);
+        total_output = total_output.saturating_add(call2_out);
 
         let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = month_requests
             .iter()
@@ -937,57 +1027,193 @@ async fn run_rollup_llm_calls(
         }
     }
 
-    Ok(())
+    Ok((total_input, total_output))
 }
 
-/// Call 3: Memory Update — updates semantic and prospective memory via LLM.
-async fn run_memory_update_call(
+/// Step 3: Semantic Update — updates semantic memory via LLM.
+async fn run_semantic_update_step(
     ctx: &mut BatchContext,
-    _state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
-    rendered_episodic: Option<String>,
-) -> Result<memory_update::SleepBatchOutput, SleepBatchError> {
-    let mut final_output = None;
+) -> Option<String> {
+    let run_id = ctx.run_id.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.start_sleep_step(&run_id, SleepStepName::SemanticUpdate)
+    })
+    .await
+    .ok();
+
     let total_chunks = ctx.session_chunks.len();
+    let mut last_semantic = None;
+    let mut total_input: i64 = 0;
+    let mut total_output: i64 = 0;
+    let mut step_failed = false;
+    let mut error_msg = None;
 
     for (index, sessions_text) in ctx.session_chunks.clone().into_iter().enumerate() {
-        let input = memory_update::build_sleep_input_from_parts(
+        let system_prompt = memory_update::build_semantic_system_prompt(
             agent_id,
-            ctx.current_memory.clone(),
-            sessions_text,
-            ctx.context_tokens,
-            0,
-        )?;
-        let system_prompt = memory_update::build_sleep_system_prompt(&input);
-        let (output, in_tok, out_tok) = memory_update::send_sleep_request(
+            &ctx.current_memory,
+            &sessions_text,
+        );
+        match memory_update::send_semantic_request(
             &ctx.provider,
             agent_id,
             &system_prompt,
             index + 1,
             total_chunks,
         )
-        .await?;
-
-        ctx.input_tokens = ctx.input_tokens.saturating_add(in_tok);
-        ctx.output_tokens = ctx.output_tokens.saturating_add(out_tok);
-        ctx.current_memory =
-            memory_content_from_output(&output, ctx.current_memory.episodic.as_deref());
-        final_output = Some(output);
+        .await
+        {
+            Ok((output, inp, out)) => {
+                total_input = total_input.saturating_add(inp);
+                total_output = total_output.saturating_add(out);
+                last_semantic = Some(output.semantic);
+            }
+            Err(e) => {
+                warn!(error = %e, "semantic update failed");
+                step_failed = true;
+                error_msg = Some(e.to_string());
+                break;
+            }
+        }
     }
 
-    let mut output = final_output
-        .ok_or_else(|| SleepBatchError::Internal("sleep batch produced no output".to_string()))?;
+    let run_id = ctx.run_id.clone();
+    if step_failed {
+        let rid = run_id.clone();
+        let err = error_msg;
+        call_blocking(Arc::clone(db), move |db| {
+            db.finish_sleep_step(
+                &rid,
+                SleepStepName::SemanticUpdate,
+                SleepStepResult {
+                    status: SleepStepStatus::Failed,
+                    input_tokens: total_input,
+                    output_tokens: total_output,
+                    error_message: err.as_deref(),
+                    metadata_json: None,
+                },
+            )
+        })
+        .await
+        .ok();
+        None
+    } else {
+        let rid = run_id.clone();
+        call_blocking(Arc::clone(db), move |db| {
+            db.finish_sleep_step(
+                &rid,
+                SleepStepName::SemanticUpdate,
+                SleepStepResult {
+                    status: SleepStepStatus::Success,
+                    input_tokens: total_input,
+                    output_tokens: total_output,
+                    error_message: None,
+                    metadata_json: None,
+                },
+            )
+        })
+        .await
+        .ok();
+        if let Some(ref semantic) = last_semantic {
+            ctx.current_memory.semantic = Some(semantic.clone());
+        }
+        last_semantic
+    }
+}
 
-    if let Some(ref md) = rendered_episodic {
-        ctx.current_memory.episodic = Some(md.clone());
-        output.episodic = md.clone();
+/// Step 4: Prospective Update — updates prospective memory via LLM.
+async fn run_prospective_update_step(
+    ctx: &mut BatchContext,
+    db: &Arc<Database>,
+    agent_id: &str,
+) -> Option<String> {
+    let run_id = ctx.run_id.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.start_sleep_step(&run_id, SleepStepName::ProspectiveUpdate)
+    })
+    .await
+    .ok();
+
+    let total_chunks = ctx.session_chunks.len();
+    let mut last_prospective = None;
+    let mut total_input: i64 = 0;
+    let mut total_output: i64 = 0;
+    let mut step_failed = false;
+    let mut error_msg = None;
+
+    for (index, sessions_text) in ctx.session_chunks.clone().into_iter().enumerate() {
+        let system_prompt = memory_update::build_prospective_system_prompt(
+            agent_id,
+            &ctx.current_memory,
+            &sessions_text,
+        );
+        match memory_update::send_prospective_request(
+            &ctx.provider,
+            agent_id,
+            &system_prompt,
+            index + 1,
+            total_chunks,
+        )
+        .await
+        {
+            Ok((output, inp, out)) => {
+                total_input = total_input.saturating_add(inp);
+                total_output = total_output.saturating_add(out);
+                last_prospective = Some(output.prospective);
+            }
+            Err(e) => {
+                warn!(error = %e, "prospective update failed");
+                step_failed = true;
+                error_msg = Some(e.to_string());
+                break;
+            }
+        }
     }
 
-    // Save output snapshots
-    save_output_snapshots(db, &ctx.run_id, agent_id, &output).await?;
-
-    Ok(output)
+    let run_id = ctx.run_id.clone();
+    if step_failed {
+        let rid = run_id.clone();
+        let err = error_msg;
+        call_blocking(Arc::clone(db), move |db| {
+            db.finish_sleep_step(
+                &rid,
+                SleepStepName::ProspectiveUpdate,
+                SleepStepResult {
+                    status: SleepStepStatus::Failed,
+                    input_tokens: total_input,
+                    output_tokens: total_output,
+                    error_message: err.as_deref(),
+                    metadata_json: None,
+                },
+            )
+        })
+        .await
+        .ok();
+        None
+    } else {
+        let rid = run_id.clone();
+        call_blocking(Arc::clone(db), move |db| {
+            db.finish_sleep_step(
+                &rid,
+                SleepStepName::ProspectiveUpdate,
+                SleepStepResult {
+                    status: SleepStepStatus::Success,
+                    input_tokens: total_input,
+                    output_tokens: total_output,
+                    error_message: None,
+                    metadata_json: None,
+                },
+            )
+        })
+        .await
+        .ok();
+        if let Some(ref prospective) = last_prospective {
+            ctx.current_memory.prospective = Some(prospective.clone());
+        }
+        last_prospective
+    }
 }
 
 /// Finalizes batch: writes memory files, archives sessions, logs usage.
@@ -998,12 +1224,31 @@ async fn finalize_batch(
     agent_id: &str,
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
-    output: &memory_update::SleepBatchOutput,
+    outputs: &StepOutputs,
 ) -> Result<(), SleepBatchError> {
-    // Write memory files
-    write_memory_files(&ctx.agents_dir, agent_id, output)?;
+    let batch_output = memory_update::SleepBatchOutput {
+        episodic: outputs.episodic_md.clone().unwrap_or_default(),
+        semantic: outputs
+            .semantic_md
+            .clone()
+            .or_else(|| ctx.current_memory.semantic.clone())
+            .unwrap_or_default(),
+        prospective: outputs
+            .prospective_md
+            .clone()
+            .or_else(|| ctx.current_memory.prospective.clone())
+            .unwrap_or_default(),
+    };
 
-    // Archive sessions
+    write_memory_files(&ctx.agents_dir, agent_id, &batch_output)?;
+
+    let after_memory = MemoryContent {
+        episodic: outputs.episodic_md.clone().filter(|s| !s.is_empty()),
+        semantic: outputs.semantic_md.clone().filter(|s| !s.is_empty()),
+        prospective: outputs.prospective_md.clone().filter(|s| !s.is_empty()),
+    };
+    save_aggregate_snapshots(db, &ctx.run_id, agent_id, Some(&after_memory), Some(true)).await?;
+
     let groups_dir = state.config.groups_dir();
     let secrets = crate::tools::collect_config_secrets(&state.config);
     for session in sessions {
@@ -1017,69 +1262,67 @@ async fn finalize_batch(
         }
     }
 
-    // Log LLM usage
-    if ctx.input_tokens > 0 || ctx.output_tokens > 0 {
-        let provider_name = ctx.provider.provider_name().to_string();
-        let model_name = ctx.provider.model_name().to_string();
-        crate::runtime::metrics::inc_llm_tokens_total("input", &provider_name, ctx.input_tokens);
-        crate::runtime::metrics::inc_llm_tokens_total("output", &provider_name, ctx.output_tokens);
-        let db_for_usage = Arc::clone(db);
-        let input_tokens = ctx.input_tokens;
-        let output_tokens = ctx.output_tokens;
-        tokio::spawn(async move {
-            let _ = crate::storage::call_blocking(db_for_usage, move |db| {
-                db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                    chat_id: 0,
-                    caller_channel: "sleep_batch",
-                    provider: &provider_name,
-                    model: &model_name,
-                    input_tokens,
-                    output_tokens,
-                    request_kind: "sleep_batch",
-                })
-            })
-            .await
-            .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
-        });
-    }
-
-    // Update run success
-    let run_id_owned = ctx.run_id.clone();
+    let run_id_for_source = ctx.run_id.clone();
     let source_chats = source_chats_json.to_string();
-    let input_tokens = ctx.input_tokens;
-    let output_tokens = ctx.output_tokens;
     call_blocking(Arc::clone(db), move |db| {
-        db.update_sleep_run_success(
-            &run_id_owned,
-            &source_chats,
-            None,
-            input_tokens,
-            output_tokens,
-        )
+        db.update_sleep_run_source_chats(&run_id_for_source, &source_chats)
     })
     .await?;
 
-    Ok(())
-}
+    let run_id_for_finalize = ctx.run_id.clone();
+    let derived_status = call_blocking(Arc::clone(db), move |db| {
+        db.finalize_sleep_run(&run_id_for_finalize)
+    })
+    .await?;
 
-fn memory_content_from_output(
-    output: &memory_update::SleepBatchOutput,
-    existing_episodic: Option<&str>,
-) -> MemoryContent {
-    MemoryContent {
-        episodic: existing_episodic
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if output.episodic.is_empty() {
-                    None
-                } else {
-                    Some(output.episodic.clone())
-                }
-            }),
-        semantic: Some(output.semantic.clone()).filter(|s| !s.is_empty()),
-        prospective: Some(output.prospective.clone()).filter(|s| !s.is_empty()),
+    let run_id_for_tokens = ctx.run_id.clone();
+    if let Ok(Some(run)) = call_blocking(Arc::clone(db), move |db| {
+        db.get_sleep_run(&run_id_for_tokens)
+    })
+    .await
+    {
+        if run.input_tokens > 0 || run.output_tokens > 0 {
+            let provider_name = ctx.provider.provider_name().to_string();
+            let model_name = ctx.provider.model_name().to_string();
+            crate::runtime::metrics::inc_llm_tokens_total(
+                "input",
+                &provider_name,
+                run.input_tokens,
+            );
+            crate::runtime::metrics::inc_llm_tokens_total(
+                "output",
+                &provider_name,
+                run.output_tokens,
+            );
+            let db_for_usage = Arc::clone(db);
+            let input_tokens = run.input_tokens;
+            let output_tokens = run.output_tokens;
+            tokio::spawn(async move {
+                let _ = crate::storage::call_blocking(db_for_usage, move |db| {
+                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+                        chat_id: 0,
+                        caller_channel: "sleep_batch",
+                        provider: &provider_name,
+                        model: &model_name,
+                        input_tokens,
+                        output_tokens,
+                        request_kind: "sleep_batch",
+                    })
+                })
+                .await
+                .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
+            });
+        }
     }
+
+    info!(
+        agent_id = %agent_id,
+        run_id = %ctx.run_id,
+        status = %derived_status,
+        "sleep batch finalized"
+    );
+
+    Ok(())
 }
 
 async fn save_aggregate_snapshots(
@@ -1126,16 +1369,6 @@ async fn save_aggregate_snapshots(
     }
 
     Ok(())
-}
-
-async fn save_output_snapshots(
-    db: &Arc<Database>,
-    run_id: &str,
-    agent_id: &str,
-    output: &memory_update::SleepBatchOutput,
-) -> Result<(), SleepBatchError> {
-    let content = memory_content_from_output(output, None);
-    save_aggregate_snapshots(db, run_id, agent_id, Some(&content), Some(true)).await
 }
 
 fn safe_agent_id_for_write(id: &str) -> bool {
@@ -1472,6 +1705,17 @@ mod tests {
         crate::test_util::build_state_with_config(config, Some(llm), None, Some(Arc::new(db)), None)
     }
 
+    fn all_success_responses() -> Vec<String> {
+        vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"semantic":""}"#.to_string(),
+            r#"{"prospective":""}"#.to_string(),
+        ]
+    }
+
     // --- integration tests (run_sleep_batch) ---
 
     #[tokio::test]
@@ -1486,7 +1730,7 @@ mod tests {
     async fn run_sleep_batch_creates_run_on_proceed() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -1525,10 +1769,14 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let llm = Arc::new(MockLlmProvider::with_response(serde_json::json!({
-            "semantic": "# Semantic\n\n- fact",
-            "prospective": "# Prospective\n\n- todo"
-        })));
+        let llm = Arc::new(SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            serde_json::json!({"semantic": "# Semantic\n\n- fact"}).to_string(),
+            serde_json::json!({"prospective": "# Prospective\n\n- todo"}).to_string(),
+        ]));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -1597,7 +1845,7 @@ mod tests {
     async fn run_sleep_batch_marks_success_on_completion() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -1614,14 +1862,16 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let llm = Arc::new(MockLlmProvider::with_response(
-            serde_json::json!({"invalid": true}),
+            serde_json::json!({"bad": true}),
         ));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
-        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
-            .expect_err("should fail");
-        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+            .expect("batch completes even with step failures");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::PartialFailure);
     }
 
     #[tokio::test]
@@ -1663,7 +1913,7 @@ mod tests {
     async fn scheduled_run_records_success_status() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
@@ -1678,10 +1928,14 @@ mod tests {
     async fn scheduled_run_records_memory_snapshots() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::with_response(serde_json::json!({
-            "semantic": "s",
-            "prospective": "p"
-        })));
+        let llm = Arc::new(SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"semantic":"s"}"#.to_string(),
+            r#"{"prospective":"p"}"#.to_string(),
+        ]));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
@@ -1723,9 +1977,8 @@ mod tests {
         let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled).await;
 
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        assert_eq!(runs[0].status, SleepRunStatus::Failed);
+        assert_eq!(runs[0].status, SleepRunStatus::PartialFailure);
     }
-
     // --- write_memory_files tests ---
 
     #[test]
@@ -1889,18 +2142,17 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let extract_response = r#"{"events":[]}"#.to_string();
-        let call2_response = r#"{"rollups":[]}"#.to_string();
-        let bad_response = r#"{"not":"valid keys"}"#.to_string();
         let good_response = serde_json::json!({
             "semantic": "retried",
             "prospective": "retried"
         })
         .to_string();
         let provider = SequentialMockProvider::new(vec![
-            extract_response,
-            call2_response,
-            bad_response,
+            r#"{"not":"valid events"}"#.to_string(),
+            r#"{"not":"valid events"}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"not":"valid semantic"}"#.to_string(),
             good_response,
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -1916,19 +2168,24 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let bad1 = r#"{"bad":1}"#.to_string();
-        let bad2 = r#"{"still_bad":2}"#.to_string();
-        let call2_response = r#"{"rollups":[]}"#.to_string();
-        let provider = SequentialMockProvider::new(vec![bad1, call2_response, bad2]);
+        let bad2 = r#"not json at all"#.to_string();
+        let provider = SequentialMockProvider::new(vec![
+            bad1.clone(),
+            bad1,
+            bad2.clone(),
+            bad2.clone(),
+            bad2.clone(),
+            bad2,
+        ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
-        let err = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
             .await
-            .expect_err("should fail");
-        assert!(matches!(err, SleepBatchError::ParseFailed(_)));
+            .expect("batch completes even with step failures");
 
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, SleepRunStatus::Failed);
+        assert_eq!(runs[0].status, SleepRunStatus::PartialFailure);
     }
 
     #[tokio::test]
@@ -2007,17 +2264,14 @@ mod tests {
             }]
         })
         .to_string();
-        let call2_response = r#"{"rollups":[]}"#.to_string();
-        let memory_response = serde_json::json!({
-            "semantic": "",
-            "prospective": ""
-        })
-        .to_string();
 
         let provider = SequentialMockWithUsage::new(vec![
+            (events_response.clone(), 50, 50),
             (events_response, 50, 50),
-            (call2_response, 50, 50),
-            (memory_response, 50, 50),
+            (r#"{"rollups":[]}"#.to_string(), 50, 50),
+            (r#"{"rollups":[]}"#.to_string(), 50, 50),
+            (r#"{"semantic":""}"#.to_string(), 50, 50),
+            (r#"{"prospective":""}"#.to_string(), 50, 50),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
@@ -2103,7 +2357,6 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let call2_response = r#"{"rollups":[]}"#.to_string();
         let memory_response = serde_json::json!({
             "semantic": "updated",
             "prospective": "updated"
@@ -2113,7 +2366,9 @@ mod tests {
         let provider = SequentialMockProvider::new(vec![
             r#"{"not_events":[]}"#.to_string(),
             r#"{"not_events":[]}"#.to_string(),
-            call2_response,
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            memory_response.clone(),
             memory_response,
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -2130,6 +2385,81 @@ mod tests {
             .list_episode_events_by_run(&runs[0].id)
             .expect("events");
         assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sleep_batch_continues_after_event_extraction_failure() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let provider = SequentialMockProvider::new(vec![
+            r#"not json"#.to_string(),
+            r#"not json"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"semantic":"updated"}"#.to_string(),
+            r#"{"prospective":"updated"}"#.to_string(),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
+
+        let episodic = steps
+            .iter()
+            .find(|s| s.step_name == SleepStepName::EpisodicUpdate)
+            .expect("episodic step exists");
+        let semantic = steps
+            .iter()
+            .find(|s| s.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step exists");
+        let prospective = steps
+            .iter()
+            .find(|s| s.step_name == SleepStepName::ProspectiveUpdate)
+            .expect("prospective step exists");
+
+        assert_eq!(episodic.status, SleepStepStatus::Success);
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        assert_eq!(prospective.status, SleepStepStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn successful_step_is_not_rolled_back_by_later_failure() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let provider = SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"semantic":"good semantic"}"#.to_string(),
+            r#"not json"#.to_string(),
+        ]);
+        let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
+
+        let semantic = steps
+            .iter()
+            .find(|s| s.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step exists");
+        let prospective = steps
+            .iter()
+            .find(|s| s.step_name == SleepStepName::ProspectiveUpdate)
+            .expect("prospective step exists");
+
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        assert_eq!(prospective.status, SleepStepStatus::Failed);
     }
 
     #[tokio::test]
