@@ -1037,6 +1037,11 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Marks a sleep run step as running and sets `started_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the step is not in `pending` state.
     pub(crate) fn start_sleep_step(
         &self,
         sleep_run_id: &str,
@@ -1062,6 +1067,11 @@ impl Database {
         Ok(())
     }
 
+    /// Finishes a running sleep step with terminal status, tokens, and metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the step is not in `running` state.
     pub(crate) fn finish_sleep_step(
         &self,
         sleep_run_id: &str,
@@ -1099,6 +1109,7 @@ impl Database {
         Ok(())
     }
 
+    /// Lists all steps for a sleep run, ordered by step_name.
     pub(crate) fn list_sleep_run_steps(
         &self,
         sleep_run_id: &str,
@@ -1116,6 +1127,9 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Gets a single step by sleep_run_id and step_name.
+    ///
+    /// Returns `None` if the step does not exist.
     pub(crate) fn get_sleep_run_step(
         &self,
         sleep_run_id: &str,
@@ -1134,6 +1148,17 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Finalizes a sleep run by aggregating step results into run-level status and tokens.
+    ///
+    /// Status derivation:
+    /// - `Success`: all steps succeeded or skipped, at least one success
+    /// - `PartialFailure`: at least one success and at least one failed
+    /// - `Failed`: any pending/running remaining, or all failed
+    /// - `Skipped`: all steps skipped
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the run is not in `running` state.
     pub(crate) fn finalize_sleep_run(
         &self,
         sleep_run_id: &str,
@@ -1232,6 +1257,9 @@ impl Database {
     // Sleep step checkpoints
     // ---------------------------------------------------------------------------
 
+    /// Gets a checkpoint by composite key (agent_id, step_name, source_kind, source_id).
+    ///
+    /// Returns `None` if no checkpoint exists for the given key.
     pub(crate) fn get_sleep_checkpoint(
         &self,
         agent_id: &str,
@@ -1258,6 +1286,7 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Inserts or updates a checkpoint. On conflict, updates cursor_at, cursor_id, and updated_at.
     pub(crate) fn upsert_sleep_checkpoint(
         &self,
         checkpoint: &SleepStepCheckpoint,
@@ -1284,6 +1313,7 @@ impl Database {
         Ok(())
     }
 
+    /// Lists all checkpoints for a given agent, step, and source_kind, ordered by source_id.
     pub(crate) fn list_sleep_checkpoints(
         &self,
         agent_id: &str,

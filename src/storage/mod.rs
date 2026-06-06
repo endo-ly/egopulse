@@ -51,6 +51,7 @@ type Pool = r2d2::Pool<SqliteConnectionManager>;
 type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(())
 }

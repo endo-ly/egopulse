@@ -597,8 +597,30 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
             );
 
             INSERT INTO memory_snapshots_v9
-                SELECT id, run_id, agent_id, file, content_before, content_after, created_at
-                FROM memory_snapshots;
+                SELECT
+                    ms.id,
+                    ms.run_id,
+                    ms.agent_id,
+                    ms.file,
+                    ms.content_before,
+                    ms.content_after,
+                    ms.created_at
+                FROM memory_snapshots ms
+                JOIN sleep_runs sr ON sr.id = ms.run_id
+                WHERE ms.file IN ('episodic', 'semantic', 'prospective')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM memory_snapshots newer
+                      WHERE newer.run_id = ms.run_id
+                        AND newer.file = ms.file
+                        AND (
+                            newer.created_at > ms.created_at
+                            OR (
+                                newer.created_at = ms.created_at
+                                AND newer.id > ms.id
+                            )
+                        )
+                  );
 
             DROP TABLE memory_snapshots;
             ALTER TABLE memory_snapshots_v9 RENAME TO memory_snapshots;
@@ -1744,24 +1766,7 @@ mod tests {
                     FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
                 );
             CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
-                ON sleep_run_steps(step_name, status, started_at);
-
-            CREATE TABLE IF NOT EXISTS sleep_step_checkpoints (
-                agent_id     TEXT NOT NULL,
-                step_name    TEXT NOT NULL,
-                source_kind  TEXT NOT NULL,
-                source_id    TEXT NOT NULL,
-                cursor_at    TEXT NOT NULL,
-                cursor_id    TEXT NOT NULL,
-                updated_at   TEXT NOT NULL,
-                PRIMARY KEY (agent_id, step_name, source_kind, source_id),
-                CHECK (step_name IN ('event_extraction', 'semantic_update', 'prospective_update')),
-                CHECK (source_kind IN ('messages', 'episode_events')),
-                CHECK (
-                    (step_name IN ('event_extraction', 'prospective_update') AND source_kind = 'messages')
-                    OR (step_name = 'semantic_update' AND source_kind = 'episode_events')
-                )
-            );",
+                ON sleep_run_steps(step_name, status, started_at);",
             )
             .unwrap();
 
