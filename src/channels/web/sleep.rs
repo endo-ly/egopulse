@@ -450,4 +450,29 @@ mod tests {
         assert_eq!(snapshots[0]["file"], "episodic");
         assert!(snapshots[0]["file"].is_string());
     }
+
+    #[tokio::test]
+    async fn sleep_runs_api_returns_partial_failure_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+
+        let conn = web_state.app_state.db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at, finished_at)
+             VALUES ('run-pf', 'agent-a', 'partial_failure', 'manual', '2024-01-01T00:00:00Z', '2024-01-01T00:01:00Z')",
+            [],
+        )
+        .expect("insert partial_failure run");
+
+        let state = AxumState(web_state);
+        let query = Query(HashMap::from([(
+            "agent_id".to_string(),
+            "agent-a".to_string(),
+        )]));
+        let result = list_sleep_runs(state, query).await.expect("ok");
+        let body = result.0;
+        let runs = body["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "partial_failure");
+    }
 }

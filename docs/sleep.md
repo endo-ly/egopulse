@@ -461,7 +461,7 @@ Sleep Batch の実行履歴。
 |---|---|---|
 | id | TEXT PK | UUID v4 |
 | agent_id | TEXT | エージェント識別子 |
-| status | TEXT | running / success / failed / skipped |
+| status | TEXT | running / success / partial_failure / failed / skipped |
 | trigger_type | TEXT | manual / scheduled / backfill |
 | started_at | TEXT | 開始時刻（RFC3339） |
 | finished_at | TEXT | 終了時刻（nullable） |

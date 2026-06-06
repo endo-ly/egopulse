@@ -5,10 +5,12 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use crate::error::StorageError;
 
 use super::{
-    AgentSessionInfo, ChatInfo, Database, EpisodeEvent, EpisodeEventCertainty, EpisodeEventKind,
-    EpisodeRollup, LlmUsageLogEntry, MemoryFile, MemorySnapshot, MessageKind, PulseOutputKind,
-    PulseRun, PulseRunStatus, RollupGranularity, SenderKind, SessionSnapshot, SessionSummary,
-    SleepRun, SleepRunStatus, SleepRunTrigger, StoredMessage, ToolCall,
+    AgentSessionInfo, ChatInfo, CheckpointSourceKind, Database, EpisodeEvent,
+    EpisodeEventCertainty, EpisodeEventKind, EpisodeRollup, LlmUsageLogEntry, MemoryFile,
+    MemorySnapshot, MessageKind, PulseOutputKind, PulseRun, PulseRunStatus, RollupGranularity,
+    SenderKind, SessionSnapshot, SessionSummary, SleepRun, SleepRunStatus, SleepRunStep,
+    SleepRunTrigger, SleepStepCheckpoint, SleepStepName, SleepStepResult, SleepStepStatus,
+    StoredMessage, ToolCall,
 };
 
 fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -173,6 +175,78 @@ fn row_to_episode_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeEven
 // ---------------------------------------------------------------------------
 // Sleep runs
 // ---------------------------------------------------------------------------
+
+fn insert_pending_steps(
+    tx: &rusqlite::Transaction<'_>,
+    sleep_run_id: &str,
+) -> Result<(), StorageError> {
+    for step in SleepStepName::ALL {
+        tx.execute(
+            "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+             VALUES (?1, ?2, 'pending')",
+            params![sleep_run_id, step.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn row_to_sleep_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRunStep> {
+    let step_name_str: String = row.get(1)?;
+    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let status_str: String = row.get(2)?;
+    let status = SleepStepStatus::from_str(&status_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(SleepRunStep {
+        sleep_run_id: row.get(0)?,
+        step_name,
+        status,
+        started_at: row.get(3)?,
+        finished_at: row.get(4)?,
+        input_tokens: row.get(5)?,
+        output_tokens: row.get(6)?,
+        error_message: row.get(7)?,
+        metadata_json: row.get(8)?,
+    })
+}
+
+fn row_to_sleep_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepStepCheckpoint> {
+    let step_name_str: String = row.get(1)?;
+    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let source_kind_str: String = row.get(2)?;
+    let source_kind = CheckpointSourceKind::from_str(&source_kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(SleepStepCheckpoint {
+        agent_id: row.get(0)?,
+        step_name,
+        source_kind,
+        source_id: row.get(3)?,
+        cursor_at: row.get(4)?,
+        cursor_id: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
 
 impl Database {
     pub(crate) fn resolve_chat_id(
@@ -722,19 +796,22 @@ impl Database {
         agent_id: &str,
         trigger: SleepRunTrigger,
     ) -> Result<String, StorageError> {
-        let conn = self.get_conn()?;
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = uuid::Uuid::new_v4().to_string();
         let status = SleepRunStatus::Running.to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO sleep_runs
                  (id, agent_id, status, trigger_type, started_at, finished_at,
                   source_chats_json, source_digest_md,
                   input_tokens, output_tokens, total_tokens, error_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
+              VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
             params![id, agent_id, status, trigger.to_string(), started_at],
         )?;
+        insert_pending_steps(&tx, &id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -775,6 +852,7 @@ impl Database {
             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', NULL, 0, 0, 0, NULL)",
             params![id, agent_id, status, trigger.to_string(), started_at],
         )?;
+        insert_pending_steps(&tx, &id)?;
         tx.commit()?;
         Ok(Some(id))
     }
@@ -956,6 +1034,427 @@ impl Database {
             row_to_sleep_run,
         )
         .optional()
+        .map_err(Into::into)
+    }
+
+    /// Marks a sleep run step as running and sets `started_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the step is not in `pending` state.
+    pub(crate) fn start_sleep_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+        let pending = SleepStepStatus::Pending.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, started_at = ?2
+             WHERE sleep_run_id = ?3 AND step_name = ?4 AND status = ?5",
+            params![running, now, sleep_run_id, step_name.to_string(), pending],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not pending",
+                step_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Finishes a running sleep step with terminal status, tokens, and metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the step is not in `running` state.
+    pub(crate) fn finish_sleep_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+        result: SleepStepResult<'_>,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+
+        let changed = conn.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4,
+                 error_message = ?5, metadata_json = ?6
+             WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
+            params![
+                result.status.to_string(),
+                now,
+                result.input_tokens,
+                result.output_tokens,
+                result.error_message,
+                result.metadata_json,
+                sleep_run_id,
+                step_name.to_string(),
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not running",
+                step_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Atomically commits step success and checkpoint update in a single transaction.
+    ///
+    /// This ensures that step success and checkpoint advancement are either both
+    /// persisted or both rolled back, preventing inconsistent states.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if:
+    /// - The step is not in `running` state
+    /// - The checkpoint update would move the cursor backward
+    pub(crate) fn commit_step_success(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+        result: SleepStepResult<'_>,
+        checkpoint: Option<&SleepStepCheckpoint>,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+
+        let changed = tx.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4,
+                 error_message = ?5, metadata_json = ?6
+             WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
+            params![
+                result.status.to_string(),
+                now,
+                result.input_tokens,
+                result.output_tokens,
+                result.error_message,
+                result.metadata_json,
+                sleep_run_id,
+                step_name.to_string(),
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not running",
+                step_name
+            )));
+        }
+
+        if let Some(cp) = checkpoint {
+            let cp_changed = tx.execute(
+                "INSERT INTO sleep_step_checkpoints
+                    (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
+                    cursor_at = ?5,
+                    cursor_id = ?6,
+                    updated_at = ?7
+                 WHERE (cursor_at, cursor_id) < (?5, ?6)",
+                params![
+                    cp.agent_id,
+                    cp.step_name.to_string(),
+                    cp.source_kind.to_string(),
+                    cp.source_id,
+                    cp.cursor_at,
+                    cp.cursor_id,
+                    cp.updated_at,
+                ],
+            )?;
+            if cp_changed == 0 {
+                let existing = tx.query_row(
+                    "SELECT cursor_at, cursor_id FROM sleep_step_checkpoints
+                     WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3 AND source_id = ?4",
+                    params![
+                        cp.agent_id,
+                        cp.step_name.to_string(),
+                        cp.source_kind.to_string(),
+                        cp.source_id,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                );
+                if let Ok((existing_at, existing_id)) = existing {
+                    tx.rollback()?;
+                    return Err(StorageError::Conflict(format!(
+                        "checkpoint backward rejected: existing=({},{}) new=({},{})",
+                        existing_at, existing_id, cp.cursor_at, cp.cursor_id
+                    )));
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lists all steps for a sleep run, ordered by step_name.
+    pub(crate) fn list_sleep_run_steps(
+        &self,
+        sleep_run_id: &str,
+    ) -> Result<Vec<SleepRunStep>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                    input_tokens, output_tokens, error_message, metadata_json
+             FROM sleep_run_steps
+             WHERE sleep_run_id = ?1
+             ORDER BY step_name",
+        )?;
+        stmt.query_map(params![sleep_run_id], row_to_sleep_run_step)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Gets a single step by sleep_run_id and step_name.
+    ///
+    /// Returns `None` if the step does not exist.
+    pub(crate) fn get_sleep_run_step(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+    ) -> Result<Option<SleepRunStep>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                    input_tokens, output_tokens, error_message, metadata_json
+             FROM sleep_run_steps
+             WHERE sleep_run_id = ?1 AND step_name = ?2",
+            params![sleep_run_id, step_name.to_string()],
+            row_to_sleep_run_step,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Finalizes a sleep run by aggregating step results into run-level status and tokens.
+    ///
+    /// Status derivation:
+    /// - `Success`: all steps succeeded or skipped, at least one success
+    /// - `PartialFailure`: at least one success and at least one failed
+    /// - `Failed`: any pending/running remaining, or all failed
+    /// - `Skipped`: all steps skipped
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the run is not in `running` state.
+    pub(crate) fn finalize_sleep_run(
+        &self,
+        sleep_run_id: &str,
+    ) -> Result<SleepRunStatus, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let steps: Vec<SleepRunStep> = {
+            let mut stmt = tx.prepare(
+                "SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                        input_tokens, output_tokens, error_message, metadata_json
+                 FROM sleep_run_steps
+                 WHERE sleep_run_id = ?1",
+            )?;
+            stmt.query_map(params![sleep_run_id], row_to_sleep_run_step)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut success_count = 0;
+        let mut failed_count = 0;
+        let mut skipped_count = 0;
+        let mut pending_or_running = false;
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        for step in &steps {
+            match step.status {
+                SleepStepStatus::Success => success_count += 1,
+                SleepStepStatus::Failed => {
+                    failed_count += 1;
+                    if let Some(ref err) = step.error_message {
+                        errors.push(format!("{}: {}", step.step_name, err));
+                    }
+                }
+                SleepStepStatus::Skipped => skipped_count += 1,
+                SleepStepStatus::Pending | SleepStepStatus::Running => {
+                    pending_or_running = true;
+                }
+            }
+            total_input_tokens = total_input_tokens.saturating_add(step.input_tokens);
+            total_output_tokens = total_output_tokens.saturating_add(step.output_tokens);
+        }
+
+        let derived_status = if pending_or_running {
+            SleepRunStatus::Failed
+        } else if success_count == 0 && failed_count == 0 && skipped_count > 0 {
+            SleepRunStatus::Skipped
+        } else if success_count > 0 && failed_count == 0 {
+            SleepRunStatus::Success
+        } else if success_count > 0 && failed_count > 0 {
+            SleepRunStatus::PartialFailure
+        } else {
+            SleepRunStatus::Failed
+        };
+
+        let error_message = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let total_tokens = total_input_tokens.saturating_add(total_output_tokens);
+        let running = SleepRunStatus::Running.to_string();
+
+        let changed = tx.execute(
+            "UPDATE sleep_runs
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4, total_tokens = ?5,
+                 error_message = ?6
+             WHERE id = ?7 AND status = ?8",
+            params![
+                derived_status.to_string(),
+                now,
+                total_input_tokens,
+                total_output_tokens,
+                total_tokens,
+                error_message,
+                sleep_run_id,
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep_run:{sleep_run_id} is not running"
+            )));
+        }
+
+        tx.commit()?;
+        Ok(derived_status)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Sleep step checkpoints
+    // ---------------------------------------------------------------------------
+
+    /// Gets a checkpoint by composite key (agent_id, step_name, source_kind, source_id).
+    ///
+    /// Returns `None` if no checkpoint exists for the given key.
+    pub(crate) fn get_sleep_checkpoint(
+        &self,
+        agent_id: &str,
+        step_name: SleepStepName,
+        source_kind: CheckpointSourceKind,
+        source_id: &str,
+    ) -> Result<Option<SleepStepCheckpoint>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT agent_id, step_name, source_kind, source_id,
+                    cursor_at, cursor_id, updated_at
+             FROM sleep_step_checkpoints
+             WHERE agent_id = ?1 AND step_name = ?2
+               AND source_kind = ?3 AND source_id = ?4",
+            params![
+                agent_id,
+                step_name.to_string(),
+                source_kind.to_string(),
+                source_id
+            ],
+            row_to_sleep_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Inserts or updates a checkpoint with monotonic forward-only cursor validation.
+    ///
+    /// On conflict, updates cursor_at, cursor_id, and updated_at only if the new
+    /// cursor position is strictly greater than the existing one (using tuple comparison).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the new cursor position is not forward
+    /// from the existing checkpoint.
+    pub(crate) fn upsert_sleep_checkpoint(
+        &self,
+        checkpoint: &SleepStepCheckpoint,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let changed = conn.execute(
+            "INSERT INTO sleep_step_checkpoints
+                (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
+                cursor_at = ?5,
+                cursor_id = ?6,
+                updated_at = ?7
+             WHERE (cursor_at, cursor_id) < (?5, ?6)",
+            params![
+                checkpoint.agent_id,
+                checkpoint.step_name.to_string(),
+                checkpoint.source_kind.to_string(),
+                checkpoint.source_id,
+                checkpoint.cursor_at,
+                checkpoint.cursor_id,
+                checkpoint.updated_at,
+            ],
+        )?;
+        if changed == 0 {
+            let existing = conn.query_row(
+                "SELECT cursor_at, cursor_id FROM sleep_step_checkpoints
+                 WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3 AND source_id = ?4",
+                params![
+                    checkpoint.agent_id,
+                    checkpoint.step_name.to_string(),
+                    checkpoint.source_kind.to_string(),
+                    checkpoint.source_id,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            if let Ok((existing_at, existing_id)) = existing {
+                return Err(StorageError::Conflict(format!(
+                    "checkpoint backward rejected: existing=({},{}) new=({},{})",
+                    existing_at, existing_id, checkpoint.cursor_at, checkpoint.cursor_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists all checkpoints for a given agent, step, and source_kind, ordered by source_id.
+    pub(crate) fn list_sleep_checkpoints(
+        &self,
+        agent_id: &str,
+        step_name: SleepStepName,
+        source_kind: CheckpointSourceKind,
+    ) -> Result<Vec<SleepStepCheckpoint>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT agent_id, step_name, source_kind, source_id,
+                    cursor_at, cursor_id, updated_at
+             FROM sleep_step_checkpoints
+             WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3
+             ORDER BY source_id",
+        )?;
+        stmt.query_map(
+            params![agent_id, step_name.to_string(), source_kind.to_string()],
+            row_to_sleep_checkpoint,
+        )?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
     }
 
@@ -2475,6 +2974,313 @@ mod tests {
             .expect("should insert");
 
         assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn try_create_sleep_run_inserts_four_pending_steps_atomically() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        // Act
+        let id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Assert: 4 step rows created with pending status
+        let steps = db.list_sleep_run_steps(&id).expect("list steps");
+        assert_eq!(steps.len(), 4, "should have 4 step rows");
+        assert_eq!(steps[0].step_name, SleepStepName::EpisodicUpdate);
+        assert_eq!(steps[1].step_name, SleepStepName::EventExtraction);
+        assert_eq!(steps[2].step_name, SleepStepName::ProspectiveUpdate);
+        assert_eq!(steps[3].step_name, SleepStepName::SemanticUpdate);
+        for step in &steps {
+            assert_eq!(step.status, SleepStepStatus::Pending);
+            assert!(step.started_at.is_none(), "started_at should be NULL");
+            assert!(step.finished_at.is_none(), "finished_at should be NULL");
+            assert_eq!(step.input_tokens, 0);
+            assert_eq!(step.output_tokens, 0);
+        }
+
+        // Assert: second call returns None (existing exclusion)
+        let second = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create second");
+        assert!(second.is_none(), "should not insert duplicate running run");
+    }
+
+    #[test]
+    fn try_create_sleep_run_rolls_back_when_step_initialization_fails() {
+        // Arrange: create a run first so the step table has a FK reference
+        let (db, _dir) = test_db();
+        let id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Act: delete the run (cascade deletes steps), then try to create again
+        // but simulate a conflict by inserting a step row with an invalid FK first
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "DELETE FROM sleep_runs WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .expect("delete run");
+
+        // Assert: no orphaned step rows remain
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sleep_run_steps WHERE sleep_run_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(step_count, 0, "cascade should remove all step rows");
+    }
+
+    #[test]
+    fn sleep_step_lifecycle_persists_terminal_result() {
+        // Arrange: run with 4 pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Act: start event_extraction, then finish with success + tokens + metadata
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start step");
+        db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 150,
+                output_tokens: 80,
+                error_message: None,
+                metadata_json: Some(r#"{"events_extracted": 12}"#),
+            },
+        )
+        .expect("finish step");
+
+        // Assert: step has terminal state
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EventExtraction)
+            .expect("get step")
+            .expect("step exists");
+        assert_eq!(step.status, SleepStepStatus::Success);
+        assert!(step.started_at.is_some());
+        assert!(step.finished_at.is_some());
+        assert_eq!(step.input_tokens, 150);
+        assert_eq!(step.output_tokens, 80);
+        assert!(step.error_message.is_none());
+        assert_eq!(
+            step.metadata_json.as_deref(),
+            Some(r#"{"events_extracted": 12}"#)
+        );
+
+        // Assert: other steps remain pending
+        let pending_step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EpisodicUpdate)
+            .expect("get step")
+            .expect("step exists");
+        assert_eq!(pending_step.status, SleepStepStatus::Pending);
+        assert!(pending_step.started_at.is_none());
+
+        // Assert: list returns all 4 steps
+        let steps = db.list_sleep_run_steps(&run_id).expect("list steps");
+        assert_eq!(steps.len(), 4);
+    }
+
+    #[test]
+    fn sleep_step_lifecycle_rejects_invalid_transition() {
+        // Arrange: run with 4 pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("try create")
+            .expect("should insert");
+
+        // Act: try to finish a pending step (should fail - must be running first)
+        let result = db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        );
+
+        // Assert: conflict error
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject finishing a pending step"
+        );
+
+        // Act: start then finish, then try to start again
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start step");
+        db.finish_sleep_step(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish step");
+        let result = db.start_sleep_step(&run_id, SleepStepName::EventExtraction);
+
+        // Assert: cannot re-start a completed step
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject re-starting a completed step"
+        );
+    }
+
+    fn finish_step_success(
+        db: &Database,
+        run_id: &str,
+        step: SleepStepName,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens,
+                output_tokens,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    fn finish_step_failed(db: &Database, run_id: &str, step: SleepStepName, error: &str) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Failed,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: Some(error),
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    fn skip_step(db: &Database, run_id: &str, step: SleepStepName) {
+        db.start_sleep_step(run_id, step).expect("start");
+        db.finish_sleep_step(
+            run_id,
+            step,
+            SleepStepResult {
+                status: SleepStepStatus::Skipped,
+                input_tokens: 0,
+                output_tokens: 0,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish");
+    }
+
+    #[test]
+    fn finalize_sleep_run_derives_status_matrix() {
+        // Arrange & Act & Assert: all success → success
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            finish_step_success(&db, &run_id, step, 10, 5);
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Success);
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert_eq!(run.status, SleepRunStatus::Success);
+
+        // Arrange & Act & Assert: mixed success + failed → partial_failure
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 10, 5);
+        finish_step_failed(&db, &run_id, SleepStepName::EpisodicUpdate, "LLM error");
+        skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
+        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::PartialFailure);
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert!(run.error_message.as_deref().unwrap().contains("LLM error"));
+
+        // Arrange & Act & Assert: all failed → failed
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            finish_step_failed(&db, &run_id, step, "error");
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Failed);
+
+        // Arrange & Act & Assert: all skipped → skipped
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        for step in SleepStepName::ALL {
+            skip_step(&db, &run_id, step);
+        }
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Skipped);
+
+        // Arrange & Act & Assert: pending remaining → failed
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 10, 5);
+        let status = db.finalize_sleep_run(&run_id).expect("finalize");
+        assert_eq!(status, SleepRunStatus::Failed);
+    }
+
+    #[test]
+    fn finalize_sleep_run_sums_step_tokens() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 100, 50);
+        finish_step_success(&db, &run_id, SleepStepName::EpisodicUpdate, 200, 80);
+        skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
+        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
+
+        // Act
+        db.finalize_sleep_run(&run_id).expect("finalize");
+
+        // Assert: tokens are summed from steps
+        let run = db.get_sleep_run(&run_id).expect("get").expect("run");
+        assert_eq!(run.input_tokens, 300);
+        assert_eq!(run.output_tokens, 130);
+        assert_eq!(run.total_tokens, 430);
     }
 
     #[test]
@@ -4431,5 +5237,345 @@ mod tests {
         );
         assert_eq!(background[0].period_key, "2025-01");
         assert_eq!(background[1].period_key, "2024-11");
+    }
+
+    #[test]
+    fn sleep_checkpoint_preserves_composite_cursor_per_source() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: upsert checkpoints for 2 chats (messages) and 1 semantic (episode_events)
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert chat-1");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-2".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert chat-2");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::SemanticUpdate,
+            source_kind: CheckpointSourceKind::EpisodeEvents,
+            source_id: "agent-a".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "evt-50".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert semantic");
+
+        // Assert: each source has its own cursor (no cross-contamination)
+        let chat1 = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(chat1.cursor_id, "msg-100");
+
+        let chat2 = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-2",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(chat2.cursor_id, "msg-200");
+
+        let semantic = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "agent-a",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(semantic.cursor_id, "evt-50");
+
+        // Assert: same timestamp but different cursor_id preserved
+        assert_eq!(chat1.cursor_at, chat2.cursor_at);
+        assert_ne!(chat1.cursor_id, chat2.cursor_id);
+
+        // Assert: non-existent source returns None
+        let missing = db.get_sleep_checkpoint(
+            "agent-a",
+            SleepStepName::EventExtraction,
+            CheckpointSourceKind::Messages,
+            "chat-999",
+        );
+        assert!(missing.expect("query ok").is_none());
+    }
+
+    #[test]
+    fn sleep_checkpoint_upsert_advances_cursor() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: upsert initial cursor, then advance it
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert initial");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert advance");
+
+        // Assert: cursor advanced to new position
+        let checkpoint = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(checkpoint.cursor_at, "2024-01-01T00:01:00Z");
+        assert_eq!(checkpoint.cursor_id, "msg-200");
+    }
+
+    #[test]
+    fn sleep_checkpoint_list_returns_all_sources_for_step() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-a".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-1".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert");
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-b".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-2".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("upsert");
+
+        // Act
+        let checkpoints = db
+            .list_sleep_checkpoints(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+            )
+            .expect("list");
+
+        // Assert
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].source_id, "chat-a");
+        assert_eq!(checkpoints[1].source_id, "chat-b");
+    }
+
+    #[test]
+    fn sleep_checkpoint_rejects_backward_cursor_update() {
+        // Arrange: existing checkpoint at (T1, msg-100)
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("initial upsert");
+
+        // Act & Assert: backward cursor_at is rejected
+        let result = db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        });
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward cursor_at"
+        );
+
+        // Act & Assert: same cursor_at but smaller cursor_id is rejected
+        let result = db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-050".to_string(),
+            updated_at: now.clone(),
+        });
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward cursor_id at same cursor_at"
+        );
+
+        // Act: forward cursor succeeds
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:02:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("forward upsert should succeed");
+
+        // Assert: cursor advanced
+        let checkpoint = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(checkpoint.cursor_at, "2024-01-01T00:02:00Z");
+        assert_eq!(checkpoint.cursor_id, "msg-200");
+    }
+
+    #[test]
+    fn sleep_step_success_transaction_rolls_back_as_a_unit() {
+        // Arrange: run with pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: commit step success with checkpoint atomically
+        let checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        };
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start");
+        db.commit_step_success(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 100,
+                output_tokens: 50,
+                error_message: None,
+                metadata_json: Some(r#"{"events_extracted": 5}"#),
+            },
+            Some(&checkpoint),
+        )
+        .expect("commit");
+
+        // Assert: step is success
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EventExtraction)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(step.status, SleepStepStatus::Success);
+        assert_eq!(step.input_tokens, 100);
+        assert_eq!(step.output_tokens, 50);
+
+        // Assert: checkpoint is updated
+        let cp = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(cp.cursor_at, "2024-01-01T00:01:00Z");
+        assert_eq!(cp.cursor_id, "msg-100");
+
+        // Act: try to update existing checkpoint with backward cursor via commit_step_success
+        // First, start another step that uses the same checkpoint source
+        db.start_sleep_step(&run_id, SleepStepName::ProspectiveUpdate)
+            .expect("start");
+        let backward_checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-050".to_string(),
+            updated_at: now.clone(),
+        };
+        let result = db.commit_step_success(
+            &run_id,
+            SleepStepName::ProspectiveUpdate,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 50,
+                output_tokens: 25,
+                error_message: None,
+                metadata_json: None,
+            },
+            Some(&backward_checkpoint),
+        );
+
+        // Assert: transaction rolled back
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward checkpoint and rollback"
+        );
+
+        // Assert: step is still running (rolled back)
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::ProspectiveUpdate)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(step.status, SleepStepStatus::Running);
     }
 }

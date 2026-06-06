@@ -51,6 +51,7 @@ type Pool = r2d2::Pool<SqliteConnectionManager>;
 type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(())
 }
@@ -265,6 +266,7 @@ impl FromStr for SenderKind {
 pub(crate) enum SleepRunStatus {
     Running,
     Success,
+    PartialFailure,
     Failed,
     Skipped,
 }
@@ -274,6 +276,7 @@ impl fmt::Display for SleepRunStatus {
         match self {
             Self::Running => write!(f, "running"),
             Self::Success => write!(f, "success"),
+            Self::PartialFailure => write!(f, "partial_failure"),
             Self::Failed => write!(f, "failed"),
             Self::Skipped => write!(f, "skipped"),
         }
@@ -287,6 +290,7 @@ impl FromStr for SleepRunStatus {
         match s {
             "running" => Ok(Self::Running),
             "success" => Ok(Self::Success),
+            "partial_failure" => Ok(Self::PartialFailure),
             "failed" => Ok(Self::Failed),
             "skipped" => Ok(Self::Skipped),
             other => Err(format!("invalid sleep run status: {other}")),
@@ -326,6 +330,143 @@ impl FromStr for SleepRunTrigger {
             other => Err(format!("invalid sleep run trigger: {other}")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SleepStepName {
+    EventExtraction,
+    EpisodicUpdate,
+    SemanticUpdate,
+    ProspectiveUpdate,
+}
+
+impl SleepStepName {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::EventExtraction,
+        Self::EpisodicUpdate,
+        Self::SemanticUpdate,
+        Self::ProspectiveUpdate,
+    ];
+}
+
+impl fmt::Display for SleepStepName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EventExtraction => write!(f, "event_extraction"),
+            Self::EpisodicUpdate => write!(f, "episodic_update"),
+            Self::SemanticUpdate => write!(f, "semantic_update"),
+            Self::ProspectiveUpdate => write!(f, "prospective_update"),
+        }
+    }
+}
+
+impl FromStr for SleepStepName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "event_extraction" => Ok(Self::EventExtraction),
+            "episodic_update" => Ok(Self::EpisodicUpdate),
+            "semantic_update" => Ok(Self::SemanticUpdate),
+            "prospective_update" => Ok(Self::ProspectiveUpdate),
+            other => Err(format!("invalid sleep step name: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SleepStepStatus {
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Skipped,
+}
+
+impl fmt::Display for SleepStepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Running => write!(f, "running"),
+            Self::Success => write!(f, "success"),
+            Self::Failed => write!(f, "failed"),
+            Self::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl FromStr for SleepStepStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "success" => Ok(Self::Success),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(format!("invalid sleep step status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SleepRunStep {
+    pub sleep_run_id: String,
+    pub step_name: SleepStepName,
+    pub status: SleepStepStatus,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub error_message: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+pub(crate) struct SleepStepResult<'a> {
+    pub status: SleepStepStatus,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub error_message: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointSourceKind {
+    Messages,
+    EpisodeEvents,
+}
+
+impl fmt::Display for CheckpointSourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Messages => write!(f, "messages"),
+            Self::EpisodeEvents => write!(f, "episode_events"),
+        }
+    }
+}
+
+impl FromStr for CheckpointSourceKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "messages" => Ok(Self::Messages),
+            "episode_events" => Ok(Self::EpisodeEvents),
+            other => Err(format!("invalid checkpoint source kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SleepStepCheckpoint {
+    pub agent_id: String,
+    pub step_name: SleepStepName,
+    pub source_kind: CheckpointSourceKind,
+    pub source_id: String,
+    pub cursor_at: String,
+    pub cursor_id: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -621,10 +762,16 @@ const _: () = {
     assert_from_str::<SenderKind>();
     assert_display::<SleepRunStatus>();
     assert_display::<SleepRunTrigger>();
+    assert_display::<SleepStepName>();
+    assert_display::<SleepStepStatus>();
+    assert_display::<CheckpointSourceKind>();
     assert_display::<MemoryFile>();
     assert_display::<MessageKind>();
     assert_from_str::<SleepRunStatus>();
     assert_from_str::<SleepRunTrigger>();
+    assert_from_str::<SleepStepName>();
+    assert_from_str::<SleepStepStatus>();
+    assert_from_str::<CheckpointSourceKind>();
     assert_from_str::<MemoryFile>();
     assert_from_str::<MessageKind>();
 
@@ -636,6 +783,7 @@ const _: () = {
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
     assert_display::<PulseRun>();
+    assert_display::<SleepRunStep>();
 
     assert_display::<EpisodeEventKind>();
     assert_from_str::<EpisodeEventKind>();
@@ -661,6 +809,16 @@ impl fmt::Display for MemorySnapshot {
 impl fmt::Display for PulseRun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pulse_run({})", self.id)
+    }
+}
+
+impl fmt::Display for SleepRunStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "sleep_run_step({}, {})",
+            self.sleep_run_id, self.step_name
+        )
     }
 }
 

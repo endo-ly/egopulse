@@ -11,6 +11,7 @@ type RunListProps = {
 
 const STATUS_ICONS: Record<string, string> = {
   success: "\u2705",
+  partial_failure: "\u26A0\uFE0F",
   failed: "\u274C",
   skipped: "\u23ED",
   running: "\uD83D\uDD04",
