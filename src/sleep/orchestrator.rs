@@ -178,7 +178,7 @@ pub async fn run_sleep_batch(
 
 /// Extracts episode events from past conversation history for backfilling.
 ///
-/// Unlike normal sleep batch (which runs Call 1/2/3), this only runs Call 1
+/// Unlike normal sleep batch (which runs 4 steps), this only runs event extraction
 /// (Event Extraction) using the messages table. Old backfill events in the
 /// same period are replaced in a single transaction with new results.
 ///
@@ -523,7 +523,7 @@ async fn prepare_batch_context(
     let session_chunks =
         memory_update::build_session_text_chunks(db, sessions, chunk_session_tokens)?;
 
-    // Build extract chunks from messages table (Call 1)
+    // Build extract chunks from messages table (event_extraction step)
     let cutoff = {
         let agent_for_cutoff = agent_id.to_string();
         call_blocking(Arc::clone(db), move |db| {
@@ -825,7 +825,7 @@ async fn run_rollup_logic(
         },
     );
 
-    // Call 2a: Week rollup generation
+    // Week rollup generation
     if !week_requests.is_empty() {
         let mut week_events_map: HashMap<String, Vec<event_rollup::Call2Event>> = HashMap::new();
         for req in &week_requests {
@@ -936,7 +936,7 @@ async fn run_rollup_logic(
         &existing_week_rollups,
     );
 
-    // Call 2b: Month rollup generation
+    // Month rollup generation
     if !month_requests.is_empty() {
         let mut week_rollups_map: HashMap<String, Vec<event_rollup::Call2WeekRollupSummary>> =
             HashMap::new();

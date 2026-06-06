@@ -1,4 +1,4 @@
-//! Call 3 — Memory update via LLM (semantic + prospective).
+//! Memory update via LLM — semantic and prospective step implementations.
 
 use std::sync::Arc;
 

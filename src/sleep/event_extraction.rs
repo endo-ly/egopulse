@@ -1,4 +1,4 @@
-//! Call 1 — Event extraction from session chunks.
+//! Event extraction step — extracts episode events from session chunks.
 
 use std::str::FromStr;
 use std::sync::Arc;
