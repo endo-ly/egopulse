@@ -239,8 +239,9 @@ pub(crate) async fn run_extract_events_for_chunks(
                     chunk_index = index + 1,
                     total_chunks,
                     error = %e,
-                    "event extraction failed for chunk, skipping"
+                    "event extraction failed for chunk"
                 );
+                return Err(e);
             }
         }
     }
@@ -306,10 +307,6 @@ pub(crate) fn build_extract_chunks(
     if !current.is_empty() {
         chunks.push(current);
     }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
     Ok(chunks)
 }
 
@@ -561,12 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn build_extract_chunks_returns_empty_chunk_when_no_messages() {
+    fn build_extract_chunks_returns_no_chunks_when_no_messages() {
         let (db, _dir) = test_db();
         let sources: Vec<(i64, &str, &str)> = vec![];
         let chunks = build_extract_chunks(&db, &sources, None, None, 1000).expect("chunks");
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].is_empty());
+        assert!(chunks.is_empty());
     }
 
     #[test]
@@ -622,8 +618,7 @@ mod tests {
         let sources = vec![(chat_id, "test", "test:chat4")];
         let chunks = build_extract_chunks(&db, &sources, Some("2025-12-31T00:00:00Z"), None, 10000)
             .expect("chunks");
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].is_empty());
+        assert!(chunks.is_empty());
     }
 
     #[test]

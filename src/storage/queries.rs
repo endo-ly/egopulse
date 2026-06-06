@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::StorageError;
 
@@ -42,6 +42,145 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
         message_kind,
         recipient_agent_id: row.get(7)?,
     })
+}
+
+fn commit_checkpoints_in_tx(
+    tx: &Transaction<'_>,
+    checkpoints: &[SleepStepCheckpoint],
+) -> Result<(), StorageError> {
+    for checkpoint in checkpoints {
+        let changed = tx.execute(
+            "INSERT INTO sleep_step_checkpoints
+                (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
+                cursor_at = ?5, cursor_id = ?6, updated_at = ?7
+             WHERE (cursor_at, cursor_id) < (?5, ?6)",
+            params![
+                checkpoint.agent_id,
+                checkpoint.step_name.to_string(),
+                checkpoint.source_kind.to_string(),
+                checkpoint.source_id,
+                checkpoint.cursor_at,
+                checkpoint.cursor_id,
+                checkpoint.updated_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::Conflict(format!(
+                "checkpoint:{}:{}:{}:{} did not advance",
+                checkpoint.agent_id,
+                checkpoint.step_name,
+                checkpoint.source_kind,
+                checkpoint.source_id,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_success_result(
+    operation: &str,
+    result: &SleepStepResult<'_>,
+) -> Result<(), StorageError> {
+    if result.status != SleepStepStatus::Success {
+        return Err(StorageError::Conflict(format!(
+            "{operation} requires success status, got {}",
+            result.status
+        )));
+    }
+    Ok(())
+}
+
+fn insert_memory_snapshot_in_tx(
+    tx: &Transaction<'_>,
+    sleep_run_id: &str,
+    agent_id: &str,
+    file: MemoryFile,
+    content_before: &str,
+    content_after: &str,
+) -> Result<(), StorageError> {
+    let inserted = tx.execute(
+        "INSERT INTO memory_snapshots
+            (id, run_id, agent_id, file, content_before, content_after, created_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+         WHERE EXISTS (
+            SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3
+         )",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            sleep_run_id,
+            agent_id,
+            file.to_string(),
+            content_before,
+            content_after,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(StorageError::NotFound(format!("sleep_run:{sleep_run_id}")));
+    }
+    Ok(())
+}
+
+fn finish_step_in_tx(
+    tx: &Transaction<'_>,
+    sleep_run_id: &str,
+    step_name: SleepStepName,
+    result: SleepStepResult<'_>,
+) -> Result<(), StorageError> {
+    let changed = tx.execute(
+        "UPDATE sleep_run_steps
+         SET status = ?1, finished_at = ?2,
+             input_tokens = ?3, output_tokens = ?4,
+             error_message = ?5, metadata_json = ?6
+         WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = 'running'",
+        params![
+            result.status.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+            result.input_tokens,
+            result.output_tokens,
+            result.error_message,
+            result.metadata_json,
+            sleep_run_id,
+            step_name.to_string(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::Conflict(format!(
+            "sleep_run_step:{sleep_run_id}:{step_name} is not running"
+        )));
+    }
+    Ok(())
+}
+
+fn finish_memory_steps_in_tx(
+    tx: &Transaction<'_>,
+    sleep_run_id: &str,
+    result: SleepStepResult<'_>,
+) -> Result<(), StorageError> {
+    for (step_name, input_tokens, output_tokens) in [
+        (
+            SleepStepName::SemanticUpdate,
+            result.input_tokens,
+            result.output_tokens,
+        ),
+        (SleepStepName::ProspectiveUpdate, 0, 0),
+    ] {
+        finish_step_in_tx(
+            tx,
+            sleep_run_id,
+            step_name,
+            SleepStepResult {
+                status: result.status,
+                input_tokens,
+                output_tokens,
+                error_message: result.error_message,
+                metadata_json: result.metadata_json,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
@@ -1029,27 +1168,6 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Returns the latest successful non-backfill run for an agent.
-    pub(crate) fn get_latest_successful_non_backfill_run(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<SleepRun>, StorageError> {
-        let conn = self.get_conn()?;
-        conn.query_row(
-            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md,
-                    input_tokens, output_tokens, total_tokens, error_message
-             FROM sleep_runs
-             WHERE agent_id = ?1 AND status = 'success' AND trigger_type != 'backfill'
-             ORDER BY finished_at DESC
-             LIMIT 1",
-            params![agent_id],
-            row_to_sleep_run,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
     /// Marks a sleep run step as running and sets `started_at`.
     ///
     /// # Errors
@@ -1206,6 +1324,109 @@ impl Database {
             }
         }
 
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persists extracted events, advances message checkpoints, and
+    /// marks event extraction successful.
+    pub(crate) fn commit_event_extraction_success(
+        &self,
+        sleep_run_id: &str,
+        events: &[EpisodeEvent],
+        result: SleepStepResult<'_>,
+        checkpoints: &[SleepStepCheckpoint],
+    ) -> Result<(), StorageError> {
+        require_success_result("commit_event_extraction_success", &result)?;
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        for event in events {
+            if event.sleep_run_id != sleep_run_id {
+                return Err(StorageError::Conflict(format!(
+                    "event sleep_run_id '{}' does not match expected '{sleep_run_id}'",
+                    event.sleep_run_id,
+                )));
+            }
+            tx.execute(
+                "INSERT INTO episode_events
+                     (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                      ripple_strength, certainty, sleep_run_id, source_refs_json,
+                      created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    event.id,
+                    event.agent_id,
+                    event.experienced_at,
+                    event.encoded_at,
+                    event.kind.to_string(),
+                    event.title,
+                    event.body_md,
+                    event.ripple_strength,
+                    event.certainty.to_string(),
+                    event.sleep_run_id,
+                    event.source_refs_json,
+                    event.created_at,
+                    event.updated_at,
+                ],
+            )?;
+        }
+
+        commit_checkpoints_in_tx(&tx, checkpoints)?;
+        finish_step_in_tx(&tx, sleep_run_id, SleepStepName::EventExtraction, result)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically advances all shared Memory Update checkpoints and finishes
+    /// semantic/prospective with the same terminal status.
+    pub(crate) fn commit_memory_update_success(
+        &self,
+        sleep_run_id: &str,
+        agent_id: &str,
+        result: SleepStepResult<'_>,
+        checkpoints: &[SleepStepCheckpoint],
+        snapshots: &[(MemoryFile, String, String)],
+    ) -> Result<(), StorageError> {
+        require_success_result("commit_memory_update_success", &result)?;
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (file, content_before, content_after) in snapshots {
+            insert_memory_snapshot_in_tx(
+                &tx,
+                sleep_run_id,
+                agent_id,
+                *file,
+                content_before,
+                content_after,
+            )?;
+        }
+        commit_checkpoints_in_tx(&tx, checkpoints)?;
+        finish_memory_steps_in_tx(&tx, sleep_run_id, result)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_episodic_update_success(
+        &self,
+        sleep_run_id: &str,
+        agent_id: &str,
+        content_before: &str,
+        content_after: &str,
+        result: SleepStepResult<'_>,
+    ) -> Result<(), StorageError> {
+        require_success_result("commit_episodic_update_success", &result)?;
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_memory_snapshot_in_tx(
+            &tx,
+            sleep_run_id,
+            agent_id,
+            MemoryFile::Episodic,
+            content_before,
+            content_after,
+        )?;
+        finish_step_in_tx(&tx, sleep_run_id, SleepStepName::EpisodicUpdate, result)?;
         tx.commit()?;
         Ok(())
     }
@@ -2178,6 +2399,91 @@ impl Database {
         stmt.query_map(params![chat_id, from, to], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn get_messages_after_cursor(
+        &self,
+        chat_id: i64,
+        cursor: Option<(&str, &str)>,
+        upper_bound: (&str, &str),
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        let conn = self.get_conn()?;
+        let (cursor_at, cursor_id) = cursor.unzip();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                    message_kind, recipient_agent_id
+             FROM messages
+             WHERE chat_id = ?1
+               AND (?2 IS NULL OR (timestamp, id) > (?2, ?3))
+               AND (timestamp, id) <= (?4, ?5)
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+        stmt.query_map(
+            params![chat_id, cursor_at, cursor_id, upper_bound.0, upper_bound.1],
+            row_to_stored_message,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_latest_message_cursor(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT timestamp, id FROM messages
+             WHERE chat_id = ?1
+             ORDER BY timestamp DESC, id DESC
+             LIMIT 1",
+            params![chat_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_episode_events_after_cursor(
+        &self,
+        agent_id: &str,
+        cursor: Option<(&str, &str)>,
+        upper_bound: (&str, &str),
+    ) -> Result<Vec<EpisodeEvent>, StorageError> {
+        let conn = self.get_conn()?;
+        let (cursor_at, cursor_id) = cursor.unzip();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                    ripple_strength, certainty, sleep_run_id, source_refs_json,
+                    created_at, updated_at
+             FROM episode_events
+             WHERE agent_id = ?1
+               AND (?2 IS NULL OR (encoded_at, id) > (?2, ?3))
+               AND (encoded_at, id) <= (?4, ?5)
+             ORDER BY encoded_at ASC, id ASC",
+        )?;
+        stmt.query_map(
+            params![agent_id, cursor_at, cursor_id, upper_bound.0, upper_bound.1],
+            row_to_episode_event,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_latest_episode_event_cursor(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT encoded_at, id FROM episode_events
+             WHERE agent_id = ?1
+             ORDER BY encoded_at DESC, id DESC
+             LIMIT 1",
+            params![agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub(crate) fn get_agent_chats_with_messages_between(
@@ -4377,6 +4683,33 @@ mod tests {
     }
 
     #[test]
+    fn get_messages_after_cursor_respects_composite_upper_bound() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:cursor-bound", None, "cli", "agent-a")
+            .expect("create chat");
+        let timestamp = "2025-01-01T00:00:00Z";
+        store_msg(&db, "m1", chat_id, "first", timestamp);
+        store_msg(&db, "m2", chat_id, "upper", timestamp);
+        store_msg(&db, "m3", chat_id, "inserted later", timestamp);
+
+        // Act
+        let messages = db
+            .get_messages_after_cursor(chat_id, None, (timestamp, "m2"))
+            .expect("query");
+
+        // Assert
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+    }
+
+    #[test]
     fn get_agent_chats_with_messages_between_returns_chats_with_messages() {
         let (db, _dir) = test_db();
         let chat_id = db
@@ -4727,6 +5060,44 @@ mod tests {
 
         let count = db.count_episode_events("agent-a").expect("count");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_episode_events_after_cursor_respects_composite_upper_bound() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let mut events = ["evt-1", "evt-2", "evt-3"]
+            .into_iter()
+            .map(|id| {
+                make_event(
+                    id,
+                    "agent-a",
+                    "2025-01-10T10:00:00Z",
+                    EpisodeEventKind::Self_,
+                    3,
+                    EpisodeEventCertainty::Stated,
+                    "run-1",
+                )
+            })
+            .collect::<Vec<_>>();
+        for event in &mut events {
+            event.encoded_at = "2025-01-15T12:00:00Z".to_string();
+        }
+        db.insert_episode_events("run-1", &events).expect("insert");
+
+        // Act
+        let events = db
+            .get_episode_events_after_cursor("agent-a", None, ("2025-01-15T12:00:00Z", "evt-2"))
+            .expect("query");
+
+        // Assert
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evt-1", "evt-2"]
+        );
     }
 
     #[test]
@@ -5703,5 +6074,99 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(step.status, SleepStepStatus::Running);
+    }
+
+    #[test]
+    fn memory_update_success_commits_both_logical_steps_as_one_unit() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        db.start_memory_update_steps(&run_id)
+            .expect("start memory update");
+        let now = chrono::Utc::now().to_rfc3339();
+        let checkpoints = vec![
+            SleepStepCheckpoint {
+                agent_id: "agent-a".to_string(),
+                step_name: SleepStepName::SemanticUpdate,
+                source_kind: CheckpointSourceKind::EpisodeEvents,
+                source_id: "agent-a".to_string(),
+                cursor_at: "2024-01-01T00:01:00Z".to_string(),
+                cursor_id: "event-1".to_string(),
+                updated_at: now.clone(),
+            },
+            SleepStepCheckpoint {
+                agent_id: "agent-a".to_string(),
+                step_name: SleepStepName::ProspectiveUpdate,
+                source_kind: CheckpointSourceKind::Messages,
+                source_id: "chat-1".to_string(),
+                cursor_at: "2024-01-01T00:02:00Z".to_string(),
+                cursor_id: "message-1".to_string(),
+                updated_at: now,
+            },
+        ];
+        let snapshots = vec![
+            (
+                MemoryFile::Semantic,
+                "semantic before".to_string(),
+                "semantic after".to_string(),
+            ),
+            (
+                MemoryFile::Prospective,
+                "prospective before".to_string(),
+                "prospective after".to_string(),
+            ),
+        ];
+
+        // Act
+        db.commit_memory_update_success(
+            &run_id,
+            "agent-a",
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 120,
+                output_tokens: 40,
+                error_message: None,
+                metadata_json: None,
+            },
+            &checkpoints,
+            &snapshots,
+        )
+        .expect("commit memory update");
+
+        // Assert
+        let semantic = db
+            .get_sleep_run_step(&run_id, SleepStepName::SemanticUpdate)
+            .expect("get semantic")
+            .expect("semantic exists");
+        let prospective = db
+            .get_sleep_run_step(&run_id, SleepStepName::ProspectiveUpdate)
+            .expect("get prospective")
+            .expect("prospective exists");
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        assert_eq!(prospective.status, SleepStepStatus::Success);
+        assert_eq!((semantic.input_tokens, semantic.output_tokens), (120, 40));
+        assert_eq!(
+            (prospective.input_tokens, prospective.output_tokens),
+            (0, 0)
+        );
+        assert_eq!(
+            db.get_snapshots_for_run(&run_id).expect("snapshots").len(),
+            2
+        );
+        for checkpoint in checkpoints {
+            assert!(
+                db.get_sleep_checkpoint(
+                    &checkpoint.agent_id,
+                    checkpoint.step_name,
+                    checkpoint.source_kind,
+                    &checkpoint.source_id,
+                )
+                .expect("checkpoint")
+                .is_some()
+            );
+        }
     }
 }
