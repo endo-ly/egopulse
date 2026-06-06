@@ -1333,19 +1333,30 @@ impl Database {
     pub(crate) fn commit_event_extraction_success(
         &self,
         sleep_run_id: &str,
+        agent_id: &str,
         events: &[EpisodeEvent],
         result: SleepStepResult<'_>,
         checkpoints: &[SleepStepCheckpoint],
     ) -> Result<(), StorageError> {
         require_success_result("commit_event_extraction_success", &result)?;
+        for checkpoint in checkpoints {
+            if checkpoint.step_name != SleepStepName::EventExtraction
+                || checkpoint.agent_id != agent_id
+                || checkpoint.source_kind != CheckpointSourceKind::Messages
+            {
+                return Err(StorageError::Conflict(format!(
+                    "invalid event extraction checkpoint scope: agent={} step={} source={}",
+                    checkpoint.agent_id, checkpoint.step_name, checkpoint.source_kind,
+                )));
+            }
+        }
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         for event in events {
-            if event.sleep_run_id != sleep_run_id {
+            if event.sleep_run_id != sleep_run_id || event.agent_id != agent_id {
                 return Err(StorageError::Conflict(format!(
-                    "event sleep_run_id '{}' does not match expected '{sleep_run_id}'",
-                    event.sleep_run_id,
+                    "event scope does not match run={sleep_run_id} agent={agent_id}",
                 )));
             }
             tx.execute(
@@ -6168,5 +6179,59 @@ mod tests {
                 .is_some()
             );
         }
+    }
+
+    #[test]
+    fn event_extraction_success_rejects_checkpoint_from_another_agent() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start event extraction");
+        let checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-b".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2025-01-01T00:00:00Z".to_string(),
+            cursor_id: "message-1".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Act
+        let result = db.commit_event_extraction_success(
+            &run_id,
+            "agent-a",
+            &[],
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 10,
+                output_tokens: 5,
+                error_message: None,
+                metadata_json: None,
+            },
+            &[checkpoint],
+        );
+
+        // Assert
+        assert!(matches!(result, Err(StorageError::Conflict(_))));
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EventExtraction)
+            .expect("get step")
+            .expect("step exists");
+        assert_eq!(step.status, SleepStepStatus::Running);
+        assert!(
+            db.get_sleep_checkpoint(
+                "agent-b",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get checkpoint")
+            .is_none()
+        );
     }
 }

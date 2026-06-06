@@ -493,8 +493,8 @@ async fn execute_batch(
 
     let result = async {
         let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id).await?;
-        run_event_extraction_step(&mut ctx, &db, agent_id).await;
-        run_episodic_update_step(&mut ctx, state, &db, agent_id).await;
+        run_event_extraction_step(&mut ctx, &db, agent_id).await?;
+        run_episodic_update_step(&mut ctx, state, &db, agent_id).await?;
         run_memory_update_step(&mut ctx, &db, agent_id).await?;
 
         finalize_batch(&ctx, state, &db, agent_id, sessions, source_chats_json).await?;
@@ -575,13 +575,16 @@ async fn prepare_batch_context(
 }
 
 /// Step 1: Event Extraction — extracts episode events from session chunks.
-async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, agent_id: &str) {
+async fn run_event_extraction_step(
+    ctx: &mut BatchContext,
+    db: &Arc<Database>,
+    agent_id: &str,
+) -> Result<(), SleepBatchError> {
     let run_id = ctx.run_id.clone();
     call_blocking(Arc::clone(db), move |db| {
         db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
     })
-    .await
-    .ok();
+    .await?;
 
     let input = match load_message_step_input(ctx, db, agent_id, SleepStepName::EventExtraction) {
         Ok(input) => input,
@@ -593,12 +596,12 @@ async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, a
                 error.to_string(),
             )
             .await;
-            return;
+            return Ok(());
         }
     };
     if input.chunks.is_empty() {
         finish_step_skipped(db, &ctx.run_id, SleepStepName::EventExtraction).await;
-        return;
+        return Ok(());
     }
 
     let extract_chunks = input.chunks;
@@ -623,9 +626,11 @@ async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, a
             let event_count = episode_events.len();
             let checkpoints = input.checkpoints;
             let rid = run_id.clone();
+            let agent_id = agent_id.to_string();
             if let Err(error) = call_blocking(Arc::clone(db), move |db| {
                 db.commit_event_extraction_success(
                     &rid,
+                    &agent_id,
                     &episode_events,
                     SleepStepResult {
                         status: SleepStepStatus::Success,
@@ -647,7 +652,7 @@ async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, a
                     error.to_string(),
                 )
                 .await;
-                return;
+                return Ok(());
             }
             info!(count = event_count, "extracted episode events");
         }
@@ -672,6 +677,7 @@ async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, a
             .ok();
         }
     }
+    Ok(())
 }
 
 async fn finish_step_failed(
@@ -723,13 +729,12 @@ async fn run_episodic_update_step(
     state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
-) -> Option<String> {
+) -> Result<Option<String>, SleepBatchError> {
     let run_id = ctx.run_id.clone();
     call_blocking(Arc::clone(db), move |db| {
         db.start_sleep_step(&run_id, SleepStepName::EpisodicUpdate)
     })
-    .await
-    .ok();
+    .await?;
 
     let tz_str = &state.config.timezone;
     let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
@@ -755,7 +760,7 @@ async fn run_episodic_update_step(
                 e.to_string(),
             )
             .await;
-            return None;
+            return Ok(None);
         }
     };
 
@@ -771,12 +776,12 @@ async fn run_episodic_update_step(
                     error.to_string(),
                 )
                 .await;
-                return None;
+                return Ok(None);
             }
         };
     if !changed {
         finish_step_skipped(db, &ctx.run_id, SleepStepName::EpisodicUpdate).await;
-        return None;
+        return Ok(None);
     }
 
     let Some(rendered) =
@@ -791,7 +796,7 @@ async fn run_episodic_update_step(
             error.to_string(),
         )
         .await;
-        return None;
+        return Ok(None);
     };
 
     let before = ctx.current_memory.clone();
@@ -805,7 +810,7 @@ async fn run_episodic_update_step(
             error.to_string(),
         )
         .await;
-        return None;
+        return Ok(None);
     }
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
@@ -837,11 +842,11 @@ async fn run_episodic_update_step(
             error.to_string(),
         )
         .await;
-        return None;
+        return Ok(None);
     }
 
     ctx.current_memory = after;
-    Some(rendered)
+    Ok(Some(rendered))
 }
 
 /// Internal: Run rollup LLM calls for week and month rollups.
