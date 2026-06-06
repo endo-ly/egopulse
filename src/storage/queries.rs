@@ -2092,6 +2092,23 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub(crate) fn get_latest_message_cursor(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT timestamp, id FROM messages
+             WHERE chat_id = ?1
+             ORDER BY timestamp DESC, id DESC
+             LIMIT 1",
+            params![chat_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub(crate) fn get_agent_chats_with_messages_between(
         &self,
         agent_id: &str,

@@ -412,6 +412,7 @@ struct BatchContext {
     session_chunks: Vec<String>,
     extract_chunks: Vec<String>,
     current_memory: MemoryContent,
+    chat_ids: Vec<i64>,
 }
 
 struct StepOutputs {
@@ -546,6 +547,8 @@ async fn prepare_batch_context(
     let memory_before = state.memory_loader.load(agent_id);
     save_aggregate_snapshots(db, run_id, agent_id, memory_before.as_ref(), None).await?;
 
+    let chat_ids: Vec<i64> = sessions.iter().map(|s| s.chat_id).collect();
+
     Ok(BatchContext {
         run_id: run_id.to_string(),
         agents_dir,
@@ -553,6 +556,7 @@ async fn prepare_batch_context(
         session_chunks,
         extract_chunks,
         current_memory: memory_before.unwrap_or_default(),
+        chat_ids,
     })
 }
 
@@ -598,6 +602,29 @@ async fn run_event_extraction_step(ctx: &mut BatchContext, db: &Arc<Database>, a
                 }
             }
             let rid = run_id.clone();
+            let chat_ids = ctx.chat_ids.clone();
+            let agent = agent_id.to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            for &chat_id in &chat_ids {
+                let db_for_cp = Arc::clone(db);
+                if let Ok(Some((cursor_at, cursor_id))) =
+                    call_blocking(db_for_cp, move |db| db.get_latest_message_cursor(chat_id)).await
+                {
+                    let cp = crate::storage::SleepStepCheckpoint {
+                        agent_id: agent.clone(),
+                        step_name: SleepStepName::EventExtraction,
+                        source_kind: crate::storage::CheckpointSourceKind::Messages,
+                        source_id: chat_id.to_string(),
+                        cursor_at: cursor_at.clone(),
+                        cursor_id: cursor_id.clone(),
+                        updated_at: now.clone(),
+                    };
+                    let db_for_write = Arc::clone(db);
+                    call_blocking(db_for_write, move |db| db.upsert_sleep_checkpoint(&cp))
+                        .await
+                        .ok();
+                }
+            }
             call_blocking(Arc::clone(db), move |db| {
                 db.finish_sleep_step(
                     &rid,
@@ -2819,5 +2846,78 @@ mod tests {
             }
             other => panic!("expected Skip, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn successful_sleep_step_advances_composite_checkpoint() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let checkpoints = state
+            .db
+            .list_sleep_checkpoints(
+                "test-agent",
+                SleepStepName::EventExtraction,
+                crate::storage::CheckpointSourceKind::Messages,
+            )
+            .expect("checkpoints");
+        assert!(
+            !checkpoints.is_empty(),
+            "extraction should write per-chat checkpoints on success"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sleep_step_keeps_checkpoint() {
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "");
+        for i in 1..=6 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let existing_cp = crate::storage::SleepStepCheckpoint {
+            agent_id: "test-agent".to_string(),
+            step_name: SleepStepName::SemanticUpdate,
+            source_kind: crate::storage::CheckpointSourceKind::EpisodeEvents,
+            source_id: "test-agent".to_string(),
+            cursor_at: "2025-01-01T00:00:03Z".to_string(),
+            cursor_id: "e-3".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        db.upsert_sleep_checkpoint(&existing_cp).expect("seed cp");
+
+        let llm = Arc::new(MockLlmProvider::with_response(
+            serde_json::json!({"bad": true}),
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
+
+        let cp = state
+            .db
+            .get_sleep_checkpoint(
+                "test-agent",
+                SleepStepName::SemanticUpdate,
+                crate::storage::CheckpointSourceKind::EpisodeEvents,
+                "test-agent",
+            )
+            .expect("get cp")
+            .expect("cp exists");
+        assert_eq!(cp.cursor_at, "2025-01-01T00:00:03Z");
+        assert_eq!(cp.cursor_id, "e-3");
     }
 }
