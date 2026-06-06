@@ -1109,6 +1109,100 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically commits step success and checkpoint update in a single transaction.
+    ///
+    /// This ensures that step success and checkpoint advancement are either both
+    /// persisted or both rolled back, preventing inconsistent states.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if:
+    /// - The step is not in `running` state
+    /// - The checkpoint update would move the cursor backward
+    pub(crate) fn commit_step_success(
+        &self,
+        sleep_run_id: &str,
+        step_name: SleepStepName,
+        result: SleepStepResult<'_>,
+        checkpoint: Option<&SleepStepCheckpoint>,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+
+        let changed = tx.execute(
+            "UPDATE sleep_run_steps
+             SET status = ?1, finished_at = ?2,
+                 input_tokens = ?3, output_tokens = ?4,
+                 error_message = ?5, metadata_json = ?6
+             WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
+            params![
+                result.status.to_string(),
+                now,
+                result.input_tokens,
+                result.output_tokens,
+                result.error_message,
+                result.metadata_json,
+                sleep_run_id,
+                step_name.to_string(),
+                running,
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Err(StorageError::Conflict(format!(
+                "sleep_run_step:{sleep_run_id}:{} is not running",
+                step_name
+            )));
+        }
+
+        if let Some(cp) = checkpoint {
+            let cp_changed = tx.execute(
+                "INSERT INTO sleep_step_checkpoints
+                    (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
+                    cursor_at = ?5,
+                    cursor_id = ?6,
+                    updated_at = ?7
+                 WHERE (cursor_at, cursor_id) < (?5, ?6)",
+                params![
+                    cp.agent_id,
+                    cp.step_name.to_string(),
+                    cp.source_kind.to_string(),
+                    cp.source_id,
+                    cp.cursor_at,
+                    cp.cursor_id,
+                    cp.updated_at,
+                ],
+            )?;
+            if cp_changed == 0 {
+                let existing = tx.query_row(
+                    "SELECT cursor_at, cursor_id FROM sleep_step_checkpoints
+                     WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3 AND source_id = ?4",
+                    params![
+                        cp.agent_id,
+                        cp.step_name.to_string(),
+                        cp.source_kind.to_string(),
+                        cp.source_id,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                );
+                if let Ok((existing_at, existing_id)) = existing {
+                    tx.rollback()?;
+                    return Err(StorageError::Conflict(format!(
+                        "checkpoint backward rejected: existing=({},{}) new=({},{})",
+                        existing_at, existing_id, cp.cursor_at, cp.cursor_id
+                    )));
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Lists all steps for a sleep run, ordered by step_name.
     pub(crate) fn list_sleep_run_steps(
         &self,
@@ -1286,20 +1380,29 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Inserts or updates a checkpoint. On conflict, updates cursor_at, cursor_id, and updated_at.
+    /// Inserts or updates a checkpoint with monotonic forward-only cursor validation.
+    ///
+    /// On conflict, updates cursor_at, cursor_id, and updated_at only if the new
+    /// cursor position is strictly greater than the existing one (using tuple comparison).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` if the new cursor position is not forward
+    /// from the existing checkpoint.
     pub(crate) fn upsert_sleep_checkpoint(
         &self,
         checkpoint: &SleepStepCheckpoint,
     ) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO sleep_step_checkpoints
                 (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(agent_id, step_name, source_kind, source_id) DO UPDATE SET
                 cursor_at = ?5,
                 cursor_id = ?6,
-                updated_at = ?7",
+                updated_at = ?7
+             WHERE (cursor_at, cursor_id) < (?5, ?6)",
             params![
                 checkpoint.agent_id,
                 checkpoint.step_name.to_string(),
@@ -1310,6 +1413,25 @@ impl Database {
                 checkpoint.updated_at,
             ],
         )?;
+        if changed == 0 {
+            let existing = conn.query_row(
+                "SELECT cursor_at, cursor_id FROM sleep_step_checkpoints
+                 WHERE agent_id = ?1 AND step_name = ?2 AND source_kind = ?3 AND source_id = ?4",
+                params![
+                    checkpoint.agent_id,
+                    checkpoint.step_name.to_string(),
+                    checkpoint.source_kind.to_string(),
+                    checkpoint.source_id,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            if let Ok((existing_at, existing_id)) = existing {
+                return Err(StorageError::Conflict(format!(
+                    "checkpoint backward rejected: existing=({},{}) new=({},{})",
+                    existing_at, existing_id, checkpoint.cursor_at, checkpoint.cursor_id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -5285,5 +5407,175 @@ mod tests {
         assert_eq!(checkpoints.len(), 2);
         assert_eq!(checkpoints[0].source_id, "chat-a");
         assert_eq!(checkpoints[1].source_id, "chat-b");
+    }
+
+    #[test]
+    fn sleep_checkpoint_rejects_backward_cursor_update() {
+        // Arrange: existing checkpoint at (T1, msg-100)
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("initial upsert");
+
+        // Act & Assert: backward cursor_at is rejected
+        let result = db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        });
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward cursor_at"
+        );
+
+        // Act & Assert: same cursor_at but smaller cursor_id is rejected
+        let result = db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-050".to_string(),
+            updated_at: now.clone(),
+        });
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward cursor_id at same cursor_at"
+        );
+
+        // Act: forward cursor succeeds
+        db.upsert_sleep_checkpoint(&SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:02:00Z".to_string(),
+            cursor_id: "msg-200".to_string(),
+            updated_at: now.clone(),
+        })
+        .expect("forward upsert should succeed");
+
+        // Assert: cursor advanced
+        let checkpoint = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(checkpoint.cursor_at, "2024-01-01T00:02:00Z");
+        assert_eq!(checkpoint.cursor_id, "msg-200");
+    }
+
+    #[test]
+    fn sleep_step_success_transaction_rolls_back_as_a_unit() {
+        // Arrange: run with pending steps
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("inserted");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Act: commit step success with checkpoint atomically
+        let checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:01:00Z".to_string(),
+            cursor_id: "msg-100".to_string(),
+            updated_at: now.clone(),
+        };
+        db.start_sleep_step(&run_id, SleepStepName::EventExtraction)
+            .expect("start");
+        db.commit_step_success(
+            &run_id,
+            SleepStepName::EventExtraction,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 100,
+                output_tokens: 50,
+                error_message: None,
+                metadata_json: Some(r#"{"events_extracted": 5}"#),
+            },
+            Some(&checkpoint),
+        )
+        .expect("commit");
+
+        // Assert: step is success
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::EventExtraction)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(step.status, SleepStepStatus::Success);
+        assert_eq!(step.input_tokens, 100);
+        assert_eq!(step.output_tokens, 50);
+
+        // Assert: checkpoint is updated
+        let cp = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::EventExtraction,
+                CheckpointSourceKind::Messages,
+                "chat-1",
+            )
+            .expect("get")
+            .expect("exists");
+        assert_eq!(cp.cursor_at, "2024-01-01T00:01:00Z");
+        assert_eq!(cp.cursor_id, "msg-100");
+
+        // Act: try to update existing checkpoint with backward cursor via commit_step_success
+        // First, start another step that uses the same checkpoint source
+        db.start_sleep_step(&run_id, SleepStepName::ProspectiveUpdate)
+            .expect("start");
+        let backward_checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::EventExtraction,
+            source_kind: CheckpointSourceKind::Messages,
+            source_id: "chat-1".to_string(),
+            cursor_at: "2024-01-01T00:00:00Z".to_string(),
+            cursor_id: "msg-050".to_string(),
+            updated_at: now.clone(),
+        };
+        let result = db.commit_step_success(
+            &run_id,
+            SleepStepName::ProspectiveUpdate,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 50,
+                output_tokens: 25,
+                error_message: None,
+                metadata_json: None,
+            },
+            Some(&backward_checkpoint),
+        );
+
+        // Assert: transaction rolled back
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "should reject backward checkpoint and rollback"
+        );
+
+        // Assert: step is still running (rolled back)
+        let step = db
+            .get_sleep_run_step(&run_id, SleepStepName::ProspectiveUpdate)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(step.status, SleepStepStatus::Running);
     }
 }
