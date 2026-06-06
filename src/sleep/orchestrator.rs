@@ -2920,4 +2920,65 @@ mod tests {
         assert_eq!(cp.cursor_at, "2025-01-01T00:00:03Z");
         assert_eq!(cp.cursor_id, "e-3");
     }
+
+    #[tokio::test]
+    async fn next_sleep_run_retries_only_failed_step_input() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        let first_semantic_fail = vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"not json"#.to_string(),
+            r#"not json"#.to_string(),
+            r#"{"prospective":"first"}"#.to_string(),
+        ];
+        let llm1 = Arc::new(SequentialMockProvider::new(first_semantic_fail));
+        let state = build_test_state_with_llm(db, dir.path(), llm1);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("first batch");
+
+        let runs_after_first = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs_after_first.len(), 1);
+
+        let steps_first = state
+            .db
+            .list_sleep_run_steps(&runs_after_first[0].id)
+            .expect("steps");
+        let semantic_first = steps_first
+            .iter()
+            .find(|s| s.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic");
+        assert_eq!(semantic_first.status, SleepStepStatus::Failed);
+
+        let all_success_second = vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"semantic":"second"}"#.to_string(),
+            r#"{"prospective":"second"}"#.to_string(),
+        ];
+        let llm2 = Arc::new(SequentialMockProvider::new(all_success_second));
+        let config = crate::test_util::test_config(&dir.path().to_string_lossy());
+        let state2 = crate::test_util::build_state_with_config(
+            config,
+            Some(llm2),
+            None,
+            Some(Arc::clone(&state.db)),
+            None,
+        );
+
+        run_sleep_batch(&state2, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("second batch");
+
+        let runs_after_second = state2.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs_after_second.len(), 2);
+        assert_eq!(runs_after_second[0].status, SleepRunStatus::Success);
+    }
 }
