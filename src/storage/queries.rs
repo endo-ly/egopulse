@@ -1080,6 +1080,39 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically transitions both memory update steps from pending to running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either step is not pending or database access fails.
+    pub(crate) fn start_memory_update_steps(&self, sleep_run_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let pending = SleepStepStatus::Pending.to_string();
+        let running = SleepStepStatus::Running.to_string();
+
+        for step_name in [
+            SleepStepName::SemanticUpdate,
+            SleepStepName::ProspectiveUpdate,
+        ] {
+            let changed = tx.execute(
+                "UPDATE sleep_run_steps
+                 SET status = ?1, started_at = ?2
+                 WHERE sleep_run_id = ?3 AND step_name = ?4 AND status = ?5",
+                params![running, now, sleep_run_id, step_name.to_string(), pending],
+            )?;
+            if changed == 0 {
+                return Err(StorageError::Conflict(format!(
+                    "sleep_run_step:{sleep_run_id}:{step_name} is not pending"
+                )));
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Finishes a running sleep step with terminal status, tokens, and metadata.
     ///
     /// # Errors
@@ -1119,6 +1152,61 @@ impl Database {
                 step_name
             )));
         }
+        Ok(())
+    }
+
+    /// Atomically finishes both memory update steps with the same terminal status.
+    ///
+    /// The shared LLM usage is recorded once on `semantic_update` so run-level
+    /// aggregation does not double count it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either step is not running or database access fails.
+    pub(crate) fn finish_memory_update_steps(
+        &self,
+        sleep_run_id: &str,
+        result: SleepStepResult<'_>,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let running = SleepStepStatus::Running.to_string();
+
+        for (step_name, input_tokens, output_tokens) in [
+            (
+                SleepStepName::SemanticUpdate,
+                result.input_tokens,
+                result.output_tokens,
+            ),
+            (SleepStepName::ProspectiveUpdate, 0, 0),
+        ] {
+            let changed = tx.execute(
+                "UPDATE sleep_run_steps
+                 SET status = ?1, finished_at = ?2,
+                     input_tokens = ?3, output_tokens = ?4,
+                     error_message = ?5, metadata_json = ?6
+                 WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
+                params![
+                    result.status.to_string(),
+                    now,
+                    input_tokens,
+                    output_tokens,
+                    result.error_message,
+                    result.metadata_json,
+                    sleep_run_id,
+                    step_name.to_string(),
+                    running,
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StorageError::Conflict(format!(
+                    "sleep_run_step:{sleep_run_id}:{step_name} is not running"
+                )));
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -2090,23 +2178,6 @@ impl Database {
         stmt.query_map(params![chat_id, from, to], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
-    }
-
-    pub(crate) fn get_latest_message_cursor(
-        &self,
-        chat_id: i64,
-    ) -> Result<Option<(String, String)>, StorageError> {
-        let conn = self.get_conn()?;
-        conn.query_row(
-            "SELECT timestamp, id FROM messages
-             WHERE chat_id = ?1
-             ORDER BY timestamp DESC, id DESC
-             LIMIT 1",
-            params![chat_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(Into::into)
     }
 
     pub(crate) fn get_agent_chats_with_messages_between(
@@ -3300,17 +3371,42 @@ mod tests {
             .expect("inserted");
         finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 100, 50);
         finish_step_success(&db, &run_id, SleepStepName::EpisodicUpdate, 200, 80);
-        skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
-        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
+        db.start_memory_update_steps(&run_id)
+            .expect("start memory update");
+        db.finish_memory_update_steps(
+            &run_id,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 300,
+                output_tokens: 120,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("finish memory update");
 
         // Act
         db.finalize_sleep_run(&run_id).expect("finalize");
 
         // Assert: tokens are summed from steps
         let run = db.get_sleep_run(&run_id).expect("get").expect("run");
-        assert_eq!(run.input_tokens, 300);
-        assert_eq!(run.output_tokens, 130);
-        assert_eq!(run.total_tokens, 430);
+        assert_eq!(run.input_tokens, 600);
+        assert_eq!(run.output_tokens, 250);
+        assert_eq!(run.total_tokens, 850);
+
+        let steps = db.list_sleep_run_steps(&run_id).expect("steps");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        let prospective = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::ProspectiveUpdate)
+            .expect("prospective step");
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        assert_eq!(prospective.status, SleepStepStatus::Success);
+        assert_eq!(semantic.input_tokens, 300);
+        assert_eq!(prospective.input_tokens, 0);
     }
 
     #[test]
