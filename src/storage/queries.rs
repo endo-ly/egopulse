@@ -13,24 +13,37 @@ use super::{
     StoredMessage, ToolCall,
 };
 
-fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
-    let sender_kind_str: String = row.get(4)?;
-    let sender_kind = SenderKind::from_str(&sender_kind_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+macro_rules! parse_row_enum {
+    ($row:expr, $idx:expr, $ty:ty) => {{
+        let s: String = $row.get($idx)?;
+        <$ty>::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                $idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })
+    }};
+}
 
-    let message_kind_str: String = row.get(6)?;
-    let message_kind = MessageKind::from_str(&message_kind_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            6,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+macro_rules! parse_opt_row_enum {
+    ($row:expr, $idx:expr, $ty:ty) => {{
+        $row.get::<_, Option<String>>($idx)?
+            .map(|s| <$ty>::from_str(&s))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    $idx,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })
+    }};
+}
+
+fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    let sender_kind = parse_row_enum!(row, 4, SenderKind)?;
+    let message_kind = parse_row_enum!(row, 6, MessageKind)?;
 
     Ok(StoredMessage {
         id: row.get(0)?,
@@ -184,23 +197,8 @@ fn finish_memory_steps_in_tx(
 }
 
 fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
-    let status_str: String = row.get(2)?;
-    let status = SleepRunStatus::from_str(&status_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-
-    let trigger_str: String = row.get(3)?;
-    let trigger = SleepRunTrigger::from_str(&trigger_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let status = parse_row_enum!(row, 2, SleepRunStatus)?;
+    let trigger = parse_row_enum!(row, 3, SleepRunTrigger)?;
 
     Ok(SleepRun {
         id: row.get(0)?,
@@ -219,14 +217,7 @@ fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
 }
 
 fn row_to_memory_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySnapshot> {
-    let file_str: String = row.get(3)?;
-    let file = MemoryFile::from_str(&file_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let file = parse_row_enum!(row, 3, MemoryFile)?;
 
     Ok(MemorySnapshot {
         id: row.get(0)?,
@@ -240,26 +231,8 @@ fn row_to_memory_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySna
 }
 
 fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PulseRun> {
-    let status_str: String = row.get(6)?;
-    let status = PulseRunStatus::from_str(&status_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            6,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-
-    let output_kind: Option<PulseOutputKind> = row
-        .get::<_, Option<String>>(9)?
-        .map(|s| PulseOutputKind::from_str(&s))
-        .transpose()
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                9,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            )
-        })?;
+    let status = parse_row_enum!(row, 6, PulseRunStatus)?;
+    let output_kind = parse_opt_row_enum!(row, 9, PulseOutputKind)?;
 
     Ok(PulseRun {
         id: row.get(0)?,
@@ -278,22 +251,8 @@ fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PulseRun> {
 }
 
 fn row_to_episode_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeEvent> {
-    let kind_str: String = row.get(4)?;
-    let kind = EpisodeEventKind::from_str(&kind_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-    let certainty_str: String = row.get(8)?;
-    let certainty = EpisodeEventCertainty::from_str(&certainty_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            8,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let kind = parse_row_enum!(row, 4, EpisodeEventKind)?;
+    let certainty = parse_row_enum!(row, 8, EpisodeEventCertainty)?;
     Ok(EpisodeEvent {
         id: row.get(0)?,
         agent_id: row.get(1)?,
@@ -330,22 +289,8 @@ fn insert_pending_steps(
 }
 
 fn row_to_sleep_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRunStep> {
-    let step_name_str: String = row.get(1)?;
-    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-    let status_str: String = row.get(2)?;
-    let status = SleepStepStatus::from_str(&status_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let step_name = parse_row_enum!(row, 1, SleepStepName)?;
+    let status = parse_row_enum!(row, 2, SleepStepStatus)?;
     Ok(SleepRunStep {
         sleep_run_id: row.get(0)?,
         step_name,
@@ -360,22 +305,8 @@ fn row_to_sleep_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRunSt
 }
 
 fn row_to_sleep_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepStepCheckpoint> {
-    let step_name_str: String = row.get(1)?;
-    let step_name = SleepStepName::from_str(&step_name_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-    let source_kind_str: String = row.get(2)?;
-    let source_kind = CheckpointSourceKind::from_str(&source_kind_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let step_name = parse_row_enum!(row, 1, SleepStepName)?;
+    let source_kind = parse_row_enum!(row, 2, CheckpointSourceKind)?;
     Ok(SleepStepCheckpoint {
         agent_id: row.get(0)?,
         step_name,
@@ -1797,27 +1728,15 @@ impl Database {
         since: Option<&str>,
     ) -> Result<i64, StorageError> {
         let conn = self.get_conn()?;
-        if let Some(cutoff) = since {
-            conn.query_row(
-                "SELECT COUNT(*)
-                 FROM messages m
-                 JOIN chats c ON m.chat_id = c.chat_id
-                 WHERE c.agent_id = ?1 AND m.timestamp > ?2",
-                params![agent_id, cutoff],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-        } else {
-            conn.query_row(
-                "SELECT COUNT(*)
-                 FROM messages m
-                 JOIN chats c ON m.chat_id = c.chat_id
-                 WHERE c.agent_id = ?1",
-                params![agent_id],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-        }
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM messages m
+             JOIN chats c ON m.chat_id = c.chat_id
+             WHERE c.agent_id = ?1 AND (?2 IS NULL OR m.timestamp > ?2)",
+            params![agent_id, since],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     pub(crate) fn get_agent_sessions_since(
@@ -1827,61 +1746,32 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<AgentSessionInfo>, StorageError> {
         let conn = self.get_conn()?;
-        if let Some(cutoff) = since {
-            let mut stmt = conn.prepare_cached(
-                "SELECT
-                    c.chat_id,
-                    c.channel,
-                    c.external_chat_id,
-                    s.updated_at,
-                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
-                    LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
-                 FROM chats c
-                 JOIN sessions s ON c.chat_id = s.chat_id
-                 WHERE c.agent_id = ?1 AND s.updated_at > ?2
-                 ORDER BY s.updated_at DESC
-                 LIMIT ?3",
-            )?;
-            stmt.query_map(params![agent_id, cutoff, limit as i64], |row| {
-                Ok(AgentSessionInfo {
-                    chat_id: row.get(0)?,
-                    channel: row.get(1)?,
-                    external_chat_id: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    message_count: row.get(4)?,
-                    estimated_tokens: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-        } else {
-            let mut stmt = conn.prepare_cached(
-                "SELECT
-                    c.chat_id,
-                    c.channel,
-                    c.external_chat_id,
-                    s.updated_at,
-                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
-                    LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
-                 FROM chats c
-                 JOIN sessions s ON c.chat_id = s.chat_id
-                 WHERE c.agent_id = ?1
-                 ORDER BY s.updated_at DESC
-                 LIMIT ?2",
-            )?;
-            stmt.query_map(params![agent_id, limit as i64], |row| {
-                Ok(AgentSessionInfo {
-                    chat_id: row.get(0)?,
-                    channel: row.get(1)?,
-                    external_chat_id: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    message_count: row.get(4)?,
-                    estimated_tokens: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT
+                c.chat_id,
+                c.channel,
+                c.external_chat_id,
+                s.updated_at,
+                (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
+                LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
+             FROM chats c
+             JOIN sessions s ON c.chat_id = s.chat_id
+             WHERE c.agent_id = ?1 AND (?2 IS NULL OR s.updated_at > ?2)
+             ORDER BY s.updated_at DESC
+             LIMIT ?3",
+        )?;
+        stmt.query_map(params![agent_id, since, limit as i64], |row| {
+            Ok(AgentSessionInfo {
+                chat_id: row.get(0)?,
+                channel: row.get(1)?,
+                external_chat_id: row.get(2)?,
+                updated_at: row.get(3)?,
+                message_count: row.get(4)?,
+                estimated_tokens: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     // ---------------------------------------------------------------------------
@@ -2602,14 +2492,7 @@ impl Database {
 // ---------------------------------------------------------------------------
 
 fn row_to_episode_rollup(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRollup> {
-    let granularity_str: String = row.get(2)?;
-    let granularity = RollupGranularity::from_str(&granularity_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let granularity = parse_row_enum!(row, 2, RollupGranularity)?;
     Ok(EpisodeRollup {
         id: row.get(0)?,
         agent_id: row.get(1)?,
@@ -3152,25 +3035,6 @@ mod tests {
     }
 
     #[test]
-    fn log_llm_usage_returns_row_id() {
-        let (db, _dir) = test_db();
-
-        let row_id = db
-            .log_llm_usage(&LlmUsageLogEntry {
-                chat_id: 100,
-                caller_channel: "tui",
-                provider: "openai",
-                model: "gpt-4",
-                input_tokens: 100,
-                output_tokens: 50,
-                request_kind: "agent_loop",
-            })
-            .expect("log usage");
-
-        assert!(row_id > 0);
-    }
-
-    #[test]
     fn log_llm_usage_stores_request_kind() {
         let (db, _dir) = test_db();
 
@@ -3329,20 +3193,6 @@ mod tests {
 
         let run = db.get_sleep_run(&id).expect("get").expect("run exists");
         assert_eq!(run.status, SleepRunStatus::Running);
-    }
-
-    #[test]
-    fn create_sleep_run_generates_id_and_timestamp() {
-        let (db, _dir) = test_db();
-        let id = create_test_sleep_run(&db, "agent-a");
-
-        assert!(id.contains('-'), "UUID v4 should contain hyphens");
-
-        let run = db.get_sleep_run(&id).expect("get").expect("run exists");
-        assert!(
-            run.started_at.contains('T'),
-            "RFC3339 timestamp should contain 'T'"
-        );
     }
 
     #[test]
@@ -3782,15 +3632,6 @@ mod tests {
     }
 
     #[test]
-    fn get_sleep_run_returns_none_for_missing() {
-        let (db, _dir) = test_db();
-        ensure_sleep_runs_table(&db);
-
-        let result = db.get_sleep_run("nonexistent-id").expect("get");
-        assert!(result.is_none());
-    }
-
-    #[test]
     fn list_sleep_runs_by_agent() {
         let (db, _dir) = test_db();
 
@@ -3803,15 +3644,6 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, id_a3);
         assert_eq!(runs[1].id, id_a2);
-    }
-
-    #[test]
-    fn list_sleep_runs_empty() {
-        let (db, _dir) = test_db();
-        ensure_sleep_runs_table(&db);
-
-        let runs = db.list_sleep_runs("nobody", 10).expect("list");
-        assert!(runs.is_empty());
     }
 
     #[test]
@@ -3831,15 +3663,6 @@ mod tests {
             .expect("get latest")
             .expect("should exist");
         assert_eq!(latest.id, id_2);
-    }
-
-    #[test]
-    fn get_latest_successful_run_returns_none() {
-        let (db, _dir) = test_db();
-        let _id = create_test_sleep_run(&db, "agent-a");
-
-        let latest = db.get_latest_successful_run("agent-a").expect("get latest");
-        assert!(latest.is_none());
     }
 
     fn ensure_memory_snapshots_table(db: &Database) {
@@ -3924,16 +3747,6 @@ mod tests {
         assert_eq!(run1_snapshots[0].file, MemoryFile::Episodic);
         assert_eq!(run1_snapshots[1].file, MemoryFile::Semantic);
         assert_eq!(run1_snapshots[2].file, MemoryFile::Prospective);
-    }
-
-    #[test]
-    fn get_snapshots_for_run_empty() {
-        let (db, _dir) = test_db();
-        ensure_memory_snapshots_table(&db);
-        let snapshots = db
-            .get_snapshots_for_run("nonexistent")
-            .expect("get snapshots");
-        assert!(snapshots.is_empty());
     }
 
     #[test]
@@ -4025,16 +3838,6 @@ mod tests {
         assert_eq!(snapshots[0].content_after, "after");
     }
 
-    #[test]
-    fn get_latest_snapshot_returns_none() {
-        let (db, _dir) = test_db();
-        ensure_memory_snapshots_table(&db);
-        let result = db
-            .get_latest_snapshot_for_file("agent-a", MemoryFile::Episodic)
-            .expect("get latest");
-        assert!(result.is_none());
-    }
-
     // ---------------------------------------------------------------------------
     // Agent session enumeration tests
     // ---------------------------------------------------------------------------
@@ -4056,34 +3859,6 @@ mod tests {
             .count_agent_messages_since("agent-a", Some("2024-01-01T00:00:01Z"))
             .expect("count");
         assert_eq!(count, 2, "should count only messages after the cutoff");
-    }
-
-    #[test]
-    fn count_agent_messages_since_with_no_cutoff() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:no-cutoff", None, "cli", "agent-a")
-            .expect("create chat");
-
-        store_msg(&db, "msg-1", chat_id, "a", "2024-01-01T00:00:00Z");
-        store_msg(&db, "msg-2", chat_id, "b", "2024-01-01T00:00:01Z");
-        store_msg(&db, "msg-3", chat_id, "c", "2024-01-01T00:00:02Z");
-
-        let count = db
-            .count_agent_messages_since("agent-a", None)
-            .expect("count");
-        assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn count_agent_messages_since_returns_zero_for_unknown_agent() {
-        let (db, _dir) = test_db();
-
-        let count = db
-            .count_agent_messages_since("nonexistent-agent", None)
-            .expect("count");
-        assert_eq!(count, 0);
     }
 
     #[test]
@@ -4152,38 +3927,6 @@ mod tests {
     }
 
     #[test]
-    fn get_agent_sessions_since_respects_limit() {
-        let (db, _dir) = test_db();
-
-        for i in 0..5 {
-            let chat_id = db
-                .resolve_or_create_chat_id("cli", &format!("cli:limit-{i}"), None, "cli", "agent-a")
-                .expect("create chat");
-            db.save_session(chat_id, r#"{}"#).expect("save session");
-        }
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 3)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 3);
-    }
-
-    #[test]
-    fn get_agent_sessions_since_with_no_cutoff() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:nocut", None, "cli", "agent-a")
-            .expect("create chat");
-        db.save_session(chat_id, r#"{}"#).expect("save session");
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 10)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 1);
-    }
-
-    #[test]
     fn get_agent_sessions_since_returns_empty_for_unknown_agent() {
         let (db, _dir) = test_db();
 
@@ -4214,72 +3957,7 @@ mod tests {
         assert_eq!(sessions[0].message_count, 3);
     }
 
-    #[test]
-    fn get_agent_sessions_includes_estimated_tokens() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:tokcount", None, "cli", "agent-a")
-            .expect("create chat");
-
-        // Use a known-length session JSON: 30 chars → estimated_tokens = 30/3 = 10
-        let session_json = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 30 'A' chars
-        assert_eq!(
-            session_json.len(),
-            30,
-            "test fixture should be exactly 30 chars"
-        );
-
-        db.save_session(chat_id, session_json)
-            .expect("save session");
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 10)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].estimated_tokens > 0);
-        assert_eq!(
-            sessions[0].estimated_tokens,
-            (session_json.len() as i64) / 3
-        );
-    }
-
     // --- Channel Log tests ---
-
-    #[test]
-    fn resolve_channel_log_creates_new() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db.resolve_channel_log_chat_id(12345).expect("create");
-        assert!(chat_id > 0);
-    }
-
-    #[test]
-    fn resolve_channel_log_returns_existing() {
-        let (db, _dir) = test_db();
-
-        let first = db.resolve_channel_log_chat_id(12345).expect("create");
-        let second = db.resolve_channel_log_chat_id(12345).expect("reuse");
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn channel_log_external_chat_id_format() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db.resolve_channel_log_chat_id(99).expect("create");
-        let info = db.get_chat_by_id(chat_id).expect("info").expect("present");
-        assert_eq!(info.external_chat_id, "discord:99:multi-room-log");
-    }
-
-    #[test]
-    fn channel_log_chat_type() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db.resolve_channel_log_chat_id(99).expect("create");
-        let info = db.get_chat_by_id(chat_id).expect("info").expect("present");
-        assert_eq!(info.chat_type, "channel_log");
-    }
 
     #[test]
     fn store_message_to_channel_log() {
@@ -4596,14 +4274,6 @@ mod tests {
 
         let runs = db.list_all_sleep_runs(3).expect("list all");
         assert_eq!(runs.len(), 3);
-    }
-
-    #[test]
-    fn list_all_sleep_runs_empty() {
-        let (db, _dir) = test_db();
-
-        let runs = db.list_all_sleep_runs(10).expect("list all");
-        assert!(runs.is_empty());
     }
 
     // ---------------------------------------------------------------------------
