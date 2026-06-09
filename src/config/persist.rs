@@ -138,6 +138,12 @@ struct SerializableChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_origins: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    default_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_surfaces: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bots: Option<HashMap<String, SerializableDiscordBot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     channels: Option<HashMap<String, SerializableDiscordChannel>>,
@@ -248,6 +254,9 @@ impl From<&Config> for SerializableConfig {
                         host: c.host.clone(),
                         auth_token: c.file_auth_token.clone(),
                         allowed_origins: c.allowed_origins.clone(),
+                        default_surface: c.default_surface.clone(),
+                        default_session: c.default_session.clone(),
+                        allowed_surfaces: c.allowed_surfaces.clone(),
                         bots: c.discord_bots.as_ref().map(|bots| {
                             bots.iter()
                                 .map(|(bot_id, bot)| {

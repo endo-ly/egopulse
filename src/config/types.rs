@@ -137,6 +137,9 @@ pub(crate) struct ChannelConfig {
     pub auth_token: Option<ResolvedValue>,
     pub file_auth_token: Option<yaml_serde::Value>,
     pub allowed_origins: Option<Vec<String>>,
+    pub default_surface: Option<String>,
+    pub default_session: Option<String>,
+    pub allowed_surfaces: Option<Vec<String>>,
     pub discord_bots: Option<HashMap<BotId, DiscordBotConfig>>,
     /// Shared Discord channel configs at the channel level (`channels.discord.channels`).
     /// Each bot determines channel membership by checking which agents in each
@@ -156,6 +159,9 @@ impl std::fmt::Debug for ChannelConfig {
             .field("host", &self.host)
             .field("auth_token", &debug_secret(self.auth_token.as_ref()))
             .field("allowed_origins", &self.allowed_origins)
+            .field("default_surface", &self.default_surface)
+            .field("default_session", &self.default_session)
+            .field("allowed_surfaces", &self.allowed_surfaces)
             .field("discord_bots", &self.discord_bots)
             .field("discord_channels", &self.discord_channels)
             .field("telegram_bots", &self.telegram_bots)

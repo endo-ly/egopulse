@@ -161,6 +161,39 @@ impl Config {
             .filter(|token| !token.is_empty())
     }
 
+    pub(crate) fn voice_enabled(&self) -> bool {
+        self.channel_enabled("voice")
+    }
+
+    pub(crate) fn voice_auth_token(&self) -> Option<&str> {
+        self.channels
+            .get("voice")
+            .and_then(|c| c.auth_token.as_ref().map(|rv| rv.value()))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+
+    pub(crate) fn voice_default_surface(&self) -> &str {
+        self.channels
+            .get("voice")
+            .and_then(|c| c.default_surface.as_deref())
+            .unwrap_or("voice")
+    }
+
+    pub(crate) fn voice_default_session(&self) -> &str {
+        self.channels
+            .get("voice")
+            .and_then(|c| c.default_session.as_deref())
+            .unwrap_or("main")
+    }
+
+    pub(crate) fn voice_allowed_surfaces(&self) -> &[String] {
+        self.channels
+            .get("voice")
+            .and_then(|c| c.allowed_surfaces.as_deref())
+            .unwrap_or(&[])
+    }
+
     /// Returns the list of allowed WebSocket origins for the web channel.
     pub(crate) fn web_allowed_origins(&self) -> Vec<String> {
         self.channels

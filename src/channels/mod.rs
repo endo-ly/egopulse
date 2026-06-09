@@ -11,4 +11,5 @@ pub(crate) mod discord;
 pub(crate) mod telegram;
 pub(crate) mod tui;
 pub(crate) mod utils;
+pub(crate) mod voice;
 pub(crate) mod web;

@@ -44,6 +44,9 @@ struct FileChannelConfig {
     host: Option<String>,
     auth_token: Option<StringOrRef>,
     allowed_origins: Option<Vec<String>>,
+    default_surface: Option<String>,
+    default_session: Option<String>,
+    allowed_surfaces: Option<Vec<String>>,
     /// Discord bot configs (`channels.discord.bots`).
     bots: Option<HashMap<String, FileDiscordBotConfig>>,
     /// Discord channel configs (`channels.discord.channels`).
@@ -295,6 +298,15 @@ pub(super) fn build_config(
         return Err(ConfigError::MissingWebAuthToken);
     }
 
+    if config.voice_enabled() {
+        if !config.web_enabled() {
+            return Err(ConfigError::VoiceRequiresWebChannel);
+        }
+        if config.voice_auth_token().is_none() {
+            return Err(ConfigError::MissingVoiceAuthToken);
+        }
+    }
+
     Ok(config)
 }
 
@@ -358,6 +370,14 @@ fn normalize_channels(
             auth_token: resolved_auth,
             file_auth_token,
             allowed_origins: fc.allowed_origins,
+            default_surface: normalize_string(fc.default_surface),
+            default_session: normalize_string(fc.default_session),
+            allowed_surfaces: fc.allowed_surfaces.map(|surfaces| {
+                surfaces
+                    .into_iter()
+                    .filter_map(|surface| normalize_string(Some(surface)))
+                    .collect()
+            }),
             discord_bots: None,
             discord_channels: None,
             telegram_bots: None,

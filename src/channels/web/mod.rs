@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::OriginalUri;
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,7 +22,7 @@ use crate::channels::adapter::ConversationKind;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
-mod auth;
+pub(crate) mod auth;
 mod config;
 pub(crate) mod health;
 mod sessions;
@@ -251,7 +251,10 @@ async fn index_html() -> impl IntoResponse {
     }
 }
 
-async fn index_or_asset(OriginalUri(uri): OriginalUri) -> impl IntoResponse {
+async fn index_or_asset(OriginalUri(uri): OriginalUri, method: Method) -> impl IntoResponse {
+    if method != Method::GET || uri.path().starts_with("/api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     asset_or_index(&uri)
 }
 
@@ -302,32 +305,7 @@ pub(crate) async fn run_server(
         run_hub: RunHub::default(),
         active_ws_connections: Arc::new(AtomicUsize::new(0)),
     };
-
-    let api_routes = Router::new()
-        .route(
-            "/api/config",
-            get(config::api_get_config).put(config::api_put_config),
-        )
-        .route("/api/sessions", get(sessions::list_sessions))
-        .route("/api/history", get(sessions::get_history))
-        .route("/api/send_stream", post(stream::api_send_stream))
-        .route("/api/stream", get(stream::api_stream))
-        .route("/api/agents", get(sleep::list_agents))
-        .route("/api/sleep/runs", get(sleep::list_sleep_runs))
-        .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
-        .route_layer(middleware::from_fn_with_state(
-            web_state.clone(),
-            auth::require_http_auth,
-        ));
-
-    let app = Router::new()
-        .route("/", get(index_html))
-        .route("/ws", get(ws::ws_handler))
-        .route("/health", get(health::health))
-        .route("/telemetry", get(health::telemetry_handler))
-        .merge(api_routes)
-        .fallback(get(index_or_asset))
-        .with_state(web_state);
+    let app = build_router(web_state);
 
     let shutdown_signal = async {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -361,9 +339,56 @@ pub(crate) async fn run_server(
     Ok(())
 }
 
+fn build_router(web_state: WebState) -> Router {
+    let api_routes = Router::new()
+        .route(
+            "/api/config",
+            get(config::api_get_config).put(config::api_put_config),
+        )
+        .route("/api/sessions", get(sessions::list_sessions))
+        .route("/api/history", get(sessions::get_history))
+        .route("/api/send_stream", post(stream::api_send_stream))
+        .route("/api/stream", get(stream::api_stream))
+        .route("/api/agents", get(sleep::list_agents))
+        .route("/api/sleep/runs", get(sleep::list_sleep_runs))
+        .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
+        .route_layer(middleware::from_fn_with_state(
+            web_state.clone(),
+            auth::require_http_auth,
+        ));
+
+    let voice_routes = web_state.app_state.config.voice_enabled().then(|| {
+        Router::new()
+            .route("/api/voice/turn", post(crate::channels::voice::turn))
+            .route_layer(middleware::from_fn_with_state(
+                web_state.clone(),
+                crate::channels::voice::require_voice_auth,
+            ))
+    });
+
+    let mut app = Router::new()
+        .route("/", get(index_html))
+        .route("/ws", get(ws::ws_handler))
+        .route("/health", get(health::health))
+        .route("/telemetry", get(health::telemetry_handler))
+        .merge(api_routes);
+    if let Some(routes) = voice_routes {
+        app = app.merge(routes);
+    }
+    app.fallback(index_or_asset).with_state(web_state)
+}
+
 #[cfg(test)]
 mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::agent_loop::turn::FakeProvider;
+    use crate::config::{ChannelConfig, ChannelName};
+    use crate::llm::MessagesResponse;
+    use crate::test_util::{build_state_with_config, test_config};
 
     #[test]
     fn web_adapter_properties() {
@@ -391,5 +416,205 @@ mod tests {
         assert_eq!(web_session_key("web:   "), "main");
         assert_eq!(web_session_key("  web:foo  "), "foo");
         assert_eq!(web_session_key("web:web:nested"), "web:nested");
+    }
+
+    fn voice_test_router(dir: &tempfile::TempDir) -> (Router, Arc<AppState>) {
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            "web-secret".to_string(),
+        ));
+        config.channels.insert(
+            ChannelName::new("voice"),
+            ChannelConfig {
+                enabled: Some(true),
+                auth_token: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                    "voice-secret".to_string(),
+                )),
+                default_surface: Some("stackchan".to_string()),
+                default_session: Some("main".to_string()),
+                allowed_surfaces: Some(vec!["stackchan".to_string()]),
+                ..Default::default()
+            },
+        );
+        let provider = FakeProvider {
+            responses: std::sync::Mutex::new(vec![MessagesResponse {
+                content: "音声応答です".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            }]),
+        };
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(provider)),
+            None,
+            None,
+            None,
+        ));
+        let router = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+        (router, app_state)
+    }
+
+    fn web_only_test_router(dir: &tempfile::TempDir) -> Router {
+        let config = test_config(dir.path().to_str().expect("state root"));
+        let state = build_state_with_config(config, None, None, None, None);
+        build_router(WebState {
+            config_path: None,
+            app_state: Arc::new(state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[tokio::test]
+    async fn voice_route_requires_voice_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let response = voice_test_router(&dir)
+            .0
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"こんにちは"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn disabled_voice_route_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let response = web_only_test_router(&dir)
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"こんにちは"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn voice_route_rejects_web_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let response = voice_test_router(&dir)
+            .0
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer web-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"こんにちは"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn voice_route_validates_text_and_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blank = voice_test_router(&dir)
+            .0
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer voice-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"  "}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+        let disallowed = voice_test_router(&dir)
+            .0
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer voice-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"こんにちは","surface":"phone"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(disallowed.status(), StatusCode::FORBIDDEN);
+
+        let malformed = voice_test_router(&dir)
+            .0
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer voice-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn voice_route_processes_and_persists_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, app_state) = voice_test_router(&dir);
+        let response = app
+            .oneshot(
+                Request::post("/api/voice/turn")
+                    .header(header::AUTHORIZATION, "Bearer voice-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"text":"こんにちは","surface":"stackchan","session_key":"main","source":"stackchan-wake"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["response"], "音声応答です");
+        assert_eq!(body["surface_thread"], "stackchan:main");
+        assert!(body["trace_id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let config = test_config(dir.path().to_str().expect("state root"));
+        let db = crate::storage::Database::new(&config.db_path()).expect("db");
+        let session = db
+            .list_sessions()
+            .expect("list sessions")
+            .into_iter()
+            .find(|session| {
+                session.channel == "voice"
+                    && session.surface_thread == "stackchan:main"
+                    && session.agent_id == "default"
+            })
+            .expect("voice session");
+        let messages = db.get_all_messages(session.chat_id).expect("load messages");
+        assert_eq!(messages.len(), 2);
+
+        let turns = app_state.runtime_status.recent_turns();
+        let turn = turns.last().expect("voice turn status");
+        assert_eq!(turn.channel, "voice");
+        assert_eq!(turn.agent_id, "default");
+        assert!(turn.ok);
     }
 }

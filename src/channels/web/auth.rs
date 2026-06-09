@@ -98,7 +98,7 @@ fn is_authorized_bearer(headers: &HeaderMap, expected_token: &str) -> bool {
     constant_time_eq(token.trim(), expected_token)
 }
 
-fn constant_time_eq(left: &str, right: &str) -> bool {
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
     let mut diff = left.len() ^ right.len();

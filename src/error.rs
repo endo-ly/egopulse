@@ -163,6 +163,10 @@ pub enum ConfigError {
     WebChannelDisabled,
     #[error("missing_web_auth_token")]
     MissingWebAuthToken,
+    #[error("missing_voice_auth_token")]
+    MissingVoiceAuthToken,
+    #[error("voice_channel_requires_web_channel")]
+    VoiceRequiresWebChannel,
     #[error("missing_provider_api_key: {provider}")]
     MissingProviderApiKey { provider: String },
     #[error("invalid_compaction_config: {0}")]
