@@ -539,6 +539,19 @@ pub(crate) fn execute_scheduled_turn(
 
 const MAX_TURN_RETRIES: u32 = 2;
 
+/// Executes one agent turn while recording runtime activity and telemetry.
+///
+/// The crate-visible helper accepts the shared [`AppState`], a
+/// [`crate::agent_loop::SurfaceContext`], and the user `input`, returning the
+/// generated response as `Result<String, EgoPulseError>`. It touches channel
+/// activity, records the completed turn, and records an error plus the
+/// `turn_failure` metric when execution fails.
+///
+/// # Errors
+///
+/// Propagates any [`EgoPulseError`] returned by `execute_turn_with_retry`,
+/// including a final turn failure after retryable errors exhaust their retries.
+/// Such failures are also recorded through `runtime_status.push_error`.
 pub(crate) async fn execute_observed_turn(
     state: &AppState,
     context: &crate::agent_loop::SurfaceContext,

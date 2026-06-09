@@ -77,8 +77,9 @@ ignore = [
     "RUSTSEC-2026-0104",
     # time 0.3.45 transitively pulled by serenity & ratatui
     "RUSTSEC-2026-0009",
-    # serde_yml 0.0.12 — direct dep, needs replacement
-    "RUSTSEC-2025-0068",
+    # teloxide 0.17 -> aquamarine 0.6 -> proc-macro-error2 2.0.1;
+    # upstream currently has no maintained upgrade path
+    "RUSTSEC-2026-0173",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

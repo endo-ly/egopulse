@@ -98,6 +98,11 @@ fn is_authorized_bearer(headers: &HeaderMap, expected_token: &str) -> bool {
     constant_time_eq(token.trim(), expected_token)
 }
 
+/// Compares two UTF-8 strings without early exit to reduce timing leakage.
+///
+/// Returns `true` only when both `&str` values contain identical bytes. Length
+/// differences are folded into the result while the loop still processes the
+/// longer input, making this suitable for authentication token comparison.
 pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();

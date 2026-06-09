@@ -16,44 +16,81 @@ use crate::runtime::AppState;
 
 use super::web::WebState;
 
+/// Channel adapter for inbound Voice API turns.
+///
+/// `VoiceAdapter` registers voice conversations with the channel registry. It
+/// does not provide outbound delivery; responses are returned synchronously by
+/// the Voice API handler.
 pub(crate) struct VoiceAdapter;
 
 #[async_trait]
 impl ChannelAdapter for VoiceAdapter {
+    /// Returns the stable channel name used for voice sessions.
     fn name(&self) -> &str {
         "voice"
     }
 
+    /// Registers `voice` conversations as private, agent-scoped sessions.
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
         vec![("voice", ConversationKind::Private)]
     }
 
+    /// Rejects outbound delivery because voice replies use the HTTP response.
+    ///
+    /// This method intentionally always returns
+    /// `Err("outbound voice delivery is not supported")`.
     async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
         Err("outbound voice delivery is not supported".to_string())
     }
 }
 
+/// JSON request accepted by `POST /api/voice/turn`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct VoiceTurnRequest {
+    /// Required STT result. Whitespace-only text is rejected.
     text: String,
+    /// Optional voice surface; defaults to `channels.voice.default_surface`.
+    /// Must be non-empty and must not contain `:`.
     surface: Option<String>,
+    /// Optional session within the surface; defaults to
+    /// `channels.voice.default_session`. Must not be empty or contain `:`.
     session_key: Option<String>,
+    /// Optional stable speaker identifier; defaults to `voice-user`.
+    /// Must not be empty or contain `:`.
     user_id: Option<String>,
+    /// Optional trigger or transcription source; defaults to `unknown`.
     source: Option<String>,
+    /// Optional target agent; defaults to the configured default agent.
+    /// Must not be empty or contain `:`.
     agent_id: Option<String>,
 }
 
+/// Successful JSON response returned by `POST /api/voice/turn`.
 #[derive(Debug, Serialize)]
 pub(crate) struct VoiceTurnResponse {
+    /// Always `true` for this success response type.
     ok: bool,
+    /// Agent-generated reply. It may be empty when the runtime returns silence.
     response: String,
+    /// Normalized session key used for persistence.
     session_key: String,
+    /// Normalized voice surface used for persistence.
     surface: String,
+    /// Stable `{surface}:{session_key}` conversation identifier.
     surface_thread: String,
+    /// Agent that processed the turn.
     agent_id: String,
+    /// UUID identifying this turn in logs and runtime telemetry.
     trace_id: String,
 }
 
+/// Authenticates Voice API requests using `Authorization: Bearer <token>`.
+///
+/// The middleware reads configuration from `State<WebState>`, inspects the
+/// supplied `HeaderMap`, and forwards the original `Request<Body>` through
+/// `Next::run` after a constant-time token comparison. It returns `404 Not
+/// Found` when Voice authentication is disabled and `401 Unauthorized` when
+/// the header is missing or invalid.
 pub(crate) async fn require_voice_auth(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -74,6 +111,7 @@ pub(crate) async fn require_voice_auth(
     let authorized =
         candidate.is_some_and(|token| super::web::auth::constant_time_eq(token.trim(), expected));
     if !authorized {
+        tracing::warn!("voice auth failed: invalid or missing token");
         return error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -83,6 +121,14 @@ pub(crate) async fn require_voice_auth(
     next.run(request).await
 }
 
+/// Handles the asynchronous Voice API entry point.
+///
+/// `state` supplies the shared `WebState`; `request` is a JSON
+/// [`VoiceTurnRequest`]. JSON extraction failures return `400 Bad Request` with
+/// the `invalid_params` code and `JsonRejection::body_text()`. Valid input is
+/// delegated to `process_request`, returning its JSON success response or
+/// forwarding its error response unchanged. Processing records conversation
+/// history and runtime telemetry through the agent runtime.
 pub(crate) async fn turn(
     State(state): State<WebState>,
     request: Result<Json<VoiceTurnRequest>, JsonRejection>,
@@ -103,6 +149,13 @@ pub(crate) async fn turn(
     }
 }
 
+/// Validates and executes one normalized voice turn.
+///
+/// Surface and session defaults come from configuration, while `:` is rejected
+/// in identity components because it separates the `{surface}:{session_key}`
+/// thread identity. The configured surface allowlist is enforced before a
+/// traced [`SurfaceContext`] is passed to
+/// [`crate::runtime::execute_observed_turn`].
 async fn process_request(
     state: &AppState,
     request: VoiceTurnRequest,

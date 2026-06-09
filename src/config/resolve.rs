@@ -161,10 +161,12 @@ impl Config {
             .filter(|token| !token.is_empty())
     }
 
+    /// Returns whether the `voice` channel is enabled.
     pub(crate) fn voice_enabled(&self) -> bool {
         self.channel_enabled("voice")
     }
 
+    /// Returns the configured, trimmed Voice API token when non-empty.
     pub(crate) fn voice_auth_token(&self) -> Option<&str> {
         self.channels
             .get("voice")
@@ -173,6 +175,7 @@ impl Config {
             .filter(|token| !token.is_empty())
     }
 
+    /// Returns the configured default voice surface, or `voice`.
     pub(crate) fn voice_default_surface(&self) -> &str {
         self.channels
             .get("voice")
@@ -180,6 +183,7 @@ impl Config {
             .unwrap_or("voice")
     }
 
+    /// Returns the configured default voice session, or `main`.
     pub(crate) fn voice_default_session(&self) -> &str {
         self.channels
             .get("voice")
@@ -187,6 +191,7 @@ impl Config {
             .unwrap_or("main")
     }
 
+    /// Returns the allowed voice surfaces, or an empty unrestricted slice.
     pub(crate) fn voice_allowed_surfaces(&self) -> &[String] {
         self.channels
             .get("voice")
