@@ -2100,8 +2100,14 @@ mod tests {
             .expect("batch");
 
         let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
-        assert!(memory_dir.join("episodic.md").exists(), "episodic.md missing");
-        assert!(memory_dir.join("semantic.md").exists(), "semantic.md missing");
+        assert!(
+            memory_dir.join("episodic.md").exists(),
+            "episodic.md missing"
+        );
+        assert!(
+            memory_dir.join("semantic.md").exists(),
+            "semantic.md missing"
+        );
         assert!(
             memory_dir.join("prospective.md").exists(),
             "prospective.md missing"
