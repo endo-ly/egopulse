@@ -8,8 +8,12 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+mod chat;
+mod episode;
 mod migration;
-mod queries;
+mod pulse;
+mod sleep;
+mod tool;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
