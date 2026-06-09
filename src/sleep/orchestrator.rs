@@ -802,7 +802,21 @@ async fn run_episodic_update_step(
     let before = ctx.current_memory.clone();
     let mut after = before.clone();
     after.episodic = Some(rendered.clone());
-    if let Err(error) = write_memory_content(&ctx.agents_dir, agent_id, &after) {
+    if let Err(error) = write_memory_files(
+        &ctx.agents_dir,
+        agent_id,
+        &[
+            ("episodic.md", rendered.as_str()),
+            (
+                "semantic.md",
+                before.semantic.clone().unwrap_or_default().as_str(),
+            ),
+            (
+                "prospective.md",
+                before.prospective.clone().unwrap_or_default().as_str(),
+            ),
+        ],
+    ) {
         finish_step_failed(
             db,
             &ctx.run_id,
@@ -833,7 +847,24 @@ async fn run_episodic_update_step(
     })
     .await
     {
-        let _ = write_memory_content(&ctx.agents_dir, agent_id, &before);
+        let _ = write_memory_files(
+            &ctx.agents_dir,
+            agent_id,
+            &[
+                (
+                    "episodic.md",
+                    before.episodic.clone().unwrap_or_default().as_str(),
+                ),
+                (
+                    "semantic.md",
+                    before.semantic.clone().unwrap_or_default().as_str(),
+                ),
+                (
+                    "prospective.md",
+                    before.prospective.clone().unwrap_or_default().as_str(),
+                ),
+            ],
+        );
         warn!(error = %error, "failed to commit episodic update");
         finish_step_failed(
             db,
@@ -1358,7 +1389,28 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    if let Err(error) = write_memory_content(&ctx.agents_dir, agent_id, &working_memory) {
+    if let Err(error) = write_memory_files(
+        &ctx.agents_dir,
+        agent_id,
+        &[
+            (
+                "episodic.md",
+                working_memory.episodic.clone().unwrap_or_default().as_str(),
+            ),
+            (
+                "semantic.md",
+                working_memory.semantic.clone().unwrap_or_default().as_str(),
+            ),
+            (
+                "prospective.md",
+                working_memory
+                    .prospective
+                    .clone()
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+        ],
+    ) {
         let run_id = ctx.run_id.clone();
         let error_message = error.to_string();
         call_blocking(Arc::clone(db), move |db| {
@@ -1395,7 +1447,24 @@ async fn run_memory_update_step(
     })
     .await
     {
-        let _ = write_memory_content(&ctx.agents_dir, agent_id, &before);
+        let _ = write_memory_files(
+            &ctx.agents_dir,
+            agent_id,
+            &[
+                (
+                    "episodic.md",
+                    before.episodic.clone().unwrap_or_default().as_str(),
+                ),
+                (
+                    "semantic.md",
+                    before.semantic.clone().unwrap_or_default().as_str(),
+                ),
+                (
+                    "prospective.md",
+                    before.prospective.clone().unwrap_or_default().as_str(),
+                ),
+            ],
+        );
         let run_id = ctx.run_id.clone();
         let error_message = error.to_string();
         call_blocking(Arc::clone(db), move |db| {
@@ -1622,7 +1691,7 @@ pub(crate) fn recover_memory_write(
 pub(crate) fn write_memory_files(
     agents_dir: &Path,
     agent_id: &str,
-    output: &memory_update::SleepBatchOutput,
+    files: &[(&str, &str)],
 ) -> Result<(), SleepBatchError> {
     if !safe_agent_id_for_write(agent_id) {
         return Err(SleepBatchError::UnsafeAgentId(agent_id.to_string()));
@@ -1643,12 +1712,10 @@ pub(crate) fn write_memory_files(
         .map_err(|e| SleepBatchError::Io(format!("failed to create tmp dir: {e}")))?;
 
     let write_result = (|| -> Result<(), SleepBatchError> {
-        std::fs::write(tmp_dir.join("episodic.md"), &output.episodic)
-            .map_err(|e| SleepBatchError::Io(format!("failed to write episodic.md: {e}")))?;
-        std::fs::write(tmp_dir.join("semantic.md"), &output.semantic)
-            .map_err(|e| SleepBatchError::Io(format!("failed to write semantic.md: {e}")))?;
-        std::fs::write(tmp_dir.join("prospective.md"), &output.prospective)
-            .map_err(|e| SleepBatchError::Io(format!("failed to write prospective.md: {e}")))?;
+        for (name, content) in files {
+            std::fs::write(tmp_dir.join(name), content)
+                .map_err(|e| SleepBatchError::Io(format!("failed to write {name}: {e}")))?;
+        }
         Ok(())
     })();
 
@@ -1685,22 +1752,6 @@ pub(crate) fn write_memory_files(
     }
 
     Ok(())
-}
-
-fn write_memory_content(
-    agents_dir: &Path,
-    agent_id: &str,
-    memory: &MemoryContent,
-) -> Result<(), SleepBatchError> {
-    write_memory_files(
-        agents_dir,
-        agent_id,
-        &memory_update::SleepBatchOutput {
-            episodic: memory.episodic.clone().unwrap_or_default(),
-            semantic: memory.semantic.clone().unwrap_or_default(),
-            prospective: memory.prospective.clone().unwrap_or_default(),
-        },
-    )
 }
 
 fn archive_and_clear_session(
@@ -2038,6 +2089,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_sleep_batch_persists_all_three_memory_files() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        assert!(
+            memory_dir.join("episodic.md").exists(),
+            "episodic.md missing"
+        );
+        assert!(
+            memory_dir.join("semantic.md").exists(),
+            "semantic.md missing"
+        );
+        assert!(
+            memory_dir.join("prospective.md").exists(),
+            "prospective.md missing"
+        );
+    }
+
+    #[tokio::test]
     async fn run_sleep_batch_marks_failed_on_error() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
@@ -2162,14 +2239,51 @@ mod tests {
     // --- write_memory_files tests ---
 
     #[test]
-    fn write_memory_files_writes_all_three_files() {
+    fn write_memory_files_writes_all_given_files() {
         let dir = tempfile::tempdir().unwrap();
-        let output = memory_update::SleepBatchOutput {
-            episodic: "ep".to_string(),
-            semantic: "sem".to_string(),
-            prospective: "pro".to_string(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("write");
+        write_memory_files(
+            dir.path(),
+            "agent",
+            &[("semantic.md", "sem"), ("prospective.md", "pro")],
+        )
+        .expect("write");
+
+        let memory_dir = dir.path().join("agent").join("memory");
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
+            "sem"
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
+            "pro"
+        );
+    }
+
+    #[test]
+    fn write_memory_files_writes_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_memory_files(dir.path(), "agent", &[("episodic.md", "ep")]).expect("write");
+
+        let memory_dir = dir.path().join("agent").join("memory");
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
+            "ep"
+        );
+    }
+
+    #[test]
+    fn write_memory_files_writes_three_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_memory_files(
+            dir.path(),
+            "agent",
+            &[
+                ("episodic.md", "ep"),
+                ("semantic.md", "sem"),
+                ("prospective.md", "pro"),
+            ],
+        )
+        .expect("write");
 
         let memory_dir = dir.path().join("agent").join("memory");
         assert_eq!(
@@ -2189,12 +2303,7 @@ mod tests {
     #[test]
     fn write_memory_files_creates_memory_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: "s".to_string(),
-            prospective: String::new(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
 
         let memory_dir = dir.path().join("agent").join("memory");
         assert!(memory_dir.exists());
@@ -2203,12 +2312,8 @@ mod tests {
     #[test]
     fn write_memory_files_rejects_unsafe_agent_id() {
         let dir = tempfile::tempdir().unwrap();
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: String::new(),
-            prospective: String::new(),
-        };
-        let err = write_memory_files(dir.path(), "../etc", &output).expect_err("should reject");
+        let err = write_memory_files(dir.path(), "../etc", &[("semantic.md", "s")])
+            .expect_err("should reject");
         assert!(matches!(err, SleepBatchError::UnsafeAgentId(_)));
     }
 
@@ -2220,12 +2325,7 @@ mod tests {
         std::fs::write(agent_dir.join("semantic.md"), "old").unwrap();
 
         // This should succeed — we're writing valid content
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: "new".to_string(),
-            prospective: String::new(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
     }
 
     #[test]
@@ -2236,12 +2336,7 @@ mod tests {
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::fs::write(backup_dir.join("semantic.md"), "recovered").unwrap();
 
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: "new".to_string(),
-            prospective: String::new(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
     }
 
     #[test]
@@ -2251,12 +2346,7 @@ mod tests {
         let tmp_dir = agent_dir.join("memory.tmp-stale");
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: "s".to_string(),
-            prospective: String::new(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
         assert!(!tmp_dir.exists());
     }
 
@@ -2264,13 +2354,8 @@ mod tests {
     fn write_memory_files_documents_rename_limit() {
         // Verify the function handles concurrent writes gracefully
         let dir = tempfile::tempdir().unwrap();
-        let output = memory_update::SleepBatchOutput {
-            episodic: String::new(),
-            semantic: "s".to_string(),
-            prospective: String::new(),
-        };
-        write_memory_files(dir.path(), "agent", &output).expect("first write");
-        write_memory_files(dir.path(), "agent", &output).expect("second write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("first write");
+        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("second write");
     }
 
     // --- retry integration ---

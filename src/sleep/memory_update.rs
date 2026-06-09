@@ -25,7 +25,6 @@ Output the raw JSON object and nothing else.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SleepBatchOutput {
-    pub episodic: String,
     pub semantic: String,
     pub prospective: String,
 }
@@ -66,7 +65,6 @@ pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, S
         .to_string();
 
     Ok(SleepBatchOutput {
-        episodic: String::new(),
         semantic,
         prospective,
     })
@@ -327,7 +325,6 @@ mod tests {
         })
         .to_string();
         let output = parse_sleep_response(&response).expect("should parse");
-        assert_eq!(output.episodic, "");
         assert_eq!(output.semantic, "# Semantic\n\n- fact");
         assert_eq!(output.prospective, "# Prospective\n\n- todo");
     }
