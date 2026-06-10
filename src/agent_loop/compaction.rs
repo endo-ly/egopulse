@@ -1325,7 +1325,7 @@ mod tests {
         for _ in 0..20 {
             let (requests, input_tokens, output_tokens, total_tokens) =
                 call_blocking(Arc::clone(&state.db), move |db| {
-                    db.get_llm_usage_summary(Some(chat_id), None, None)
+                    db.get_llm_usage_summary(Some(chat_id))
                 })
                 .await
                 .expect("summary");

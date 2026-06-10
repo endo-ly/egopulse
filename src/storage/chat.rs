@@ -152,7 +152,7 @@ impl Database {
                     SELECT m.content
                     FROM messages m
                     WHERE m.chat_id = c.chat_id
-                    ORDER BY m.timestamp DESC
+                    ORDER BY m.timestamp DESC, m.id DESC
                     LIMIT 1
                 ) AS last_message_preview,
                 c.agent_id
@@ -218,7 +218,7 @@ impl Database {
                     message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
-             ORDER BY timestamp DESC
+             ORDER BY timestamp DESC, id DESC
              LIMIT ?2",
         )?;
 
@@ -239,7 +239,7 @@ impl Database {
                     message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
-             ORDER BY timestamp ASC",
+             ORDER BY timestamp ASC, id ASC",
         )?;
         stmt.query_map(params![chat_id], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
@@ -367,7 +367,7 @@ impl Database {
                         message_kind, recipient_agent_id
                  FROM messages
                  WHERE chat_id = ?1
-                 ORDER BY timestamp DESC
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT ?2",
             )?;
             let mut messages = stmt

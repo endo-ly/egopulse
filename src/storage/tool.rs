@@ -5,6 +5,11 @@ use crate::error::StorageError;
 use super::{Database, LlmUsageLogEntry, ToolCall};
 
 impl Database {
+    /// Persists a [`ToolCall`] record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or execution failures.
     pub(crate) fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
         conn.execute(
@@ -23,6 +28,12 @@ impl Database {
         Ok(())
     }
 
+    /// Updates the output field of a tool call identified by `(chat_id, message_id, id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotFound`] when no matching row exists.
+    /// Returns other [`StorageError`] variants on database connection or execution failures.
     pub(crate) fn update_tool_call_output_for_message(
         &self,
         chat_id: i64,
@@ -45,6 +56,11 @@ impl Database {
         Ok(())
     }
 
+    /// Logs an LLM usage entry and returns the inserted row's rowid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or execution failures.
     pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
         let conn = self.get_conn()?;
         let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
@@ -98,18 +114,18 @@ impl Database {
     pub(crate) fn get_llm_usage_summary(
         &self,
         chat_id: Option<i64>,
-        _since: Option<&str>,
-        _request_kind: Option<&str>,
     ) -> Result<(i64, i64, i64, i64), StorageError> {
         let conn = self.get_conn()?;
         let mut sql = String::from(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0)
              FROM llm_usage_logs WHERE 1=1",
         );
-        if let Some(cid) = chat_id {
-            sql.push_str(&format!(" AND chat_id = {cid}"));
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        if let Some(ref cid) = chat_id {
+            sql.push_str(" AND chat_id = ?");
+            params.push(cid as &dyn rusqlite::types::ToSql);
         }
-        let result = conn.query_row(&sql, [], |row| {
+        let result = conn.query_row(&sql, params.as_slice(), |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         Ok(result)

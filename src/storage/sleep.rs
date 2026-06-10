@@ -686,6 +686,18 @@ impl Database {
         snapshots: &[(MemoryFile, String, String)],
     ) -> Result<(), StorageError> {
         require_success_result("commit_memory_update_success", &result)?;
+        for checkpoint in checkpoints {
+            if !matches!(
+                checkpoint.step_name,
+                SleepStepName::SemanticUpdate | SleepStepName::ProspectiveUpdate
+            ) || checkpoint.agent_id != agent_id
+            {
+                return Err(StorageError::Conflict(format!(
+                    "invalid memory update checkpoint scope: agent={} step={}",
+                    checkpoint.agent_id, checkpoint.step_name,
+                )));
+            }
+        }
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (file, content_before, content_after) in snapshots {

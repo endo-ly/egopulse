@@ -51,6 +51,10 @@ impl Database {
     ///
     /// Returns `Err(StorageError::Conflict)` when the `(agent_id,
     /// intention_id, due_key)` unique index is already satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] when the `(agent_id, intention_id, due_key)` unique index is already satisfied. Returns other [`StorageError`] variants on database connection or execution failures.
     pub(crate) fn try_create_pulse_run(
         &self,
         id: &str,
@@ -81,6 +85,12 @@ impl Database {
         }
     }
 
+    /// Marks a pulse run as successful and records the output details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] if the pulse run is not in the `Running` state.
+    /// Returns other [`StorageError`] variants on database connection or execution failures.
     pub(crate) fn update_pulse_run_success(
         &self,
         id: &str,
@@ -118,6 +128,12 @@ impl Database {
         Ok(())
     }
 
+    /// Marks a pulse run as failed with an error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] if the pulse run is not in the `Running` state.
+    /// Returns other [`StorageError`] variants on database connection or execution failures.
     pub(crate) fn update_pulse_run_failed(
         &self,
         id: &str,
@@ -141,6 +157,12 @@ impl Database {
         Ok(())
     }
 
+    /// Marks a pulse run as skipped with a reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] if the pulse run is not in the `Running` state.
+    /// Returns other [`StorageError`] variants on database connection or execution failures.
     pub(crate) fn update_pulse_run_skipped(
         &self,
         id: &str,
@@ -166,6 +188,10 @@ impl Database {
 
     /// Returns `true` when any record exists for `(agent_id, intention_id,
     /// due_key)`, regardless of status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query execution failures.
     pub(crate) fn has_pulse_due_run(
         &self,
         agent_id: &str,
@@ -205,7 +231,11 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Get agent chats ordered by `updated_at` DESC, filtered to the given channels.
+    /// Returns agent chats matching the given channels, ordered by `last_message_time` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query execution failures.
     pub(crate) fn get_agent_chats_by_recent(
         &self,
         agent_id: &str,

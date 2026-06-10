@@ -278,6 +278,31 @@ impl Database {
                     event.sleep_run_id,
                 )));
             }
+            if event.agent_id != agent_id {
+                tx.rollback()?;
+                return Err(StorageError::Conflict(format!(
+                    "event agent_id '{}' does not match expected '{agent_id}'",
+                    event.agent_id,
+                )));
+            }
+            if let Some(f) = from {
+                if event.experienced_at.as_str() < f {
+                    tx.rollback()?;
+                    return Err(StorageError::Conflict(format!(
+                        "event experienced_at '{}' is before range start '{f}'",
+                        event.experienced_at,
+                    )));
+                }
+            }
+            if let Some(t) = to {
+                if event.experienced_at.as_str() >= t {
+                    tx.rollback()?;
+                    return Err(StorageError::Conflict(format!(
+                        "event experienced_at '{}' is at or beyond range end '{t}'",
+                        event.experienced_at,
+                    )));
+                }
+            }
             tx.execute(
                 "INSERT INTO episode_events
                      (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
