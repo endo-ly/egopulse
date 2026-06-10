@@ -11,19 +11,6 @@ use super::{
 
 use super::chat::row_to_stored_message;
 
-macro_rules! parse_row_enum {
-    ($row:expr, $idx:expr, $ty:ty) => {{
-        let s: String = $row.get($idx)?;
-        <$ty>::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                $idx,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            )
-        })
-    }};
-}
-
 fn row_to_episode_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeEvent> {
     let kind = parse_row_enum!(row, 4, EpisodeEventKind)?;
     let certainty = parse_row_enum!(row, 8, EpisodeEventCertainty)?;
@@ -62,15 +49,15 @@ fn row_to_episode_rollup(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRol
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 episode event queries; exercised by unit tests below, wired into runtime in Phase 2+"
-    )
-)]
 impl Database {
     /// Lists events by `sleep_run_id`.
+    ///
+    /// Only called from integration tests (sleep/orchestrator.rs) which verify
+    /// that sleep batch event extraction persisted the correct events.
+    /// No runtime callers yet — gated with #[cfg(test)] to avoid dead_code
+    /// warnings in production builds.  Remove the gate when a runtime caller
+    /// is introduced.
+    #[cfg(test)]
     pub(crate) fn list_episode_events_by_run(
         &self,
         sleep_run_id: &str,

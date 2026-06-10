@@ -1,42 +1,30 @@
-use std::str::FromStr;
-
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 use crate::error::StorageError;
 
-use super::{ChatInfo, Database, PulseOutputKind, PulseRun, PulseRunStatus};
+use super::{ChatInfo, Database, PulseOutputKind, PulseRunStatus};
 
-macro_rules! parse_row_enum {
-    ($row:expr, $idx:expr, $ty:ty) => {{
-        let s: String = $row.get($idx)?;
-        <$ty>::from_str(&s).map_err(|e| {
+/// Parses a `pulse_runs` row into [`super::PulseRun`].
+///
+/// Only used by [`Database::get_pulse_run`] which is itself gated with
+/// `#[cfg(test)]` — see that method for the rationale.
+#[cfg(test)]
+fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::PulseRun> {
+    use super::PulseRun;
+    use std::str::FromStr;
+
+    let status = parse_row_enum!(row, 6, PulseRunStatus)?;
+    let output_kind: Option<PulseOutputKind> = row
+        .get::<_, Option<String>>(9)?
+        .map(|s| PulseOutputKind::from_str(&s))
+        .transpose()
+        .map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                $idx,
+                9,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             )
-        })
-    }};
-}
-
-macro_rules! parse_opt_row_enum {
-    ($row:expr, $idx:expr, $ty:ty) => {{
-        $row.get::<_, Option<String>>($idx)?
-            .map(|s| <$ty>::from_str(&s))
-            .transpose()
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    $idx,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                )
-            })
-    }};
-}
-
-fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PulseRun> {
-    let status = parse_row_enum!(row, 6, PulseRunStatus)?;
-    let output_kind = parse_opt_row_enum!(row, 9, PulseOutputKind)?;
+        })?;
 
     Ok(PulseRun {
         id: row.get(0)?,
@@ -58,13 +46,6 @@ fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PulseRun> {
 // Pulse runs
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 pulse run queries; exercised by unit tests below, wired into runtime in Phase 2+"
-    )
-)]
 impl Database {
     /// Inserts a new `pulse_run` row with status "running".
     ///
@@ -201,7 +182,17 @@ impl Database {
         Ok(count > 0)
     }
 
-    pub(crate) fn get_pulse_run(&self, id: &str) -> Result<Option<PulseRun>, StorageError> {
+    /// Returns a single pulse run by its primary key.
+    ///
+    /// Only called from integration tests (pulse/output.rs) which verify
+    /// that pulse output handling correctly persisted the run status.
+    /// No runtime callers yet — gated with #[cfg(test)] to avoid dead_code
+    /// warnings in production builds.  Remove the gate when a runtime caller
+    /// is introduced.
+    #[cfg(test)]
+    pub(crate) fn get_pulse_run(&self, id: &str) -> Result<Option<super::PulseRun>, StorageError> {
+        use rusqlite::OptionalExtension;
+
         let conn = self.get_conn()?;
         conn.query_row(
             "SELECT id, agent_id, intention_id, due_key, chat_id, message_id,

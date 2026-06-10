@@ -8,19 +8,6 @@ use super::{
     ChatInfo, Database, MessageKind, SenderKind, SessionSnapshot, SessionSummary, StoredMessage,
 };
 
-macro_rules! parse_row_enum {
-    ($row:expr, $idx:expr, $ty:ty) => {{
-        let s: String = $row.get($idx)?;
-        <$ty>::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                $idx,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            )
-        })
-    }};
-}
-
 pub(crate) fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     let sender_kind = parse_row_enum!(row, 4, SenderKind)?;
     let message_kind = parse_row_enum!(row, 6, MessageKind)?;

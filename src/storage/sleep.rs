@@ -10,19 +10,6 @@ use super::{
     SleepStepResult, SleepStepStatus,
 };
 
-macro_rules! parse_row_enum {
-    ($row:expr, $idx:expr, $ty:ty) => {{
-        let s: String = $row.get($idx)?;
-        <$ty>::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                $idx,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            )
-        })
-    }};
-}
-
 fn commit_checkpoints_in_tx(
     tx: &Transaction<'_>,
     checkpoints: &[SleepStepCheckpoint],
@@ -239,14 +226,14 @@ fn row_to_sleep_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepSte
         updated_at: row.get(6)?,
     })
 }
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 2 DB audit queries; exercised by unit tests below, wired into runtime in Phase 3+"
-    )
-)]
 impl Database {
+    /// Convenience wrapper around [`try_create_sleep_run`] that expect()-s
+    /// the result for use in test helpers.
+    ///
+    /// Only called from integration tests (sleep/orchestrator.rs,
+    /// sleep/scheduler.rs).  Runtime code uses [`try_create_sleep_run`]
+    /// directly.  Gated with #[cfg(test)] to avoid dead_code warnings.
+    #[cfg(test)]
     pub(crate) fn create_sleep_run(
         &self,
         agent_id: &str,
@@ -742,6 +729,13 @@ impl Database {
     }
 
     /// Lists all steps for a sleep run, ordered by step_name.
+    ///
+    /// Only called from integration tests (sleep/orchestrator.rs) which verify
+    /// that sleep batch steps transitioned to the expected terminal states.
+    /// No runtime callers yet — gated with #[cfg(test)] to avoid dead_code
+    /// warnings in production builds.  Remove the gate when a runtime caller
+    /// is introduced.
+    #[cfg(test)]
     pub(crate) fn list_sleep_run_steps(
         &self,
         sleep_run_id: &str,

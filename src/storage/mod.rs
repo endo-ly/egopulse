@@ -8,15 +8,6 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
-mod chat;
-mod episode;
-mod migration;
-mod pulse;
-mod sleep;
-mod tool;
-
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
 macro_rules! define_enum {
     (
         $(#[$outer:meta])*
@@ -54,6 +45,28 @@ macro_rules! define_enum {
         };
     };
 }
+
+macro_rules! parse_row_enum {
+    ($row:expr, $idx:expr, $ty:ty) => {{
+        let s: String = $row.get($idx)?;
+        <$ty>::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                $idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })
+    }};
+}
+
+mod chat;
+mod episode;
+mod migration;
+mod pulse;
+mod sleep;
+mod tool;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection factory that opens a SQLite database file with connection-local
 /// SQLite settings. Database-file settings such as WAL mode are initialized
@@ -265,37 +278,12 @@ define_enum! {
     }
 }
 
-/// How a sleep batch run was initiated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SleepRunTrigger {
-    /// User-triggered via CLI or WebUI.
-    Manual,
-    /// Triggered by the automatic scheduler.
-    Scheduled,
-    /// Backfill run for re-extracting events from historical messages.
-    Backfill,
-}
-
-impl fmt::Display for SleepRunTrigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Manual => write!(f, "manual"),
-            Self::Scheduled => write!(f, "scheduled"),
-            Self::Backfill => write!(f, "backfill"),
-        }
-    }
-}
-
-impl std::str::FromStr for SleepRunTrigger {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "manual" => Ok(Self::Manual),
-            "scheduled" => Ok(Self::Scheduled),
-            "backfill" => Ok(Self::Backfill),
-            other => Err(format!("invalid sleep run trigger: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SleepRunTrigger {
+        Manual => "manual",
+        Scheduled => "scheduled",
+        Backfill => "backfill",
     }
 }
 
@@ -356,32 +344,11 @@ define_enum! {
     }
 }
 
-/// No notification sent (silent success).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PulseOutputKind {
-    Silent,
-    /// Notification sent to the home surface.
-    Notify,
-}
-
-impl fmt::Display for PulseOutputKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Silent => write!(f, "silent"),
-            Self::Notify => write!(f, "notify"),
-        }
-    }
-}
-
-impl std::str::FromStr for PulseOutputKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "silent" => Ok(Self::Silent),
-            "notify" => Ok(Self::Notify),
-            other => Err(format!("invalid pulse output kind: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PulseOutputKind {
+        Silent => "silent",
+        Notify => "notify",
     }
 }
 
@@ -399,36 +366,12 @@ define_enum! {
     }
 }
 
-/// Conclusion explicitly stated in conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EpisodeEventCertainty {
-    Stated,
-    /// Conclusion derived from multiple messages / patterns.
-    Derived,
-    /// Tentative hypothesis with weak evidence.
-    Tentative,
-}
-
-impl fmt::Display for EpisodeEventCertainty {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stated => write!(f, "stated"),
-            Self::Derived => write!(f, "derived"),
-            Self::Tentative => write!(f, "tentative"),
-        }
-    }
-}
-
-impl std::str::FromStr for EpisodeEventCertainty {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "stated" => Ok(Self::Stated),
-            "derived" => Ok(Self::Derived),
-            "tentative" => Ok(Self::Tentative),
-            other => Err(format!("invalid episode event certainty: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum EpisodeEventCertainty {
+        Stated => "stated",
+        Derived => "derived",
+        Tentative => "tentative",
     }
 }
 
@@ -561,19 +504,11 @@ pub(crate) struct LlmUsageLogEntry<'a> {
 
 const _: () = {
     const fn assert_display<T: fmt::Display>() {}
-    const fn assert_from_str<T: std::str::FromStr>() {}
 
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
     assert_display::<PulseRun>();
     assert_display::<SleepRunStep>();
-    assert_display::<SleepRunTrigger>();
-    assert_display::<PulseOutputKind>();
-    assert_display::<EpisodeEventCertainty>();
-
-    assert_from_str::<SleepRunTrigger>();
-    assert_from_str::<PulseOutputKind>();
-    assert_from_str::<EpisodeEventCertainty>();
 };
 
 impl fmt::Display for SleepRun {
