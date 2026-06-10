@@ -1,6 +1,5 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +8,63 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+macro_rules! define_enum {
+    (
+        $(#[$outer:meta])*
+        $vis:vis enum $name:ident {
+            $($variant:ident => $str:expr),+ $(,)?
+        }
+    ) => {
+        $(#[$outer])*
+        $vis enum $name {
+            $($variant,)+
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    $(Self::$variant => write!(f, $str),)+
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($str => Ok(Self::$variant),)+
+                    other => Err(format!(concat!("invalid ", stringify!($name), ": {}"), other)),
+                }
+            }
+        }
+
+        const _: () = {
+            const fn assert_traits<T: fmt::Display + std::str::FromStr>() {}
+            assert_traits::<$name>();
+        };
+    };
+}
+
+macro_rules! parse_row_enum {
+    ($row:expr, $idx:expr, $ty:ty) => {{
+        let s: String = $row.get($idx)?;
+        <$ty>::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                $idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })
+    }};
+}
+
+mod chat;
+mod episode;
 mod migration;
-mod queries;
+mod pulse;
+mod sleep;
+mod tool;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -91,45 +145,43 @@ pub(crate) struct StoredMessage {
 }
 
 impl StoredMessage {
-    /// Creates an assistant-originated message with auto-generated id and timestamp.
-    pub(crate) fn assistant(chat_id: i64, sender_id: String, content: String) -> Self {
+    fn new(
+        chat_id: i64,
+        sender_id: String,
+        content: String,
+        sender_kind: SenderKind,
+        recipient_agent_id: Option<String>,
+    ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
             sender_id,
             content,
-            sender_kind: SenderKind::Assistant,
+            sender_kind,
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
-            recipient_agent_id: None,
+            recipient_agent_id,
         }
+    }
+
+    /// Creates an assistant-originated message with auto-generated id and timestamp.
+    pub(crate) fn assistant(chat_id: i64, sender_id: String, content: String) -> Self {
+        Self::new(chat_id, sender_id, content, SenderKind::Assistant, None)
     }
 
     /// Creates a user-originated message with auto-generated id and timestamp.
     pub(crate) fn user(chat_id: i64, sender_id: String, content: String) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            sender_id,
-            content,
-            sender_kind: SenderKind::User,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            recipient_agent_id: None,
-        }
+        Self::new(chat_id, sender_id, content, SenderKind::User, None)
     }
 
     pub(crate) fn system(chat_id: i64, content: String) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
+        Self::new(
             chat_id,
-            sender_id: "system".to_string(),
+            "system".to_string(),
             content,
-            sender_kind: SenderKind::System,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            recipient_agent_id: None,
-        }
+            SenderKind::System,
+            None,
+        )
     }
 
     pub(crate) fn tool(
@@ -138,16 +190,13 @@ impl StoredMessage {
         recipient_id: String,
         content: String,
     ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
+        Self::new(
             chat_id,
             sender_id,
             content,
-            sender_kind: SenderKind::Tool,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            recipient_agent_id: Some(recipient_id),
-        }
+            SenderKind::Tool,
+            Some(recipient_id),
+        )
     }
 }
 
@@ -199,145 +248,53 @@ pub(crate) struct ToolCall {
     pub timestamp: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageKind {
-    Message,
-    AgentSend,
-    SystemEvent,
-}
-
-impl fmt::Display for MessageKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Message => write!(f, "message"),
-            Self::AgentSend => write!(f, "agent_send"),
-            Self::SystemEvent => write!(f, "system_event"),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum MessageKind {
+        Message => "message",
+        AgentSend => "agent_send",
+        SystemEvent => "system_event",
     }
 }
 
-impl FromStr for MessageKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "message" => Ok(Self::Message),
-            "agent_send" => Ok(Self::AgentSend),
-            "system_event" => Ok(Self::SystemEvent),
-            other => Err(format!("invalid message kind: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SenderKind {
+        User => "user",
+        Assistant => "assistant",
+        System => "system",
+        Tool => "tool",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SenderKind {
-    User,
-    Assistant,
-    System,
-    Tool,
-}
-
-impl fmt::Display for SenderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::User => write!(f, "user"),
-            Self::Assistant => write!(f, "assistant"),
-            Self::System => write!(f, "system"),
-            Self::Tool => write!(f, "tool"),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SleepRunStatus {
+        Running => "running",
+        Success => "success",
+        PartialFailure => "partial_failure",
+        Failed => "failed",
+        Skipped => "skipped",
     }
 }
 
-impl FromStr for SenderKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "user" => Ok(Self::User),
-            "assistant" => Ok(Self::Assistant),
-            "system" => Ok(Self::System),
-            "tool" => Ok(Self::Tool),
-            other => Err(format!("invalid sender kind: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SleepRunTrigger {
+        Manual => "manual",
+        Scheduled => "scheduled",
+        Backfill => "backfill",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SleepRunStatus {
-    Running,
-    Success,
-    PartialFailure,
-    Failed,
-    Skipped,
-}
-
-impl fmt::Display for SleepRunStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Running => write!(f, "running"),
-            Self::Success => write!(f, "success"),
-            Self::PartialFailure => write!(f, "partial_failure"),
-            Self::Failed => write!(f, "failed"),
-            Self::Skipped => write!(f, "skipped"),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SleepStepName {
+        EventExtraction => "event_extraction",
+        EpisodicUpdate => "episodic_update",
+        SemanticUpdate => "semantic_update",
+        ProspectiveUpdate => "prospective_update",
     }
-}
-
-impl FromStr for SleepRunStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(Self::Running),
-            "success" => Ok(Self::Success),
-            "partial_failure" => Ok(Self::PartialFailure),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            other => Err(format!("invalid sleep run status: {other}")),
-        }
-    }
-}
-
-/// How a sleep batch run was initiated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SleepRunTrigger {
-    /// User-triggered via CLI or WebUI.
-    Manual,
-    /// Triggered by the automatic scheduler.
-    Scheduled,
-    /// Backfill run for re-extracting events from historical messages.
-    Backfill,
-}
-
-impl fmt::Display for SleepRunTrigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Manual => write!(f, "manual"),
-            Self::Scheduled => write!(f, "scheduled"),
-            Self::Backfill => write!(f, "backfill"),
-        }
-    }
-}
-
-impl FromStr for SleepRunTrigger {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "manual" => Ok(Self::Manual),
-            "scheduled" => Ok(Self::Scheduled),
-            "backfill" => Ok(Self::Backfill),
-            other => Err(format!("invalid sleep run trigger: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SleepStepName {
-    EventExtraction,
-    EpisodicUpdate,
-    SemanticUpdate,
-    ProspectiveUpdate,
 }
 
 impl SleepStepName {
@@ -349,64 +306,80 @@ impl SleepStepName {
     ];
 }
 
-impl fmt::Display for SleepStepName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EventExtraction => write!(f, "event_extraction"),
-            Self::EpisodicUpdate => write!(f, "episodic_update"),
-            Self::SemanticUpdate => write!(f, "semantic_update"),
-            Self::ProspectiveUpdate => write!(f, "prospective_update"),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SleepStepStatus {
+        Pending => "pending",
+        Running => "running",
+        Success => "success",
+        Failed => "failed",
+        Skipped => "skipped",
     }
 }
 
-impl FromStr for SleepStepName {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "event_extraction" => Ok(Self::EventExtraction),
-            "episodic_update" => Ok(Self::EpisodicUpdate),
-            "semantic_update" => Ok(Self::SemanticUpdate),
-            "prospective_update" => Ok(Self::ProspectiveUpdate),
-            other => Err(format!("invalid sleep step name: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CheckpointSourceKind {
+        Messages => "messages",
+        EpisodeEvents => "episode_events",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SleepStepStatus {
-    Pending,
-    Running,
-    Success,
-    Failed,
-    Skipped,
-}
-
-impl fmt::Display for SleepStepStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Running => write!(f, "running"),
-            Self::Success => write!(f, "success"),
-            Self::Failed => write!(f, "failed"),
-            Self::Skipped => write!(f, "skipped"),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum MemoryFile {
+        Episodic => "episodic",
+        Semantic => "semantic",
+        Prospective => "prospective",
     }
 }
 
-impl FromStr for SleepStepStatus {
-    type Err = String;
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PulseRunStatus {
+        Running => "running",
+        Success => "success",
+        Failed => "failed",
+        Skipped => "skipped",
+    }
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "running" => Ok(Self::Running),
-            "success" => Ok(Self::Success),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            other => Err(format!("invalid sleep step status: {other}")),
-        }
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PulseOutputKind {
+        Silent => "silent",
+        Notify => "notify",
+    }
+}
+
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum EpisodeEventKind {
+        Self_ => "self",
+        Relationship => "relationship",
+        World => "world",
+        Feat => "feat",
+        Anomaly => "anomaly",
+        Decision => "decision",
+        Insight => "insight",
+        Rhythm => "rhythm",
+    }
+}
+
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum EpisodeEventCertainty {
+        Stated => "stated",
+        Derived => "derived",
+        Tentative => "tentative",
+    }
+}
+
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RollupGranularity {
+        Week => "week",
+        Month => "month",
     }
 }
 
@@ -429,33 +402,6 @@ pub(crate) struct SleepStepResult<'a> {
     pub output_tokens: i64,
     pub error_message: Option<&'a str>,
     pub metadata_json: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CheckpointSourceKind {
-    Messages,
-    EpisodeEvents,
-}
-
-impl fmt::Display for CheckpointSourceKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Messages => write!(f, "messages"),
-            Self::EpisodeEvents => write!(f, "episode_events"),
-        }
-    }
-}
-
-impl FromStr for CheckpointSourceKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "messages" => Ok(Self::Messages),
-            "episode_events" => Ok(Self::EpisodeEvents),
-            other => Err(format!("invalid checkpoint source kind: {other}")),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,36 +431,6 @@ pub(crate) struct SleepRun {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemoryFile {
-    Episodic,
-    Semantic,
-    Prospective,
-}
-
-impl fmt::Display for MemoryFile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Episodic => write!(f, "episodic"),
-            Self::Semantic => write!(f, "semantic"),
-            Self::Prospective => write!(f, "prospective"),
-        }
-    }
-}
-
-impl FromStr for MemoryFile {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "episodic" => Ok(Self::Episodic),
-            "semantic" => Ok(Self::Semantic),
-            "prospective" => Ok(Self::Prospective),
-            other => Err(format!("invalid memory file: {other}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemorySnapshot {
     pub id: String,
@@ -524,68 +440,6 @@ pub(crate) struct MemorySnapshot {
     pub content_before: String,
     pub content_after: String,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PulseRunStatus {
-    Running,
-    Success,
-    Failed,
-    Skipped,
-}
-
-impl fmt::Display for PulseRunStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Running => write!(f, "running"),
-            Self::Success => write!(f, "success"),
-            Self::Failed => write!(f, "failed"),
-            Self::Skipped => write!(f, "skipped"),
-        }
-    }
-}
-
-impl FromStr for PulseRunStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(Self::Running),
-            "success" => Ok(Self::Success),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            other => Err(format!("invalid pulse run status: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PulseOutputKind {
-    /// No notification sent (silent success).
-    Silent,
-    /// Notification sent to the home surface.
-    Notify,
-}
-
-impl fmt::Display for PulseOutputKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Silent => write!(f, "silent"),
-            Self::Notify => write!(f, "notify"),
-        }
-    }
-}
-
-impl FromStr for PulseOutputKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "silent" => Ok(Self::Silent),
-            "notify" => Ok(Self::Notify),
-            other => Err(format!("invalid pulse output kind: {other}")),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -604,84 +458,6 @@ pub(crate) struct PulseRun {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EpisodeEventKind {
-    Self_,
-    Relationship,
-    World,
-    Feat,
-    Anomaly,
-    Decision,
-    Insight,
-    Rhythm,
-}
-
-impl fmt::Display for EpisodeEventKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Self_ => write!(f, "self"),
-            Self::Relationship => write!(f, "relationship"),
-            Self::World => write!(f, "world"),
-            Self::Feat => write!(f, "feat"),
-            Self::Anomaly => write!(f, "anomaly"),
-            Self::Decision => write!(f, "decision"),
-            Self::Insight => write!(f, "insight"),
-            Self::Rhythm => write!(f, "rhythm"),
-        }
-    }
-}
-
-impl FromStr for EpisodeEventKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "self" => Ok(Self::Self_),
-            "relationship" => Ok(Self::Relationship),
-            "world" => Ok(Self::World),
-            "feat" => Ok(Self::Feat),
-            "anomaly" => Ok(Self::Anomaly),
-            "decision" => Ok(Self::Decision),
-            "insight" => Ok(Self::Insight),
-            "rhythm" => Ok(Self::Rhythm),
-            other => Err(format!("invalid episode event kind: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EpisodeEventCertainty {
-    /// Conclusion explicitly stated in conversation.
-    Stated,
-    /// Conclusion derived from multiple messages / patterns.
-    Derived,
-    /// Tentative hypothesis with weak evidence.
-    Tentative,
-}
-
-impl fmt::Display for EpisodeEventCertainty {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stated => write!(f, "stated"),
-            Self::Derived => write!(f, "derived"),
-            Self::Tentative => write!(f, "tentative"),
-        }
-    }
-}
-
-impl FromStr for EpisodeEventCertainty {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "stated" => Ok(Self::Stated),
-            "derived" => Ok(Self::Derived),
-            "tentative" => Ok(Self::Tentative),
-            other => Err(format!("invalid episode event certainty: {other}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EpisodeEvent {
     pub id: String,
@@ -697,34 +473,6 @@ pub(crate) struct EpisodeEvent {
     pub source_refs_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-/// Granularity for episode rollup periods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RollupGranularity {
-    Week,
-    Month,
-}
-
-impl fmt::Display for RollupGranularity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Week => write!(f, "week"),
-            Self::Month => write!(f, "month"),
-        }
-    }
-}
-
-impl FromStr for RollupGranularity {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "week" => Ok(Self::Week),
-            "month" => Ok(Self::Month),
-            other => Err(format!("invalid rollup granularity: {other}")),
-        }
-    }
 }
 
 /// A derived summary rollup over a week or month of episode events.
@@ -756,42 +504,11 @@ pub(crate) struct LlmUsageLogEntry<'a> {
 
 const _: () = {
     const fn assert_display<T: fmt::Display>() {}
-    const fn assert_from_str<T: FromStr>() {}
-
-    assert_display::<SenderKind>();
-    assert_from_str::<SenderKind>();
-    assert_display::<SleepRunStatus>();
-    assert_display::<SleepRunTrigger>();
-    assert_display::<SleepStepName>();
-    assert_display::<SleepStepStatus>();
-    assert_display::<CheckpointSourceKind>();
-    assert_display::<MemoryFile>();
-    assert_display::<MessageKind>();
-    assert_from_str::<SleepRunStatus>();
-    assert_from_str::<SleepRunTrigger>();
-    assert_from_str::<SleepStepName>();
-    assert_from_str::<SleepStepStatus>();
-    assert_from_str::<CheckpointSourceKind>();
-    assert_from_str::<MemoryFile>();
-    assert_from_str::<MessageKind>();
-
-    assert_display::<PulseRunStatus>();
-    assert_from_str::<PulseRunStatus>();
-    assert_display::<PulseOutputKind>();
-    assert_from_str::<PulseOutputKind>();
 
     assert_display::<SleepRun>();
     assert_display::<MemorySnapshot>();
     assert_display::<PulseRun>();
     assert_display::<SleepRunStep>();
-
-    assert_display::<EpisodeEventKind>();
-    assert_from_str::<EpisodeEventKind>();
-    assert_display::<EpisodeEventCertainty>();
-    assert_from_str::<EpisodeEventCertainty>();
-
-    assert_display::<RollupGranularity>();
-    assert_from_str::<RollupGranularity>();
 };
 
 impl fmt::Display for SleepRun {
@@ -899,7 +616,6 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     fn temp_db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("runtime").join("egopulse.db")
@@ -924,236 +640,6 @@ mod tests {
         // Assert
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
-    }
-
-    #[test]
-    fn sleep_run_status_display() {
-        assert_eq!(SleepRunStatus::Running.to_string(), "running");
-        assert_eq!(SleepRunStatus::Success.to_string(), "success");
-        assert_eq!(SleepRunStatus::Failed.to_string(), "failed");
-        assert_eq!(SleepRunStatus::Skipped.to_string(), "skipped");
-    }
-
-    #[test]
-    fn message_kind_display_message() {
-        assert_eq!(MessageKind::Message.to_string(), "message");
-    }
-
-    #[test]
-    fn message_kind_display_agent_send() {
-        assert_eq!(MessageKind::AgentSend.to_string(), "agent_send");
-    }
-
-    #[test]
-    fn message_kind_display_system_event() {
-        assert_eq!(MessageKind::SystemEvent.to_string(), "system_event");
-    }
-
-    #[test]
-    fn message_kind_from_str_valid() {
-        assert_eq!(
-            MessageKind::from_str("message").unwrap(),
-            MessageKind::Message
-        );
-        assert_eq!(
-            MessageKind::from_str("agent_send").unwrap(),
-            MessageKind::AgentSend
-        );
-        assert_eq!(
-            MessageKind::from_str("system_event").unwrap(),
-            MessageKind::SystemEvent
-        );
-    }
-
-    #[test]
-    fn message_kind_from_str_unknown() {
-        assert!(MessageKind::from_str("unknown").is_err());
-    }
-
-    #[test]
-    fn sleep_run_trigger_display() {
-        assert_eq!(SleepRunTrigger::Manual.to_string(), "manual");
-        assert_eq!(SleepRunTrigger::Scheduled.to_string(), "scheduled");
-        assert_eq!(SleepRunTrigger::Backfill.to_string(), "backfill");
-    }
-
-    #[test]
-    fn memory_file_display() {
-        assert_eq!(MemoryFile::Episodic.to_string(), "episodic");
-        assert_eq!(MemoryFile::Semantic.to_string(), "semantic");
-        assert_eq!(MemoryFile::Prospective.to_string(), "prospective");
-    }
-
-    #[test]
-    fn sleep_run_status_from_str() {
-        assert_eq!(
-            SleepRunStatus::from_str("running").unwrap(),
-            SleepRunStatus::Running
-        );
-        assert_eq!(
-            SleepRunStatus::from_str("success").unwrap(),
-            SleepRunStatus::Success
-        );
-        assert_eq!(
-            SleepRunStatus::from_str("failed").unwrap(),
-            SleepRunStatus::Failed
-        );
-        assert_eq!(
-            SleepRunStatus::from_str("skipped").unwrap(),
-            SleepRunStatus::Skipped
-        );
-        assert!(SleepRunStatus::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn sleep_run_trigger_from_str() {
-        assert_eq!(
-            SleepRunTrigger::from_str("manual").unwrap(),
-            SleepRunTrigger::Manual
-        );
-        assert_eq!(
-            SleepRunTrigger::from_str("scheduled").unwrap(),
-            SleepRunTrigger::Scheduled
-        );
-        assert_eq!(
-            SleepRunTrigger::from_str("backfill").unwrap(),
-            SleepRunTrigger::Backfill
-        );
-        assert!(SleepRunTrigger::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn memory_file_from_str() {
-        assert_eq!(
-            MemoryFile::from_str("episodic").unwrap(),
-            MemoryFile::Episodic
-        );
-        assert_eq!(
-            MemoryFile::from_str("semantic").unwrap(),
-            MemoryFile::Semantic
-        );
-        assert_eq!(
-            MemoryFile::from_str("prospective").unwrap(),
-            MemoryFile::Prospective
-        );
-        assert!(MemoryFile::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn episode_event_kind_display() {
-        assert_eq!(EpisodeEventKind::Self_.to_string(), "self");
-        assert_eq!(EpisodeEventKind::Relationship.to_string(), "relationship");
-        assert_eq!(EpisodeEventKind::World.to_string(), "world");
-        assert_eq!(EpisodeEventKind::Feat.to_string(), "feat");
-        assert_eq!(EpisodeEventKind::Anomaly.to_string(), "anomaly");
-        assert_eq!(EpisodeEventKind::Decision.to_string(), "decision");
-        assert_eq!(EpisodeEventKind::Insight.to_string(), "insight");
-        assert_eq!(EpisodeEventKind::Rhythm.to_string(), "rhythm");
-    }
-
-    #[test]
-    fn episode_event_kind_from_str_valid() {
-        assert_eq!(
-            EpisodeEventKind::from_str("self").unwrap(),
-            EpisodeEventKind::Self_
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("relationship").unwrap(),
-            EpisodeEventKind::Relationship
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("world").unwrap(),
-            EpisodeEventKind::World
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("feat").unwrap(),
-            EpisodeEventKind::Feat
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("anomaly").unwrap(),
-            EpisodeEventKind::Anomaly
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("decision").unwrap(),
-            EpisodeEventKind::Decision
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("insight").unwrap(),
-            EpisodeEventKind::Insight
-        );
-        assert_eq!(
-            EpisodeEventKind::from_str("rhythm").unwrap(),
-            EpisodeEventKind::Rhythm
-        );
-    }
-
-    #[test]
-    fn episode_event_kind_from_str_invalid() {
-        assert!(EpisodeEventKind::from_str("unknown").is_err());
-    }
-
-    #[test]
-    fn episode_event_certainty_display() {
-        assert_eq!(EpisodeEventCertainty::Stated.to_string(), "stated");
-        assert_eq!(EpisodeEventCertainty::Derived.to_string(), "derived");
-        assert_eq!(EpisodeEventCertainty::Tentative.to_string(), "tentative");
-    }
-
-    #[test]
-    fn episode_event_certainty_from_str_valid() {
-        assert_eq!(
-            EpisodeEventCertainty::from_str("stated").unwrap(),
-            EpisodeEventCertainty::Stated
-        );
-        assert_eq!(
-            EpisodeEventCertainty::from_str("derived").unwrap(),
-            EpisodeEventCertainty::Derived
-        );
-        assert_eq!(
-            EpisodeEventCertainty::from_str("tentative").unwrap(),
-            EpisodeEventCertainty::Tentative
-        );
-    }
-
-    #[test]
-    fn episode_event_certainty_from_str_invalid() {
-        assert!(EpisodeEventCertainty::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn sender_kind_display() {
-        assert_eq!(SenderKind::User.to_string(), "user");
-    }
-
-    #[test]
-    fn sender_kind_display_assistant() {
-        assert_eq!(SenderKind::Assistant.to_string(), "assistant");
-    }
-
-    #[test]
-    fn sender_kind_display_system() {
-        assert_eq!(SenderKind::System.to_string(), "system");
-    }
-
-    #[test]
-    fn sender_kind_display_tool() {
-        assert_eq!(SenderKind::Tool.to_string(), "tool");
-    }
-
-    #[test]
-    fn sender_kind_from_str() {
-        assert_eq!(
-            SenderKind::from_str("assistant").unwrap(),
-            SenderKind::Assistant
-        );
-        assert_eq!(SenderKind::from_str("user").unwrap(), SenderKind::User);
-        assert_eq!(SenderKind::from_str("system").unwrap(), SenderKind::System);
-        assert_eq!(SenderKind::from_str("tool").unwrap(), SenderKind::Tool);
-    }
-
-    #[test]
-    fn sender_kind_from_str_invalid() {
-        assert!(SenderKind::from_str("unknown").is_err());
     }
 
     #[test]
