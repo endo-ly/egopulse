@@ -55,3 +55,13 @@ channels:
     bot_username: replace-me
     allowed_chat_ids:
       - -1001234567890
+
+  voice:
+    enabled: false
+    auth_token:
+      source: env
+      id: EGOPULSE_VOICE_AUTH_TOKEN
+    default_surface: stackchan
+    default_session: main
+    allowed_surfaces:
+      - stackchan

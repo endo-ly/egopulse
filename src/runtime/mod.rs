@@ -25,6 +25,7 @@ use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
+use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
@@ -169,6 +170,9 @@ pub async fn build_app_state_with_path(
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
+    if config.voice_enabled() {
+        channels.register(Arc::new(VoiceAdapter));
+    }
 
     #[cfg(feature = "channel-discord")]
     if !config.discord_bots().is_empty() {
@@ -534,6 +538,52 @@ pub(crate) fn execute_scheduled_turn(
 }
 
 const MAX_TURN_RETRIES: u32 = 2;
+
+/// Executes one agent turn while recording runtime activity and telemetry.
+///
+/// The crate-visible helper accepts the shared [`AppState`], a
+/// [`crate::agent_loop::SurfaceContext`], and the user `input`, returning the
+/// generated response as `Result<String, EgoPulseError>`. It touches channel
+/// activity, records the completed turn, and records an error plus the
+/// `turn_failure` metric when execution fails.
+///
+/// # Errors
+///
+/// Propagates any [`EgoPulseError`] returned by `execute_turn_with_retry`,
+/// including a final turn failure after retryable errors exhaust their retries.
+/// Such failures are also recorded through `runtime_status.push_error`.
+pub(crate) async fn execute_observed_turn(
+    state: &AppState,
+    context: &crate::agent_loop::SurfaceContext,
+    input: &str,
+) -> Result<String, EgoPulseError> {
+    state
+        .runtime_status
+        .touch_channel_activity(&context.channel);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
+    let result = execute_turn_with_retry(state, context, input).await;
+    let duration = started.elapsed().as_secs_f64();
+    state.runtime_status.push_turn(
+        &context.trace_id,
+        &context.agent_id,
+        &context.channel,
+        &started_at,
+        duration,
+        result.is_ok(),
+    );
+    if let Err(error) = &result {
+        state.runtime_status.push_error(
+            &context.trace_id,
+            "turn_failure",
+            &context.agent_id,
+            &context.channel,
+            &error.to_string(),
+        );
+        crate::runtime::metrics::inc_turn_errors_total("turn_failure", &context.agent_id);
+    }
+    result
+}
 
 async fn execute_turn_with_retry(
     state: &AppState,

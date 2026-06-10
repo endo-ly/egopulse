@@ -92,6 +92,70 @@ fn loads_provider_based_config() {
 
 #[test]
 #[serial]
+fn voice_channel_config_resolves_declared_values() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = sample_config().replace(
+        "  discord:",
+        r#"  voice:
+    enabled: true
+    auth_token: voice-secret
+    default_surface: stackchan
+    default_session: kitchen
+    allowed_surfaces:
+      - stackchan
+      - desk-mic
+  discord:"#,
+    );
+    let file_path = write_config(&temp_dir, &body);
+
+    let config = Config::load(Some(&file_path)).expect("load voice config");
+
+    assert!(config.voice_enabled());
+    assert_eq!(config.voice_auth_token(), Some("voice-secret"));
+    assert_eq!(config.voice_default_surface(), "stackchan");
+    assert_eq!(config.voice_default_session(), "kitchen");
+    assert_eq!(config.voice_allowed_surfaces(), ["stackchan", "desk-mic"]);
+}
+
+#[test]
+#[serial]
+fn voice_channel_enabled_requires_auth_token() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = sample_config().replace("  discord:", "  voice:\n    enabled: true\n  discord:");
+    let file_path = write_config(&temp_dir, &body);
+
+    assert!(matches!(
+        Config::load(Some(&file_path)),
+        Err(ConfigError::MissingVoiceAuthToken)
+    ));
+}
+
+#[test]
+#[serial]
+fn voice_channel_enabled_requires_web_channel() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = sample_config()
+        .replace(
+            "    enabled: true\n    auth_token: web-secret",
+            "    enabled: false\n    auth_token: web-secret",
+        )
+        .replace(
+            "  discord:",
+            "  voice:\n    enabled: true\n    auth_token: voice-secret\n  discord:",
+        );
+    let file_path = write_config(&temp_dir, &body);
+
+    assert!(matches!(
+        Config::load(Some(&file_path)),
+        Err(ConfigError::VoiceRequiresWebChannel)
+    ));
+}
+
+#[test]
+#[serial]
 fn allows_missing_api_key_for_local_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
