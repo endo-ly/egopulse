@@ -47,6 +47,14 @@ fn is_default(b: &bool) -> bool {
 }
 
 #[derive(Serialize)]
+struct SerializableAgentProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
 struct SerializableAgent {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +65,8 @@ struct SerializableAgent {
     discord_bot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     telegram_bot: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    profiles: HashMap<String, SerializableAgentProfile>,
 }
 
 #[derive(Serialize)]
@@ -336,6 +346,19 @@ impl From<&Config> for SerializableConfig {
                         model: a.model.clone(),
                         discord_bot: a.discord_bot.as_ref().map(|b| b.to_string()),
                         telegram_bot: a.telegram_bot.as_ref().map(|b| b.to_string()),
+                        profiles: a
+                            .profiles
+                            .iter()
+                            .map(|(k, p)| {
+                                (
+                                    k.clone(),
+                                    SerializableAgentProfile {
+                                        provider: p.provider.clone(),
+                                        model: p.model.clone(),
+                                    },
+                                )
+                            })
+                            .collect(),
                     },
                 )
             })
