@@ -200,6 +200,8 @@ pub(crate) struct SurfaceContext {
 }
 ```
 
+`channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §3](./config.md#3-モデル解決チェーン)）。
+
 ---
 
 ## 5. リクエストフロー
