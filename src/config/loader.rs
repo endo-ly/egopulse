@@ -93,12 +93,20 @@ struct FileTelegramBotConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct FileAgentProfileConfig {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
     discord_bot: Option<String>,
     telegram_bot: Option<String>,
+    profiles: Option<HashMap<String, FileAgentProfileConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -606,6 +614,24 @@ fn normalize_agents(
             model: normalize_string(fa.model),
             discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
             telegram_bot: normalize_string(fa.telegram_bot).map(|s| BotId::new(&s)),
+            profiles: fa
+                .profiles
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let key = k.trim().to_string();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        key,
+                        super::types::AgentProfileConfig {
+                            provider: normalize_string(v.provider),
+                            model: normalize_string(v.model),
+                        },
+                    ))
+                })
+                .collect(),
         };
         normalized.insert(key, config);
     }
@@ -1018,7 +1044,13 @@ fn validate_agent_provider_references(
     providers: &HashMap<ProviderId, ProviderConfig>,
     agents: &HashMap<AgentId, AgentConfig>,
 ) -> Result<(), ConfigError> {
-    validate_provider_references(providers, agents.values().map(|a| a.provider.as_ref()))
+    validate_provider_references(
+        providers,
+        agents.values().flat_map(|a| {
+            std::iter::once(a.provider.as_ref())
+                .chain(a.profiles.values().map(|p| p.provider.as_ref()))
+        }),
+    )
 }
 
 fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelConfig>) {
