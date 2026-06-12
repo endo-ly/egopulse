@@ -287,6 +287,141 @@ agents:
 
 #[test]
 #[serial]
+fn loader_parses_agent_profiles() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+    profiles:
+      voice:
+        provider: local
+        model: qwen2.5
+      discord:
+        model: gpt-4.1-mini"#,
+    );
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let alice = config
+        .agents
+        .get(&super::AgentId::new("alice"))
+        .expect("alice");
+    let voice = alice.profiles.get("voice").expect("voice profile");
+    assert_eq!(voice.provider.as_deref(), Some("local"));
+    assert_eq!(voice.model.as_deref(), Some("qwen2.5"));
+    let discord = alice.profiles.get("discord").expect("discord profile");
+    assert!(discord.provider.is_none());
+    assert_eq!(discord.model.as_deref(), Some("gpt-4.1-mini"));
+}
+
+#[test]
+#[serial]
+fn save_load_round_trip_preserves_agent_profiles() {
+    use crate::config::persist::save_config_with_secrets;
+    use crate::config::secret_ref::env_resolved_value;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let path = temp_dir.path().join("egopulse.config.yaml");
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: Some("local".to_string()),
+                    model: Some("qwen2.5".to_string()),
+                },
+            )]),
+            ..Default::default()
+        },
+    );
+    agents.insert(
+        super::AgentId::new("default"),
+        super::AgentConfig {
+            label: "Default Agent".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let config = Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers: HashMap::from([
+            (
+                super::ProviderId::new("openai"),
+                super::ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                    default_model: "gpt-5".to_string(),
+                    models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+                },
+            ),
+            (
+                super::ProviderId::new("local"),
+                super::ProviderConfig {
+                    label: "Local".to_string(),
+                    base_url: "http://127.0.0.1:1234/v1".to_string(),
+                    api_key: None,
+                    default_model: "qwen2.5".to_string(),
+                    models: HashMap::new(),
+                },
+            ),
+        ]),
+        state_root: temp_dir.path().to_str().expect("path").to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels: HashMap::new(),
+        default_agent: super::AgentId::new("alice"),
+        agents,
+        timezone: "UTC".to_string(),
+        sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
+    };
+
+    save_config_with_secrets(&config, &path).expect("save config");
+    let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+
+    let alice = loaded
+        .agents
+        .get(&super::AgentId::new("alice"))
+        .expect("alice");
+    let voice = alice.profiles.get("voice").expect("voice profile");
+    assert_eq!(voice.provider.as_deref(), Some("local"));
+    assert_eq!(voice.model.as_deref(), Some("qwen2.5"));
+}
+
+#[test]
+#[serial]
 fn load_allow_missing_api_key_accepts_incomplete_remote_provider() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -3489,4 +3624,272 @@ fn minimal_config_with_channels(
         pulse: super::PulseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Interaction Profiles tests
+// ---------------------------------------------------------------------------
+
+fn profile_config(
+    agent_overrides: impl IntoIterator<Item = (super::AgentId, super::AgentConfig)>,
+) -> super::Config {
+    let mut providers = HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig {
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-openai".to_string(),
+            )),
+            default_model: "gpt-4o-mini".to_string(),
+            models: HashMap::new(),
+        },
+    );
+    providers.insert(
+        super::ProviderId::new("local"),
+        super::ProviderConfig {
+            label: "Local".to_string(),
+            base_url: "http://127.0.0.1:1234/v1".to_string(),
+            api_key: None,
+            default_model: "qwen2.5".to_string(),
+            models: HashMap::new(),
+        },
+    );
+
+    let mut agents: HashMap<super::AgentId, super::AgentConfig> =
+        agent_overrides.into_iter().collect();
+    agents
+        .entry(super::AgentId::new("default"))
+        .or_insert_with(|| super::AgentConfig {
+            label: "Default".to_string(),
+            ..Default::default()
+        });
+
+    let default_agent = agents
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| super::AgentId::new("default"));
+
+    let mut channels = HashMap::new();
+    channels.insert(
+        super::ChannelName::new("web"),
+        super::ChannelConfig {
+            enabled: Some(true),
+            ..Default::default()
+        },
+    );
+
+    super::Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: Some("gpt-5".to_string()),
+        providers,
+        state_root: "/tmp/egopulse".to_string(),
+        log_level: "info".to_string(),
+        compaction_timeout_secs: 180,
+        max_history_messages: 50,
+        compact_keep_recent: 20,
+        default_context_window_tokens: 32768,
+        compaction_threshold_ratio: 0.80,
+        compaction_target_ratio: 0.40,
+        channels,
+        default_agent,
+        agents,
+        timezone: "UTC".to_string(),
+        sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
+    }
+}
+
+#[test]
+fn resolve_llm_uses_profile_model_when_channel_matches() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            provider: Some("openai".to_string()),
+            model: None,
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: None,
+                    model: Some("gpt-4.1-mini".to_string()),
+                },
+            )]),
+            ..Default::default()
+        },
+    )]);
+
+    let resolved = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect("resolve");
+
+    assert_eq!(resolved.model, "gpt-4.1-mini");
+    assert_eq!(resolved.provider, "openai");
+}
+
+#[test]
+fn resolve_llm_uses_profile_provider_when_specified() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            provider: None,
+            model: None,
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: Some("local".to_string()),
+                    model: Some("qwen2.5".to_string()),
+                },
+            )]),
+            ..Default::default()
+        },
+    )]);
+
+    let resolved = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect("resolve");
+
+    assert_eq!(resolved.provider, "local");
+    assert_eq!(resolved.model, "qwen2.5");
+    assert_eq!(resolved.base_url, "http://127.0.0.1:1234/v1");
+}
+
+#[test]
+fn resolve_llm_falls_back_when_profile_not_found_for_channel() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        },
+    )]);
+
+    let resolved = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect("resolve");
+
+    assert_eq!(resolved.model, "gpt-5");
+}
+
+#[test]
+fn resolve_llm_profile_takes_priority_over_agent_default_model() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            model: Some("claude-sonnet-4".to_string()),
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: None,
+                    model: Some("gpt-4.1-mini".to_string()),
+                },
+            )]),
+            ..Default::default()
+        },
+    )]);
+
+    let voice = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect("voice resolve");
+    assert_eq!(voice.model, "gpt-4.1-mini");
+
+    let web = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
+        .expect("web resolve");
+    assert_eq!(web.model, "claude-sonnet-4");
+}
+
+#[test]
+fn different_agents_can_have_different_models_for_same_profile() {
+    let config = profile_config(vec![
+        (
+            super::AgentId::new("alice"),
+            super::AgentConfig {
+                label: "Alice".to_string(),
+                profiles: HashMap::from([(
+                    "voice".to_string(),
+                    super::AgentProfileConfig {
+                        provider: None,
+                        model: Some("gpt-4.1-mini".to_string()),
+                    },
+                )]),
+                ..Default::default()
+            },
+        ),
+        (
+            super::AgentId::new("bob"),
+            super::AgentConfig {
+                label: "Bob".to_string(),
+                profiles: HashMap::from([(
+                    "voice".to_string(),
+                    super::AgentProfileConfig {
+                        provider: None,
+                        model: Some("claude-sonnet-4".to_string()),
+                    },
+                )]),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    let alice = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect("alice voice");
+    assert_eq!(alice.model, "gpt-4.1-mini");
+
+    let bob = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("bob"), "voice")
+        .expect("bob voice");
+    assert_eq!(bob.model, "claude-sonnet-4");
+}
+
+#[test]
+fn resolve_llm_without_profiles_unchanged_behavior() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        },
+    )]);
+
+    let resolved = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "web")
+        .expect("resolve");
+
+    assert_eq!(resolved.model, "gpt-5");
+}
+
+#[test]
+fn validate_agent_profile_provider_references() {
+    let config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: Some("nonexistent".to_string()),
+                    model: None,
+                },
+            )]),
+            ..Default::default()
+        },
+    )]);
+
+    let error = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("alice"), "voice")
+        .expect_err("should fail");
+
+    assert!(
+        matches!(error, ConfigError::InvalidProviderReference { ref provider } if provider == "nonexistent"),
+        "expected InvalidProviderReference, got {error:?}"
+    );
 }
