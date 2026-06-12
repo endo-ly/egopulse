@@ -354,6 +354,14 @@ pub(crate) fn parse_duration(input: &str) -> Result<u64, String> {
     Ok(total_secs)
 }
 
+/// Per-channel profile override within an agent definition.
+/// Keyed by channel name (e.g. "voice") to override provider/model per channel.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AgentProfileConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct AgentConfig {
     pub label: String,
@@ -361,6 +369,7 @@ pub(crate) struct AgentConfig {
     pub model: Option<String>,
     pub discord_bot: Option<BotId>,
     pub telegram_bot: Option<BotId>,
+    pub profiles: HashMap<String, AgentProfileConfig>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -371,6 +380,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("model", &self.model)
             .field("discord_bot", &self.discord_bot)
             .field("telegram_bot", &self.telegram_bot)
+            .field("profiles", &self.profiles)
             .finish()
     }
 }
