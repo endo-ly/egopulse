@@ -619,7 +619,7 @@ fn normalize_agents(
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|(k, v)| {
-                    let key = k.trim().to_string();
+                    let key = k.trim().to_ascii_lowercase().to_string();
                     if key.is_empty() {
                         return None;
                     }
