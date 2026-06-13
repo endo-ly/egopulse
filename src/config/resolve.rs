@@ -31,12 +31,13 @@ impl Config {
         }
     }
 
-    /// Resolves the provider/model pair for a specific agent.
+    /// Resolves the provider/model pair for a specific agent and channel.
     ///
     /// Resolution chain (highest priority first):
-    /// 1. `agent.provider` / `agent.model`
-    /// 2. `config.default_provider` / `config.default_model`
-    /// 3. `provider.default_model`
+    /// 1. `agent.profiles[channel].provider` / `agent.profiles[channel].model`
+    /// 2. `agent.provider` / `agent.model`
+    /// 3. `config.default_provider` / `config.default_model`
+    /// 4. `provider.default_model`
     ///
     /// # Errors
     ///
@@ -46,7 +47,7 @@ impl Config {
     pub(crate) fn resolve_llm_for_agent_channel(
         &self,
         agent_id: &AgentId,
-        _channel: &str,
+        channel: &str,
     ) -> Result<ResolvedLlmConfig, ConfigError> {
         let agent = self
             .agents
@@ -55,10 +56,17 @@ impl Config {
                 agent_id: agent_id.to_string(),
             })?;
 
-        let provider_name = agent
-            .provider
-            .as_deref()
+        let profile = agent.profiles.get(channel);
+
+        let provider_name = profile
+            .and_then(|p| p.provider.as_deref())
             .map(|p| p.trim().to_ascii_lowercase())
+            .or_else(|| {
+                agent
+                    .provider
+                    .as_deref()
+                    .map(|p| p.trim().to_ascii_lowercase())
+            })
             .unwrap_or_else(|| self.default_provider.to_string());
 
         let provider_id = ProviderId::new(&provider_name);
@@ -68,11 +76,11 @@ impl Config {
             }
         })?;
 
-        let model = agent.model.as_deref().map(String::from).unwrap_or_else(|| {
-            self.default_model
-                .clone()
-                .unwrap_or_else(|| provider.default_model.clone())
-        });
+        let model = profile
+            .and_then(|p| p.model.as_deref().map(String::from))
+            .or_else(|| agent.model.as_deref().map(String::from))
+            .or_else(|| self.default_model.clone())
+            .unwrap_or_else(|| provider.default_model.clone());
 
         Ok(ResolvedLlmConfig {
             provider: provider_name,
