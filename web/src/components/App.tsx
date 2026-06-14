@@ -80,7 +80,7 @@ export function App() {
 
   async function refreshHealth() {
     const payload = await api<{ ok: boolean; version: string }>(
-      "/api/health",
+      "/health",
       authTokenRef.current,
     );
     setHealth({ version: payload.version });
