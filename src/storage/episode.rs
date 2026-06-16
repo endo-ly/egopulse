@@ -219,6 +219,8 @@ impl Database {
              FROM chats c
              WHERE c.agent_id = ?1
                AND c.chat_type != 'channel_log'
+               -- TODO(temp): exclude voice channel from sleep batch; remove when no longer needed
+               AND c.chat_type != 'voice'
                AND EXISTS (
                    SELECT 1 FROM messages m
                    WHERE m.chat_id = c.chat_id

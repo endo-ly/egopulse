@@ -934,6 +934,8 @@ impl Database {
              FROM chats c
              JOIN sessions s ON c.chat_id = s.chat_id
              WHERE c.agent_id = ?1 AND (?2 IS NULL OR s.updated_at > ?2)
+             -- TODO(temp): exclude voice channel from sleep batch; remove when no longer needed
+             AND c.chat_type != 'voice'
              ORDER BY s.updated_at DESC
              LIMIT ?3",
         )?;
