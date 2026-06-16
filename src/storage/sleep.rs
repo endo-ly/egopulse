@@ -909,7 +909,9 @@ impl Database {
             "SELECT COUNT(*)
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE c.agent_id = ?1 AND (?2 IS NULL OR m.timestamp > ?2)",
+             WHERE c.agent_id = ?1 AND (?2 IS NULL OR m.timestamp > ?2)
+             -- TODO(temp): exclude voice channel from sleep batch; remove when no longer needed
+             AND c.chat_type != 'voice'",
             params![agent_id, since],
             |row| row.get(0),
         )
