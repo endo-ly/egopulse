@@ -26,8 +26,8 @@ use super::event_extraction::{self, ExtractedEvent};
 use super::event_rollup;
 use super::memory_update;
 
-/// Threshold (≤ 4) at which sleep is skipped due to too few new messages.
-const SKIP_THRESHOLD: i64 = 4;
+/// Threshold (≤ 16) at which sleep is skipped due to too few new messages.
+const SKIP_THRESHOLD: i64 = 16;
 /// Maximum number of source sessions included in sleep input.
 const MAX_SOURCE_SESSIONS: usize = 20;
 
@@ -1909,7 +1909,7 @@ mod tests {
 
     fn seed_messages_for_proceed(db: &Database, agent_id: &str) {
         let chat_id = create_chat(db, agent_id, "");
-        for i in 1..=6 {
+        for i in 1..=17 {
             store_msg(
                 db,
                 &format!("m-{i}"),
@@ -2795,10 +2795,15 @@ mod tests {
     fn collect_returns_skip_when_below_threshold() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        store_msg(&db, "m-1", chat_id, "hi", "2025-01-01T00:00:01Z");
-        store_msg(&db, "m-2", chat_id, "hi", "2025-01-01T00:00:02Z");
-        store_msg(&db, "m-3", chat_id, "hi", "2025-01-01T00:00:03Z");
-        store_msg(&db, "m-4", chat_id, "hi", "2025-01-01T00:00:04Z");
+        for i in 1..=16 {
+            store_msg(
+                &db,
+                &format!("m-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-01-01T00:00:{i:02}Z"),
+            );
+        }
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         match result {
@@ -2806,7 +2811,7 @@ mod tests {
                 reason: _,
                 new_message_count,
             } => {
-                assert_eq!(new_message_count, 4);
+                assert_eq!(new_message_count, 16);
             }
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -2816,7 +2821,7 @@ mod tests {
     fn collect_returns_proceed_above_threshold() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=5 {
+        for i in 1..=17 {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2843,26 +2848,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_returns_proceed_with_many_messages() {
-        let (db, _dir) = test_db();
-        let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=10 {
-            store_msg(
-                &db,
-                &format!("m-{i}"),
-                chat_id,
-                "hi",
-                &format!("2025-01-01T00:00:{i:02}Z"),
-            );
-        }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
-
-        let result = collect_sleep_input(&db, "test-agent").expect("collect");
-        assert!(matches!(result, InputDecision::Proceed { .. }));
-    }
-
-    #[test]
     fn collect_since_last_successful_run() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
@@ -2879,16 +2864,14 @@ mod tests {
             .expect("save session");
 
         let after_cutoff = chrono::Utc::now().to_rfc3339();
-        store_msg(&db, "new-1", chat_id, "new", &after_cutoff);
-        store_msg(&db, "new-2", chat_id, "new", &after_cutoff);
-        store_msg(&db, "new-3", chat_id, "new", &after_cutoff);
-        store_msg(&db, "new-4", chat_id, "new", &after_cutoff);
-        store_msg(&db, "new-5", chat_id, "new", &after_cutoff);
+        for i in 1..=17 {
+            store_msg(&db, &format!("new-{i}"), chat_id, "new", &after_cutoff);
+        }
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         assert!(
             matches!(result, InputDecision::Proceed { .. }),
-            "5 new messages (> 4 threshold) should trigger Proceed"
+            "17 new messages (> 16 threshold) should trigger Proceed"
         );
     }
 
@@ -2896,7 +2879,7 @@ mod tests {
     fn collect_first_run_no_previous_run() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=8 {
+        for i in 1..=17 {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2911,7 +2894,7 @@ mod tests {
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         assert!(
             matches!(result, InputDecision::Proceed { .. }),
-            "8 messages with no previous run should trigger Proceed"
+            "17 messages with no previous run should trigger Proceed"
         );
     }
 
@@ -2938,7 +2921,7 @@ mod tests {
     fn collect_source_chats_json_format() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=6 {
+        for i in 1..=17 {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2983,7 +2966,7 @@ mod tests {
     #[test]
     fn collect_source_chats_json_sorted_newest_first() {
         let (db, _dir) = test_db();
-        for i in 0..8 {
+        for i in 0..17 {
             let cid = create_chat(&db, "test-agent", &format!("-{i}"));
             store_msg(&db, &format!("m{i}"), cid, "hi", "2025-06-01T00:00:00Z");
             db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
