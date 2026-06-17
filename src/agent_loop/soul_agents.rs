@@ -92,12 +92,12 @@ impl SoulAgentsLoader {
             return None;
         }
 
-        let mut section = String::from("# Memories\n");
+        let mut section = String::from("# CONTEXT\n");
         if let Some(content) = global {
-            section.push_str(&format!("\n<agents>\n{content}\n</agents>\n"));
+            section.push_str(&format!("\n<agents>\nThe following is the high-priority main context, which includes rules common to all agents.\n{content}\n</agents>\n"));
         }
         if let Some(content) = agent_agents {
-            section.push_str(&format!("\n<agents>\n{content}\n</agents>\n"));
+            section.push_str(&format!("\n<agents>\nThe following is the context organized by each agent.\n{content}\n</agents>\n"));
         }
         Some(section)
     }
