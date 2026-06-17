@@ -293,6 +293,36 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Updates `sessions.messages_json` to `new_messages_json` and bumps
+    /// `updated_at`. Unlike [`Database::clear_session_messages`], which wipes
+    /// to `[]`, this keeps a caller-supplied payload — used by the sleep
+    /// batch to retain the trailing N messages while still archiving the full
+    /// conversation.
+    ///
+    /// Uses optimistic concurrency: the update only succeeds when
+    /// `expected_updated_at` matches the current row. Returns `Ok(true)` if
+    /// the row was updated, `Ok(false)` on concurrent modification or missing
+    /// row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite update fails.
+    pub(crate) fn truncate_session_messages(
+        &self,
+        chat_id: i64,
+        expected_updated_at: &str,
+        new_messages_json: &str,
+    ) -> Result<bool, StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE sessions SET messages_json = ?1, updated_at = ?2 \
+             WHERE chat_id = ?3 AND updated_at = ?4",
+            params![new_messages_json, now, chat_id, expected_updated_at],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub(crate) fn store_message_with_session(
         &self,
         message: &StoredMessage,
@@ -641,6 +671,58 @@ mod tests {
         assert!(
             snapshot.messages_json.as_deref() != Some(r#"[]"#),
             "messages_json should not be cleared"
+        );
+    }
+
+    #[test]
+    fn truncate_session_messages_replaces_json() {
+        let (db, _dir) = test_db();
+        let chat_id = 300;
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"old"}]"#)
+            .expect("save session");
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        let updated_at = snapshot.updated_at.as_deref().expect("has updated_at");
+
+        let new_json = r#"[{"role":"assistant","content":"kept"}]"#;
+        let truncated = db
+            .truncate_session_messages(chat_id, updated_at, new_json)
+            .expect("truncate session messages");
+        assert!(truncated, "should have updated the row");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        assert_eq!(
+            snapshot.messages_json.as_deref(),
+            Some(new_json),
+            "messages_json should be replaced with the supplied payload"
+        );
+
+        let messages = db
+            .get_recent_messages(chat_id, 10)
+            .expect("load recent messages");
+        assert_eq!(messages.len(), 2, "messages records should be preserved");
+    }
+
+    #[test]
+    fn truncate_session_messages_returns_false_on_stale_timestamp() {
+        let (db, _dir) = test_db();
+        let chat_id = 400;
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let truncated = db
+            .truncate_session_messages(chat_id, "stale-timestamp", r#"[]"#)
+            .expect("truncate session messages");
+        assert!(!truncated, "should not have updated the row");
+
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        assert!(
+            snapshot.messages_json.as_deref() != Some(r#"[]"#),
+            "messages_json should not be modified"
         );
     }
 

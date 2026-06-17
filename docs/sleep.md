@@ -394,9 +394,9 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 1. 各 source session について、event_extraction と prospective_update の両方が成功しているか確認
 2. 両方の checkpoint が進んでいる場合、そのセッションをアーカイブ対象とする
-3. `archive_conversation_blocking()` で会話を Parquet ファイルとして保存
-4. `clear_session_messages()` で `messages` テーブルから該当メッセージを削除
-5. クリアは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
+3. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（`messages_json` 全体）
+4. `truncate_session_messages()` で `sessions.messages_json` を最新4件に切り詰め（`messages` テーブルは無傷）
+5. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
 
 ### Run 状態集約
 

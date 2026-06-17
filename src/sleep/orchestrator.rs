@@ -30,6 +30,10 @@ use super::memory_update;
 const SKIP_THRESHOLD: i64 = 16;
 /// Maximum number of source sessions included in sleep input.
 const MAX_SOURCE_SESSIONS: usize = 20;
+/// Number of trailing messages kept in `sessions.messages_json` after a sleep
+/// batch clears the conversation buffer. The `messages` table retains
+/// everything; this only controls the agent-loop's live context residue.
+const SESSION_CLEAR_KEEP_RECENT: usize = 4;
 
 /// Decision from checking whether enough new messages exist for a sleep run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1783,18 +1787,39 @@ fn archive_and_clear_session(
     }
 
     if let Some(updated_at) = &snapshot.updated_at {
-        let cleared = db
-            .clear_session_messages(session.chat_id, updated_at)
+        let truncated_json =
+            truncate_messages_json(snapshot.messages_json.as_deref(), SESSION_CLEAR_KEEP_RECENT);
+        let truncated = db
+            .truncate_session_messages(session.chat_id, updated_at, &truncated_json)
             .map_err(SleepBatchError::Storage)?;
-        if !cleared {
+        if !truncated {
             warn!(
                 chat_id = session.chat_id,
-                "skipping session clear: concurrent modification detected"
+                "skipping session truncate: concurrent modification detected"
             );
         }
     }
 
     Ok(())
+}
+
+/// Builds the replacement `messages_json` payload for a sleep-batch session
+/// truncate: keeps the trailing `keep` messages, or returns the input
+/// unchanged when it already fits. Falls back to `"[]"` on missing/empty
+/// input or (defensively) on serialization failure.
+fn truncate_messages_json(messages_json: Option<&str>, keep: usize) -> String {
+    let Some(json) = messages_json else {
+        return "[]".to_string();
+    };
+    let messages = parse_messages_json(json);
+    if messages.is_empty() {
+        return "[]".to_string();
+    }
+    if messages.len() <= keep {
+        return json.to_string();
+    }
+    let start = messages.len() - keep;
+    serde_json::to_string(&messages[start..]).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn parse_messages_json(json: &str) -> Vec<Message> {
@@ -3084,5 +3109,42 @@ mod tests {
         let runs_after_second = state2.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(runs_after_second.len(), 2);
         assert_eq!(runs_after_second[0].status, SleepRunStatus::Success);
+    }
+
+    #[test]
+    fn truncate_messages_json_keeps_last_n() {
+        let json = r#"[
+            {"role":"user","content":"m1"},
+            {"role":"assistant","content":"m2"},
+            {"role":"user","content":"m3"},
+            {"role":"assistant","content":"m4"},
+            {"role":"user","content":"m5"},
+            {"role":"assistant","content":"m6"}
+        ]"#;
+        let result = truncate_messages_json(Some(json), 4);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed.len(), 4, "should keep only the trailing 4 messages");
+        assert_eq!(parsed[0]["content"], "m3");
+        assert_eq!(parsed[3]["content"], "m6");
+    }
+
+    #[test]
+    fn truncate_messages_json_keeps_all_when_under_limit() {
+        let json = r#"[{"role":"user","content":"only"}]"#;
+        let result = truncate_messages_json(Some(json), 4);
+        assert_eq!(
+            result, json,
+            "should return input unchanged when at or under limit"
+        );
+    }
+
+    #[test]
+    fn truncate_messages_json_returns_empty_for_none() {
+        assert_eq!(truncate_messages_json(None, 4), "[]");
+    }
+
+    #[test]
+    fn truncate_messages_json_returns_empty_for_empty_input() {
+        assert_eq!(truncate_messages_json(Some("[]"), 4), "[]");
     }
 }
