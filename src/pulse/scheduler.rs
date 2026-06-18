@@ -2,13 +2,34 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use tracing::{info, warn};
 
 use crate::config::AgentId;
+use crate::error::EgoPulseError;
+use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
 use crate::storage::Database;
+
+const PULSE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+async fn guard_activation<Fut>(
+    fut: Fut,
+    timeout: Duration,
+) -> Result<ActivationResult, EgoPulseError>
+where
+    Fut: std::future::Future<Output = Result<ActivationResult, EgoPulseError>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(EgoPulseError::Internal(format!(
+            "pulse activation timeout after {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
 
 /// Run a single pulse scan across all configured agents.
 ///
@@ -82,6 +103,29 @@ async fn process_intention(
     pulse_body: &str,
     timezone: &str,
     now: chrono::DateTime<Utc>,
+) {
+    process_intention_with_activation_timeout(
+        state,
+        agent_id,
+        intention,
+        default_delivery,
+        pulse_body,
+        timezone,
+        now,
+        PULSE_ACTIVATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn process_intention_with_activation_timeout(
+    state: &AppState,
+    agent_id: &AgentId,
+    intention: &super::definition::TemporalIntention,
+    default_delivery: Option<&super::definition::DeliverySpec>,
+    pulse_body: &str,
+    timezone: &str,
+    now: chrono::DateTime<Utc>,
+    activation_timeout: Duration,
 ) {
     let agent_id_str = agent_id.as_str();
 
@@ -204,27 +248,31 @@ async fn process_intention(
         &now_rfc3339,
     );
 
-    // 7. Run activation
-    let activation_result =
-        match super::runner::run_activation(state, agent_id_str, &capsule, &home_surface).await {
-            Ok(result) => result,
-            Err(e) => {
+    // 7. Run activation (guarded by timeout)
+    let activation_result = match guard_activation(
+        super::runner::run_activation(state, agent_id_str, &capsule, &home_surface),
+        activation_timeout,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            warn!(
+                agent_id = agent_id_str,
+                intention_id = %intention.id,
+                error = %e,
+                "pulse scan: activation failed"
+            );
+            if let Err(e) = update_run_failed(&state.db, &pulse_run_id, &e.to_string()).await {
                 warn!(
-                    agent_id = agent_id_str,
-                    intention_id = %intention.id,
+                    pulse_run_id = %pulse_run_id,
                     error = %e,
-                    "pulse scan: activation failed"
+                    "pulse scan: failed to mark pulse_run as failed"
                 );
-                if let Err(e) = update_run_failed(&state.db, &pulse_run_id, &e.to_string()).await {
-                    warn!(
-                        pulse_run_id = %pulse_run_id,
-                        error = %e,
-                        "pulse scan: failed to mark pulse_run as failed"
-                    );
-                }
-                return;
             }
-        };
+            return;
+        }
+    };
 
     // 8. Handle output
     if let Err(e) = super::output::handle_output(
@@ -328,6 +376,15 @@ mod tests {
         pulse_config: PulseConfig,
         agents: Vec<(&str, &str)>,
     ) -> AppState {
+        build_pulse_state_with_llm(dir, pulse_config, agents, Arc::new(MockPulseLlm::new()))
+    }
+
+    fn build_pulse_state_with_llm(
+        dir: &tempfile::TempDir,
+        pulse_config: PulseConfig,
+        agents: Vec<(&str, &str)>,
+        llm: Arc<dyn crate::llm::LlmProvider>,
+    ) -> AppState {
         let state_root = dir.path().to_str().expect("utf8");
         let mut config = crate::test_util::test_config(state_root);
         config.pulse = pulse_config;
@@ -354,7 +411,7 @@ mod tests {
 
         crate::test_util::build_state_with_config(
             config.clone(),
-            Some(Arc::new(MockPulseLlm::new())),
+            Some(llm),
             None,
             Some(Arc::new(Database::new(&config.db_path()).expect("db"))),
             Some(Arc::new(channels)),
@@ -772,5 +829,101 @@ intentions:
             .expect("intention_id");
         drop(conn);
         assert_eq!(intention_id, "active_check");
+    }
+
+    #[tokio::test]
+    async fn guard_activation_returns_err_on_timeout() {
+        use std::future::pending;
+        use std::time::Duration;
+
+        let pending_future = pending::<Result<ActivationResult, EgoPulseError>>();
+        let result = guard_activation(pending_future, Duration::from_millis(100)).await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timeout"),
+            "expected timeout in error message, got: {msg}"
+        );
+    }
+
+    struct PendingLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for PendingLlm {
+        fn provider_name(&self) -> &str {
+            "pending-mock"
+        }
+
+        fn model_name(&self) -> &str {
+            "pending-mock-model"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn process_intention_marks_run_failed_on_activation_timeout() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state_with_llm(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", &valid_daily_pulse_md())],
+            Arc::new(PendingLlm),
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        let definition = super::super::definition::load_pulse_definition(
+            std::path::Path::new(&state.config.state_root),
+            "default",
+        )
+        .expect("load pulse definition");
+        let intention = &definition.intentions[0];
+        let agent_id = AgentId::new("default");
+        let now = chrono::Utc::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            process_intention_with_activation_timeout(
+                &state,
+                &agent_id,
+                intention,
+                definition.default_delivery.as_ref(),
+                &definition.body,
+                "UTC",
+                now,
+                Duration::from_millis(100),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "inner activation timeout should fire before outer wall-clock, got Elapsed"
+        );
+
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "timeout should still create exactly 1 pulse_run"
+        );
+        assert_eq!(
+            latest_run_status(&state.db, "default"),
+            PulseRunStatus::Failed,
+            "pulse_run should be marked failed on activation timeout"
+        );
     }
 }
