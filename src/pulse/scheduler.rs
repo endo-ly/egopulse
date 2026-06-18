@@ -22,12 +22,32 @@ async fn guard_activation<Fut>(
 where
     Fut: std::future::Future<Output = Result<ActivationResult, EgoPulseError>>,
 {
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(EgoPulseError::Internal(format!(
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    match AssertUnwindSafe(tokio::time::timeout(timeout, fut))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_elapsed)) => Err(EgoPulseError::Internal(format!(
             "pulse activation timeout after {}s",
             timeout.as_secs()
         ))),
+        Err(panic_payload) => Err(EgoPulseError::Internal(format!(
+            "pulse activation panicked: {}",
+            extract_panic_message(&panic_payload)
+        ))),
+    }
+}
+
+fn extract_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -847,6 +867,24 @@ intentions:
         );
     }
 
+    #[tokio::test]
+    async fn guard_activation_catches_panic() {
+        use std::time::Duration;
+
+        let panicking_future = async {
+            let _result: Result<ActivationResult, EgoPulseError> = panic!("boom from activation");
+        };
+
+        let result = guard_activation(panicking_future, Duration::from_secs(60)).await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("panic"),
+            "expected panic in error message, got: {msg}"
+        );
+    }
+
     struct PendingLlm;
 
     #[async_trait::async_trait]
@@ -866,6 +904,28 @@ intentions:
             _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             std::future::pending().await
+        }
+    }
+
+    struct PanickingLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for PanickingLlm {
+        fn provider_name(&self) -> &str {
+            "panicking-mock"
+        }
+
+        fn model_name(&self) -> &str {
+            "panicking-mock-model"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            panic!("panicking-mock-llm: boom from send_message")
         }
     }
 
@@ -924,6 +984,78 @@ intentions:
             latest_run_status(&state.db, "default"),
             PulseRunStatus::Failed,
             "pulse_run should be marked failed on activation timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_intention_marks_run_failed_on_activation_panic() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state_with_llm(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", &valid_daily_pulse_md())],
+            Arc::new(PanickingLlm),
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        let definition = super::super::definition::load_pulse_definition(
+            std::path::Path::new(&state.config.state_root),
+            "default",
+        )
+        .expect("load pulse definition");
+        let intention = &definition.intentions[0];
+        let agent_id = AgentId::new("default");
+        let now = chrono::Utc::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            process_intention_with_activation_timeout(
+                &state,
+                &agent_id,
+                intention,
+                definition.default_delivery.as_ref(),
+                &definition.body,
+                "UTC",
+                now,
+                Duration::from_secs(60),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "panic should be caught by guard_activation, got Elapsed"
+        );
+
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "panic should still create exactly 1 pulse_run"
+        );
+        assert_eq!(
+            latest_run_status(&state.db, "default"),
+            PulseRunStatus::Failed,
+            "pulse_run should be marked failed on activation panic"
+        );
+
+        let conn = state.db.get_conn().expect("pool");
+        let error_msg: String = conn
+            .query_row(
+                "SELECT error_message FROM pulse_runs WHERE agent_id = ?1 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params!["default"],
+                |row| row.get(0),
+            )
+            .expect("error_message");
+        drop(conn);
+        assert!(
+            error_msg.contains("panic"),
+            "error_message should mention panic, got: {error_msg}"
         );
     }
 }
