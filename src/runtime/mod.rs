@@ -837,6 +837,16 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     }
 
     if state.config.pulse().scheduler_enabled() {
+        match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
+            db.reap_orphaned_pulse_runs()
+        })
+        .await
+        {
+            Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
+        }
+
         let pulse_state = state.clone();
         info!("Starting pulse scheduler");
         let handle = tokio::spawn(async move {
