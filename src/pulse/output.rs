@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::agent_loop::session::{
     PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once,
@@ -120,15 +120,9 @@ async fn handle_notify(
                 channel = %home_surface.channel,
                 "pulse channel adapter not found, marking run as failed"
             );
-            let db = Arc::clone(&state.db);
-            let run_id = pulse_run_id.to_string();
             let error_msg = format!("channel adapter not found: {}", home_surface.channel);
             let error_for_return = error_msg.clone();
-            crate::storage::call_blocking(db, move |db| {
-                db.update_pulse_run_failed(&run_id, &error_msg)
-            })
-            .await
-            .ok();
+            mark_pulse_run_failed_or_log(&state.db, pulse_run_id, &error_msg).await;
             return Err(EgoPulseError::Internal(error_for_return));
         }
     };
@@ -143,14 +137,8 @@ async fn handle_notify(
             channel = %home_surface.channel,
             "pulse send failed"
         );
-        let db = Arc::clone(&state.db);
-        let run_id = pulse_run_id.to_string();
         let error_msg = format!("channel send failed: {e}");
-        crate::storage::call_blocking(db, move |db| {
-            db.update_pulse_run_failed(&run_id, &error_msg)
-        })
-        .await
-        .ok();
+        mark_pulse_run_failed_or_log(&state.db, pulse_run_id, &error_msg).await;
         return Err(EgoPulseError::Internal(format!(
             "pulse channel send failed: {e}"
         )));
@@ -174,14 +162,8 @@ async fn handle_notify(
                 intention_id = %intention.id,
                 "pulse notification persistence failed (message was delivered)"
             );
-            let db = Arc::clone(&state.db);
-            let run_id = pulse_run_id.to_string();
             let error_msg = e.to_string();
-            crate::storage::call_blocking(db, move |db| {
-                db.update_pulse_run_failed(&run_id, &error_msg)
-            })
-            .await
-            .ok();
+            mark_pulse_run_failed_or_log(&state.db, pulse_run_id, &error_msg).await;
             return Err(e);
         }
     };
@@ -207,6 +189,27 @@ async fn handle_notify(
         output_text: output_text.to_string(),
         output_kind: PulseOutputKind::Notify,
     })
+}
+
+async fn mark_pulse_run_failed_or_log(
+    db: &Arc<crate::storage::Database>,
+    pulse_run_id: &str,
+    error_message: &str,
+) {
+    let db = Arc::clone(db);
+    let run_id = pulse_run_id.to_string();
+    let error_message = error_message.to_string();
+    let result = crate::storage::call_blocking(db, move |db| {
+        db.update_pulse_run_failed(&run_id, &error_message)
+    })
+    .await;
+    if let Err(update_err) = result {
+        error!(
+            pulse_run_id = %pulse_run_id,
+            error = %update_err,
+            "failed to mark pulse_run as failed"
+        );
+    }
 }
 
 /// Build the synthetic user-visible content for a Pulse intention injection.
@@ -936,5 +939,147 @@ mod tests {
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.sender_id, "pulse");
         assert_eq!(msg.message_kind, MessageKind::SystemEvent);
+    }
+
+    struct ErrorCountLayer {
+        count: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ErrorCountLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                *self.count.lock().expect("error count lock") += 1;
+            }
+        }
+    }
+
+    fn capture_error_logs() -> (
+        Arc<std::sync::Mutex<usize>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let count = Arc::new(std::sync::Mutex::new(0usize));
+        let layer = ErrorCountLayer {
+            count: Arc::clone(&count),
+        };
+        let guard = tracing_subscriber::registry().with(layer).set_default();
+        (count, guard)
+    }
+
+    #[tokio::test]
+    async fn handle_notify_logs_error_when_failed_update_db_errors() {
+        // Arrange: capture tracing ERROR events on this thread
+        let (error_count, _guard) = capture_error_logs();
+
+        // Arrange: empty channel registry → adapter-not-found error path
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state_with_channels(&dir, Arc::new(ChannelRegistry::new()));
+        let agent_id = "lyre";
+        let intention = test_intention("db_err_test");
+        let pulse_run_id = "run-db-err-001";
+
+        let chat_id = insert_chat(&state.db, agent_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
+
+        let home_surface = test_home_surface(chat_id);
+        let activation = ActivationResult {
+            output_text: "msg".to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
+        };
+
+        // Drop pulse_runs so update_pulse_run_failed returns Err
+        {
+            let conn = state.db.get_conn().expect("pool");
+            conn.execute("DROP TABLE pulse_runs", rusqlite::params![])
+                .expect("drop pulse_runs");
+        }
+
+        // Act
+        let result = handle_output(
+            &state,
+            agent_id,
+            &intention,
+            &home_surface,
+            &activation,
+            pulse_run_id,
+        )
+        .await;
+
+        // Assert: original Err still propagates
+        assert!(
+            result.is_err(),
+            "handle_output should still return Err for adapter not found"
+        );
+
+        // Assert: DB error was surfaced via error! (currently swallowed by .ok())
+        let captured = *error_count.lock().expect("error count lock");
+        assert!(
+            captured >= 1,
+            "expected at least one error! log for DB failure, got {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_notify_succeeds_silently_when_failed_update_db_succeeds() {
+        // Arrange: capture tracing ERROR events on this thread
+        let (error_count, _guard) = capture_error_logs();
+
+        // Arrange: empty channel registry → adapter-not-found path,
+        // but pulse_runs table is intact so update_pulse_run_failed succeeds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state_with_channels(&dir, Arc::new(ChannelRegistry::new()));
+        let agent_id = "lyre";
+        let intention = test_intention("silent_err_test");
+        let pulse_run_id = "run-silent-001";
+
+        let chat_id = insert_chat(&state.db, agent_id);
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
+
+        let home_surface = test_home_surface(chat_id);
+        let activation = ActivationResult {
+            output_text: "msg".to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
+        };
+
+        // Act
+        let result = handle_output(
+            &state,
+            agent_id,
+            &intention,
+            &home_surface,
+            &activation,
+            pulse_run_id,
+        )
+        .await;
+
+        // Assert: Err returned (adapter not found) but DB write succeeded,
+        // so no error! log should be emitted.
+        assert!(
+            result.is_err(),
+            "handle_output should return Err for missing adapter"
+        );
+        let captured = *error_count.lock().expect("error count lock");
+        assert_eq!(
+            captured, 0,
+            "no error! log expected when update_pulse_run_failed succeeds, got {captured}"
+        );
+
+        // Assert: run was marked failed as expected
+        let run = state
+            .db
+            .get_pulse_run(pulse_run_id)
+            .expect("get run")
+            .expect("exists");
+        assert_eq!(run.status, crate::storage::PulseRunStatus::Failed);
     }
 }
