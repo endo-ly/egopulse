@@ -292,7 +292,7 @@ mod tests {
 
         let result = loader.build_agents_section("web", "thread1", None);
         let section = result.expect("should return Some");
-        assert!(section.contains("# Memories"));
+        assert!(section.contains("# CONTEXT"));
         assert!(section.contains("<agents>"));
         assert!(section.contains("Global agents content"));
         assert!(section.contains("</agents>"));

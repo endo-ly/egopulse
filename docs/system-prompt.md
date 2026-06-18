@@ -24,7 +24,7 @@ LLM に送信される system prompt の構築方法を定義する。
 ┌─────────────────────────────────────────────────────────────┐
 │ ① <soul> セクション      （SOUL.md が存在する場合のみ）      │
 │ ② Core Instructions       （固定テキスト、常に出力）          │
-│ ③ # Memories セクション   （AGENTS.md が存在する場合のみ）    │
+│ ③ # CONTEXT セクション   （AGENTS.md が存在する場合のみ）    │
 │ ④ # Long-term Memory      （記憶ファイルが存在する場合のみ）  │
 │ ⑤ # Agent Skills セクション（スキルが存在する場合のみ）       │
 └─────────────────────────────────────────────────────────────┘
@@ -33,7 +33,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | セクション | 条件 | 内容 | コード位置 |
 |---|---|---|---|
 | ① Soul | SOUL.md 存在時 | `<soul>` タグでラップされた人格定義 | `turn.rs:566-568` → `soul_agents.rs:94-95` |
-| ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `turn.rs:571-621` |
+| ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `prompt_builder.rs:build_base_prompt` ← `prompts/core_instructions.md` (`include_str!`) |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
 | ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
 | ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
@@ -141,7 +141,8 @@ I am a capable, action-oriented AI assistant that lives inside chat channels.
 
 ### 4.2 Core Instructions（注入順: ②、常に出力）
 
-**コード**: [`src/agent_loop/turn.rs`](../src/agent_loop/turn.rs) 571-621 行目
+**ファイル**: [`src/agent_loop/prompts/core_instructions.md`](../src/agent_loop/prompts/core_instructions.md)
+**コード**: [`src/agent_loop/prompt_builder.rs`](../src/agent_loop/prompt_builder.rs) `build_base_prompt()` （`include_str!` + `replace()` で `{CHANNEL}` / `{SESSION}` / `{CHAT_TYPE}` を埋め込む）
 
 ```
 You are an AI assistant running on the '{channel}' channel. You can execute tools to help users with tasks.
@@ -161,7 +162,7 @@ IMPORTANT: When you need to run a shell command, execute it using the actual `ba
 Use the tool_call format provided by the API. Do NOT write `[tool_use: tool_name(...)]` as text; that is only a message-history summary and will NOT execute.
 
 Example:
-- WRONG: `[tool_use: bash({{"command": "ls"}})]`  ← text only, not execution
+- WRONG: `[tool_use: bash({"command": "ls"})]`  ← text only, not execution
 - CORRECT: call the real `bash` tool with `command: "ls"`
 
 Built-in execution playbook:
@@ -197,7 +198,7 @@ Be concise and helpful.
 **コード**: [`src/soul_agents.rs`](../src/soul_agents.rs) `build_agents_section()` (98-118 行目)
 
 ```
-# Memories
+# CONTEXT
 
 <agents>
 {グローバル AGENTS.md の内容}
@@ -239,7 +240,7 @@ let system_prompt = build_system_prompt(state, &context);
 ```text
 ① <soul> セクション
 ② Core Instructions
-③ # Memories セクション
+③ # CONTEXT セクション
 ④ # Long-term Memory（prospective 含む）
 ⑤ # Agent Skills セクション
 ```
