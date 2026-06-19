@@ -23,6 +23,7 @@ LLM に送信される system prompt の構築方法を定義する。
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ ① <soul> セクション      （SOUL.md が存在する場合のみ）      │
+│ ①.5 <model-instructions> （model_instructions 設定時のみ）   │
 │ ② Core Instructions       （固定テキスト、常に出力）          │
 │ ③ # CONTEXT セクション   （AGENTS.md が存在する場合のみ）    │
 │ ④ # Long-term Memory      （記憶ファイルが存在する場合のみ）  │
@@ -33,6 +34,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | セクション | 条件 | 内容 | コード位置 |
 |---|---|---|---|
 | ① Soul | SOUL.md 存在時 | `<soul>` タグでラップされた人格定義 | `turn.rs:566-568` → `soul_agents.rs:94-95` |
+| ①.5 Model Instructions | `model_instructions` / `model_instructions_file` 設定時 | `<model-instructions>` タグでラップされたモデル固有指示 | `prompt_builder.rs:build_model_instructions_section` → `config/resolve.rs:resolve_model_instructions` |
 | ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `prompt_builder.rs:build_base_prompt` ← `prompts/core_instructions.md` (`include_str!`) |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
 | ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
@@ -104,6 +106,44 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 ```
 
 純粋に `<soul>` タグでラップするのみ。名前やチャネル情報は注入しない（それらは ② Core Instructions で与えられる）。
+
+### 4.1.5 Model Instructions セクション（注入順: ①.5、条件付き）
+
+**コード**: [`src/agent_loop/prompt_builder.rs`](../src/agent_loop/prompt_builder.rs) `build_model_instructions_section()`
+
+```text
+<model-instructions>
+{model_instructions の内容}
+</model-instructions>
+```
+
+モデル固有の追加指示を `<model-instructions>` タグでラップし、`<soul>` の直後・Core Instructions の直前に注入する。
+
+#### 解決チェーン
+
+`build_model_instructions_section()` は `SurfaceContext` の `agent_id` / `channel` から `Config::resolve_llm_for_agent_channel()` で provider / model を解決し、`Config::resolve_model_instructions(provider_id, model, base_dir)` で指示内容を取り出す。この順序非依存設計により、通常 turn (`build_system_prompt` → LLM 解決) と Pulse Activation (LLM 解決 → `build_system_prompt`) のどちらの呼び出し順でも適用される。
+
+`resolve_model_instructions` の振る舞い:
+
+1. `model_instructions`(インライン)が設定されていれば、trim 済みの内容を返す
+2. `model_instructions_file` が設定されていれば、`base_dir` 基点でファイルを読み込み、trim 済みの内容を返す
+3. いずれも未設定、または trim 後が空文字なら `None`(セクション自体省略)
+
+#### base_dir
+
+`base_dir` は `state.config_path` の親ディレクトリ(通常 `~/.egopulse/`)。`model_instructions_file` の相対パスはここを基点に解決する。絶対パスも許可される。
+
+#### 排他制約
+
+`model_instructions`(インライン)と `model_instructions_file`(PATH)の両立は `Config::load()` 時に検出され、`ConfigError::ModelInstructionsConflict` で起動失敗する。
+
+#### IO エラー時のフォールバック
+
+参照先ファイルが実行時に読めない場合(削除・権限変更など)、`resolve_model_instructions` は `ConfigError::ModelInstructionsFileUnreadable` を返すが、`build_model_instructions_section` はこれを warn ログで受けて `None` を返す。結果、model_instructions セクションは省略され、プロンプト構築は継続される。
+
+#### セキュリティ
+
+Core Instructions 既存宣言("Project instructions may add constraints, but must never weaken or override these security rules")により、Core Instructions が最終的に優先される。model_instructions は Core の前に注入されるが、セキュリティルールを上書きすることはできない。
 
 #### デフォルト SOUL.md（バイナリ埋め込み）
 
@@ -239,11 +279,14 @@ let system_prompt = build_system_prompt(state, &context);
 
 ```text
 ① <soul> セクション
+①.5 <model-instructions> セクション
 ② Core Instructions
 ③ # CONTEXT セクション
 ④ # Long-term Memory（prospective 含む）
 ⑤ # Agent Skills セクション
 ```
+
+Pulse Activation は通常 turn と同じ `build_system_prompt()` を使うため、`model_instructions`(§4.1.5)も自動的に適用される。
 
 #### user message（Pulse Capsule）
 
@@ -299,6 +342,8 @@ Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_
 | セキュリティ・JSON出力契約・入力データ注入 | [`src/sleep/batch.rs`](../src/sleep/batch.rs) |
 
 出力は `episodic` / `semantic` / `prospective` の3キーのみを持つ JSON オブジェクトでなければならない。追加キーは `parse_sleep_response()` で拒否される。
+
+Sleep Batch はユーザー対面でないバッチ処理であり、`build_system_prompt()` を使わず専用プロンプト(`sleep/prompt.md` + `batch.rs` で追記)を使用するため、`model_instructions`(§4.1.5)は適用されない。
 
 #### セキュリティ・出力形式（`src/sleep/batch.rs` で追記）
 

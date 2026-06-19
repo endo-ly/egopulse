@@ -826,6 +826,17 @@ fn normalize_provider_map(
             models.insert(default_model.clone(), ModelConfig::default());
         }
 
+        for (model_name, model_config) in &models {
+            if model_config.model_instructions.is_some()
+                && model_config.model_instructions_file.is_some()
+            {
+                return Err(ConfigError::ModelInstructionsConflict {
+                    provider: key.to_string(),
+                    model: model_name.clone(),
+                });
+            }
+        }
+
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
         if !allow_missing_api_key
             && api_key.is_none()

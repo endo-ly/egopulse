@@ -2370,6 +2370,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                         "gpt-5".to_string(),
                         ModelConfig {
                             context_window_tokens: Some(200000),
+                            ..Default::default()
                         },
                     ),
                     ("gpt-4o-mini".to_string(), ModelConfig::default()),
@@ -3892,4 +3893,182 @@ fn validate_agent_profile_provider_references() {
         matches!(error, ConfigError::InvalidProviderReference { ref provider } if provider == "nonexistent"),
         "expected InvalidProviderReference, got {error:?}"
     );
+}
+
+#[test]
+#[serial]
+fn model_instructions_conflict_when_both_specified() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions: |
+          Be concise.
+        model_instructions_file: instructions.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+
+    let error = Config::load(Some(&file_path)).expect_err("conflict should fail");
+
+    match error {
+        ConfigError::ModelInstructionsConflict { provider, model } => {
+            assert_eq!(provider, "openai");
+            assert_eq!(model, "gpt-4o-mini");
+        }
+        _ => panic!("expected ModelInstructionsConflict, got {error:?}"),
+    }
+}
+
+#[test]
+#[serial]
+fn resolve_model_instructions_returns_inline() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions: "  Be concise.  "
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result.as_deref(), Some("Be concise."));
+}
+
+#[test]
+#[serial]
+fn resolve_model_instructions_reads_file_relative_to_base_dir() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    std::fs::write(temp_dir.path().join("instructions.txt"), "Be concise.\n").expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: instructions.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result.as_deref(), Some("Be concise."));
+}
+
+#[test]
+#[serial]
+fn resolve_model_instructions_returns_none_for_blank_content() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    std::fs::write(temp_dir.path().join("blank.txt"), "   \n\t\n  ").expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: blank.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result, None);
+}
+
+#[test]
+#[serial]
+fn resolve_model_instructions_rejects_file_exceeding_size_limit() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let oversized = "a".repeat(64 * 1024 + 1);
+    std::fs::write(temp_dir.path().join("oversize.txt"), &oversized).expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: oversize.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let error = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect_err("should fail");
+
+    match error {
+        ConfigError::ModelInstructionsFileUnreadable { detail, .. } => {
+            assert!(
+                detail.contains("file too large"),
+                "expected size-limit detail, got: {detail}"
+            );
+        }
+        _ => panic!("expected ModelInstructionsFileUnreadable, got {error:?}"),
+    }
 }

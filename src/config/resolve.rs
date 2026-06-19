@@ -300,6 +300,50 @@ impl Config {
             .unwrap_or(self.default_context_window_tokens)
     }
 
+    /// Resolves the model-specific instructions content for a provider+model pair.
+    ///
+    /// Returns the trimmed inline `model_instructions` content when set.
+    /// When only `model_instructions_file` is set, the referenced file is read
+    /// (relative paths resolve against `base_dir`) and its trimmed contents are
+    /// returned. Surrounding whitespace is trimmed; empty/whitespace-only content
+    /// yields `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ModelInstructionsFileUnreadable`] when the
+    /// referenced file cannot be read or exceeds
+    /// [`MAX_MODEL_INSTRUCTIONS_FILE_BYTES`].
+    pub(crate) fn resolve_model_instructions(
+        &self,
+        provider_id: &ProviderId,
+        model: &str,
+        base_dir: &std::path::Path,
+    ) -> Result<Option<String>, ConfigError> {
+        let Some(provider) = self.providers.get(provider_id) else {
+            return Ok(None);
+        };
+        let Some(model_config) = provider.models.get(model) else {
+            return Ok(None);
+        };
+        if let Some(inline) = &model_config.model_instructions {
+            let trimmed = inline.trim();
+            return Ok(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            });
+        }
+        let Some(relative) = &model_config.model_instructions_file else {
+            return Ok(None);
+        };
+        let path = if std::path::Path::new(relative).is_absolute() {
+            std::path::PathBuf::from(relative)
+        } else {
+            base_dir.join(relative)
+        };
+        read_model_instructions_file(provider_id, model, &path)
+    }
+
     /// Saves config with SecretRef-aware YAML and .env file.
     pub(crate) fn save_config_with_secrets(
         &self,
@@ -450,4 +494,45 @@ pub(super) fn default_compaction_target_ratio() -> f64 {
 
 pub(super) fn default_compact_keep_recent() -> usize {
     20
+}
+
+// 64KB ceiling: `model_instructions_file` is re-read on every turn and every
+// Pulse activation, so an unbounded file would degrade latency and memory.
+// Roughly 16k tokens, ample for any system-prompt-level directive.
+const MAX_MODEL_INSTRUCTIONS_FILE_BYTES: u64 = 64 * 1024;
+
+fn read_model_instructions_file(
+    provider_id: &ProviderId,
+    model: &str,
+    path: &std::path::Path,
+) -> Result<Option<String>, ConfigError> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| model_instructions_io_err(provider_id, model, path, e.to_string()))?
+        .len();
+    if file_size > MAX_MODEL_INSTRUCTIONS_FILE_BYTES {
+        return Err(model_instructions_io_err(
+            provider_id,
+            model,
+            path,
+            format!("file too large: {file_size} bytes (max {MAX_MODEL_INSTRUCTIONS_FILE_BYTES})"),
+        ));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| model_instructions_io_err(provider_id, model, path, e.to_string()))?;
+    let trimmed = content.trim();
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+}
+
+fn model_instructions_io_err(
+    provider_id: &ProviderId,
+    model: &str,
+    path: &std::path::Path,
+    detail: String,
+) -> ConfigError {
+    ConfigError::ModelInstructionsFileUnreadable {
+        provider: provider_id.to_string(),
+        model: model.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        detail,
+    }
 }

@@ -15,6 +15,11 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
         prompt.push_str("\n\n");
     }
 
+    if let Some(instr) = build_model_instructions_section(state, context) {
+        prompt.push_str(&instr);
+        prompt.push_str("\n\n");
+    }
+
     prompt.push_str(&build_base_prompt(context));
 
     if let Some(agents_section) = build_agents_prompt_section(state, context) {
@@ -49,6 +54,37 @@ fn build_soul_prompt_section(state: &AppState, context: &SurfaceContext) -> Opti
             .soul_agents
             .build_soul_section(&soul_content, &context.channel),
     )
+}
+
+fn build_model_instructions_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+    let config = &state.config;
+    let agent_id = crate::config::AgentId::new(&context.agent_id);
+    let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "model_instructions: llm resolution failed");
+            return None;
+        }
+    };
+    let provider_id = crate::config::ProviderId::new(&resolved.provider);
+    let base_dir = state
+        .config_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let content = match config.resolve_model_instructions(&provider_id, &resolved.model, base_dir) {
+        Ok(Some(c)) => c,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "model_instructions: resolution failed");
+            return None;
+        }
+    };
+
+    Some(format!(
+        "<model-instructions>\n{content}\n</model-instructions>"
+    ))
 }
 
 fn build_agents_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
@@ -586,6 +622,121 @@ mod tests {
         assert!(
             prompt.contains("Built-in execution playbook"),
             "should still contain identity section"
+        );
+    }
+
+    fn build_test_state_with_instructions(
+        state_root: &std::path::Path,
+        instructions: &str,
+    ) -> AppState {
+        let mut config = test_util::test_config(state_root.to_str().expect("utf8"));
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .models
+            .get_mut("gpt-4o-mini")
+            .expect("gpt-4o-mini")
+            .model_instructions = Some(instructions.to_string());
+        test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::from(Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })
+                as Box<dyn crate::llm::LlmProvider>)),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn system_prompt_injects_model_instructions_between_soul_and_core() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "global soul content");
+        let state = build_test_state_with_instructions(dir.path(), "You prefer terse output.");
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            prompt.contains("<model-instructions>"),
+            "should contain <model-instructions> tag"
+        );
+        assert!(
+            prompt.contains("</model-instructions>"),
+            "should contain </model-instructions> tag"
+        );
+        assert!(
+            prompt.contains("You prefer terse output."),
+            "should contain instructions content"
+        );
+
+        let soul_pos = prompt.find("<soul>").expect("should find <soul>");
+        let instructions_pos = prompt
+            .find("<model-instructions>")
+            .expect("should find <model-instructions>");
+        let core_pos = prompt
+            .find("Built-in execution playbook")
+            .expect("should find execution playbook");
+        assert!(
+            soul_pos < instructions_pos,
+            "<soul> should appear before <model-instructions>"
+        );
+        assert!(
+            instructions_pos < core_pos,
+            "<model-instructions> should appear before execution playbook"
+        );
+    }
+
+    #[test]
+    fn system_prompt_without_model_instructions_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "global soul content");
+        let state = build_test_state(dir.path());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("<model-instructions>"),
+            "should not contain <model-instructions> when not configured"
+        );
+        assert!(prompt.contains("<soul>"), "<soul> should still be present");
+        assert!(
+            prompt.contains("Built-in execution playbook"),
+            "core instructions should still be present"
+        );
+    }
+
+    #[test]
+    fn build_model_instructions_section_returns_none_on_io_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_util::test_config(dir.path().to_str().expect("utf8"));
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .models
+            .get_mut("gpt-4o-mini")
+            .expect("gpt-4o-mini")
+            .model_instructions_file = Some("missing.txt".to_string());
+        let state = test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::from(Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })
+                as Box<dyn crate::llm::LlmProvider>)),
+            Some(dir.path().join("egopulse.config.yaml")),
+            None,
+            None,
+        );
+
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("<model-instructions>"),
+            "should not contain <model-instructions> on IO error"
+        );
+        assert!(
+            prompt.contains("Built-in execution playbook"),
+            "core instructions should still be present despite fallback"
         );
     }
 }
