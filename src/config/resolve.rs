@@ -303,14 +303,21 @@ impl Config {
     /// Resolves the model-specific instructions content for a provider+model pair.
     ///
     /// Returns the trimmed inline `model_instructions` content when set.
-    /// Surrounding whitespace is trimmed; empty/whitespace-only content yields `None`.
+    /// When only `model_instructions_file` is set, the referenced file is read
+    /// (relative paths resolve against `base_dir`) and its trimmed contents are
+    /// returned. Surrounding whitespace is trimmed; empty/whitespace-only content
+    /// yields `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ModelInstructionsFileUnreadable`] when the
+    /// referenced file cannot be read.
     pub(crate) fn resolve_model_instructions(
         &self,
         provider_id: &ProviderId,
         model: &str,
         base_dir: &std::path::Path,
     ) -> Result<Option<String>, ConfigError> {
-        let _ = base_dir;
         let Some(provider) = self.providers.get(provider_id) else {
             return Ok(None);
         };
@@ -319,6 +326,27 @@ impl Config {
         };
         if let Some(inline) = &model_config.model_instructions {
             let trimmed = inline.trim();
+            return Ok(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            });
+        }
+        if let Some(relative) = &model_config.model_instructions_file {
+            let path = if std::path::Path::new(relative).is_absolute() {
+                std::path::PathBuf::from(relative)
+            } else {
+                base_dir.join(relative)
+            };
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                ConfigError::ModelInstructionsFileUnreadable {
+                    provider: provider_id.to_string(),
+                    model: model.to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                }
+            })?;
+            let trimmed = content.trim();
             return Ok(if trimmed.is_empty() {
                 None
             } else {

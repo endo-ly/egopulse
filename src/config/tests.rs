@@ -3961,3 +3961,73 @@ channels:
 
     assert_eq!(result.as_deref(), Some("Be concise."));
 }
+
+#[test]
+#[serial]
+fn resolve_model_instructions_reads_file_relative_to_base_dir() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    std::fs::write(temp_dir.path().join("instructions.txt"), "Be concise.\n")
+        .expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: instructions.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result.as_deref(), Some("Be concise."));
+}
+
+#[test]
+#[serial]
+fn resolve_model_instructions_returns_none_for_blank_content() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    std::fs::write(temp_dir.path().join("blank.txt"), "   \n\t\n  ")
+        .expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: blank.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result, None);
+}
