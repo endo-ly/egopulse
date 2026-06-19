@@ -3928,3 +3928,36 @@ channels:
         _ => panic!("expected ModelInstructionsConflict, got {error:?}"),
     }
 }
+
+#[test]
+#[serial]
+fn resolve_model_instructions_returns_inline() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions: "  Be concise.  "
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let result = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect("resolve");
+
+    assert_eq!(result.as_deref(), Some("Be concise."));
+}

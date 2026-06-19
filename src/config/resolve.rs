@@ -300,6 +300,34 @@ impl Config {
             .unwrap_or(self.default_context_window_tokens)
     }
 
+    /// Resolves the model-specific instructions content for a provider+model pair.
+    ///
+    /// Returns the trimmed inline `model_instructions` content when set.
+    /// Surrounding whitespace is trimmed; empty/whitespace-only content yields `None`.
+    pub(crate) fn resolve_model_instructions(
+        &self,
+        provider_id: &ProviderId,
+        model: &str,
+        base_dir: &std::path::Path,
+    ) -> Result<Option<String>, ConfigError> {
+        let _ = base_dir;
+        let Some(provider) = self.providers.get(provider_id) else {
+            return Ok(None);
+        };
+        let Some(model_config) = provider.models.get(model) else {
+            return Ok(None);
+        };
+        if let Some(inline) = &model_config.model_instructions {
+            let trimmed = inline.trim();
+            return Ok(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            });
+        }
+        Ok(None)
+    }
+
     /// Saves config with SecretRef-aware YAML and .env file.
     pub(crate) fn save_config_with_secrets(
         &self,
