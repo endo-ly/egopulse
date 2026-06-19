@@ -81,6 +81,8 @@
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
+| `model_instructions` | `string` | 任意 | なし | モデル固有の追加指示(インライン)。system prompt の `<soul>` セクションと Core Instructions の間に `<model-instructions>` タグで注入される。`model_instructions_file` と排他(両立時は起動エラー) |
+| `model_instructions_file` | `string` | 任意 | なし | モデル固有の追加指示を記述したファイルパス。相対パスは設定ファイルのディレクトリ基点で解決(絶対パスも可)。`model_instructions` と排他 |
 
 ### 2.3 Web チャネル（`channels.web`）
 
@@ -313,8 +315,14 @@ providers:
     models:
       anthropic/claude-sonnet-4:
         context_window_tokens: 200000
+        # モデル固有の追加指示(インライン)
+        model_instructions: |
+          Prefer concise, action-first responses.
+          Avoid preamble unless the user asks for reasoning.
       google/gemini-2.5-pro:
         context_window_tokens: 1048576
+        # モデル固有の追加指示(ファイル参照・相対パスは設定ファイルと同ディレクトリ基点)
+        model_instructions_file: prompts/gemini-instructions.md
       openai/gpt-4.1:
         context_window_tokens: 1048576
   ollama:
@@ -664,6 +672,8 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `sleep_batch.*` | Sleep Batch 実行時に参照 |
 | `pulse.*` | Pulse 実行時に参照 |
 | `web_fetch.*` | 次回 web_fetch 実行時に参照 |
+| `providers.<id>.models.<model>.model_instructions` | 次回メッセージ送信(または Pulse 起火)時に毎ターン再読み込み |
+| `providers.<id>.models.<model>.model_instructions_file` | 同上(参照先ファイルの内容も毎ターン再読み込み) |
 
 ### 9.3 秘匿フィールド
 
