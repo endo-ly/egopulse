@@ -56,10 +56,7 @@ fn build_soul_prompt_section(state: &AppState, context: &SurfaceContext) -> Opti
     )
 }
 
-fn build_model_instructions_section(
-    state: &AppState,
-    context: &SurfaceContext,
-) -> Option<String> {
+fn build_model_instructions_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
     let config = &state.config;
     let agent_id = crate::config::AgentId::new(&context.agent_id);
     let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
@@ -657,8 +654,7 @@ mod tests {
     fn system_prompt_injects_model_instructions_between_soul_and_core() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "global soul content");
-        let state =
-            build_test_state_with_instructions(dir.path(), "You prefer terse output.");
+        let state = build_test_state_with_instructions(dir.path(), "You prefer terse output.");
         let prompt = build_system_prompt(&state, &web_context("s1"));
 
         assert!(

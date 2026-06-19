@@ -3967,8 +3967,7 @@ channels:
 fn resolve_model_instructions_reads_file_relative_to_base_dir() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    std::fs::write(temp_dir.path().join("instructions.txt"), "Be concise.\n")
-        .expect("write file");
+    std::fs::write(temp_dir.path().join("instructions.txt"), "Be concise.\n").expect("write file");
     let body = r#"default_provider: openai
 providers:
   openai:
@@ -4002,8 +4001,7 @@ channels:
 fn resolve_model_instructions_returns_none_for_blank_content() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    std::fs::write(temp_dir.path().join("blank.txt"), "   \n\t\n  ")
-        .expect("write file");
+    std::fs::write(temp_dir.path().join("blank.txt"), "   \n\t\n  ").expect("write file");
     let body = r#"default_provider: openai
 providers:
   openai:
