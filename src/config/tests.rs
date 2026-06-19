@@ -3894,3 +3894,37 @@ fn validate_agent_profile_provider_references() {
         "expected InvalidProviderReference, got {error:?}"
     );
 }
+
+#[test]
+#[serial]
+fn model_instructions_conflict_when_both_specified() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions: |
+          Be concise.
+        model_instructions_file: instructions.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+
+    let error = Config::load(Some(&file_path)).expect_err("conflict should fail");
+
+    match error {
+        ConfigError::ModelInstructionsConflict { provider, model } => {
+            assert_eq!(provider, "openai");
+            assert_eq!(model, "gpt-4o-mini");
+        }
+        _ => panic!("expected ModelInstructionsConflict, got {error:?}"),
+    }
+}

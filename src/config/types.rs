@@ -183,6 +183,12 @@ pub(crate) struct ModelConfig {
     /// `<model-instructions>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_instructions: Option<String>,
+
+    /// Optional path to a file whose contents are used as model-specific
+    /// instructions. Relative paths resolve against the config file directory.
+    /// Mutually exclusive with [`ModelConfig::model_instructions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_instructions_file: Option<String>,
 }
 
 #[derive(Clone)]

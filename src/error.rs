@@ -235,6 +235,10 @@ pub enum ConfigError {
     PulseInvalidTickInterval { reason: String },
     #[error("invalid_timezone: {timezone}")]
     InvalidTimezone { timezone: String },
+    #[error(
+        "model_instructions_conflict: provider={provider} model={model}: specify either 'model_instructions' or 'model_instructions_file', not both"
+    )]
+    ModelInstructionsConflict { provider: String, model: String },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.
