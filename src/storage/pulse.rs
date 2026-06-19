@@ -208,6 +208,31 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Marks every `running` pulse run as `failed` with
+    /// `error_message = "orphaned: process restarted"`. Called once at
+    /// runtime startup to clean up rows left behind by a previous crash.
+    ///
+    /// Returns the number of rows reaped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or execution failures.
+    pub(crate) fn reap_orphaned_pulse_runs(&self) -> Result<usize, StorageError> {
+        let conn = self.get_conn()?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let status = PulseRunStatus::Failed.to_string();
+        let running = PulseRunStatus::Running.to_string();
+        let error_message = "orphaned: process restarted";
+
+        let changed = conn.execute(
+            "UPDATE pulse_runs
+             SET status = ?1, finished_at = ?2, error_message = ?3
+             WHERE status = ?4",
+            params![status, finished_at, error_message, running],
+        )?;
+        Ok(changed)
+    }
+
     /// Returns a single pulse run by its primary key.
     ///
     /// Only called from integration tests (pulse/output.rs) which verify
@@ -444,6 +469,97 @@ mod tests {
         // Attempting to create a second run with same due_key should conflict
         let result = db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01");
         assert!(matches!(result, Err(StorageError::Conflict(_))));
+    }
+
+    #[test]
+    fn reap_orphaned_pulse_runs_marks_running_as_failed() {
+        let (db, _dir) = test_db();
+
+        // Arrange: 2 running + 1 success
+        create_test_pulse_run(&db, "run-1", "agent-a", "int-1", "2025-01-01");
+        create_test_pulse_run(&db, "run-2", "agent-b", "int-2", "2025-01-02");
+        create_test_pulse_run(&db, "run-3", "agent-c", "int-3", "2025-01-03");
+        db.update_pulse_run_success("run-3", None, None, PulseOutputKind::Silent, "ok")
+            .expect("success");
+
+        // Act
+        let reaped = db.reap_orphaned_pulse_runs().expect("reap");
+
+        // Assert
+        assert_eq!(reaped, 2, "should reap exactly the 2 running rows");
+
+        let r1 = db.get_pulse_run("run-1").expect("get").expect("exists");
+        assert_eq!(r1.status, PulseRunStatus::Failed);
+        assert!(r1.finished_at.is_some());
+        assert!(
+            r1.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("orphaned")),
+            "error_message should mention orphaned, got {:?}",
+            r1.error_message
+        );
+
+        let r2 = db.get_pulse_run("run-2").expect("get").expect("exists");
+        assert_eq!(r2.status, PulseRunStatus::Failed);
+        assert!(r2.finished_at.is_some());
+        assert!(
+            r2.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("orphaned"))
+        );
+
+        let r3 = db.get_pulse_run("run-3").expect("get").expect("exists");
+        assert_eq!(
+            r3.status,
+            PulseRunStatus::Success,
+            "success row should be untouched"
+        );
+    }
+
+    #[test]
+    fn reap_orphaned_pulse_runs_preserves_terminal_status() {
+        let (db, _dir) = test_db();
+
+        // Arrange: one each of success/failed/skipped, no running
+        create_test_pulse_run(&db, "run-s", "agent-a", "int-x", "2025-01-01");
+        db.update_pulse_run_success("run-s", None, None, PulseOutputKind::Silent, "ok")
+            .expect("success");
+
+        create_test_pulse_run(&db, "run-f", "agent-a", "int-x", "2025-01-02");
+        db.update_pulse_run_failed("run-f", "err").expect("failed");
+
+        create_test_pulse_run(&db, "run-k", "agent-a", "int-x", "2025-01-03");
+        db.update_pulse_run_skipped("run-k", "skip")
+            .expect("skipped");
+
+        // Act
+        let reaped = db.reap_orphaned_pulse_runs().expect("reap");
+
+        // Assert
+        assert_eq!(reaped, 0, "no running rows should be reaped");
+
+        let s = db.get_pulse_run("run-s").expect("get").expect("exists");
+        assert_eq!(s.status, PulseRunStatus::Success);
+        assert!(s.error_message.is_none());
+
+        let f = db.get_pulse_run("run-f").expect("get").expect("exists");
+        assert_eq!(f.status, PulseRunStatus::Failed);
+        assert_eq!(f.error_message.as_deref(), Some("err"));
+
+        let k = db.get_pulse_run("run-k").expect("get").expect("exists");
+        assert_eq!(k.status, PulseRunStatus::Skipped);
+        assert_eq!(k.error_message.as_deref(), Some("skip"));
+    }
+
+    #[test]
+    fn reap_orphaned_pulse_runs_returns_zero_on_empty() {
+        let (db, _dir) = test_db();
+
+        // Act
+        let reaped = db.reap_orphaned_pulse_runs().expect("reap");
+
+        // Assert
+        assert_eq!(reaped, 0, "empty DB should return 0");
     }
 
     // ---------------------------------------------------------------------------
