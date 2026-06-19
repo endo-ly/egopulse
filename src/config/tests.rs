@@ -2370,6 +2370,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                         "gpt-5".to_string(),
                         ModelConfig {
                             context_window_tokens: Some(200000),
+                            ..Default::default()
                         },
                     ),
                     ("gpt-4o-mini".to_string(), ModelConfig::default()),

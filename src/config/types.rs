@@ -177,6 +177,12 @@ pub(crate) struct ModelConfig {
     /// When `None`, falls back to `Config.default_context_window_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
+
+    /// Optional inline model-specific instructions injected into the system
+    /// prompt between SOUL and Core Instructions (wrapped in
+    /// `<model-instructions>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_instructions: Option<String>,
 }
 
 #[derive(Clone)]
@@ -506,5 +512,22 @@ mod tests {
     #[test]
     fn parse_duration_rejects_bare_number() {
         assert!(parse_duration("60").is_err());
+    }
+
+    #[test]
+    fn model_config_deserializes_inline_instructions() {
+        let yaml = "context_window_tokens: 200000
+model_instructions: |
+  Be concise.
+  Avoid preamble.
+";
+
+        let config: ModelConfig = yaml_serde::from_str(yaml).expect("deserialize ModelConfig");
+
+        assert_eq!(config.context_window_tokens, Some(200000));
+        assert_eq!(
+            config.model_instructions.as_deref(),
+            Some("Be concise.\nAvoid preamble.\n")
+        );
     }
 }
