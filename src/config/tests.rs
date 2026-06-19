@@ -4029,3 +4029,46 @@ channels:
 
     assert_eq!(result, None);
 }
+
+#[test]
+#[serial]
+fn resolve_model_instructions_rejects_file_exceeding_size_limit() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let oversized = "a".repeat(64 * 1024 + 1);
+    std::fs::write(temp_dir.path().join("oversize.txt"), &oversized).expect("write file");
+    let body = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+    models:
+      gpt-4o-mini:
+        model_instructions_file: oversize.txt
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, body);
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let error = config
+        .resolve_model_instructions(
+            &super::ProviderId::new("openai"),
+            "gpt-4o-mini",
+            temp_dir.path(),
+        )
+        .expect_err("should fail");
+
+    match error {
+        ConfigError::ModelInstructionsFileUnreadable { detail, .. } => {
+            assert!(
+                detail.contains("file too large"),
+                "expected size-limit detail, got: {detail}"
+            );
+        }
+        _ => panic!("expected ModelInstructionsFileUnreadable, got {error:?}"),
+    }
+}

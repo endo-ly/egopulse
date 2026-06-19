@@ -311,7 +311,8 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError::ModelInstructionsFileUnreadable`] when the
-    /// referenced file cannot be read.
+    /// referenced file cannot be read or exceeds
+    /// [`MAX_MODEL_INSTRUCTIONS_FILE_BYTES`].
     pub(crate) fn resolve_model_instructions(
         &self,
         provider_id: &ProviderId,
@@ -332,28 +333,15 @@ impl Config {
                 Some(trimmed.to_string())
             });
         }
-        if let Some(relative) = &model_config.model_instructions_file {
-            let path = if std::path::Path::new(relative).is_absolute() {
-                std::path::PathBuf::from(relative)
-            } else {
-                base_dir.join(relative)
-            };
-            let content = std::fs::read_to_string(&path).map_err(|e| {
-                ConfigError::ModelInstructionsFileUnreadable {
-                    provider: provider_id.to_string(),
-                    model: model.to_string(),
-                    path: path.to_string_lossy().into_owned(),
-                    detail: e.to_string(),
-                }
-            })?;
-            let trimmed = content.trim();
-            return Ok(if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            });
-        }
-        Ok(None)
+        let Some(relative) = &model_config.model_instructions_file else {
+            return Ok(None);
+        };
+        let path = if std::path::Path::new(relative).is_absolute() {
+            std::path::PathBuf::from(relative)
+        } else {
+            base_dir.join(relative)
+        };
+        read_model_instructions_file(provider_id, model, &path)
     }
 
     /// Saves config with SecretRef-aware YAML and .env file.
@@ -506,4 +494,45 @@ pub(super) fn default_compaction_target_ratio() -> f64 {
 
 pub(super) fn default_compact_keep_recent() -> usize {
     20
+}
+
+// 64KB ceiling: `model_instructions_file` is re-read on every turn and every
+// Pulse activation, so an unbounded file would degrade latency and memory.
+// Roughly 16k tokens, ample for any system-prompt-level directive.
+const MAX_MODEL_INSTRUCTIONS_FILE_BYTES: u64 = 64 * 1024;
+
+fn read_model_instructions_file(
+    provider_id: &ProviderId,
+    model: &str,
+    path: &std::path::Path,
+) -> Result<Option<String>, ConfigError> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| model_instructions_io_err(provider_id, model, path, e.to_string()))?
+        .len();
+    if file_size > MAX_MODEL_INSTRUCTIONS_FILE_BYTES {
+        return Err(model_instructions_io_err(
+            provider_id,
+            model,
+            path,
+            format!("file too large: {file_size} bytes (max {MAX_MODEL_INSTRUCTIONS_FILE_BYTES})"),
+        ));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| model_instructions_io_err(provider_id, model, path, e.to_string()))?;
+    let trimmed = content.trim();
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+}
+
+fn model_instructions_io_err(
+    provider_id: &ProviderId,
+    model: &str,
+    path: &std::path::Path,
+    detail: String,
+) -> ConfigError {
+    ConfigError::ModelInstructionsFileUnreadable {
+        provider: provider_id.to_string(),
+        model: model.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        detail,
+    }
 }

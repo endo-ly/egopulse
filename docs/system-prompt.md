@@ -111,7 +111,7 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 
 **コード**: [`src/agent_loop/prompt_builder.rs`](../src/agent_loop/prompt_builder.rs) `build_model_instructions_section()`
 
-```
+```text
 <model-instructions>
 {model_instructions の内容}
 </model-instructions>
