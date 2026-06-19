@@ -690,4 +690,57 @@ mod tests {
             "<model-instructions> should appear before execution playbook"
         );
     }
+
+    #[test]
+    fn system_prompt_without_model_instructions_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("SOUL.md"), "global soul content");
+        let state = build_test_state(dir.path());
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("<model-instructions>"),
+            "should not contain <model-instructions> when not configured"
+        );
+        assert!(prompt.contains("<soul>"), "<soul> should still be present");
+        assert!(
+            prompt.contains("Built-in execution playbook"),
+            "core instructions should still be present"
+        );
+    }
+
+    #[test]
+    fn build_model_instructions_section_returns_none_on_io_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_util::test_config(dir.path().to_str().expect("utf8"));
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .models
+            .get_mut("gpt-4o-mini")
+            .expect("gpt-4o-mini")
+            .model_instructions_file = Some("missing.txt".to_string());
+        let state = test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::from(Box::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })
+                as Box<dyn crate::llm::LlmProvider>)),
+            Some(dir.path().join("egopulse.config.yaml")),
+            None,
+            None,
+        );
+
+        let prompt = build_system_prompt(&state, &web_context("s1"));
+
+        assert!(
+            !prompt.contains("<model-instructions>"),
+            "should not contain <model-instructions> on IO error"
+        );
+        assert!(
+            prompt.contains("Built-in execution playbook"),
+            "core instructions should still be present despite fallback"
+        );
+    }
 }
