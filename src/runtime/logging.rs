@@ -52,7 +52,8 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
         Err(error)
             if error
                 .to_string()
-                .contains("global default trace dispatcher") =>
+                .contains("global default trace dispatcher")
+                || error.to_string().contains("already initialized") =>
         {
             Ok(())
         }

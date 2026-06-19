@@ -137,6 +137,11 @@ async fn process_intention(
     .await
 }
 
+/// Testable form of [`process_intention`] that accepts an explicit
+/// `activation_timeout`. Production callers go through [`process_intention`]
+/// which always uses [`PULSE_ACTIVATION_TIMEOUT`]; tests pass a short
+/// duration so they do not need to wait the full 30 minutes.
+#[allow(clippy::too_many_arguments)]
 async fn process_intention_with_activation_timeout(
     state: &AppState,
     agent_id: &AgentId,
@@ -871,11 +876,11 @@ intentions:
     async fn guard_activation_catches_panic() {
         use std::time::Duration;
 
-        let panicking_future = async {
-            let _result: Result<ActivationResult, EgoPulseError> = panic!("boom from activation");
-        };
+        async fn panicking_activation() -> Result<ActivationResult, EgoPulseError> {
+            panic!("boom from activation")
+        }
 
-        let result = guard_activation(panicking_future, Duration::from_secs(60)).await;
+        let result = guard_activation(panicking_activation(), Duration::from_secs(60)).await;
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
