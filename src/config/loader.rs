@@ -12,9 +12,9 @@ use super::secret_ref::{
     resolve_string_or_ref,
 };
 use super::{
-    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DiscordBotConfig,
-    DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig, SleepBatchConfig,
-    TelegramBotConfig, TelegramChatConfig, web_fetch::WebFetchConfig,
+    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DatabaseConfig,
+    DiscordBotConfig, DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig,
+    SleepBatchConfig, TelegramBotConfig, TelegramChatConfig, web_fetch::WebFetchConfig,
 };
 use crate::error::ConfigError;
 
@@ -157,6 +157,22 @@ struct FileWebFetchContentValidationConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct FileDatabaseConfig {
+    #[serde(default)]
+    backup: FileBackupConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileBackupConfig {
+    enabled: Option<bool>,
+    interval_days: Option<u32>,
+    time: Option<String>,
+    max_generations: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     state_root: Option<String>,
     default_provider: Option<String>,
@@ -175,6 +191,7 @@ struct FileConfig {
     timezone: Option<String>,
     sleep_batch: Option<FileSleepBatchConfig>,
     pulse: Option<FilePulseConfig>,
+    db: Option<FileDatabaseConfig>,
     web_fetch: Option<FileWebFetchConfig>,
 }
 
@@ -207,6 +224,7 @@ pub(super) fn build_config(
         timezone: file_timezone,
         sleep_batch: file_sleep_batch,
         pulse: file_pulse,
+        db: file_db,
         web_fetch: file_web_fetch,
     } = read_file_config(resolved_config_path.as_deref())?;
 
@@ -274,6 +292,8 @@ pub(super) fn build_config(
     let timezone = normalize_string(file_timezone).unwrap_or_else(|| "UTC".to_string());
     validate_timezone(&timezone)?;
 
+    let db = normalize_db(file_db)?;
+
     let web_fetch = normalize_web_fetch(file_web_fetch);
 
     let config = Config {
@@ -294,6 +314,7 @@ pub(super) fn build_config(
         timezone,
         sleep_batch,
         pulse,
+        db,
         web_fetch,
     };
 
@@ -752,6 +773,37 @@ fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigE
         enabled: fp.enabled.unwrap_or(false),
         tick_interval_secs,
     })
+}
+
+fn normalize_db(file: Option<FileDatabaseConfig>) -> Result<DatabaseConfig, ConfigError> {
+    let Some(fd) = file else {
+        return Ok(DatabaseConfig::default());
+    };
+
+    let defaults = super::types::BackupConfig::default();
+    let backup = super::types::BackupConfig {
+        enabled: fd.backup.enabled.unwrap_or(defaults.enabled),
+        interval_days: fd.backup.interval_days.unwrap_or(defaults.interval_days),
+        time: normalize_string(fd.backup.time).unwrap_or(defaults.time),
+        max_generations: fd
+            .backup
+            .max_generations
+            .unwrap_or(defaults.max_generations),
+    };
+
+    if backup.interval_days == 0 {
+        return Err(ConfigError::InvalidBackupConfig(
+            "interval_days must be at least 1".to_string(),
+        ));
+    }
+    if backup.max_generations == 0 {
+        return Err(ConfigError::InvalidBackupConfig(
+            "max_generations must be at least 1".to_string(),
+        ));
+    }
+    validate_schedule(&backup.time)?;
+
+    Ok(DatabaseConfig { backup })
 }
 
 fn normalize_agent_list(

@@ -348,6 +348,12 @@ impl BackupConfig {
     }
 }
 
+/// Database-specific configuration section (`db:` in YAML).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DatabaseConfig {
+    pub backup: BackupConfig,
+}
+
 /// Parse a human-friendly duration string into seconds.
 ///
 /// Supported formats: `30s`, `5m`, `1h`, or combinations like `1h30m`.
@@ -449,6 +455,7 @@ pub struct Config {
     pub timezone: String,
     pub(crate) sleep_batch: SleepBatchConfig,
     pub(crate) pulse: PulseConfig,
+    pub(crate) db: DatabaseConfig,
     pub(crate) web_fetch: super::web_fetch::WebFetchConfig,
 }
 
@@ -478,6 +485,7 @@ impl std::fmt::Debug for Config {
             .field("timezone", &self.timezone)
             .field("sleep_batch", &self.sleep_batch)
             .field("pulse", &self.pulse)
+            .field("db", &self.db)
             .field("web_fetch", &self.web_fetch)
             .finish()
     }

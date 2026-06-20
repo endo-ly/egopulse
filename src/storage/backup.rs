@@ -6,14 +6,14 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveTime, Utc};
 use chrono_tz::Tz;
 use rusqlite::Connection;
 use tracing::warn;
 
 use crate::config::BackupConfig;
 use crate::error::StorageError;
-use crate::sleep::scheduler::{resolve_gap, try_date};
+use crate::sleep::scheduler::try_date;
 use crate::storage::Database;
 
 /// Builds the backup file name in the configured timezone.

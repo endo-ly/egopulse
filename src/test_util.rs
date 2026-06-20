@@ -64,6 +64,7 @@ pub(crate) fn test_config(state_root: &str) -> Config {
         timezone: "UTC".to_string(),
         sleep_batch: crate::config::SleepBatchConfig::default(),
         pulse: crate::config::PulseConfig::default(),
+        db: crate::config::DatabaseConfig::default(),
         web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
     }
 }

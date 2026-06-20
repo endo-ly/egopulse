@@ -405,6 +405,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -804,6 +805,7 @@ fn persists_agents_without_discord_config_surface() {
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -1586,6 +1588,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -2397,6 +2400,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -2664,6 +2668,7 @@ fn persist_preserves_sleep_batch_config() {
             ..Default::default()
         },
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -3074,6 +3079,7 @@ fn persist_preserves_sleep_batch_scheduler_config() {
             ..Default::default()
         },
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     };
 
@@ -3623,6 +3629,7 @@ fn minimal_config_with_channels(
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     }
 }
@@ -3700,6 +3707,7 @@ fn profile_config(
         timezone: "UTC".to_string(),
         sleep_batch: super::SleepBatchConfig::default(),
         pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
     }
 }
@@ -4071,4 +4079,145 @@ channels:
         }
         _ => panic!("expected ModelInstructionsFileUnreadable, got {error:?}"),
     }
+}
+
+#[test]
+#[serial]
+fn backup_config_default_when_db_section_missing() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: local
+providers:
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#,
+    );
+
+    let config = Config::load_allow_missing_api_key(Some(&file_path)).expect("load config");
+
+    let backup = &config.db.backup;
+    assert!(backup.enabled, "enabled default");
+    assert_eq!(backup.interval_days, 7, "interval_days default");
+    assert_eq!(backup.time, "03:00", "time default");
+    assert_eq!(backup.max_generations, 12, "max_generations default");
+}
+
+#[test]
+#[serial]
+fn backup_config_scheduler_enabled_returns_false_when_disabled() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: local
+providers:
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+db:
+  backup:
+    enabled: false"#,
+    );
+
+    let config = Config::load_allow_missing_api_key(Some(&file_path)).expect("load config");
+
+    assert!(!config.db.backup.scheduler_enabled());
+}
+
+#[test]
+#[serial]
+fn backup_config_rejects_zero_interval_and_generations() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+
+    for (label, body) in [
+        (
+            "interval_days",
+            r#"default_provider: local
+providers:
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+db:
+  backup:
+    interval_days: 0"#,
+        ),
+        (
+            "max_generations",
+            r#"default_provider: local
+providers:
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+db:
+  backup:
+    max_generations: 0"#,
+        ),
+    ] {
+        let file_path = write_config(&temp_dir, body);
+        let result = Config::load_allow_missing_api_key(Some(&file_path));
+        match result {
+            Err(ConfigError::InvalidBackupConfig(_)) => {}
+            other => panic!("{label}: expected InvalidBackupConfig, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn db_backup_config_round_trips_through_save_and_load() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: local
+providers:
+  local:
+    label: Local
+    base_url: http://127.0.0.1:1234/v1
+    default_model: qwen2.5
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+db:
+  backup:
+    enabled: false
+    interval_days: 3
+    time: "23:45"
+    max_generations: 7"#,
+    );
+
+    let original = Config::load_allow_missing_api_key(Some(&file_path)).expect("load");
+
+    original.save_config_with_secrets(&file_path).expect("save");
+
+    let reloaded = Config::load_allow_missing_api_key(Some(&file_path)).expect("reload");
+
+    assert_eq!(reloaded.db.backup.enabled, false);
+    assert_eq!(reloaded.db.backup.interval_days, 3);
+    assert_eq!(reloaded.db.backup.time, "23:45");
+    assert_eq!(reloaded.db.backup.max_generations, 7);
 }
