@@ -84,7 +84,7 @@ pub(crate) fn run_backup_with_integrity_checker(
     dest_dir: &Path,
     timezone: &str,
     now: DateTime<Utc>,
-    _max_generations: u32,
+    max_generations: u32,
     checker: IntegrityChecker,
 ) -> Result<BackupOutcome, StorageError> {
     std::fs::create_dir_all(dest_dir)?;
@@ -109,6 +109,8 @@ pub(crate) fn run_backup_with_integrity_checker(
         );
     }
 
+    prune_old_backups(dest_dir, max_generations)?;
+
     Ok(outcome)
 }
 
@@ -117,6 +119,61 @@ fn run_pragma_integrity_check(path: &Path) -> Result<bool, StorageError> {
     let conn = Connection::open(path)?;
     let result: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
     Ok(result == "ok")
+}
+
+/// Removes the oldest `egopulse-*.db` files beyond `max_generations`.
+///
+/// Files are sorted by name (descending timestamp) and the oldest overflow is
+/// deleted. Non-matching files (notes, manual copies, subdirectories) are
+/// preserved. A missing or empty directory is a no-op.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] only when an existing entry cannot be removed.
+pub(crate) fn prune_old_backups(dir: &Path, max_generations: u32) -> Result<usize, StorageError> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if is_backup_filename(name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut removed = 0usize;
+    for name in names.into_iter().skip(max_generations as usize) {
+        std::fs::remove_file(dir.join(name))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Returns `true` when `name` matches the canonical backup file pattern.
+fn is_backup_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("egopulse-") else {
+        return false;
+    };
+    let Some(stem) = rest.strip_suffix(".db") else {
+        return false;
+    };
+    stem.len() == 15
+        && stem.as_bytes().iter().enumerate().all(|(i, b)| {
+            if i == 8 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -233,5 +290,107 @@ mod tests {
             !outcome.path.exists(),
             "corrupted backup should be removed from disk"
         );
+    }
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"stub").expect("touch");
+    }
+
+    #[test]
+    fn prune_old_backups_deletes_oldest_beyond_max() {
+        // Arrange: 5 backups dated 06/01..06/05
+        let dir = tempfile::tempdir().expect("dir");
+        for day in 1..=5 {
+            touch(dir.path(), &format!("egopulse-2026060{day}-030000.db"));
+        }
+
+        // Act
+        let removed = prune_old_backups(dir.path(), 3).expect("prune");
+
+        // Assert: 2 oldest removed, 3 newest retained
+        assert_eq!(removed, 2);
+        for day in 3..=5 {
+            assert!(
+                dir.path()
+                    .join(format!("egopulse-2026060{day}-030000.db"))
+                    .exists(),
+                "newest {day} should remain"
+            );
+        }
+        for day in 1..=2 {
+            assert!(
+                !dir.path()
+                    .join(format!("egopulse-2026060{day}-030000.db"))
+                    .exists(),
+                "oldest {day} should be deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_old_backups_keeps_all_when_below_max() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("dir");
+        for day in 1..=3 {
+            touch(dir.path(), &format!("egopulse-2026060{day}-030000.db"));
+        }
+
+        // Act
+        let removed = prune_old_backups(dir.path(), 5).expect("prune");
+
+        // Assert
+        assert_eq!(removed, 0);
+        for day in 1..=3 {
+            assert!(
+                dir.path()
+                    .join(format!("egopulse-2026060{day}-030000.db"))
+                    .exists(),
+                "{day} should remain"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_old_backups_handles_missing_or_empty_dir() {
+        // Arrange
+        let missing = tempfile::tempdir().expect("missing");
+        let path_outside = missing.path().join("does_not_exist");
+        let empty = tempfile::tempdir().expect("empty");
+
+        // Act
+        let removed_missing = prune_old_backups(&path_outside, 3).expect("prune");
+        let removed_empty = prune_old_backups(empty.path(), 3).expect("prune");
+
+        // Assert
+        assert_eq!(removed_missing, 0);
+        assert_eq!(removed_empty, 0);
+    }
+
+    #[test]
+    fn prune_old_backups_ignores_non_backup_files() {
+        // Arrange: 3 valid backups, plus noise
+        let dir = tempfile::tempdir().expect("dir");
+        for day in 1..=3 {
+            touch(dir.path(), &format!("egopulse-2026060{day}-030000.db"));
+        }
+        touch(dir.path(), "notes.txt");
+        touch(dir.path(), "egopulse-manual.db");
+        std::fs::create_dir(dir.path().join("old")).expect("mkdir");
+
+        // Act
+        let removed = prune_old_backups(dir.path(), 2).expect("prune");
+
+        // Assert: only the oldest valid backup is removed
+        assert_eq!(removed, 1);
+        assert!(
+            !dir.path().join("egopulse-20260601-030000.db").exists(),
+            "oldest valid backup removed"
+        );
+        assert!(dir.path().join("notes.txt").exists(), "notes preserved");
+        assert!(
+            dir.path().join("egopulse-manual.db").exists(),
+            "manual backup preserved"
+        );
+        assert!(dir.path().join("old").exists(), "subdir preserved");
     }
 }
