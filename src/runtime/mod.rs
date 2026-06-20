@@ -2,6 +2,7 @@
 //!
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
+pub(crate) mod backup_scheduler;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
@@ -864,6 +865,16 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             Ok(())
         });
         handles.push(("pulse-scheduler".to_string(), handle));
+    }
+
+    if state.config.db.backup.scheduler_enabled() {
+        let backup_state = state.clone();
+        info!("Starting backup scheduler");
+        let handle =
+            tokio::spawn(
+                async move { backup_scheduler::run_backup_scheduler_loop(backup_state).await },
+            );
+        handles.push(("backup-scheduler".to_string(), handle));
     }
 
     info!("Runtime active; waiting for Ctrl-C or channel failure");

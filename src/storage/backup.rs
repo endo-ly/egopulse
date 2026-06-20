@@ -8,13 +8,15 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, NaiveTime, Utc};
 use chrono_tz::Tz;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::warn;
 
 use crate::config::BackupConfig;
 use crate::error::StorageError;
 use crate::sleep::scheduler::try_date;
 use crate::storage::Database;
+
+const BACKUP_LAST_RUN_KEY: &str = "backup_last_run";
 
 /// Builds the backup file name in the configured timezone.
 ///
@@ -287,6 +289,43 @@ fn parse_hhmm(schedule: &str) -> Option<NaiveTime> {
         return None;
     }
     NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// Persists `last_run` into `db_meta.backup_last_run` as an RFC3339 string.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the upsert cannot be executed.
+pub(crate) fn upsert_backup_last_run(
+    db: &Database,
+    last_run: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    let conn = db.get_conn()?;
+    conn.execute(
+        "INSERT INTO db_meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![BACKUP_LAST_RUN_KEY, last_run.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Reads the most recent periodic backup timestamp from `db_meta`.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] on database failures; a missing row yields `None`.
+pub(crate) fn get_backup_last_run(db: &Database) -> Result<Option<DateTime<Utc>>, StorageError> {
+    let conn = db.get_conn()?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM db_meta WHERE key = ?1",
+            params![BACKUP_LAST_RUN_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc)))
 }
 
 #[cfg(test)]
