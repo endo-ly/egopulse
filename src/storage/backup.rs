@@ -6,12 +6,14 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use rusqlite::Connection;
 use tracing::warn;
 
+use crate::config::BackupConfig;
 use crate::error::StorageError;
+use crate::sleep::scheduler::{resolve_gap, try_date};
 use crate::storage::Database;
 
 /// Builds the backup file name in the configured timezone.
@@ -174,6 +176,64 @@ fn is_backup_filename(name: &str) -> bool {
                 b.is_ascii_digit()
             }
         })
+}
+
+/// Returns the next UTC instant at which the periodic backup should run.
+///
+/// When `last_run_at` is `None`, the candidate is the next `time` occurrence
+/// (today if still in the future, otherwise tomorrow). When `last_run_at` is
+/// `Some`, the candidate is `last_run_at + interval_days` at `time`; if that
+/// has already passed, later days are probed up to `interval_days + 1` times.
+///
+/// Returns `None` when the config is disabled, the timezone is invalid, or
+/// the `time` string cannot be parsed as `HH:MM`. DST gaps and folds are
+/// resolved via the shared [`try_date`] / [`resolve_gap`] helpers so that
+/// backup scheduling matches the sleep scheduler's semantics.
+pub(crate) fn compute_next_backup_run(
+    config: &BackupConfig,
+    timezone: &str,
+    now: DateTime<Utc>,
+    last_run_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    if !config.enabled {
+        return None;
+    }
+    let tz = timezone.parse::<Tz>().ok()?;
+    let time = parse_hhmm(&config.time)?;
+    let local_now = now.with_timezone(&tz);
+
+    let base_date = match last_run_at {
+        None => local_now.date_naive(),
+        Some(last) => {
+            let local_last = last.with_timezone(&tz);
+            local_last.date_naive() + Duration::days(config.interval_days as i64)
+        }
+    };
+
+    if let Some(instant) = try_date(tz, base_date, time, &local_now) {
+        return Some(instant);
+    }
+
+    let cap = config.interval_days.max(1) as i64 + 1;
+    let mut candidate = base_date;
+    for _ in 0..cap {
+        candidate += Duration::days(1);
+        if let Some(instant) = try_date(tz, candidate, time, &local_now) {
+            return Some(instant);
+        }
+    }
+
+    None
+}
+
+fn parse_hhmm(schedule: &str) -> Option<NaiveTime> {
+    let (h, m) = schedule.split_once(':')?;
+    let hour: u32 = h.parse().ok()?;
+    let minute: u32 = m.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
 #[cfg(test)]
@@ -392,5 +452,136 @@ mod tests {
             "manual backup preserved"
         );
         assert!(dir.path().join("old").exists(), "subdir preserved");
+    }
+
+    fn backup_config(interval_days: u32, time: &str) -> BackupConfig {
+        BackupConfig {
+            enabled: true,
+            interval_days,
+            time: time.to_string(),
+            max_generations: 12,
+        }
+    }
+
+    fn disabled_config() -> BackupConfig {
+        BackupConfig {
+            enabled: false,
+            ..BackupConfig::default()
+        }
+    }
+
+    #[test]
+    fn compute_next_backup_run_first_run_returns_today_or_tomorrow() {
+        // Arrange
+        let config = backup_config(1, "14:00");
+        let tz = "Asia/Tokyo";
+
+        // Sub-case (a): now = 13:00 JST → today 14:00 JST is future
+        let now_a: DateTime<Utc> = "2026-01-15T04:00:00Z".parse().unwrap();
+        // Sub-case (b): now = 15:00 JST → today 14:00 JST passed → tomorrow
+        let now_b: DateTime<Utc> = "2026-01-15T06:00:00Z".parse().unwrap();
+
+        // Act
+        let next_a = compute_next_backup_run(&config, tz, now_a, None).unwrap();
+        let next_b = compute_next_backup_run(&config, tz, now_b, None).unwrap();
+
+        // Assert
+        assert_eq!(
+            next_a,
+            "2026-01-15T05:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            next_b,
+            "2026-01-16T05:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_next_backup_run_with_last_run_uses_interval() {
+        // Arrange: 7-day cadence, last run 2026-06-14 03:00 UTC
+        let config = backup_config(7, "03:00");
+        let tz = "UTC";
+        let now: DateTime<Utc> = "2026-06-16T12:00:00Z".parse().unwrap();
+        let last_run: DateTime<Utc> = "2026-06-14T03:00:00Z".parse().unwrap();
+
+        // Act
+        let next = compute_next_backup_run(&config, tz, now, Some(last_run)).unwrap();
+
+        // Assert: last_run + 7 days = 2026-06-21 03:00 UTC
+        assert_eq!(
+            next,
+            "2026-06-21T03:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_next_backup_run_returns_none_when_disabled() {
+        // Arrange
+        let config = disabled_config();
+        let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
+
+        // Act
+        let next = compute_next_backup_run(&config, "UTC", now, None);
+
+        // Assert
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn compute_next_backup_run_returns_none_for_invalid_time_format() {
+        // Arrange
+        let cfg_25_99 = BackupConfig {
+            time: "25:99".to_string(),
+            ..backup_config(1, "03:00")
+        };
+        let cfg_abc = BackupConfig {
+            time: "abc".to_string(),
+            ..backup_config(1, "03:00")
+        };
+        let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
+
+        // Act
+        let next_25_99 = compute_next_backup_run(&cfg_25_99, "UTC", now, None);
+        let next_abc = compute_next_backup_run(&cfg_abc, "UTC", now, None);
+
+        // Assert
+        assert!(next_25_99.is_none(), "25:99 should be rejected");
+        assert!(next_abc.is_none(), "abc should be rejected");
+    }
+
+    #[test]
+    fn compute_next_backup_run_handles_dst_gap() {
+        // Arrange: America/New_York, DST starts 2026-03-08 02:00 EST → 03:00 EDT.
+        // Local 02:30 does not exist; should move to 03:00 EDT.
+        let config = backup_config(1, "02:30");
+        let tz = "America/New_York";
+        let now: DateTime<Utc> = "2026-03-08T06:00:00Z".parse().unwrap();
+
+        // Act
+        let next = compute_next_backup_run(&config, tz, now, None).unwrap();
+
+        // Assert: 03:00 EDT = 07:00 UTC
+        assert_eq!(
+            next,
+            "2026-03-08T07:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_next_backup_run_handles_dst_fold() {
+        // Arrange: America/New_York, DST ends 2026-11-01 02:00 EDT → 01:00 EST.
+        // Local 01:30 happens twice; earliest instant wins (01:30 EDT = 05:30 UTC).
+        let config = backup_config(1, "01:30");
+        let tz = "America/New_York";
+        let now: DateTime<Utc> = "2026-11-01T04:00:00Z".parse().unwrap();
+
+        // Act
+        let next = compute_next_backup_run(&config, tz, now, None).unwrap();
+
+        // Assert: 01:30 EDT = 05:30 UTC
+        assert_eq!(
+            next,
+            "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 }

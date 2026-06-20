@@ -316,6 +316,38 @@ impl PulseConfig {
     }
 }
 
+/// Backup schedule and retention settings for the SQLite DB.
+///
+/// `interval_days` expresses the cadence in days between periodic backups,
+/// and `time` is an `HH:MM` string interpreted in `Config::timezone`. The
+/// startup backup always runs (when `enabled`) and is independent of
+/// `interval_days`. `max_generations` bounds the number of `egopulse-*.db`
+/// snapshots retained on disk.
+#[derive(Clone, Debug)]
+pub(crate) struct BackupConfig {
+    pub enabled: bool,
+    pub interval_days: u32,
+    pub time: String,
+    pub max_generations: u32,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_days: 7,
+            time: "03:00".to_string(),
+            max_generations: 12,
+        }
+    }
+}
+
+impl BackupConfig {
+    pub(crate) fn scheduler_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 /// Parse a human-friendly duration string into seconds.
 ///
 /// Supported formats: `30s`, `5m`, `1h`, or combinations like `1h30m`.
