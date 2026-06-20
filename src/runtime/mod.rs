@@ -290,7 +290,17 @@ fn build_app_state_dependencies(
     config: &Config,
     provision_default_soul: ProvisionDefaultSoul,
 ) -> Result<AppStateDependencies, EgoPulseError> {
-    let db = Arc::new(Database::new(&config.db_path())?);
+    let backup_settings = crate::storage::BackupSettings {
+        enabled: config.db.backup.enabled,
+        dest_dir: config.backup_dir(),
+        max_generations: config.db.backup.max_generations,
+        tz: config.timezone.clone(),
+        now: chrono::Utc::now(),
+    };
+    let db = Arc::new(Database::new_with_backup(
+        &config.db_path(),
+        &backup_settings,
+    )?);
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
 
     if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))

@@ -40,6 +40,17 @@ pub(crate) struct BackupOutcome {
     pub integrity_ok: bool,
 }
 
+/// Inputs for a single backup operation, decoupled from [`crate::config::Config`]
+/// so the storage layer stays testable without the full config graph.
+#[derive(Debug, Clone)]
+pub(crate) struct BackupSettings {
+    pub enabled: bool,
+    pub dest_dir: PathBuf,
+    pub max_generations: u32,
+    pub tz: String,
+    pub now: DateTime<Utc>,
+}
+
 /// Pluggable integrity checker used by [`run_backup_with_integrity_checker`].
 ///
 /// Accepts a backup file path and returns whether the file passes
@@ -98,6 +109,48 @@ pub(crate) fn run_backup_with_integrity_checker(
         conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
     }
 
+    finalize_backup(dest_dir, dest_path, max_generations, checker)
+}
+
+/// Creates a backup snapshot from a raw connection (used before pool construction).
+///
+/// Unlike [`run_backup`], this opens the source database directly via a fresh
+/// `Connection`, which is required for the startup path where the r2d2 pool
+/// has not been built yet.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] on snapshot creation, integrity check, or pruning
+/// failures.
+pub(crate) fn run_startup_backup(
+    db_path: &Path,
+    settings: &BackupSettings,
+) -> Result<BackupOutcome, StorageError> {
+    std::fs::create_dir_all(&settings.dest_dir)?;
+    let dest_path = settings
+        .dest_dir
+        .join(generate_backup_filename(settings.now, &settings.tz));
+
+    {
+        let conn = Connection::open(db_path)?;
+        let escaped = dest_path.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+    }
+
+    finalize_backup(
+        &settings.dest_dir,
+        dest_path,
+        settings.max_generations,
+        run_pragma_integrity_check,
+    )
+}
+
+fn finalize_backup(
+    dest_dir: &Path,
+    dest_path: PathBuf,
+    max_generations: u32,
+    checker: IntegrityChecker,
+) -> Result<BackupOutcome, StorageError> {
     let integrity_ok = checker(&dest_path)?;
     let outcome = BackupOutcome {
         path: dest_path,
@@ -583,5 +636,72 @@ mod tests {
             next,
             "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap()
         );
+    }
+
+    fn backup_settings(dest_dir: PathBuf) -> BackupSettings {
+        BackupSettings {
+            enabled: true,
+            dest_dir,
+            max_generations: 12,
+            tz: "UTC".to_string(),
+            now: "2026-06-20T03:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn database_new_with_backup_creates_startup_backup_before_migration() {
+        // Arrange: create an existing DB, then close it
+        let src = tempfile::tempdir().expect("src");
+        let db_path = src.path().join("runtime").join("egopulse.db");
+        {
+            let _db = Database::new(&db_path).expect("seed db");
+        }
+        let backup_dir = tempfile::tempdir().expect("backup");
+        let settings = backup_settings(backup_dir.path().to_path_buf());
+
+        // Act
+        let _db = Database::new_with_backup(&db_path, &settings).expect("open with backup");
+
+        // Assert
+        let expected = backup_dir.path().join("egopulse-20260620-030000.db");
+        assert!(expected.exists(), "startup backup file should exist");
+    }
+
+    #[test]
+    fn database_new_with_backup_skips_backup_when_db_file_missing() {
+        // Arrange: DB file does not exist (first run)
+        let src = tempfile::tempdir().expect("src");
+        let db_path = src.path().join("runtime").join("egopulse.db");
+        let backup_dir = tempfile::tempdir().expect("backup");
+        let settings = backup_settings(backup_dir.path().to_path_buf());
+
+        // Act
+        let _db = Database::new_with_backup(&db_path, &settings).expect("open with backup");
+
+        // Assert
+        assert!(
+            backup_dir.path().read_dir().unwrap().count() == 0,
+            "no backup should be created on first run"
+        );
+    }
+
+    #[test]
+    fn database_new_with_backup_continues_when_startup_backup_fails() {
+        // Arrange: existing DB, but dest_dir is a regular file (unwritable as dir)
+        let src = tempfile::tempdir().expect("src");
+        let db_path = src.path().join("runtime").join("egopulse.db");
+        {
+            let _db = Database::new(&db_path).expect("seed db");
+        }
+        let bogus = tempfile::tempdir().expect("bogus");
+        let bogus_dest = bogus.path().join("not_a_dir"); // regular file path
+        std::fs::write(&bogus_dest, b"blocker").expect("blocker");
+        let settings = backup_settings(bogus_dest.clone());
+
+        // Act
+        let db = Database::new_with_backup(&db_path, &settings);
+
+        // Assert: open succeeds even though backup could not write
+        assert!(db.is_ok(), "startup should succeed despite backup failure");
     }
 }
