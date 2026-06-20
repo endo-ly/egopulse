@@ -59,6 +59,7 @@ macro_rules! parse_row_enum {
     }};
 }
 
+mod backup;
 mod chat;
 mod episode;
 mod migration;
