@@ -801,7 +801,9 @@ fn normalize_db(file: Option<FileDatabaseConfig>) -> Result<DatabaseConfig, Conf
             "max_generations must be at least 1".to_string(),
         ));
     }
-    validate_schedule(&backup.time)?;
+    validate_schedule(&backup.time).map_err(|_| {
+        ConfigError::InvalidBackupConfig("time must be in HH:MM format".to_string())
+    })?;
 
     Ok(DatabaseConfig { backup })
 }

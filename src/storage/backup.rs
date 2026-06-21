@@ -188,6 +188,9 @@ fn run_pragma_integrity_check(path: &Path) -> Result<bool, StorageError> {
 ///
 /// Returns [`StorageError`] only when an existing entry cannot be removed.
 pub(crate) fn prune_old_backups(dir: &Path, max_generations: u32) -> Result<usize, StorageError> {
+    if max_generations == 0 {
+        return Ok(0);
+    }
     if !dir.exists() {
         return Ok(0);
     }
