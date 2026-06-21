@@ -4216,7 +4216,7 @@ db:
 
     let reloaded = Config::load_allow_missing_api_key(Some(&file_path)).expect("reload");
 
-    assert_eq!(reloaded.db.backup.enabled, false);
+    assert!(!reloaded.db.backup.enabled);
     assert_eq!(reloaded.db.backup.interval_days, 3);
     assert_eq!(reloaded.db.backup.time, "23:45");
     assert_eq!(reloaded.db.backup.max_generations, 7);

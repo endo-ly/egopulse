@@ -59,7 +59,7 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
 
     loop {
         let now = clock.now();
-        let last_run = call_blocking(Arc::clone(&state.db), |db| get_backup_last_run(db)).await?;
+        let last_run = call_blocking(Arc::clone(&state.db), get_backup_last_run).await?;
         let next = match compute_next_backup_run(
             &state.config.db.backup,
             &state.config.timezone,
@@ -82,8 +82,11 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
         sleep(delay).await;
 
         match run_periodic_backup_once(&state, clock.now()).await {
-            Ok(outcome) => {
+            Ok(outcome) if outcome.integrity_ok => {
                 info!(path = %outcome.path.display(), "backup scheduler: created");
+            }
+            Ok(_) => {
+                warn!("backup scheduler: snapshot integrity check failed");
             }
             Err(error) => warn!(%error, "backup scheduler: failed"),
         }
@@ -171,7 +174,7 @@ mod tests {
 
         // Assert
         assert!(outcome.integrity_ok);
-        let stored = call_blocking(Arc::clone(&state.db), |db| get_backup_last_run(db))
+        let stored = call_blocking(Arc::clone(&state.db), get_backup_last_run)
             .await
             .expect("read")
             .expect("last_run present");
@@ -209,7 +212,7 @@ mod tests {
         let completed = tokio::time::timeout(StdDuration::from_secs(5), async {
             loop {
                 if let Ok(Some(_)) =
-                    call_blocking(Arc::clone(&db_for_poll), |db| get_backup_last_run(db)).await
+                    call_blocking(Arc::clone(&db_for_poll), get_backup_last_run).await
                 {
                     return;
                 }

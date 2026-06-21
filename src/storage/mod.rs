@@ -67,7 +67,7 @@ mod pulse;
 mod sleep;
 mod tool;
 
-pub(crate) use backup::{BackupOutcome, BackupSettings};
+pub(crate) use backup::BackupSettings;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -553,6 +553,11 @@ where
 }
 
 impl Database {
+    /// Constructs a `Database` without running a pre-migration backup.
+    ///
+    /// Only used by tests; production code must use [`Database::new_with_backup`]
+    /// so the runtime can perform a backup before migrations touch the schema.
+    #[cfg(test)]
     pub(crate) fn new(db_path: &Path) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
         initialize_database_file(db_path)?;
