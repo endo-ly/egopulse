@@ -59,12 +59,15 @@ macro_rules! parse_row_enum {
     }};
 }
 
+pub(crate) mod backup;
 mod chat;
 mod episode;
 mod migration;
 mod pulse;
 mod sleep;
 mod tool;
+
+pub(crate) use backup::BackupSettings;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -550,42 +553,35 @@ where
 }
 
 impl Database {
+    /// Constructs a `Database` without running a pre-migration backup.
+    ///
+    /// Only used by tests; production code must use [`Database::new_with_backup`]
+    /// so the runtime can perform a backup before migrations touch the schema.
+    #[cfg(test)]
     pub(crate) fn new(db_path: &Path) -> Result<Self, StorageError> {
-        let legacy_db = db_path
-            .parent()
-            .and_then(|runtime| runtime.parent())
-            .map(|root| root.join("data").join("egopulse.db"))
-            .unwrap_or_else(|| Path::new("data").join("egopulse.db"));
-        if legacy_db.exists() && !db_path.exists() {
-            return Err(StorageError::InitFailed(format!(
-                "legacy_db_pending_migration: found {}, but {} does not exist. \
-                 run 'mv {} {}' to migrate.",
-                legacy_db.display(),
-                db_path.display(),
-                legacy_db.display(),
-                db_path.display(),
-            )));
-        }
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+        prepare_db_path(db_path)?;
         initialize_database_file(db_path)?;
+        let pool = build_pool_and_migrate(db_path)?;
+        Ok(Self { pool })
+    }
 
-        let manager = SqliteConnectionManager::new(db_path.to_path_buf());
-        let pool = r2d2::Pool::builder()
-            .max_size(4)
-            .build(manager)
-            .map_err(|e| StorageError::InitFailed(e.to_string()))?;
-
-        {
-            let conn = pool
-                .get()
-                .map_err(|e| StorageError::InitFailed(e.to_string()))?;
-            migration::run_migrations(&conn)?;
+    /// Initializes the database with a pre-migration backup when `settings.enabled`
+    /// is `true` and the DB file already exists. The backup runs against a raw
+    /// connection before the pool is constructed, so any failure is logged and
+    /// swallowed to keep the startup path best-effort. After the backup (or
+    /// skip), this function behaves exactly like [`Database::new`].
+    pub(crate) fn new_with_backup(
+        db_path: &Path,
+        settings: &backup::BackupSettings,
+    ) -> Result<Self, StorageError> {
+        prepare_db_path(db_path)?;
+        if db_path.exists() && settings.enabled {
+            if let Err(error) = backup::run_startup_backup(db_path, settings) {
+                tracing::warn!(%error, "startup backup failed; continuing");
+            }
         }
-
+        initialize_database_file(db_path)?;
+        let pool = build_pool_and_migrate(db_path)?;
         Ok(Self { pool })
     }
 
@@ -611,6 +607,45 @@ impl Database {
             .map_err(|e| StorageError::InitFailed(e.to_string()))?;
         Ok(Self { pool })
     }
+}
+
+fn prepare_db_path(db_path: &Path) -> Result<(), StorageError> {
+    let legacy_db = db_path
+        .parent()
+        .and_then(|runtime| runtime.parent())
+        .map(|root| root.join("data").join("egopulse.db"))
+        .unwrap_or_else(|| Path::new("data").join("egopulse.db"));
+    if legacy_db.exists() && !db_path.exists() {
+        return Err(StorageError::InitFailed(format!(
+            "legacy_db_pending_migration: found {}, but {} does not exist. \
+             run 'mv {} {}' to migrate.",
+            legacy_db.display(),
+            db_path.display(),
+            legacy_db.display(),
+            db_path.display(),
+        )));
+    }
+
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn build_pool_and_migrate(db_path: &Path) -> Result<Pool, StorageError> {
+    let manager = SqliteConnectionManager::new(db_path.to_path_buf());
+    let pool = r2d2::Pool::builder()
+        .max_size(4)
+        .build(manager)
+        .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+
+    {
+        let conn = pool
+            .get()
+            .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+        migration::run_migrations(&conn)?;
+    }
+    Ok(pool)
 }
 
 #[cfg(test)]

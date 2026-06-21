@@ -2,6 +2,7 @@
 //!
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
+pub(crate) mod backup_scheduler;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
@@ -290,7 +291,17 @@ fn build_app_state_dependencies(
     config: &Config,
     provision_default_soul: ProvisionDefaultSoul,
 ) -> Result<AppStateDependencies, EgoPulseError> {
-    let db = Arc::new(Database::new(&config.db_path())?);
+    let backup_settings = crate::storage::BackupSettings {
+        enabled: config.db.backup.enabled,
+        dest_dir: config.backup_dir(),
+        max_generations: config.db.backup.max_generations,
+        tz: config.timezone.clone(),
+        now: chrono::Utc::now(),
+    };
+    let db = Arc::new(Database::new_with_backup(
+        &config.db_path(),
+        &backup_settings,
+    )?);
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
 
     if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
@@ -854,6 +865,16 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             Ok(())
         });
         handles.push(("pulse-scheduler".to_string(), handle));
+    }
+
+    if state.config.db.backup.scheduler_enabled() {
+        let backup_state = state.clone();
+        info!("Starting backup scheduler");
+        let handle =
+            tokio::spawn(
+                async move { backup_scheduler::run_backup_scheduler_loop(backup_state).await },
+            );
+        handles.push(("backup-scheduler".to_string(), handle));
     }
 
     info!("Runtime active; waiting for Ctrl-C or channel failure");

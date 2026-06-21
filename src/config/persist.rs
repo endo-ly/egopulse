@@ -92,6 +92,40 @@ struct SerializableRetry {
 }
 
 #[derive(Serialize)]
+struct SerializableBackup {
+    #[serde(skip_serializing_if = "is_default_bool_true")]
+    enabled: bool,
+    #[serde(skip_serializing_if = "is_default_interval_days")]
+    interval_days: u32,
+    #[serde(skip_serializing_if = "is_default_time")]
+    time: String,
+    #[serde(skip_serializing_if = "is_default_max_generations")]
+    max_generations: u32,
+}
+
+fn is_default_bool_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_default_interval_days(v: &u32) -> bool {
+    *v == super::types::BackupConfig::default().interval_days
+}
+
+fn is_default_time(v: &str) -> bool {
+    v == super::types::BackupConfig::default().time
+}
+
+fn is_default_max_generations(v: &u32) -> bool {
+    *v == super::types::BackupConfig::default().max_generations
+}
+
+#[derive(Serialize)]
+struct SerializableDb {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<SerializableBackup>,
+}
+
+#[derive(Serialize)]
 struct SerializableConfig {
     default_provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +148,8 @@ struct SerializableConfig {
     timezone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sleep_batch: Option<SerializableSleepBatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db: Option<SerializableDb>,
     #[serde(skip_serializing_if = "Option::is_none")]
     web_fetch: Option<SerializableWebFetchConfig>,
 }
@@ -415,6 +451,26 @@ impl From<&Config> for SerializableConfig {
                     })
                 }
             },
+            db: {
+                let defaults = super::types::BackupConfig::default();
+                let bc = &config.db.backup;
+                let is_default = bc.enabled == defaults.enabled
+                    && bc.interval_days == defaults.interval_days
+                    && bc.time == defaults.time
+                    && bc.max_generations == defaults.max_generations;
+                if is_default {
+                    None
+                } else {
+                    Some(SerializableDb {
+                        backup: Some(SerializableBackup {
+                            enabled: bc.enabled,
+                            interval_days: bc.interval_days,
+                            time: bc.time.clone(),
+                            max_generations: bc.max_generations,
+                        }),
+                    })
+                }
+            },
             web_fetch: {
                 let wf = &config.web_fetch;
                 let wf_defaults = super::web_fetch::WebFetchConfig::default();
@@ -695,6 +751,7 @@ mod tests {
             timezone: "UTC".to_string(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
+            db: crate::config::DatabaseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
         }
     }

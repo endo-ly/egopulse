@@ -179,7 +179,12 @@ fn next_run_for_time(tz: Tz, time: NaiveTime, now: DateTime<Utc>) -> Option<Date
     try_date(tz, tomorrow_date, time, &local_now)
 }
 
-fn try_date(
+/// Resolves `date @ time` in `tz` to a UTC instant strictly after `local_now`.
+///
+/// Handles DST gaps by delegating to [`resolve_gap`], and DST folds by picking
+/// the earliest disambiguation that is still in the future. Shared between the
+/// sleep and backup schedulers so both observe identical DST semantics.
+pub(crate) fn try_date(
     tz: Tz,
     date: chrono::NaiveDate,
     time: NaiveTime,
@@ -207,7 +212,9 @@ fn try_date(
     }
 }
 
-fn resolve_gap(
+/// Advances minute-by-minute from `start` until the local datetime maps to a
+/// single UTC instant strictly after `local_now`. Used to recover from DST gaps.
+pub(crate) fn resolve_gap(
     tz: Tz,
     start: chrono::NaiveDateTime,
     local_now: &DateTime<Tz>,

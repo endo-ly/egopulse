@@ -264,6 +264,11 @@ impl Config {
         self.runtime_dir().join("egopulse.db")
     }
 
+    /// バックアップ保存ディレクトリ: `state_root/runtime/backups`。
+    pub(crate) fn backup_dir(&self) -> PathBuf {
+        self.runtime_dir().join("backups")
+    }
+
     /// アセットディレクトリ: `state_root/runtime/assets`。
     pub(crate) fn assets_dir(&self) -> PathBuf {
         self.runtime_dir().join("assets")

@@ -248,6 +248,8 @@ pub enum ConfigError {
         path: String,
         detail: String,
     },
+    #[error("invalid_backup_config: {0}")]
+    InvalidBackupConfig(String),
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

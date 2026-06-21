@@ -217,6 +217,7 @@ mod tests {
             timezone: "UTC".to_string(),
             sleep_batch: crate::config::SleepBatchConfig::default(),
             pulse: crate::config::PulseConfig::default(),
+            db: crate::config::DatabaseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
         }
     }

@@ -213,7 +213,34 @@ Pulse（注意活性化）のスケジューラ設定。
 | `pulse.enabled` | `bool` | 任意 | `false` | Pulse 機能の有効/無効 |
 | `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`） |
 
-### 2.9 Web Fetch 設定（`web_fetch`）
+### 2.9 DB バックアップ設定（`db.backup`）
+
+SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md#5-バックアップ復元) も参照。
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| `db.backup.enabled` | `bool` | 任意 | `true` | バックアップ機能の有効/無効。`false` で起動時・定期ともに停止 |
+| `db.backup.interval_days` | `u32` | 任意 | `7` | 定期バックアップの間隔（日）。`1` 以上 |
+| `db.backup.time` | `string` | 任意 | `"03:00"` | 定期バックアップの実行時刻（HH:MM）。`Config.timezone` で解釈 |
+| `db.backup.max_generations` | `u32` | 任意 | `12` | 保持する世代数。超過分は古い順に削除。`1` 以上 |
+
+#### バックアップのタイミング
+
+- **起動時バックアップ**: マイグレーション前に1回だけ実行（既存 DB が存在する場合）
+- **定期バックアップ**: `interval_days` 間隔で `time` 時刻に実行。直近 `max_generations` 件を保持
+
+#### 設定例
+
+```yaml
+db:
+  backup:
+    enabled: true
+    interval_days: 7
+    time: "03:00"
+    max_generations: 12
+```
+
+### 2.10 Web Fetch 設定（`web_fetch`）
 
 `web_fetch` built-in tool の挙動を制御する設定。URL scheme、タイムアウト、SSRF 対策、コンテンツバリデーションの各項目を設定する。
 
@@ -230,7 +257,7 @@ Pulse（注意活性化）のスケジューラ設定。
 | `web_fetch.content_validation.strict_mode` | `bool` | 任意 | `false` | 厳格モード: 低信頼度ヒットでもブロック |
 | `web_fetch.content_validation.max_scan_bytes` | `usize` | 任意 | `65536` | インジェクションスキャンの最大バイト数 |
 
-### 2.10 エージェント定義（`agents.<id>`）
+### 2.11 エージェント定義（`agents.<id>`）
 
 `agents` はキーがエージェント ID のマップ。複数定義可能。
 
@@ -265,7 +292,7 @@ agents:
         model: gpt-4.1-mini
 ```
 
-### 2.11 完全 YAML 例
+### 2.12 完全 YAML 例
 
 ```yaml
 # ========================================
@@ -425,7 +452,7 @@ web_fetch:
     max_scan_bytes: 65536
 ```
 
-### 2.12 環境変数オーバーライド
+### 2.13 環境変数オーバーライド
 
 Config YAML の値を環境変数で上書き可能。環境変数が設定されている場合、YAML の値より優先される。
 
