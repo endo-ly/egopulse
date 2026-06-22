@@ -643,6 +643,86 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Secret DB のスキーマバージョン。
+///
+/// `egopulse.db` とは独立して管理する。
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 1;
+
+/// Secret DB のマイグレーションを実行する。
+///
+/// `egopulse.db` の6テーブル（chats, messages, sessions, llm_usage_logs, db_meta, schema_migrations）
+/// のみを作成する。`tool_calls`, `sleep_runs`, `pulse_runs` 等は含まない。
+pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageError> {
+    let mut version = schema_version(conn)?;
+
+    if version < SECRET_SCHEMA_VERSION {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_title TEXT,
+                chat_type TEXT NOT NULL DEFAULT 'private',
+                last_message_time TEXT NOT NULL,
+                channel TEXT,
+                external_chat_id TEXT,
+                agent_id TEXT NOT NULL DEFAULT 'default'
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
+                ON chats(channel, external_chat_id);
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                is_from_bot INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL,
+                message_kind TEXT NOT NULL DEFAULT 'message',
+                sender_agent_id TEXT,
+                recipient_agent_id TEXT,
+                PRIMARY KEY (id, chat_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+                ON messages(chat_id, timestamp);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                chat_id INTEGER PRIMARY KEY,
+                messages_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                caller_channel TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
+                ON llm_usage_logs(chat_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+                ON llm_usage_logs(created_at);",
+        )?;
+        set_schema_version(
+            conn,
+            1,
+            "initial secret schema: chats, messages, sessions, llm_usage_logs",
+        )?;
+        version = 1;
+    }
+
+    debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
