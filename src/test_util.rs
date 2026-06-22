@@ -123,6 +123,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
+        is_secret: false,
     }
 }
 

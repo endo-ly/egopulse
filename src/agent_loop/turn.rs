@@ -101,6 +101,7 @@ pub async fn ask_in_session(
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
+        is_secret: false,
     };
 
     tokio::select! {
@@ -1334,6 +1335,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         }
     }
 
@@ -1578,6 +1580,7 @@ mod tests {
                     chain_depth: 0,
                     origin_id: String::new(),
                     trace_id: String::new(),
+                    is_secret: false,
                 },
             ),
         ];

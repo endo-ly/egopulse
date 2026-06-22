@@ -930,6 +930,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         assert_eq!(context.agent_id, "default");
@@ -955,6 +956,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
@@ -966,6 +968,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         let chat_a = super::resolve_chat_id(&state, &ctx_a)
@@ -1001,6 +1004,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
@@ -1021,6 +1025,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
         let telegram_ctx = SurfaceContext {
             channel: "telegram".to_string(),
@@ -1032,6 +1037,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         assert_eq!(web_ctx.session_key(), "web:s1:agent:default");
@@ -1082,6 +1088,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         let first = super::resolve_chat_id(&state, &ctx).await.expect("first");

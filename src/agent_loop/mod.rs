@@ -67,6 +67,9 @@ pub(crate) struct SurfaceContext {
     /// Trace ID for observability: UUID correlating all log events within a single turn.
     /// Generated in `execute_scheduled_turn` and propagated through the turn lifecycle.
     pub trace_id: String,
+    /// Whether this turn originates from a secret channel.
+    /// When `true`, all DB access routes to `secret.db` instead of `egopulse.db`.
+    pub is_secret: bool,
 }
 
 impl SurfaceContext {
@@ -88,6 +91,7 @@ impl SurfaceContext {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         }
     }
 
@@ -173,5 +177,17 @@ mod tests {
         );
 
         assert_eq!(ctx.session_key(), "cli:mysession");
+    }
+
+    #[test]
+    fn surface_context_defaults_is_secret_to_false() {
+        let ctx = SurfaceContext::new(
+            "discord".to_string(),
+            "user".to_string(),
+            "thread".to_string(),
+            "discord".to_string(),
+            "default".to_string(),
+        );
+        assert!(!ctx.is_secret);
     }
 }

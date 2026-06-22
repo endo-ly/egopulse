@@ -182,6 +182,7 @@ impl Tool for AgentSendTool {
             chain_depth: target_chain_depth,
             origin_id: context.origin_id.clone(),
             trace_id: String::new(),
+            is_secret: false,
         };
 
         let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
