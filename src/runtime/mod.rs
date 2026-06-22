@@ -40,6 +40,8 @@ use crate::tools::ToolRegistry;
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) db: Arc<Database>,
+    /// Secret DB for isolated secret-mode storage. `None` when no secret channels are configured.
+    pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
@@ -66,6 +68,7 @@ pub struct AppState {
 
 pub(crate) struct AppStateParts {
     pub(crate) db: Arc<Database>,
+    pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
@@ -92,6 +95,7 @@ impl AppState {
     pub(crate) fn from_parts(parts: AppStateParts) -> Self {
         Self {
             db: parts.db,
+            secret_db: parts.secret_db,
             config: parts.config,
             config_path: parts.config_path,
             llm_override: parts.llm_override,
@@ -109,6 +113,28 @@ impl AppState {
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
             runtime_status: parts.runtime_status,
             _sealed: (),
+        }
+    }
+
+    /// Returns `true` when the secret DB is initialized (i.e., at least one
+    /// channel has `secret: true` in the config).
+    pub(crate) fn secret_enabled(&self) -> bool {
+        self.secret_db.is_some()
+    }
+
+    /// Returns the appropriate `Database` reference based on `is_secret`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `is_secret == true` but `secret_db` was not initialized
+    /// (i.e., no secret channels in config).
+    pub(crate) fn db_for(&self, is_secret: bool) -> &Database {
+        if is_secret {
+            self.secret_db
+                .as_ref()
+                .expect("secret db required but not initialized")
+        } else {
+            &self.db
         }
     }
 
@@ -232,6 +258,7 @@ pub async fn build_app_state_with_path(
 
     let state = AppState::from_parts(AppStateParts {
         db: deps.db,
+        secret_db: None,
         config,
         config_path,
         llm_override: None,
@@ -267,6 +294,7 @@ pub fn build_sleep_app_state_with_path(
 
     Ok(AppState::from_parts(AppStateParts {
         db: deps.db,
+        secret_db: None,
         config,
         config_path,
         llm_override: None,
@@ -1117,5 +1145,54 @@ mod tests {
         let state = build_sleep_app_state_with_path(config, None).expect("build sleep state");
         let snap = state.runtime_status.snapshot();
         assert!(!snap.version.is_empty());
+    }
+
+    fn build_sleep_state(dir: &tempfile::TempDir) -> AppState {
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        build_sleep_app_state_with_path(config, None).expect("build sleep state")
+    }
+
+    #[test]
+    fn secret_enabled_returns_false_when_no_secret_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        assert!(!state.secret_enabled());
+    }
+
+    #[test]
+    fn secret_enabled_returns_true_when_secret_db_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(secret_db);
+        assert!(state.secret_enabled());
+    }
+
+    #[test]
+    fn db_for_returns_normal_db_when_not_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        let result = state.db_for(false);
+        assert!(std::ptr::eq(result, state.db.as_ref()));
+    }
+
+    #[test]
+    fn db_for_returns_secret_db_when_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+        let result = state.db_for(true);
+        assert!(std::ptr::eq(result, secret_db.as_ref()));
+    }
+
+    #[test]
+    #[should_panic(expected = "secret db required but not initialized")]
+    fn db_for_panics_when_secret_db_uninitialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        let _ = state.db_for(true);
     }
 }

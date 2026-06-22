@@ -436,6 +436,12 @@ impl Config {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Returns `true` when any Discord channel or Telegram chat has `secret: true`.
+    pub(crate) fn needs_secret_db(&self) -> bool {
+        self.discord_channels().values().any(|c| c.secret)
+            || self.telegram_channels().values().any(|c| c.secret)
+    }
 }
 
 /// Runtime data needed to start and operate one Discord bot.
