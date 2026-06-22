@@ -266,6 +266,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         }
     }
 
@@ -488,6 +489,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -536,6 +538,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -619,6 +622,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool
@@ -649,6 +653,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool
@@ -688,6 +693,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -727,6 +733,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -772,6 +779,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool

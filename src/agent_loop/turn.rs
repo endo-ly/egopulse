@@ -218,6 +218,7 @@ async fn process_turn_inner(
             origin_id: context.origin_id.clone(),
             turn_sender: state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: context.is_secret,
         };
         let system_prompt = build_system_prompt(state, context);
         let channel_llm = state.llm_for_context(context).inspect_err(|e| {
@@ -293,6 +294,7 @@ async fn process_turn_inner(
                 log_scope: "agent_loop",
                 send_failure_log: "LLM send_message failed",
                 iteration,
+                is_secret: context.is_secret,
             })
             .await?;
 
@@ -312,6 +314,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
+                                context.is_secret,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -338,6 +341,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
+                                context.is_secret,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -469,6 +473,7 @@ fn evaluate_malformed_response(
 
 async fn persist_and_finalize(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     messages: &mut Arc<Vec<Message>>,
@@ -485,6 +490,7 @@ async fn persist_and_finalize(
 
     let _persisted = persist_phase(
         state,
+        is_secret,
         StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
         &updated,
@@ -512,6 +518,7 @@ async fn execute_and_persist_tools(
     let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
     let persisted = persist_tool_call_assistant_message(
         state,
+        tool_context.is_secret,
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
@@ -534,6 +541,7 @@ async fn execute_and_persist_tools(
     let tool_result_phase = build_tool_result_phase(tool_outcomes);
     let persisted = persist_tool_result_messages(
         state,
+        tool_context.is_secret,
         tool_context.chat_id,
         &tool_context.agent_id,
         messages,
@@ -549,6 +557,7 @@ async fn execute_and_persist_tools(
 
 async fn persist_tool_call_assistant_message(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     assistant_message_id: &str,
@@ -561,6 +570,7 @@ async fn persist_tool_call_assistant_message(
 
     persist_phase(
         state,
+        is_secret,
         StoredMessage {
             id: assistant_message_id.to_string(),
             ..StoredMessage::assistant(
@@ -578,6 +588,7 @@ async fn persist_tool_call_assistant_message(
 
 async fn persist_tool_result_messages(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     messages: Vec<Message>,
@@ -599,6 +610,7 @@ async fn persist_tool_result_messages(
     messages_with_tools.extend(tool_messages.iter().cloned());
     persist_phase_messages(
         state,
+        is_secret,
         StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview),
         tool_messages,
         &messages_with_tools,
@@ -619,8 +631,14 @@ async fn execute_tool_calls(
     }
 
     for tool_call in &valid_tool_calls {
-        store_pending_tool_call(state, tool_context.chat_id, assistant_message_id, tool_call)
-            .await?;
+        store_pending_tool_call(
+            state,
+            tool_context.is_secret,
+            tool_context.chat_id,
+            assistant_message_id,
+            tool_call,
+        )
+        .await?;
     }
 
     let start_emitter = on_event.clone();
@@ -653,6 +671,7 @@ async fn execute_tool_calls(
     for outcome in &outcomes {
         update_tool_call_output(
             state,
+            tool_context.is_secret,
             tool_context.chat_id,
             assistant_message_id,
             &outcome.tool_call.id,
@@ -666,10 +685,14 @@ async fn execute_tool_calls(
 
 async fn store_pending_tool_call(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     message_id: &str,
     tool_call: &ToolCall,
 ) -> Result<(), EgoPulseError> {
+    if is_secret {
+        return Ok(());
+    }
     let record = StoredToolCall {
         id: tool_call.id.clone(),
         chat_id,
@@ -686,11 +709,15 @@ async fn store_pending_tool_call(
 
 async fn update_tool_call_output(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     message_id: &str,
     tool_call_id: &str,
     output: &str,
 ) -> Result<(), EgoPulseError> {
+    if is_secret {
+        return Ok(());
+    }
     let message_id = message_id.to_string();
     let tool_call_id = tool_call_id.to_string();
     let output = output.to_string();
@@ -710,7 +737,7 @@ async fn persist_user_turn_with_compaction(
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
-    let mut loaded = load_messages_for_turn(state, chat_id).await?;
+    let mut loaded = load_messages_for_turn(state, context.is_secret, chat_id).await?;
     let stored_message = StoredMessage::user(
         chat_id,
         context.surface_user.clone(),
@@ -734,6 +761,7 @@ async fn persist_user_turn_with_compaction(
 
         let persist_result = persist_phase_once(
             state,
+            context.is_secret,
             stored_message.clone(),
             &candidate_messages,
             loaded.session_updated_at.clone(),
@@ -742,7 +770,14 @@ async fn persist_user_turn_with_compaction(
         let persisted = match persist_result {
             Ok(persisted) => persisted,
             Err(error) => {
-                loaded = handle_user_turn_persist_error(state, chat_id, attempt, error).await?;
+                loaded = handle_user_turn_persist_error(
+                    state,
+                    context.is_secret,
+                    chat_id,
+                    attempt,
+                    error,
+                )
+                .await?;
                 continue;
             }
         };
@@ -757,19 +792,20 @@ async fn persist_user_turn_with_compaction(
 
 async fn handle_user_turn_persist_error(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     attempt: usize,
     error: EgoPulseError,
 ) -> Result<crate::agent_loop::session::LoadedSession, EgoPulseError> {
     match persist_phase_conflict_outcome(attempt, error) {
-        PersistConflictOutcome::Reload => load_messages_for_turn(state, chat_id).await,
+        PersistConflictOutcome::Reload => load_messages_for_turn(state, is_secret, chat_id).await,
         PersistConflictOutcome::Return(error) => Err(error),
     }
 }
 
 async fn load_channel_context(state: &AppState, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
-    let messages = call_blocking(Arc::clone(&state.db), move |db| {
+    let messages = call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
         db.get_channel_log_messages(log_chat_id, CHANNEL_CONTEXT_LIMIT)
     })
     .await

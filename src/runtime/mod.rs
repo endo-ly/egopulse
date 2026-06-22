@@ -128,7 +128,7 @@ impl AppState {
     ///
     /// Panics if `is_secret == true` but `secret_db` was not initialized
     /// (i.e., no secret channels in config).
-    pub(crate) fn db_for(&self, is_secret: bool) -> &Database {
+    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
         if is_secret {
             self.secret_db
                 .as_ref()
@@ -1174,7 +1174,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
         let result = state.db_for(false);
-        assert!(std::ptr::eq(result, state.db.as_ref()));
+        assert!(Arc::ptr_eq(result, &state.db));
     }
 
     #[test]
@@ -1185,7 +1185,7 @@ mod tests {
         let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
         state.secret_db = Some(Arc::clone(&secret_db));
         let result = state.db_for(true);
-        assert!(std::ptr::eq(result, secret_db.as_ref()));
+        assert!(Arc::ptr_eq(result, &secret_db));
     }
 
     #[test]

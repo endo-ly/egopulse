@@ -219,7 +219,7 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(state, chat_id).await {
+    let loaded = match load_messages_for_turn(state, context.is_secret, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };

@@ -77,6 +77,7 @@ pub(crate) struct ToolPhaseRequest<'a> {
     pub(crate) log_scope: &'static str,
     pub(crate) send_failure_log: &'static str,
     pub(crate) iteration: usize,
+    pub(crate) is_secret: bool,
 }
 
 pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str) -> Vec<ToolCall> {
@@ -126,6 +127,7 @@ pub(crate) async fn send_tool_phase_request(
     if let Some(usage) = &response.usage {
         log_llm_usage(
             request.state,
+            request.is_secret,
             request.chat_id,
             request.caller_channel,
             request.llm,
@@ -196,6 +198,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
 
 pub(crate) fn log_llm_usage(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     caller_channel: &str,
     llm: &dyn LlmProvider,
@@ -203,7 +206,7 @@ pub(crate) fn log_llm_usage(
     request_kind: &'static str,
     failure_message: &'static str,
 ) {
-    let db = Arc::clone(&state.db);
+    let db = Arc::clone(state.db_for(is_secret));
     let channel = caller_channel.to_string();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();

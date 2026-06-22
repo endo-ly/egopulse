@@ -31,7 +31,7 @@ pub(crate) async fn resolve_chat_id(
     state: &AppState,
     context: &SurfaceContext,
 ) -> Result<i64, EgoPulseError> {
-    call_blocking(Arc::clone(&state.db), {
+    call_blocking(Arc::clone(state.db_for(context.is_secret)), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
         let surface_thread = context.surface_thread.clone();
@@ -64,7 +64,7 @@ pub(crate) async fn load_session_messages(
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let chat_id = resolve_chat_id(state, context).await?;
-    let history = call_blocking(Arc::clone(&state.db), move |db| {
+    let history = call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
         db.get_all_messages(chat_id)
     })
     .await?;
@@ -84,10 +84,11 @@ pub(crate) async fn load_session_messages(
 /// Loads the trimmed session snapshot used as input for the next agent turn.
 pub(crate) async fn load_messages_for_turn(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
     let max_history_messages = state.config.max_history_messages;
-    let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
+    let snapshot = call_blocking(Arc::clone(state.db_for(is_secret)), move |db| {
         db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
@@ -97,18 +98,26 @@ pub(crate) async fn load_messages_for_turn(
 
 pub(crate) async fn persist_phase_once(
     state: &AppState,
+    is_secret: bool,
     message: StoredMessage,
     messages: &[Message],
     session_updated_at: Option<String>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    store_phase_snapshot(state, message, messages.to_vec(), session_updated_at)
-        .await
-        .map_err(EgoPulseError::Storage)
+    store_phase_snapshot(
+        state,
+        is_secret,
+        message,
+        messages.to_vec(),
+        session_updated_at,
+    )
+    .await
+    .map_err(EgoPulseError::Storage)
 }
 
 /// Persists one turn phase with optimistic concurrency and a single conflict retry.
 pub(crate) async fn persist_phase(
     state: &AppState,
+    is_secret: bool,
     message: StoredMessage,
     phase_message: Message,
     messages: &[Message],
@@ -116,6 +125,7 @@ pub(crate) async fn persist_phase(
 ) -> Result<PersistedTurn, EgoPulseError> {
     persist_phase_messages(
         state,
+        is_secret,
         message,
         vec![phase_message],
         messages,
@@ -126,6 +136,7 @@ pub(crate) async fn persist_phase(
 
 pub(crate) async fn persist_phase_messages(
     state: &AppState,
+    is_secret: bool,
     message: StoredMessage,
     phase_messages: Vec<Message>,
     messages: &[Message],
@@ -133,6 +144,7 @@ pub(crate) async fn persist_phase_messages(
 ) -> Result<PersistedTurn, EgoPulseError> {
     let persisted = store_phase_snapshot(
         state,
+        is_secret,
         message.clone(),
         messages.to_vec(),
         session_updated_at.clone(),
@@ -147,13 +159,19 @@ pub(crate) async fn persist_phase_messages(
     let LoadedSession {
         messages: refreshed_messages,
         session_updated_at: refreshed_updated_at,
-    } = load_messages_for_turn(state, message.chat_id).await?;
+    } = load_messages_for_turn(state, is_secret, message.chat_id).await?;
     let mut all_messages = Arc::try_unwrap(refreshed_messages).unwrap_or_else(|arc| (*arc).clone());
     all_messages.extend(phase_messages);
 
-    store_phase_snapshot(state, message, all_messages, refreshed_updated_at)
-        .await
-        .map_err(EgoPulseError::Storage)
+    store_phase_snapshot(
+        state,
+        is_secret,
+        message,
+        all_messages,
+        refreshed_updated_at,
+    )
+    .await
+    .map_err(EgoPulseError::Storage)
 }
 
 fn persisted_turn_or_retry(
@@ -425,6 +443,7 @@ fn missing_image_text_part(image_ref: &str, error: StorageError) -> MessageConte
 
 async fn store_phase_snapshot(
     state: &AppState,
+    is_secret: bool,
     message: StoredMessage,
     snapshot_messages: Vec<Message>,
     session_updated_at: Option<String>,
@@ -435,7 +454,7 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
-    let updated_at = call_blocking(Arc::clone(&state.db), move |db| {
+    let updated_at = call_blocking(Arc::clone(state.db_for(is_secret)), move |db| {
         db.store_message_with_session(&message, &session_json, session_updated_at.as_deref())
     })
     .await?;
@@ -596,6 +615,7 @@ mod tests {
 
         let persisted = persist_phase(
             &state,
+            false,
             StoredMessage {
                 id: "new-user".to_string(),
                 chat_id,
@@ -651,6 +671,7 @@ mod tests {
 
         persist_phase(
             &state,
+            false,
             StoredMessage {
                 id: "tool-msg".to_string(),
                 chat_id,
@@ -681,7 +702,7 @@ mod tests {
         assert!(!session_json.contains("data:image/png;base64"));
         assert!(session_json.contains("\"type\":\"input_image_ref\""));
 
-        let loaded = load_messages_for_turn(&state, chat_id)
+        let loaded = load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("load messages");
         match &loaded.messages[0].content {
@@ -718,7 +739,7 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, chat_id)
+        let loaded = load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("load messages");
         match &loaded.messages[0].content {
@@ -769,7 +790,7 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, chat_id)
+        let loaded = load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("load messages");
 
@@ -817,7 +838,7 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, chat_id)
+        let loaded = load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("load messages");
         assert_eq!(loaded.messages.len(), 55);
@@ -892,6 +913,7 @@ mod tests {
         stale_messages.push(Message::text("user", "next"));
         let persisted = persist_phase(
             &state,
+            false,
             StoredMessage {
                 id: "new-user-full".to_string(),
                 chat_id,
@@ -1200,7 +1222,7 @@ mod tests {
         .await
         .expect("store assistant message");
 
-        let loaded = load_messages_for_turn(&state, chat_id)
+        let loaded = load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("load messages");
 
@@ -1393,6 +1415,7 @@ mod tests {
 
         let _persisted = persist_phase(
             &state,
+            false,
             StoredMessage {
                 id: "borrow-msg".to_string(),
                 chat_id,

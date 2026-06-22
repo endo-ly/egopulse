@@ -3190,7 +3190,7 @@ fn telegram_chat_config_accepts_agents_and_multi_agent() {
         require_mention: true,
         agents: agents.clone(),
         multi_agent: true,
-        secret: false,
+        ..Default::default()
     };
 
     assert!(config.require_mention);
@@ -3230,7 +3230,7 @@ fn channel_config_accepts_telegram_channels() {
             require_mention: false,
             agents: vec![super::AgentId::new("default")],
             multi_agent: false,
-            secret: false,
+            ..Default::default()
         },
     );
 
@@ -3564,7 +3564,7 @@ fn telegram_channels_returns_configured_map() {
             require_mention: true,
             agents: vec![super::AgentId::new("default")],
             multi_agent: false,
-            secret: false,
+            ..Default::default()
         },
     );
 

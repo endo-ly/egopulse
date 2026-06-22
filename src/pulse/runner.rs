@@ -99,6 +99,7 @@ pub(crate) async fn run_activation(
         origin_id: String::new(),
         turn_sender: state.turn_sender.clone(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        is_secret: false,
     };
 
     let system_prompt = build_system_prompt(state, &context);
@@ -120,6 +121,7 @@ pub(crate) async fn run_activation(
             log_scope: "pulse",
             send_failure_log: "pulse LLM send_message failed",
             iteration,
+            is_secret: false,
         })
         .await?;
 

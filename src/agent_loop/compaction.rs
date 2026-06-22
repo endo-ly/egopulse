@@ -1021,7 +1021,7 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("loaded session");
         let loaded_summary = loaded.messages[0].content.as_text_lossy();
@@ -1126,7 +1126,7 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("loaded session");
         assert!(loaded.messages.iter().all(|message| {
