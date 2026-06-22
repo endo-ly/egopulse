@@ -72,6 +72,8 @@ struct FileDiscordChannelConfig {
     agents: Option<Vec<String>>,
     #[serde(default)]
     multi_agent: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    secret: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -83,6 +85,8 @@ struct FileTelegramChatConfig {
     agents: Option<Vec<String>>,
     #[serde(default)]
     multi_agent: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    secret: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -541,6 +545,7 @@ fn normalize_discord_channels(
                 require_mention: v.require_mention,
                 agents,
                 multi_agent,
+                secret: v.secret,
             },
         );
     }
@@ -614,6 +619,7 @@ fn normalize_telegram_channels(
                 require_mention: v.require_mention,
                 agents,
                 multi_agent,
+                secret: v.secret,
             },
         );
     }

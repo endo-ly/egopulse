@@ -927,6 +927,7 @@ channels:
                     require_mention: false,
                     agents: vec![crate::config::AgentId::new("default")],
                     multi_agent: false,
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -983,6 +984,7 @@ channels:
                         crate::config::AgentId::new("reviewer"),
                     ],
                     multi_agent: true,
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -1082,6 +1084,7 @@ channels:
                         crate::config::AgentId::new("reviewer"),
                     ],
                     multi_agent: true,
+                    secret: false,
                 },
             )]
             .into_iter()

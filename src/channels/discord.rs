@@ -1231,6 +1231,7 @@ mod tests {
             require_mention,
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
+            secret: false,
         }
     }
 

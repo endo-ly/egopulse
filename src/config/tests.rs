@@ -3190,6 +3190,7 @@ fn telegram_chat_config_accepts_agents_and_multi_agent() {
         require_mention: true,
         agents: agents.clone(),
         multi_agent: true,
+        secret: false,
     };
 
     assert!(config.require_mention);
@@ -3229,6 +3230,7 @@ fn channel_config_accepts_telegram_channels() {
             require_mention: false,
             agents: vec![super::AgentId::new("default")],
             multi_agent: false,
+            secret: false,
         },
     );
 
@@ -3562,6 +3564,7 @@ fn telegram_channels_returns_configured_map() {
             require_mention: true,
             agents: vec![super::AgentId::new("default")],
             multi_agent: false,
+            secret: false,
         },
     );
 
@@ -4220,4 +4223,149 @@ db:
     assert_eq!(reloaded.db.backup.interval_days, 3);
     assert_eq!(reloaded.db.backup.time, "23:45");
     assert_eq!(reloaded.db.backup.max_generations, 7);
+}
+
+// --- Secret flag tests ---
+
+#[test]
+#[serial]
+fn discord_channel_config_parses_secret_flag() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+               main:
+                 token:
+                   source: env
+                   id: MY_TOKEN"#,
+            Some(
+                r#"      "111":
+            secret: true"#,
+            ),
+        ),
+    );
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert
+    let discord = config.channels.get("discord").expect("discord channel");
+    let channels = discord.discord_channels.as_ref().expect("channels");
+    let ch = channels.get(&111).expect("channel 111");
+    assert!(ch.secret, "secret flag should be true");
+}
+
+#[test]
+#[serial]
+fn telegram_chat_config_parses_secret_flag() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "TG_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: assistant
+agents:
+  assistant:
+    label: Assistant
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      default:
+        token:
+          source: env
+          id: TG_TOKEN
+    telegram_channels:
+      "-1001234567890":
+        secret: true"#,
+    );
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert
+    let telegram = config.channels.get("telegram").expect("telegram channel");
+    let chats = telegram
+        .telegram_channels
+        .as_ref()
+        .expect("telegram_channels");
+    let chat = chats.get(&-1001234567890i64).expect("chat");
+    assert!(chat.secret, "secret flag should be true");
+}
+
+#[test]
+#[serial]
+fn channel_config_secret_defaults_to_false() {
+    // Arrange
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_TOKEN=tok\nTG_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: assistant
+agents:
+  assistant:
+    label: Assistant
+channels:
+  discord:
+    enabled: true
+    bots:
+      main:
+        token:
+          source: env
+          id: MY_TOKEN
+    channels:
+      "222": {}
+  telegram:
+    enabled: true
+    telegram_bots:
+      default:
+        token:
+          source: env
+          id: TG_TOKEN
+    telegram_channels:
+      "-1009876543210": {}"#,
+    );
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert - Discord
+    let discord = config.channels.get("discord").expect("discord channel");
+    let dc = discord
+        .discord_channels
+        .as_ref()
+        .expect("channels")
+        .get(&222)
+        .expect("channel 222");
+    assert!(!dc.secret, "discord secret should default to false");
+
+    // Assert - Telegram
+    let telegram = config.channels.get("telegram").expect("telegram channel");
+    let tc = telegram
+        .telegram_channels
+        .as_ref()
+        .expect("telegram_channels")
+        .get(&-1009876543210i64)
+        .expect("chat");
+    assert!(!tc.secret, "telegram secret should default to false");
 }
