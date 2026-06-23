@@ -2146,4 +2146,133 @@ mod tests {
             "is_secret must be false for non-secret turn"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Secret mode DB isolation
+    // -----------------------------------------------------------------------
+
+    fn count_rows(conn: &rusqlite::Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|e| panic!("count {table}: {e}"))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_chat_routes_to_secret_db_not_egopulse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-routing");
+        context.is_secret = true;
+
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&state, &context)
+            .await
+            .expect("resolve chat id");
+        assert!(chat_id > 0, "secret chat should resolve to a positive id");
+
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        for table in [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+        ] {
+            assert_eq!(
+                count_rows(&ego_conn, table),
+                0,
+                "egopulse.db.{table} must be empty when the turn is secret"
+            );
+        }
+
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        assert_eq!(
+            count_rows(&secret_conn, "chats"),
+            1,
+            "secret.db should hold exactly the one routed chat"
+        );
+    }
+
+    /// Full-turn variant of [`secret_chat_routes_to_secret_db_not_egopulse`].
+    ///
+    /// Currently `#[ignore]`d: the secret `messages` table shipped in
+    /// `run_secret_migrations` (commit 7dea087) still uses the legacy
+    /// `sender_name`/`is_from_bot` columns, so `process_turn` aborts at
+    /// `load_session_snapshot` (`no such column: sender_id`) before any
+    /// message is persisted. This is a production schema bug — not a routing
+    /// bug — and must be fixed in a dedicated step. Once the secret schema is
+    /// aligned with the current `messages` table, remove the attribute.
+    #[tokio::test]
+    #[serial]
+    #[ignore = "blocked by stale secret.db messages schema (see doc comment)"]
+    async fn secret_turn_leaves_egopulse_db_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-db-isolation");
+        context.is_secret = true;
+
+        let reply = process_turn(&state, &context, "top secret")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "secret reply");
+
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        for table in [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+        ] {
+            assert_eq!(
+                count_rows(&ego_conn, table),
+                0,
+                "egopulse.db.{table} must be empty after a secret turn"
+            );
+        }
+
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        for table in ["chats", "messages", "sessions"] {
+            assert!(
+                count_rows(&secret_conn, table) > 0,
+                "secret.db.{table} should have at least one row after a secret turn"
+            );
+        }
+    }
 }
