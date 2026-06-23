@@ -23,7 +23,7 @@ use teloxide::prelude::*;
 use teloxide::types::{FileId, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
-use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
 use crate::channels::utils::text::split_text;
@@ -277,11 +277,18 @@ impl TelegramHandler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let is_secret = thread
+        let scope = thread
             .parse::<i64>()
             .ok()
             .and_then(|cid| self.channels.get(&cid))
-            .is_some_and(|c| c.secret);
+            .map(|c| {
+                if c.secret {
+                    ConversationScope::Secret
+                } else {
+                    ConversationScope::Normal
+                }
+            })
+            .unwrap_or(ConversationScope::Normal);
         let mut ctx = SurfaceContext::new(
             "telegram".to_string(),
             user.to_string(),
@@ -289,7 +296,7 @@ impl TelegramHandler {
             "telegram".to_string(),
             agent_id.to_string(),
         );
-        ctx.is_secret = is_secret;
+        ctx.scope = scope;
         ctx
     }
 
@@ -343,14 +350,21 @@ impl TelegramHandler {
         msg_id: i32,
         text: &str,
     ) -> Option<i64> {
-        let is_secret = self.channels.get(&raw_chat_id).is_some_and(|c| c.secret);
-        match crate::storage::call_blocking(
-            std::sync::Arc::clone(self.app_state.db_for(is_secret)),
-            {
-                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
-                move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
-            },
-        )
+        let scope = self
+            .channels
+            .get(&raw_chat_id)
+            .map(|c| {
+                if c.secret {
+                    ConversationScope::Secret
+                } else {
+                    ConversationScope::Normal
+                }
+            })
+            .unwrap_or(ConversationScope::Normal);
+        match crate::storage::call_blocking(std::sync::Arc::clone(self.app_state.db_for(scope)), {
+            let db = std::sync::Arc::clone(self.app_state.db_for(scope));
+            move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
+        })
         .await
         {
             Ok(chat_id) => {
@@ -364,7 +378,7 @@ impl TelegramHandler {
                     message_kind: crate::storage::MessageKind::Message,
                     recipient_agent_id: None,
                 };
-                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
+                let db = std::sync::Arc::clone(self.app_state.db_for(scope));
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.get_conn()?;
                     conn.execute(
@@ -1696,7 +1710,7 @@ mod tests {
         assert_eq!(msg.sender_id, "user:telegram:987654321");
     }
 
-    // --- make_context is_secret propagation (Step 9) ---
+    // --- make_context scope propagation (Step 9) ---
 
     fn secret_chat_config(
         agent_ids: &[&str],
@@ -1712,28 +1726,28 @@ mod tests {
     }
 
     #[test]
-    fn make_context_sets_is_secret_for_secret_chat() {
+    fn make_context_sets_secret_scope_for_secret_chat() {
         let mut channels = HashMap::new();
         channels.insert(-100123i64, secret_chat_config(&["default"], false, true));
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "-100123", "default");
-        assert!(ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Secret);
     }
 
     #[test]
-    fn make_context_sets_is_secret_false_for_normal_chat() {
+    fn make_context_defaults_to_normal_scope_for_normal_chat() {
         let mut channels = HashMap::new();
         channels.insert(-100456i64, secret_chat_config(&["default"], false, false));
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "-100456", "default");
-        assert!(!ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
     #[test]
-    fn make_context_sets_is_secret_false_for_unknown_chat() {
+    fn make_context_defaults_to_normal_scope_for_unknown_chat() {
         let channels: HashMap<i64, TelegramChatConfig> = HashMap::new();
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "-100789", "default");
-        assert!(!ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 }

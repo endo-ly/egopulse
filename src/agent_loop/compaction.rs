@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::agent_loop::ConversationScope;
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::error::{EgoPulseError, LlmError};
@@ -247,7 +248,7 @@ async fn archive_current_conversation(
     messages: &[Message],
 ) {
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    let groups_dir = if context.is_secret {
+    let groups_dir = if context.scope == ConversationScope::Secret {
         state.config.runtime_dir().join("secret_groups")
     } else {
         state.config.groups_dir()
@@ -348,7 +349,7 @@ fn log_summarizer_usage(
         return;
     };
 
-    let db = std::sync::Arc::clone(state.db_for(context.is_secret));
+    let db = std::sync::Arc::clone(state.db_for(context.scope));
     let channel = context.channel.clone();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();
@@ -1019,9 +1020,13 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
-            .await
-            .expect("loaded session");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state,
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
         let loaded_summary = loaded.messages[0].content.as_text_lossy();
         assert!(loaded_summary.contains("[CONTEXT COMPACTION — REFERENCE ONLY]"));
         assert!(loaded_summary.contains("summary text"));
@@ -1124,9 +1129,13 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
-            .await
-            .expect("loaded session");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state,
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
         assert!(loaded.messages.iter().all(|message| {
             !message
                 .content
@@ -1265,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn archive_path_uses_secret_groups_when_is_secret() {
+    async fn archive_path_uses_secret_groups_for_secret_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
         let provider = RecordingProvider::new(
@@ -1280,7 +1289,7 @@ mod tests {
         let config = test_config_with_compaction(state_root, 40, 1);
         let state = build_state(config, Box::new(provider));
         let mut context = cli_context("archive-secret-routing");
-        context.is_secret = true;
+        context.scope = ConversationScope::Secret;
         let llm = state.llm_for_context(&context).expect("llm");
         let chat_id: i64 = 77;
         let messages = vec![

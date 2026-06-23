@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent_loop::{PendingAgentTurn, SurfaceContext};
+use crate::agent_loop::{ConversationScope, PendingAgentTurn, SurfaceContext};
 use crate::config::{AgentConfig, AgentId};
 use crate::llm::ToolDefinition;
 use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
@@ -51,13 +51,13 @@ impl AgentSendTool {
         }
     }
 
-    fn db_for(&self, is_secret: bool) -> &Arc<crate::storage::Database> {
-        if is_secret {
-            self.secret_db
+    fn db_for(&self, scope: ConversationScope) -> &Arc<crate::storage::Database> {
+        match scope {
+            ConversationScope::Normal => &self.db,
+            ConversationScope::Secret => self
+                .secret_db
                 .as_ref()
-                .expect("secret db required for secret mode agent_send")
-        } else {
-            &self.db
+                .expect("secret db required for secret mode agent_send"),
         }
     }
 }
@@ -163,7 +163,7 @@ impl Tool for AgentSendTool {
         stored.id = message_id;
         stored.message_kind = MessageKind::AgentSend;
 
-        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.is_secret)), move |db| {
+        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
             db.store_message_only(&stored)
         })
         .await
@@ -172,7 +172,7 @@ impl Tool for AgentSendTool {
         }
 
         // 2. Display in channel
-        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.is_secret)), chat_id).await;
+        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.scope)), chat_id).await;
         if let Ok(Some(info)) = chat_info {
             if let Some(adapter) = self.channels.get(&info.channel) {
                 if let Err(error) = adapter
@@ -195,7 +195,7 @@ impl Tool for AgentSendTool {
             chain_depth: target_chain_depth,
             origin_id: context.origin_id.clone(),
             trace_id: String::new(),
-            is_secret: context.is_secret,
+            scope: context.scope,
         };
 
         let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
@@ -279,7 +279,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         }
     }
 
@@ -502,7 +502,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let _ = tool
@@ -551,7 +551,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let _ = tool
@@ -635,7 +635,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = tool
@@ -666,7 +666,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = tool
@@ -706,7 +706,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let _ = tool
@@ -746,7 +746,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let _ = tool
@@ -792,7 +792,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = tool

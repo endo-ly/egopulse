@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
+use crate::agent_loop::ConversationScope;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
@@ -117,19 +118,19 @@ impl AppState {
         }
     }
 
-    /// Returns the appropriate `Database` reference based on `is_secret`.
+    /// Returns the appropriate `Database` reference based on `scope`.
     ///
     /// # Panics
     ///
-    /// Panics if `is_secret == true` but `secret_db` was not initialized
+    /// Panics if `scope` is `Secret` but `secret_db` was not initialized
     /// (i.e., no secret channels in config).
-    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
-        if is_secret {
-            self.secret_db
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+        match scope {
+            ConversationScope::Normal => &self.db,
+            ConversationScope::Secret => self
+                .secret_db
                 .as_ref()
-                .expect("secret db required but not initialized")
-        } else {
-            &self.db
+                .expect("secret db required but not initialized"),
         }
     }
 
@@ -448,7 +449,7 @@ pub(crate) fn execute_scheduled_turn(
             crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state
-                    .db_for(turn.context.is_secret)
+                    .db_for(turn.context.scope)
                     .store_system_event(log_chat_id, &reason)
                 {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -515,7 +516,7 @@ pub(crate) fn execute_scheduled_turn(
                 }
                 if !response.is_empty() {
                     if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                        let db = std::sync::Arc::clone(state.db_for(turn.context.is_secret));
+                        let db = std::sync::Arc::clone(state.db_for(turn.context.scope));
                         let agent_id = turn.context.agent_id.clone();
                         let response_owned = response.clone();
                         if let Err(error) = crate::storage::call_blocking(db, move |db| {
@@ -562,7 +563,7 @@ pub(crate) fn execute_scheduled_turn(
                     .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
-                        .db_for(turn.context.is_secret)
+                        .db_for(turn.context.scope)
                         .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
                     {
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
@@ -973,6 +974,7 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::soul_agents::SoulAgentsLoader;
     use crate::config::ResolvedLlmConfig;
 
@@ -1159,22 +1161,47 @@ mod tests {
     }
 
     #[test]
-    fn db_for_returns_normal_db_when_not_secret() {
+    fn db_for_returns_normal_db_for_normal_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
-        let result = state.db_for(false);
+        let result = state.db_for(ConversationScope::Normal);
         assert!(Arc::ptr_eq(result, &state.db));
     }
 
     #[test]
-    fn db_for_returns_secret_db_when_secret() {
+    fn db_for_returns_secret_db_for_secret_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = build_sleep_state(&dir);
         let secret_path = dir.path().join("runtime").join("secret.db");
         let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
         state.secret_db = Some(Arc::clone(&secret_db));
-        let result = state.db_for(true);
+        let result = state.db_for(ConversationScope::Secret);
         assert!(Arc::ptr_eq(result, &secret_db));
+    }
+
+    #[test]
+    fn db_for_returns_database_for_conversation_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+
+        let normal_db = state.db_for(ConversationScope::Normal);
+        let secret_result = state.db_for(ConversationScope::Secret);
+
+        assert!(
+            Arc::ptr_eq(normal_db, &state.db),
+            "Normal scope must return the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(secret_result, &secret_db),
+            "Secret scope must return the isolated secret database"
+        );
+        assert!(
+            !Arc::ptr_eq(normal_db, secret_result),
+            "Normal and Secret scopes must return different databases"
+        );
     }
 
     #[test]
@@ -1182,6 +1209,6 @@ mod tests {
     fn db_for_panics_when_secret_db_uninitialized() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
-        let _ = state.db_for(true);
+        let _ = state.db_for(ConversationScope::Secret);
     }
 }

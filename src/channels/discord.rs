@@ -22,7 +22,7 @@ use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use tracing::{error, info, warn};
 
-use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{ChannelAdapter, TurnActivity};
 use crate::channels::utils::text::split_text;
@@ -492,11 +492,18 @@ impl Handler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let is_secret = thread
+        let scope = thread
             .parse::<u64>()
             .ok()
             .and_then(|cid| self.channels.get(&cid))
-            .is_some_and(|c| c.secret);
+            .map(|c| {
+                if c.secret {
+                    ConversationScope::Secret
+                } else {
+                    ConversationScope::Normal
+                }
+            })
+            .unwrap_or(ConversationScope::Normal);
         let mut ctx = SurfaceContext::new(
             "discord".to_string(),
             user.to_string(),
@@ -504,7 +511,7 @@ impl Handler {
             "discord".to_string(),
             agent_id.to_string(),
         );
-        ctx.is_secret = is_secret;
+        ctx.scope = scope;
         ctx
     }
 
@@ -597,14 +604,21 @@ impl Handler {
         msg: &DiscordMessage,
         text: &str,
     ) -> Option<i64> {
-        let is_secret = self.channels.get(&channel_id).is_some_and(|c| c.secret);
-        match crate::storage::call_blocking(
-            std::sync::Arc::clone(self.app_state.db_for(is_secret)),
-            {
-                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
-                move |_| db.resolve_channel_log_chat_id(channel_id)
-            },
-        )
+        let scope = self
+            .channels
+            .get(&channel_id)
+            .map(|c| {
+                if c.secret {
+                    ConversationScope::Secret
+                } else {
+                    ConversationScope::Normal
+                }
+            })
+            .unwrap_or(ConversationScope::Normal);
+        match crate::storage::call_blocking(std::sync::Arc::clone(self.app_state.db_for(scope)), {
+            let db = std::sync::Arc::clone(self.app_state.db_for(scope));
+            move |_| db.resolve_channel_log_chat_id(channel_id)
+        })
         .await
         {
             Ok(chat_id) => {
@@ -619,7 +633,7 @@ impl Handler {
                     message_kind: crate::storage::MessageKind::Message,
                     recipient_agent_id: None,
                 };
-                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
+                let db = std::sync::Arc::clone(self.app_state.db_for(scope));
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.get_conn()?;
                     conn.execute(
@@ -2186,7 +2200,7 @@ mod tests {
         assert_eq!(msg.sender_id, "user:discord:123456789");
     }
 
-    // --- make_context is_secret propagation (Step 8) ---
+    // --- make_context scope propagation (Step 8) ---
 
     fn secret_channel(agent_ids: &[&str], multi_agent: bool, secret: bool) -> DiscordChannelConfig {
         DiscordChannelConfig {
@@ -2198,28 +2212,28 @@ mod tests {
     }
 
     #[test]
-    fn make_context_sets_is_secret_for_secret_channel() {
+    fn make_context_sets_secret_scope_for_secret_channel() {
         let mut channels = HashMap::new();
         channels.insert(123u64, secret_channel(&["default"], false, true));
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "123", "default");
-        assert!(ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Secret);
     }
 
     #[test]
-    fn make_context_sets_is_secret_false_for_normal_channel() {
+    fn make_context_defaults_to_normal_scope_for_normal_channel() {
         let mut channels = HashMap::new();
         channels.insert(456u64, secret_channel(&["default"], false, false));
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "456", "default");
-        assert!(!ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
     #[test]
-    fn make_context_sets_is_secret_false_for_unknown_channel() {
+    fn make_context_defaults_to_normal_scope_for_unknown_channel() {
         let channels: HashMap<u64, DiscordChannelConfig> = HashMap::new();
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "789", "default");
-        assert!(!ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 }

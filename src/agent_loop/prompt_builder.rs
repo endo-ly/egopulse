@@ -1,6 +1,6 @@
 //! System prompt construction for agent turns.
 
-use crate::agent_loop::SurfaceContext;
+use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::runtime::AppState;
 
 const CORE_INSTRUCTIONS: &str = include_str!("prompts/core_instructions.md");
@@ -101,7 +101,7 @@ fn build_agents_prompt_section(state: &AppState, context: &SurfaceContext) -> Op
 }
 
 fn build_secret_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
-    if !context.is_secret {
+    if context.scope != ConversationScope::Secret {
         return None;
     }
     let content = state.soul_agents.load_secret(&context.agent_id)?;
@@ -427,7 +427,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         }
     }
 
@@ -760,12 +760,12 @@ mod tests {
 
     fn secret_context(session: &str) -> SurfaceContext {
         let mut ctx = web_context_with_agent(session, "default");
-        ctx.is_secret = true;
+        ctx.scope = ConversationScope::Secret;
         ctx
     }
 
     #[test]
-    fn system_prompt_includes_secret_md_when_is_secret() {
+    fn system_prompt_includes_secret_md_for_secret_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(
             &dir.path().join("agents/default/SECRET.md"),

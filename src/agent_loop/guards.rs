@@ -69,6 +69,7 @@ pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{FakeProvider, build_state_with_provider, cli_context};
     use crate::error::EgoPulseError;
@@ -167,9 +168,13 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
-            .await
-            .expect("loaded session");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state,
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
         assert!(
             loaded
                 .messages

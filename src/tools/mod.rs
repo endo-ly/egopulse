@@ -31,6 +31,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::agent_loop::ConversationScope;
 use crate::config::Config;
 use crate::config::secret_ref::dotenv_path;
 use crate::llm::ToolDefinition;
@@ -82,8 +83,8 @@ pub(crate) struct ToolExecutionContext {
     /// sessions never share this state. Secret values are never persisted
     /// beyond the turn boundary.
     pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// Whether this turn operates in secret mode (routes DB to `secret.db`).
-    pub is_secret: bool,
+    /// Storage scope for this turn's DB routing.
+    pub scope: ConversationScope,
 }
 
 /// Uniform result type returned by all tool implementations.
