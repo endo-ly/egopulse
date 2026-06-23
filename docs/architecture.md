@@ -163,6 +163,7 @@ src/
 ```rust
 pub struct AppState {
     pub(crate) db: Arc<Database>,
+    pub(crate) secret_db: Option<Arc<Database>>,  // None = 秘密モード無効
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
@@ -179,6 +180,17 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<TurnScheduler>,
     pub(crate) turn_tracker: Arc<TurnTracker>,
     pub(crate) runtime_status: Arc<RuntimeStatus>,  // インメモリヘルスサマリー
+}
+
+impl AppState {
+    /// 文脈に応じた DB 参照を返す
+    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
+        if is_secret {
+            self.secret_db.as_ref().expect("secret db required but not initialized")
+        } else {
+            &self.db
+        }
+    }
 }
 ```
 
@@ -197,6 +209,7 @@ pub(crate) struct SurfaceContext {
     pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
     pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
     pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
+    pub is_secret: bool,         // 秘密モードフラグ。true のとき全 DB 操作が secret.db にルーティングされる
 }
 ```
 
@@ -253,9 +266,10 @@ pub(crate) struct SurfaceContext {
 2. Config YAML をロード (~/.egopulse/egopulse.config.yaml)
       │
 3. build_app_state()
-      │
-      ├─ Database 初期化 (SQLite WAL, マイグレーション)
-      ├─ SkillManager 構築
+       │
+       ├─ Database 初期化 (SQLite WAL, マイグレーション)
+       ├─ secret_db 初期化 (Config::needs_secret_db() が true の場合のみ)
+       ├─ SkillManager 構築
       ├─ McpManager 初期化 (MCP server 接続)
       ├─ ToolRegistry 構築 (built-in + MCP adapters)
       ├─ ChannelAdapter 登録
@@ -309,6 +323,7 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
+| **Secret DB Routing** | `runtime/` AppState | `db_for(is_secret)` で通常 DB と秘密 DB を切替。`SurfaceContext.is_secret` でルーティング判定 |
 
 ---
 

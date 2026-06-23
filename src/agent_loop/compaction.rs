@@ -247,14 +247,12 @@ async fn archive_current_conversation(
     messages: &[Message],
 ) {
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    archive_conversation(
-        &state.config.groups_dir(),
-        &context.channel,
-        chat_id,
-        messages,
-        &secrets,
-    )
-    .await;
+    let groups_dir = if context.is_secret {
+        state.config.runtime_dir().join("secret_groups")
+    } else {
+        state.config.groups_dir()
+    };
+    archive_conversation(&groups_dir, &context.channel, chat_id, messages, &secrets).await;
 }
 
 fn select_compaction_slices(
@@ -350,7 +348,7 @@ fn log_summarizer_usage(
         return;
     };
 
-    let db = std::sync::Arc::clone(&state.db);
+    let db = std::sync::Arc::clone(state.db_for(context.is_secret));
     let channel = context.channel.clone();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();
@@ -1021,7 +1019,7 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("loaded session");
         let loaded_summary = loaded.messages[0].content.as_text_lossy();
@@ -1126,7 +1124,7 @@ mod tests {
             "expected last message to end with 'fresh question', got: {final_request}",
         );
 
-        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, chat_id)
+        let loaded = crate::agent_loop::session::load_messages_for_turn(&state, false, chat_id)
             .await
             .expect("loaded session");
         assert!(loaded.messages.iter().all(|message| {
@@ -1263,6 +1261,127 @@ mod tests {
         assert_eq!(archives.len(), 1);
         let body = std::fs::read_to_string(archives[0].path()).expect("archive body");
         assert!(body.contains("msg-1"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn archive_path_uses_secret_groups_when_is_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "summary text".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let config = test_config_with_compaction(state_root, 40, 1);
+        let state = build_state(config, Box::new(provider));
+        let mut context = cli_context("archive-secret-routing");
+        context.is_secret = true;
+        let llm = state.llm_for_context(&context).expect("llm");
+        let chat_id: i64 = 77;
+        let messages = vec![
+            Message::text("user", "secret-msg-1"),
+            Message::text("assistant", "secret-reply-1"),
+        ];
+
+        force_compact(&state, &context, chat_id, &messages, &llm)
+            .await
+            .expect("force_compact");
+
+        let secret_archive_dir = dir
+            .path()
+            .join("runtime")
+            .join("secret_groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        assert!(
+            secret_archive_dir.exists(),
+            "secret archive dir should exist"
+        );
+        let archives = std::fs::read_dir(&secret_archive_dir)
+            .expect("archive dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("archive entries");
+        assert_eq!(archives.len(), 1, "exactly one secret archive expected");
+        let body = std::fs::read_to_string(archives[0].path()).expect("archive body");
+        assert!(body.contains("secret-msg-1"));
+
+        let normal_archive_dir = dir
+            .path()
+            .join("runtime")
+            .join("groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        assert!(
+            !normal_archive_dir.exists(),
+            "normal groups dir should not exist for secret context"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn archive_path_uses_normal_groups_when_not_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "summary text".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let config = test_config_with_compaction(state_root, 40, 1);
+        let state = build_state(config, Box::new(provider));
+        let context = cli_context("archive-normal-routing");
+        let llm = state.llm_for_context(&context).expect("llm");
+        let chat_id: i64 = 88;
+        let messages = vec![
+            Message::text("user", "normal-msg-1"),
+            Message::text("assistant", "normal-reply-1"),
+        ];
+
+        force_compact(&state, &context, chat_id, &messages, &llm)
+            .await
+            .expect("force_compact");
+
+        let normal_archive_dir = dir
+            .path()
+            .join("runtime")
+            .join("groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        assert!(
+            normal_archive_dir.exists(),
+            "normal archive dir should exist"
+        );
+        let archives = std::fs::read_dir(&normal_archive_dir)
+            .expect("archive dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("archive entries");
+        assert_eq!(archives.len(), 1, "exactly one archive expected");
+        let body = std::fs::read_to_string(archives[0].path()).expect("archive body");
+        assert!(body.contains("normal-msg-1"));
+
+        let secret_archive_dir = dir
+            .path()
+            .join("runtime")
+            .join("secret_groups")
+            .join("cli")
+            .join(chat_id.to_string())
+            .join("conversations");
+        assert!(
+            !secret_archive_dir.exists(),
+            "secret groups dir should not exist for normal context"
+        );
     }
 
     #[tokio::test]

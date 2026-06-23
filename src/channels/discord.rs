@@ -492,13 +492,20 @@ impl Handler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        SurfaceContext::new(
+        let is_secret = thread
+            .parse::<u64>()
+            .ok()
+            .and_then(|cid| self.channels.get(&cid))
+            .is_some_and(|c| c.secret);
+        let mut ctx = SurfaceContext::new(
             "discord".to_string(),
             user.to_string(),
             thread.to_string(),
             "discord".to_string(),
             agent_id.to_string(),
-        )
+        );
+        ctx.is_secret = is_secret;
+        ctx
     }
 
     /// メッセージの mention にこの bot が含まれているかを判定する。
@@ -590,10 +597,14 @@ impl Handler {
         msg: &DiscordMessage,
         text: &str,
     ) -> Option<i64> {
-        match crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
-            let db = std::sync::Arc::clone(&self.app_state.db);
-            move |_| db.resolve_channel_log_chat_id(channel_id)
-        })
+        let is_secret = self.channels.get(&channel_id).is_some_and(|c| c.secret);
+        match crate::storage::call_blocking(
+            std::sync::Arc::clone(self.app_state.db_for(is_secret)),
+            {
+                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
+                move |_| db.resolve_channel_log_chat_id(channel_id)
+            },
+        )
         .await
         {
             Ok(chat_id) => {
@@ -608,7 +619,7 @@ impl Handler {
                     message_kind: crate::storage::MessageKind::Message,
                     recipient_agent_id: None,
                 };
-                let db = std::sync::Arc::clone(&self.app_state.db);
+                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.get_conn()?;
                     conn.execute(
@@ -1231,6 +1242,7 @@ mod tests {
             require_mention,
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
+            secret: false,
         }
     }
 
@@ -2172,5 +2184,42 @@ mod tests {
         );
         assert_eq!(msg.sender_kind, crate::storage::SenderKind::User);
         assert_eq!(msg.sender_id, "user:discord:123456789");
+    }
+
+    // --- make_context is_secret propagation (Step 8) ---
+
+    fn secret_channel(agent_ids: &[&str], multi_agent: bool, secret: bool) -> DiscordChannelConfig {
+        DiscordChannelConfig {
+            require_mention: false,
+            agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
+            multi_agent,
+            secret,
+        }
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_for_secret_channel() {
+        let mut channels = HashMap::new();
+        channels.insert(123u64, secret_channel(&["default"], false, true));
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "123", "default");
+        assert!(ctx.is_secret);
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_false_for_normal_channel() {
+        let mut channels = HashMap::new();
+        channels.insert(456u64, secret_channel(&["default"], false, false));
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "456", "default");
+        assert!(!ctx.is_secret);
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_false_for_unknown_channel() {
+        let channels: HashMap<u64, DiscordChannelConfig> = HashMap::new();
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "789", "default");
+        assert!(!ctx.is_secret);
     }
 }

@@ -27,6 +27,11 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
         prompt.push_str(&agents_section);
     }
 
+    if let Some(secret_section) = build_secret_prompt_section(state, context) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&secret_section);
+    }
+
     if let Some(memory_section) = build_memory_prompt_section(state, context) {
         prompt.push_str("\n\n");
         prompt.push_str(&memory_section);
@@ -93,6 +98,14 @@ fn build_agents_prompt_section(state: &AppState, context: &SurfaceContext) -> Op
         &context.surface_thread,
         Some(&context.agent_id),
     )
+}
+
+fn build_secret_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+    if !context.is_secret {
+        return None;
+    }
+    let content = state.soul_agents.load_secret(&context.agent_id)?;
+    Some(format!("<secret>\n{content}\n</secret>"))
 }
 
 fn build_skills_prompt_section(state: &AppState) -> Option<String> {
@@ -414,6 +427,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         }
     }
 
@@ -737,6 +751,84 @@ mod tests {
         assert!(
             prompt.contains("Built-in execution playbook"),
             "core instructions should still be present despite fallback"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SECRET.md injection tests
+    // -----------------------------------------------------------------------
+
+    fn secret_context(session: &str) -> SurfaceContext {
+        let mut ctx = web_context_with_agent(session, "default");
+        ctx.is_secret = true;
+        ctx
+    }
+
+    #[test]
+    fn system_prompt_includes_secret_md_when_is_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path().join("agents/default/SECRET.md"),
+            "you are in secret mode",
+        );
+        let state = build_test_state(dir.path());
+
+        let prompt = build_system_prompt(&state, &secret_context("s1"));
+
+        assert!(
+            prompt.contains("<secret>"),
+            "prompt should contain secret block"
+        );
+        assert!(
+            prompt.contains("you are in secret mode"),
+            "prompt should contain SECRET.md content"
+        );
+    }
+
+    #[test]
+    fn system_prompt_excludes_secret_md_when_not_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path().join("agents/default/SECRET.md"),
+            "you are in secret mode",
+        );
+        let state = build_test_state(dir.path());
+
+        let prompt = build_system_prompt(&state, &web_context_with_agent("s1", "default"));
+
+        assert!(
+            !prompt.contains("<secret>"),
+            "prompt should NOT contain secret block"
+        );
+        assert!(
+            !prompt.contains("you are in secret mode"),
+            "prompt should NOT contain SECRET.md content"
+        );
+    }
+
+    #[test]
+    fn secret_md_appears_between_agents_and_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path().join("agents/default/SECRET.md"),
+            "SECRET_MARKER",
+        );
+        write_memory_file(dir.path(), "default", "episodic.md", "EPISODIC_MARKER");
+
+        let state = build_test_state(dir.path());
+
+        let prompt = build_system_prompt(&state, &secret_context("s1"));
+
+        let secret_pos = prompt
+            .find("SECRET_MARKER")
+            .expect("SECRET_MARKER should be in prompt");
+        let memory_pos = prompt
+            .find("EPISODIC_MARKER")
+            .expect("EPISODIC_MARKER should be in prompt");
+
+        assert!(
+            secret_pos < memory_pos,
+            "SECRET should appear before Memory"
         );
     }
 }

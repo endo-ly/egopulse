@@ -253,7 +253,7 @@ async fn persist_notification_with_session(
         recipient_agent_id: None,
     };
 
-    let loaded = crate::agent_loop::session::load_messages_for_turn(state, chat_id).await?;
+    let loaded = crate::agent_loop::session::load_messages_for_turn(state, false, chat_id).await?;
 
     let mut session_messages = (*loaded.messages).clone();
     session_messages.push(Message::text("user", &synthetic_input.content));
@@ -263,6 +263,7 @@ async fn persist_notification_with_session(
         messages: mut session_messages,
     } = persist_phase_once(
         state,
+        false,
         synthetic_input.clone(),
         &session_messages,
         loaded.session_updated_at,
@@ -276,6 +277,7 @@ async fn persist_notification_with_session(
             messages: persisted_messages,
         } = persist_phase(
             state,
+            false,
             StoredMessage {
                 id: phase.assistant_message_id.clone(),
                 chat_id,
@@ -303,6 +305,7 @@ async fn persist_notification_with_session(
                 messages: persisted_messages,
             } = persist_phase_messages(
                 state,
+                false,
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
                     chat_id,
@@ -340,7 +343,14 @@ async fn persist_notification_with_session(
 
     session_messages.push(Message::text("assistant", output_text));
 
-    persist_phase_once(state, assistant_msg, &session_messages, Some(updated_at)).await?;
+    persist_phase_once(
+        state,
+        false,
+        assistant_msg,
+        &session_messages,
+        Some(updated_at),
+    )
+    .await?;
 
     Ok(assistant_id)
 }

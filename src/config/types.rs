@@ -78,6 +78,8 @@ pub(crate) struct DiscordChannelConfig {
     pub require_mention: bool,
     pub agents: Vec<AgentId>,
     pub multi_agent: bool,
+    /// Whether this channel routes conversations to the isolated `secret.db`.
+    pub secret: bool,
 }
 
 /// Per-chat Telegram configuration stored inside `ChannelConfig.telegram_channels`.
@@ -89,6 +91,8 @@ pub(crate) struct TelegramChatConfig {
     pub agents: Vec<AgentId>,
     /// Whether this chat operates as a multi-agent room.
     pub multi_agent: bool,
+    /// Whether this chat routes conversations to the isolated `secret.db`.
+    pub secret: bool,
 }
 
 /// Per-bot Telegram configuration stored under `channels.telegram.telegram_bots.<bot_id>`.

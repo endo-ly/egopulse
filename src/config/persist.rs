@@ -40,6 +40,8 @@ struct SerializableDiscordChannel {
     agents: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     multi_agent: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    secret: bool,
 }
 
 fn is_default(b: &bool) -> bool {
@@ -207,6 +209,8 @@ struct SerializableTelegramChannel {
     agents: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     multi_agent: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    secret: bool,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -329,6 +333,7 @@ impl From<&Config> for SerializableConfig {
                                                 .map(|a| a.to_string())
                                                 .collect(),
                                             multi_agent: ch_config.multi_agent,
+                                            secret: ch_config.secret,
                                         },
                                     )
                                 })
@@ -360,6 +365,7 @@ impl From<&Config> for SerializableConfig {
                                                 .map(|a| a.to_string())
                                                 .collect(),
                                             multi_agent: ch_config.multi_agent,
+                                            secret: ch_config.secret,
                                         },
                                     )
                                 })
@@ -927,6 +933,7 @@ channels:
                     require_mention: false,
                     agents: vec![crate::config::AgentId::new("default")],
                     multi_agent: false,
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -983,6 +990,7 @@ channels:
                         crate::config::AgentId::new("reviewer"),
                     ],
                     multi_agent: true,
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -1082,6 +1090,7 @@ channels:
                         crate::config::AgentId::new("reviewer"),
                     ],
                     multi_agent: true,
+                    ..Default::default()
                 },
             )]
             .into_iter()

@@ -264,6 +264,11 @@ impl Config {
         self.runtime_dir().join("egopulse.db")
     }
 
+    /// Secret DB ファイルパス: `state_root/runtime/secret.db`。
+    pub(crate) fn secret_db_path(&self) -> PathBuf {
+        self.runtime_dir().join("secret.db")
+    }
+
     /// バックアップ保存ディレクトリ: `state_root/runtime/backups`。
     pub(crate) fn backup_dir(&self) -> PathBuf {
         self.runtime_dir().join("backups")
@@ -435,6 +440,12 @@ impl Config {
             .and_then(|ch| ch.telegram_channels.as_ref())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Returns `true` when any Discord channel or Telegram chat has `secret: true`.
+    pub(crate) fn needs_secret_db(&self) -> bool {
+        self.discord_channels().values().any(|c| c.secret)
+            || self.telegram_channels().values().any(|c| c.secret)
     }
 }
 

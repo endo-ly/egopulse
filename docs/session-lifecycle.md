@@ -260,14 +260,44 @@ Sleep Batch も session クリア前に `archive_conversation_blocking`（compac
 
 ---
 
-## 8. Conflict Retry
+## 8. Secret DB Routing
+
+`SurfaceContext.is_secret == true` のとき、turn 全体の DB 操作が `secret.db` にルーティングされる。対象操作:
+
+| 操作 | ルーティング |
+|---|---|
+| chat_id 解決（`resolve_or_create_chat_id`） | `state.db_for(ctx.is_secret)` |
+| session snapshot 読込（`load_session` / `load_session_snapshot`） | `state.db_for(ctx.is_secret)` |
+| message 保存（`store_message` / `store_message_with_session`） | `state.db_for(ctx.is_secret)` |
+| session snapshot 保存（`save_session`） | `state.db_for(ctx.is_secret)` |
+| LLM usage log（`log_llm_usage`） | `state.db_for(ctx.is_secret)` |
+| compaction 中の LLM usage log | `state.db_for(ctx.is_secret)` |
+| slash command handlers（`/new`, `/compact`, `/status`） | `state.db_for(context.is_secret)` |
+
+### tool_call 永続化のスキップ
+
+秘密モードでは `store_pending_tool_call` / `update_tool_call_output` をスキップする。`secret.db` に `tool_calls` テーブルが存在しないため。tool call block は `sessions.messages_json` に包含されており、LLM context 復元には影響しない。
+
+### Compaction Archive の出力先分離
+
+秘密モードの compaction アーカイブは `runtime/secret_groups/` に出力される。通常モードは `runtime/groups/` のまま。
+
+```text
+通常: <state_root>/runtime/groups/<channel>/<chat_id>/conversations/
+秘密: <state_root>/runtime/secret_groups/<channel>/<chat_id>/conversations/
+```
+
+`runtime/groups/` 配下はデバッグ・監査用の artifact でトラブルシュート時に共有されることが想定される。秘匿内容のアーカイブが混入するリスクを防ぐため、ディレクトリを分離する。
+
+---
+
+## 9. Conflict Retry
 
 session snapshot 保存には楽観ロックを使う。
 
 ### 基本方針
 
 pre-LLM の user-phase save が競合したら、次をやり直す。
-
 1. 最新 snapshot を再ロードする
 2. 新しい user message を積み直す
 3. compaction 条件を再評価する

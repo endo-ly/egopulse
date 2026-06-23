@@ -26,6 +26,7 @@ pub(crate) struct SendMessageTool {
     workspace_dir: PathBuf,
     channels: Arc<ChannelRegistry>,
     db: Arc<Database>,
+    secret_db: Option<Arc<Database>>,
 }
 
 impl SendMessageTool {
@@ -33,11 +34,23 @@ impl SendMessageTool {
         workspace_dir: PathBuf,
         channels: Arc<ChannelRegistry>,
         db: Arc<Database>,
+        secret_db: Option<Arc<Database>>,
     ) -> Self {
         Self {
             workspace_dir,
             channels,
             db,
+            secret_db,
+        }
+    }
+
+    fn db_for(&self, is_secret: bool) -> &Arc<Database> {
+        if is_secret {
+            self.secret_db
+                .as_ref()
+                .expect("secret db required for secret mode send_message")
+        } else {
+            &self.db
         }
     }
 }
@@ -101,13 +114,19 @@ impl Tool for SendMessageTool {
             );
         }
 
-        let chat_info = match lookup_chat_info(Arc::clone(&self.db), context.chat_id).await {
-            Ok(Some(info)) => info,
-            Ok(None) => {
-                return ToolResult::error(format!("no chat found for chat_id {}", context.chat_id));
-            }
-            Err(e) => return ToolResult::error(format!("failed to resolve chat info: {e}")),
-        };
+        let chat_info =
+            match lookup_chat_info(Arc::clone(self.db_for(context.is_secret)), context.chat_id)
+                .await
+            {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    return ToolResult::error(format!(
+                        "no chat found for chat_id {}",
+                        context.chat_id
+                    ));
+                }
+                Err(e) => return ToolResult::error(format!("failed to resolve chat info: {e}")),
+            };
 
         let adapter = match self.channels.get(&chat_info.channel) {
             Some(a) => a,

@@ -277,13 +277,20 @@ impl TelegramHandler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        SurfaceContext::new(
+        let is_secret = thread
+            .parse::<i64>()
+            .ok()
+            .and_then(|cid| self.channels.get(&cid))
+            .is_some_and(|c| c.secret);
+        let mut ctx = SurfaceContext::new(
             "telegram".to_string(),
             user.to_string(),
             thread.to_string(),
             "telegram".to_string(),
             agent_id.to_string(),
-        )
+        );
+        ctx.is_secret = is_secret;
+        ctx
     }
 
     /// テキスト内に @username メンションが含まれているかを判定する。
@@ -336,10 +343,14 @@ impl TelegramHandler {
         msg_id: i32,
         text: &str,
     ) -> Option<i64> {
-        match crate::storage::call_blocking(std::sync::Arc::clone(&self.app_state.db), {
-            let db = std::sync::Arc::clone(&self.app_state.db);
-            move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
-        })
+        let is_secret = self.channels.get(&raw_chat_id).is_some_and(|c| c.secret);
+        match crate::storage::call_blocking(
+            std::sync::Arc::clone(self.app_state.db_for(is_secret)),
+            {
+                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
+                move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
+            },
+        )
         .await
         {
             Ok(chat_id) => {
@@ -353,7 +364,7 @@ impl TelegramHandler {
                     message_kind: crate::storage::MessageKind::Message,
                     recipient_agent_id: None,
                 };
-                let db = std::sync::Arc::clone(&self.app_state.db);
+                let db = std::sync::Arc::clone(self.app_state.db_for(is_secret));
                 if let Err(e) = crate::storage::call_blocking(db, move |db| {
                     let conn = db.get_conn()?;
                     conn.execute(
@@ -1124,6 +1135,7 @@ mod tests {
             require_mention,
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
+            secret: false,
         }
     }
 
@@ -1682,5 +1694,46 @@ mod tests {
         );
         assert_eq!(msg.sender_kind, crate::storage::SenderKind::User);
         assert_eq!(msg.sender_id, "user:telegram:987654321");
+    }
+
+    // --- make_context is_secret propagation (Step 9) ---
+
+    fn secret_chat_config(
+        agent_ids: &[&str],
+        multi_agent: bool,
+        secret: bool,
+    ) -> TelegramChatConfig {
+        TelegramChatConfig {
+            require_mention: false,
+            agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
+            multi_agent,
+            secret,
+        }
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_for_secret_chat() {
+        let mut channels = HashMap::new();
+        channels.insert(-100123i64, secret_chat_config(&["default"], false, true));
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "-100123", "default");
+        assert!(ctx.is_secret);
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_false_for_normal_chat() {
+        let mut channels = HashMap::new();
+        channels.insert(-100456i64, secret_chat_config(&["default"], false, false));
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "-100456", "default");
+        assert!(!ctx.is_secret);
+    }
+
+    #[test]
+    fn make_context_sets_is_secret_false_for_unknown_chat() {
+        let channels: HashMap<i64, TelegramChatConfig> = HashMap::new();
+        let handler = test_handler(channels);
+        let ctx = handler.make_context("user", "-100789", "default");
+        assert!(!ctx.is_secret);
     }
 }

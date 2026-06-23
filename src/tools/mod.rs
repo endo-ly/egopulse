@@ -82,6 +82,8 @@ pub(crate) struct ToolExecutionContext {
     /// sessions never share this state. Secret values are never persisted
     /// beyond the turn boundary.
     pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Whether this turn operates in secret mode (routes DB to `secret.db`).
+    pub is_secret: bool,
 }
 
 /// Uniform result type returned by all tool implementations.

@@ -40,6 +40,8 @@ use crate::tools::ToolRegistry;
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) db: Arc<Database>,
+    /// Secret DB for isolated secret-mode storage. `None` when no secret channels are configured.
+    pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
@@ -66,6 +68,7 @@ pub struct AppState {
 
 pub(crate) struct AppStateParts {
     pub(crate) db: Arc<Database>,
+    pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
@@ -82,6 +85,7 @@ pub(crate) struct AppStateParts {
 
 struct AppStateDependencies {
     db: Arc<Database>,
+    secret_db: Option<Arc<Database>>,
     assets: Arc<AssetStore>,
     skills: Arc<SkillManager>,
     soul_agents: Arc<SoulAgentsLoader>,
@@ -92,6 +96,7 @@ impl AppState {
     pub(crate) fn from_parts(parts: AppStateParts) -> Self {
         Self {
             db: parts.db,
+            secret_db: parts.secret_db,
             config: parts.config,
             config_path: parts.config_path,
             llm_override: parts.llm_override,
@@ -109,6 +114,22 @@ impl AppState {
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
             runtime_status: parts.runtime_status,
             _sealed: (),
+        }
+    }
+
+    /// Returns the appropriate `Database` reference based on `is_secret`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `is_secret == true` but `secret_db` was not initialized
+    /// (i.e., no secret channels in config).
+    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
+        if is_secret {
+            self.secret_db
+                .as_ref()
+                .expect("secret db required but not initialized")
+        } else {
+            &self.db
         }
     }
 
@@ -215,6 +236,7 @@ pub async fn build_app_state_with_path(
         workspace_dir.clone(),
         Arc::clone(&channels),
         Arc::clone(&deps.db),
+        deps.secret_db.clone(),
     )));
 
     let (turn_sender, turn_receiver) =
@@ -223,6 +245,7 @@ pub async fn build_app_state_with_path(
     tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
         config.agents.clone(),
         Arc::clone(&deps.db),
+        deps.secret_db.clone(),
         Arc::clone(&channels),
     )));
 
@@ -232,6 +255,7 @@ pub async fn build_app_state_with_path(
 
     let state = AppState::from_parts(AppStateParts {
         db: deps.db,
+        secret_db: deps.secret_db,
         config,
         config_path,
         llm_override: None,
@@ -267,6 +291,7 @@ pub fn build_sleep_app_state_with_path(
 
     Ok(AppState::from_parts(AppStateParts {
         db: deps.db,
+        secret_db: deps.secret_db,
         config,
         config_path,
         llm_override: None,
@@ -302,6 +327,11 @@ fn build_app_state_dependencies(
         &config.db_path(),
         &backup_settings,
     )?);
+    let secret_db = if config.needs_secret_db() {
+        Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
+    } else {
+        None
+    };
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
 
     if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
@@ -325,6 +355,7 @@ fn build_app_state_dependencies(
 
     Ok(AppStateDependencies {
         db,
+        secret_db,
         assets,
         skills,
         soul_agents,
@@ -416,7 +447,10 @@ pub(crate) fn execute_scheduled_turn(
             );
             crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
+                if let Err(error) = state
+                    .db_for(turn.context.is_secret)
+                    .store_system_event(log_chat_id, &reason)
+                {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
                 }
             }
@@ -481,7 +515,7 @@ pub(crate) fn execute_scheduled_turn(
                 }
                 if !response.is_empty() {
                     if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                        let db = std::sync::Arc::clone(&state.db);
+                        let db = std::sync::Arc::clone(state.db_for(turn.context.is_secret));
                         let agent_id = turn.context.agent_id.clone();
                         let response_owned = response.clone();
                         if let Err(error) = crate::storage::call_blocking(db, move |db| {
@@ -528,7 +562,7 @@ pub(crate) fn execute_scheduled_turn(
                     .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
-                        .db
+                        .db_for(turn.context.is_secret)
                         .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
                     {
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
@@ -1117,5 +1151,37 @@ mod tests {
         let state = build_sleep_app_state_with_path(config, None).expect("build sleep state");
         let snap = state.runtime_status.snapshot();
         assert!(!snap.version.is_empty());
+    }
+
+    fn build_sleep_state(dir: &tempfile::TempDir) -> AppState {
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        build_sleep_app_state_with_path(config, None).expect("build sleep state")
+    }
+
+    #[test]
+    fn db_for_returns_normal_db_when_not_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        let result = state.db_for(false);
+        assert!(Arc::ptr_eq(result, &state.db));
+    }
+
+    #[test]
+    fn db_for_returns_secret_db_when_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+        let result = state.db_for(true);
+        assert!(Arc::ptr_eq(result, &secret_db));
+    }
+
+    #[test]
+    #[should_panic(expected = "secret db required but not initialized")]
+    fn db_for_panics_when_secret_db_uninitialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        let _ = state.db_for(true);
     }
 }

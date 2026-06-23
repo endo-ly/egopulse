@@ -32,6 +32,7 @@ struct AgentSendParams {
 pub(crate) struct AgentSendTool {
     agents: std::collections::HashMap<AgentId, AgentConfig>,
     db: Arc<crate::storage::Database>,
+    secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
 }
 
@@ -39,12 +40,24 @@ impl AgentSendTool {
     pub(crate) fn new(
         agents: std::collections::HashMap<AgentId, AgentConfig>,
         db: Arc<crate::storage::Database>,
+        secret_db: Option<Arc<crate::storage::Database>>,
         channels: Arc<crate::channels::adapter::ChannelRegistry>,
     ) -> Self {
         Self {
             agents,
             db,
+            secret_db,
             channels,
+        }
+    }
+
+    fn db_for(&self, is_secret: bool) -> &Arc<crate::storage::Database> {
+        if is_secret {
+            self.secret_db
+                .as_ref()
+                .expect("secret db required for secret mode agent_send")
+        } else {
+            &self.db
         }
     }
 }
@@ -150,7 +163,7 @@ impl Tool for AgentSendTool {
         stored.id = message_id;
         stored.message_kind = MessageKind::AgentSend;
 
-        if let Err(error) = call_blocking(Arc::clone(&self.db), move |db| {
+        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.is_secret)), move |db| {
             db.store_message_only(&stored)
         })
         .await
@@ -159,7 +172,7 @@ impl Tool for AgentSendTool {
         }
 
         // 2. Display in channel
-        let chat_info = lookup_chat_info(Arc::clone(&self.db), chat_id).await;
+        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.is_secret)), chat_id).await;
         if let Ok(Some(info)) = chat_info {
             if let Some(adapter) = self.channels.get(&info.channel) {
                 if let Err(error) = adapter
@@ -182,6 +195,7 @@ impl Tool for AgentSendTool {
             chain_depth: target_chain_depth,
             origin_id: context.origin_id.clone(),
             trace_id: String::new(),
+            is_secret: context.is_secret,
         };
 
         let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
@@ -247,7 +261,7 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
-        AgentSendTool::new(agents, db, channels)
+        AgentSendTool::new(agents, db, None, channels)
     }
 
     fn test_context_with_agent(
@@ -265,6 +279,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         }
     }
 
@@ -474,7 +489,7 @@ mod tests {
         .expect("create log chat");
 
         let agents = test_agents();
-        let tool = AgentSendTool::new(agents, Arc::clone(&db), channels);
+        let tool = AgentSendTool::new(agents, Arc::clone(&db), None, channels);
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -487,6 +502,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -522,7 +538,7 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let tool = AgentSendTool::new(test_agents(), Arc::clone(&db), channels);
+        let tool = AgentSendTool::new(test_agents(), Arc::clone(&db), None, channels);
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -535,6 +551,7 @@ mod tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -596,7 +613,7 @@ mod integration_tests {
     ) -> (AgentSendTool, Arc<crate::storage::Database>) {
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
-        let tool = AgentSendTool::new(config.agents.clone(), Arc::clone(&db), channels);
+        let tool = AgentSendTool::new(config.agents.clone(), Arc::clone(&db), None, channels);
         (tool, db)
     }
 
@@ -618,6 +635,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool
@@ -648,6 +666,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool
@@ -687,6 +706,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -726,6 +746,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let _ = tool
@@ -771,6 +792,7 @@ mod integration_tests {
             origin_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: false,
         };
 
         let result = tool

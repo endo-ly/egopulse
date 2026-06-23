@@ -20,16 +20,16 @@ const BACKUP_LAST_RUN_KEY: &str = "backup_last_run";
 
 /// Builds the backup file name in the configured timezone.
 ///
-/// The timestamp is rendered as `egopulse-YYYYMMDD-HHMMSS.db` using the
+/// The timestamp is rendered as `{prefix}-YYYYMMDD-HHMMSS.db` using the
 /// supplied IANA timezone, so nightly runs stamp the local date even when
 /// the process runs in UTC. When `timezone` cannot be parsed as an IANA
 /// timezone identifier, UTC is used as a fallback to keep the function pure.
-pub(crate) fn generate_backup_filename(now: DateTime<Utc>, timezone: &str) -> String {
+pub(crate) fn generate_backup_filename(now: DateTime<Utc>, timezone: &str, prefix: &str) -> String {
     let formatted = match timezone.parse::<Tz>() {
         Ok(tz) => now.with_timezone(&tz).format("%Y%m%d-%H%M%S").to_string(),
         Err(_) => now.format("%Y%m%d-%H%M%S").to_string(),
     };
-    format!("egopulse-{formatted}.db")
+    format!("{prefix}-{formatted}.db")
 }
 
 /// Outcome of a single backup run.
@@ -62,7 +62,7 @@ pub(crate) type IntegrityChecker = fn(&Path) -> Result<bool, StorageError>;
 
 /// Runs a single backup with the production integrity checker.
 ///
-/// Creates a `VACUUM INTO` snapshot at `<dest_dir>/egopulse-YYYYMMDD-HHMMSS.db`
+/// Creates a `VACUUM INTO` snapshot at `<dest_dir>/{prefix}-YYYYMMDD-HHMMSS.db`
 /// stamped with `now` interpreted in `timezone`. The snapshot is then verified
 /// via [`run_pragma_integrity_check`]; a failed check removes the file and
 /// returns `BackupOutcome { integrity_ok: false }`.
@@ -79,6 +79,7 @@ pub(crate) fn run_backup(
     timezone: &str,
     now: DateTime<Utc>,
     max_generations: u32,
+    prefix: &str,
 ) -> Result<BackupOutcome, StorageError> {
     run_backup_with_integrity_checker(
         db,
@@ -86,6 +87,7 @@ pub(crate) fn run_backup(
         timezone,
         now,
         max_generations,
+        prefix,
         run_pragma_integrity_check,
     )
 }
@@ -100,10 +102,11 @@ pub(crate) fn run_backup_with_integrity_checker(
     timezone: &str,
     now: DateTime<Utc>,
     max_generations: u32,
+    prefix: &str,
     checker: IntegrityChecker,
 ) -> Result<BackupOutcome, StorageError> {
     std::fs::create_dir_all(dest_dir)?;
-    let dest_path = dest_dir.join(generate_backup_filename(now, timezone));
+    let dest_path = dest_dir.join(generate_backup_filename(now, timezone, prefix));
 
     {
         let conn = db.get_conn()?;
@@ -111,7 +114,7 @@ pub(crate) fn run_backup_with_integrity_checker(
         conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
     }
 
-    finalize_backup(dest_dir, dest_path, max_generations, checker)
+    finalize_backup(dest_dir, dest_path, max_generations, prefix, checker)
 }
 
 /// Creates a backup snapshot from a raw connection (used before pool construction).
@@ -129,9 +132,11 @@ pub(crate) fn run_startup_backup(
     settings: &BackupSettings,
 ) -> Result<BackupOutcome, StorageError> {
     std::fs::create_dir_all(&settings.dest_dir)?;
-    let dest_path = settings
-        .dest_dir
-        .join(generate_backup_filename(settings.now, &settings.tz));
+    let dest_path = settings.dest_dir.join(generate_backup_filename(
+        settings.now,
+        &settings.tz,
+        "egopulse",
+    ));
 
     {
         let conn = Connection::open(db_path)?;
@@ -143,6 +148,7 @@ pub(crate) fn run_startup_backup(
         &settings.dest_dir,
         dest_path,
         settings.max_generations,
+        "egopulse",
         run_pragma_integrity_check,
     )
 }
@@ -151,6 +157,7 @@ fn finalize_backup(
     dest_dir: &Path,
     dest_path: PathBuf,
     max_generations: u32,
+    prefix: &str,
     checker: IntegrityChecker,
 ) -> Result<BackupOutcome, StorageError> {
     let integrity_ok = checker(&dest_path)?;
@@ -166,7 +173,7 @@ fn finalize_backup(
         );
     }
 
-    prune_old_backups(dest_dir, max_generations)?;
+    prune_old_backups(dest_dir, max_generations, prefix)?;
 
     Ok(outcome)
 }
@@ -178,16 +185,21 @@ fn run_pragma_integrity_check(path: &Path) -> Result<bool, StorageError> {
     Ok(result == "ok")
 }
 
-/// Removes the oldest `egopulse-*.db` files beyond `max_generations`.
+/// Removes the oldest `{prefix}-*.db` files beyond `max_generations`.
 ///
 /// Files are sorted by name (descending timestamp) and the oldest overflow is
-/// deleted. Non-matching files (notes, manual copies, subdirectories) are
-/// preserved. A missing or empty directory is a no-op.
+/// deleted. Non-matching files (notes, manual copies, subdirectories, and
+/// files with a different prefix) are preserved. A missing or empty directory
+/// is a no-op.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError`] only when an existing entry cannot be removed.
-pub(crate) fn prune_old_backups(dir: &Path, max_generations: u32) -> Result<usize, StorageError> {
+pub(crate) fn prune_old_backups(
+    dir: &Path,
+    max_generations: u32,
+    prefix: &str,
+) -> Result<usize, StorageError> {
     if max_generations == 0 {
         return Ok(0);
     }
@@ -202,7 +214,7 @@ pub(crate) fn prune_old_backups(dir: &Path, max_generations: u32) -> Result<usiz
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
-            if is_backup_filename(name) {
+            if is_backup_filename(name, prefix) {
                 names.push(name.to_string());
             }
         }
@@ -218,9 +230,12 @@ pub(crate) fn prune_old_backups(dir: &Path, max_generations: u32) -> Result<usiz
     Ok(removed)
 }
 
-/// Returns `true` when `name` matches the canonical backup file pattern.
-fn is_backup_filename(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("egopulse-") else {
+/// Returns `true` when `name` matches the backup file pattern for `prefix`.
+fn is_backup_filename(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
         return false;
     };
     let Some(stem) = rest.strip_suffix(".db") else {
@@ -363,7 +378,7 @@ mod tests {
         let tz = "Asia/Tokyo";
 
         // Act
-        let name = generate_backup_filename(now, tz);
+        let name = generate_backup_filename(now, tz, "egopulse");
 
         // Assert
         assert_eq!(name, "egopulse-20260621-030000.db");
@@ -377,7 +392,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
 
         // Act
-        let outcome = run_backup(&db, dest.path(), "UTC", now, 1).expect("backup");
+        let outcome = run_backup(&db, dest.path(), "UTC", now, 1, "egopulse").expect("backup");
 
         // Assert
         assert_eq!(
@@ -398,7 +413,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
 
         // Act
-        let outcome = run_backup(&db, dest.path(), "UTC", now, 1).expect("backup");
+        let outcome = run_backup(&db, dest.path(), "UTC", now, 1, "egopulse").expect("backup");
 
         // Assert
         let conn = Connection::open(&outcome.path).expect("open backup");
@@ -416,7 +431,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
 
         // Act
-        let outcome = run_backup(&db, dest.path(), "UTC", now, 1).expect("backup");
+        let outcome = run_backup(&db, dest.path(), "UTC", now, 1, "egopulse").expect("backup");
 
         // Assert
         assert!(
@@ -435,9 +450,16 @@ mod tests {
         let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
 
         // Act
-        let outcome =
-            run_backup_with_integrity_checker(&db, dest.path(), "UTC", now, 1, fail_integrity)
-                .expect("backup");
+        let outcome = run_backup_with_integrity_checker(
+            &db,
+            dest.path(),
+            "UTC",
+            now,
+            1,
+            "egopulse",
+            fail_integrity,
+        )
+        .expect("backup");
 
         // Assert
         assert!(!outcome.integrity_ok);
@@ -460,7 +482,7 @@ mod tests {
         }
 
         // Act
-        let removed = prune_old_backups(dir.path(), 3).expect("prune");
+        let removed = prune_old_backups(dir.path(), 3, "egopulse").expect("prune");
 
         // Assert: 2 oldest removed, 3 newest retained
         assert_eq!(removed, 2);
@@ -491,7 +513,7 @@ mod tests {
         }
 
         // Act
-        let removed = prune_old_backups(dir.path(), 5).expect("prune");
+        let removed = prune_old_backups(dir.path(), 5, "egopulse").expect("prune");
 
         // Assert
         assert_eq!(removed, 0);
@@ -513,8 +535,8 @@ mod tests {
         let empty = tempfile::tempdir().expect("empty");
 
         // Act
-        let removed_missing = prune_old_backups(&path_outside, 3).expect("prune");
-        let removed_empty = prune_old_backups(empty.path(), 3).expect("prune");
+        let removed_missing = prune_old_backups(&path_outside, 3, "egopulse").expect("prune");
+        let removed_empty = prune_old_backups(empty.path(), 3, "egopulse").expect("prune");
 
         // Assert
         assert_eq!(removed_missing, 0);
@@ -533,7 +555,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("old")).expect("mkdir");
 
         // Act
-        let removed = prune_old_backups(dir.path(), 2).expect("prune");
+        let removed = prune_old_backups(dir.path(), 2, "egopulse").expect("prune");
 
         // Assert: only the oldest valid backup is removed
         assert_eq!(removed, 1);

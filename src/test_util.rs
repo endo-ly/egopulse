@@ -91,6 +91,13 @@ pub(crate) fn build_state_with_config(
     ));
     AppState::from_parts(AppStateParts {
         db: db.unwrap_or_else(|| Arc::new(Database::new(&config.db_path()).expect("db"))),
+        secret_db: if config.needs_secret_db() {
+            Some(Arc::new(
+                Database::new_secret(&config.secret_db_path()).expect("secret db"),
+            ))
+        } else {
+            None
+        },
         config: config.clone(),
         config_path,
         llm_override,
@@ -122,6 +129,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
+        is_secret: false,
     }
 }
 
@@ -138,5 +146,6 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         origin_id: String::new(),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        is_secret: false,
     }
 }

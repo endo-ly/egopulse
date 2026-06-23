@@ -101,6 +101,7 @@ pub async fn ask_in_session(
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
+        is_secret: false,
     };
 
     tokio::select! {
@@ -194,6 +195,7 @@ async fn process_turn_inner(
         session = %context.surface_thread,
         origin_id = %context.origin_id,
         chain_depth = context.chain_depth,
+        is_secret = context.is_secret,
     );
 
     async move {
@@ -217,6 +219,7 @@ async fn process_turn_inner(
             origin_id: context.origin_id.clone(),
             turn_sender: state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            is_secret: context.is_secret,
         };
         let system_prompt = build_system_prompt(state, context);
         let channel_llm = state.llm_for_context(context).inspect_err(|e| {
@@ -292,6 +295,7 @@ async fn process_turn_inner(
                 log_scope: "agent_loop",
                 send_failure_log: "LLM send_message failed",
                 iteration,
+                is_secret: context.is_secret,
             })
             .await?;
 
@@ -311,6 +315,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
+                                context.is_secret,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -337,6 +342,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
+                                context.is_secret,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -466,8 +472,10 @@ fn evaluate_malformed_response(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_and_finalize(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     messages: &mut Arc<Vec<Message>>,
@@ -484,6 +492,7 @@ async fn persist_and_finalize(
 
     let _persisted = persist_phase(
         state,
+        is_secret,
         StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
         &updated,
@@ -511,6 +520,7 @@ async fn execute_and_persist_tools(
     let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
     let persisted = persist_tool_call_assistant_message(
         state,
+        tool_context.is_secret,
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
@@ -533,6 +543,7 @@ async fn execute_and_persist_tools(
     let tool_result_phase = build_tool_result_phase(tool_outcomes);
     let persisted = persist_tool_result_messages(
         state,
+        tool_context.is_secret,
         tool_context.chat_id,
         &tool_context.agent_id,
         messages,
@@ -546,8 +557,10 @@ async fn execute_and_persist_tools(
     Ok((Arc::new(messages), session_updated_at))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_tool_call_assistant_message(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     assistant_message_id: &str,
@@ -560,6 +573,7 @@ async fn persist_tool_call_assistant_message(
 
     persist_phase(
         state,
+        is_secret,
         StoredMessage {
             id: assistant_message_id.to_string(),
             ..StoredMessage::assistant(
@@ -577,6 +591,7 @@ async fn persist_tool_call_assistant_message(
 
 async fn persist_tool_result_messages(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     agent_id: &str,
     messages: Vec<Message>,
@@ -598,6 +613,7 @@ async fn persist_tool_result_messages(
     messages_with_tools.extend(tool_messages.iter().cloned());
     persist_phase_messages(
         state,
+        is_secret,
         StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview),
         tool_messages,
         &messages_with_tools,
@@ -618,8 +634,14 @@ async fn execute_tool_calls(
     }
 
     for tool_call in &valid_tool_calls {
-        store_pending_tool_call(state, tool_context.chat_id, assistant_message_id, tool_call)
-            .await?;
+        store_pending_tool_call(
+            state,
+            tool_context.is_secret,
+            tool_context.chat_id,
+            assistant_message_id,
+            tool_call,
+        )
+        .await?;
     }
 
     let start_emitter = on_event.clone();
@@ -652,6 +674,7 @@ async fn execute_tool_calls(
     for outcome in &outcomes {
         update_tool_call_output(
             state,
+            tool_context.is_secret,
             tool_context.chat_id,
             assistant_message_id,
             &outcome.tool_call.id,
@@ -665,10 +688,14 @@ async fn execute_tool_calls(
 
 async fn store_pending_tool_call(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     message_id: &str,
     tool_call: &ToolCall,
 ) -> Result<(), EgoPulseError> {
+    if is_secret {
+        return Ok(());
+    }
     let record = StoredToolCall {
         id: tool_call.id.clone(),
         chat_id,
@@ -685,11 +712,15 @@ async fn store_pending_tool_call(
 
 async fn update_tool_call_output(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     message_id: &str,
     tool_call_id: &str,
     output: &str,
 ) -> Result<(), EgoPulseError> {
+    if is_secret {
+        return Ok(());
+    }
     let message_id = message_id.to_string();
     let tool_call_id = tool_call_id.to_string();
     let output = output.to_string();
@@ -709,7 +740,7 @@ async fn persist_user_turn_with_compaction(
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
-    let mut loaded = load_messages_for_turn(state, chat_id).await?;
+    let mut loaded = load_messages_for_turn(state, context.is_secret, chat_id).await?;
     let stored_message = StoredMessage::user(
         chat_id,
         context.surface_user.clone(),
@@ -733,6 +764,7 @@ async fn persist_user_turn_with_compaction(
 
         let persist_result = persist_phase_once(
             state,
+            context.is_secret,
             stored_message.clone(),
             &candidate_messages,
             loaded.session_updated_at.clone(),
@@ -741,7 +773,14 @@ async fn persist_user_turn_with_compaction(
         let persisted = match persist_result {
             Ok(persisted) => persisted,
             Err(error) => {
-                loaded = handle_user_turn_persist_error(state, chat_id, attempt, error).await?;
+                loaded = handle_user_turn_persist_error(
+                    state,
+                    context.is_secret,
+                    chat_id,
+                    attempt,
+                    error,
+                )
+                .await?;
                 continue;
             }
         };
@@ -756,19 +795,20 @@ async fn persist_user_turn_with_compaction(
 
 async fn handle_user_turn_persist_error(
     state: &AppState,
+    is_secret: bool,
     chat_id: i64,
     attempt: usize,
     error: EgoPulseError,
 ) -> Result<crate::agent_loop::session::LoadedSession, EgoPulseError> {
     match persist_phase_conflict_outcome(attempt, error) {
-        PersistConflictOutcome::Reload => load_messages_for_turn(state, chat_id).await,
+        PersistConflictOutcome::Reload => load_messages_for_turn(state, is_secret, chat_id).await,
         PersistConflictOutcome::Return(error) => Err(error),
     }
 }
 
 async fn load_channel_context(state: &AppState, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
-    let messages = call_blocking(Arc::clone(&state.db), move |db| {
+    let messages = call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
         db.get_channel_log_messages(log_chat_id, CHANNEL_CONTEXT_LIMIT)
     })
     .await
@@ -1334,6 +1374,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
+            is_secret: false,
         }
     }
 
@@ -1578,6 +1619,7 @@ mod tests {
                     chain_depth: 0,
                     origin_id: String::new(),
                     trace_id: String::new(),
+                    is_secret: false,
                 },
             ),
         ];
@@ -1820,8 +1862,14 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Clone)]
+    struct CapturedSpan {
+        trace_id: String,
+        is_secret: bool,
+    }
+
+    #[derive(Clone)]
     struct SpanCapture {
-        spans: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        spans: std::sync::Arc<std::sync::Mutex<Vec<CapturedSpan>>>,
     }
 
     impl SpanCapture {
@@ -1832,18 +1880,34 @@ mod tests {
         }
 
         fn captured_trace_ids(&self) -> Vec<String> {
+            self.spans
+                .lock()
+                .expect("spans")
+                .iter()
+                .map(|s| s.trace_id.clone())
+                .collect()
+        }
+
+        fn captured_spans(&self) -> Vec<CapturedSpan> {
             self.spans.lock().expect("spans").clone()
         }
     }
 
     struct FieldVisitor {
         trace_id: Option<String>,
+        is_secret: bool,
     }
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "trace_id" {
                 self.trace_id = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "is_secret" {
+                self.is_secret = value;
             }
         }
     }
@@ -1861,10 +1925,16 @@ mod tests {
             if attrs.metadata().name() != "agent_turn" {
                 return;
             }
-            let mut visitor = FieldVisitor { trace_id: None };
+            let mut visitor = FieldVisitor {
+                trace_id: None,
+                is_secret: false,
+            };
             attrs.record(&mut visitor);
             if let Some(trace_id) = visitor.trace_id {
-                self.spans.lock().expect("spans").push(trace_id);
+                self.spans.lock().expect("spans").push(CapturedSpan {
+                    trace_id,
+                    is_secret: visitor.is_secret,
+                });
             }
         }
     }
@@ -1999,5 +2069,200 @@ mod tests {
             !trace_ids[0].is_empty(),
             "execute_scheduled_turn must generate a non-empty trace_id"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_turn_span_omits_content_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-span-test");
+        context.is_secret = true;
+        context.trace_id = uuid::Uuid::new_v4().to_string();
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "top secret input")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "secret reply");
+        let spans = capture.captured_spans();
+        assert_eq!(spans.len(), 1, "exactly one agent_turn span");
+        assert!(spans[0].is_secret, "is_secret must be true for secret turn");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn normal_turn_span_includes_is_secret_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "normal reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let mut context = cli_context("normal-span-test");
+        context.trace_id = uuid::Uuid::new_v4().to_string();
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "normal input")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "normal reply");
+        let spans = capture.captured_spans();
+        assert_eq!(spans.len(), 1, "exactly one agent_turn span");
+        assert!(
+            !spans[0].is_secret,
+            "is_secret must be false for non-secret turn"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret mode DB isolation
+    // -----------------------------------------------------------------------
+
+    fn count_rows(conn: &rusqlite::Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|e| panic!("count {table}: {e}"))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_chat_routes_to_secret_db_not_egopulse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-routing");
+        context.is_secret = true;
+
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&state, &context)
+            .await
+            .expect("resolve chat id");
+        assert!(chat_id > 0, "secret chat should resolve to a positive id");
+
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        for table in [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+        ] {
+            assert_eq!(
+                count_rows(&ego_conn, table),
+                0,
+                "egopulse.db.{table} must be empty when the turn is secret"
+            );
+        }
+
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        assert_eq!(
+            count_rows(&secret_conn, "chats"),
+            1,
+            "secret.db should hold exactly the one routed chat"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_turn_leaves_egopulse_db_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-db-isolation");
+        context.is_secret = true;
+
+        let reply = process_turn(&state, &context, "top secret")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "secret reply");
+
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        for table in [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+        ] {
+            assert_eq!(
+                count_rows(&ego_conn, table),
+                0,
+                "egopulse.db.{table} must be empty after a secret turn"
+            );
+        }
+
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        for table in ["chats", "messages", "sessions"] {
+            assert!(
+                count_rows(&secret_conn, table) > 0,
+                "secret.db.{table} should have at least one row after a secret turn"
+            );
+        }
     }
 }

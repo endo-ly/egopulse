@@ -585,6 +585,18 @@ impl Database {
         Ok(Self { pool })
     }
 
+    /// Constructs a `Database` for the secret DB (`secret.db`).
+    ///
+    /// Runs `run_secret_migrations` instead of `run_migrations`. The secret DB
+    /// contains only `chats`, `messages`, `sessions`, `llm_usage_logs`, `db_meta`,
+    /// and `schema_migrations` — no `tool_calls`, `sleep_runs`, etc.
+    pub(crate) fn new_secret(db_path: &Path) -> Result<Self, StorageError> {
+        prepare_db_path(db_path)?;
+        initialize_database_file(db_path)?;
+        let pool = build_secret_pool_and_migrate(db_path)?;
+        Ok(Self { pool })
+    }
+
     pub(crate) fn get_conn(&self) -> Result<PooledConn, StorageError> {
         self.pool
             .get()
@@ -648,6 +660,22 @@ fn build_pool_and_migrate(db_path: &Path) -> Result<Pool, StorageError> {
     Ok(pool)
 }
 
+fn build_secret_pool_and_migrate(db_path: &Path) -> Result<Pool, StorageError> {
+    let manager = SqliteConnectionManager::new(db_path.to_path_buf());
+    let pool = r2d2::Pool::builder()
+        .max_size(4)
+        .build(manager)
+        .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+
+    {
+        let conn = pool
+            .get()
+            .map_err(|e| StorageError::InitFailed(e.to_string()))?;
+        migration::run_secret_migrations(&conn)?;
+    }
+    Ok(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +722,75 @@ mod tests {
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.content, "hi");
         assert!(msg.recipient_agent_id.is_none());
+    }
+
+    #[test]
+    fn new_secret_opens_wal_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("secret.db");
+
+        let db = Database::new_secret(&db_path).expect("secret db");
+        let conn = db.get_conn().expect("conn");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .expect("journal_mode");
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn run_secret_migrations_creates_expected_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("secret.db");
+
+        let db = Database::new_secret(&db_path).expect("secret db");
+        let conn = db.get_conn().expect("conn");
+        let table_names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query_map")
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        for expected in &[
+            "chats",
+            "messages",
+            "sessions",
+            "llm_usage_logs",
+            "db_meta",
+            "schema_migrations",
+        ] {
+            assert!(
+                table_names.iter().any(|t| t == expected),
+                "missing table: {expected}"
+            );
+        }
+        assert!(
+            !table_names.iter().any(|t| t == "tool_calls"),
+            "tool_calls must not exist in secret.db"
+        );
+        assert!(
+            !table_names.iter().any(|t| t == "sleep_runs"),
+            "sleep_runs must not exist in secret.db"
+        );
+    }
+
+    #[test]
+    fn run_secret_migrations_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("secret.db");
+
+        let _db1 = Database::new_secret(&db_path).expect("first open");
+        let db2 = Database::new_secret(&db_path).expect("second open");
+        let conn = db2.get_conn().expect("conn");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert!(count >= 6, "expected at least 6 tables, got {count}");
     }
 }
