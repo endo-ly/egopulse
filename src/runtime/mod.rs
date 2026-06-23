@@ -241,6 +241,7 @@ pub async fn build_app_state_with_path(
         workspace_dir.clone(),
         Arc::clone(&channels),
         Arc::clone(&deps.db),
+        None,
     )));
 
     let (turn_sender, turn_receiver) =
@@ -249,6 +250,7 @@ pub async fn build_app_state_with_path(
     tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
         config.agents.clone(),
         Arc::clone(&deps.db),
+        None,
         Arc::clone(&channels),
     )));
 
@@ -444,7 +446,10 @@ pub(crate) fn execute_scheduled_turn(
             );
             crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(error) = state.db.store_system_event(log_chat_id, &reason) {
+                if let Err(error) = state
+                    .db_for(turn.context.is_secret)
+                    .store_system_event(log_chat_id, &reason)
+                {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
                 }
             }
@@ -556,7 +561,7 @@ pub(crate) fn execute_scheduled_turn(
                     .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
-                        .db
+                        .db_for(turn.context.is_secret)
                         .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
                     {
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
