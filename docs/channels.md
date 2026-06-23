@@ -44,6 +44,39 @@ pub(crate) trait ChannelAdapter: Send + Sync {
 
 モデル解決の優先順位は [config.md §3](./config.md#3-モデル解決チェーン) を参照。
 
+### 秘密モード（Secret Mode）
+
+Discord と Telegram のチャネルは `secret: true` 設定で秘密モードに切り替えられる。秘密モードのチャネルでは、すべての会話データが `egopulse.db` ではなく別ファイルの `secret.db` に保存される。
+
+#### 対応チャネル
+
+| チャネル | 対応 | 設定パス |
+|---|---|---|
+| Discord | Phase 1 | `channels.discord.channels.<id>.secret` |
+| Telegram | Phase 1 | `channels.telegram.telegram_channels.<id>.secret` |
+| Web | 未対応（常に `false`） | |
+| TUI / CLI / Voice | 未対応（常に `false`） | |
+
+#### 挙動の違い
+
+| 項目 | 通常モード | 秘密モード |
+|---|---|---|
+| DB 保存先 | `egopulse.db` | `secret.db` |
+| Channel Log 保存先 | `egopulse.db` | `secret.db` |
+| tool_call 永続化 | `tool_calls` テーブル | スキップ（`sessions.messages_json` に包含） |
+| Sleep Batch | 対象になる | 対象にならない |
+| PULSE | 発火する | 発火しない |
+| Slash commands (`/new`, `/compact`, `/status`) | `egopulse.db` を操作 | `secret.db` を操作 |
+| `agent_send` 経由の DB アクセス | `egopulse.db` | `secret.db` |
+
+#### `is_secret` の伝播
+
+各チャネルのエントリポイントで `SurfaceContext.is_secret` を決定し、`make_context()` ヘルパーを経由して全下流に自動伝播する。メッセージハンドラ、slash command、interaction handler など `make_context` 経由で `SurfaceContext` を構築する全経路で一貫して `is_secret` が設定される。
+
+#### 設定変更時の再起動
+
+`secret` フラグの変更にはプロセス再起動が必要。`secret_db` の初期化は起動時に1回だけ行われる。
+
 ---
 
 ## 2. Web

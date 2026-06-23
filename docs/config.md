@@ -119,6 +119,7 @@
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agents` | `list<string>` | `[]`（正規化後は `[default_agent]`） | チャンネルで使用するエージェント ID のリスト。空の場合はグローバル `default_agent` が設定される |
 | `multi_agent` | `bool` | `false` | `true` の場合複数エージェントで応答。`agents` に 2 つ以上指定が必要 |
+| `secret` | `bool` | `false` | `true` の場合、このチャネルの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャネルの内容に触れない。Web / TUI では Phase 1 未対応 |
 
 ### 2.5 Telegram チャネル（`channels.telegram`）
 
@@ -145,6 +146,7 @@ Telegram は Discord と同一の Multi-Agent 仕様をサポートする。
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agents` | `[string]` | `["default"]` | チャットにバインドするエージェント ID リスト |
 | `multi_agent` | `bool` | `false` | `true` の場合 Multi-Agent ルームとして動作。`@mention` でBot に紐づくエージェントが応答し、非メンション時は Channel Log のみ記録 |
+| `secret` | `bool` | `false` | `true` の場合、このチャットの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャットの内容に触れない。Web / TUI では Phase 1 未対応 |
 
 ### 2.6 Voice チャネル（`channels.voice`）
 
@@ -677,10 +679,10 @@ WebUI の設定 API 仕様は [api.md](./api.md) を参照。
 | `channels.voice.allowed_surfaces` | Voice API の access control 更新 |
 | `channels.discord.enabled` | Discord Bot の接続/切断 |
 | `channels.discord.bots.<bot_id>.token` | Bot 認証の再確立 |
-| `channels.discord.channels` | チャンネルアクセス制御・メンション要件の変更 |
+| `channels.discord.channels` | チャンネルアクセス制御・メンション要件・秘密モードの変更 |
 | `channels.telegram.enabled` | Telegram Bot の接続/切断 |
 | `channels.telegram.telegram_bots` | Bot 定義の更新 |
-| `channels.telegram.telegram_channels` | チャットアクセス制御・メンション要件の変更 |
+| `channels.telegram.telegram_channels` | チャットアクセス制御・メンション要件・秘密モードの変更 |
 | `log_level` | ロガーの初期化が伴う |
 
 ### 9.2 ホットリロード可能なフィールド

@@ -7,12 +7,13 @@ LLM に送信される system prompt の構築方法を定義する。
 1. [セクション構成](#1-セクション構成)
 2. [SOUL.md 読み込み](#2-soulmd-読み込み)
 3. [AGENTS.md 読み込み](#3-agentsmd-読み込み)
-4. [固定プロンプト全文と記載場所](#4-固定プロンプト全文と記載場所)
-5. [Long-term Memory 注入](#5-long-term-memory-注入)
-6. [Tool / MCP Tool 定義の注入](#6-tool--mcp-tool-定義の注入)
-7. [Compaction 用プロンプト](#7-compaction-用プロンプト)
-8. [Channel Context 注入（Multi-Agent Room）](#8-channel-context-注入multi-agent-room)
-9. [Current Time 注入（全ターン共通）](#9-current-time-注入全ターン共通)
+4. [SECRET.md 読み込み](#35-secretmd-読み込み)
+5. [固定プロンプト全文と記載場所](#4-固定プロンプト全文と記載場所)
+6. [Long-term Memory 注入](#5-long-term-memory-注入)
+7. [Tool / MCP Tool 定義の注入](#6-tool--mcp-tool-定義の注入)
+8. [Compaction 用プロンプト](#7-compaction-用プロンプト)
+9. [Channel Context 注入（Multi-Agent Room）](#8-channel-context-注入multi-agent-room)
+10. [Current Time 注入（全ターン共通）](#9-current-time-注入全ターン共通)
 
 ---
 
@@ -26,6 +27,7 @@ LLM に送信される system prompt の構築方法を定義する。
 │ ①.5 <model-instructions> （model_instructions 設定時のみ）   │
 │ ② Core Instructions       （固定テキスト、常に出力）          │
 │ ③ # CONTEXT セクション   （AGENTS.md が存在する場合のみ）    │
+│ ③.5 <secret> セクション   （SECRET.md が存在 ＆ 秘密モード時のみ）│
 │ ④ # Long-term Memory      （記憶ファイルが存在する場合のみ）  │
 │ ⑤ # Agent Skills セクション（スキルが存在する場合のみ）       │
 └─────────────────────────────────────────────────────────────┘
@@ -37,6 +39,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | ①.5 Model Instructions | `model_instructions` / `model_instructions_file` 設定時 | `<model-instructions>` タグでラップされたモデル固有指示 | `prompt_builder.rs:build_model_instructions_section` → `config/resolve.rs:resolve_model_instructions` |
 | ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `prompt_builder.rs:build_base_prompt` ← `prompts/core_instructions.md` (`include_str!`) |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
+| ③.5 Secret | `is_secret == true` かつ SECRET.md 存在時 | `<secret>` タグでラップされた秘密モード指示 | `soul_agents.rs::load_secret()` → `prompt_builder.rs::build_secret_prompt_section()` |
 | ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
 | ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
 
@@ -88,6 +91,51 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 
 エージェント別:
 \n<agents>\nThe following is the context organized by each agent.\n{content}\n</agents>\n
+
+---
+
+## 3.5 SECRET.md 読み込み
+
+秘密モード（`SurfaceContext.is_secret == true`）時にのみ読み込まれるユーザー編集可能な指示ファイル。AGENTS.md と同形式の Markdown 自由文。
+
+### パス
+
+| 優先度 | パス |
+|---|---|
+| 1（唯一） | `agents/{agent_id}/SECRET.md` |
+
+グローバル（`state_root/SECRET.md`）は存在しない。エージェント別のみ。
+
+### 読み込み条件
+
+- `is_secret == true` のときのみロードを試みる
+- ファイルが存在しない場合は `None`（セクション自体省略）
+- 空ファイルも `None` 扱い
+- **ファイルが無くても秘密モードは正常に動作する**（DB ルーティング等の隔離は SECRET.md の有無によらない）
+
+### 注入フォーマット
+
+```text
+<secret>
+{SECRET.md の内容}
+</secret>
+```
+
+### 注入位置
+
+AGENTS.md セクション（③）の直後、Long-term Memory（④）の直前。この位置の理由:
+
+- SOUL → Model Instructions → Base Prompt → AGENTS.md で「自分が誰で何ができるか」を確定
+- SECRET.md を直後に置くことで、後続の Long-term Memory 解釈に「いまは秘密モード」というフレームが効く
+- Memory・Skills は動的情報なので、静的なモード指示の後に配置
+
+### 内容の例
+
+ユーザーが自由に記述できる。代表的な用途:
+
+- 秘密モード用ペルソナ指示（「より親密なトーンで」等）
+- 秘密モード認識の指示（「ここは秘密の空間、通常話題への言及は避ける」等）
+- ロールプレイ設定、シナリオ、キャラクター設定等
 
 ---
 
@@ -282,6 +330,7 @@ let system_prompt = build_system_prompt(state, &context);
 ①.5 <model-instructions> セクション
 ② Core Instructions
 ③ # CONTEXT セクション
+③.5 <secret> セクション（秘密モード時のみ）
 ④ # Long-term Memory（prospective 含む）
 ⑤ # Agent Skills セクション
 ```

@@ -8,6 +8,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 2. [事前検査](#2-事前検査)
 3. [事後処理](#3-事後処理)
 4. [制約事項](#4-制約事項)
+5. [Secret Mode 隔離戦略](#5-secret-mode-隔離戦略)
 
 ---
 
@@ -158,3 +159,47 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | 出力リダクション | シークレット値が結果に含まれない | `[REDACTED:KEY_NAME]` として表示 |
 | Compaction Archive | 会話アーカイブにシークレットが含まれる | 二層 redaction 適用 + ファイルパーミッション `0600` |
 | 値ベースリダクションの対象外 | Config に登録されていないシークレットはマスクされない | パターンベースで補完 |
+
+---
+
+## 5. Secret Mode 隔離戦略
+
+秘匿会話（`secret: true` のチャネル）を通常の会話経路から物理的に隔離する多層防御。各層で独立に秘匿内容を排除する。
+
+### 5.1 物理ファイル分離
+
+| 項目 | 通常経路 | 秘密経路 |
+|---|---|---|
+| DB ファイル | `egopulse.db` | `secret.db` |
+| Compaction archive | `runtime/groups/` | `runtime/secret_groups/` |
+
+同じプロセス内でも別の `Database` インスタンス（別 `Mutex<Connection>`）として動作する。クロスデータベーストランザクションは不要（1 turn は通常/秘密いずれか一方で完結）。
+
+### 5.2 構造的保証
+
+Sleep Batch・PULSE は `state.db`（通常）のみ参照し、`secret.db` には接続しない。これは実装の省略ではなく構造的保証。コード経路が存在しないため、誤って秘匿内容を処理することはない。
+
+- 秘密チャットのメッセージは `episodic.md` 等に昇格しない
+- PULSE は秘密チャットで発火・投稿しない
+
+### 5.3 ログ Redaction
+
+秘密ターンでは `tracing` の span に内容フィールドを含めない:
+
+- `info_span!("turn", agent_id, is_secret = true)` — `user_msg` 等の content フィールドを含めない
+- tool 実行ログは `name` と `status` のみ
+- LLM request/response ログは token 数やエラーメタ情報のみ
+
+`is_secret = true` フラグが span に記録されるため、ログ検索で秘密ターンを識別できる。
+
+### 5.4 バックアップ
+
+`secret.db` は `egopulse.db` と同一スケジュールでバックアップされる。世代管理も独立。ファイルパーミッションは `0600`。バックアップファイルの取扱いはユーザー運用責任。
+
+### 5.5 Phase 1 の対象外
+
+以下の経路は Phase 1 では対処しない:
+
+- Tool 実行（`write`/`edit`/`bash`）による `secret.db` 外への書き出し
+- `secret.db` の暗号化（SQLCipher）
+- WebUI / TUI での秘密チャット表示
