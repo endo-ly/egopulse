@@ -1293,7 +1293,9 @@ mod tests {
         let config = test_config_with_compaction(state_root, 40, 1);
         let mut state = build_state(config, Box::new(provider));
         let secret_path = dir.path().join("runtime").join("secret.db");
-        state.secret_db = Some(Arc::new(Database::new_secret(&secret_path).expect("secret db")));
+        state.secret_db = Some(Arc::new(
+            Database::new_secret(&secret_path).expect("secret db"),
+        ));
         let mut context = cli_context("archive-secret-routing");
         context.scope = ConversationScope::Secret;
         let llm = state.llm_for_context(&context).expect("llm");

@@ -1291,4 +1291,76 @@ mod tests {
             "Normal and Secret archive roots must differ"
         );
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scheduled_turn_logs_route_by_conversation_scope() {
+        use crate::agent_loop::ScheduledTurn;
+        use crate::agent_loop::turn::RecordingProvider;
+        use crate::llm::MessagesResponse;
+        use crate::storage::call_blocking;
+
+        // Arrange: state with secret DB + recording provider
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret scheduled reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let log_chat_id: i64 = 9999;
+        let mut context = crate::test_util::cli_context("scheduled-secret-routing");
+        context.scope = ConversationScope::Secret;
+        context.channel_log_chat_id = Some(log_chat_id);
+
+        let turn = ScheduledTurn {
+            context,
+            input: "scheduled secret input".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Act: execute the scheduled turn
+        execute_scheduled_turn(&state, turn).await;
+
+        // Assert: secret DB has the bot response
+        let secret_messages = call_blocking(
+            Arc::clone(state.secret_db.as_ref().expect("secret db")),
+            move |db| db.get_channel_log_messages(log_chat_id, 10),
+        )
+        .await
+        .expect("read secret channel log");
+        let secret_has_reply = secret_messages
+            .iter()
+            .any(|m| m.content.contains("secret scheduled reply"));
+        assert!(
+            secret_has_reply,
+            "secret DB should contain the bot response"
+        );
+
+        // Assert: normal DB has no entries from this turn
+        let normal_messages = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_channel_log_messages(log_chat_id, 10)
+        })
+        .await
+        .expect("read normal channel log");
+        let normal_has_reply = normal_messages
+            .iter()
+            .any(|m| m.content.contains("secret scheduled reply"));
+        assert!(
+            !normal_has_reply,
+            "normal DB should not contain the secret bot response"
+        );
+    }
 }
