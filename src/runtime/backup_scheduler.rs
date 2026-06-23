@@ -95,6 +95,10 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
 
 /// Executes a single periodic backup and records the timestamp.
 ///
+/// Backs up the main `egopulse.db` first, then the `secret.db` if the secret
+/// store is enabled. A secret-db backup failure is logged as a warning but
+/// does not prevent the `backup_last_run` timestamp from being recorded.
+///
 /// Split out of the loop so unit tests can exercise the persistence side
 /// effect without driving the full scheduler cadence.
 ///
@@ -110,9 +114,21 @@ pub(crate) async fn run_periodic_backup_once(
     let tz = state.config.timezone.clone();
 
     let outcome = call_blocking(Arc::clone(&state.db), move |db| {
-        run_backup(db, &dest_dir, &tz, now, max_generations)
+        run_backup(db, &dest_dir, &tz, now, max_generations, "egopulse")
     })
     .await?;
+
+    if let Some(secret_db) = &state.secret_db {
+        let dest_dir = state.config.backup_dir();
+        let tz = state.config.timezone.clone();
+        if let Err(error) = call_blocking(Arc::clone(secret_db), move |db| {
+            run_backup(db, &dest_dir, &tz, now, max_generations, "secret")
+        })
+        .await
+        {
+            warn!(%error, "secret db backup failed");
+        }
+    }
 
     call_blocking(Arc::clone(&state.db), move |db| {
         upsert_backup_last_run(db, now)
@@ -249,6 +265,83 @@ mod tests {
         assert!(
             !backup_dir.exists() || backup_dir.read_dir().unwrap().count() == 0,
             "no backup file should be created"
+        );
+    }
+
+    fn backup_enabled_config() -> BackupConfig {
+        BackupConfig {
+            enabled: true,
+            interval_days: 7,
+            time: "03:00".to_string(),
+            max_generations: 12,
+        }
+    }
+
+    fn count_files_starting_with(dir: &std::path::Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .expect("backup dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn backup_creates_secret_db_snapshot_when_present() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("dir");
+        let state_root = dir.path().to_str().expect("utf8");
+        let mut state = state_with_backup(state_root, backup_enabled_config());
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db =
+            Arc::new(crate::storage::Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(secret_db);
+        let now = Utc.with_ymd_and_hms(2026, 6, 20, 3, 0, 0).unwrap();
+
+        // Act
+        let outcome = run_periodic_backup_once(&state, now).await.expect("backup");
+
+        // Assert
+        assert!(outcome.integrity_ok);
+        let backup_dir = state.config.backup_dir();
+        assert_eq!(
+            count_files_starting_with(&backup_dir, "egopulse-"),
+            1,
+            "egopulse backup should exist"
+        );
+        assert_eq!(
+            count_files_starting_with(&backup_dir, "secret-"),
+            1,
+            "secret backup should exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_skips_secret_db_when_not_present() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("dir");
+        let state_root = dir.path().to_str().expect("utf8");
+        let state = state_with_backup(state_root, backup_enabled_config());
+        let now = Utc.with_ymd_and_hms(2026, 6, 20, 3, 0, 0).unwrap();
+
+        // Act
+        let outcome = run_periodic_backup_once(&state, now).await.expect("backup");
+
+        // Assert
+        assert!(outcome.integrity_ok);
+        let backup_dir = state.config.backup_dir();
+        assert_eq!(
+            count_files_starting_with(&backup_dir, "egopulse-"),
+            1,
+            "egopulse backup should exist"
+        );
+        assert_eq!(
+            count_files_starting_with(&backup_dir, "secret-"),
+            0,
+            "no secret backup should exist"
         );
     }
 }
