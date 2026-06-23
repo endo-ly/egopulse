@@ -78,6 +78,7 @@ pub(crate) struct DiscordChannelConfig {
     pub require_mention: bool,
     pub agents: Vec<AgentId>,
     pub multi_agent: bool,
+    /// Whether this channel routes conversations to the isolated `secret.db`.
     pub secret: bool,
 }
 
@@ -90,6 +91,7 @@ pub(crate) struct TelegramChatConfig {
     pub agents: Vec<AgentId>,
     /// Whether this chat operates as a multi-agent room.
     pub multi_agent: bool,
+    /// Whether this chat routes conversations to the isolated `secret.db`.
     pub secret: bool,
 }
 

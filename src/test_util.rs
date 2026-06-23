@@ -91,7 +91,13 @@ pub(crate) fn build_state_with_config(
     ));
     AppState::from_parts(AppStateParts {
         db: db.unwrap_or_else(|| Arc::new(Database::new(&config.db_path()).expect("db"))),
-        secret_db: None,
+        secret_db: if config.needs_secret_db() {
+            Some(Arc::new(
+                Database::new_secret(&config.secret_db_path()).expect("secret db"),
+            ))
+        } else {
+            None
+        },
         config: config.clone(),
         config_path,
         llm_override,

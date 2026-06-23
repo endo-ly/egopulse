@@ -515,7 +515,7 @@ pub(crate) fn execute_scheduled_turn(
                 }
                 if !response.is_empty() {
                     if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                        let db = std::sync::Arc::clone(&state.db);
+                        let db = std::sync::Arc::clone(state.db_for(turn.context.is_secret));
                         let agent_id = turn.context.agent_id.clone();
                         let response_owned = response.clone();
                         if let Err(error) = crate::storage::call_blocking(db, move |db| {

@@ -2090,7 +2090,7 @@ mod tests {
         );
         let secret_path = dir.path().join("runtime").join("secret.db");
         state.secret_db = Some(Arc::new(
-            crate::storage::Database::new(&secret_path).expect("secret db"),
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
         ));
 
         let mut context = cli_context("secret-span-test");

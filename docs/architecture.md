@@ -183,13 +183,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// 秘密モードが有効（設定に secret チャネルが1件でもある）
-    pub(crate) fn secret_enabled(&self) -> bool {
-        self.secret_db.is_some()
-    }
-
     /// 文脈に応じた DB 参照を返す
-    pub(crate) fn db_for(&self, is_secret: bool) -> &Database {
+    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
         if is_secret {
             self.secret_db.as_ref().expect("secret db required but not initialized")
         } else {
