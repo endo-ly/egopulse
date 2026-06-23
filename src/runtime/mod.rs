@@ -1369,7 +1369,10 @@ mod tests {
         // Arrange: AppState with secret_db = None (no secret channels configured)
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
-        assert!(state.secret_db.is_none(), "test precondition: secret_db is None");
+        assert!(
+            state.secret_db.is_none(),
+            "test precondition: secret_db is None"
+        );
 
         // Act: call db_for and storage_for with Normal scope
         let db = state.db_for(ConversationScope::Normal);
@@ -1389,5 +1392,20 @@ mod tests {
             "storage_for(Normal) archive root must end with 'groups', got: {:?}",
             storage.archive_root
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "secret db required")]
+    fn secret_scope_requires_secret_database() {
+        // Arrange: AppState without secret_db
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        assert!(
+            state.secret_db.is_none(),
+            "test precondition: secret_db is None"
+        );
+
+        // Act + Assert: storage_for(Secret) must panic
+        let _ = state.storage_for(ConversationScope::Secret);
     }
 }
