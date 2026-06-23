@@ -2207,18 +2207,8 @@ mod tests {
         );
     }
 
-    /// Full-turn variant of [`secret_chat_routes_to_secret_db_not_egopulse`].
-    ///
-    /// Currently `#[ignore]`d: the secret `messages` table shipped in
-    /// `run_secret_migrations` (commit 7dea087) still uses the legacy
-    /// `sender_name`/`is_from_bot` columns, so `process_turn` aborts at
-    /// `load_session_snapshot` (`no such column: sender_id`) before any
-    /// message is persisted. This is a production schema bug — not a routing
-    /// bug — and must be fixed in a dedicated step. Once the secret schema is
-    /// aligned with the current `messages` table, remove the attribute.
     #[tokio::test]
     #[serial]
-    #[ignore = "blocked by stale secret.db messages schema (see doc comment)"]
     async fn secret_turn_leaves_egopulse_db_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(

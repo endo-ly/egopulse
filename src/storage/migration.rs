@@ -673,12 +673,11 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
-                sender_name TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
                 content TEXT NOT NULL,
-                is_from_bot INTEGER NOT NULL DEFAULT 0,
+                sender_kind TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 message_kind TEXT NOT NULL DEFAULT 'message',
-                sender_agent_id TEXT,
                 recipient_agent_id TEXT,
                 PRIMARY KEY (id, chat_id)
             );
