@@ -1363,4 +1363,31 @@ mod tests {
             "normal DB should not contain the secret bot response"
         );
     }
+
+    #[test]
+    fn normal_scope_does_not_require_secret_db() {
+        // Arrange: AppState with secret_db = None (no secret channels configured)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        assert!(state.secret_db.is_none(), "test precondition: secret_db is None");
+
+        // Act: call db_for and storage_for with Normal scope
+        let db = state.db_for(ConversationScope::Normal);
+        let storage = state.storage_for(ConversationScope::Normal);
+
+        // Assert: both succeed and resolve to the normal db and archive root
+        assert!(
+            Arc::ptr_eq(db, &state.db),
+            "db_for(Normal) must return the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(storage.db, &state.db),
+            "storage_for(Normal) must return the primary database"
+        );
+        assert!(
+            storage.archive_root.ends_with("groups"),
+            "storage_for(Normal) archive root must end with 'groups', got: {:?}",
+            storage.archive_root
+        );
+    }
 }
