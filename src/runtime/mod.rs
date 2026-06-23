@@ -93,6 +93,17 @@ struct AppStateDependencies {
     memory_loader: Arc<MemoryLoader>,
 }
 
+/// Resolved storage endpoints for a conversation scope.
+///
+/// Groups the database handle and archive root path so callers do not
+/// need to know scope-specific path conventions.
+pub(crate) struct ScopedStorage<'a> {
+    /// The database handle for this scope.
+    pub db: &'a Arc<Database>,
+    /// Root directory for archived conversations.
+    pub archive_root: PathBuf,
+}
+
 impl AppState {
     pub(crate) fn from_parts(parts: AppStateParts) -> Self {
         Self {
@@ -131,6 +142,31 @@ impl AppState {
                 .secret_db
                 .as_ref()
                 .expect("secret db required but not initialized"),
+        }
+    }
+
+    /// Resolves the database and archive root for the given conversation scope.
+    ///
+    /// Callers that need both the database handle and the archive directory
+    /// (e.g. compaction) should prefer this over [`Self::db_for`] to avoid
+    /// duplicating scope-specific path logic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
+    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
+        match scope {
+            ConversationScope::Normal => ScopedStorage {
+                db: &self.db,
+                archive_root: self.config.groups_dir(),
+            },
+            ConversationScope::Secret => ScopedStorage {
+                db: self
+                    .secret_db
+                    .as_ref()
+                    .expect("secret db required but not initialized"),
+                archive_root: self.config.runtime_dir().join("secret_groups"),
+            },
         }
     }
 
@@ -1210,5 +1246,49 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
         let _ = state.db_for(ConversationScope::Secret);
+    }
+
+    #[test]
+    fn storage_for_returns_archive_root_for_conversation_scope() {
+        // Arrange: create AppState with both normal and secret DBs
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+
+        // Act
+        let normal = state.storage_for(ConversationScope::Normal);
+        let secret = state.storage_for(ConversationScope::Secret);
+
+        // Assert: db pointer equality
+        assert!(
+            Arc::ptr_eq(normal.db, &state.db),
+            "Normal scope must resolve to the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(secret.db, &secret_db),
+            "Secret scope must resolve to the isolated secret database"
+        );
+        assert!(
+            !Arc::ptr_eq(normal.db, secret.db),
+            "Normal and Secret scopes must resolve to different databases"
+        );
+
+        // Assert: archive root paths
+        assert!(
+            normal.archive_root.ends_with("groups"),
+            "Normal archive root must end with 'groups', got: {:?}",
+            normal.archive_root
+        );
+        assert!(
+            secret.archive_root.ends_with("secret_groups"),
+            "Secret archive root must end with 'secret_groups', got: {:?}",
+            secret.archive_root
+        );
+        assert_ne!(
+            normal.archive_root, secret.archive_root,
+            "Normal and Secret archive roots must differ"
+        );
     }
 }

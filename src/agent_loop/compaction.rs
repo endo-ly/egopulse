@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::ConversationScope;
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::error::{EgoPulseError, LlmError};
@@ -248,12 +247,15 @@ async fn archive_current_conversation(
     messages: &[Message],
 ) {
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    let groups_dir = if context.scope == ConversationScope::Secret {
-        state.config.runtime_dir().join("secret_groups")
-    } else {
-        state.config.groups_dir()
-    };
-    archive_conversation(&groups_dir, &context.channel, chat_id, messages, &secrets).await;
+    let storage = state.storage_for(context.scope);
+    archive_conversation(
+        &storage.archive_root,
+        &context.channel,
+        chat_id,
+        messages,
+        &secrets,
+    )
+    .await;
 }
 
 fn select_compaction_slices(
@@ -349,7 +351,7 @@ fn log_summarizer_usage(
         return;
     };
 
-    let db = std::sync::Arc::clone(state.db_for(context.scope));
+    let db = std::sync::Arc::clone(state.storage_for(context.scope).db);
     let channel = context.channel.clone();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();
@@ -712,12 +714,14 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
     use crate::error::LlmError;
     use crate::llm::{Message, MessagesResponse, ToolCall};
+    use crate::storage::Database;
     use crate::storage::call_blocking;
     use serial_test::serial;
     use std::sync::Arc;
@@ -1287,7 +1291,9 @@ mod tests {
             vec![0],
         );
         let config = test_config_with_compaction(state_root, 40, 1);
-        let state = build_state(config, Box::new(provider));
+        let mut state = build_state(config, Box::new(provider));
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(Database::new_secret(&secret_path).expect("secret db")));
         let mut context = cli_context("archive-secret-routing");
         context.scope = ConversationScope::Secret;
         let llm = state.llm_for_context(&context).expect("llm");
