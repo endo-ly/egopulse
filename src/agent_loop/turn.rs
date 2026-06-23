@@ -195,6 +195,7 @@ async fn process_turn_inner(
         session = %context.surface_thread,
         origin_id = %context.origin_id,
         chain_depth = context.chain_depth,
+        is_secret = context.is_secret,
     );
 
     async move {
@@ -1859,8 +1860,14 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Clone)]
+    struct CapturedSpan {
+        trace_id: String,
+        is_secret: bool,
+    }
+
+    #[derive(Clone)]
     struct SpanCapture {
-        spans: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        spans: std::sync::Arc<std::sync::Mutex<Vec<CapturedSpan>>>,
     }
 
     impl SpanCapture {
@@ -1871,18 +1878,34 @@ mod tests {
         }
 
         fn captured_trace_ids(&self) -> Vec<String> {
+            self.spans
+                .lock()
+                .expect("spans")
+                .iter()
+                .map(|s| s.trace_id.clone())
+                .collect()
+        }
+
+        fn captured_spans(&self) -> Vec<CapturedSpan> {
             self.spans.lock().expect("spans").clone()
         }
     }
 
     struct FieldVisitor {
         trace_id: Option<String>,
+        is_secret: bool,
     }
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "trace_id" {
                 self.trace_id = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "is_secret" {
+                self.is_secret = value;
             }
         }
     }
@@ -1900,10 +1923,16 @@ mod tests {
             if attrs.metadata().name() != "agent_turn" {
                 return;
             }
-            let mut visitor = FieldVisitor { trace_id: None };
+            let mut visitor = FieldVisitor {
+                trace_id: None,
+                is_secret: false,
+            };
             attrs.record(&mut visitor);
             if let Some(trace_id) = visitor.trace_id {
-                self.spans.lock().expect("spans").push(trace_id);
+                self.spans.lock().expect("spans").push(CapturedSpan {
+                    trace_id,
+                    is_secret: visitor.is_secret,
+                });
             }
         }
     }
@@ -2037,6 +2066,82 @@ mod tests {
         assert!(
             !trace_ids[0].is_empty(),
             "execute_scheduled_turn must generate a non-empty trace_id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_turn_span_omits_content_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-span-test");
+        context.is_secret = true;
+        context.trace_id = uuid::Uuid::new_v4().to_string();
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "top secret input")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "secret reply");
+        let spans = capture.captured_spans();
+        assert_eq!(spans.len(), 1, "exactly one agent_turn span");
+        assert!(spans[0].is_secret, "is_secret must be true for secret turn");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn normal_turn_span_includes_is_secret_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "normal reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let mut context = cli_context("normal-span-test");
+        context.trace_id = uuid::Uuid::new_v4().to_string();
+
+        let capture = SpanCapture::new();
+        let _guard = install_capture_subscriber(&capture);
+
+        let reply = process_turn(&state, &context, "normal input")
+            .await
+            .expect("turn");
+
+        assert_eq!(reply, "normal reply");
+        let spans = capture.captured_spans();
+        assert_eq!(spans.len(), 1, "exactly one agent_turn span");
+        assert!(
+            !spans[0].is_secret,
+            "is_secret must be false for non-secret turn"
         );
     }
 }
