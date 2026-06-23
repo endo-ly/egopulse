@@ -196,6 +196,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
     truncate_by_chars(&joined, MAX_TOOL_RESULT_TEXT_CHARS)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn log_llm_usage(
     state: &AppState,
     is_secret: bool,

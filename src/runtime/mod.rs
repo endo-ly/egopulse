@@ -85,6 +85,7 @@ pub(crate) struct AppStateParts {
 
 struct AppStateDependencies {
     db: Arc<Database>,
+    secret_db: Option<Arc<Database>>,
     assets: Arc<AssetStore>,
     skills: Arc<SkillManager>,
     soul_agents: Arc<SoulAgentsLoader>,
@@ -114,12 +115,6 @@ impl AppState {
             runtime_status: parts.runtime_status,
             _sealed: (),
         }
-    }
-
-    /// Returns `true` when the secret DB is initialized (i.e., at least one
-    /// channel has `secret: true` in the config).
-    pub(crate) fn secret_enabled(&self) -> bool {
-        self.secret_db.is_some()
     }
 
     /// Returns the appropriate `Database` reference based on `is_secret`.
@@ -241,7 +236,7 @@ pub async fn build_app_state_with_path(
         workspace_dir.clone(),
         Arc::clone(&channels),
         Arc::clone(&deps.db),
-        None,
+        deps.secret_db.clone(),
     )));
 
     let (turn_sender, turn_receiver) =
@@ -250,7 +245,7 @@ pub async fn build_app_state_with_path(
     tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
         config.agents.clone(),
         Arc::clone(&deps.db),
-        None,
+        deps.secret_db.clone(),
         Arc::clone(&channels),
     )));
 
@@ -260,7 +255,7 @@ pub async fn build_app_state_with_path(
 
     let state = AppState::from_parts(AppStateParts {
         db: deps.db,
-        secret_db: None,
+        secret_db: deps.secret_db,
         config,
         config_path,
         llm_override: None,
@@ -296,7 +291,7 @@ pub fn build_sleep_app_state_with_path(
 
     Ok(AppState::from_parts(AppStateParts {
         db: deps.db,
-        secret_db: None,
+        secret_db: deps.secret_db,
         config,
         config_path,
         llm_override: None,
@@ -332,6 +327,11 @@ fn build_app_state_dependencies(
         &config.db_path(),
         &backup_settings,
     )?);
+    let secret_db = if config.needs_secret_db() {
+        Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
+    } else {
+        None
+    };
     let assets = Arc::new(AssetStore::new(&config.assets_dir())?);
 
     if let Err(error) = crate::builtin_skills::expand_builtin_skills(Path::new(&config.state_root))
@@ -355,6 +355,7 @@ fn build_app_state_dependencies(
 
     Ok(AppStateDependencies {
         db,
+        secret_db,
         assets,
         skills,
         soul_agents,
@@ -1155,23 +1156,6 @@ mod tests {
     fn build_sleep_state(dir: &tempfile::TempDir) -> AppState {
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         build_sleep_app_state_with_path(config, None).expect("build sleep state")
-    }
-
-    #[test]
-    fn secret_enabled_returns_false_when_no_secret_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        assert!(!state.secret_enabled());
-    }
-
-    #[test]
-    fn secret_enabled_returns_true_when_secret_db_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_sleep_state(&dir);
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
-        state.secret_db = Some(secret_db);
-        assert!(state.secret_enabled());
     }
 
     #[test]

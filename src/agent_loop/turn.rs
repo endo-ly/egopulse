@@ -472,6 +472,7 @@ fn evaluate_malformed_response(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_and_finalize(
     state: &AppState,
     is_secret: bool,
@@ -556,6 +557,7 @@ async fn execute_and_persist_tools(
     Ok((Arc::new(messages), session_updated_at))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_tool_call_assistant_message(
     state: &AppState,
     is_secret: bool,

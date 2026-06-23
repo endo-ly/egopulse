@@ -264,6 +264,11 @@ impl Config {
         self.runtime_dir().join("egopulse.db")
     }
 
+    /// Secret DB ファイルパス: `state_root/runtime/secret.db`。
+    pub(crate) fn secret_db_path(&self) -> PathBuf {
+        self.runtime_dir().join("secret.db")
+    }
+
     /// バックアップ保存ディレクトリ: `state_root/runtime/backups`。
     pub(crate) fn backup_dir(&self) -> PathBuf {
         self.runtime_dir().join("backups")
