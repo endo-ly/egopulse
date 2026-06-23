@@ -260,19 +260,19 @@ Sleep Batch も session クリア前に `archive_conversation_blocking`（compac
 
 ---
 
-## 8. Secret DB Routing
+## 8. Conversation Scope による DB Routing
 
-`SurfaceContext.is_secret == true` のとき、turn 全体の DB 操作が `secret.db` にルーティングされる。対象操作:
+`SurfaceContext.scope`（`ConversationScope::Normal` | `ConversationScope::Secret`）が turn 全体のストレージ境界を決定する。スコープはコンテキスト構築時にチャネル設定の `secret: true` から `ConversationScope::Secret` へとマッピングされ、turn 中の全永続化操作が同じスコープの DB にルーティングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照）。
 
 | 操作 | ルーティング |
 |---|---|
-| chat_id 解決（`resolve_or_create_chat_id`） | `state.db_for(ctx.is_secret)` |
-| session snapshot 読込（`load_session` / `load_session_snapshot`） | `state.db_for(ctx.is_secret)` |
-| message 保存（`store_message` / `store_message_with_session`） | `state.db_for(ctx.is_secret)` |
-| session snapshot 保存（`save_session`） | `state.db_for(ctx.is_secret)` |
-| LLM usage log（`log_llm_usage`） | `state.db_for(ctx.is_secret)` |
-| compaction 中の LLM usage log | `state.db_for(ctx.is_secret)` |
-| slash command handlers（`/new`, `/compact`, `/status`） | `state.db_for(context.is_secret)` |
+| chat_id 解決（`resolve_or_create_chat_id`） | `state.db_for(ctx.scope)` |
+| session snapshot 読込（`load_session` / `load_session_snapshot`） | `state.db_for(ctx.scope)` |
+| message 保存（`store_message` / `store_message_with_session`） | `state.db_for(ctx.scope)` |
+| session snapshot 保存（`save_session`） | `state.db_for(ctx.scope)` |
+| LLM usage log（`log_llm_usage`） | `state.db_for(ctx.scope)` |
+| compaction 中の LLM usage log | `state.db_for(ctx.scope)` |
+| slash command handlers（`/new`, `/compact`, `/status`） | `state.db_for(context.scope)` |
 
 ### tool_call 永続化のスキップ
 
@@ -280,11 +280,11 @@ Sleep Batch も session クリア前に `archive_conversation_blocking`（compac
 
 ### Compaction Archive の出力先分離
 
-秘密モードの compaction アーカイブは `runtime/secret_groups/` に出力される。通常モードは `runtime/groups/` のまま。
+`AppState::storage_for(scope)` で解決される archive root に従い、Secret スコープの compaction アーカイブは `runtime/secret_groups/` に出力される。Normal スコープは `runtime/groups/` のまま。
 
 ```text
-通常: <state_root>/runtime/groups/<channel>/<chat_id>/conversations/
-秘密: <state_root>/runtime/secret_groups/<channel>/<chat_id>/conversations/
+Normal: <state_root>/runtime/groups/<channel>/<chat_id>/conversations/
+Secret: <state_root>/runtime/secret_groups/<channel>/<chat_id>/conversations/
 ```
 
 `runtime/groups/` 配下はデバッグ・監査用の artifact でトラブルシュート時に共有されることが想定される。秘匿内容のアーカイブが混入するリスクを防ぐため、ディレクトリを分離する。

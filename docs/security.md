@@ -164,11 +164,11 @@ Well-known なシークレットプレフィックスに一致する文字列を
 
 ## 5. Secret Mode 隔離戦略
 
-秘匿会話（`secret: true` のチャネル）を通常の会話経路から物理的に隔離する多層防御。各層で独立に秘匿内容を排除する。
+秘匿会話（`secret: true` のチャネル）を通常の会話経路から物理的に隔離する多層防御。各層で独立に秘匿内容を排除する。内部では `ConversationScope::Secret` としてスコープ全体に伝播し、コンテキスト構築から turn 終了まで一貫した境界を保証する（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照）。
 
 ### 5.1 物理ファイル分離
 
-| 項目 | 通常経路 | 秘密経路 |
+| 項目 | Normal スコープ | Secret スコープ |
 |---|---|---|
 | DB ファイル | `egopulse.db` | `secret.db` |
 | Compaction archive | `runtime/groups/` | `runtime/secret_groups/` |
@@ -177,20 +177,20 @@ Well-known なシークレットプレフィックスに一致する文字列を
 
 ### 5.2 構造的保証
 
-Sleep Batch・PULSE は `state.db`（通常）のみ参照し、`secret.db` には接続しない。これは実装の省略ではなく構造的保証。コード経路が存在しないため、誤って秘匿内容を処理することはない。
+Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`ConversationScope::Secret` の DB（`secret.db`）には接続しない。これは実装の省略ではなく構造的保証。スコープはコンテキスト構築時に決定され、コード経路が存在しないため、誤って秘匿内容を処理することはない。
 
-- 秘密チャットのメッセージは `episodic.md` 等に昇格しない
-- PULSE は秘密チャットで発火・投稿しない
+- Secret スコープのチャットメッセージは `episodic.md` 等に昇格しない
+- PULSE は Secret スコープのチャットで発火・投稿しない
 
 ### 5.3 ログ Redaction
 
-秘密ターンでは `tracing` の span に内容フィールドを含めない:
+Secret スコープの turn では `tracing` の span に内容フィールドを含めない:
 
-- `info_span!("turn", agent_id, is_secret = true)` — `user_msg` 等の content フィールドを含めない
+- `info_span!("turn", agent_id, scope = "secret")` — `user_msg` 等の content フィールドを含めない
 - tool 実行ログは `name` と `status` のみ
 - LLM request/response ログは token 数やエラーメタ情報のみ
 
-`is_secret = true` フラグが span に記録されるため、ログ検索で秘密ターンを識別できる。
+`scope = "secret"` フィールドが span に記録されるため、ログ検索で Secret スコープの turn を識別できる。
 
 ### 5.4 バックアップ
 

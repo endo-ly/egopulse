@@ -39,7 +39,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | ①.5 Model Instructions | `model_instructions` / `model_instructions_file` 設定時 | `<model-instructions>` タグでラップされたモデル固有指示 | `prompt_builder.rs:build_model_instructions_section` → `config/resolve.rs:resolve_model_instructions` |
 | ② Core Instructions | 常に | ツール一覧・実行ルール・セキュリティルール | `prompt_builder.rs:build_base_prompt` ← `prompts/core_instructions.md` (`include_str!`) |
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `turn.rs:623-630` → `soul_agents.rs:98-118` |
-| ③.5 Secret | `is_secret == true` かつ SECRET.md 存在時 | `<secret>` タグでラップされた秘密モード指示 | `soul_agents.rs::load_secret()` → `prompt_builder.rs::build_secret_prompt_section()` |
+| ③.5 Secret | `scope == ConversationScope::Secret` かつ SECRET.md 存在時 | `<secret>` タグでラップされた秘密モード指示 | `soul_agents.rs::load_secret()` → `prompt_builder.rs::build_secret_prompt_section()` |
 | ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `turn.rs` |
 | ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs:632-637` |
 
@@ -96,7 +96,7 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 
 ## 3.5 SECRET.md 読み込み
 
-秘密モード（`SurfaceContext.is_secret == true`）時にのみ読み込まれるユーザー編集可能な指示ファイル。AGENTS.md と同形式の Markdown 自由文。
+`ConversationScope::Secret` がアクティブな turn にのみ読み込まれるユーザー編集可能な指示ファイル。AGENTS.md と同形式の Markdown 自由文。スコープの決定方法は [architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) を参照。
 
 ### パス
 
@@ -108,10 +108,10 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 
 ### 読み込み条件
 
-- `is_secret == true` のときのみロードを試みる
+- `scope == ConversationScope::Secret` のときのみロードを試みる
 - ファイルが存在しない場合は `None`（セクション自体省略）
 - 空ファイルも `None` 扱い
-- **ファイルが無くても秘密モードは正常に動作する**（DB ルーティング等の隔離は SECRET.md の有無によらない）
+- **ファイルが無くても Secret スコープの turn は正常に動作する**（DB ルーティング等の隔離は SECRET.md の有無によらない）
 
 ### 注入フォーマット
 
