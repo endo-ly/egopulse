@@ -5,6 +5,7 @@
 
 mod channels;
 pub(crate) mod inputs;
+pub(crate) mod prompts;
 mod provider;
 pub(crate) mod slugify;
 mod summary;
