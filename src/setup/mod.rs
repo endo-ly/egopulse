@@ -712,11 +712,10 @@ fn draw_selector_popup(frame: &mut ratatui::Frame<'_>, state: &SelectorState, ar
 }
 
 /// Runs the interactive setup wizard and writes the resulting configuration file.
+///
+/// Thin wrapper around [`wizard::run`] for backwards-compatible entrypoint.
 pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), String> {
-    let mut app = SetupApp::new(config_path)?;
-    let terminal = init_terminal()?;
-
-    run_loop(terminal, &mut app).await
+    wizard::run(config_path)
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, String> {

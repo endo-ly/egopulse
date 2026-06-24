@@ -1,13 +1,21 @@
-//! Setup wizard のメッセージビルダーと分岐判断純粋関数。
+//! Setup wizard のフロー制御、メッセージビルダー、分岐判断純粋関数。
 //!
-//! dialoguer に依存しない純粋関数群。Step 8 の wizard フロー統合時に
-//! これらの関数を並べて呼び出すことで、回帰リスクを最小化する。
+//! Step 7 の純粋関数群と Step 8 の trait 抽象化されたフロー統合を統合する。
+//! wizard 本体 ([`run_with_source_and_sink`]) は [`PromptSource`] / [`OutputSink`]
+//! trait を介して入出力を行い、本番では dialoguer、テストではモックを使用する。
 
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::config::default_config_path;
 use crate::llm::codex_auth::provider_allows_empty_api_key;
 use crate::setup::inputs::SetupInputs;
 use crate::setup::prompts::format_api_key_for_review;
-use crate::setup::provider::find_provider_preset;
+use crate::setup::prompts::{DialoguerOutputSink, DialoguerPromptSource, OutputSink, PromptSource};
+use crate::setup::provider::{PROVIDER_PRESETS, find_provider_preset, provider_label_for};
 use crate::setup::slugify::slugify_agent_id;
+use crate::setup::summary::{ExistingConfig, parse_existing_config, save_config_from_inputs};
 
 /// Web UI のデフォルトアクセス URL。
 const WEB_UI_URL: &str = "http://127.0.0.1:10961";
@@ -165,6 +173,346 @@ fn enabled_label(enabled: bool) -> &'static str {
     if enabled { "enabled" } else { "disabled" }
 }
 
+struct PrefillValues {
+    agent_label: String,
+    base_url: String,
+    model: String,
+    web_enabled: bool,
+    discord_enabled: bool,
+    telegram_enabled: bool,
+}
+
+fn extract_prefill(existing: &ExistingConfig) -> PrefillValues {
+    PrefillValues {
+        agent_label: existing
+            .root
+            .as_ref()
+            .and_then(root_agent_label)
+            .unwrap_or_default(),
+        base_url: existing.fields.get("BASE_URL").cloned().unwrap_or_default(),
+        model: existing.fields.get("MODEL").cloned().unwrap_or_default(),
+        web_enabled: existing
+            .root
+            .as_ref()
+            .and_then(root_web_enabled)
+            .unwrap_or(true),
+        discord_enabled: existing
+            .fields
+            .get("DISCORD_ENABLED")
+            .map(|v| is_truthy(v.as_str()))
+            .unwrap_or(false),
+        telegram_enabled: existing
+            .fields
+            .get("TELEGRAM_ENABLED")
+            .map(|v| is_truthy(v.as_str()))
+            .unwrap_or(false),
+    }
+}
+
+fn root_agent_label(root: &yaml_serde::Value) -> Option<String> {
+    let map = root.as_mapping()?;
+    let default_agent = map.get(yaml_str("default_agent"))?.as_str()?;
+    map.get(yaml_str("agents"))?
+        .as_mapping()?
+        .get(yaml_str(default_agent))?
+        .as_mapping()?
+        .get(yaml_str("label"))?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn root_web_enabled(root: &yaml_serde::Value) -> Option<bool> {
+    root.as_mapping()?
+        .get(yaml_str("channels"))?
+        .as_mapping()?
+        .get(yaml_str("web"))?
+        .as_mapping()?
+        .get(yaml_str("enabled"))?
+        .as_bool()
+}
+
+fn yaml_str(key: &str) -> yaml_serde::Value {
+    yaml_serde::Value::String(key.to_string())
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+fn provider_select_items() -> Vec<String> {
+    PROVIDER_PRESETS
+        .iter()
+        .map(|p| p.label.to_string())
+        .chain(std::iter::once("Custom".to_string()))
+        .collect()
+}
+
+fn model_select_items(provider_id: &str) -> Vec<String> {
+    find_provider_preset(provider_id)
+        .map(|p| p.models.iter().map(|m| m.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn load_existing(
+    source: &dyn PromptSource,
+    sink: &dyn OutputSink,
+    config_path: &Path,
+) -> Result<ExistingConfig, String> {
+    let yaml_text = match fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(ExistingConfig {
+                fields: HashMap::new(),
+                root: None,
+            });
+        }
+    };
+
+    match parse_existing_config(&yaml_text) {
+        Ok(config) => Ok(config),
+        Err(e) => {
+            sink.println(&format!("WARNING: {e}"));
+            if source.confirm("Continue with empty defaults? (y/N)", false)? {
+                Ok(ExistingConfig {
+                    fields: HashMap::new(),
+                    root: None,
+                })
+            } else {
+                Err("Setup aborted due to config parse error".to_string())
+            }
+        }
+    }
+}
+
+fn collect_inputs(
+    source: &dyn PromptSource,
+    prefill: &PrefillValues,
+) -> Result<SetupInputs, String> {
+    let agent_label = prompt_agent_label(source, &prefill.agent_label)?;
+    let (provider_id, base_url) = prompt_provider(source, &agent_label, prefill)?;
+    let model = prompt_model(source, &provider_id, &prefill.model)?;
+    let api_key = prompt_api_key(source, &provider_id, &base_url)?;
+    let web_enabled = prompt_web(source, prefill.web_enabled)?;
+    let (discord_enabled, discord_bot_token) = prompt_discord(source, prefill.discord_enabled)?;
+    let (telegram_enabled, telegram_bot_token) = prompt_telegram(source, prefill.telegram_enabled)?;
+
+    Ok(SetupInputs {
+        agent_label,
+        provider_id,
+        base_url,
+        model,
+        api_key,
+        web_enabled,
+        discord_enabled,
+        discord_bot_token,
+        telegram_enabled,
+        telegram_bot_token,
+    })
+}
+
+fn prompt_agent_label(source: &dyn PromptSource, default: &str) -> Result<String, String> {
+    let prompt = "Name your agent (e.g. Partner, Companion, Assistant):";
+    let input = source.text(prompt, default)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        if default.is_empty() {
+            Ok("Default".to_string())
+        } else {
+            Ok(default.to_string())
+        }
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn prompt_provider(
+    source: &dyn PromptSource,
+    agent_label: &str,
+    prefill: &PrefillValues,
+) -> Result<(String, String), String> {
+    let items = provider_select_items();
+    let label = format!("Choose the LLM provider for {agent_label}:");
+    let idx = source.select(&label, &items)?;
+
+    if idx >= PROVIDER_PRESETS.len() {
+        let url = source.text(
+            "Enter the base_url (e.g. https://api.example.com/v1):",
+            &prefill.base_url,
+        )?;
+        Ok(("custom".to_string(), url.trim().to_string()))
+    } else {
+        let preset = &PROVIDER_PRESETS[idx];
+        Ok((preset.id.to_string(), preset.default_base_url.to_string()))
+    }
+}
+
+fn prompt_model(
+    source: &dyn PromptSource,
+    provider_id: &str,
+    default: &str,
+) -> Result<String, String> {
+    if should_ask_model_as_free_text(provider_id) {
+        let input = source.text(
+            "Enter the model name (e.g. gpt-4o, claude-3-opus):",
+            default,
+        )?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() && !default.is_empty() {
+            Ok(default.to_string())
+        } else {
+            Ok(trimmed.to_string())
+        }
+    } else {
+        let items = model_select_items(provider_id);
+        let idx = source.select("Choose the model to use:", &items)?;
+        Ok(items[idx].clone())
+    }
+}
+
+fn prompt_api_key(
+    source: &dyn PromptSource,
+    provider_id: &str,
+    base_url: &str,
+) -> Result<String, String> {
+    let provider_label = provider_label_for(provider_id);
+    let prompt = format!(
+        "Enter the API key for {provider_label} (input is hidden).\n\
+         For local endpoints (Ollama/LMStudio), leave it empty and press Enter:"
+    );
+    loop {
+        let key = source.password(&prompt)?;
+        if key.trim().is_empty() && should_confirm_empty_api_key(provider_id, base_url) {
+            let confirm = format!(
+                "WARNING: {provider_label} usually requires an API key. \
+                 Proceed with an empty key? (y/N)"
+            );
+            if !source.confirm(&confirm, false)? {
+                continue;
+            }
+        }
+        return Ok(key);
+    }
+}
+
+fn prompt_web(source: &dyn PromptSource, default: bool) -> Result<bool, String> {
+    source.confirm(
+        &format!(
+            "Enable the Web UI? (Y/n)\n\
+             You can access it at {WEB_UI_URL} from your browser."
+        ),
+        default,
+    )
+}
+
+fn prompt_discord(source: &dyn PromptSource, default: bool) -> Result<(bool, String), String> {
+    let enabled = source.confirm("Configure a Discord bot? (y/N)", default)?;
+    if enabled {
+        let token = source.password("Enter the Discord bot token (input is hidden):")?;
+        Ok((true, token))
+    } else {
+        Ok((false, String::new()))
+    }
+}
+
+fn prompt_telegram(source: &dyn PromptSource, default: bool) -> Result<(bool, String), String> {
+    let enabled = source.confirm("Configure a Telegram bot? (y/N)", default)?;
+    if enabled {
+        let token = source.password("Enter the Telegram bot token (input is hidden):")?;
+        Ok((true, token))
+    } else {
+        Ok((false, String::new()))
+    }
+}
+
+fn save_and_finish(
+    sink: &dyn OutputSink,
+    inputs: &SetupInputs,
+    existing: &ExistingConfig,
+    config_path: &Path,
+) -> Result<(), String> {
+    let (backup_path, _summary) =
+        save_config_from_inputs(inputs, existing.root.as_ref(), config_path)?;
+
+    sink.println(&build_additional_options_text());
+    let path_str = config_path.to_string_lossy();
+    sink.println(&build_done_message(
+        inputs,
+        &path_str,
+        backup_path.as_deref(),
+    ));
+
+    Ok(())
+}
+
+/// trait 抽象化されたプロンプト/シンクを用いて wizard フロー全体を実行する。
+///
+/// Welcome → Q1〜Q7 → Review → Save → Additional Options → Done の順次制御を行う。
+/// Review で no 選択時は StartOver / Abort / SaveAnyway の3択へ分岐する。
+/// 既存 YAML のパースエラー時は warn 表示 + Y/N 確認を行う。
+///
+/// # Errors
+///
+/// - ユーザーが Abort を選択した場合
+/// - 既存 YAML パースエラー時にユーザーが N を選択した場合
+/// - プロンプト入力エラー
+/// - 設定保存エラー
+pub(crate) fn run_with_source_and_sink(
+    source: &dyn PromptSource,
+    sink: &dyn OutputSink,
+    config_path: Option<PathBuf>,
+) -> Result<(), String> {
+    let resolved_path = match config_path {
+        Some(path) => path,
+        None => default_config_path().map_err(|e| e.to_string())?,
+    };
+
+    sink.println("Welcome to EgoPulse setup.");
+    sink.println("Answer a few questions to configure the minimum settings to run your AI agent.");
+
+    let existing = load_existing(source, sink, &resolved_path)?;
+    let prefill = extract_prefill(&existing);
+
+    loop {
+        let inputs = collect_inputs(source, &prefill)?;
+
+        sink.println(&build_review_summary(&inputs));
+
+        if source.confirm("Save? (Y/n)", true)? {
+            return save_and_finish(sink, &inputs, &existing, &resolved_path);
+        }
+
+        let choices = vec![
+            "Start over (back to Agent Label)".to_string(),
+            "Abort (exit without saving)".to_string(),
+            "Save anyway".to_string(),
+        ];
+        let idx = source.select("What would you like to do?", &choices)?;
+        match review_decision_from_index(idx) {
+            ReviewDecision::StartOver => continue,
+            ReviewDecision::Abort => return Err("Setup aborted".to_string()),
+            ReviewDecision::SaveAnyway => {
+                return save_and_finish(sink, &inputs, &existing, &resolved_path);
+            }
+        }
+    }
+}
+
+/// dialoguer ベースのプロンプト/シンクを使用して wizard を実行する thin wrapper。
+///
+/// # Errors
+///
+/// [`run_with_source_and_sink`] に準ずる。
+pub(crate) fn run(config_path: Option<PathBuf>) -> Result<(), String> {
+    run_with_source_and_sink(
+        &DialoguerPromptSource::new(),
+        &DialoguerOutputSink::new(),
+        config_path,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +626,226 @@ mod tests {
         assert!(should_ask_model_as_free_text("custom"));
         assert!(!should_ask_model_as_free_text("openai"));
         assert!(!should_ask_model_as_free_text("deepseek"));
+    }
+
+    use crate::setup::prompts::test_mocks::{MockPromptSource, VecOutputSink};
+    use serial_test::serial;
+
+    /// Ollama is at index 3 in PROVIDER_PRESETS.
+    const OLLAMA_INDEX: usize = 3;
+
+    fn setup_happy_path(source: &MockPromptSource) {
+        source
+            .expect_text("Name your agent", "Partner")
+            .expect_select("Choose the LLM provider", OLLAMA_INDEX)
+            .expect_select("Choose the model", 0)
+            .expect_password("API key", "")
+            .expect_confirm("Web UI", true)
+            .expect_confirm("Discord", false)
+            .expect_confirm("Telegram", false);
+    }
+
+    fn assert_config_saved(config_path: &std::path::Path) {
+        assert!(config_path.exists(), "config file must be created");
+        let content = std::fs::read_to_string(config_path).expect("read saved config");
+        assert!(
+            content.contains("default_provider"),
+            "saved config must contain default_provider"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn prefill_defaults_uses_existing_config_values() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        std::fs::write(
+            &config_path,
+            "default_provider: ollama\n\
+             default_agent: partner\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             agents:\n\
+             \x20 partner:\n\
+             \x20   label: Partner\n\
+             channels:\n\
+             \x20 web:\n\
+             \x20   enabled: true\n\
+             \x20 discord:\n\
+             \x20   enabled: false\n\
+             \x20 telegram:\n\
+             \x20   enabled: false\n",
+        )
+        .expect("write existing config");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        setup_happy_path(&source);
+        source.expect_confirm("Save?", true);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should succeed");
+
+        let text_defs = source.text_defaults();
+        let label_default = text_defs
+            .iter()
+            .find(|(l, _)| l.contains("Name your agent"))
+            .map(|(_, d)| d.clone())
+            .expect("agent label text default must be recorded");
+        assert_eq!(label_default, "Partner");
+
+        let confirm_defs = source.confirm_defaults();
+        let web_default = confirm_defs
+            .iter()
+            .find(|(l, _)| l.contains("Web UI"))
+            .map(|(_, d)| *d)
+            .expect("web confirm default must be recorded");
+        assert!(web_default);
+
+        assert_config_saved(&config_path);
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_review_startover_returns_to_q1() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        // Round 1: review -> no -> StartOver
+        setup_happy_path(&source);
+        source
+            .expect_confirm("Save?", false)
+            .expect_select("What would you like to do?", 0);
+
+        // Round 2: review -> yes -> save
+        setup_happy_path(&source);
+        source.expect_confirm("Save?", true);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should succeed after StartOver loop");
+
+        assert_config_saved(&config_path);
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_review_abort_exits_without_save() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        setup_happy_path(&source);
+        source
+            .expect_confirm("Save?", false)
+            .expect_select("What would you like to do?", 1);
+
+        let result = run_with_source_and_sink(&source, &sink, Some(config_path.clone()));
+
+        assert!(result.is_err(), "Abort must return Err");
+        assert!(
+            !config_path.exists(),
+            "config file must NOT be created on Abort"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_review_save_anyway_writes_config() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        setup_happy_path(&source);
+        source
+            .expect_confirm("Save?", false)
+            .expect_select("What would you like to do?", 2);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should succeed via SaveAnyway");
+
+        assert_config_saved(&config_path);
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_review_yes_saves_directly() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        setup_happy_path(&source);
+        source.expect_confirm("Save?", true);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should succeed on direct yes");
+
+        assert_config_saved(&config_path);
+
+        let output = sink.joined();
+        assert!(
+            output.contains("Configuration saved"),
+            "Done message must appear in output"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_parse_error_decline_aborts() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        std::fs::write(&config_path, "default_provider: [unclosed").expect("write broken yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        source.expect_confirm("Continue with empty defaults", false);
+
+        let result = run_with_source_and_sink(&source, &sink, Some(config_path.clone()));
+
+        assert!(result.is_err(), "decline on parse error must return Err");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "default_provider: [unclosed",
+            "original broken config must remain untouched"
+        );
+
+        let output = sink.joined();
+        assert!(
+            output.contains("WARNING"),
+            "warning must be displayed on parse error"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_parse_error_accept_continues() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        std::fs::write(&config_path, "default_provider: [unclosed").expect("write broken yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        source.expect_confirm("Continue with empty defaults", true);
+        setup_happy_path(&source);
+        source.expect_confirm("Save?", true);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should continue after accepting parse error");
+
+        assert_config_saved(&config_path);
     }
 }
