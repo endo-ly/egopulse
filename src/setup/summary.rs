@@ -203,6 +203,7 @@ pub(crate) fn save_config(
     };
 
     let mut channels = build_channel_configs(
+        true,
         auth_token,
         discord_enabled,
         telegram_enabled,
