@@ -50,9 +50,6 @@ pub(crate) trait PromptSource {
 
 /// セットアップウィザードの出力先を抽象化する trait。
 pub(crate) trait OutputSink {
-    /// 改行なしでテキストを出力する。
-    fn print(&self, text: &str);
-
     /// 改行付きでテキストを出力する。
     fn println(&self, text: &str);
 }
@@ -126,13 +123,6 @@ impl Default for DialoguerOutputSink {
 }
 
 impl OutputSink for DialoguerOutputSink {
-    fn print(&self, text: &str) {
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = handle.write_all(text.as_bytes());
-        let _ = handle.flush();
-    }
-
     fn println(&self, text: &str) {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
@@ -281,10 +271,6 @@ pub(crate) mod test_mocks {
             }
         }
 
-        pub(crate) fn output(&self) -> Vec<String> {
-            self.lines.borrow().clone()
-        }
-
         pub(crate) fn joined(&self) -> String {
             self.lines.borrow().join("\n")
         }
@@ -297,15 +283,6 @@ pub(crate) mod test_mocks {
     }
 
     impl OutputSink for VecOutputSink {
-        fn print(&self, text: &str) {
-            let mut lines = self.lines.borrow_mut();
-            if let Some(last) = lines.last_mut() {
-                last.push_str(text);
-            } else {
-                lines.push(text.to_string());
-            }
-        }
-
         fn println(&self, text: &str) {
             self.lines.borrow_mut().push(text.to_string());
         }

@@ -15,7 +15,7 @@ use crate::setup::prompts::format_api_key_for_review;
 use crate::setup::prompts::{DialoguerOutputSink, DialoguerPromptSource, OutputSink, PromptSource};
 use crate::setup::provider::{PROVIDER_PRESETS, find_provider_preset, provider_label_for};
 use crate::setup::slugify::slugify_agent_id;
-use crate::setup::summary::{ExistingConfig, parse_existing_config, save_config_from_inputs};
+use crate::setup::summary::{ExistingConfig, parse_existing_config, save_config};
 
 /// Web UI のデフォルトアクセス URL。
 const WEB_UI_URL: &str = "http://127.0.0.1:10961";
@@ -433,8 +433,7 @@ fn save_and_finish(
     existing: &ExistingConfig,
     config_path: &Path,
 ) -> Result<(), String> {
-    let (backup_path, _summary) =
-        save_config_from_inputs(inputs, existing.root.as_ref(), config_path)?;
+    let (backup_path, _summary) = save_config(inputs, existing.root.as_ref(), config_path)?;
 
     sink.println(&build_additional_options_text());
     let path_str = config_path.to_string_lossy();
