@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::channels::{build_channel_configs, extract_existing_state_root, generate_auth_token};
+use super::channels::{
+    build_channel_configs, extract_existing_state_root, generate_auth_token, load_channel_fields,
+};
 use super::provider::{
     find_provider_preset, normalize_provider_id, provider_default_base_url, provider_default_model,
     provider_label_for,
@@ -467,4 +469,132 @@ pub(crate) fn draw_completion_summary(frame: &mut ratatui::Frame<'_>, app: &Setu
         .block(Block::default().title("Summary").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
+}
+
+/// 既存設定 YAML のパース結果。
+///
+/// `fields` はウィザードプロンプトのデフォルト値として事前入力に使用する平坦なマップ。
+/// `root` は元の YAML ルートノード (state_root 抽出等に使用)。
+pub(crate) struct ExistingConfig {
+    pub fields: HashMap<String, String>,
+    pub root: Option<yaml_serde::Value>,
+}
+
+/// YAML 文字列をパースし、プロバイダー・チャネル情報を抽出する純粋関数。
+///
+/// ファイル IO (`.env` からのトークン読み込み等) は行わず、YAML テキストのみを入力とする。
+/// 既存 `SetupApp::load_existing_config` の YAML パース部分を切り出したもので、
+/// パースエラーを黙殺せず `Err` で返す。
+///
+/// # Errors
+///
+/// YAML 構文エラーの場合、パースエラーの内容を含むメッセージを返す。
+pub(crate) fn parse_existing_config(yaml_text: &str) -> Result<ExistingConfig, String> {
+    let parsed: yaml_serde::Value = yaml_serde::from_str(yaml_text)
+        .map_err(|e| format!("Failed to parse existing config YAML: {e}"))?;
+
+    let mut fields = HashMap::new();
+
+    if let Some(map) = parsed.as_mapping() {
+        extract_provider_fields(map, &mut fields);
+        if let Some(channels) = map.get(yaml_string_key("channels")) {
+            load_channel_fields(channels, &mut fields);
+        }
+    }
+
+    Ok(ExistingConfig {
+        fields,
+        root: Some(parsed),
+    })
+}
+
+fn extract_provider_fields(map: &yaml_serde::Mapping, fields: &mut HashMap<String, String>) {
+    let Some(default_provider) = map
+        .get(yaml_string_key("default_provider"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+
+    let provider_id = normalize_provider_id(default_provider);
+    fields.insert("PROVIDER".into(), provider_id.clone());
+
+    let provider_map = map
+        .get(yaml_string_key("providers"))
+        .and_then(|v| v.as_mapping())
+        .and_then(|providers| providers.get(yaml_string_key(default_provider)))
+        .and_then(|v| v.as_mapping());
+
+    let model = map
+        .get(yaml_string_key("default_model"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            provider_map
+                .and_then(|pm| pm.get(yaml_string_key("default_model")))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| provider_default_model(&provider_id).map(str::to_string));
+    if let Some(model) = model {
+        fields.insert("MODEL".into(), model);
+    }
+
+    let base_url = provider_map
+        .and_then(|pm| pm.get(yaml_string_key("base_url")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| provider_default_base_url(&provider_id).map(str::to_string));
+    if let Some(base_url) = base_url {
+        fields.insert("BASE_URL".into(), base_url);
+    }
+
+    if let Some(api_key) = provider_map
+        .and_then(|pm| pm.get(yaml_string_key("api_key")))
+        .and_then(|v| v.as_str())
+    {
+        fields.insert("API_KEY".into(), api_key.to_string());
+    }
+}
+
+fn yaml_string_key(value: &str) -> yaml_serde::Value {
+    yaml_serde::Value::String(value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_existing_config;
+
+    #[test]
+    fn parse_existing_config_returns_err_for_invalid_yaml() {
+        let result = parse_existing_config("default_provider: [unclosed");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_existing_config_extracts_provider_schema() {
+        let yaml = r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-token
+"#;
+        let config = parse_existing_config(yaml).expect("valid yaml");
+        assert_eq!(config.fields.get("PROVIDER"), Some(&"openai".to_string()));
+        assert_eq!(config.fields.get("MODEL"), Some(&"gpt-4o-mini".to_string()));
+        assert_eq!(
+            config.fields.get("BASE_URL"),
+            Some(&"https://api.openai.com/v1".to_string())
+        );
+        assert_eq!(
+            config.fields.get("WEB_AUTH_TOKEN"),
+            Some(&"web-token".to_string())
+        );
+    }
 }
