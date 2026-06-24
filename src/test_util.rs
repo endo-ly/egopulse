@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::agent_loop::ConversationScope;
 use crate::assets::AssetStore;
 use crate::channels::adapter::ChannelRegistry;
 use crate::config::{
@@ -129,7 +130,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
-        is_secret: false,
+        scope: ConversationScope::Normal,
     }
 }
 
@@ -146,6 +147,6 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         origin_id: String::new(),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        is_secret: false,
+        scope: ConversationScope::Normal,
     }
 }

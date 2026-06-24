@@ -6,9 +6,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::force_compact;
 use crate::agent_loop::session::{load_messages_for_turn, resolve_chat_id};
+use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
@@ -131,7 +131,7 @@ pub(crate) async fn handle_slash_command(
     let _args = parts.get(1).copied().unwrap_or("");
 
     match command.as_str() {
-        "/new" => handle_new(state, context.is_secret, chat_id).await,
+        "/new" => handle_new(state, context.scope, chat_id).await,
         "/compact" => handle_compact(state, chat_id, context).await,
         "/status" => handle_status(state, chat_id, context, sender_id).await,
         "/skills" => Some(handle_skills(state)),
@@ -188,8 +188,8 @@ pub(crate) fn unknown_command_response() -> String {
 // Command handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_new(state: &AppState, is_secret: bool, chat_id: i64) -> Option<String> {
-    match call_blocking(Arc::clone(state.db_for(is_secret)), move |db| {
+async fn handle_new(state: &AppState, scope: ConversationScope, chat_id: i64) -> Option<String> {
+    match call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         let snapshot = db.load_session_snapshot(chat_id, 1)?;
         let updated_at = match snapshot.updated_at {
             Some(ts) => ts,
@@ -219,7 +219,7 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(state, context.is_secret, chat_id).await {
+    let loaded = match load_messages_for_turn(state, context.scope, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
@@ -239,7 +239,7 @@ async fn handle_compact(
                 Ok(j) => j,
                 Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
             };
-            match call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
+            match call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
                 db.save_session(chat_id, &json)
             })
             .await
@@ -273,7 +273,7 @@ async fn handle_status(
         Err(e) => return Some(format!("Failed to resolve LLM: {e}")),
     };
 
-    let messages = call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
+    let messages = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
         db.get_recent_messages(chat_id, 99999)
     })
     .await
@@ -735,8 +735,8 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::agent_loop::SurfaceContext;
     use crate::agent_loop::turn::{build_state, build_state_for_config_file, test_config};
+    use crate::agent_loop::{ConversationScope, SurfaceContext};
     use crate::config::{AgentId, Config};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
@@ -862,7 +862,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         }
     }
 
@@ -1194,7 +1194,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1235,7 +1235,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1316,7 +1316,7 @@ agents:
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1363,7 +1363,7 @@ agents:
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;

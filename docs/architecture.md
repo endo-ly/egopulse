@@ -183,14 +183,18 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// 文脈に応じた DB 参照を返す
-    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
-        if is_secret {
-            self.secret_db.as_ref().expect("secret db required but not initialized")
-        } else {
-            &self.db
+    /// スコープに応じた DB 参照を返す
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+        match scope {
+            ConversationScope::Secret => {
+                self.secret_db.as_ref().expect("secret db required but not initialized")
+            }
+            ConversationScope::Normal => &self.db,
         }
     }
+
+    /// スコープに応じたストレージ参照（DB + archive root）を返す
+    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage { /* ... */ }
 }
 ```
 
@@ -209,7 +213,7 @@ pub(crate) struct SurfaceContext {
     pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
     pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
     pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
-    pub is_secret: bool,         // 秘密モードフラグ。true のとき全 DB 操作が secret.db にルーティングされる
+    pub scope: ConversationScope,// ストレージ境界。turn 全体の DB・archive ルーティングを決定
 }
 ```
 
@@ -323,7 +327,33 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
-| **Secret DB Routing** | `runtime/` AppState | `db_for(is_secret)` で通常 DB と秘密 DB を切替。`SurfaceContext.is_secret` でルーティング判定 |
+| **Conversation Scope Routing** | `runtime/` AppState | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`db_for(scope)` / `storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+
+---
+
+## 7.1 ConversationScope（ストレージ境界）
+
+`ConversationScope` は、turn 全体のストレージ境界を決定する内部抽象である。YAML 設定の `secret: true` はユーザー向け API であり、内部では `ConversationScope::Secret` に変換される。
+
+### スコープの種類
+
+| スコープ | YAML 設定 | DB ファイル | Archive ディレクトリ | 用途 |
+|---|---|---|---|---|
+| `Normal` | `secret: false`（デフォルト） | `egopulse.db` | `runtime/groups/` | 通常の会話永続化 |
+| `Secret` | `secret: true` | `secret.db` | `runtime/secret_groups/` | 秘匿会話の物理隔離 |
+
+### ライフサイクル
+
+1. **コンテキスト構築**: チャネルアダプタが YAML 設定の `secret: true` を読み取り、`SurfaceContext.scope = ConversationScope::Secret` を設定
+2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`AppState::storage_for(scope)` で DB + archive root を一意に解決
+3. **Turn 全体への伝播**: `SurfaceContext.scope` が `ToolExecutionContext.scope` 経由で turn 全体に伝播し、session 読込・message 保存・compaction・LLM usage log のすべてが同じスコープの DB にルーティングされる
+
+### 構造的保証
+
+- Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`secret.db` には接続しない
+- スコープはコンテキスト構築時に決定され、turn 中に変更されることはない
+
+詳細は [security.md §5](./security.md#5-secret-mode-隔離戦略)、[db.md §5](./db.md#5-secretdb秘匿会話用データベース) を参照。
 
 ---
 

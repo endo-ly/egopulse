@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 
+use crate::agent_loop::ConversationScope;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
@@ -92,6 +93,17 @@ struct AppStateDependencies {
     memory_loader: Arc<MemoryLoader>,
 }
 
+/// Resolved storage endpoints for a conversation scope.
+///
+/// Groups the database handle and archive root path so callers do not
+/// need to know scope-specific path conventions.
+pub(crate) struct ScopedStorage<'a> {
+    /// The database handle for this scope.
+    pub db: &'a Arc<Database>,
+    /// Root directory for archived conversations.
+    pub archive_root: PathBuf,
+}
+
 impl AppState {
     pub(crate) fn from_parts(parts: AppStateParts) -> Self {
         Self {
@@ -117,19 +129,44 @@ impl AppState {
         }
     }
 
-    /// Returns the appropriate `Database` reference based on `is_secret`.
+    /// Returns the appropriate `Database` reference based on `scope`.
     ///
     /// # Panics
     ///
-    /// Panics if `is_secret == true` but `secret_db` was not initialized
+    /// Panics if `scope` is `Secret` but `secret_db` was not initialized
     /// (i.e., no secret channels in config).
-    pub(crate) fn db_for(&self, is_secret: bool) -> &Arc<Database> {
-        if is_secret {
-            self.secret_db
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+        match scope {
+            ConversationScope::Normal => &self.db,
+            ConversationScope::Secret => self
+                .secret_db
                 .as_ref()
-                .expect("secret db required but not initialized")
-        } else {
-            &self.db
+                .expect("secret db required but not initialized"),
+        }
+    }
+
+    /// Resolves the database and archive root for the given conversation scope.
+    ///
+    /// Callers that need both the database handle and the archive directory
+    /// (e.g. compaction) should prefer this over [`Self::db_for`] to avoid
+    /// duplicating scope-specific path logic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
+    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
+        match scope {
+            ConversationScope::Normal => ScopedStorage {
+                db: &self.db,
+                archive_root: self.config.groups_dir(),
+            },
+            ConversationScope::Secret => ScopedStorage {
+                db: self
+                    .secret_db
+                    .as_ref()
+                    .expect("secret db required but not initialized"),
+                archive_root: self.config.runtime_dir().join("secret_groups"),
+            },
         }
     }
 
@@ -448,7 +485,7 @@ pub(crate) fn execute_scheduled_turn(
             crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                 if let Err(error) = state
-                    .db_for(turn.context.is_secret)
+                    .db_for(turn.context.scope)
                     .store_system_event(log_chat_id, &reason)
                 {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
@@ -515,7 +552,7 @@ pub(crate) fn execute_scheduled_turn(
                 }
                 if !response.is_empty() {
                     if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                        let db = std::sync::Arc::clone(state.db_for(turn.context.is_secret));
+                        let db = std::sync::Arc::clone(state.db_for(turn.context.scope));
                         let agent_id = turn.context.agent_id.clone();
                         let response_owned = response.clone();
                         if let Err(error) = crate::storage::call_blocking(db, move |db| {
@@ -562,7 +599,7 @@ pub(crate) fn execute_scheduled_turn(
                     .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
-                        .db_for(turn.context.is_secret)
+                        .db_for(turn.context.scope)
                         .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
                     {
                         tracing::warn!(error = %db_err, "failed to store LLM failure system event");
@@ -973,6 +1010,7 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::soul_agents::SoulAgentsLoader;
     use crate::config::ResolvedLlmConfig;
 
@@ -1159,22 +1197,47 @@ mod tests {
     }
 
     #[test]
-    fn db_for_returns_normal_db_when_not_secret() {
+    fn db_for_returns_normal_db_for_normal_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
-        let result = state.db_for(false);
+        let result = state.db_for(ConversationScope::Normal);
         assert!(Arc::ptr_eq(result, &state.db));
     }
 
     #[test]
-    fn db_for_returns_secret_db_when_secret() {
+    fn db_for_returns_secret_db_for_secret_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = build_sleep_state(&dir);
         let secret_path = dir.path().join("runtime").join("secret.db");
         let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
         state.secret_db = Some(Arc::clone(&secret_db));
-        let result = state.db_for(true);
+        let result = state.db_for(ConversationScope::Secret);
         assert!(Arc::ptr_eq(result, &secret_db));
+    }
+
+    #[test]
+    fn db_for_returns_database_for_conversation_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+
+        let normal_db = state.db_for(ConversationScope::Normal);
+        let secret_result = state.db_for(ConversationScope::Secret);
+
+        assert!(
+            Arc::ptr_eq(normal_db, &state.db),
+            "Normal scope must return the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(secret_result, &secret_db),
+            "Secret scope must return the isolated secret database"
+        );
+        assert!(
+            !Arc::ptr_eq(normal_db, secret_result),
+            "Normal and Secret scopes must return different databases"
+        );
     }
 
     #[test]
@@ -1182,6 +1245,167 @@ mod tests {
     fn db_for_panics_when_secret_db_uninitialized() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_sleep_state(&dir);
-        let _ = state.db_for(true);
+        let _ = state.db_for(ConversationScope::Secret);
+    }
+
+    #[test]
+    fn storage_for_returns_archive_root_for_conversation_scope() {
+        // Arrange: create AppState with both normal and secret DBs
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_sleep_state(&dir);
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
+        state.secret_db = Some(Arc::clone(&secret_db));
+
+        // Act
+        let normal = state.storage_for(ConversationScope::Normal);
+        let secret = state.storage_for(ConversationScope::Secret);
+
+        // Assert: db pointer equality
+        assert!(
+            Arc::ptr_eq(normal.db, &state.db),
+            "Normal scope must resolve to the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(secret.db, &secret_db),
+            "Secret scope must resolve to the isolated secret database"
+        );
+        assert!(
+            !Arc::ptr_eq(normal.db, secret.db),
+            "Normal and Secret scopes must resolve to different databases"
+        );
+
+        // Assert: archive root paths
+        assert!(
+            normal.archive_root.ends_with("groups"),
+            "Normal archive root must end with 'groups', got: {:?}",
+            normal.archive_root
+        );
+        assert!(
+            secret.archive_root.ends_with("secret_groups"),
+            "Secret archive root must end with 'secret_groups', got: {:?}",
+            secret.archive_root
+        );
+        assert_ne!(
+            normal.archive_root, secret.archive_root,
+            "Normal and Secret archive roots must differ"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scheduled_turn_logs_route_by_conversation_scope() {
+        use crate::agent_loop::ScheduledTurn;
+        use crate::agent_loop::turn::RecordingProvider;
+        use crate::llm::MessagesResponse;
+        use crate::storage::call_blocking;
+
+        // Arrange: state with secret DB + recording provider
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "secret scheduled reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let log_chat_id: i64 = 9999;
+        let mut context = crate::test_util::cli_context("scheduled-secret-routing");
+        context.scope = ConversationScope::Secret;
+        context.channel_log_chat_id = Some(log_chat_id);
+
+        let turn = ScheduledTurn {
+            context,
+            input: "scheduled secret input".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Act: execute the scheduled turn
+        execute_scheduled_turn(&state, turn).await;
+
+        // Assert: secret DB has the bot response
+        let secret_messages = call_blocking(
+            Arc::clone(state.secret_db.as_ref().expect("secret db")),
+            move |db| db.get_channel_log_messages(log_chat_id, 10),
+        )
+        .await
+        .expect("read secret channel log");
+        let secret_has_reply = secret_messages
+            .iter()
+            .any(|m| m.content.contains("secret scheduled reply"));
+        assert!(
+            secret_has_reply,
+            "secret DB should contain the bot response"
+        );
+
+        // Assert: normal DB has no entries from this turn
+        let normal_messages = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_channel_log_messages(log_chat_id, 10)
+        })
+        .await
+        .expect("read normal channel log");
+        let normal_has_reply = normal_messages
+            .iter()
+            .any(|m| m.content.contains("secret scheduled reply"));
+        assert!(
+            !normal_has_reply,
+            "normal DB should not contain the secret bot response"
+        );
+    }
+
+    #[test]
+    fn normal_scope_does_not_require_secret_db() {
+        // Arrange: AppState with secret_db = None (no secret channels configured)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        assert!(
+            state.secret_db.is_none(),
+            "test precondition: secret_db is None"
+        );
+
+        // Act: call db_for and storage_for with Normal scope
+        let db = state.db_for(ConversationScope::Normal);
+        let storage = state.storage_for(ConversationScope::Normal);
+
+        // Assert: both succeed and resolve to the normal db and archive root
+        assert!(
+            Arc::ptr_eq(db, &state.db),
+            "db_for(Normal) must return the primary database"
+        );
+        assert!(
+            Arc::ptr_eq(storage.db, &state.db),
+            "storage_for(Normal) must return the primary database"
+        );
+        assert!(
+            storage.archive_root.ends_with("groups"),
+            "storage_for(Normal) archive root must end with 'groups', got: {:?}",
+            storage.archive_root
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "secret db required")]
+    fn secret_scope_requires_secret_database() {
+        // Arrange: AppState without secret_db
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+        assert!(
+            state.secret_db.is_none(),
+            "test precondition: secret_db is None"
+        );
+
+        // Act + Assert: storage_for(Secret) must panic
+        let _ = state.storage_for(ConversationScope::Secret);
     }
 }

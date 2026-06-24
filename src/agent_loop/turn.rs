@@ -3,7 +3,6 @@
 //! セッション復元、LLM 応答、ツール呼び出し、イベント通知、永続化を
 //! 1 本の turn loop としてまとめて扱う。
 
-use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
@@ -18,6 +17,7 @@ use crate::agent_loop::tool_phase::{
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
     send_tool_phase_request,
 };
+use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::utils::text::truncate_by_chars;
 use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
@@ -101,7 +101,7 @@ pub async fn ask_in_session(
         chain_depth: 0,
         origin_id: String::new(),
         trace_id: String::new(),
-        is_secret: false,
+        scope: ConversationScope::Normal,
     };
 
     tokio::select! {
@@ -195,7 +195,7 @@ async fn process_turn_inner(
         session = %context.surface_thread,
         origin_id = %context.origin_id,
         chain_depth = context.chain_depth,
-        is_secret = context.is_secret,
+        scope = %context.scope,
     );
 
     async move {
@@ -219,7 +219,7 @@ async fn process_turn_inner(
             origin_id: context.origin_id.clone(),
             turn_sender: state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            is_secret: context.is_secret,
+            scope: context.scope,
         };
         let system_prompt = build_system_prompt(state, context);
         let channel_llm = state.llm_for_context(context).inspect_err(|e| {
@@ -295,7 +295,7 @@ async fn process_turn_inner(
                 log_scope: "agent_loop",
                 send_failure_log: "LLM send_message failed",
                 iteration,
-                is_secret: context.is_secret,
+                scope: context.scope,
             })
             .await?;
 
@@ -315,7 +315,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
-                                context.is_secret,
+                                context.scope,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -342,7 +342,7 @@ async fn process_turn_inner(
                         } => {
                             return persist_and_finalize(
                                 state,
-                                context.is_secret,
+                                context.scope,
                                 chat_id,
                                 &context.agent_id,
                                 &mut messages,
@@ -475,7 +475,7 @@ fn evaluate_malformed_response(
 #[allow(clippy::too_many_arguments)]
 async fn persist_and_finalize(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
     messages: &mut Arc<Vec<Message>>,
@@ -492,7 +492,7 @@ async fn persist_and_finalize(
 
     let _persisted = persist_phase(
         state,
-        is_secret,
+        scope,
         StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
         &updated,
@@ -520,7 +520,7 @@ async fn execute_and_persist_tools(
     let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
     let persisted = persist_tool_call_assistant_message(
         state,
-        tool_context.is_secret,
+        tool_context.scope,
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
@@ -543,7 +543,7 @@ async fn execute_and_persist_tools(
     let tool_result_phase = build_tool_result_phase(tool_outcomes);
     let persisted = persist_tool_result_messages(
         state,
-        tool_context.is_secret,
+        tool_context.scope,
         tool_context.chat_id,
         &tool_context.agent_id,
         messages,
@@ -560,7 +560,7 @@ async fn execute_and_persist_tools(
 #[allow(clippy::too_many_arguments)]
 async fn persist_tool_call_assistant_message(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
     assistant_message_id: &str,
@@ -573,7 +573,7 @@ async fn persist_tool_call_assistant_message(
 
     persist_phase(
         state,
-        is_secret,
+        scope,
         StoredMessage {
             id: assistant_message_id.to_string(),
             ..StoredMessage::assistant(
@@ -591,7 +591,7 @@ async fn persist_tool_call_assistant_message(
 
 async fn persist_tool_result_messages(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
     messages: Vec<Message>,
@@ -613,7 +613,7 @@ async fn persist_tool_result_messages(
     messages_with_tools.extend(tool_messages.iter().cloned());
     persist_phase_messages(
         state,
-        is_secret,
+        scope,
         StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview),
         tool_messages,
         &messages_with_tools,
@@ -636,7 +636,7 @@ async fn execute_tool_calls(
     for tool_call in &valid_tool_calls {
         store_pending_tool_call(
             state,
-            tool_context.is_secret,
+            tool_context.scope,
             tool_context.chat_id,
             assistant_message_id,
             tool_call,
@@ -674,7 +674,7 @@ async fn execute_tool_calls(
     for outcome in &outcomes {
         update_tool_call_output(
             state,
-            tool_context.is_secret,
+            tool_context.scope,
             tool_context.chat_id,
             assistant_message_id,
             &outcome.tool_call.id,
@@ -688,12 +688,12 @@ async fn execute_tool_calls(
 
 async fn store_pending_tool_call(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     message_id: &str,
     tool_call: &ToolCall,
 ) -> Result<(), EgoPulseError> {
-    if is_secret {
+    if scope == ConversationScope::Secret {
         return Ok(());
     }
     let record = StoredToolCall {
@@ -712,13 +712,13 @@ async fn store_pending_tool_call(
 
 async fn update_tool_call_output(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     message_id: &str,
     tool_call_id: &str,
     output: &str,
 ) -> Result<(), EgoPulseError> {
-    if is_secret {
+    if scope == ConversationScope::Secret {
         return Ok(());
     }
     let message_id = message_id.to_string();
@@ -740,7 +740,7 @@ async fn persist_user_turn_with_compaction(
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
 ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
-    let mut loaded = load_messages_for_turn(state, context.is_secret, chat_id).await?;
+    let mut loaded = load_messages_for_turn(state, context.scope, chat_id).await?;
     let stored_message = StoredMessage::user(
         chat_id,
         context.surface_user.clone(),
@@ -764,7 +764,7 @@ async fn persist_user_turn_with_compaction(
 
         let persist_result = persist_phase_once(
             state,
-            context.is_secret,
+            context.scope,
             stored_message.clone(),
             &candidate_messages,
             loaded.session_updated_at.clone(),
@@ -773,14 +773,9 @@ async fn persist_user_turn_with_compaction(
         let persisted = match persist_result {
             Ok(persisted) => persisted,
             Err(error) => {
-                loaded = handle_user_turn_persist_error(
-                    state,
-                    context.is_secret,
-                    chat_id,
-                    attempt,
-                    error,
-                )
-                .await?;
+                loaded =
+                    handle_user_turn_persist_error(state, context.scope, chat_id, attempt, error)
+                        .await?;
                 continue;
             }
         };
@@ -795,20 +790,20 @@ async fn persist_user_turn_with_compaction(
 
 async fn handle_user_turn_persist_error(
     state: &AppState,
-    is_secret: bool,
+    scope: ConversationScope,
     chat_id: i64,
     attempt: usize,
     error: EgoPulseError,
 ) -> Result<crate::agent_loop::session::LoadedSession, EgoPulseError> {
     match persist_phase_conflict_outcome(attempt, error) {
-        PersistConflictOutcome::Reload => load_messages_for_turn(state, is_secret, chat_id).await,
+        PersistConflictOutcome::Reload => load_messages_for_turn(state, scope, chat_id).await,
         PersistConflictOutcome::Return(error) => Err(error),
     }
 }
 
 async fn load_channel_context(state: &AppState, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
-    let messages = call_blocking(Arc::clone(state.db_for(context.is_secret)), move |db| {
+    let messages = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
         db.get_channel_log_messages(log_chat_id, CHANNEL_CONTEXT_LIMIT)
     })
     .await
@@ -1054,6 +1049,7 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
 
+    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
@@ -1374,7 +1370,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         }
     }
 
@@ -1619,7 +1615,7 @@ mod tests {
                     chain_depth: 0,
                     origin_id: String::new(),
                     trace_id: String::new(),
-                    is_secret: false,
+                    scope: ConversationScope::Normal,
                 },
             ),
         ];
@@ -1864,7 +1860,7 @@ mod tests {
     #[derive(Clone)]
     struct CapturedSpan {
         trace_id: String,
-        is_secret: bool,
+        scope: String,
     }
 
     #[derive(Clone)]
@@ -1895,19 +1891,15 @@ mod tests {
 
     struct FieldVisitor {
         trace_id: Option<String>,
-        is_secret: bool,
+        scope: Option<String>,
     }
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "trace_id" {
-                self.trace_id = Some(format!("{value:?}"));
-            }
-        }
-
-        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-            if field.name() == "is_secret" {
-                self.is_secret = value;
+            match field.name() {
+                "trace_id" => self.trace_id = Some(format!("{value:?}")),
+                "scope" => self.scope = Some(format!("{value:?}")),
+                _ => {}
             }
         }
     }
@@ -1927,13 +1919,13 @@ mod tests {
             }
             let mut visitor = FieldVisitor {
                 trace_id: None,
-                is_secret: false,
+                scope: None,
             };
             attrs.record(&mut visitor);
             if let Some(trace_id) = visitor.trace_id {
                 self.spans.lock().expect("spans").push(CapturedSpan {
                     trace_id,
-                    is_secret: visitor.is_secret,
+                    scope: visitor.scope.unwrap_or_default(),
                 });
             }
         }
@@ -2094,7 +2086,7 @@ mod tests {
         ));
 
         let mut context = cli_context("secret-span-test");
-        context.is_secret = true;
+        context.scope = ConversationScope::Secret;
         context.trace_id = uuid::Uuid::new_v4().to_string();
 
         let capture = SpanCapture::new();
@@ -2107,12 +2099,15 @@ mod tests {
         assert_eq!(reply, "secret reply");
         let spans = capture.captured_spans();
         assert_eq!(spans.len(), 1, "exactly one agent_turn span");
-        assert!(spans[0].is_secret, "is_secret must be true for secret turn");
+        assert_eq!(
+            spans[0].scope, "secret",
+            "scope must be 'secret' for secret turn"
+        );
     }
 
     #[tokio::test]
     #[serial]
-    async fn normal_turn_span_includes_is_secret_false() {
+    async fn normal_turn_span_includes_normal_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -2141,9 +2136,9 @@ mod tests {
         assert_eq!(reply, "normal reply");
         let spans = capture.captured_spans();
         assert_eq!(spans.len(), 1, "exactly one agent_turn span");
-        assert!(
-            !spans[0].is_secret,
-            "is_secret must be false for non-secret turn"
+        assert_eq!(
+            spans[0].scope, "normal",
+            "scope must be 'normal' for non-secret turn"
         );
     }
 
@@ -2172,7 +2167,7 @@ mod tests {
         ));
 
         let mut context = cli_context("secret-routing");
-        context.is_secret = true;
+        context.scope = ConversationScope::Secret;
 
         let chat_id = crate::agent_loop::session::resolve_chat_id(&state, &context)
             .await
@@ -2230,7 +2225,7 @@ mod tests {
         ));
 
         let mut context = cli_context("secret-db-isolation");
-        context.is_secret = true;
+        context.scope = ConversationScope::Secret;
 
         let reply = process_turn(&state, &context, "top secret")
             .await

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::agent_loop::ConversationScope;
 use crate::channels::adapter::ChannelRegistry;
 use crate::error::StorageError;
 use crate::llm::ToolDefinition;
@@ -44,13 +45,13 @@ impl SendMessageTool {
         }
     }
 
-    fn db_for(&self, is_secret: bool) -> &Arc<Database> {
-        if is_secret {
-            self.secret_db
+    fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+        match scope {
+            ConversationScope::Normal => &self.db,
+            ConversationScope::Secret => self
+                .secret_db
                 .as_ref()
-                .expect("secret db required for secret mode send_message")
-        } else {
-            &self.db
+                .expect("secret db required for secret mode send_message"),
         }
     }
 }
@@ -115,9 +116,7 @@ impl Tool for SendMessageTool {
         }
 
         let chat_info =
-            match lookup_chat_info(Arc::clone(self.db_for(context.is_secret)), context.chat_id)
-                .await
-            {
+            match lookup_chat_info(Arc::clone(self.db_for(context.scope)), context.chat_id).await {
                 Ok(Some(info)) => info,
                 Ok(None) => {
                     return ToolResult::error(format!(

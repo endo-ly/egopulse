@@ -48,6 +48,28 @@ impl ScheduledTurn {
     }
 }
 
+/// The storage boundary a conversation belongs to.
+///
+/// Determines which database and archive root are used for persistence.
+/// `Normal` routes to the primary `egopulse.db`; `Secret` routes to the
+/// isolated `secret.db` and `secret_groups` archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationScope {
+    /// Default scope — persists to `egopulse.db` and `runtime/groups`.
+    Normal,
+    /// Secret scope — persists to `secret.db` and `runtime/secret_groups`.
+    Secret,
+}
+
+impl std::fmt::Display for ConversationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal => write!(f, "normal"),
+            Self::Secret => write!(f, "secret"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Identifies the external conversation surface mapped to a persisted session.
 pub(crate) struct SurfaceContext {
@@ -67,9 +89,8 @@ pub(crate) struct SurfaceContext {
     /// Trace ID for observability: UUID correlating all log events within a single turn.
     /// Generated in `execute_scheduled_turn` and propagated through the turn lifecycle.
     pub trace_id: String,
-    /// Whether this turn originates from a secret channel.
-    /// When `true`, all DB access routes to `secret.db` instead of `egopulse.db`.
-    pub is_secret: bool,
+    /// Storage scope for this conversation surface.
+    pub scope: ConversationScope,
 }
 
 impl SurfaceContext {
@@ -91,7 +112,7 @@ impl SurfaceContext {
             chain_depth: 0,
             origin_id: String::new(),
             trace_id: String::new(),
-            is_secret: false,
+            scope: ConversationScope::Normal,
         }
     }
 
@@ -180,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_context_defaults_is_secret_to_false() {
+    fn surface_context_defaults_to_normal_scope() {
         let ctx = SurfaceContext::new(
             "discord".to_string(),
             "user".to_string(),
@@ -188,6 +209,6 @@ mod tests {
             "discord".to_string(),
             "default".to_string(),
         );
-        assert!(!ctx.is_secret);
+        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 }
