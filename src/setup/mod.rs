@@ -9,6 +9,7 @@ pub(crate) mod prompts;
 mod provider;
 pub(crate) mod slugify;
 mod summary;
+pub(crate) mod wizard;
 
 use std::collections::HashMap;
 use std::fs;
