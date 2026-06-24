@@ -327,7 +327,7 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + input queue による同時実行制御 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
-| **Conversation Scope Routing** | `runtime/` AppState | `ConversationScope`（`Normal` | `Secret`）で DB・archive のストレージ境界を一意に決定。`db_for(scope)` / `storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+| **Conversation Scope Routing** | `runtime/` AppState | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`db_for(scope)` / `storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
 
 ---
 
