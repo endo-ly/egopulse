@@ -4,6 +4,7 @@
 //! `egopulse.config.yaml` を生成・更新する。
 
 mod channels;
+pub(crate) mod inputs;
 mod provider;
 pub(crate) mod slugify;
 mod summary;
