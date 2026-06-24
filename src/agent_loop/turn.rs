@@ -21,7 +21,7 @@ use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::utils::text::truncate_by_chars;
 use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
-use crate::llm::{Message, ToolCall};
+use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
 use crate::runtime::{AppState, build_app_state};
 use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
 use crate::tools::ToolExecutionContext;
@@ -82,6 +82,59 @@ enum TurnAction {
         final_content: String,
         reasoning_content: Option<String>,
     },
+}
+
+enum PhaseOutcome {
+    Continue,
+    ToolsExecuted,
+    Finished(String),
+}
+
+struct PreparedTurn {
+    chat_id: i64,
+    tool_context: ToolExecutionContext,
+    system_prompt: String,
+    channel_llm: Arc<dyn LlmProvider>,
+    tool_defs: Arc<Vec<ToolDefinition>>,
+    tools_json: Option<String>,
+    user_message: Message,
+}
+
+struct TurnLoopState {
+    messages: Arc<Vec<Message>>,
+    session_updated_at: Option<String>,
+    retry_messages: Option<Arc<Vec<Message>>>,
+    empty_reply_retry_attempted: bool,
+    declarative_retry_attempted: bool,
+}
+
+impl TurnLoopState {
+    fn new(messages: Arc<Vec<Message>>, session_updated_at: Option<String>) -> Self {
+        Self {
+            messages,
+            session_updated_at,
+            retry_messages: None,
+            empty_reply_retry_attempted: false,
+            declarative_retry_attempted: false,
+        }
+    }
+
+    fn request_messages(&mut self) -> Arc<Vec<Message>> {
+        self.retry_messages
+            .take()
+            .unwrap_or_else(|| Arc::clone(&self.messages))
+    }
+
+    fn reset_retry_guards_after_tool_phase(&mut self) {
+        self.empty_reply_retry_attempted = false;
+        self.declarative_retry_attempted = false;
+    }
+}
+
+struct TurnExecutor<'a> {
+    state: &'a AppState,
+    context: &'a SurfaceContext,
+    on_event: EventEmitter,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -175,214 +228,200 @@ async fn process_turn_inner(
     user_input: &str,
     on_event: EventEmitter,
 ) -> Result<String, EgoPulseError> {
-    state.active_turns.begin_turn(&context.agent_id);
-    crate::runtime::metrics::inc_turns_total(&context.agent_id, &context.channel);
-    let _guard = ActiveTurnGuard {
+    let executor = TurnExecutor {
         state,
-        agent_id: &context.agent_id,
+        context,
+        on_event,
     };
 
-    let trace_id = if context.trace_id.is_empty() {
-        uuid::Uuid::new_v4().to_string()
-    } else {
-        context.trace_id.clone()
-    };
-    let span = tracing::info_span!(
-        "agent_turn",
-        trace_id = %trace_id,
-        agent_id = %context.agent_id,
-        channel = %context.channel,
-        session = %context.surface_thread,
-        origin_id = %context.origin_id,
-        chain_depth = context.chain_depth,
-        scope = %context.scope,
-    );
+    executor.run(user_input).await
+}
 
-    async move {
-        let chat_id = resolve_chat_id(state, context).await.inspect_err(|e| {
-            warn!(
-                error_kind = e.error_kind(),
-                error = %e,
-                channel = context.channel,
-                surface_thread = context.surface_thread,
-                "resolve_chat_id failed"
-            );
-        })?;
+impl TurnExecutor<'_> {
+    async fn run(&self, user_input: &str) -> Result<String, EgoPulseError> {
+        self.state.active_turns.begin_turn(&self.context.agent_id);
+        crate::runtime::metrics::inc_turns_total(&self.context.agent_id, &self.context.channel);
+        let _guard = ActiveTurnGuard {
+            state: self.state,
+            agent_id: &self.context.agent_id,
+        };
+
+        let span = self.turn_span();
+
+        async move {
+            // 段階1: セッションを変更する前に、このターンで使う依存を解決する。
+            let prepared = self.prepare_turn(user_input).await?;
+            let prompt_ctx = PromptContext {
+                system_prompt: &prepared.system_prompt,
+                tools_json: prepared.tools_json.as_deref(),
+            };
+
+            // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
+            let (messages, session_updated_at) = self
+                .persist_user_input(&prepared, user_input, &prompt_ctx)
+                .await?;
+
+            // 段階3: 一時的なチャネル背景情報を、保存済みセッションとは別に読み込む。
+            let channel_context_msg = load_channel_context(self.state, self.context).await;
+
+            // 段階4: 最終応答が得られるまで、LLM 呼び出しとツール実行を反復する。
+            self.run_model_loop(
+                &prepared,
+                &prompt_ctx,
+                channel_context_msg,
+                messages,
+                session_updated_at,
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    fn turn_span(&self) -> tracing::Span {
+        let trace_id = if self.context.trace_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            self.context.trace_id.clone()
+        };
+
+        tracing::info_span!(
+            "agent_turn",
+            trace_id = %trace_id,
+            agent_id = %self.context.agent_id,
+            channel = %self.context.channel,
+            session = %self.context.surface_thread,
+            origin_id = %self.context.origin_id,
+            chain_depth = self.context.chain_depth,
+            scope = %self.context.scope,
+        )
+    }
+
+    async fn prepare_turn(&self, user_input: &str) -> Result<PreparedTurn, EgoPulseError> {
+        let chat_id = resolve_chat_id(self.state, self.context)
+            .await
+            .inspect_err(|e| {
+                warn!(
+                    error_kind = e.error_kind(),
+                    error = %e,
+                    channel = self.context.channel,
+                    surface_thread = self.context.surface_thread,
+                    "resolve_chat_id failed"
+                );
+            })?;
         let tool_context = ToolExecutionContext {
             chat_id,
-            channel: context.channel.clone(),
-            surface_thread: context.surface_thread.clone(),
-            chat_type: context.chat_type.clone(),
-            agent_id: context.agent_id.clone(),
-            channel_log_chat_id: context.channel_log_chat_id,
-            chain_depth: context.chain_depth,
-            origin_id: context.origin_id.clone(),
-            turn_sender: state.turn_sender.clone(),
+            channel: self.context.channel.clone(),
+            surface_thread: self.context.surface_thread.clone(),
+            chat_type: self.context.chat_type.clone(),
+            agent_id: self.context.agent_id.clone(),
+            channel_log_chat_id: self.context.channel_log_chat_id,
+            chain_depth: self.context.chain_depth,
+            origin_id: self.context.origin_id.clone(),
+            turn_sender: self.state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            scope: context.scope,
+            scope: self.context.scope,
         };
-        let system_prompt = build_system_prompt(state, context);
-        let channel_llm = state.llm_for_context(context).inspect_err(|e| {
+        let system_prompt = build_system_prompt(self.state, self.context);
+        let channel_llm = self.state.llm_for_context(self.context).inspect_err(|e| {
             warn!(
                 error_kind = e.error_kind(),
                 error = %e,
-                channel = context.channel,
+                channel = self.context.channel,
                 "llm_for_context failed"
             );
         })?;
 
         let timestamp_line = format!(
             "[Current time: {}]\n",
-            format_current_time(&state.config.timezone)
+            format_current_time(&self.state.config.timezone)
         );
         let user_message = Message::text("user", format!("{timestamp_line}{user_input}"));
 
-        let tool_defs = state.tools.definitions_async().await;
+        let tool_defs = self.state.tools.definitions_async().await;
         let tools_json = serde_json::to_string(&tool_defs).ok();
-        let prompt_ctx = PromptContext {
-            system_prompt: &system_prompt,
-            tools_json: tools_json.as_deref(),
-        };
 
-        let (messages, mut session_updated_at) = persist_user_turn_with_compaction(
-            state,
-            context,
+        Ok(PreparedTurn {
             chat_id,
-            &user_message,
+            tool_context,
+            system_prompt,
+            channel_llm,
+            tool_defs,
+            tools_json,
+            user_message,
+        })
+    }
+
+    async fn persist_user_input(
+        &self,
+        prepared: &PreparedTurn,
+        user_input: &str,
+        prompt_ctx: &PromptContext<'_>,
+    ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
+        persist_user_turn_with_compaction(
+            self.state,
+            self.context,
+            prepared.chat_id,
+            &prepared.user_message,
             user_input,
-            &channel_llm,
-            &prompt_ctx,
+            &prepared.channel_llm,
+            prompt_ctx,
         )
-        .await?;
+        .await
+    }
 
-        // Load Channel Context for multi-agent rooms (temporary injection)
-        let channel_context_msg = load_channel_context(state, context).await;
-
-        // LLM → tool execution → tool result feedback を 1 反復として回し、
-        // tool_calls が空になるまで続ける。
-        // 「宣言だけして終わる」「空応答」「壊れた tool call」に耐性を持たせる。
-        let mut empty_reply_retry_attempted = false;
-        let mut declarative_retry_attempted = false;
-        let mut retry_messages: Option<Arc<Vec<Message>>> = None;
-        let mut messages = messages;
-
+    async fn run_model_loop(
+        &self,
+        prepared: &PreparedTurn,
+        prompt_ctx: &PromptContext<'_>,
+        channel_context_msg: Option<Message>,
+        messages: Arc<Vec<Message>>,
+        session_updated_at: Option<String>,
+    ) -> Result<String, EgoPulseError> {
+        let mut loop_state = TurnLoopState::new(messages, session_updated_at);
         for iteration in 1..=MAX_TOOL_ITERATIONS {
-            on_event.emit(AgentEvent::Iteration { iteration });
-            let mut request_messages = retry_messages
-                .take()
-                .unwrap_or_else(|| Arc::clone(&messages));
-
-            // Inject Channel Context temporarily before LLM call
-            if iteration == 1 {
-                if let Some(ref ctx_msg) = channel_context_msg {
-                    let mut msgs =
-                        Arc::try_unwrap(request_messages).unwrap_or_else(|arc| (*arc).clone());
-                    msgs.insert(0, ctx_msg.clone());
-                    request_messages = Arc::new(msgs);
-                }
-            }
+            self.on_event.emit(AgentEvent::Iteration { iteration });
+            let request_messages =
+                request_messages_for_iteration(&mut loop_state, iteration, &channel_context_msg);
 
             let phase_response = send_tool_phase_request(ToolPhaseRequest {
-                state,
-                llm: channel_llm.as_ref(),
-                system_prompt: &system_prompt,
+                state: self.state,
+                llm: prepared.channel_llm.as_ref(),
+                system_prompt: &prepared.system_prompt,
                 messages: request_messages,
-                tools: Some(Arc::clone(&tool_defs)),
-                chat_id,
-                caller_channel: &context.channel,
+                tools: Some(Arc::clone(&prepared.tool_defs)),
+                chat_id: prepared.chat_id,
+                caller_channel: &self.context.channel,
                 request_kind: "agent_loop",
                 usage_log_failure: "llm usage logging failed",
                 log_scope: "agent_loop",
                 send_failure_log: "LLM send_message failed",
                 iteration,
-                scope: context.scope,
+                scope: self.context.scope,
             })
             .await?;
 
-            match phase_response {
-                ToolPhaseResponse::Final(response) => {
-                    match evaluate_end_turn(
-                        &response.content,
-                        response.reasoning_content.as_deref(),
-                        &mut empty_reply_retry_attempted,
-                        &mut declarative_retry_attempted,
-                        &messages,
-                    )? {
-                        TurnAction::Retry(msgs) => retry_messages = msgs,
-                        TurnAction::Done {
-                            final_content,
-                            reasoning_content,
-                        } => {
-                            return persist_and_finalize(
-                                state,
-                                context.scope,
-                                chat_id,
-                                &context.agent_id,
-                                &mut messages,
-                                session_updated_at.clone(),
-                                &on_event,
-                                (final_content, reasoning_content),
-                            )
-                            .await;
-                        }
-                    }
-                    continue;
-                }
-                ToolPhaseResponse::MalformedToolCalls(response) => {
-                    match evaluate_malformed_response(
-                        &response.content,
-                        response.reasoning_content.as_deref(),
-                        &mut declarative_retry_attempted,
-                        &messages,
-                    )? {
-                        TurnAction::Retry(msgs) => retry_messages = msgs,
-                        TurnAction::Done {
-                            final_content,
-                            reasoning_content,
-                        } => {
-                            return persist_and_finalize(
-                                state,
-                                context.scope,
-                                chat_id,
-                                &context.agent_id,
-                                &mut messages,
-                                session_updated_at.clone(),
-                                &on_event,
-                                (final_content, reasoning_content),
-                            )
-                            .await;
-                        }
-                    }
-                    continue;
-                }
-                ToolPhaseResponse::ToolCalls(assistant_phase) => {
-                    let (updated_messages, updated_at) = execute_and_persist_tools(
-                        state,
-                        &on_event,
-                        &tool_context,
-                        messages,
-                        session_updated_at,
-                        assistant_phase,
-                    )
-                    .await?;
-                    messages = updated_messages;
-                    session_updated_at = updated_at;
-                }
+            match self
+                .handle_phase_response(prepared, &mut loop_state, phase_response)
+                .await?
+            {
+                PhaseOutcome::Continue => continue,
+                PhaseOutcome::Finished(response) => return Ok(response),
+                PhaseOutcome::ToolsExecuted => {}
             }
-            empty_reply_retry_attempted = false;
-            declarative_retry_attempted = false;
 
+            loop_state.reset_retry_guards_after_tool_phase();
             if let Ok(compacted) = maybe_compact_messages(
-                state,
-                context,
-                chat_id,
-                &messages,
-                &channel_llm,
-                &prompt_ctx,
+                self.state,
+                self.context,
+                prepared.chat_id,
+                &loop_state.messages,
+                &prepared.channel_llm,
+                prompt_ctx,
             )
             .await
             {
-                messages = Arc::new(compacted);
+                loop_state.messages = Arc::new(compacted);
             }
         }
 
@@ -390,8 +429,106 @@ async fn process_turn_inner(
             "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
         )))
     }
-    .instrument(span)
-    .await
+
+    async fn handle_phase_response(
+        &self,
+        prepared: &PreparedTurn,
+        loop_state: &mut TurnLoopState,
+        phase_response: ToolPhaseResponse,
+    ) -> Result<PhaseOutcome, EgoPulseError> {
+        match phase_response {
+            ToolPhaseResponse::Final(response) => {
+                match evaluate_end_turn(
+                    &response.content,
+                    response.reasoning_content.as_deref(),
+                    &mut loop_state.empty_reply_retry_attempted,
+                    &mut loop_state.declarative_retry_attempted,
+                    &loop_state.messages,
+                )? {
+                    TurnAction::Retry(msgs) => loop_state.retry_messages = msgs,
+                    TurnAction::Done {
+                        final_content,
+                        reasoning_content,
+                    } => {
+                        return self
+                            .finish_turn(prepared, loop_state, final_content, reasoning_content)
+                            .await;
+                    }
+                }
+                Ok(PhaseOutcome::Continue)
+            }
+            ToolPhaseResponse::MalformedToolCalls(response) => {
+                match evaluate_malformed_response(
+                    &response.content,
+                    response.reasoning_content.as_deref(),
+                    &mut loop_state.declarative_retry_attempted,
+                    &loop_state.messages,
+                )? {
+                    TurnAction::Retry(msgs) => loop_state.retry_messages = msgs,
+                    TurnAction::Done {
+                        final_content,
+                        reasoning_content,
+                    } => {
+                        return self
+                            .finish_turn(prepared, loop_state, final_content, reasoning_content)
+                            .await;
+                    }
+                }
+                Ok(PhaseOutcome::Continue)
+            }
+            ToolPhaseResponse::ToolCalls(assistant_phase) => {
+                let (updated_messages, updated_at) = execute_and_persist_tools(
+                    self.state,
+                    &self.on_event,
+                    &prepared.tool_context,
+                    Arc::clone(&loop_state.messages),
+                    loop_state.session_updated_at.clone(),
+                    assistant_phase,
+                )
+                .await?;
+                loop_state.messages = updated_messages;
+                loop_state.session_updated_at = updated_at;
+                Ok(PhaseOutcome::ToolsExecuted)
+            }
+        }
+    }
+
+    async fn finish_turn(
+        &self,
+        prepared: &PreparedTurn,
+        loop_state: &mut TurnLoopState,
+        final_content: String,
+        reasoning_content: Option<String>,
+    ) -> Result<PhaseOutcome, EgoPulseError> {
+        let response = persist_and_finalize(
+            self.state,
+            self.context.scope,
+            prepared.chat_id,
+            &self.context.agent_id,
+            &mut loop_state.messages,
+            loop_state.session_updated_at.clone(),
+            &self.on_event,
+            (final_content, reasoning_content),
+        )
+        .await?;
+        Ok(PhaseOutcome::Finished(response))
+    }
+}
+
+fn request_messages_for_iteration(
+    loop_state: &mut TurnLoopState,
+    iteration: usize,
+    channel_context_msg: &Option<Message>,
+) -> Arc<Vec<Message>> {
+    let mut request_messages = loop_state.request_messages();
+    if iteration == 1 {
+        if let Some(ctx_msg) = channel_context_msg {
+            let mut msgs = Arc::try_unwrap(request_messages).unwrap_or_else(|arc| (*arc).clone());
+            msgs.insert(0, ctx_msg.clone());
+            request_messages = Arc::new(msgs);
+        }
+    }
+    request_messages
 }
 
 fn evaluate_end_turn(
