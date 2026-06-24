@@ -617,32 +617,162 @@ SecretRef 解決は以下の 2 層で構成される。
 
 ## 7. セットアップウィザード
 
-`egopulse setup` で起動する対話型 TUI ウィザード。
-プロバイダープリセットから選択し、必要に応じて Discord / Telegram Bot を設定する。
+`egopulse setup` で起動する対話型設定プロンプト（dialoguer ベースのチャットライク順次プロンプト）。
+Agent-First 設計に基づき、エージェント名を最初に問い、LLM と対話するために必要な最小限の項目のみを順次収集する。
 
-### 設定可能項目
+> 設計の背景・方針・経緯は [setup-redesign.md](./setup-redesign.md) を参照。コマンド仕様は [commands.md §1.1](./commands.md#1-cli-サブコマンド) を参照。
 
-| 項目 | 必須 | 備考 |
-|------|:---:|------|
-| プロバイダー選択（25 プリセットから選択） | **必須** | `PROVIDER` → `BASE_URL` → `MODEL` の順に連動入力 |
-| API キー | 条件付き | localhost 系（Ollama, LMStudio）では不要 |
-| Discord Bot トークン | 任意 | Discord 有効時は必須 |
-| Telegram Bot トークン・ユーザー名 | 任意 | Telegram 有効時は必須 |
+### 7.1 フロー全体像
 
-### 動作
+```text
+[Welcome]
+   │
+   ▼
+[既存設定の読み込み]  ── パースエラー時は警告 + Y/N 確認
+   │
+   ▼
+[Q1: Agent Label]       エージェント名 (text)
+   │
+   ▼
+[Q2: Provider]          26 プリセット + Custom (select)
+   │                     Custom 選択時のみ base_url 入力を追加
+   ▼
+[Q3: Model]             preset なら select / Custom なら text
+   │
+   ▼
+[Q4: API Key]           password。空欄可、非 localhost 系の空欄は Y/N 確認
+   │
+   ▼
+[Q5: Web Channel]       Y/n（デフォルト yes）
+   │
+   ▼
+[Q6: Discord]           y/N ── yes のみ Bot Token 入力
+   │
+   ▼
+[Q7: Telegram]          y/N ── yes のみ Bot Token 入力
+   │
+   ▼
+[Review]                生成内容表示 + Save? (Y/n)
+   │                     no の場合は StartOver / Abort / SaveAnyway の 3 択
+   ▼
+[Save]                  YAML + .env 永続化（上書き前にバックアップ）
+   │
+   ▼
+[Additional Options]    設定対象外項目の案内（情報表示のみ）
+   │
+   ▼
+[Done]                  保存先・次ステップ・チャネル案内
+```
 
-- Web チャネルは常に有効化。`auth_token` は自動生成される
-- 秘匿値は YAML に SecretRef、実値は `.env` に保存
-- 既存設定ファイルは上書き前にバックアップ
-- 単一プロバイダーのみ生成（複数追加は手動編集）
+### 7.2 入力項目仕様（Q1〜Q7）
 
-### ウィザードで設定できないフィールド
+| Q | 項目 | 入力種別 | 必須 | デフォルト | 備考 |
+|---|---|---|:---:|---|---|
+| Q1 | Agent Label | text | ○ | なし | エージェントの表示名。空入力時は `"Default"` にフォールバック |
+| — | Agent ID | (自動) | — | label を slugify | lowercase + 英数字以外をハイフン化 + 連続ハイフン圧縮。空結果は `"default"` にフォールバック |
+| Q2 | Provider | select | ○ | なし | 26 プリセット（[§5](#5-プロバイダープリセット)）+ `Custom` |
+| Q2' | base_url | text | 条件付き | なし | `Custom` 選択時のみ追加質問。URL 検証あり |
+| Q3 | Model | select / text | ○ | preset の `default_model` | preset 選択時は select、`Custom` 選択時は text |
+| Q4 | API Key | password | △ | 空文字 | 常に入力ステップを表示。localhost 系は空欄でそのまま通す |
+| Q5 | Web Channel | confirm | — | `yes` | 無効時は `channels.web` エントリ自体を YAML に含めない |
+| — | Web auth_token | (自動) | — | `generate_auth_token()` | ユーザー入力なし。実値は Review / Done で非表示 |
+| Q6 | Discord | confirm | — | `no` | `yes` のみ Bot Token 入力 (password) へ分岐 |
+| Q7 | Telegram | confirm | — | `no` | `yes` のみ Bot Token 入力 (password) へ分岐 |
 
-- `log_level`, `compaction_*`, `max_*`, `default_context_window_tokens`
-- `channels.web.host`, `channels.web.port`, `channels.web.allowed_origins`
-- `channels.voice.*`
-- チャネル別アクセス制御（`channels`, `chats`）
-- 複数プロバイダーの追加
+各質問の分岐仕様:
+
+- **Q2 Provider**: `Custom` 選択時のみ直後に base_url 入力を追加。preset 選択時は base_url を preset のデフォルトで自動補完
+- **Q3 Model**: preset 選択時は `models` リストからの select（リスト外は選択不可）。`Custom` 選択時は手入力 text モードに切替
+- **Q4 API Key**: ステップ自体は常に表示。非 localhost 系プロバイダで空欄入力時は `Proceed with an empty key? (y/N)` で確認。`no` で再入力、`yes` で警告付きで進行
+- **Q6 / Q7**: `yes` の場合のみ Bot Token (password 入力) を追加質問。空トークンは拒否
+
+### 7.3 Review（保存確認）
+
+収集した入力から生成される設定内容を表示し、保存確認を行う。
+
+```text
+About to save the configuration file with the following values:
+
+  Agent:    Partner (id: partner)
+  Provider: openai (https://api.openai.com/v1)
+  Model:    gpt-5.2
+  API Key:  sk-...xxxx
+  Web:      enabled (auth_token: auto-generated, saved to .env)
+  Discord:  disabled
+  Telegram: disabled
+
+Save? (Y/n)
+```
+
+- API Key は先頭 3 文字 + `...` + 末尾 4 文字でマスク。空欄時は `(empty)`
+- `Save?` で `no` の場合は 3 択を提示:
+
+| 選択肢 | 動作 |
+|---|---|
+| Start over (back to Agent Label) | Q1 に戻り入力をやり直す |
+| Abort (exit without saving) | 保存せずに終了（exit code 1） |
+| Save anyway | 警告を了承の上、保存へ進む |
+
+### 7.4 Additional Options（設定対象外項目の案内）
+
+保存完了後、セットアップで設定しなかったが YAML 編集で設定可能な項目をカテゴリ別に案内する。入力は受け付けず、Enter で次へ進む情報表示のみ。
+
+| カテゴリ | 案内項目 |
+|---|---|
+| System | `timezone` / `log_level` / `default_context_window_tokens` / `compaction_*` / `max_history_messages` |
+| Web UI | `channels.web.host` / `channels.web.port` / `channels.web.allowed_origins` |
+| Channels | 追加プロバイダー・エージェント / Discord・Telegram チャネルアクセス制御 / Voice チャネル / エージェント別人格 (`SOUL.md`) |
+| Subsystems | `sleep_batch` / `pulse` / `db.backup` / `web_fetch` |
+
+詳細は `docs/config.md`（本ドキュメント）および [channels.md](./channels.md) へ誘導。
+
+### 7.5 Done（完了メッセージ）
+
+保存完了時に以下を出力する。
+
+- **保存先**: `~/.egopulse/egopulse.config.yaml`
+- **バックアップ**: 既存設定があった場合のみバックアップファイルパスを表示
+- **次ステップ**:
+
+| アクション | コマンド |
+|---|---|
+| すぐチャット開始 | `egopulse chat` |
+| systemd サービス登録 | `egopulse gateway install` |
+| 設定編集 | `~/.egopulse/egopulse.config.yaml` |
+| エージェント追加 | YAML の `agents` セクション編集 |
+
+- **Web UI 有効時**: アクセス URL (`http://127.0.0.1:10961`) とトークン参照先 (`~/.egopulse/.env` の `WEB_AUTH_TOKEN`)
+- **Discord / Telegram 有効時**: DM は即利用可能、サーバー / グループ応答には YAML へのチャネル ID 追加が必要（[channels.md](./channels.md) 参照）
+
+API Key / トークン類の**実値は表示しない**（セキュリティ）。
+
+### 7.6 既存設定の再編集（prefill）
+
+`egopulse setup` を既存設定が存在する状態で実行した場合、各 Q のプロンプトは既存値をデフォルトとして事前入力する。Enter で進めば既存値を維持、入力し直せば上書き。
+
+| Q | 事前入力される値 |
+|---|---|
+| Q1 Agent Label | 既存 `agents.<default_agent>.label`（無ければ空） |
+| Q2 / Q2' | 既存 `default_provider`（preset 非一致なら `Custom` 扱いで base_url も事前入力） |
+| Q3 Model | 既存 `providers.<id>.default_model` |
+| Q4 API Key | 既存 `.env` から解決した `api_key`（解決不能なら空） |
+| Q5 Web | 既存 `channels.web.enabled`（無ければ `yes`） |
+| Q6 Discord | 既存 `channels.discord.enabled` |
+| Q7 Telegram | 既存 `channels.telegram.enabled` |
+
+既存 YAML のパースエラー時は Q1 の前に警告表示 + `Continue with empty defaults? (y/N)` で確認する（黙殺は廃止）。`WEB_AUTH_TOKEN` と `state_root` は事前入力対象外だが上書きされない。
+
+### 7.7 生成される YAML 構造
+
+- `default_agent`: Q1 で生成した agent id
+- `default_provider`: Q2 で選んだ provider id
+- `agents.<id>.label`: Q1 の入力値
+- `providers.<id>`: Q2 / Q3 / Q4 の値（label, base_url, api_key, default_model, models）
+- `channels.web`: Q5 の結果。`yes` の場合は `enabled / host=127.0.0.1 / port=10961 / auth_token` を保存。`no` の場合はエントリ自体を含めない
+- `channels.discord`: Q6 の結果（enabled, `bots.default.token`）
+- `channels.telegram`: Q7 の結果（enabled, `bots.default.token`）
+- 秘匿値は `~/.egopulse/.env` に書き出し、YAML には SecretRef で参照（[§4](#4-secretrefシークレット参照) 参照）
+- 単一プロバイダー・単一エージェントのみ生成（複数追加は手動 YAML 編集）
 
 ---
 
@@ -653,7 +783,7 @@ SecretRef 解決は以下の 2 層で構成される。
 | インターフェース | 読み取り | 書き込み | 対象 |
 |---------|:---:|:---:|------|
 | YAML 手動編集 | 全フィールド | 全フィールド | `~/.egopulse/egopulse.config.yaml` |
-| Setup Wizard | — | プロバイダー、Bot トークン | 初回セットアップ |
+| Setup Prompt (`egopulse setup`) | — | エージェント・プロバイダー・モデル・チャネル | 初回セットアップ・再設定 ([§7](#7-セットアップウィザード)) |
 | WebUI (`/api/config`) | 公開フィールド | 公開フィールド | ランタイム中の設定変更 |
 | スラッシュコマンド (`/provider`, `/model`) | ○ | ○ | プロバイダー・モデルの動的切替 |
 

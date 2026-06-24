@@ -1,7 +1,7 @@
 # Setup Wizard Refresh (設計メモ)
 
-> **Status**: 設計段階 (未実装)
-> **Date**: 2026-06-22
+> **Status**: 実装済み
+> **Date**: 2026-06-24
 > **関連**: [commands.md §1.1](./commands.md) `egopulse setup` / [config.md §7](./config.md#7-セットアップウィザード)
 
 ## 目次
@@ -92,7 +92,7 @@
    ↓
 [Q1: Agent Label]  ── Agent-First のため最初に聞く
    ↓
-[Q2: Provider]  ── 25 presets から選択
+[Q2: Provider]  ── 26 presets から選択
    ↓ (Custom 選択時のみ base_url 追加質問)
 [Q3: Model]  ── preset から選択 / Custom 時は手入力
    ↓
@@ -142,7 +142,7 @@ Choose the LLM provider for {Agent Label} (arrow keys to move, Enter to confirm)
   OpenRouter
   DeepSeek
   Ollama (local)
-  ... (25 presets)
+  ... (26 presets)
   Custom
 ```
 
@@ -333,7 +333,7 @@ If Discord or Telegram is enabled:
 
 | Q | 項目 | 必須 | デフォルト | バリデーション |
 |---|---|:---:|---|---|
-| 1 | Agent Label | ○ | なし | 空文字拒否、表示名として妥当な長さ (1〜64 文字程度) |
+| 1 | Agent Label | ○ | なし | 空入力時は `"Default"` (prefill なし) または既存デフォルト値にフォールバック。表示名として妥当な長さ (1〜64 文字程度) |
 | 1' | Agent ID | (自動) | label を自前 slugify | 英数字・ハイフンのみ、連続ハイフン圧縮、空結果拒否 (フォールバックで `"default"`) |
 | 2 | Provider | ○ | なし | `PROVIDER_PRESETS` いずれか、または `Custom` |
 | 2' | base_url | 条件付き | なし | Custom 選択時のみ Q2 の直後に聞く。`url::Url::parse` で検証、再入力 |
@@ -458,8 +458,8 @@ If Discord or Telegram is enabled:
 
 ### 8.2 docs 整備
 
-本リフレッシュ実装完了後に以下を更新する:
+本リフレッシュ実装完了に伴い、以下を更新済み:
 
-- `docs/commands.md §1.1` — `egopulse setup` 行の説明を「対話型設定プロンプト」へ
+- `docs/commands.md §1.1` — `egopulse setup` 行の説明を「対話型設定プロンプト (dialoguer)」へ
 - `docs/config.md §7` — 「セットアップウィザード」節を新仕様へ全面書き換え
-- `README.md` — Getting Started の `egopulse setup` 記載があれば整合性確認
+- `README.md` — Getting Started の `egopulse setup` 記載の整合性確認 (TUI 言及なし、変更不要)
