@@ -463,8 +463,7 @@ fn yaml_string_key(value: &str) -> yaml_serde::Value {
 mod tests {
     use std::path::Path;
 
-    use super::parse_existing_config;
-    use super::save_config;
+    use super::{mask_secret, parse_existing_config, save_config};
     use crate::config::AgentId;
     use crate::config::Config;
     use crate::setup::inputs::SetupInputs;
@@ -700,5 +699,14 @@ channels:
             root_str.to_string(),
             "existing state_root must be preserved"
         );
+    }
+
+    #[test]
+    fn mask_secret_fully_masks_short_values() {
+        let short_secret = "sk-1234";
+
+        let masked = mask_secret(short_secret);
+
+        assert_eq!(masked, "********");
     }
 }
