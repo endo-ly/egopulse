@@ -5,6 +5,7 @@
 
 mod channels;
 mod provider;
+pub(crate) mod slugify;
 mod summary;
 
 use std::collections::HashMap;
