@@ -1,6 +1,6 @@
 //! 対話型セットアップウィザードのエントリポイント。
 //!
-//! 実際のフロー実装は [`wizard`] モジュールを参照。本モジュールは
+//! 実際のフロー実装は `wizard` モジュールを参照。本モジュールは
 //! `main.rs` から呼ばれる後方互換エントリポイントのみを公開する。
 
 mod channels;
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 /// Runs the interactive setup wizard and writes the resulting configuration file.
 ///
-/// Thin wrapper around [`wizard::run`] for backwards-compatible entrypoint.
+/// Thin wrapper around `wizard::run` for backwards-compatible entrypoint.
 pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), String> {
     wizard::run(config_path)
 }
