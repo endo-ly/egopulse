@@ -175,6 +175,7 @@ fn enabled_label(enabled: bool) -> &'static str {
 
 struct PrefillValues {
     agent_label: String,
+    provider_id: String,
     base_url: String,
     model: String,
     web_enabled: bool,
@@ -189,6 +190,7 @@ fn extract_prefill(existing: &ExistingConfig) -> PrefillValues {
             .as_ref()
             .and_then(root_agent_label)
             .unwrap_or_default(),
+        provider_id: existing.fields.get("PROVIDER").cloned().unwrap_or_default(),
         base_url: existing.fields.get("BASE_URL").cloned().unwrap_or_default(),
         model: existing.fields.get("MODEL").cloned().unwrap_or_default(),
         web_enabled: existing
@@ -240,6 +242,16 @@ fn is_truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes" | "on"
     )
+}
+
+fn provider_default_index(provider_id: &str) -> usize {
+    if provider_id.is_empty() {
+        return 0;
+    }
+    PROVIDER_PRESETS
+        .iter()
+        .position(|p| p.id == provider_id)
+        .unwrap_or(PROVIDER_PRESETS.len())
 }
 
 fn provider_select_items() -> Vec<String> {
@@ -335,7 +347,8 @@ fn prompt_provider(
 ) -> Result<(String, String), String> {
     let items = provider_select_items();
     let label = format!("Choose the LLM provider for {agent_label}:");
-    let idx = source.select(&label, &items)?;
+    let default_idx = provider_default_index(&prefill.provider_id);
+    let idx = source.select(&label, &items, default_idx)?;
 
     if idx >= PROVIDER_PRESETS.len() {
         let url = source.text(
@@ -371,7 +384,8 @@ fn prompt_model(
             let input = source.text("Enter the model name (e.g. gpt-4o):", default)?;
             return Ok(input.trim().to_string());
         }
-        let idx = source.select("Choose the model to use:", &items)?;
+        let default_idx = items.iter().position(|m| m == default).unwrap_or(0);
+        let idx = source.select("Choose the model to use:", &items, default_idx)?;
         Ok(items[idx].clone())
     }
 }
@@ -498,7 +512,7 @@ pub(crate) fn run_with_source_and_sink(
             "Abort (exit without saving)".to_string(),
             "Save anyway".to_string(),
         ];
-        let idx = source.select("What would you like to do?", &choices)?;
+        let idx = source.select("What would you like to do?", &choices, 0)?;
         match review_decision_from_index(idx) {
             ReviewDecision::StartOver => continue,
             ReviewDecision::Abort => {
@@ -717,6 +731,17 @@ mod tests {
             .map(|(_, d)| *d)
             .expect("web confirm default must be recorded");
         assert!(web_default);
+
+        let select_defs = source.select_defaults();
+        let provider_default = select_defs
+            .iter()
+            .find(|(l, _)| l.contains("Choose the LLM provider"))
+            .map(|(_, d)| *d)
+            .expect("provider select default must be recorded");
+        assert_eq!(
+            provider_default, OLLAMA_INDEX,
+            "provider select default must point at the existing provider preset"
+        );
 
         assert_config_saved(&config_path);
     }

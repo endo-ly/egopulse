@@ -45,7 +45,7 @@ pub(crate) trait PromptSource {
     fn password(&self, label: &str) -> Result<String, String>;
 
     /// 選択肢からインデックスを選ぶ。`items` は表示文字列のリスト。
-    fn select(&self, label: &str, items: &[String]) -> Result<usize, String>;
+    fn select(&self, label: &str, items: &[String], default: usize) -> Result<usize, String>;
 
     /// Yes/No 確認。`default` は Enter 押下時の値。
     fn confirm(&self, label: &str, default: bool) -> Result<bool, String>;
@@ -91,11 +91,11 @@ impl PromptSource for DialoguerPromptSource {
             .map_err(|e| format!("Password input error: {e}"))
     }
 
-    fn select(&self, label: &str, items: &[String]) -> Result<usize, String> {
+    fn select(&self, label: &str, items: &[String], default: usize) -> Result<usize, String> {
         dialoguer::Select::new()
             .with_prompt(label)
             .items(items)
-            .default(0)
+            .default(default)
             .interact()
             .map_err(|e| format!("Select error: {e}"))
     }
@@ -158,6 +158,7 @@ pub(crate) mod test_mocks {
         select: RefCell<VecDeque<(String, usize)>>,
         confirm: RefCell<VecDeque<(String, bool)>>,
         text_defaults: RefCell<Vec<(String, String)>>,
+        select_defaults: RefCell<Vec<(String, usize)>>,
         confirm_defaults: RefCell<Vec<(String, bool)>>,
     }
 
@@ -169,6 +170,7 @@ pub(crate) mod test_mocks {
                 select: RefCell::new(VecDeque::new()),
                 confirm: RefCell::new(VecDeque::new()),
                 text_defaults: RefCell::new(Vec::new()),
+                select_defaults: RefCell::new(Vec::new()),
                 confirm_defaults: RefCell::new(Vec::new()),
             }
         }
@@ -206,6 +208,10 @@ pub(crate) mod test_mocks {
             self.text_defaults.borrow().clone()
         }
 
+        pub(crate) fn select_defaults(&self) -> Vec<(String, usize)> {
+            self.select_defaults.borrow().clone()
+        }
+
         /// wizard から渡された confirm デフォルト値の (label, default) ペアを返す。
         pub(crate) fn confirm_defaults(&self) -> Vec<(String, bool)> {
             self.confirm_defaults.borrow().clone()
@@ -224,7 +230,10 @@ pub(crate) mod test_mocks {
             consume_entry(&mut queue, label, "password")
         }
 
-        fn consume_select(&self, label: &str) -> Result<usize, String> {
+        fn consume_select(&self, label: &str, default: usize) -> Result<usize, String> {
+            self.select_defaults
+                .borrow_mut()
+                .push((label.to_string(), default));
             let mut queue = self.select.borrow_mut();
             consume_entry(&mut queue, label, "select")
         }
@@ -253,8 +262,8 @@ pub(crate) mod test_mocks {
             self.consume_password(label)
         }
 
-        fn select(&self, label: &str, _items: &[String]) -> Result<usize, String> {
-            self.consume_select(label)
+        fn select(&self, label: &str, _items: &[String], default: usize) -> Result<usize, String> {
+            self.consume_select(label, default)
         }
 
         fn confirm(&self, label: &str, default: bool) -> Result<bool, String> {
