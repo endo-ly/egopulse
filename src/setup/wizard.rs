@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::default_config_path;
 use crate::llm::codex_auth::provider_allows_empty_api_key;
-use crate::setup::inputs::SetupInputs;
+use crate::setup::inputs::{SetupInputs, validate_inputs};
 use crate::setup::prompts::format_api_key_for_review;
 use crate::setup::prompts::{DialoguerOutputSink, DialoguerPromptSource, OutputSink, PromptSource};
 use crate::setup::provider::{PROVIDER_PRESETS, find_provider_preset, provider_label_for};
@@ -367,6 +367,10 @@ fn prompt_model(
         }
     } else {
         let items = model_select_items(provider_id);
+        if items.is_empty() {
+            let input = source.text("Enter the model name (e.g. gpt-4o):", default)?;
+            return Ok(input.trim().to_string());
+        }
         let idx = source.select("Choose the model to use:", &items)?;
         Ok(items[idx].clone())
     }
@@ -477,6 +481,12 @@ pub(crate) fn run_with_source_and_sink(
     loop {
         let inputs = collect_inputs(source, &prefill)?;
 
+        if let Err(message) = validate_inputs(&inputs) {
+            sink.println(&format!("Invalid input: {message}"));
+            sink.println("Please answer the questions again.");
+            continue;
+        }
+
         sink.println(&build_review_summary(&inputs));
 
         if source.confirm("Save? (Y/n)", true)? {
@@ -491,7 +501,10 @@ pub(crate) fn run_with_source_and_sink(
         let idx = source.select("What would you like to do?", &choices)?;
         match review_decision_from_index(idx) {
             ReviewDecision::StartOver => continue,
-            ReviewDecision::Abort => return Err("Setup aborted".to_string()),
+            ReviewDecision::Abort => {
+                sink.println("Setup aborted. No configuration was saved.");
+                return Err("Setup aborted".to_string());
+            }
             ReviewDecision::SaveAnyway => {
                 return save_and_finish(sink, &inputs, &existing, &resolved_path);
             }
