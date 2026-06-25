@@ -82,7 +82,7 @@ src/
 │
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, build_app_state(), start_channels()
-│   ├── ingress.rs       # チャネル入力から Channel Log / ScheduledTurn への変換
+│   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
@@ -230,7 +230,7 @@ pub(crate) struct SurfaceContext {
 2. チャネルが受信イベントを内部メタデータへ正規化
       │  (channel, surface_user, surface_thread, agent_id)
       │
-3. runtime/ingress.rs が SurfaceContext を生成し、必要に応じて Channel Log へ保存
+3. runtime/channel_input.rs が SurfaceContext を生成し、必要に応じて Channel Log へ保存
       │
 4. ScheduledTurn を TurnScheduler に投入
       │
@@ -318,7 +318,7 @@ pub(crate) struct SurfaceContext {
 | パターン | 適用箇所 | 目的 |
 |---------|---------|------|
 | **Channel Adapter** | `channels/adapter.rs` | 全チャネルを統一インターフェースで扱う |
-| **Channel Ingress** | `runtime/ingress.rs` | チャネルが正規化した入力を `SurfaceContext`、Channel Log、`ScheduledTurn` に変換する |
+| **Channel Input Boundary** | `runtime/channel_input.rs` | チャネルが正規化した入力を `SurfaceContext`、Channel Log、`ScheduledTurn` に変換する |
 | **Dependency Injection** | `runtime/` AppState | 全コンポーネントの依存を明示的に注入 |
 | **Optimistic Concurrency** | `storage/` sessions | セッション書き込みの競合を `updated_at` で解決 |
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |

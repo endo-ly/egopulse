@@ -32,11 +32,11 @@ pub(crate) trait ChannelAdapter: Send + Sync {
 }
 ```
 
-### Channel Ingress
+### Channel Input Boundary
 
-Discord / Telegram などの受信チャネルは、プラットフォーム固有の受信判定、mention 解析、添付ファイル取得を行った後、runtime の `ingress` に正規化済み入力を渡す。
+Discord / Telegram などの受信チャネルは、プラットフォーム固有の受信判定、mention 解析、添付ファイル取得を行った後、runtime の `channel_input` に正規化済み入力を渡す。
 
-`runtime/ingress.rs` は以下の EgoPulse 共通処理を担う。
+`runtime/channel_input.rs` は以下の EgoPulse 共通処理を担う。
 
 - `SurfaceContext` の構築と `ConversationScope` の反映
 - Multi-Agent Room の人間メッセージを Channel Log に保存
