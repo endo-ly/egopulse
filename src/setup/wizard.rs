@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::default_config_path;
 use crate::llm::codex_auth::provider_allows_empty_api_key;
+use crate::setup::error::SetupWizardError;
 use crate::setup::inputs::{SetupInputs, validate_inputs};
 use crate::setup::prompts::format_api_key_for_review;
 use crate::setup::prompts::{DialoguerOutputSink, DialoguerPromptSource, OutputSink, PromptSource};
@@ -272,7 +273,7 @@ fn load_existing(
     source: &dyn PromptSource,
     sink: &dyn OutputSink,
     config_path: &Path,
-) -> Result<ExistingConfig, String> {
+) -> Result<ExistingConfig, SetupWizardError> {
     let yaml_text = match fs::read_to_string(config_path) {
         Ok(text) => text,
         Err(_) => {
@@ -287,13 +288,16 @@ fn load_existing(
         Ok(config) => Ok(config),
         Err(e) => {
             sink.println(&format!("WARNING: {e}"));
-            if source.confirm("Continue with empty defaults? (y/N)", false)? {
+            if source
+                .confirm("Continue with empty defaults? (y/N)", false)
+                .map_err(SetupWizardError::Prompt)?
+            {
                 Ok(ExistingConfig {
                     fields: HashMap::new(),
                     root: None,
                 })
             } else {
-                Err("Setup aborted due to config parse error".to_string())
+                Err(SetupWizardError::Aborted)
             }
         }
     }
@@ -302,7 +306,7 @@ fn load_existing(
 fn collect_inputs(
     source: &dyn PromptSource,
     prefill: &PrefillValues,
-) -> Result<SetupInputs, String> {
+) -> Result<SetupInputs, SetupWizardError> {
     let agent_label = prompt_agent_label(source, &prefill.agent_label)?;
     let (provider_id, base_url) = prompt_provider(source, &agent_label, prefill)?;
     let model = prompt_model(source, &provider_id, &prefill.model)?;
@@ -325,9 +329,14 @@ fn collect_inputs(
     })
 }
 
-fn prompt_agent_label(source: &dyn PromptSource, default: &str) -> Result<String, String> {
+fn prompt_agent_label(
+    source: &dyn PromptSource,
+    default: &str,
+) -> Result<String, SetupWizardError> {
     let prompt = "Name your agent (e.g. Partner, Companion, Assistant):";
-    let input = source.text(prompt, default)?;
+    let input = source
+        .text(prompt, default)
+        .map_err(SetupWizardError::Prompt)?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         if default.is_empty() {
@@ -344,17 +353,21 @@ fn prompt_provider(
     source: &dyn PromptSource,
     agent_label: &str,
     prefill: &PrefillValues,
-) -> Result<(String, String), String> {
+) -> Result<(String, String), SetupWizardError> {
     let items = provider_select_items();
     let label = format!("Choose the LLM provider for {agent_label}:");
     let default_idx = provider_default_index(&prefill.provider_id);
-    let idx = source.select(&label, &items, default_idx)?;
+    let idx = source
+        .select(&label, &items, default_idx)
+        .map_err(SetupWizardError::Prompt)?;
 
     if idx >= PROVIDER_PRESETS.len() {
-        let url = source.text(
-            "Enter the base_url (e.g. https://api.example.com/v1):",
-            &prefill.base_url,
-        )?;
+        let url = source
+            .text(
+                "Enter the base_url (e.g. https://api.example.com/v1):",
+                &prefill.base_url,
+            )
+            .map_err(SetupWizardError::Prompt)?;
         Ok(("custom".to_string(), url.trim().to_string()))
     } else {
         let preset = &PROVIDER_PRESETS[idx];
@@ -366,12 +379,14 @@ fn prompt_model(
     source: &dyn PromptSource,
     provider_id: &str,
     default: &str,
-) -> Result<String, String> {
+) -> Result<String, SetupWizardError> {
     if should_ask_model_as_free_text(provider_id) {
-        let input = source.text(
-            "Enter the model name (e.g. gpt-4o, claude-3-opus):",
-            default,
-        )?;
+        let input = source
+            .text(
+                "Enter the model name (e.g. gpt-4o, claude-3-opus):",
+                default,
+            )
+            .map_err(SetupWizardError::Prompt)?;
         let trimmed = input.trim();
         if trimmed.is_empty() && !default.is_empty() {
             Ok(default.to_string())
@@ -381,11 +396,15 @@ fn prompt_model(
     } else {
         let items = model_select_items(provider_id);
         if items.is_empty() {
-            let input = source.text("Enter the model name (e.g. gpt-4o):", default)?;
+            let input = source
+                .text("Enter the model name (e.g. gpt-4o):", default)
+                .map_err(SetupWizardError::Prompt)?;
             return Ok(input.trim().to_string());
         }
         let default_idx = items.iter().position(|m| m == default).unwrap_or(0);
-        let idx = source.select("Choose the model to use:", &items, default_idx)?;
+        let idx = source
+            .select("Choose the model to use:", &items, default_idx)
+            .map_err(SetupWizardError::Prompt)?;
         Ok(items[idx].clone())
     }
 }
@@ -394,20 +413,23 @@ fn prompt_api_key(
     source: &dyn PromptSource,
     provider_id: &str,
     base_url: &str,
-) -> Result<String, String> {
+) -> Result<String, SetupWizardError> {
     let provider_label = provider_label_for(provider_id);
     let prompt = format!(
         "Enter the API key for {provider_label} (input is hidden).\n\
          For local endpoints (Ollama/LMStudio), leave it empty and press Enter:"
     );
     loop {
-        let key = source.password(&prompt)?;
+        let key = source.password(&prompt).map_err(SetupWizardError::Prompt)?;
         if key.trim().is_empty() && should_confirm_empty_api_key(provider_id, base_url) {
             let confirm = format!(
                 "WARNING: {provider_label} usually requires an API key. \
                  Proceed with an empty key? (y/N)"
             );
-            if !source.confirm(&confirm, false)? {
+            if !source
+                .confirm(&confirm, false)
+                .map_err(SetupWizardError::Prompt)?
+            {
                 continue;
             }
         }
@@ -415,30 +437,46 @@ fn prompt_api_key(
     }
 }
 
-fn prompt_web(source: &dyn PromptSource, default: bool) -> Result<bool, String> {
-    source.confirm(
-        &format!(
-            "Enable the Web UI? (Y/n)\n\
-             You can access it at {WEB_UI_URL} from your browser."
-        ),
-        default,
-    )
+fn prompt_web(source: &dyn PromptSource, default: bool) -> Result<bool, SetupWizardError> {
+    source
+        .confirm(
+            &format!(
+                "Enable the Web UI? (Y/n)\n\
+                 You can access it at {WEB_UI_URL} from your browser."
+            ),
+            default,
+        )
+        .map_err(SetupWizardError::Prompt)
 }
 
-fn prompt_discord(source: &dyn PromptSource, default: bool) -> Result<(bool, String), String> {
-    let enabled = source.confirm("Configure a Discord bot? (y/N)", default)?;
+fn prompt_discord(
+    source: &dyn PromptSource,
+    default: bool,
+) -> Result<(bool, String), SetupWizardError> {
+    let enabled = source
+        .confirm("Configure a Discord bot? (y/N)", default)
+        .map_err(SetupWizardError::Prompt)?;
     if enabled {
-        let token = source.password("Enter the Discord bot token (input is hidden):")?;
+        let token = source
+            .password("Enter the Discord bot token (input is hidden):")
+            .map_err(SetupWizardError::Prompt)?;
         Ok((true, token))
     } else {
         Ok((false, String::new()))
     }
 }
 
-fn prompt_telegram(source: &dyn PromptSource, default: bool) -> Result<(bool, String), String> {
-    let enabled = source.confirm("Configure a Telegram bot? (y/N)", default)?;
+fn prompt_telegram(
+    source: &dyn PromptSource,
+    default: bool,
+) -> Result<(bool, String), SetupWizardError> {
+    let enabled = source
+        .confirm("Configure a Telegram bot? (y/N)", default)
+        .map_err(SetupWizardError::Prompt)?;
     if enabled {
-        let token = source.password("Enter the Telegram bot token (input is hidden):")?;
+        let token = source
+            .password("Enter the Telegram bot token (input is hidden):")
+            .map_err(SetupWizardError::Prompt)?;
         Ok((true, token))
     } else {
         Ok((false, String::new()))
@@ -450,8 +488,9 @@ fn save_and_finish(
     inputs: &SetupInputs,
     existing: &ExistingConfig,
     config_path: &Path,
-) -> Result<(), String> {
-    let (backup_path, _summary) = save_config(inputs, existing.root.as_ref(), config_path)?;
+) -> Result<(), SetupWizardError> {
+    let (backup_path, _summary) =
+        save_config(inputs, existing.root.as_ref(), config_path).map_err(SetupWizardError::Save)?;
 
     sink.println(&build_additional_options_text());
     let path_str = config_path.to_string_lossy();
@@ -480,10 +519,12 @@ pub(crate) fn run_with_source_and_sink(
     source: &dyn PromptSource,
     sink: &dyn OutputSink,
     config_path: Option<PathBuf>,
-) -> Result<(), String> {
+) -> Result<(), SetupWizardError> {
     let resolved_path = match config_path {
         Some(path) => path,
-        None => default_config_path().map_err(|e| e.to_string())?,
+        None => {
+            default_config_path().map_err(|e| SetupWizardError::ConfigResolve(e.to_string()))?
+        }
     };
 
     sink.println("Welcome to EgoPulse setup.");
@@ -503,7 +544,10 @@ pub(crate) fn run_with_source_and_sink(
 
         sink.println(&build_review_summary(&inputs));
 
-        if source.confirm("Save? (Y/n)", true)? {
+        if source
+            .confirm("Save? (Y/n)", true)
+            .map_err(SetupWizardError::Prompt)?
+        {
             return save_and_finish(sink, &inputs, &existing, &resolved_path);
         }
 
@@ -512,12 +556,14 @@ pub(crate) fn run_with_source_and_sink(
             "Abort (exit without saving)".to_string(),
             "Save anyway".to_string(),
         ];
-        let idx = source.select("What would you like to do?", &choices, 0)?;
+        let idx = source
+            .select("What would you like to do?", &choices, 0)
+            .map_err(SetupWizardError::Prompt)?;
         match review_decision_from_index(idx) {
             ReviewDecision::StartOver => continue,
             ReviewDecision::Abort => {
                 sink.println("Setup aborted. No configuration was saved.");
-                return Err("Setup aborted".to_string());
+                return Err(SetupWizardError::Aborted);
             }
             ReviewDecision::SaveAnyway => {
                 return save_and_finish(sink, &inputs, &existing, &resolved_path);
@@ -531,7 +577,7 @@ pub(crate) fn run_with_source_and_sink(
 /// # Errors
 ///
 /// [`run_with_source_and_sink`] に準ずる。
-pub(crate) fn run(config_path: Option<PathBuf>) -> Result<(), String> {
+pub(crate) fn run(config_path: Option<PathBuf>) -> Result<(), SetupWizardError> {
     run_with_source_and_sink(
         &DialoguerPromptSource::new(),
         &DialoguerOutputSink::new(),
