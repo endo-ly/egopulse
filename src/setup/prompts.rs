@@ -16,6 +16,9 @@ pub(crate) fn format_api_key_for_review(api_key: &str) -> String {
         return "(empty)".to_string();
     }
     let chars: Vec<char> = api_key.chars().collect();
+    if chars.len() <= 7 {
+        return "********".to_string();
+    }
     let head: String = chars.iter().take(3).collect();
     let tail: String = chars
         .iter()
@@ -315,5 +318,11 @@ mod tests {
     #[test]
     fn format_api_key_for_review_shows_empty_for_blank() {
         assert_eq!(format_api_key_for_review(""), "(empty)");
+    }
+
+    #[test]
+    fn format_api_key_for_review_fully_masks_short_values() {
+        assert_eq!(format_api_key_for_review("abc"), "********");
+        assert_eq!(format_api_key_for_review("sk-1234"), "********");
     }
 }

@@ -16,9 +16,7 @@ use crate::config::secret_ref::{
     DISCORD_BOT_TOKEN_ENV_NAME, env_resolved_value, env_yaml_value as yaml_value,
     provider_api_key_env_name,
 };
-use crate::config::{
-    Config, ProviderConfig, ProviderId, default_state_root, default_workspace_dir,
-};
+use crate::config::{Config, ProviderConfig, ProviderId, default_state_root};
 use crate::error::EgoPulseError;
 
 const CONFIG_BACKUP_DIR: &str = "egopulse.config.backups";
@@ -85,11 +83,13 @@ pub(crate) fn save_config(
     }
     let default_root =
         default_state_root().map_err(|e| format!("Failed to resolve state root: {e}"))?;
-    fs::create_dir_all(&default_root)
+    let resolved_state_root = existing_state_root
+        .clone()
+        .unwrap_or_else(|| default_root.to_string_lossy().into_owned());
+    fs::create_dir_all(&resolved_state_root)
         .map_err(|e| format!("Failed to create state root directory: {e}"))?;
-    let default_ws =
-        default_workspace_dir().map_err(|e| format!("Failed to resolve workspace dir: {e}"))?;
-    fs::create_dir_all(&default_ws)
+    let workspace_dir = Path::new(&resolved_state_root).join("workspace");
+    fs::create_dir_all(&workspace_dir)
         .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
 
     let backup_path = if config_path.exists() {
@@ -187,8 +187,7 @@ pub(crate) fn save_config(
         default_provider: ProviderId::new(&provider_id),
         default_model: Some(model.clone()),
         providers,
-        state_root: existing_state_root
-            .unwrap_or_else(|| default_root.to_string_lossy().into_owned()),
+        state_root: resolved_state_root.clone(),
         log_level: "info".to_string(),
         compaction_timeout_secs: existing_config
             .as_ref()
@@ -420,7 +419,7 @@ fn extract_provider_fields(map: &yaml_serde::Mapping, fields: &mut HashMap<Strin
     let provider_map = map
         .get(yaml_string_key("providers"))
         .and_then(|v| v.as_mapping())
-        .and_then(|providers| providers.get(yaml_string_key(default_provider)))
+        .and_then(|providers| providers.get(yaml_string_key(&provider_id)))
         .and_then(|v| v.as_mapping());
 
     let model = map

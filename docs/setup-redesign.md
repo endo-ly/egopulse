@@ -69,7 +69,7 @@
 
 ### 3.2 対象外 (やらないこと)
 
-- **TUI チャネル (`src/channels/tui.rs`) の刷新** — 別課題 ([§9](#9-関連課題-本メモのスコープ外)) で扱う
+- **TUI チャネル (`src/channels/tui.rs`) の刷新** — 別課題 ([§8](#8-関連課題-本メモのスコープ外)) で扱う
 - 複数プロバイダー / 複数エージェントの設定 (1つだけ生成、残りは手動 YAML or WebUI)
 - Discord / Telegram の channel access control (channels マップ)
 - Voice / Sleep Batch / Pulse / DB backup / Web Fetch 等の高度設定
@@ -422,7 +422,7 @@ If Discord or Telegram is enabled:
 
 | 対象 | 場所 | 用途 |
 |---|---|---|
-| `PROVIDER_PRESETS` 配列 | `src/setup/provider.rs:12-234` | 25 preset のデータ。そのまま参照 |
+| `PROVIDER_PRESETS` 配列 | `src/setup/provider.rs:12-234` | 26 preset のデータ。そのまま参照 |
 | `build_channel_configs()` | `src/setup/channels.rs:88-130` | ChannelConfig 生成ロジック。Web 強制有効化を廃止して `enabled: Some(user_choice)` へ |
 | `generate_auth_token()` | `src/setup/channels.rs:135-139` | 32 bytes ランダム base64。そのまま流用 |
 | `validate_fields()` | `src/setup/summary.rs:31-90` | バリデーションロジック。新しい入力項目に合わせて拡張 |
