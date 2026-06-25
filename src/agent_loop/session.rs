@@ -5,10 +5,13 @@
 
 use std::sync::Arc;
 
+use crate::agent_loop::session_snapshot::{
+    SnapshotMessage, messages_from_snapshot, messages_to_snapshot,
+};
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
-use crate::llm::{Message, MessageContent, MessageContentPart};
+use crate::llm::{Message, MessageContent};
 use crate::runtime::AppState;
 use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
@@ -284,7 +287,7 @@ async fn serialize_snapshot(
     messages: Vec<Message>,
 ) -> Result<String, EgoPulseError> {
     tokio::task::spawn_blocking(move || {
-        let persisted = persist_messages(&assets, &messages)?;
+        let persisted = messages_to_snapshot(&assets, &messages)?;
         serde_json::to_string(&persisted).map_err(StorageError::SessionSerialize)
     })
     .await
@@ -292,141 +295,15 @@ async fn serialize_snapshot(
     .map_err(EgoPulseError::Storage)
 }
 
-/// Convert `InputImage` parts to `InputImageRef` for disk serialization.
-fn persist_messages(
-    assets: &AssetStore,
-    messages: &[Message],
-) -> Result<Vec<Message>, StorageError> {
-    messages
-        .iter()
-        .map(|message| {
-            Ok(Message {
-                role: message.role.clone(),
-                content: persist_content(assets, &message.content)?,
-                reasoning_content: message.reasoning_content.clone(),
-                tool_calls: message.tool_calls.clone(),
-                tool_call_id: message.tool_call_id.clone(),
-            })
-        })
-        .collect()
-}
-
-fn persist_content(
-    assets: &AssetStore,
-    content: &MessageContent,
-) -> Result<MessageContent, StorageError> {
-    match content {
-        MessageContent::Text(text) => Ok(MessageContent::Text(text.clone())),
-        MessageContent::Parts(parts) => Ok(MessageContent::Parts(
-            parts
-                .iter()
-                .map(|part| persist_part(assets, part))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-    }
-}
-
-fn persist_part(
-    assets: &AssetStore,
-    part: &MessageContentPart,
-) -> Result<MessageContentPart, StorageError> {
-    match part {
-        MessageContentPart::InputText { text } => {
-            Ok(MessageContentPart::InputText { text: text.clone() })
-        }
-        MessageContentPart::InputImage { image_url, detail } => {
-            let stored = assets.persist_image_data_url(image_url)?;
-            Ok(MessageContentPart::InputImageRef {
-                image_ref: stored.image_ref,
-                mime_type: stored.mime_type,
-                detail: detail.clone(),
-            })
-        }
-        MessageContentPart::InputImageRef { .. } => Ok(part.clone()),
-    }
-}
-
-/// Deserialize snapshot JSON as `Vec<Message>` and hydrate `InputImageRef` → `InputImage`.
-///
-/// For text-only sessions (the common case), the JSON string is scanned for
-/// `"input_image_ref"` before any per-message work. When absent the hydration
-/// pass is skipped entirely, eliminating the second iteration.
+/// Deserialize snapshot JSON and hydrate image references for LLM input.
 fn restore_snapshot_messages(
     assets: &AssetStore,
     json: &str,
 ) -> Result<Vec<Message>, StorageError> {
-    let messages: Vec<Message> =
+    let messages: Vec<SnapshotMessage> =
         serde_json::from_str(json).map_err(StorageError::SessionSerialize)?;
 
-    // Fast path: no image references in the serialized form → nothing to hydrate.
-    if !json.contains("\"input_image_ref\"") {
-        return Ok(messages);
-    }
-
-    // Selective hydration: only transform messages that actually contain refs.
-    Ok(messages
-        .into_iter()
-        .map(|message| {
-            if message_contains_image_ref(&message) {
-                hydrate_message(assets, message)
-            } else {
-                message
-            }
-        })
-        .collect())
-}
-
-fn message_contains_image_ref(message: &Message) -> bool {
-    match &message.content {
-        MessageContent::Text(_) => false,
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .any(|part| matches!(part, MessageContentPart::InputImageRef { .. })),
-    }
-}
-
-fn hydrate_message(assets: &AssetStore, message: Message) -> Message {
-    Message {
-        content: hydrate_content(assets, message.content),
-        ..message
-    }
-}
-
-fn hydrate_content(assets: &AssetStore, content: MessageContent) -> MessageContent {
-    match content {
-        MessageContent::Text(text) => MessageContent::Text(text),
-        MessageContent::Parts(parts) => MessageContent::Parts(
-            parts
-                .into_iter()
-                .map(|part| hydrate_part(assets, part))
-                .collect(),
-        ),
-    }
-}
-
-fn hydrate_part(assets: &AssetStore, part: MessageContentPart) -> MessageContentPart {
-    match part {
-        MessageContentPart::InputText { text } => MessageContentPart::InputText { text },
-        MessageContentPart::InputImage { .. } => part,
-        MessageContentPart::InputImageRef {
-            image_ref,
-            mime_type,
-            detail,
-        } => assets
-            .load_image_data_url(&image_ref, &mime_type)
-            .map(|image_url| MessageContentPart::InputImage { image_url, detail })
-            .unwrap_or_else(|error| missing_image_text_part(&image_ref, error)),
-    }
-}
-
-fn missing_image_text_part(image_ref: &str, error: StorageError) -> MessageContentPart {
-    let reason = match error {
-        StorageError::NotFound(_) => format!("missing image_ref {image_ref}"),
-        other => other.to_string(),
-    };
-    MessageContentPart::InputText {
-        text: format!("Previously attached image could not be restored: {reason}"),
-    }
+    Ok(messages_from_snapshot(assets, messages))
 }
 
 async fn store_phase_snapshot(
@@ -460,7 +337,6 @@ mod tests {
 
     use super::{load_messages_for_turn, persist_phase};
     use crate::agent_loop::{ConversationScope, SurfaceContext};
-    use crate::assets::AssetStore;
     use crate::config::Config;
     use crate::error::LlmError;
     use crate::llm::{
@@ -721,7 +597,7 @@ mod tests {
         call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(
                 chat_id,
-                r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"missing-ref","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
+                r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
             )
         })
         .await
@@ -735,7 +611,7 @@ mod tests {
                 assert!(matches!(
                     parts[1],
                     MessageContentPart::InputText { ref text }
-                    if text.contains("missing image_ref missing-ref")
+                    if text.contains("missing image_ref aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 ));
             }
             other => panic!("expected restored parts, got {other:?}"),
@@ -1219,165 +1095,6 @@ mod tests {
         assert_eq!(loaded.messages[0].content.as_text_lossy(), "hello");
         assert_eq!(loaded.messages[1].role, "assistant");
         assert_eq!(loaded.messages[1].content.as_text_lossy(), "response");
-    }
-
-    // -- Restore snapshot hydration optimization tests -------------------------
-
-    #[test]
-    fn text_only_snapshot_skips_hydration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let assets = AssetStore::new(dir.path()).expect("store");
-        let json = serde_json::to_string(&vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "world"),
-        ])
-        .expect("json");
-
-        let messages = super::restore_snapshot_messages(&assets, &json).expect("restore");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content.as_text_lossy(), "hello");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content.as_text_lossy(), "world");
-    }
-
-    #[test]
-    fn image_snapshot_hydrates_refs() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let assets = AssetStore::new(dir.path()).expect("store");
-        let data_url = "data:image/png;base64,AAAA";
-        let stored = assets.persist_image_data_url(data_url).expect("persist");
-
-        let snapshot = vec![Message {
-            role: "tool".to_string(),
-            content: MessageContent::parts(vec![
-                MessageContentPart::InputText {
-                    text: "screenshot".to_string(),
-                },
-                MessageContentPart::InputImageRef {
-                    image_ref: stored.image_ref.clone(),
-                    mime_type: stored.mime_type.clone(),
-                    detail: Some("auto".to_string()),
-                },
-            ]),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: Some("call_1".to_string()),
-        }];
-        let json = serde_json::to_string(&snapshot).expect("json");
-
-        let messages = super::restore_snapshot_messages(&assets, &json).expect("restore");
-        assert_eq!(messages.len(), 1);
-        match &messages[0].content {
-            MessageContent::Parts(parts) => {
-                assert!(matches!(
-                    &parts[1],
-                    MessageContentPart::InputImage { image_url, detail }
-                    if image_url == data_url && detail.as_deref() == Some("auto")
-                ));
-            }
-            other => panic!("expected parts, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn identical_output_to_two_pass() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let assets = AssetStore::new(dir.path()).expect("store");
-        let data_url = "data:image/png;base64,iVBORw==";
-        let stored = assets.persist_image_data_url(data_url).expect("persist");
-
-        let snapshot = vec![
-            Message::text("user", "look at this"),
-            Message {
-                role: "tool".to_string(),
-                content: MessageContent::parts(vec![
-                    MessageContentPart::InputText {
-                        text: "file read".to_string(),
-                    },
-                    MessageContentPart::InputImageRef {
-                        image_ref: stored.image_ref.clone(),
-                        mime_type: stored.mime_type.clone(),
-                        detail: None,
-                    },
-                ]),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: Some("call_img".to_string()),
-            },
-            Message::text("assistant", "I see the image"),
-        ];
-        let json = serde_json::to_string(&snapshot).expect("json");
-
-        let single_pass = super::restore_snapshot_messages(&assets, &json).expect("single");
-
-        // Simulate old two-pass: deserialize then hydrate every message unconditionally.
-        let raw: Vec<Message> = serde_json::from_str(&json).expect("deserialize");
-        let two_pass: Vec<Message> = raw
-            .into_iter()
-            .map(|message| {
-                let content = match message.content {
-                    MessageContent::Text(text) => MessageContent::Text(text),
-                    MessageContent::Parts(parts) => MessageContent::Parts(
-                        parts
-                            .into_iter()
-                            .map(|part| match part {
-                                MessageContentPart::InputText { text } => {
-                                    MessageContentPart::InputText { text }
-                                }
-                                MessageContentPart::InputImage { image_url, detail } => {
-                                    MessageContentPart::InputImage { image_url, detail }
-                                }
-                                MessageContentPart::InputImageRef {
-                                    image_ref,
-                                    mime_type,
-                                    detail,
-                                } => assets
-                                    .load_image_data_url(&image_ref, &mime_type)
-                                    .map(|image_url| MessageContentPart::InputImage {
-                                        image_url,
-                                        detail,
-                                    })
-                                    .unwrap_or_else(|error| {
-                                        MessageContentPart::InputText {
-                                            text: format!(
-                                                "Previously attached image could not be restored: {error}"
-                                            ),
-                                        }
-                                    }),
-                            })
-                            .collect(),
-                    ),
-                };
-                Message {
-                    content,
-                    ..message
-                }
-            })
-            .collect();
-
-        assert_eq!(single_pass, two_pass);
-    }
-
-    #[test]
-    fn large_session_load_performance() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let assets = AssetStore::new(dir.path()).expect("store");
-        let messages: Vec<Message> = (0..1000)
-            .map(|index| {
-                Message::text(
-                    if index % 2 == 0 { "user" } else { "assistant" },
-                    format!("message-{index}"),
-                )
-            })
-            .collect();
-        let json = serde_json::to_string(&messages).expect("json");
-
-        let start = std::time::Instant::now();
-        let restored = super::restore_snapshot_messages(&assets, &json).expect("restore");
-        let _elapsed = start.elapsed();
-
-        assert_eq!(restored.len(), 1000);
     }
 
     /// Verifies that `persist_phase` borrows `&[Message]` for serialization,
