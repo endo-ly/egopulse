@@ -3,6 +3,7 @@
 //! `AppState` の構築、単発 LLM 実行、各チャネルの起動と監視を提供する。
 
 pub(crate) mod backup_scheduler;
+pub(crate) mod channel_input;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
@@ -10,6 +11,10 @@ pub(crate) mod runtime_status;
 pub mod status;
 pub(crate) mod turn_scheduler;
 
+pub(crate) use channel_input::{
+    ChannelLogKey, HumanChannelLogMessage, build_channel_context, channel_scope_from_secret,
+    store_human_channel_log_message, submit_agent_turn,
+};
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
@@ -412,12 +417,7 @@ fn spawn_agent_turn_worker(
                 origin_id: pending.origin_id,
             };
 
-            if let Some(turn) = state.turn_scheduler.submit(scheduled) {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    execute_scheduled_turn(&state, turn).await;
-                });
-            }
+            channel_input::submit_scheduled_turn(&state, scheduled);
         }
     });
 }

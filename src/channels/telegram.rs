@@ -28,7 +28,7 @@ use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
 use crate::channels::utils::text::split_text;
 use crate::config::TelegramChatConfig;
-use crate::runtime::AppState;
+use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 
 /// Telegram メッセージ長制限 (文字数)。
@@ -277,27 +277,17 @@ impl TelegramHandler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let scope = thread
+        let scope = self.scope_for_thread(thread);
+        crate::runtime::build_channel_context("telegram", user, thread, "telegram", agent_id, scope)
+    }
+
+    fn scope_for_thread(&self, thread: &str) -> ConversationScope {
+        thread
             .parse::<i64>()
             .ok()
             .and_then(|cid| self.channels.get(&cid))
-            .map(|c| {
-                if c.secret {
-                    ConversationScope::Secret
-                } else {
-                    ConversationScope::Normal
-                }
-            })
-            .unwrap_or(ConversationScope::Normal);
-        let mut ctx = SurfaceContext::new(
-            "telegram".to_string(),
-            user.to_string(),
-            thread.to_string(),
-            "telegram".to_string(),
-            agent_id.to_string(),
-        );
-        ctx.scope = scope;
-        ctx
+            .map(|c| crate::runtime::channel_scope_from_secret(c.secret))
+            .unwrap_or(ConversationScope::Normal)
     }
 
     /// テキスト内に @username メンションが含まれているかを判定する。
@@ -340,78 +330,6 @@ impl TelegramHandler {
                     .strip_prefix('@')
                     .is_some_and(|m| m.eq_ignore_ascii_case(username))
             })
-    }
-
-    /// Channel Log 用のチャット ID を解決し、人間のメッセージを保存する。
-    async fn store_human_channel_log_message(
-        &self,
-        raw_chat_id: i64,
-        sender_id: &str,
-        msg_id: i32,
-        text: &str,
-    ) -> Option<i64> {
-        let scope = self
-            .channels
-            .get(&raw_chat_id)
-            .map(|c| {
-                if c.secret {
-                    ConversationScope::Secret
-                } else {
-                    ConversationScope::Normal
-                }
-            })
-            .unwrap_or(ConversationScope::Normal);
-        match crate::storage::call_blocking(std::sync::Arc::clone(self.app_state.db_for(scope)), {
-            let db = std::sync::Arc::clone(self.app_state.db_for(scope));
-            move |_| db.resolve_telegram_channel_log_chat_id(raw_chat_id)
-        })
-        .await
-        {
-            Ok(chat_id) => {
-                let stored = crate::storage::StoredMessage {
-                    id: format!("cl-tg-{raw_chat_id}-{msg_id}"),
-                    chat_id,
-                    sender_id: sender_id.to_string(),
-                    content: text.to_string(),
-                    sender_kind: crate::storage::SenderKind::User,
-                    timestamp: Utc::now().to_rfc3339(),
-                    message_kind: crate::storage::MessageKind::Message,
-                    recipient_agent_id: None,
-                };
-                let db = std::sync::Arc::clone(self.app_state.db_for(scope));
-                if let Err(e) = crate::storage::call_blocking(db, move |db| {
-                    let conn = db.get_conn()?;
-                    conn.execute(
-                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![
-                            stored.id,
-                            stored.chat_id,
-                            stored.sender_id,
-                            stored.content,
-                            stored.sender_kind.to_string(),
-                            stored.timestamp,
-                            stored.message_kind.to_string(),
-                            stored.recipient_agent_id.as_deref(),
-                        ],
-                    )?;
-                    Ok::<_, crate::error::StorageError>(())
-                })
-                .await
-                {
-                    warn!(
-                        chat_id = raw_chat_id,
-                        error = %e,
-                        "failed to store Telegram message in Channel Log"
-                    );
-                }
-                Some(chat_id)
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to resolve Channel Log chat_id");
-                None
-            }
-        }
     }
 }
 
@@ -939,14 +857,18 @@ async fn handle_message(
 
     // Channel Log: multi-agent room では combined_text（添付情報込み）を保存
     let channel_log_chat_id = if is_multi_agent && !is_dm {
-        handler
-            .store_human_channel_log_message(
-                raw_chat_id,
-                &storage_sender_id,
-                msg.id.0,
-                &combined_text,
-            )
-            .await
+        crate::runtime::store_human_channel_log_message(
+            &handler.app_state,
+            HumanChannelLogMessage {
+                key: ChannelLogKey::Telegram(raw_chat_id),
+                scope: handler.scope_for_thread(&thread),
+                id: format!("cl-tg-{raw_chat_id}-{}", msg.id.0),
+                sender_id: storage_sender_id,
+                content: combined_text.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+            },
+        )
+        .await
     } else {
         None
     };
@@ -965,19 +887,7 @@ async fn handle_message(
         "Telegram message received"
     );
 
-    // TurnScheduler 経由でターンを実行
-    let scheduled = crate::agent_loop::ScheduledTurn {
-        context: context.clone(),
-        input: combined_text,
-        origin_id: context.origin_id.clone(),
-    };
-
-    if let Some(turn) = handler.app_state.turn_scheduler.submit(scheduled) {
-        let state = Arc::clone(&handler.app_state);
-        tokio::spawn(async move {
-            crate::runtime::execute_scheduled_turn(&state, turn).await;
-        });
-    }
+    crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text);
 
     Ok(())
 }

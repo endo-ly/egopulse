@@ -32,6 +32,18 @@ pub(crate) trait ChannelAdapter: Send + Sync {
 }
 ```
 
+### Channel Input Boundary
+
+Discord / Telegram などの受信チャネルは、プラットフォーム固有の受信判定、mention 解析、添付ファイル取得を行った後、runtime の `channel_input` に正規化済み入力を渡す。
+
+`runtime/channel_input.rs` は以下の EgoPulse 共通処理を担う。
+
+- `SurfaceContext` の構築と `ConversationScope` の反映
+- Multi-Agent Room の人間メッセージを Channel Log に保存
+- `ScheduledTurn` の作成と `TurnScheduler` への投入
+
+これにより、各チャネル実装は外部 API との接続とチャネル固有ルールに集中し、会話開始ユースケースは runtime 側で一貫する。
+
 ### チャネル横断の設定オーバーライド
 
 各チャネルはグローバル設定に対して以下をオーバーライドできる：
