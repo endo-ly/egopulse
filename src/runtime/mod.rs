@@ -4,12 +4,17 @@
 
 pub(crate) mod backup_scheduler;
 pub mod gateway;
+pub(crate) mod ingress;
 pub mod logging;
 pub(crate) mod metrics;
 pub(crate) mod runtime_status;
 pub mod status;
 pub(crate) mod turn_scheduler;
 
+pub(crate) use ingress::{
+    ChannelLogKey, HumanChannelLogMessage, build_channel_context, channel_scope_from_secret,
+    store_human_channel_log_message, submit_agent_turn,
+};
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
@@ -412,12 +417,7 @@ fn spawn_agent_turn_worker(
                 origin_id: pending.origin_id,
             };
 
-            if let Some(turn) = state.turn_scheduler.submit(scheduled) {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    execute_scheduled_turn(&state, turn).await;
-                });
-            }
+            ingress::submit_scheduled_turn(&state, scheduled);
         }
     });
 }
@@ -1013,6 +1013,7 @@ mod tests {
     use crate::agent_loop::ConversationScope;
     use crate::agent_loop::soul_agents::SoulAgentsLoader;
     use crate::config::ResolvedLlmConfig;
+    use crate::storage::SenderKind;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
@@ -1290,6 +1291,62 @@ mod tests {
             normal.archive_root, secret.archive_root,
             "Normal and Secret archive roots must differ"
         );
+    }
+
+    #[test]
+    fn channel_scope_from_secret_maps_channel_flag() {
+        assert_eq!(channel_scope_from_secret(true), ConversationScope::Secret);
+        assert_eq!(channel_scope_from_secret(false), ConversationScope::Normal);
+    }
+
+    #[test]
+    fn build_channel_context_applies_scope_and_session_identity() {
+        let context = build_channel_context(
+            "discord",
+            "alice",
+            "123",
+            "discord",
+            "reviewer",
+            ConversationScope::Secret,
+        );
+
+        assert_eq!(context.channel, "discord");
+        assert_eq!(context.surface_user, "alice");
+        assert_eq!(context.surface_thread, "123");
+        assert_eq!(context.chat_type, "discord");
+        assert_eq!(context.agent_id, "reviewer");
+        assert_eq!(context.scope, ConversationScope::Secret);
+        assert_eq!(context.session_key(), "discord:123:agent:reviewer");
+    }
+
+    #[tokio::test]
+    async fn store_human_channel_log_message_persists_discord_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_sleep_state(&dir);
+
+        let chat_id = store_human_channel_log_message(
+            &state,
+            HumanChannelLogMessage {
+                key: ChannelLogKey::Discord(42),
+                scope: ConversationScope::Normal,
+                id: "cl-42".to_string(),
+                sender_id: "user:discord:7".to_string(),
+                content: "hello".to_string(),
+                timestamp: "2026-06-25T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .expect("channel log chat id");
+
+        let messages = state
+            .db_for(ConversationScope::Normal)
+            .get_channel_log_messages(chat_id, 10)
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "cl-42");
+        assert_eq!(messages[0].sender_id, "user:discord:7");
+        assert_eq!(messages[0].sender_kind, SenderKind::User);
+        assert_eq!(messages[0].content, "hello");
     }
 
     #[tokio::test]

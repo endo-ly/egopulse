@@ -27,7 +27,7 @@ use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{ChannelAdapter, TurnActivity};
 use crate::channels::utils::text::split_text;
 use crate::config::DiscordChannelConfig;
-use crate::runtime::AppState;
+use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 
 /// Discord API リクエストのタイムアウト (秒)。
 const DISCORD_REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -492,27 +492,17 @@ impl Handler {
 
     /// [`SurfaceContext`] を構築する。
     fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let scope = thread
+        let scope = self.scope_for_thread(thread);
+        crate::runtime::build_channel_context("discord", user, thread, "discord", agent_id, scope)
+    }
+
+    fn scope_for_thread(&self, thread: &str) -> ConversationScope {
+        thread
             .parse::<u64>()
             .ok()
             .and_then(|cid| self.channels.get(&cid))
-            .map(|c| {
-                if c.secret {
-                    ConversationScope::Secret
-                } else {
-                    ConversationScope::Normal
-                }
-            })
-            .unwrap_or(ConversationScope::Normal);
-        let mut ctx = SurfaceContext::new(
-            "discord".to_string(),
-            user.to_string(),
-            thread.to_string(),
-            "discord".to_string(),
-            agent_id.to_string(),
-        );
-        ctx.scope = scope;
-        ctx
+            .map(|c| crate::runtime::channel_scope_from_secret(c.secret))
+            .unwrap_or(ConversationScope::Normal)
     }
 
     /// メッセージの mention にこの bot が含まれているかを判定する。
@@ -594,78 +584,6 @@ impl Handler {
                 true
             }
             crate::slash_commands::SlashCommandOutcome::NotHandled => false,
-        }
-    }
-
-    /// Channel Log 用のチャット ID を解決し、人間のメッセージを保存する。
-    async fn store_human_channel_log_message(
-        &self,
-        channel_id: u64,
-        msg: &DiscordMessage,
-        text: &str,
-    ) -> Option<i64> {
-        let scope = self
-            .channels
-            .get(&channel_id)
-            .map(|c| {
-                if c.secret {
-                    ConversationScope::Secret
-                } else {
-                    ConversationScope::Normal
-                }
-            })
-            .unwrap_or(ConversationScope::Normal);
-        match crate::storage::call_blocking(std::sync::Arc::clone(self.app_state.db_for(scope)), {
-            let db = std::sync::Arc::clone(self.app_state.db_for(scope));
-            move |_| db.resolve_channel_log_chat_id(channel_id)
-        })
-        .await
-        {
-            Ok(chat_id) => {
-                let sender_id = format!("user:discord:{}", msg.author.id.get());
-                let stored = crate::storage::StoredMessage {
-                    id: format!("cl-{}", msg.id.get()),
-                    chat_id,
-                    sender_id,
-                    content: text.to_string(),
-                    sender_kind: crate::storage::SenderKind::User,
-                    timestamp: msg.timestamp.to_string(),
-                    message_kind: crate::storage::MessageKind::Message,
-                    recipient_agent_id: None,
-                };
-                let db = std::sync::Arc::clone(self.app_state.db_for(scope));
-                if let Err(e) = crate::storage::call_blocking(db, move |db| {
-                    let conn = db.get_conn()?;
-                    conn.execute(
-                        "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![
-                            stored.id,
-                            stored.chat_id,
-                            stored.sender_id,
-                            stored.content,
-                            stored.sender_kind.to_string(),
-                            stored.timestamp,
-                            stored.message_kind.to_string(),
-                            stored.recipient_agent_id.as_deref(),
-                        ],
-                    )?;
-                    Ok::<_, crate::error::StorageError>(())
-                })
-                .await
-                {
-                    warn!(
-                        channel_id = channel_id,
-                        error = %e,
-                        "failed to store Discord message in Channel Log"
-                    );
-                }
-                Some(chat_id)
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to resolve Channel Log chat_id");
-                None
-            }
         }
     }
 
@@ -770,8 +688,18 @@ impl EventHandler for Handler {
             .is_some_and(|c| c.multi_agent);
 
         let channel_log_chat_id = if is_multi_agent && !is_dm {
-            self.store_human_channel_log_message(channel_id, &msg, &text)
-                .await
+            crate::runtime::store_human_channel_log_message(
+                &self.app_state,
+                HumanChannelLogMessage {
+                    key: ChannelLogKey::Discord(channel_id),
+                    scope: self.scope_for_thread(&thread),
+                    id: format!("cl-{}", msg.id.get()),
+                    sender_id: format!("user:discord:{}", msg.author.id.get()),
+                    content: text.clone(),
+                    timestamp: msg.timestamp.to_string(),
+                },
+            )
+            .await
         } else {
             None
         };
@@ -811,18 +739,7 @@ impl EventHandler for Handler {
             "Discord message received"
         );
 
-        let scheduled = crate::agent_loop::ScheduledTurn {
-            context: context.clone(),
-            input: combined_text.clone(),
-            origin_id: context.origin_id.clone(),
-        };
-
-        if let Some(turn) = self.app_state.turn_scheduler.submit(scheduled) {
-            let state = Arc::clone(&self.app_state);
-            tokio::spawn(async move {
-                crate::runtime::execute_scheduled_turn(&state, turn).await;
-            });
-        }
+        crate::runtime::submit_agent_turn(&self.app_state, context, combined_text);
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
