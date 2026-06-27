@@ -21,6 +21,17 @@ use crate::error::EgoPulseError;
 /// Runs the interactive setup wizard and writes the resulting configuration file.
 ///
 /// Thin wrapper around `wizard::run` for backwards-compatible entrypoint.
+/// A user-initiated abort is treated as a successful cancellation and returns
+/// `Ok(())`; genuine setup failures are surfaced via [`EgoPulseError`].
+///
+/// # Errors
+///
+/// Returns `Err(EgoPulseError::SetupWizard(_))` when the wizard fails due to
+/// prompt I/O, validation, config save, or config path resolution errors.
 pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
-    wizard::run(config_path).map_err(EgoPulseError::from)
+    match wizard::run(config_path) {
+        Ok(()) => Ok(()),
+        Err(SetupWizardError::Aborted) => Ok(()),
+        Err(error) => Err(EgoPulseError::from(error)),
+    }
 }
