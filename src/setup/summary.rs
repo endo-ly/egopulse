@@ -185,33 +185,37 @@ pub(crate) fn save_config(
         channels.remove(&web_key);
     }
 
+    let discord_key = crate::config::ChannelName::new("discord");
     if discord_enabled {
-        let discord_key = crate::config::ChannelName::new("discord");
-        if let Some(bots) = discord_bots {
-            channels.entry(discord_key).or_default().discord_bots = Some(bots);
-        } else if let Some(new_discord) = new_channels.get(&discord_key) {
-            channels.insert(discord_key, new_discord.clone());
+        if let Some(new_discord) = new_channels.get(&discord_key) {
+            channels.insert(discord_key.clone(), new_discord.clone());
         }
+        if let Some(bots) = discord_bots {
+            channels
+                .entry(discord_key.clone())
+                .or_default()
+                .discord_bots = Some(bots);
+        }
+    } else {
+        channels.remove(&discord_key);
     }
 
+    let telegram_key = crate::config::ChannelName::new("telegram");
     if telegram_enabled {
-        let telegram_key = crate::config::ChannelName::new("telegram");
         if let Some(telegram) = new_channels.get(&telegram_key) {
-            channels.insert(telegram_key, telegram.clone());
+            channels.insert(telegram_key.clone(), telegram.clone());
         }
+    } else {
+        channels.remove(&telegram_key);
     }
 
     let mut agents = existing_config
         .as_ref()
         .map(|c| c.agents.clone())
         .unwrap_or_default();
-    agents.insert(
-        crate::config::AgentId::new(&agent_id),
-        crate::config::AgentConfig {
-            label: inputs.agent_label.clone(),
-            ..Default::default()
-        },
-    );
+    let agent_key = crate::config::AgentId::new(&agent_id);
+    let agent = agents.entry(agent_key).or_default();
+    agent.label = inputs.agent_label.clone();
 
     let config = Config {
         default_provider: ProviderId::new(&provider_id),
@@ -824,6 +828,90 @@ channels:
         assert!(
             loaded.providers.contains_key(&ProviderId::new("openai")),
             "existing non-default provider must be preserved"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_preserves_existing_agent_provider_and_model() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: openai\n\
+             default_agent: partner\n\
+             providers:\n\
+             \x20 openai:\n\
+             \x20   label: OpenAI\n\
+             \x20   base_url: https://api.openai.com/v1\n\
+             \x20   default_model: gpt-4o\n\
+             agents:\n\
+             \x20 partner:\n\
+             \x20   label: Partner\n\
+             \x20   provider: openai\n\
+             \x20   model: gpt-4o\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let mut inputs = ollama_inputs("Partner");
+        inputs.provider_id = "openai".into();
+        inputs.base_url = "https://api.openai.com/v1".into();
+        inputs.model = "gpt-4o".into();
+        inputs.api_key = "sk-test".into();
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        let partner = loaded
+            .agents
+            .get(&AgentId::new("partner"))
+            .expect("partner exists");
+        assert_eq!(
+            partner.provider,
+            Some("openai".to_string()),
+            "existing agent provider must be preserved across re-setup"
+        );
+        assert_eq!(
+            partner.model,
+            Some("gpt-4o".to_string()),
+            "existing agent model must be preserved across re-setup"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_removes_disabled_discord_and_telegram() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: ollama\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             agents:\n\
+             \x20 default:\n\
+             \x20   label: Default\n\
+             channels:\n\
+             \x20 discord:\n\
+             \x20   enabled: true\n\
+             \x20 telegram:\n\
+             \x20   enabled: true\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let inputs = ollama_inputs("Partner");
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        let discord_key = crate::config::ChannelName::new("discord");
+        let telegram_key = crate::config::ChannelName::new("telegram");
+        assert!(
+            !loaded.channels.contains_key(&discord_key),
+            "disabled discord channel must be removed"
+        );
+        assert!(
+            !loaded.channels.contains_key(&telegram_key),
+            "disabled telegram channel must be removed"
         );
     }
 }
