@@ -27,6 +27,9 @@ pub enum EgoPulseError {
     #[error(transparent)]
     #[allow(private_interfaces)]
     Pulse(#[from] crate::pulse::definition::PulseParseError),
+    #[error(transparent)]
+    #[allow(private_interfaces)]
+    SetupWizard(#[from] crate::setup::SetupWizardError),
     #[error("shutdown_requested")]
     ShutdownRequested,
     #[error("internal_error: {0}")]
@@ -45,6 +48,7 @@ impl EgoPulseError {
             Self::Channel(_) => "channel",
             Self::Mcp(_) => "mcp",
             Self::Pulse(_) => "pulse",
+            Self::SetupWizard(_) => "setup",
             Self::ShutdownRequested => "shutdown",
             Self::Internal(_) => "internal",
         }

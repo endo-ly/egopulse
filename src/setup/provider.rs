@@ -1,5 +1,3 @@
-use super::{SelectorItem, SelectorState, SetupApp};
-
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderPreset {
     pub id: &'static str,
@@ -255,20 +253,6 @@ pub(crate) fn provider_label_for(provider: &str) -> String {
         .unwrap_or_else(|| provider.to_string())
 }
 
-pub(crate) fn provider_choices() -> String {
-    PROVIDER_PRESETS
-        .iter()
-        .map(|preset| {
-            if preset.models.is_empty() {
-                preset.id.to_string()
-            } else {
-                format!("{} (e.g. {})", preset.id, preset.models.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub(crate) fn normalize_provider_id(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -280,113 +264,21 @@ pub(crate) fn normalize_provider_id(raw: &str) -> String {
     trimmed.to_string()
 }
 
-pub(crate) fn provider_selector_items() -> Vec<SelectorItem> {
-    PROVIDER_PRESETS
-        .iter()
-        .map(|preset| SelectorItem {
-            display: format!("{} ({})", preset.id, preset_models_preview(preset)),
-            value: preset.id.to_string(),
-        })
-        .collect()
-}
-
-fn preset_models_preview(preset: &ProviderPreset) -> String {
-    if preset.models.len() <= 2 {
-        return preset.models.join(", ");
-    }
-
-    format!(
-        "{}, ... ({} total)",
-        preset.models[..2].join(", "),
-        preset.models.len()
-    )
-}
-
-pub(crate) fn model_selector_items(provider_id: &str) -> Vec<SelectorItem> {
-    find_provider_preset(provider_id)
-        .map(|preset| {
-            preset
-                .models
-                .iter()
-                .map(|model| SelectorItem {
-                    display: model.to_string(),
-                    value: model.to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-impl SetupApp {
-    pub(crate) fn enter_selector(&self, field_key: &str) -> SelectorState {
-        let items = match field_key {
-            "PROVIDER" => provider_selector_items(),
-            "MODEL" => model_selector_items(self.provider_field_value()),
-            _ => Vec::new(),
-        };
-        let original_value = self
-            .fields
-            .iter()
-            .find(|f| f.key == field_key)
-            .map(|f| f.value.clone())
-            .unwrap_or_default();
-        SelectorState {
-            field_key: field_key.to_string(),
-            filter: String::new(),
-            items,
-            selected: 0,
-            original_value,
-        }
-    }
-
-    pub(crate) fn apply_selector_selection(&mut self, field_key: &str) {
-        if field_key != "PROVIDER" {
-            return;
-        }
-
-        let Some(preset) = find_provider_preset(self.provider_field_value()) else {
-            return;
-        };
-
-        if let Some(model_field) = self.fields.iter_mut().find(|f| f.key == "MODEL") {
-            model_field.value = preset.default_model.to_string();
-        }
-        if let Some(url_field) = self.fields.iter_mut().find(|f| f.key == "BASE_URL") {
-            url_field.value = preset.default_base_url.to_string();
-        }
-    }
-
-    fn provider_field_value(&self) -> &str {
-        self.fields
-            .iter()
-            .find(|f| f.key == "PROVIDER")
-            .map(|f| f.value.as_str())
-            .unwrap_or("")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{model_selector_items, provider_selector_items};
-
     #[test]
-    fn provider_selector_items_includes_key_presets() {
-        let items = provider_selector_items();
-        assert!(!items.is_empty());
-        assert!(items.iter().any(|i| i.value == "openai"));
-        assert!(items.iter().any(|i| i.value == "lmstudio"));
+    fn find_provider_preset_matches_known_id() {
+        assert!(super::find_provider_preset("openai").is_some());
+        assert!(super::find_provider_preset("lmstudio").is_some());
     }
 
     #[test]
-    fn model_selector_items_returns_models_for_known_provider() {
-        let items = model_selector_items("openai");
-        assert!(!items.is_empty());
-        assert!(items.iter().any(|i| i.value == "gpt-5.2"));
+    fn find_provider_preset_returns_none_for_unknown() {
+        assert!(super::find_provider_preset("nonexistent").is_none());
     }
 
     #[test]
-    fn model_selector_items_returns_empty_for_unknown_provider() {
-        let items = model_selector_items("nonexistent");
-        assert!(items.is_empty());
+    fn normalize_provider_id_lowercases_known_preset() {
+        assert_eq!(super::normalize_provider_id("OpenAI"), "openai");
     }
 }

@@ -1,37 +1,8 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rand::RngExt;
-
-use super::Field;
-
-pub(crate) fn update_field_visibility(fields: &mut [Field]) {
-    let discord_enabled = fields
-        .iter()
-        .find(|f| f.key == "DISCORD_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    let telegram_enabled = fields
-        .iter()
-        .find(|f| f.key == "TELEGRAM_ENABLED")
-        .map(|f| super::parse_bool(&f.value).unwrap_or(false))
-        .unwrap_or(false);
-
-    for field in fields.iter_mut() {
-        match field.key.as_str() {
-            "DISCORD_BOT_TOKEN" => {
-                field.required = discord_enabled;
-            }
-            "TELEGRAM_BOT_TOKEN" => {
-                field.required = telegram_enabled;
-            }
-            _ => {}
-        }
-    }
-}
 
 pub(crate) fn load_channel_fields(
     channels: &yaml_serde::Value,
@@ -48,19 +19,6 @@ pub(crate) fn load_channel_fields(
     insert_telegram_bot_field(ch_map, "token", result, "TELEGRAM_BOT_TOKEN");
 }
 
-pub(crate) fn load_discord_default_bot_token(config_path: &Path) -> Option<String> {
-    let config = crate::config::Config::load_allow_missing_api_key(Some(config_path)).ok()?;
-    let token = config
-        .channels
-        .get("discord")?
-        .discord_bots
-        .as_ref()?
-        .get("default")?
-        .token
-        .as_ref()?;
-    Some(token.value().to_string())
-}
-
 pub(crate) fn extract_existing_state_root(
     original_yaml: &Option<yaml_serde::Value>,
 ) -> Option<String> {
@@ -73,6 +31,7 @@ pub(crate) fn extract_existing_state_root(
 }
 
 pub(crate) fn build_channel_configs(
+    web_enabled: bool,
     auth_token: String,
     discord_enabled: bool,
     telegram_enabled: bool,
@@ -85,17 +44,19 @@ pub(crate) fn build_channel_configs(
 
     let mut channels = HashMap::new();
 
-    channels.insert(
-        ChannelName::new("web"),
-        ChannelConfig {
-            enabled: Some(true),
-            host: Some("127.0.0.1".to_string()),
-            port: Some(10961),
-            auth_token: Some(env_resolved_value(WEB_AUTH_TOKEN_ENV_NAME, auth_token)),
-            file_auth_token: Some(env_yaml_value(WEB_AUTH_TOKEN_ENV_NAME)),
-            ..Default::default()
-        },
-    );
+    if web_enabled {
+        channels.insert(
+            ChannelName::new("web"),
+            ChannelConfig {
+                enabled: Some(true),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(10961),
+                auth_token: Some(env_resolved_value(WEB_AUTH_TOKEN_ENV_NAME, auth_token)),
+                file_auth_token: Some(env_yaml_value(WEB_AUTH_TOKEN_ENV_NAME)),
+                ..Default::default()
+            },
+        );
+    }
 
     if discord_enabled {
         channels.insert(
@@ -212,6 +173,7 @@ mod tests {
     #[test]
     fn build_channel_configs_stores_channel_secrets_as_env_refs() {
         let channels = build_channel_configs(
+            true,
             "web-token".to_string(),
             true,
             true,
@@ -236,5 +198,36 @@ mod tests {
             yaml_serde::to_string(default_bot.file_token.as_ref().expect("telegram file"))
                 .expect("serialize telegram file");
         assert!(telegram_file.contains("id: TELEGRAM_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn build_channel_configs_includes_web_when_enabled() {
+        let channels =
+            build_channel_configs(true, "web-token".to_string(), false, false, String::new());
+        assert!(channels.contains_key("web"));
+    }
+
+    #[test]
+    fn build_channel_configs_omits_web_when_disabled() {
+        let channels =
+            build_channel_configs(false, "web-token".to_string(), false, false, String::new());
+        assert!(
+            !channels.contains_key("web"),
+            "web entry must be absent when web_enabled is false"
+        );
+    }
+
+    #[test]
+    fn build_channel_configs_includes_discord_and_telegram_when_enabled() {
+        let channels = build_channel_configs(
+            false,
+            "web-token".to_string(),
+            true,
+            true,
+            "telegram-token".to_string(),
+        );
+        assert!(channels.contains_key("discord"));
+        assert!(channels.contains_key("telegram"));
+        assert!(!channels.contains_key("web"));
     }
 }

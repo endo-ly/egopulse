@@ -95,9 +95,7 @@ async fn run() -> Result<(), EgoPulseError> {
 
     // setup は設定ファイル未作成でも実行できるよう、通常の設定解決フローに入る前に分岐する。
     if matches!(cli.command, Some(Command::Setup)) {
-        return setup::run_setup_wizard(cli.config.clone())
-            .await
-            .map_err(EgoPulseError::Internal);
+        return setup::run_setup_wizard(cli.config.clone()).await;
     }
 
     match cli.command {
