@@ -123,7 +123,10 @@ pub(crate) fn save_config(
     // Ensure the user's chosen model is always in the models map.
     preset_models.entry(model.clone()).or_default();
 
-    let mut providers = HashMap::new();
+    let mut providers = existing_config
+        .as_ref()
+        .map(|c| c.providers.clone())
+        .unwrap_or_default();
     providers.insert(
         ProviderId::new(&provider_id),
         ProviderConfig {
@@ -160,7 +163,7 @@ pub(crate) fn save_config(
             None
         };
 
-    let mut channels = build_channel_configs(
+    let new_channels = build_channel_configs(
         inputs.web_enabled,
         auth_token,
         discord_enabled,
@@ -168,27 +171,57 @@ pub(crate) fn save_config(
         telegram_bot_token,
     );
 
-    if let Some(bots) = discord_bots {
-        channels
-            .entry(crate::config::ChannelName::new("discord"))
-            .or_default()
-            .discord_bots = Some(bots);
+    let mut channels = existing_config
+        .as_ref()
+        .map(|c| c.channels.clone())
+        .unwrap_or_default();
+
+    let web_key = crate::config::ChannelName::new("web");
+    if inputs.web_enabled {
+        if let Some(web) = new_channels.get(&web_key) {
+            channels.insert(web_key.clone(), web.clone());
+        }
+    } else {
+        channels.remove(&web_key);
     }
 
-    let agents: HashMap<crate::config::AgentId, crate::config::AgentConfig> = HashMap::from([(
+    if discord_enabled {
+        let discord_key = crate::config::ChannelName::new("discord");
+        if let Some(bots) = discord_bots {
+            channels.entry(discord_key).or_default().discord_bots = Some(bots);
+        } else if let Some(new_discord) = new_channels.get(&discord_key) {
+            channels.insert(discord_key, new_discord.clone());
+        }
+    }
+
+    if telegram_enabled {
+        let telegram_key = crate::config::ChannelName::new("telegram");
+        if let Some(telegram) = new_channels.get(&telegram_key) {
+            channels.insert(telegram_key, telegram.clone());
+        }
+    }
+
+    let mut agents = existing_config
+        .as_ref()
+        .map(|c| c.agents.clone())
+        .unwrap_or_default();
+    agents.insert(
         crate::config::AgentId::new(&agent_id),
         crate::config::AgentConfig {
             label: inputs.agent_label.clone(),
             ..Default::default()
         },
-    )]);
+    );
 
     let config = Config {
         default_provider: ProviderId::new(&provider_id),
         default_model: Some(model.clone()),
         providers,
         state_root: resolved_state_root.clone(),
-        log_level: "info".to_string(),
+        log_level: existing_config
+            .as_ref()
+            .map(|c| c.log_level.clone())
+            .unwrap_or_else(|| "info".to_string()),
         compaction_timeout_secs: existing_config
             .as_ref()
             .map(|c| c.compaction_timeout_secs)
@@ -280,24 +313,6 @@ pub(crate) fn save_config(
 
     if let Some(ref backup) = backup_path {
         completion_summary.push(format!("Previous config backed up to: {backup}"));
-    }
-
-    let existing_non_default = original_yaml
-        .and_then(|yaml| yaml.as_mapping())
-        .and_then(|m| m.get(yaml_serde::Value::String("agents".into())))
-        .and_then(|a| a.as_mapping())
-        .map(|m| {
-            m.keys()
-                .filter_map(|k| k.as_str())
-                .filter(|id| *id != agent_id)
-                .count()
-        })
-        .unwrap_or(0);
-    if existing_non_default > 0 {
-        completion_summary.push(format!(
-            "⚠ Existing {existing_non_default} custom agent(s) preserved in backup; \
-             re-add them to agents in config YAML if needed"
-        ));
     }
 
     Ok((backup_path, completion_summary))
@@ -463,8 +478,7 @@ mod tests {
     use std::path::Path;
 
     use super::{mask_secret, parse_existing_config, save_config};
-    use crate::config::AgentId;
-    use crate::config::Config;
+    use crate::config::{AgentId, Config, ProviderId};
     use crate::setup::inputs::SetupInputs;
     use serial_test::serial;
 
@@ -707,5 +721,109 @@ channels:
         let masked = mask_secret(short_secret);
 
         assert_eq!(masked, "********");
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_preserves_existing_non_default_agents() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: ollama\n\
+             default_agent: partner\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             agents:\n\
+             \x20 partner:\n\
+             \x20   label: Partner\n\
+             \x20 assistant:\n\
+             \x20   label: Assistant\n\
+             \x20 researcher:\n\
+             \x20   label: Researcher\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let inputs = ollama_inputs("Partner");
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        assert!(loaded.agents.contains_key(&AgentId::new("partner")));
+        assert!(
+            loaded.agents.contains_key(&AgentId::new("assistant")),
+            "existing non-default agent must be preserved"
+        );
+        assert!(
+            loaded.agents.contains_key(&AgentId::new("researcher")),
+            "existing non-default agent must be preserved"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_preserves_existing_log_level() {
+        // SAFETY: テストは #[serial] で直列実行され、他テストは LOG_LEVEL に依存しない。
+        unsafe {
+            std::env::remove_var("LOG_LEVEL");
+        }
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: ollama\n\
+             log_level: debug\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             agents:\n\
+             \x20 default:\n\
+             \x20   label: Default\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let inputs = ollama_inputs("Partner");
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        assert_eq!(
+            loaded.log_level, "debug",
+            "existing log_level must be preserved across re-setup"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_preserves_existing_non_default_providers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: ollama\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             \x20 openai:\n\
+             \x20   label: OpenAI\n\
+             \x20   base_url: https://api.openai.com/v1\n\
+             \x20   default_model: gpt-4o\n\
+             agents:\n\
+             \x20 default:\n\
+             \x20   label: Default\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let inputs = ollama_inputs("Partner");
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        assert!(loaded.providers.contains_key(&ProviderId::new("ollama")));
+        assert!(
+            loaded.providers.contains_key(&ProviderId::new("openai")),
+            "existing non-default provider must be preserved"
+        );
     }
 }
