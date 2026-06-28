@@ -98,10 +98,12 @@ Plan には以下をこの順序で含める。詳細な書式は [assets/plan-t
 9. Step N+1: 動作確認
 10. Step N+2: Plan・仕様書との自己チェック
 11. Step N+3: PR 作成
-12. 変更ファイル一覧
-13. コミット分割
-14. 自動テスト一覧
-15. 工数見積もり
+12. Step N+4: 初回レビューバック
+13. Step N+5: レビュー対応後の再レビューバック
+14. 変更ファイル一覧
+15. コミット分割
+16. 自動テスト一覧
+17. 工数見積もり
 
 ## 品質チェック
 
@@ -111,5 +113,7 @@ Plan 完成前に以下を確認する。
 - Plan スコープに `WT作成 → 実装(TDD) → コミット(意味ごとに分離) → PR作成` が含まれている
 - テストリスト、TDD Cycle、自動テスト一覧の対応が崩れていない
 - 動作確認後、PR 作成前に Plan と関連仕様書を読み直し、実装・テスト・文書の差分を自己チェックする Step がある
+- PR 作成後に `sleep 15m` して `pr-review-back-workflow` Skill を実行する Step がある。レビューがまだ無い場合は `sleep 5m` して再実行し、最大 2 回まで追加待機する
+- レビュー対応を push した後に、再度 `sleep 15m` して `pr-review-back-workflow` Skill を実行する Step がある。レビューがまだ無い場合は `sleep 5m` して再実行し、最大 2 回まで追加待機する
 - Rust 実装なら `cargo fmt --check`, `cargo test`, `cargo check`, `cargo clippy --all-targets --all-features -- -D warnings` が動作確認に含まれている
 - 関連 docs がある場合、更新対象に含まれている

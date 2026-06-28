@@ -459,6 +459,110 @@ Content-Type: application/json
 
 ---
 
+### 2.8 Sleep Batch
+
+Sleep Batch の実行履歴とメモリ変更差分を確認するためのエンドポイント。
+
+#### Agent 一覧
+
+```text
+GET /api/agents
+```
+
+Sleep Batch 実行履歴がある agent ID の一覧を返す。
+
+##### レスポンス (200)
+
+```json
+{
+  "ok": true,
+  "agents": ["default", "alice"]
+}
+```
+
+---
+
+#### Sleep Run 一覧
+
+```text
+GET /api/sleep/runs?agent_id={agent_id}&limit={limit}
+```
+
+##### クエリパラメータ
+
+| パラメータ | 必須 | デフォルト | 説明 |
+|-----------|:---:|----------|------|
+| `agent_id` | 必須 | — | エージェント ID |
+| `limit` | 任意 | `20` | 最大取得件数 |
+
+##### レスポンス (200)
+
+```json
+{
+  "ok": true,
+  "runs": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "agent_id": "default",
+      "status": "success",
+      "trigger_type": "scheduled",
+      "started_at": "2026-06-01T04:00:00+09:00",
+      "finished_at": "2026-06-01T04:02:30+09:00",
+      "input_tokens": 15000,
+      "output_tokens": 5000,
+      "session_count": 3
+    }
+  ]
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `status` | `string` | `running`, `success`, `partial_failure`, `failed`, `skipped` |
+| `trigger_type` | `string` | `manual`, `scheduled`, `backfill` |
+| `session_count` | `number` | `source_chats_json` から算出した対象セッション数 |
+
+---
+
+#### Sleep Run 詳細
+
+```text
+GET /api/sleep/runs/{run_id}
+```
+
+##### レスポンス (200)
+
+```json
+{
+  "ok": true,
+  "run": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "agent_id": "default",
+    "status": "success",
+    "trigger_type": "scheduled",
+    "started_at": "2026-06-01T04:00:00+09:00",
+    "finished_at": "2026-06-01T04:02:30+09:00",
+    "input_tokens": 15000,
+    "output_tokens": 5000,
+    "error_message": null
+  },
+  "snapshots": [
+    {
+      "file": "semantic",
+      "content_before": "# Semantic\n\n- fact A",
+      "content_after": "# Semantic\n\n- fact A\n- fact B"
+    }
+  ]
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `run` | `object` | sleep_runs テーブルの内容 |
+| `snapshots` | `array` | この run で変更された memory_snapshots（`content_before` ≠ `content_after` のもの）。ファイルは `episodic`, `semantic`, `prospective` |
+
+---
+
 ## 3. WebSocket
 
 ### 接続
