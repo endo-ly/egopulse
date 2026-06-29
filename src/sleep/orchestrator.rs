@@ -1803,23 +1803,20 @@ fn archive_and_clear_session(
     Ok(())
 }
 
-/// Builds the replacement `messages_json` payload for a sleep-batch session
-/// truncate: keeps the trailing `keep` messages, or returns the input
-/// unchanged when it already fits. Falls back to `"[]"` on missing/empty
-/// input or (defensively) on serialization failure.
+/// Sleep-batch session truncate: keeps the trailing `keep` user/assistant
+/// text messages, dropping any `tool` role and any `assistant` with
+/// `tool_calls`.
 fn truncate_messages_json(messages_json: Option<&str>, keep: usize) -> String {
     let Some(json) = messages_json else {
         return "[]".to_string();
     };
     let messages = parse_messages_json(json);
-    if messages.is_empty() {
-        return "[]".to_string();
-    }
-    if messages.len() <= keep {
-        return json.to_string();
-    }
-    let start = messages.len() - keep;
-    serde_json::to_string(&messages[start..]).unwrap_or_else(|_| "[]".to_string())
+    let retained: Vec<&Message> = messages
+        .iter()
+        .filter(|message| message.role != "tool" && message.tool_calls.is_empty())
+        .collect();
+    let start = retained.len().saturating_sub(keep);
+    serde_json::to_string(&retained[start..]).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn parse_messages_json(json: &str) -> Vec<Message> {
@@ -3146,5 +3143,58 @@ mod tests {
     #[test]
     fn truncate_messages_json_returns_empty_for_empty_input() {
         assert_eq!(truncate_messages_json(Some("[]"), 4), "[]");
+    }
+
+    #[test]
+    fn truncate_messages_json_excludes_tool_role() {
+        let json = r#"[
+            {"role":"user","content":"m1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"tool","content":"result","tool_call_id":"call_x"},
+            {"role":"user","content":"m2"},
+            {"role":"assistant","content":"a2"}
+        ]"#;
+        let result = truncate_messages_json(Some(json), 4);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed.len(), 4);
+        assert!(parsed.iter().all(|m| m["role"] != "tool"));
+    }
+
+    #[test]
+    fn truncate_messages_json_excludes_assistant_with_tool_calls() {
+        let json = r#"[
+            {"role":"user","content":"m1"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"call_x","name":"read","arguments":{}}]},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"m2"},
+            {"role":"assistant","content":"a2"}
+        ]"#;
+        let result = truncate_messages_json(Some(json), 4);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed.len(), 4);
+        assert!(parsed.iter().all(|m| m["tool_calls"].as_array().is_none()));
+    }
+
+    #[test]
+    fn truncate_messages_json_keeps_last_n_after_filtering_tool() {
+        let json = r#"[
+            {"role":"user","content":"u1"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"c1","name":"read","arguments":{}}]},
+            {"role":"tool","content":"r1","tool_call_id":"c1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"u2"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"c2","name":"read","arguments":{}}]},
+            {"role":"tool","content":"r2","tool_call_id":"c2"},
+            {"role":"assistant","content":"a2"},
+            {"role":"user","content":"u3"},
+            {"role":"assistant","content":"a3"}
+        ]"#;
+        let result = truncate_messages_json(Some(json), 4);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0]["content"], "u2");
+        assert_eq!(parsed[1]["content"], "a2");
+        assert_eq!(parsed[2]["content"], "u3");
+        assert_eq!(parsed[3]["content"], "a3");
     }
 }
