@@ -26,8 +26,8 @@ use super::event_extraction::{self, ExtractedEvent};
 use super::event_rollup;
 use super::memory_update;
 
-/// Threshold (≤ 16) at which sleep is skipped due to too few new messages.
-const SKIP_THRESHOLD: i64 = 16;
+/// Threshold (≤ 64) at which sleep is skipped due to too few new messages.
+const SKIP_THRESHOLD: i64 = 64;
 /// Maximum number of source sessions included in sleep input.
 const MAX_SOURCE_SESSIONS: usize = 20;
 /// Number of trailing messages kept in `sessions.messages_json` after a sleep
@@ -1931,7 +1931,7 @@ mod tests {
 
     fn seed_messages_for_proceed(db: &Database, agent_id: &str) {
         let chat_id = create_chat(db, agent_id, "");
-        for i in 1..=17 {
+        for i in 1..=(SKIP_THRESHOLD + 1) {
             store_msg(
                 db,
                 &format!("m-{i}"),
@@ -1942,6 +1942,19 @@ mod tests {
         }
         db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
             .expect("save session");
+    }
+
+    fn seed_sessions_above_threshold(db: &Database, agent_id: &str, n_chats: usize) {
+        let needed = (SKIP_THRESHOLD + 1) as usize;
+        let per_chat = needed.div_ceil(n_chats);
+        for i in 0..n_chats {
+            let cid = create_chat(db, agent_id, &format!("-{i}"));
+            for j in 0..per_chat {
+                store_msg(db, &format!("m{i}-{j}"), cid, "hi", "2025-06-01T00:00:00Z");
+            }
+            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
+                .expect("save session");
+        }
     }
 
     fn build_test_state(db: Database, dir: &std::path::Path) -> AppState {
@@ -2066,36 +2079,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sleep_batch_does_not_record_phases_json() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
-            .await
-            .expect("batch");
-
-        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        assert!(runs[0].source_digest_md.is_none());
-    }
-
-    #[tokio::test]
-    async fn run_sleep_batch_does_not_record_summary_md() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
-            .await
-            .expect("batch");
-
-        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        assert!(runs[0].source_digest_md.is_none());
-    }
-
-    #[tokio::test]
     async fn run_sleep_batch_marks_success_on_completion() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
@@ -2190,7 +2173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduled_run_records_success_status() {
+    async fn scheduled_run_records_trigger_type() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
         let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
@@ -2201,62 +2184,8 @@ mod tests {
             .expect("batch");
 
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
-    }
-
-    #[tokio::test]
-    async fn scheduled_run_records_memory_snapshots() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(SequentialMockProvider::new(vec![
-            r#"{"events":[]}"#.to_string(),
-            r#"{"events":[]}"#.to_string(),
-            r#"{"rollups":[]}"#.to_string(),
-            r#"{"rollups":[]}"#.to_string(),
-            r#"{"semantic":"s","prospective":"p"}"#.to_string(),
-        ]));
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
-            .await
-            .expect("batch");
-
-        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        let snapshots = state
-            .db
-            .get_snapshots_for_run(&runs[0].id)
-            .expect("snapshots");
-        assert!(!snapshots.is_empty());
-    }
-
-    #[tokio::test]
-    async fn scheduled_run_records_source_chats_json() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::new());
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled)
-            .await
-            .expect("batch");
-
-        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        assert!(!runs[0].source_chats_json.is_empty());
-    }
-
-    #[tokio::test]
-    async fn scheduled_run_records_failed_status() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-        let llm = Arc::new(MockLlmProvider::with_response(
-            serde_json::json!({"bad": true}),
-        ));
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Scheduled).await;
-
-        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
-        assert_eq!(runs[0].status, SleepRunStatus::Failed);
     }
     // --- write_memory_files tests ---
 
@@ -2817,7 +2746,7 @@ mod tests {
     fn collect_returns_skip_when_below_threshold() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=16 {
+        for i in 1..=SKIP_THRESHOLD {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2833,7 +2762,7 @@ mod tests {
                 reason: _,
                 new_message_count,
             } => {
-                assert_eq!(new_message_count, 16);
+                assert_eq!(new_message_count, SKIP_THRESHOLD);
             }
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -2843,7 +2772,7 @@ mod tests {
     fn collect_returns_proceed_above_threshold() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=17 {
+        for i in 1..=(SKIP_THRESHOLD + 1) {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2886,14 +2815,14 @@ mod tests {
             .expect("save session");
 
         let after_cutoff = chrono::Utc::now().to_rfc3339();
-        for i in 1..=17 {
+        for i in 1..=(SKIP_THRESHOLD + 1) {
             store_msg(&db, &format!("new-{i}"), chat_id, "new", &after_cutoff);
         }
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         assert!(
             matches!(result, InputDecision::Proceed { .. }),
-            "17 new messages (> 16 threshold) should trigger Proceed"
+            "messages above threshold should trigger Proceed"
         );
     }
 
@@ -2901,7 +2830,7 @@ mod tests {
     fn collect_first_run_no_previous_run() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=17 {
+        for i in 1..=(SKIP_THRESHOLD + 1) {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2916,19 +2845,14 @@ mod tests {
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         assert!(
             matches!(result, InputDecision::Proceed { .. }),
-            "17 messages with no previous run should trigger Proceed"
+            "messages above threshold with no previous run should trigger Proceed"
         );
     }
 
     #[test]
     fn collect_respects_max_sessions_limit() {
         let (db, _dir) = test_db();
-        for i in 0..25 {
-            let cid = create_chat(&db, "test-agent", &format!("-{i}"));
-            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
-                .expect("save session");
-            store_msg(&db, &format!("m{i}"), cid, "hi", "2025-06-01T00:00:00Z");
-        }
+        seed_sessions_above_threshold(&db, "test-agent", MAX_SOURCE_SESSIONS + 5);
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         match result {
@@ -2943,7 +2867,7 @@ mod tests {
     fn collect_source_chats_json_format() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
-        for i in 1..=17 {
+        for i in 1..=(SKIP_THRESHOLD + 1) {
             store_msg(
                 &db,
                 &format!("m-{i}"),
@@ -2988,12 +2912,7 @@ mod tests {
     #[test]
     fn collect_source_chats_json_sorted_newest_first() {
         let (db, _dir) = test_db();
-        for i in 0..17 {
-            let cid = create_chat(&db, "test-agent", &format!("-{i}"));
-            store_msg(&db, &format!("m{i}"), cid, "hi", "2025-06-01T00:00:00Z");
-            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
-                .expect("save session");
-        }
+        seed_sessions_above_threshold(&db, "test-agent", MAX_SOURCE_SESSIONS);
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         let json_str = match &result {

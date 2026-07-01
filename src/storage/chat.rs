@@ -536,22 +536,11 @@ mod tests {
     }
 
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
-        store_msg_with_kind(db, id, chat_id, content, "user", ts);
-    }
-
-    fn store_msg_with_kind(
-        db: &Database,
-        id: &str,
-        chat_id: i64,
-        content: &str,
-        sender_kind: &str,
-        ts: &str,
-    ) {
         let conn = db.get_conn().expect("pool");
         conn.execute(
                 "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, chat_id, "alice", content, sender_kind, ts, "message"],
+                rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
             )
             .expect("store message");
     }
@@ -950,25 +939,6 @@ mod tests {
             .count_agent_messages_since("agent-a", None)
             .expect("count");
         assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn count_agent_messages_since_excludes_tool_and_system() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:kind-filter", None, "cli", "agent-a")
-            .expect("create chat");
-
-        store_msg_with_kind(&db, "u1", chat_id, "u", "user", "2024-01-01T00:00:00Z");
-        store_msg_with_kind(&db, "a1", chat_id, "a", "assistant", "2024-01-01T00:00:01Z");
-        store_msg_with_kind(&db, "t1", chat_id, "t", "tool", "2024-01-01T00:00:02Z");
-        store_msg_with_kind(&db, "s1", chat_id, "s", "system", "2024-01-01T00:00:03Z");
-
-        let count = db
-            .count_agent_messages_since("agent-a", None)
-            .expect("count");
-        assert_eq!(count, 2, "only user + assistant should be counted");
     }
 
     #[test]

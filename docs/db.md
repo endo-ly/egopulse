@@ -200,7 +200,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
 - `resolve_or_create_chat_id(channel, external_chat_id, chat_title, chat_type)` — Upsert（`ON CONFLICT DO UPDATE`）
 - `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
-- `count_agent_messages_since(agent_id, since: Option<&str>)` — agent の新規メッセージ数をカウント（JOIN messages + chats）。`sender_kind IN ('user', 'assistant')` で絞り込み、tool 出力・system イベントは対象外
+- `count_agent_messages_since(agent_id, since: Option<&str>)` — agent の新規メッセージ数をカウント（JOIN messages + chats）
 - `get_agent_sessions_since(agent_id, since: Option<&str>, limit)` — agent のセッション一覧を updated_at 降順で取得（JOIN chats + sessions）。message_count と estimated_tokens（chars/3 近似）を含む
 
 #### Channel Log (Multi-Agent Room)
