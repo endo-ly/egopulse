@@ -1,0 +1,1162 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EgoPulse WebUI — Mockup</title>
+    <style>
+      :root {
+        --bg: #040812;
+        --panel: #081020;
+        --panel-2: #0e1830;
+        --panel-hover: #142244;
+        --border: rgba(0, 212, 255, 0.1);
+        --border-strong: rgba(0, 212, 255, 0.22);
+        --text: #dce4f0;
+        --text-strong: #f4f7fc;
+        --muted: #6b7fa8;
+        --muted-2: #4b5e80;
+        --accent: #00d4ff;
+        --accent-2: #c084fc;
+        --accent-2-soft: rgba(192, 132, 252, 0.08);
+        --danger: #f87171;
+        --danger-soft: rgba(248, 113, 113, 0.08);
+        --success: #5ceaff;
+        --success-soft: rgba(92, 234, 255, 0.08);
+        --warning: #fbbf24;
+        --warning-soft: rgba(251, 191, 36, 0.08);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        background: radial-gradient(
+            circle at top left,
+            rgba(0, 212, 255, 0.06),
+            transparent 32%
+          ),
+          linear-gradient(180deg, #060a14 0%, #030508 100%);
+        color: var(--text);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      button {
+        font: inherit;
+        cursor: pointer;
+        color: inherit;
+      }
+      kbd {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 1px 6px;
+        color: var(--muted);
+      }
+
+      /* === App Shell === */
+      .app-shell {
+        display: grid;
+        grid-template-columns: 260px 1fr;
+        grid-template-rows: 56px 1fr;
+        grid-template-areas:
+          "sidebar topbar"
+          "sidebar main";
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      /* === Sidebar === */
+      .sidebar {
+        grid-area: sidebar;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 16px 20px;
+        background: rgba(8, 16, 32, 0.85);
+        backdrop-filter: blur(20px);
+        border-right: 1px solid var(--border);
+        overflow: hidden;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 56px;
+      }
+      .brand-logo {
+        width: 40px;
+        height: 40px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+        color: var(--bg);
+      }
+      .brand-text h1 {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.2;
+        color: var(--text-strong);
+      }
+      .brand-text p {
+        margin: 2px 0 0;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .section-title {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 8px;
+      }
+
+      .agents-list {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .agent-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: 14px;
+        border: 1px solid transparent;
+        background: transparent;
+        width: 100%;
+        text-align: left;
+        color: var(--text);
+        font-size: 14px;
+      }
+      .agent-item:hover {
+        background: var(--panel-hover);
+      }
+      .agent-item.active {
+        background: var(--panel);
+        border-color: rgba(192, 132, 252, 0.45);
+        box-shadow: 0 0 0 1px rgba(192, 132, 252, 0.18) inset;
+        color: var(--text-strong);
+      }
+      .agent-tag {
+        margin-left: auto;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        padding: 2px 8px;
+        background: var(--panel-2);
+        border-radius: 999px;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .dot-live {
+        background: var(--accent);
+        animation: pulse 1.6s ease-in-out infinite;
+        box-shadow: 0 0 0 0 rgba(0, 212, 255, 0.6);
+      }
+      .dot-idle {
+        background: var(--muted-2);
+      }
+      .dot-error {
+        background: var(--danger);
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 rgba(0, 212, 255, 0.6);
+        }
+        50% {
+          box-shadow: 0 0 0 6px rgba(0, 212, 255, 0);
+        }
+      }
+
+      .sessions-section {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .sessions-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .sessions-filter {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        color: var(--text);
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 8px;
+      }
+      .session-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        overflow-y: auto;
+        flex: 1;
+      }
+      .session-item {
+        width: 100%;
+        text-align: left;
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(8, 16, 32, 0.8);
+        color: var(--text);
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .session-item:hover {
+        transform: translateY(-1px);
+        filter: brightness(1.06);
+      }
+      .session-item.active {
+        border-color: rgba(192, 132, 252, 0.45);
+        background: rgba(192, 132, 252, 0.06);
+      }
+      .session-top {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .session-label {
+        font-weight: 600;
+        color: var(--text-strong);
+        font-size: 13px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .badge {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 2px 6px;
+        border-radius: 6px;
+        background: var(--panel-2);
+        color: var(--muted);
+      }
+      .session-preview {
+        font-size: 11px;
+        color: var(--muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .new-session {
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--text);
+        text-align: center;
+        font-weight: 500;
+      }
+      .new-session:hover {
+        background: var(--panel-hover);
+      }
+
+      .runtime-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        color: var(--muted);
+        padding-top: 12px;
+        border-top: 1px solid var(--border);
+      }
+
+      /* === Top Bar === */
+      .topbar {
+        grid-area: topbar;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 0 20px;
+        background: rgba(6, 10, 22, 0.5);
+        backdrop-filter: blur(16px);
+        border-bottom: 1px solid var(--border);
+      }
+      .palette-trigger {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 13px;
+        min-width: 280px;
+      }
+      .palette-trigger:hover {
+        background: var(--panel-hover);
+      }
+      .palette-trigger kbd {
+        margin-left: auto;
+      }
+      .tabs {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        flex: 1;
+      }
+      .tab {
+        padding: 8px 14px;
+        border-radius: 8px;
+        font-size: 13px;
+        color: var(--muted);
+        background: transparent;
+        border: none;
+      }
+      .tab:hover {
+        color: var(--text);
+      }
+      .tab.active {
+        color: var(--text-strong);
+        box-shadow: inset 0 -2px 0 var(--accent);
+      }
+      .tab.disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .tab-badge {
+        display: inline-block;
+        margin-left: 6px;
+        font-size: 9px;
+        background: var(--panel-2);
+        color: var(--muted);
+        padding: 1px 5px;
+        border-radius: 4px;
+        text-transform: uppercase;
+      }
+      .health-badge {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: var(--success-soft);
+        color: var(--success);
+        font-size: 12px;
+      }
+
+      /* === Main / Chat Tab === */
+      .main {
+        grid-area: main;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        overflow: hidden;
+        min-height: 0;
+      }
+      .chat-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 16px 24px;
+        border-bottom: 1px solid var(--border);
+      }
+      .chat-header-info {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .chat-header-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .chat-header-title h2 {
+        margin: 0;
+        font-size: 16px;
+        color: var(--text-strong);
+      }
+      .chat-header-meta {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .chat-header-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .icon-button {
+        width: 32px;
+        height: 32px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+      }
+      .icon-button:hover {
+        background: var(--panel-hover);
+      }
+
+      .timeline {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        overflow-y: auto;
+        padding: 24px;
+      }
+      .bubble {
+        max-width: min(760px, 78%);
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        background: rgba(8, 16, 32, 0.85);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .bubble-user {
+        align-self: flex-end;
+        border-color: rgba(192, 132, 252, 0.18);
+        background: var(--accent-2-soft);
+      }
+      .bubble-assistant {
+        align-self: flex-start;
+      }
+      .bubble-meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+      }
+      .bubble-sender {
+        font-weight: 600;
+        color: var(--text-strong);
+      }
+      .bubble-time {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .pulse-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(0, 212, 255, 0.1);
+        color: var(--accent);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .bubble-content {
+        font-size: 14px;
+        line-height: 1.6;
+        color: var(--text);
+      }
+      .bubble-content p {
+        margin: 0 0 8px;
+      }
+      .bubble-content p:last-child {
+        margin-bottom: 0;
+      }
+      .bubble-content code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        background: rgba(0, 0, 0, 0.3);
+        padding: 1px 6px;
+        border-radius: 4px;
+      }
+      .bubble-content pre {
+        background: rgba(0, 0, 0, 0.3);
+        padding: 12px;
+        border-radius: 8px;
+        overflow-x: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        margin: 8px 0;
+      }
+
+      /* Tool card */
+      .tool-card {
+        align-self: flex-start;
+        max-width: min(760px, 78%);
+        margin-left: 32px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: var(--panel-2);
+        overflow: hidden;
+      }
+      .tool-card-header {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: transparent;
+        border: none;
+        color: var(--text);
+        font-size: 13px;
+        text-align: left;
+      }
+      .tool-card-header:hover {
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .tool-card-name {
+        font-weight: 600;
+        color: var(--text-strong);
+      }
+      .tool-card-summary {
+        color: var(--muted);
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .tool-card-badge {
+        margin-left: auto;
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: var(--success-soft);
+        color: var(--success);
+      }
+      .tool-card-badge.error {
+        background: var(--danger-soft);
+        color: var(--danger);
+      }
+
+      .streaming-cursor {
+        display: inline-block;
+        width: 8px;
+        height: 16px;
+        background: var(--accent);
+        margin-left: 2px;
+        vertical-align: text-bottom;
+        animation: blink 0.8s steps(2) infinite;
+      }
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      /* Composer */
+      .composer {
+        padding: 16px 24px;
+        border-top: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .composer-wrapper {
+        position: relative;
+      }
+      .composer textarea {
+        width: 100%;
+        min-height: 56px;
+        max-height: 160px;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--text);
+        font: inherit;
+        resize: none;
+      }
+      .composer textarea:focus {
+        outline: none;
+        border-color: var(--border-strong);
+      }
+      .composer-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .composer-hint {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .btn-primary {
+        background: var(--accent-2);
+        color: var(--bg);
+        border: none;
+        border-radius: 14px;
+        padding: 10px 18px;
+        font-weight: 700;
+        font-size: 13px;
+      }
+      .btn-primary:hover {
+        filter: brightness(1.06);
+      }
+      .btn-primary:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* Read-only banner (alternative to composer) */
+      .readonly-banner {
+        margin: 16px 24px;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        background: var(--panel-2);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .readonly-icon {
+        font-size: 20px;
+      }
+      .readonly-text-strong {
+        color: var(--text-strong);
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .readonly-text-muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      /* Command palette overlay */
+      .palette-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(3, 5, 12, 0.85);
+        display: none;
+        align-items: flex-start;
+        justify-content: center;
+        padding-top: 12vh;
+        z-index: 50;
+      }
+      .palette-overlay.open {
+        display: flex;
+      }
+      .palette {
+        width: min(640px, 90vw);
+        max-height: 70vh;
+        background: linear-gradient(
+          to bottom,
+          rgba(10, 16, 30, 0.98),
+          rgba(6, 10, 20, 0.98)
+        );
+        border: 1px solid var(--border-strong);
+        border-radius: 28px;
+        box-shadow: 0 28px 60px rgba(0, 0, 0, 0.3);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .palette-input-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--border);
+      }
+      .palette-input {
+        flex: 1;
+        background: transparent;
+        border: none;
+        color: var(--text);
+        font-size: 15px;
+        outline: none;
+      }
+      .palette-results {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px;
+      }
+      .palette-section + .palette-section {
+        margin-top: 12px;
+      }
+      .palette-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 12px;
+        border-radius: 10px;
+        color: var(--text);
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .palette-item:hover,
+      .palette-item.active {
+        background: var(--panel-2);
+        color: var(--text-strong);
+      }
+      .palette-item kbd {
+        margin-left: auto;
+      }
+
+      .hint-bar {
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 12px;
+        color: var(--muted);
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        z-index: 10;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-logo">◆</div>
+          <div class="brand-text">
+            <h1>EgoPulse</h1>
+            <p>v0.1.0</p>
+          </div>
+        </div>
+
+        <div>
+          <p class="section-title">Agents</p>
+          <div class="agents-list">
+            <button class="agent-item active" data-session-picker>
+              <span class="dot dot-live"></span>
+              <span>lyre</span>
+              <span class="agent-tag">default</span>
+            </button>
+            <button class="agent-item">
+              <span class="dot dot-idle"></span>
+              <span>ace</span>
+            </button>
+            <button class="agent-item">
+              <span class="dot dot-idle"></span>
+              <span>vega</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="sessions-section">
+          <div class="sessions-header">
+            <p class="section-title" style="margin: 0">Sessions</p>
+            <select class="sessions-filter">
+              <option>All</option>
+              <option>Web</option>
+              <option>Discord</option>
+              <option>Telegram</option>
+              <option>CLI</option>
+              <option>TUI</option>
+            </select>
+          </div>
+          <div class="session-list">
+            <button
+              class="session-item active"
+              data-target-session="web-chat"
+            >
+              <div class="session-top">
+                <span class="session-label">Web Chat</span>
+                <span class="badge">web</span>
+              </div>
+              <div class="session-preview">
+                今日のタスク確認したいんですけど…
+              </div>
+            </button>
+            <button
+              class="session-item"
+              data-target-session="discord-dev"
+            >
+              <div class="session-top">
+                <span class="session-label">Dev #general</span>
+                <span class="badge">discord</span>
+              </div>
+              <div class="session-preview">design discussion about…</div>
+            </button>
+            <button class="session-item">
+              <div class="session-top">
+                <span class="session-label">Morning notes</span>
+                <span class="badge">cli</span>
+              </div>
+              <div class="session-preview">昨日の振り返りを…</div>
+            </button>
+            <button class="session-item">
+              <div class="session-top">
+                <span class="session-label">Quick test</span>
+                <span class="badge">tui</span>
+              </div>
+              <div class="session-preview">proto 動かない…</div>
+            </button>
+          </div>
+          <button class="new-session">+ New Session</button>
+        </div>
+
+        <div class="runtime-status">
+          <span class="dot dot-live"></span>
+          <span>ok · 2 turns live</span>
+        </div>
+      </aside>
+
+      <header class="topbar">
+        <button
+          class="palette-trigger"
+          id="palette-trigger"
+          aria-label="Open command palette"
+        >
+          <span>🔍</span>
+          <span>Search or jump…</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <nav class="tabs">
+          <button class="tab active">Chat</button>
+          <button class="tab disabled">
+            Sleep <span class="tab-badge">Phase 2</span>
+          </button>
+          <button class="tab disabled">
+            Pulse <span class="tab-badge">Phase 2</span>
+          </button>
+          <button class="tab disabled">
+            Metrics <span class="tab-badge">Phase 2</span>
+          </button>
+          <button class="tab disabled">
+            Config <span class="tab-badge">Phase 2</span>
+          </button>
+        </nav>
+        <div class="health-badge">
+          <span class="dot dot-live"></span>
+          <span>3/3 channels · 2 MCP</span>
+        </div>
+      </header>
+
+      <main class="main" id="main-area">
+        <div class="chat-header">
+          <div class="chat-header-info">
+            <div class="chat-header-title">
+              <h2 id="session-title">Web Chat</h2>
+              <span class="badge" id="session-channel">web</span>
+            </div>
+            <p class="chat-header-meta" id="session-meta">
+              Started 2026-07-01 14:32 · 12 messages
+            </p>
+          </div>
+          <div class="chat-header-actions">
+            <button class="icon-button" aria-label="Refresh">↻</button>
+            <button class="icon-button" aria-label="More">⋯</button>
+          </div>
+        </div>
+
+        <section class="timeline" id="timeline">
+          <article class="bubble bubble-user">
+            <div class="bubble-meta">
+              <span class="bubble-sender">You</span>
+              <span class="bubble-time">14:32</span>
+            </div>
+            <div class="bubble-content">
+              <p>今日のタスク確認したいんですけど、tasks.md 読んでくれる？</p>
+            </div>
+          </article>
+
+          <article class="bubble bubble-assistant">
+            <div class="bubble-meta">
+              <span class="bubble-sender">lyre</span>
+              <span class="bubble-time">14:32</span>
+            </div>
+            <div class="bubble-content">
+              <p>はい、確認します。</p>
+            </div>
+          </article>
+
+          <div class="tool-card">
+            <button class="tool-card-header">
+              <span>🔧</span>
+              <span class="tool-card-name">read</span>
+              <span class="tool-card-summary">tasks.md</span>
+              <span class="tool-card-badge">120ms</span>
+            </button>
+          </div>
+
+          <article class="bubble bubble-assistant">
+            <div class="bubble-meta">
+              <span class="bubble-sender">lyre</span>
+              <span class="bubble-time">14:33</span>
+            </div>
+            <div class="bubble-content">
+              <p>
+                今日のタスクは以下の3つです。コードレビュー、設計ミーティング、ドキュメント更新。
+              </p>
+              <p>
+                進め方は<code>git pull</code>して最新を確認するのがよさそうです。
+              </p>
+              <pre><code>$ git pull origin main
+$ npm test</code></pre>
+            </div>
+          </article>
+
+          <article class="bubble bubble-assistant">
+            <div class="bubble-meta">
+              <span class="bubble-sender">Pulse · lyre</span>
+              <span class="pulse-badge" title="intention: morning_review · 09:00">◴ Pulse</span>
+              <span class="bubble-time">09:00</span>
+            </div>
+            <div class="bubble-content">
+              <p>
+                おはようございます。今日のMTGは10時からです。議題は昨日の設計レビュー。
+              </p>
+            </div>
+          </article>
+
+          <article class="bubble bubble-user">
+            <div class="bubble-meta">
+              <span class="bubble-sender">You</span>
+              <span class="bubble-time">14:35</span>
+            </div>
+            <div class="bubble-content">
+              <p>MTG の議題、整理しておいてくれる？</p>
+            </div>
+          </article>
+
+          <article class="bubble bubble-assistant">
+            <div class="bubble-meta">
+              <span class="bubble-sender">lyre</span>
+              <span class="bubble-time">14:35</span>
+            </div>
+            <div class="bubble-content">
+              <p>
+                昨日の設計レビューをベースに、議題を3つに整理しました<span
+                  class="streaming-cursor"
+                ></span>
+              </p>
+            </div>
+          </article>
+        </section>
+
+        <div id="composer-area">
+          <form class="composer">
+            <div class="composer-wrapper">
+              <textarea placeholder="Type a message. / for commands."></textarea>
+            </div>
+            <div class="composer-footer">
+              <span class="composer-hint">
+                <kbd>Enter</kbd> to send · <kbd>Shift+Enter</kbd> for newline
+              </span>
+              <button class="btn-primary" type="submit">Send</button>
+            </div>
+          </form>
+        </div>
+      </main>
+    </div>
+
+    <div class="palette-overlay" id="palette-overlay">
+      <div class="palette" role="dialog" aria-modal="true">
+        <div class="palette-input-row">
+          <span>🔍</span>
+          <input
+            class="palette-input"
+            placeholder="Search commands, sessions, agents…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <kbd>Esc</kbd>
+        </div>
+        <div class="palette-results">
+          <div class="palette-section">
+            <p class="section-title" style="padding: 4px 12px">Recent</p>
+            <div class="palette-item active">
+              <span>💬</span>
+              <span>Chat with lyre · Web Chat</span>
+            </div>
+            <div class="palette-item">
+              <span> sleeps</span>
+              <span>Sleep run 2026-06-29 03:00</span>
+            </div>
+          </div>
+          <div class="palette-section">
+            <p class="section-title" style="padding: 4px 12px">Quick Actions</p>
+            <div class="palette-item">
+              <span>＋</span>
+              <span>New Session (with lyre)</span>
+              <kbd>⌘N</kbd>
+            </div>
+            <div class="palette-item">
+              <span>↻</span>
+              <span>Refresh current tab</span>
+            </div>
+          </div>
+          <div class="palette-section">
+            <p class="section-title" style="padding: 4px 12px">Navigation</p>
+            <div class="palette-item">
+              <span>→</span>
+              <span>Go to Chat tab</span>
+            </div>
+            <div class="palette-item" style="opacity: 0.5">
+              <span>→</span>
+              <span>Go to Sleep tab</span>
+              <span class="badge">Phase 2</span>
+            </div>
+          </div>
+          <div class="palette-section">
+            <p class="section-title" style="padding: 4px 12px">Agents</p>
+            <div class="palette-item">
+              <span>●</span>
+              <span>Switch to agent: ace</span>
+            </div>
+            <div class="palette-item">
+              <span>●</span>
+              <span>Switch to agent: vega</span>
+            </div>
+          </div>
+          <div class="palette-section">
+            <p class="section-title" style="padding: 4px 12px">Sessions</p>
+            <div class="palette-item">
+              <span>▸</span>
+              <span>Web Chat</span>
+              <span class="badge">web</span>
+            </div>
+            <div class="palette-item">
+              <span>▸</span>
+              <span>Dev #general</span>
+              <span class="badge">discord</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="hint-bar">
+      <span><kbd>⌘K</kbd> Command Palette</span>
+      <span>·</span>
+      <span>Click sessions to switch writable/read-only</span>
+    </div>
+
+    <script>
+      // === Session switching (writable vs read-only) ===
+      const sessions = {
+        "web-chat": {
+          title: "Web Chat",
+          channel: "web",
+          meta: "Started 2026-07-01 14:32 · 12 messages",
+          timeline: document.getElementById("timeline").innerHTML,
+          composer: "writable",
+        },
+        "discord-dev": {
+          title: "Dev #general",
+          channel: "discord",
+          meta: "Discord · dev-general · 143 messages · read-only",
+          timeline: `
+            <article class="bubble bubble-user">
+              <div class="bubble-meta">
+                <span class="bubble-sender">taro</span>
+                <span class="bubble-time">14:20</span>
+              </div>
+              <div class="bubble-content">
+                <p>設計レビューおつかれさまでした</p>
+              </div>
+            </article>
+            <article class="bubble bubble-assistant">
+              <div class="bubble-meta">
+                <span class="bubble-sender">lyre</span>
+                <span class="bubble-time">14:21</span>
+              </div>
+              <div class="bubble-content">
+                <p>ありがとうございます。議事録は後ほど共有します。</p>
+              </div>
+            </article>
+            <article class="bubble bubble-user">
+              <div class="bubble-meta">
+                <span class="bubble-sender">hanako</span>
+                <span class="bubble-time">14:25</span>
+              </div>
+              <div class="bubble-content">
+                <p>次のMTGの議題、事前に共有しておける？</p>
+              </div>
+            </article>
+          `,
+          composer: "readonly",
+        },
+      };
+
+      document.querySelectorAll("[data-target-session]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const key = btn.dataset.targetSession;
+          const sess = sessions[key];
+          if (!sess) return;
+
+          document.querySelectorAll(".session-item").forEach((b) =>
+            b.classList.remove("active")
+          );
+          btn.classList.add("active");
+
+          document.getElementById("session-title").textContent = sess.title;
+          document.getElementById("session-channel").textContent = sess.channel;
+          document.getElementById("session-meta").textContent = sess.meta;
+          document.getElementById("timeline").innerHTML = sess.timeline;
+
+          const composerArea = document.getElementById("composer-area");
+          if (sess.composer === "readonly") {
+            composerArea.innerHTML = \`
+              <div class="readonly-banner">
+                <div class="readonly-icon">🔒</div>
+                <div>
+                  <div class="readonly-text-strong">
+                    This is a \${sess.channel} session.
+                  </div>
+                  <div class="readonly-text-muted">
+                    To reply, use \${sess.channel.charAt(0).toUpperCase() + sess.channel.slice(1)} directly.
+                  </div>
+                </div>
+              </div>
+            \`;
+          } else {
+            composerArea.innerHTML = \`
+              <form class="composer">
+                <div class="composer-wrapper">
+                  <textarea placeholder="Type a message. / for commands."></textarea>
+                </div>
+                <div class="composer-footer">
+                  <span class="composer-hint">
+                    <kbd>Enter</kbd> to send · <kbd>Shift+Enter</kbd> for newline
+                  </span>
+                  <button class="btn-primary" type="submit">Send</button>
+                </div>
+              </form>
+            \`;
+          }
+        });
+      });
+
+      // === Command Palette ===
+      const overlay = document.getElementById("palette-overlay");
+      const trigger = document.getElementById("palette-trigger");
+
+      function openPalette() {
+        overlay.classList.add("open");
+        setTimeout(() => overlay.querySelector("input").focus(), 50);
+      }
+      function closePalette() {
+        overlay.classList.remove("open");
+      }
+      trigger.addEventListener("click", openPalette);
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) closePalette();
+      });
+      document.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+          e.preventDefault();
+          overlay.classList.contains("open") ? closePalette() : openPalette();
+        }
+        if (e.key === "Escape") closePalette();
+      });
+    </script>
+  </body>
+</html>
