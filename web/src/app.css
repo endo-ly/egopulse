@@ -405,13 +405,108 @@
     transition: width 60ms linear;
   }
 
+  .app-shell {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    grid-template-rows: 56px 1fr;
+    grid-template-areas:
+      "sidebar topbar"
+      "sidebar main";
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .sidebar {
+    grid-area: sidebar;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-base);
+    padding: var(--space-base);
+    background: rgba(8, 16, 32, 0.8);
+    border-right: 1px solid var(--color-border);
+    backdrop-filter: blur(20px);
+    overflow-y: auto;
+  }
+
+  .sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 800;
+    background: rgba(3, 5, 10, 0.6);
+    backdrop-filter: blur(2px);
+  }
+
+  .topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: 0 var(--space-base);
+    background: rgba(8, 16, 32, 0.7);
+    border-bottom: 1px solid var(--color-border);
+    backdrop-filter: blur(20px);
+  }
+
+  .main {
+    grid-area: main;
+    padding: var(--space-xl);
+    overflow-y: auto;
+  }
+
+  .hamburger-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-sm);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+    cursor: pointer;
+    transition: color var(--motion-fast, 120ms) ease;
+  }
+
+  .hamburger-btn:hover {
+    color: var(--color-accent);
+  }
+
+  @media (max-width: 639px) {
+    .app-shell {
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "topbar"
+        "main";
+    }
+
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 260px;
+      max-width: 80vw;
+      z-index: 900;
+      transform: translateX(-100%);
+      transition: transform var(--motion-slow, 240ms) ease;
+    }
+
+    .sidebar.open {
+      transform: translateX(0);
+    }
+
+    .sidebar.closed {
+      transform: translateX(-100%);
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .btn-primary,
     .btn-secondary,
     .btn-icon,
     .btn-danger,
     .card,
-    .toast-close {
+    .toast-close,
+    .sidebar {
       transition-duration: 0.01ms;
     }
 
