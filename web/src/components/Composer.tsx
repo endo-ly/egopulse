@@ -1,8 +1,9 @@
-import { useState, useRef, type KeyboardEvent } from "react";
+import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 
 export interface ComposerProps {
   onSubmit: (text: string) => void;
   disabled?: boolean;
+  storageKey?: string;
 }
 
 const SLASH_COMMANDS = [
@@ -12,8 +13,15 @@ const SLASH_COMMANDS = [
   { name: "/help", description: "Show available commands" },
 ];
 
-export function Composer({ onSubmit, disabled }: ComposerProps) {
-  const [text, setText] = useState("");
+export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
+  const [text, setText] = useState(() => {
+    if (!storageKey) return "";
+    try {
+      return localStorage.getItem(`egopulse.draft.${storageKey}`) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [suggestIndex, setSuggestIndex] = useState(-1);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -21,6 +29,19 @@ export function Composer({ onSubmit, disabled }: ComposerProps) {
   const matches = showSuggest
     ? SLASH_COMMANDS.filter((c) => c.name.startsWith(text))
     : [];
+
+  useEffect(() => {
+    if (!storageKey) return;
+    try {
+      if (text) {
+        localStorage.setItem(`egopulse.draft.${storageKey}`, text);
+      } else {
+        localStorage.removeItem(`egopulse.draft.${storageKey}`);
+      }
+    } catch {
+      return;
+    }
+  }, [text, storageKey]);
 
   const submit = () => {
     const trimmed = text.trim();

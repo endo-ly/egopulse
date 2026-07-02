@@ -11,6 +11,8 @@ export interface SidebarProps {
   healthStatus?: HealthStatus;
   activeTurns?: number;
   version?: string;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
 export function healthTone(status: HealthStatus): StatusTone {
@@ -31,9 +33,11 @@ export function Sidebar({
   healthStatus = "ok",
   activeTurns = 0,
   version = "0.1.0",
+  collapsed = false,
+  onToggleCollapse,
 }: SidebarProps) {
   return (
-    <nav className="sidebar-nav" aria-label="Sidebar">
+    <nav className={`sidebar-nav ${collapsed ? "collapsed" : ""}`} aria-label="Sidebar">
       <div className="sidebar-brand">
         <svg
           className="sidebar-brand-logo"
@@ -55,20 +59,52 @@ export function Sidebar({
             strokeWidth="1.5"
           />
         </svg>
-        <span className="sidebar-brand-name">EgoPulse</span>
-        <span className="sidebar-brand-version">v{version}</span>
+        {!collapsed && (
+          <>
+            <span className="sidebar-brand-name">EgoPulse</span>
+            <span className="sidebar-brand-version">v{version}</span>
+          </>
+        )}
+        {onToggleCollapse && !collapsed && (
+          <button
+            type="button"
+            className="sidebar-collapse-btn"
+            aria-label="Collapse sidebar"
+            onClick={onToggleCollapse}
+          >
+            ‹
+          </button>
+        )}
+        {onToggleCollapse && collapsed && (
+          <button
+            type="button"
+            className="sidebar-expand-btn"
+            aria-label="Expand sidebar"
+            onClick={onToggleCollapse}
+          >
+            ›
+          </button>
+        )}
       </div>
 
-      <div className="sidebar-body">
-        <section className="sidebar-section">{agents}</section>
-        <section className="sidebar-section">{sessions}</section>
-      </div>
+      {!collapsed && (
+        <div className="sidebar-body">
+          <section className="sidebar-section">{agents}</section>
+          <section className="sidebar-section">{sessions}</section>
+        </div>
+      )}
+      {collapsed && (
+        <div className="sidebar-body collapsed-icons">
+          <section className="sidebar-section">{agents}</section>
+        </div>
+      )}
 
       <div className="sidebar-footer">
         <Button
           variant="secondary"
           className="new-session-btn"
           onClick={onNewSession}
+          aria-label={collapsed ? "New Session" : undefined}
         >
           <svg
             width="16"
@@ -83,13 +119,15 @@ export function Sidebar({
             <line x1="12" y1="5" x2="12" y2="19" />
             <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
-          New Session
+          {!collapsed && "New Session"}
         </Button>
         <div className="sidebar-runtime-status" title="Runtime health">
           <StatusDot tone={healthTone(healthStatus)} />
-          <span className="sidebar-runtime-text">
-            {healthStatus} · {activeTurns} turn{activeTurns === 1 ? "" : "s"} live
-          </span>
+          {!collapsed && (
+            <span className="sidebar-runtime-text">
+              {healthStatus} · {activeTurns} turn{activeTurns === 1 ? "" : "s"} live
+            </span>
+          )}
         </div>
       </div>
     </nav>

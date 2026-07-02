@@ -2,6 +2,8 @@ import { useState, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+const FOLD_THRESHOLD = 20;
+
 export interface MarkdownRendererProps {
   content: string;
 }
@@ -23,14 +25,22 @@ type PreProps = ComponentProps<"pre">;
 
 function CodeBlockPre(props: PreProps) {
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const rawText = extractText(props.children).replace(/^\n+|\n+$/g, "");
+  const lines = rawText.split("\n");
+  const isLong = lines.length > FOLD_THRESHOLD;
 
   const handleCopy = () => {
-    const text = extractText(props.children);
-    navigator.clipboard.writeText(text).then(() => {
+    navigator.clipboard.writeText(rawText).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
   };
+
+  const displayChildren = isLong && !expanded
+    ? lines.slice(0, FOLD_THRESHOLD).join("\n")
+    : rawText;
 
   return (
     <pre {...props}>
@@ -41,7 +51,18 @@ function CodeBlockPre(props: PreProps) {
       >
         {copied ? "Copied" : "Copy"}
       </button>
-      {props.children}
+      <code>{displayChildren}</code>
+      {isLong && (
+        <button
+          type="button"
+          className="code-block-fold"
+          onClick={() => setExpanded((e) => !e)}
+        >
+          {expanded
+            ? "Collapse"
+            : `Show all (${lines.length} lines)`}
+        </button>
+      )}
     </pre>
   );
 }
@@ -51,6 +72,7 @@ function extractText(node: unknown): string {
   if (Array.isArray(node)) return node.map(extractText).join("");
   if (node && typeof node === "object" && "props" in node) {
     const props = (node as { props: { children?: unknown } }).props;
+    if (props.children == null) return "";
     return extractText(props.children);
   }
   return "";
