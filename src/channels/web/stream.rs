@@ -42,6 +42,11 @@ struct DonePayload {
 }
 
 #[derive(Debug, Serialize)]
+struct DeltaPayload {
+    delta: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorPayload {
     error: String,
 }
@@ -317,6 +322,16 @@ pub(super) async fn start_stream_run(
                                     message: format!("iteration {iteration}"),
                                 })
                                 .unwrap_or_default(),
+                            )
+                            .await;
+                    }
+                    AgentEvent::Delta { text } => {
+                        run_hub
+                            .publish(
+                                &run_id_for_events,
+                                "delta",
+                                serde_json::to_string(&DeltaPayload { delta: text })
+                                    .unwrap_or_default(),
                             )
                             .await;
                     }

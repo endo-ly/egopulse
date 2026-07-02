@@ -160,6 +160,17 @@ pub(crate) trait LlmProvider: Send + Sync {
         messages: Arc<Vec<Message>>,
         tools: Option<Arc<Vec<ToolDefinition>>>,
     ) -> Result<MessagesResponse, LlmError>;
+
+    async fn send_message_streaming(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse, LlmError> {
+        let _ = on_delta;
+        self.send_message(system, messages, tools).await
+    }
 }
 
 /// Create the default LLM provider based on the resolved request-time configuration.
