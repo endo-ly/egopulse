@@ -470,6 +470,79 @@
     color: var(--color-accent);
   }
 
+  .sidebar-nav {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    height: 40px;
+    flex-shrink: 0;
+  }
+
+  .sidebar-brand-logo {
+    flex-shrink: 0;
+  }
+
+  .sidebar-brand-name {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--color-text-strong);
+    letter-spacing: 0.01em;
+  }
+
+  .sidebar-brand-version {
+    font-size: 11px;
+    color: var(--color-muted-2);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .sidebar-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-base);
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-top: var(--space-sm);
+  }
+
+  .sidebar-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+  }
+
+  .sidebar-footer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    flex-shrink: 0;
+    padding-top: var(--space-sm);
+  }
+
+  .new-session-btn {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .sidebar-runtime-status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-xs) var(--space-sm);
+  }
+
+  .sidebar-runtime-text {
+    font-size: 12px;
+    color: var(--color-muted);
+  }
+
   @media (max-width: 639px) {
     .app-shell {
       grid-template-columns: 1fr;
