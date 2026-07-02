@@ -41,6 +41,13 @@ export function App({
 }: AppProps) {
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return new URLSearchParams(globalThis.location.search).get("sidebar") === "collapsed";
+    } catch {
+      return false;
+    }
+  });
   const sidebarOpen = isMobile ? userOpened : true;
 
   useEffect(() => {
@@ -54,6 +61,24 @@ export function App({
     return () => globalThis.removeEventListener("keydown", handler);
   }, [onOpenPalette]);
 
+  const toggleSidebarCollapse = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        const url = new URL(globalThis.location.href);
+        if (next) {
+          url.searchParams.set("sidebar", "collapsed");
+        } else {
+          url.searchParams.delete("sidebar");
+        }
+        globalThis.history.replaceState(null, "", url.toString());
+      } catch {
+        return next;
+      }
+      return next;
+    });
+  };
+
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);
 
@@ -64,6 +89,8 @@ export function App({
           onNewSession={onNewSession}
           healthStatus={healthStatus}
           activeTurns={activeTurns}
+          collapsed={!isMobile && sidebarCollapsed}
+          onToggleCollapse={isMobile ? undefined : toggleSidebarCollapse}
           agents={
             <AgentsSection
               agents={agents}

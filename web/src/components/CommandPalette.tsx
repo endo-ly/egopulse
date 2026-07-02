@@ -178,7 +178,12 @@ export function CommandPalette({
       },
     }));
 
-  const recentItems = loadHistory();
+  const recentItems = loadHistory().map((item) => ({
+    ...item,
+    section: "Recent",
+  }));
+
+  const sleepPulseItems: PaletteItem[] = [];
 
   const allItems = [
     ...recentItems,
@@ -186,6 +191,7 @@ export function CommandPalette({
     ...navigation,
     ...agentItems,
     ...sessionItems,
+    ...sleepPulseItems,
   ];
 
   const items = query
@@ -209,6 +215,10 @@ export function CommandPalette({
     acc.set(item.section, list);
     return acc;
   }, new Map());
+
+  if (!sections.has("Sleep & Pulse Runs") && !query) {
+    sections.set("Sleep & Pulse Runs", []);
+  }
 
   let runningIndex = 0;
 

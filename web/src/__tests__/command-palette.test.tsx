@@ -104,12 +104,46 @@ describe("CommandPalette", () => {
     expect(titles).toContain("Navigation");
     expect(titles).toContain("Agents");
     expect(titles).toContain("Sessions");
+    expect(titles).toContain("Sleep & Pulse Runs");
 
     const agentItems = container.querySelectorAll(".palette-item");
     const labels = Array.from(agentItems).map((i) => i.textContent?.trim());
     expect(labels?.some((l) => l?.includes("New Session"))).toBe(true);
     expect(labels?.some((l) => l?.includes("Ace"))).toBe(true);
     expect(labels?.some((l) => l?.includes("Web Chat"))).toBe(true);
+  });
+
+  it("palette_recent_reads_from_localstorage", () => {
+    localStorage.setItem(
+      "egopulse.paletteHistory",
+      JSON.stringify([
+        { id: "nav-chat", label: "Go to Chat", section: "Navigation" },
+        { id: "qa-refresh", label: "Refresh current tab", section: "Quick Actions" },
+      ]),
+    );
+
+    const { container } = render(
+      <CommandPalette
+        open={true}
+        onClose={noop}
+        agents={agents}
+        sessions={sessions}
+        selectedAgent="lyre"
+        onNavigate={noop}
+        onSelectAgent={noop}
+        onSelectSession={noop}
+        onNewSession={noop}
+        onRefresh={noop}
+      />,
+    );
+
+    const sectionTitles = container.querySelectorAll(".palette-section-title");
+    const titles = Array.from(sectionTitles).map((t) => t.textContent);
+    expect(titles).toContain("Recent");
+
+    const recentSection = Array.from(sectionTitles).find((t) => t.textContent === "Recent");
+    const recentItems = recentSection?.parentElement?.querySelectorAll(".palette-item");
+    expect(recentItems?.length).toBe(2);
   });
 
   it("command_palette_filter_narrows_results", () => {
