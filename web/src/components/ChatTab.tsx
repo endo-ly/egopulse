@@ -1,10 +1,18 @@
 import { Badge } from "./Badge";
+import { Timeline } from "./Timeline";
+import { MessageBubble } from "./MessageBubble";
+import { Composer } from "./Composer";
+import { ReadOnlyBanner } from "./ReadOnlyBanner";
+import type { ChatMessage } from "../types";
 
 export interface ChatTabProps {
   sessionLabel: string;
   channel: string;
   messageCount: number;
   readOnly: boolean;
+  messages?: ChatMessage[];
+  onSend?: (text: string) => void;
+  storageKey?: string;
 }
 
 function channelLabel(channel: string): string {
@@ -24,7 +32,12 @@ export function ChatTab({
   channel,
   messageCount,
   readOnly,
+  messages = [],
+  onSend,
+  storageKey,
 }: ChatTabProps) {
+  const searchTarget = messages.map((m) => m.content).join("\n");
+
   return (
     <div className="chat-tab">
       <header className="chat-header">
@@ -38,8 +51,18 @@ export function ChatTab({
           </span>
         </div>
       </header>
-      <div className="timeline" />
-      <div className="composer" />
+      <Timeline searchTarget={searchTarget}>
+        {messages.map((m) => (
+          <MessageBubble key={m.id} message={m} />
+        ))}
+      </Timeline>
+      <div className="composer">
+        {readOnly ? (
+          <ReadOnlyBanner channel={channel} />
+        ) : (
+          <Composer onSubmit={onSend ?? (() => {})} storageKey={storageKey} />
+        )}
+      </div>
     </div>
   );
 }
