@@ -32,6 +32,7 @@ pub(super) struct SessionItem {
     pub label: String,
     pub chat_id: i64,
     pub channel: String,
+    pub agent_id: String,
     pub last_message_time: String,
     pub last_message_preview: Option<String>,
 }
@@ -69,6 +70,7 @@ pub(super) async fn list_sessions(
                 session_key,
                 chat_id: session.chat_id,
                 channel: session.channel,
+                agent_id: session.agent_id,
                 last_message_time: session.last_message_time,
                 last_message_preview: session.last_message_preview,
             }
@@ -148,7 +150,7 @@ pub(super) async fn get_history(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_history, parse_chat_id_from_session_key};
+    use super::{get_history, list_sessions, parse_chat_id_from_session_key};
     use axum::extract::{Query, State as AxumState};
 
     use crate::channels::web::{RunHub, WebState};
@@ -191,12 +193,16 @@ mod tests {
         }
     }
 
-    fn insert_web_chat(db: &crate::storage::Database, external_chat_id: &str) -> i64 {
+    fn insert_web_chat(
+        db: &crate::storage::Database,
+        external_chat_id: &str,
+        agent_id: &str,
+    ) -> i64 {
         let conn = db.get_conn().expect("pool");
         conn.execute(
             "INSERT INTO chats (channel, external_chat_id, chat_type, agent_id, last_message_time)
-             VALUES ('web', ?1, 'dm', 'default', '2024-01-01T00:00:00Z')",
-            rusqlite::params![external_chat_id],
+             VALUES ('web', ?1, 'dm', ?2, '2024-01-01T00:00:00Z')",
+            rusqlite::params![external_chat_id, agent_id],
         )
         .expect("insert chat");
         conn.query_row(
@@ -208,12 +214,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_sessions_returns_agent_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        insert_web_chat(&db, "web:session-1", "lyre");
+        insert_web_chat(&db, "web:session-2", "ace");
+        insert_web_chat(&db, "web:session-3", "vega");
+
+        let result = list_sessions(AxumState(web_state)).await.expect("ok");
+        let body = result.0;
+        let sessions = body["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 3);
+
+        let agent_ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["agent_id"].as_str().expect("agent_id present"))
+            .collect();
+        assert!(agent_ids.contains(&"lyre"));
+        assert!(agent_ids.contains(&"ace"));
+        assert!(agent_ids.contains(&"vega"));
+    }
+
+    #[tokio::test]
     async fn api_history_returns_message_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
         let db = Arc::clone(&web_state.app_state.db);
 
-        let chat_id = insert_web_chat(&db, "web:main");
+        let chat_id = insert_web_chat(&db, "web:main", "default");
 
         let msg_message = StoredMessage::user(chat_id, "user:web".to_string(), "hello".to_string());
         db.store_message_only(&msg_message).expect("store message");
