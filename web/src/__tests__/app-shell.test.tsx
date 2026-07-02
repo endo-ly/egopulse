@@ -58,4 +58,54 @@ describe("App shell", () => {
     fireEvent.click(container.querySelector(".sidebar-backdrop") as HTMLElement);
     expect(container.querySelector(".sidebar")?.className).toContain("closed");
   });
+
+  it("app_wires_sidebar_topbar_and_sections_together", () => {
+    mockViewport(false);
+    const onSelectAgent = vi.fn();
+    const onSelectSession = vi.fn();
+    const onNewSession = vi.fn();
+    const onOpenPalette = vi.fn();
+
+    render(
+      <App
+        agents={[
+          { id: "lyre", label: "Lyre", is_default: true, active: true },
+        ]}
+        sessions={[
+          {
+            session_key: "s1",
+            label: "Web Chat",
+            channel: "web",
+            agent_id: "lyre",
+            last_message_preview: "hi",
+            last_message_time: 1,
+          },
+        ]}
+        selectedAgent="lyre"
+        selectedSession="s1"
+        onSelectAgent={onSelectAgent}
+        onSelectSession={onSelectSession}
+        onNewSession={onNewSession}
+        onOpenPalette={onOpenPalette}
+      />,
+    );
+
+    expect(screen.getByText("EgoPulse")).toBeTruthy();
+    expect(screen.getByText("AGENTS")).toBeTruthy();
+    expect(screen.getByText("SESSIONS")).toBeTruthy();
+    expect(screen.getByText("Lyre")).toBeTruthy();
+    expect(screen.getByText("Web Chat")).toBeTruthy();
+    expect(screen.getByText("Chat").closest(".tab")?.className).toContain(
+      "active",
+    );
+
+    fireEvent.click(screen.getByText("Web Chat"));
+    expect(onSelectSession).toHaveBeenCalledWith("s1");
+
+    fireEvent.click(screen.getByRole("button", { name: /open command palette/i }));
+    expect(onOpenPalette).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByText("New Session"));
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+  });
 });

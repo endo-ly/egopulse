@@ -1,5 +1,5 @@
-import { StatusDot, type StatusTone } from "./StatusDot";
-import type { HealthStatus } from "./Sidebar";
+import { StatusDot } from "./StatusDot";
+import { type HealthStatus, healthTone } from "./Sidebar";
 
 export type TabId = "chat" | "sleep" | "pulse" | "metrics" | "config";
 
@@ -24,17 +24,6 @@ const TABS: TabDef[] = [
   { id: "metrics", label: "Metrics", disabled: true },
   { id: "config", label: "Config", disabled: true },
 ];
-
-function healthTone(status: HealthStatus): StatusTone {
-  switch (status) {
-    case "ok":
-      return "live";
-    case "down":
-      return "error";
-    case "degraded":
-      return "idle";
-  }
-}
 
 export function TopBar({
   activeTab,

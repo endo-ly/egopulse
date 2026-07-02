@@ -13,7 +13,7 @@ export interface SidebarProps {
   version?: string;
 }
 
-function healthTone(status: HealthStatus): StatusTone {
+export function healthTone(status: HealthStatus): StatusTone {
   switch (status) {
     case "ok":
       return "live";

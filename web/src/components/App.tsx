@@ -1,15 +1,44 @@
 import { useState, type ReactNode } from "react";
 import { useMediaQuery } from "../hooks/useMediaQuery";
+import { Sidebar, type HealthStatus } from "./Sidebar";
+import { TopBar, type TabId } from "./TopBar";
+import { AgentsSection, type AgentEntry } from "./AgentsSection";
+import { SessionsSection, type SessionEntry } from "./SessionsSection";
 
-export interface AppShellProps {
-  sidebar?: ReactNode;
-  topbar?: ReactNode;
+export interface AppProps {
+  agents?: AgentEntry[];
+  sessions?: SessionEntry[];
+  selectedAgent?: string;
+  selectedSession?: string;
+  activeTab?: TabId;
+  healthStatus?: HealthStatus;
+  activeTurns?: number;
+  onSelectAgent?: (id: string) => void;
+  onSelectSession?: (key: string) => void;
+  onTabChange?: (tab: TabId) => void;
+  onOpenPalette?: () => void;
+  onNewSession?: () => void;
   main?: ReactNode;
 }
 
+const noop = () => {};
 const MOBILE_QUERY = "(max-width: 639px)";
 
-export function App({ sidebar, topbar, main }: AppShellProps) {
+export function App({
+  agents = [],
+  sessions = [],
+  selectedAgent = "",
+  selectedSession = "",
+  activeTab = "chat",
+  healthStatus = "ok",
+  activeTurns = 0,
+  onSelectAgent = noop,
+  onSelectSession = noop,
+  onTabChange = noop,
+  onOpenPalette = noop,
+  onNewSession = noop,
+  main,
+}: AppProps) {
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
   const sidebarOpen = isMobile ? userOpened : true;
@@ -19,7 +48,28 @@ export function App({ sidebar, topbar, main }: AppShellProps) {
 
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>{sidebar}</aside>
+      <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>
+        <Sidebar
+          onNewSession={onNewSession}
+          healthStatus={healthStatus}
+          activeTurns={activeTurns}
+          agents={
+            <AgentsSection
+              agents={agents}
+              selectedAgent={selectedAgent}
+              onSelectAgent={onSelectAgent}
+            />
+          }
+          sessions={
+            <SessionsSection
+              sessions={sessions}
+              selectedAgent={selectedAgent}
+              selectedSession={selectedSession}
+              onSelectSession={onSelectSession}
+            />
+          }
+        />
+      </aside>
       {isMobile && sidebarOpen && (
         <div
           className="sidebar-backdrop"
@@ -52,7 +102,12 @@ export function App({ sidebar, topbar, main }: AppShellProps) {
             </svg>
           </button>
         )}
-        {topbar}
+        <TopBar
+          activeTab={activeTab}
+          onTabChange={onTabChange}
+          onOpenPalette={onOpenPalette}
+          healthStatus={healthStatus}
+        />
       </header>
       <main className="main">{main}</main>
     </div>
