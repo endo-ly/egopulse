@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, useEffect, type ReactNode } from "react";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { Sidebar, type HealthStatus } from "./Sidebar";
 import { TopBar, type TabId } from "./TopBar";
@@ -42,6 +42,17 @@ export function App({
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
   const sidebarOpen = isMobile ? userOpened : true;
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        onOpenPalette();
+      }
+    };
+    globalThis.addEventListener("keydown", handler);
+    return () => globalThis.removeEventListener("keydown", handler);
+  }, [onOpenPalette]);
 
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);

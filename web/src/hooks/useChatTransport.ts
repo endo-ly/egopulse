@@ -5,6 +5,7 @@ import {
   type ChatEventPayload,
   type ChatState,
 } from "./chatReducer";
+import { invalidateQueries } from "./useServerState";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
@@ -32,6 +33,8 @@ export function useChatTransport({ sessionKey, onDone }: UseChatTransportOptions
         const event = parsed.payload as ChatEventPayload;
         setState((prev) => reduceChatEvent(prev, event));
         if (event.state === "done") {
+          invalidateQueries("sessions");
+          invalidateQueries(`history`);
           onDone?.();
         }
       }
