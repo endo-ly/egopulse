@@ -141,13 +141,105 @@ pub(super) async fn get_history(
             "sender_kind": message.sender_kind.to_string(),
             "content": message.content,
             "timestamp": message.timestamp,
+            "message_kind": message.message_kind.to_string(),
         })).collect::<Vec<_>>()
     })))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_chat_id_from_session_key;
+    use super::{get_history, parse_chat_id_from_session_key};
+    use axum::extract::{Query, State as AxumState};
+
+    use crate::channels::web::{RunHub, WebState};
+    use crate::error::LlmError;
+    use crate::llm::{LlmProvider, Message, MessagesResponse};
+    use crate::storage::{MessageKind, StoredMessage};
+    use crate::test_util::build_state_with_provider;
+    use std::sync::Arc;
+
+    struct DummyLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for DummyLlm {
+        fn provider_name(&self) -> &str {
+            "dummy"
+        }
+
+        fn model_name(&self) -> &str {
+            "dummy"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, LlmError> {
+            panic!("handler tests should not call LLM")
+        }
+    }
+
+    fn test_web_state(dir: &tempfile::TempDir) -> WebState {
+        let state_root = dir.path().to_string_lossy().to_string();
+        let app_state = build_state_with_provider(&state_root, Box::new(DummyLlm));
+        WebState {
+            app_state: Arc::new(app_state),
+            config_path: None,
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn insert_web_chat(db: &crate::storage::Database, external_chat_id: &str) -> i64 {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO chats (channel, external_chat_id, chat_type, agent_id, last_message_time)
+             VALUES ('web', ?1, 'dm', 'default', '2024-01-01T00:00:00Z')",
+            rusqlite::params![external_chat_id],
+        )
+        .expect("insert chat");
+        conn.query_row(
+            "SELECT chat_id FROM chats WHERE channel = 'web' AND external_chat_id = ?1",
+            rusqlite::params![external_chat_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("get chat_id")
+    }
+
+    #[tokio::test]
+    async fn api_history_returns_message_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:main");
+
+        let msg_message = StoredMessage::user(chat_id, "user:web".to_string(), "hello".to_string());
+        db.store_message_only(&msg_message).expect("store message");
+
+        let mut msg_event =
+            StoredMessage::user(chat_id, "system".to_string(), "system event".to_string());
+        msg_event.message_kind = MessageKind::SystemEvent;
+        db.store_message_only(&msg_event).expect("store event");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some("main".to_string()),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+
+        let kinds: Vec<&str> = messages
+            .iter()
+            .map(|m| m["message_kind"].as_str().expect("message_kind present"))
+            .collect();
+        assert!(kinds.contains(&"message"));
+        assert!(kinds.contains(&"system_event"));
+    }
 
     #[test]
     fn parses_chat_session_keys() {
