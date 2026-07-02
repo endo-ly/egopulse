@@ -693,6 +693,54 @@ mod tests {
     }
 
     #[test]
+    fn ws_chat_event_includes_session_key() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(0);
+
+        let test_session = "test-session";
+
+        let delta_event = RunEvent {
+            id: 1,
+            event: "delta".to_string(),
+            data: r#"{"delta":"chunk"}"#.to_string(),
+        };
+        forward_run_event(&tx, "run-1", test_session, &seq, delta_event);
+
+        let done_event = RunEvent {
+            id: 2,
+            event: "done".to_string(),
+            data: r#"{"response":"final"}"#.to_string(),
+        };
+        forward_run_event(&tx, "run-1", test_session, &seq, done_event);
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 2);
+
+        for msg in &messages {
+            let parsed: serde_json::Value = serde_json::from_str(msg).unwrap();
+            assert_eq!(parsed["event"], "chat");
+            assert_eq!(
+                parsed["payload"]["sessionKey"], "test-session",
+                "sessionKey must be present in every chat event"
+            );
+        }
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        let seq2 = AtomicU64::new(0);
+        let error_event = RunEvent {
+            id: 1,
+            event: "error".to_string(),
+            data: r#"{"error":"fail"}"#.to_string(),
+        };
+        forward_run_event(&tx2, "run-2", test_session, &seq2, error_event);
+
+        let error_messages = collect_text_messages(&mut rx2);
+        assert_eq!(error_messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&error_messages[0]).unwrap();
+        assert_eq!(parsed["payload"]["sessionKey"], "test-session");
+    }
+
+    #[test]
     fn ws_delta_without_intermediate_value() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let seq = AtomicU64::new(1);
