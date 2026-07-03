@@ -83,6 +83,25 @@ export function Timeline({ children, searchTarget }: TimelineProps) {
     }
   };
 
+  useEffect(() => {
+    if (!searchQuery || matches.length === 0 || !searchOpen) return;
+    const el = scrollRef.current;
+    if (!el || !searchTarget) return;
+    const matchPos = matches[matchIndex];
+    if (matchPos == null) return;
+    const lower = searchTarget.toLowerCase();
+    const beforeMatch = lower.substring(0, matchPos);
+    const lineNum = beforeMatch.split("\n").length;
+    const childArray = el.querySelectorAll(":scope > *");
+    const targetChild = childArray[lineNum] as HTMLElement | undefined;
+    if (targetChild && typeof targetChild.scrollIntoView === "function") {
+      targetChild.scrollIntoView({ behavior: "smooth", block: "center" });
+      targetChild.classList.add("search-highlight");
+      const timeout = setTimeout(() => targetChild.classList.remove("search-highlight"), 1500);
+      return () => clearTimeout(timeout);
+    }
+  }, [matchIndex, searchQuery, matches, searchTarget, searchOpen]);
+
   return (
     <div
       className="timeline"

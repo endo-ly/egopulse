@@ -104,12 +104,15 @@ export function parseStatusEvent(payload: StatusEventPayload): string | null {
 
 export interface ToolStartPayload {
   name: string;
+  callId?: string;
+  input?: unknown;
 }
 
 export interface ToolResultPayload {
   name: string;
   is_error: boolean;
   duration_ms: number;
+  callId?: string;
 }
 
 export function reduceToolStart(
@@ -117,12 +120,14 @@ export function reduceToolStart(
   runId: string,
   payload: ToolStartPayload,
 ): ChatState {
-  const key = `${runId}:${payload.name}`;
+  const key = payload.callId
+    ? `${runId}:${payload.callId}`
+    : `${runId}:${payload.name}`;
   return {
     ...state,
     toolEvents: {
       ...state.toolEvents,
-      [key]: { name: payload.name, state: "pending" },
+      [key]: { name: payload.name, state: "pending", input: payload.input },
     },
   };
 }
@@ -132,7 +137,9 @@ export function reduceToolResult(
   runId: string,
   payload: ToolResultPayload,
 ): ChatState {
-  const key = `${runId}:${payload.name}`;
+  const key = payload.callId
+    ? `${runId}:${payload.callId}`
+    : `${runId}:${payload.name}`;
   const existing = state.toolEvents[key];
   return {
     ...state,

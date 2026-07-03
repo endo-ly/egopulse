@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./app.css";
 import { App } from "./components/App";
 import { ChatTab } from "./components/ChatTab";
 import { CommandPalette } from "./components/CommandPalette";
+import { useChatTransport } from "./hooks/useChatTransport";
 import type { AgentEntry } from "./components/AgentsSection";
 import type { SessionEntry } from "./components/SessionsSection";
 import type { TabId } from "./components/TopBar";
@@ -22,10 +23,16 @@ function WebUI() {
   const [selectedSession, setSelectedSession] = useState("main");
   const [paletteOpen, setPaletteOpen] = useState(false);
 
+  const transport = useChatTransport({ sessionKey: selectedSession });
+
   const handleNewSession = () => {
     setSelectedSession("main");
     setActiveTab("chat");
   };
+
+  const handleSend = useCallback((text: string) => {
+    transport.sendMessage(text);
+  }, [transport]);
 
   const selectedSessionData = MOCK_SESSIONS.find((s) => s.session_key === selectedSession);
   const isReadOnly = selectedSessionData?.channel !== "web";
@@ -34,8 +41,11 @@ function WebUI() {
     <ChatTab
       sessionLabel={selectedSessionData?.label ?? "Web Chat"}
       channel={selectedSessionData?.channel ?? "web"}
-      messageCount={2}
+      messageCount={transport.state.messages.length}
       readOnly={isReadOnly}
+      messages={transport.state.messages}
+      onSend={handleSend}
+      storageKey={selectedSession}
     />
   );
 
