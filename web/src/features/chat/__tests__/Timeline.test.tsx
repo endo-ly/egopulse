@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render, fireEvent, act } from "@testing-library/react";
-import { Timeline } from "../features/chat/Timeline";
+import { Timeline } from "../Timeline";
 
 function setScrollProps(el: HTMLElement, h: number, c: number, t: number) {
   Object.defineProperty(el, "scrollHeight", { value: h, configurable: true });

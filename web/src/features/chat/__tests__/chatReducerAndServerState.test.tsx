@@ -6,7 +6,7 @@ import {
   reduceToolStart,
   reduceToolResult,
   type ChatEventPayload,
-} from "../features/chat/chatReducer";
+} from "../chatReducer";
 
 describe("chatReducer", () => {
   it("ws_handler_processes_chat_events_and_send_via_chat_send", () => {
@@ -84,7 +84,7 @@ describe("useServerState cache", () => {
   });
 
   it("server_state_caches_and_invalidates", async () => {
-    const { useServerState, invalidateQuery } = await import("../shared/hooks/useServerState");
+    const { useServerState, invalidateQuery } = await import("../../../shared/hooks/useServerState");
     const fetcher = vi.fn().mockResolvedValue({ agents: ["a", "b"] });
 
     const { result: r1, unmount: u1 } = renderHook(() =>
@@ -117,7 +117,7 @@ describe("useServerState cache", () => {
   });
 
   it("chat_send_invalidates_sessions_and_history", async () => {
-    const mod = await import("../shared/hooks/useServerState");
+    const mod = await import("../../../shared/hooks/useServerState");
     const fetcher = vi.fn().mockResolvedValue([]);
     const { unmount } = renderHook(() =>
       mod.useServerState("sessions", fetcher),

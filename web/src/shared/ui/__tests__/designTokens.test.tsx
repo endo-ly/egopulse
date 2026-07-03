@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import appCssSource from "../app.css?raw";
+import appCssSource from "../../../app.css?raw";
 
 const COLOR_TOKENS = [
   "--color-bg",

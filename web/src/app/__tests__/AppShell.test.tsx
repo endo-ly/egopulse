@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { App } from "../app/AppShell";
+import { App } from "../AppShell";
 
 function mockViewport(mobile: boolean): void {
   Object.defineProperty(window, "matchMedia", {

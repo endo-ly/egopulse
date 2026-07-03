@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
-import { Composer } from "../features/chat/Composer";
+import { Composer } from "../Composer";
 
 describe("Composer", () => {
   it("composer_enter_submits_and_clears", () => {

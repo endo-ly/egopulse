@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apiFetch } from "../shared/api/client";
-import { AuthRequiredError } from "../shared/api/auth";
-import { createSessionKey } from "../shared/api/sessions";
+import { apiFetch } from "../client";
+import { AuthRequiredError } from "../auth";
+import { createSessionKey } from "../sessions";
 
 afterEach(() => {
   vi.restoreAllMocks();

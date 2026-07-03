@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
-import { ChatTab } from "../features/chat/ChatTab";
+import { ChatTab } from "../ChatTab";
 
 describe("ChatTab", () => {
   it("chat_tab_renders_header_timeline_composer_structure", () => {

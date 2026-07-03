@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildPaletteItems } from "../app/command-palette/buildPaletteItems";
+import { buildPaletteItems } from "../buildPaletteItems";
 
 describe("buildPaletteItems", () => {
   it("keeps_sleep_navigation_enabled", () => {

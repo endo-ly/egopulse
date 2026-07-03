@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
-import { SessionsSection } from "../app/shell/SessionsSection";
-import type { SessionEntry } from "../shared/api/types";
+import { SessionsSection } from "../SessionsSection";
+import type { SessionEntry } from "../../../shared/api/types";
 
 const SESSIONS: SessionEntry[] = [
   {
