@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import appCssSource from "../../../app.css?raw";
+import themeCssSource from "../../../styles/theme.css?raw";
 
 const COLOR_TOKENS = [
   "--color-bg",
@@ -51,8 +51,8 @@ describe("design tokens", () => {
     for (const token of ALL_TOKENS) {
       const pattern = new RegExp(`${token}\\s*:`);
       expect(
-        pattern.test(appCssSource),
-        `${token} must be defined as a CSS custom property in app.css`,
+        pattern.test(themeCssSource),
+        `${token} must be defined as a CSS custom property in theme.css`,
       ).toBe(true);
     }
   });
