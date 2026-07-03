@@ -29,7 +29,7 @@ describe("TopBar", () => {
     expect(chatTab?.className).toContain("active");
     expect(chatTab?.getAttribute("aria-current")).toBe("page");
 
-    for (const label of ["Sleep", "Pulse", "Metrics", "Config"]) {
+    for (const label of ["Pulse", "Metrics", "Config"]) {
       const tab = screen.getByText(label).closest(".tab");
       expect(tab?.hasAttribute("disabled")).toBe(true);
     }
@@ -51,8 +51,8 @@ describe("TopBar", () => {
         healthStatus="ok"
       />,
     );
-    const sleepTab = screen.getByText("Sleep").closest(".tab") as HTMLElement;
-    fireEvent.click(sleepTab);
+    const pulseTab = screen.getByText("Pulse").closest(".tab") as HTMLElement;
+    fireEvent.click(pulseTab);
     expect(onTabChange).not.toHaveBeenCalled();
   });
 });

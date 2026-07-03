@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./app.css";
 import { App } from "./components/App";
 import { ChatTab } from "./components/ChatTab";
+import { SleepBatchPanel } from "./components/SleepBatchPanel";
 import { CommandPalette } from "./components/CommandPalette";
 import { useChatTransport } from "./hooks/useChatTransport";
 import type { AgentEntry } from "./components/AgentsSection";
@@ -68,7 +69,11 @@ function WebUI() {
         onSelectSession={setSelectedSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
-        main={activeTab === "chat" ? chatMain : null}
+        main={
+          activeTab === "chat" ? chatMain
+          : activeTab === "sleep" ? <SleepBatchPanel />
+          : null
+        }
       />
       <CommandPalette
         open={paletteOpen}

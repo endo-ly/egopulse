@@ -19,7 +19,7 @@ interface TabDef {
 
 const TABS: TabDef[] = [
   { id: "chat", label: "Chat", disabled: false },
-  { id: "sleep", label: "Sleep", disabled: true },
+  { id: "sleep", label: "Sleep", disabled: false },
   { id: "pulse", label: "Pulse", disabled: true },
   { id: "metrics", label: "Metrics", disabled: true },
   { id: "config", label: "Config", disabled: true },
