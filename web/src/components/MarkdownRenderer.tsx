@@ -21,9 +21,9 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
   );
 }
 
-type PreProps = ComponentProps<"pre">;
+type PreProps = Omit<ComponentProps<"pre">, "node">;
 
-function CodeBlockPre(props: PreProps) {
+function CodeBlockPre({ node: _, ...props }: PreProps & { node?: unknown }) {
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
 

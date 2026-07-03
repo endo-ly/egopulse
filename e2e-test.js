@@ -1,8 +1,13 @@
 const { chromium } = require('playwright');
+const path = require('path');
 
 (async () => {
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  let page;
+  let pass = 0;
+  let fail = 0;
+  try {
+    page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
   let pass = 0;
   let fail = 0;
@@ -109,11 +114,12 @@ const { chromium } = require('playwright');
   await page.waitForTimeout(300);
 
   console.log('\n7. Screenshot');
-  await page.screenshot({ path: '/root/workspace/egopulse/wt-webui-phase1/e2e-screenshot.png', fullPage: true });
+  await page.screenshot({ path: path.join(__dirname, 'e2e-screenshot.png'), fullPage: true });
   check('Screenshot saved', true);
 
   console.log(`\n=== Results: ${pass} passed, ${fail} failed ===\n`);
-
-  await browser.close();
-  process.exit(fail > 0 ? 1 : 0);
+  } finally {
+    await browser.close();
+  }
+  if (fail > 0) process.exit(1);
 })();

@@ -1,4 +1,5 @@
 import type { ChatMessage } from "../types";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
@@ -49,8 +50,17 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         )}
       </div>
       <div className="message-body">
-        {message.content}
-        {isDraft && <span className="streaming-cursor" />}
+        {message.sender_kind === "assistant" ? (
+          <>
+            <MarkdownRenderer content={message.content} />
+            {isDraft && <span className="streaming-cursor" />}
+          </>
+        ) : (
+          <>
+            {message.content}
+            {isDraft && <span className="streaming-cursor" />}
+          </>
+        )}
       </div>
     </div>
   );

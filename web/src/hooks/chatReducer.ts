@@ -16,10 +16,11 @@ export interface ChatState {
   messages: ChatMessage[];
   toolEvents: Record<string, ToolEventData>;
   runId: string | null;
+  error: string | null;
 }
 
 export function initialChatState(): ChatState {
-  return { messages: [], toolEvents: {}, runId: null };
+  return { messages: [], toolEvents: {}, runId: null, error: null };
 }
 
 export function reduceChatEvent(state: ChatState, event: ChatEventPayload): ChatState {
@@ -56,10 +57,10 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
       const finalText = extractText(event);
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
-      if (existing && finalText) {
+      if (existing) {
         messages = messages.map((m) =>
           m.id === draftId
-            ? { ...m, id: `${draftId}:done`, content: finalText }
+            ? { ...m, id: `${draftId}:done`, content: finalText || m.content }
             : m,
         );
       } else if (finalText) {
@@ -79,7 +80,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
     }
 
     case "error": {
-      return { ...state, runId: event.runId };
+      return { ...state, runId: event.runId, error: event.errorMessage ?? "unknown error" };
     }
   }
 }

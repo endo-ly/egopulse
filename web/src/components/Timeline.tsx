@@ -25,6 +25,7 @@ export function Timeline({ children, searchTarget }: TimelineProps) {
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    el.scrollTop = el.scrollHeight;
     checkNearBottom();
   }, []);
 

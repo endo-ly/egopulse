@@ -31,6 +31,18 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
     : [];
 
   useEffect(() => {
+    if (!storageKey) {
+      setText("");
+      return;
+    }
+    try {
+      setText(localStorage.getItem(`egopulse.draft.${storageKey}`) ?? "");
+    } catch {
+      setText("");
+    }
+  }, [storageKey]);
+
+  useEffect(() => {
     if (!storageKey) return;
     try {
       if (text) {

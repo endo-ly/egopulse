@@ -49,7 +49,8 @@ export function useServerState<T>(
   const entry = cache.get(key) as CacheEntry<T> | undefined;
 
   const doFetch = useCallback(async () => {
-    if (entry && entry.data !== undefined) return;
+    const current = cache.get(key) as CacheEntry<T> | undefined;
+    if (current && (current.data !== undefined || current.loading)) return;
     cache.set(key, { data: undefined, loading: true, error: null, timestamp: Date.now() });
     notify(key);
     try {
@@ -64,10 +65,10 @@ export function useServerState<T>(
       });
     }
     notify(key);
-  }, [key, fetcher, entry]);
+  }, [key, fetcher]);
 
   useEffect(() => {
-    if (!entry || (entry.data === undefined && !entry.loading)) {
+    if (!entry || (entry.data === undefined && !entry.loading && !entry.error)) {
       doFetch();
     }
   }, [entry, doFetch]);
