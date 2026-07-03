@@ -15,7 +15,6 @@ const COLOR_TOKENS = [
   "--color-success",
   "--color-danger",
   "--color-warning",
-  "--color-accent-soft",
   "--color-accent-2-soft",
   "--color-danger-soft",
   "--color-success-soft",
