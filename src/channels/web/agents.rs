@@ -21,7 +21,7 @@ pub(super) async fn list_agents(
     let config = &state.app_state.config;
     let default_agent = &config.default_agent;
 
-    let agents: Vec<AgentInfo> = config
+    let mut agents: Vec<AgentInfo> = config
         .agents
         .iter()
         .map(|(id, agent_config)| AgentInfo {
@@ -31,6 +31,7 @@ pub(super) async fn list_agents(
             active: state.app_state.active_turns.is_active(id.as_str()),
         })
         .collect();
+    agents.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok(Json(serde_json::json!({"ok": true, "agents": agents})))
 }

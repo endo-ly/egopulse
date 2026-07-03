@@ -1087,6 +1087,12 @@
     100% { opacity: 1; }
   }
 
+  .markdown-content {
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+
   .markdown-content h1 {
     font-size: var(--text-lg);
     font-weight: 700;

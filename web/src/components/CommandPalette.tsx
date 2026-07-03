@@ -27,32 +27,29 @@ export interface CommandPaletteProps {
 
 const STORAGE_KEY = "egopulse.paletteHistory";
 
-function loadHistory(): PaletteItem[] {
+interface StoredHistoryEntry {
+  id: string;
+  label: string;
+  section: string;
+}
+
+function loadHistory(): StoredHistoryEntry[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw) as Array<{ id: string; label: string; section: string }>;
-    return parsed.map((entry) => ({
-      ...entry,
-      onSelect: () => {},
-    }));
+    return JSON.parse(raw) as StoredHistoryEntry[];
   } catch {
     return [];
   }
 }
 
-function pushHistory(item: { id: string; label: string; section: string }) {
+function pushHistory(item: StoredHistoryEntry) {
   try {
     const existing = loadHistory()
       .filter((h) => h.id !== item.id)
       .slice(0, 4);
-    existing.unshift({ ...item, onSelect: () => {} });
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify(
-        existing.map((h) => ({ id: h.id, label: h.label, section: h.section })),
-      ),
-    );
+    existing.unshift(item);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(existing));
   } catch {
     return;
   }
@@ -178,11 +175,12 @@ export function CommandPalette({
       },
     }));
 
-  const recentItems = loadHistory().map((item) => {
+  const recentItems: PaletteItem[] = loadHistory().map((item) => {
     const original = [quickActions[0], quickActions[1], ...navigation, ...agentItems, ...sessionItems]
       .find((live) => live.id === item.id);
     return {
-      ...item,
+      id: item.id,
+      label: item.label,
       section: "Recent",
       onSelect: original?.onSelect ?? (() => {}),
     };
