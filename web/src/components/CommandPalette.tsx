@@ -178,10 +178,15 @@ export function CommandPalette({
       },
     }));
 
-  const recentItems = loadHistory().map((item) => ({
-    ...item,
-    section: "Recent",
-  }));
+  const recentItems = loadHistory().map((item) => {
+    const original = [quickActions[0], quickActions[1], ...navigation, ...agentItems, ...sessionItems]
+      .find((live) => live.id === item.id);
+    return {
+      ...item,
+      section: "Recent",
+      onSelect: original?.onSelect ?? (() => {}),
+    };
+  });
 
   const sleepPulseItems: PaletteItem[] = [];
 

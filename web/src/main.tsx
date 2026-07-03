@@ -8,6 +8,7 @@ import { useChatTransport } from "./hooks/useChatTransport";
 import type { AgentEntry } from "./components/AgentsSection";
 import type { SessionEntry } from "./components/SessionsSection";
 import type { TabId } from "./components/TopBar";
+import type { ChatMessage } from "./types";
 
 const MOCK_AGENTS: AgentEntry[] = [
   { id: "default", label: "Default Agent", is_default: true, active: false },
@@ -15,6 +16,11 @@ const MOCK_AGENTS: AgentEntry[] = [
 
 const MOCK_SESSIONS: SessionEntry[] = [
   { session_key: "main", label: "Web Chat", channel: "web", agent_id: "default", last_message_time: 0, last_message_preview: "hello" },
+];
+
+const INITIAL_MESSAGES: ChatMessage[] = [
+  { id: "m1", sender_id: "user:web", sender_kind: "user", content: "Hello! Can you help me?", timestamp: "2026-07-03T10:00:00Z", message_kind: "message" },
+  { id: "m2", sender_id: "default", sender_kind: "assistant", content: "Of course! What do you need?", timestamp: "2026-07-03T10:00:05Z", message_kind: "message" },
 ];
 
 function WebUI() {
@@ -41,9 +47,9 @@ function WebUI() {
     <ChatTab
       sessionLabel={selectedSessionData?.label ?? "Web Chat"}
       channel={selectedSessionData?.channel ?? "web"}
-      messageCount={transport.state.messages.length}
+      messageCount={INITIAL_MESSAGES.length + transport.state.messages.length}
       readOnly={isReadOnly}
-      messages={transport.state.messages}
+      messages={[...INITIAL_MESSAGES, ...transport.state.messages]}
       onSend={handleSend}
       storageKey={selectedSession}
     />
