@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
-import { MessageBubble } from "../components/MessageBubble";
-import type { ChatMessage } from "../types";
+import { MessageBubble } from "../features/chat/MessageBubble";
+import type { ChatMessage } from "../shared/api/types";
 
 function msg(overrides: Partial<ChatMessage>): ChatMessage {
   return {

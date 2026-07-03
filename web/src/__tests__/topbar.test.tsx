@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { TopBar } from "../components/TopBar";
+import { TopBar } from "../app/shell/TopBar";
 
 describe("TopBar", () => {
   it("topbar_renders_palette_trigger_tabs_and_health", () => {

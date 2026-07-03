@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { Badge } from "../components/Badge";
-import { StatusDot } from "../components/StatusDot";
-import { Spinner } from "../components/Spinner";
-import { Card } from "../components/Card";
-import { Modal } from "../components/Modal";
+import { Badge } from "../shared/ui/Badge";
+import { StatusDot } from "../shared/ui/StatusDot";
+import { Spinner } from "../shared/ui/Spinner";
+import { Card } from "../shared/ui/Card";
+import { Modal } from "../shared/ui/Modal";
 
 describe("common components", () => {
   it("common_components_render_according_to_spec", () => {

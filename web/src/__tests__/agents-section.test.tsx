@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { AgentsSection } from "../components/AgentsSection";
-import type { AgentEntry } from "../components/AgentsSection";
+import { AgentsSection } from "../app/shell/AgentsSection";
+import type { AgentEntry } from "../shared/api/types";
 
 const AGENTS: AgentEntry[] = [
   { id: "lyre", label: "Lyre", is_default: true, active: true },

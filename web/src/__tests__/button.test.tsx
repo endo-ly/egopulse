@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { Button } from "../components/Button";
+import { Button } from "../shared/ui/Button";
 
 describe("Button", () => {
   it("button_renders_all_variants_and_states", () => {

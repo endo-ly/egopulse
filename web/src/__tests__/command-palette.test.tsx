@@ -1,8 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
-import { CommandPalette } from "../components/CommandPalette";
-import type { AgentEntry } from "../components/AgentsSection";
-import type { SessionEntry } from "../components/SessionsSection";
+import { CommandPalette } from "../app/command-palette/CommandPalette";
+import type { AgentEntry, SessionEntry } from "../shared/api/types";
 
 const noop = () => {};
 

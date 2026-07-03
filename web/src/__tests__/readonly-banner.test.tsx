@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
-import { ReadOnlyBanner } from "../components/ReadOnlyBanner";
+import { ReadOnlyBanner } from "../features/chat/ReadOnlyBanner";
 
 describe("ReadOnlyBanner", () => {
   it("readonly_session_shows_banner_instead_of_composer", () => {

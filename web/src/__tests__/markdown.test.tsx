@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render } from "@testing-library/react";
-import { MarkdownRenderer } from "../components/MarkdownRenderer";
+import { MarkdownRenderer } from "../features/chat/MarkdownRenderer";
 
 describe("MarkdownRenderer", () => {
   it("markdown_renders_elements_and_code_block_has_copy", () => {

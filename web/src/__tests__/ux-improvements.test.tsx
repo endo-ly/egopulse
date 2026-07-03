@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
-import { Sidebar } from "../components/Sidebar";
-import { MarkdownRenderer } from "../components/MarkdownRenderer";
-import { Composer } from "../components/Composer";
+import { Sidebar } from "../app/shell/Sidebar";
+import { MarkdownRenderer } from "../features/chat/MarkdownRenderer";
+import { Composer } from "../features/chat/Composer";
 
 describe("Sidebar collapse (Step 30)", () => {
   it("sidebar_collapses_to_icon_only_bar", () => {

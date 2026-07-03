@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
-import { ToolCard } from "../components/ToolCard";
-import type { ToolEventData } from "../types";
+import { ToolCard } from "../features/chat/ToolCard";
+import type { ToolEventData } from "../shared/api/types";
 
 function evt(overrides: Partial<ToolEventData>): ToolEventData {
   return {
