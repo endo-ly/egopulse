@@ -6,6 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
+    "dev:mock": "EGOPULSE_MOCK=1 vite",
     "test": "vitest run"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.4",
     "@testing-library/react": "^16.3.0",
+    "@types/node": "^26.1.0",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.4",
