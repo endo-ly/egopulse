@@ -325,7 +325,7 @@
 
   .card-active {
     border-color: var(--color-border-strong);
-    background: var(--color-panel-hover);
+    background: var(--color-accent-soft);
   }
 
   .modal-backdrop {
@@ -598,7 +598,7 @@
   }
 
   .agent-row.active {
-    background: var(--color-panel-hover);
+    background: var(--color-accent-soft);
     border-color: var(--color-border-strong);
     color: var(--color-text-strong);
   }
