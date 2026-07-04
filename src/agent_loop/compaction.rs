@@ -149,7 +149,7 @@ pub(crate) fn estimate_prompt_tokens(
     (total_chars / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
 
-pub(crate) fn calibrated_estimate(raw_estimate: usize, factor: f64) -> usize {
+fn calibrated_estimate(raw_estimate: usize, factor: f64) -> usize {
     ((raw_estimate as f64) * factor).ceil().max(1.0) as usize
 }
 
@@ -855,6 +855,7 @@ mod tests {
 
     #[test]
     fn applies_calibration_factor_to_prompt_estimate() {
+        // Act + Assert
         assert_eq!(calibrated_estimate(10, 1.6), 16);
         assert_eq!(calibrated_estimate(1, 0.5), 1);
     }
@@ -901,14 +902,17 @@ mod tests {
 
     #[test]
     fn shrinks_compacted_summary_to_target() {
+        // Arrange
         let recent = vec![Message::text("user", "fresh question")];
         let full = build_compacted_messages(&"summary ".repeat(1000), &recent);
         let minimum = build_compacted_messages("", &recent);
         let target = estimate_prompt_tokens("", &minimum, None) + 10;
 
+        // Act
         let result =
             build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target, 1.0);
 
+        // Assert
         assert!(estimate_prompt_tokens("", &full, None) > target);
         assert!(estimate_prompt_tokens("", &result, None) <= target);
         assert!(
@@ -925,13 +929,16 @@ mod tests {
 
     #[test]
     fn shrinks_compacted_summary_using_calibrated_estimate() {
+        // Arrange
         let recent = vec![Message::text("user", "fresh question")];
         let minimum = build_compacted_messages("", &recent);
         let target = calibrated_estimate(estimate_prompt_tokens("", &minimum, None), 2.0) + 10;
 
+        // Act
         let result =
             build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target, 2.0);
 
+        // Assert
         assert!(
             calibrated_estimate(estimate_prompt_tokens("", &result, None), 2.0) <= target,
             "compacted result must fit the calibrated target"
@@ -1563,6 +1570,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn compaction_trigger_uses_calibrated_agent_loop_estimate() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -1591,6 +1599,7 @@ mod tests {
         let usable = usable_context_tokens(10_000);
         assert!(!should_compact(raw, usable, 0.80));
 
+        // Act
         let result = maybe_compact_messages(
             &state,
             &context,
@@ -1606,6 +1615,7 @@ mod tests {
         .await
         .expect("compaction");
 
+        // Assert
         assert!(
             result[0]
                 .content
@@ -1618,6 +1628,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn compaction_summarizer_usage_updates_calibration() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![
@@ -1667,9 +1678,12 @@ mod tests {
         .await
         .expect("save session");
 
+        // Act
         let reply = process_turn(&state, &context, "fresh question")
             .await
             .expect("process turn");
+
+        // Assert
         assert_eq!(reply, "final answer");
 
         let factor = state

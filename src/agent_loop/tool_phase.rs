@@ -723,6 +723,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn send_tool_phase_request_records_usage_calibration_before_payload_move() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -748,6 +749,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }]);
 
+        // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
             state: &state,
             llm: llm.as_ref(),
@@ -767,6 +769,7 @@ mod tests {
         .await
         .expect("tool phase response");
 
+        // Assert
         assert!(matches!(response, ToolPhaseResponse::Final(_)));
         let factor = state
             .usage_calibrator
@@ -783,6 +786,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn send_tool_phase_request_skips_calibration_when_usage_missing() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -800,6 +804,7 @@ mod tests {
         let context = cli_context("usage-calibration-none");
         let llm = state.llm_for_context(&context).expect("llm");
 
+        // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
             state: &state,
             llm: llm.as_ref(),
@@ -819,6 +824,7 @@ mod tests {
         .await
         .expect("tool phase response");
 
+        // Assert
         assert!(matches!(response, ToolPhaseResponse::Final(_)));
         let factor = state
             .usage_calibrator
@@ -835,6 +841,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn send_tool_phase_request_treats_empty_tools_as_no_tools_for_calibration() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -855,6 +862,7 @@ mod tests {
         let context = cli_context("usage-calibration-empty-tools");
         let llm = state.llm_for_context(&context).expect("llm");
 
+        // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
             state: &state,
             llm: llm.as_ref(),
@@ -874,6 +882,7 @@ mod tests {
         .await
         .expect("tool phase response");
 
+        // Assert
         assert!(matches!(response, ToolPhaseResponse::Final(_)));
         let without_tools = state
             .usage_calibrator
