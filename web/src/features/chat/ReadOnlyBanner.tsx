@@ -1,27 +1,17 @@
 import { Badge } from "../../shared/ui/Badge";
+import { channelLabel } from "../../shared/lib/format";
 
 export interface ReadOnlyBannerProps {
   channel: string;
 }
 
-function channelLabel(channel: string): string {
-  const map: Record<string, string> = {
-    discord: "Discord",
-    telegram: "Telegram",
-    cli: "CLI",
-    tui: "TUI",
-    voice: "Voice",
-  };
-  return map[channel] ?? channel;
-}
-
 export function ReadOnlyBanner({ channel }: ReadOnlyBannerProps) {
+  const label = channelLabel(channel);
   return (
     <div className="readonly-banner">
-      <Badge kind="channel">{channelLabel(channel)}</Badge>
+      <Badge kind="channel">{label}</Badge>
       <span className="readonly-text">
-        This is a {channelLabel(channel)} session. To reply, use{" "}
-        {channelLabel(channel)} directly.
+        This is a {label} session. To reply, use {label} directly.
       </span>
     </div>
   );

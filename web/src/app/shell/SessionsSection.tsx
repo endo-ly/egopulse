@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
+import { channelLabel } from "../../shared/lib/format";
 import type { SessionEntry } from "../../shared/api/types";
 
 export interface SessionsSectionProps {
@@ -108,7 +109,7 @@ export function SessionsSection({
               >
                 <div className="session-item">
                   <span className="session-label">{s.label}</span>
-                  <Badge kind="channel">{s.channel}</Badge>
+                  <Badge kind="channel">{channelLabel(s.channel)}</Badge>
                   <span className="session-preview">{s.last_message_preview}</span>
                 </div>
               </Card>

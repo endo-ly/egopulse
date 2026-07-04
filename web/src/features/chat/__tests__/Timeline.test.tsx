@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render, fireEvent, act } from "@testing-library/react";
+import { render, fireEvent } from "@testing-library/react";
 import { Timeline } from "../Timeline";
 
 function setScrollProps(el: HTMLElement, h: number, c: number, t: number) {
@@ -45,43 +45,15 @@ describe("Timeline", () => {
     expect(tl.scrollTop).toBe(2000);
   });
 
-  it("timeline_search_highlights_and_navigates_matches", () => {
+  it("timeline_highlights_active_search_match", () => {
     const { container } = render(
-      <Timeline searchTarget="hello world goodbye world peace">
-        <div>messages</div>
+      <Timeline searchMatches={[1]} activeMatchIndex={0}>
+        <div>first message</div>
+        <div>second message</div>
       </Timeline>,
     );
 
-    act(() => {
-      globalThis.dispatchEvent(new KeyboardEvent("keydown", { key: "f", metaKey: true }));
-    });
-
-    const searchInput = container.querySelector(".timeline-search-input") as HTMLInputElement;
-    expect(searchInput).toBeTruthy();
-
-    fireEvent.change(searchInput, { target: { value: "world" } });
-
-    const count = container.querySelector(".timeline-search-count");
-    expect(count?.textContent).toBe("1 / 2");
-  });
-
-  it("timeline_search_escape_closes", () => {
-    const { container } = render(
-      <Timeline searchTarget="hello world">
-        <div>messages</div>
-      </Timeline>,
-    );
-
-    act(() => {
-      globalThis.dispatchEvent(new KeyboardEvent("keydown", { key: "f", metaKey: true }));
-    });
-
-    const searchInput = container.querySelector(".timeline-search-input") as HTMLInputElement;
-    fireEvent.change(searchInput, { target: { value: "hello" } });
-
-    fireEvent.keyDown(searchInput, { key: "Escape" });
-
-    const searchBar = container.querySelector(".timeline-search-bar");
-    expect(searchBar).toBeFalsy();
+    const messages = container.querySelector(".timeline-messages") as HTMLElement;
+    expect(messages.children[1].classList.contains("search-highlight")).toBe(true);
   });
 });

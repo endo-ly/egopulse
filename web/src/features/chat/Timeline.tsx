@@ -1,18 +1,23 @@
-import { useRef, useEffect, useState, type ReactNode, type KeyboardEvent } from "react";
+import { useRef, useEffect, useState, type ReactNode } from "react";
 
 export interface TimelineProps {
   children?: ReactNode;
-  searchTarget?: string;
+  /** Message indices of the current search matches (drives match highlight). */
+  searchMatches?: number[];
+  /** Index within searchMatches of the active match. */
+  activeMatchIndex?: number;
 }
 
 const FOLLOW_THRESHOLD_RATIO = 0.1;
 
-export function Timeline({ children, searchTarget }: TimelineProps) {
+export function Timeline({
+  children,
+  searchMatches,
+  activeMatchIndex = 0,
+}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const [showJumpButton, setShowJumpButton] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [matchIndex, setMatchIndex] = useState(0);
 
   const checkNearBottom = () => {
     const el = scrollRef.current;
@@ -22,6 +27,7 @@ export function Timeline({ children, searchTarget }: TimelineProps) {
     setShowJumpButton(distFromBottom > threshold);
   };
 
+  // Initial mount: pin to the bottom.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -29,23 +35,20 @@ export function Timeline({ children, searchTarget }: TimelineProps) {
     checkNearBottom();
   }, []);
 
+  // Auto-follow while the user is near the bottom. A ResizeObserver keeps the
+  // view pinned as messages stream in or arrive, and stays out of the way once
+  // the user scrolls up to read history (followingRef becomes false).
+  const followingRef = useRef(true);
+  followingRef.current = !showJumpButton;
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el) return;
-    if (!showJumpButton) {
-      el.scrollTop = el.scrollHeight;
-    }
-  });
-
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        e.preventDefault();
-        setSearchOpen(true);
-      }
-    };
-    globalThis.addEventListener("keydown", handler);
-    return () => globalThis.removeEventListener("keydown", handler);
+    const target = messagesRef.current;
+    if (!el || !target || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followingRef.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
   }, []);
 
   const handleScroll = () => checkNearBottom();
@@ -57,95 +60,34 @@ export function Timeline({ children, searchTarget }: TimelineProps) {
     setShowJumpButton(false);
   };
 
-  const matches: number[] = [];
-  if (searchQuery && searchTarget) {
-    const lower = searchTarget.toLowerCase();
-    const q = searchQuery.toLowerCase();
-    let idx = lower.indexOf(q);
-    while (idx !== -1) {
-      matches.push(idx);
-      idx = lower.indexOf(q, idx + 1);
-    }
-  }
-
-  const handleSearchKey = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      if (e.shiftKey) {
-        setMatchIndex((i) => (i <= 0 ? matches.length - 1 : i - 1));
-      } else {
-        setMatchIndex((i) => (i + 1) % Math.max(matches.length, 1));
-      }
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      setSearchOpen(false);
-      setSearchQuery("");
-    }
-  };
-
+  // Scroll the active search match into view and flash it.
+  const messageIndex = searchMatches?.[activeMatchIndex];
   useEffect(() => {
-    if (!searchQuery || matches.length === 0 || !searchOpen) return;
-    const el = scrollRef.current;
-    if (!el || !searchTarget) return;
-    const matchPos = matches[matchIndex];
-    if (matchPos == null) return;
-    const lower = searchTarget.toLowerCase();
-    const beforeMatch = lower.substring(0, matchPos);
-    const lineNum = beforeMatch.split("\n").length;
-    const childArray = el.querySelectorAll(":scope > *");
-    const targetChild = childArray[lineNum] as HTMLElement | undefined;
-    if (targetChild && typeof targetChild.scrollIntoView === "function") {
+    if (messageIndex == null) return;
+    const container = messagesRef.current;
+    if (!container) return;
+    const targetChild = container.children[messageIndex] as
+      | HTMLElement
+      | undefined;
+    if (!targetChild) return;
+    if (typeof targetChild.scrollIntoView === "function") {
       targetChild.scrollIntoView({ behavior: "smooth", block: "center" });
-      targetChild.classList.add("search-highlight");
-      const timeout = setTimeout(() => targetChild.classList.remove("search-highlight"), 1500);
-      return () => clearTimeout(timeout);
     }
-  }, [matchIndex, searchQuery, matches, searchTarget, searchOpen]);
+    targetChild.classList.add("search-highlight");
+    const timeout = setTimeout(
+      () => targetChild.classList.remove("search-highlight"),
+      1500,
+    );
+    return () => clearTimeout(timeout);
+  }, [messageIndex, activeMatchIndex]);
 
   return (
-    <div
-      className="timeline"
-      ref={scrollRef}
-      onScroll={handleScroll}
-    >
-      {searchOpen && (
-        <div className="timeline-search-bar">
-          <input
-            type="text"
-            className="timeline-search-input"
-            placeholder="Search messages…"
-            value={searchQuery}
-            onChange={(e) => {
-              setSearchQuery(e.target.value);
-              setMatchIndex(0);
-            }}
-            onKeyDown={handleSearchKey}
-            autoFocus
-          />
-          {searchQuery && (
-            <span className="timeline-search-count">
-              {matches.length > 0 ? `${matchIndex + 1} / ${matches.length}` : "0 / 0"}
-            </span>
-          )}
-          <button
-            type="button"
-            className="timeline-search-close"
-            onClick={() => {
-              setSearchOpen(false);
-              setSearchQuery("");
-            }}
-          >
-            ✕
-          </button>
-        </div>
-      )}
-      {children}
+    <div className="timeline" ref={scrollRef} onScroll={handleScroll}>
+      <div className="timeline-messages" ref={messagesRef}>
+        {children}
+      </div>
       {showJumpButton && (
-        <button
-          type="button"
-          className="jump-to-latest"
-          onClick={jumpToLatest}
-        >
+        <button type="button" className="jump-to-latest" onClick={jumpToLatest}>
           Jump to latest
         </button>
       )}

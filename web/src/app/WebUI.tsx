@@ -4,6 +4,7 @@ import { AuthModal } from "./AuthModal";
 import { CommandPalette } from "./command-palette/CommandPalette";
 import { ChatTab } from "../features/chat/ChatTab";
 import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
+import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
@@ -40,6 +41,19 @@ export function WebUI() {
       setAuthMessage(authError.message);
     }
   }, [agentsState.error, historyState.error, sessionsState.error]);
+
+  const genericFetchError = useMemo(() => {
+    for (const error of [agentsState.error, sessionsState.error, historyState.error]) {
+      if (error && !(error instanceof AuthRequiredError)) return error;
+    }
+    return null;
+  }, [agentsState.error, sessionsState.error, historyState.error]);
+
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const visibleFetchError =
+    genericFetchError && genericFetchError.message !== dismissedError
+      ? genericFetchError
+      : null;
 
   useEffect(() => {
     if (selectedAgent || agents.length === 0) return;
@@ -122,7 +136,6 @@ export function WebUI() {
     <ChatTab
       sessionLabel={selectedSessionData?.label ?? "Web Chat"}
       channel={channel}
-      messageCount={messages.length}
       readOnly={isReadOnly}
       messages={messages}
       onSend={handleSend}
@@ -174,6 +187,15 @@ export function WebUI() {
           onTokenChange={setAuthDraft}
           onSubmit={handleUnlock}
         />
+      )}
+      {visibleFetchError && (
+        <div className="toast-container">
+          <Toast
+            tone="error"
+            message={`Couldn't load data: ${visibleFetchError.message}`}
+            onClose={() => setDismissedError(visibleFetchError.message)}
+          />
+        </div>
       )}
     </>
   );

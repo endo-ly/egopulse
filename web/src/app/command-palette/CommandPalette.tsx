@@ -40,23 +40,21 @@ export function CommandPalette({
     }
   }, [open]);
 
+  // Close on Escape from anywhere while open. A ref keeps the listener stable so
+  // it is registered once per open instead of on every render.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     const handler = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setActiveIndex((i) => Math.min(i + 1, Math.max(items.length - 1, 0)));
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setActiveIndex((i) => Math.max(i - 1, 0));
+        onCloseRef.current();
       }
     };
     globalThis.addEventListener("keydown", handler);
     return () => globalThis.removeEventListener("keydown", handler);
-  });
+  }, [open]);
 
   if (!open) return null;
 
@@ -83,7 +81,17 @@ export function CommandPalette({
     : allItems;
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && items[activeIndex] && !items[activeIndex].disabled) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.min(i + 1, Math.max(items.length - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (
+      e.key === "Enter" &&
+      items[activeIndex] &&
+      !items[activeIndex].disabled
+    ) {
       e.preventDefault();
       items[activeIndex].onSelect();
     }
