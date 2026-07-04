@@ -682,6 +682,11 @@ mod tests {
     use super::*;
     use axum::extract::ws::Message;
 
+    use crate::channels::web::RunHub;
+    use crate::error::LlmError;
+    use crate::llm::{LlmProvider, Message as LlmMessage, MessagesResponse};
+    use crate::test_util::build_state_with_provider;
+
     fn collect_text_messages(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<String> {
         let mut result = Vec::new();
         while let Ok(msg) = rx.try_recv() {
@@ -690,6 +695,92 @@ mod tests {
             }
         }
         result
+    }
+
+    struct StubLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StubLlm {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn model_name(&self) -> &str {
+            "stub-model"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<LlmMessage>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, LlmError> {
+            Ok(MessagesResponse {
+                content: "stub reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    fn test_web_state(dir: &tempfile::TempDir) -> WebState {
+        let state_root = dir.path().to_string_lossy().to_string();
+        let app_state = build_state_with_provider(&state_root, Box::new(StubLlm));
+        WebState {
+            app_state: Arc::new(app_state),
+            config_path: None,
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn ws_chat_event_includes_session_key() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(0);
+
+        let test_session = "test-session";
+
+        let delta_event = RunEvent {
+            id: 1,
+            event: "delta".to_string(),
+            data: r#"{"delta":"chunk"}"#.to_string(),
+        };
+        forward_run_event(&tx, "run-1", test_session, &seq, delta_event);
+
+        let done_event = RunEvent {
+            id: 2,
+            event: "done".to_string(),
+            data: r#"{"response":"final"}"#.to_string(),
+        };
+        forward_run_event(&tx, "run-1", test_session, &seq, done_event);
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 2);
+
+        for msg in &messages {
+            let parsed: serde_json::Value = serde_json::from_str(msg).unwrap();
+            assert_eq!(parsed["event"], "chat");
+            assert_eq!(
+                parsed["payload"]["sessionKey"], "test-session",
+                "sessionKey must be present in every chat event"
+            );
+        }
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        let seq2 = AtomicU64::new(0);
+        let error_event = RunEvent {
+            id: 1,
+            event: "error".to_string(),
+            data: r#"{"error":"fail"}"#.to_string(),
+        };
+        forward_run_event(&tx2, "run-2", test_session, &seq2, error_event);
+
+        let error_messages = collect_text_messages(&mut rx2);
+        assert_eq!(error_messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&error_messages[0]).unwrap();
+        assert_eq!(parsed["payload"]["sessionKey"], "test-session");
     }
 
     #[test]
@@ -818,5 +909,41 @@ mod tests {
         assert_eq!(payload["state"], "error");
         assert_eq!(payload["errorMessage"], "something went wrong");
         assert!(payload.get("message").is_none());
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_accepts_message_and_returns_run_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            in_flight_chat_sends: &in_flight,
+            conn_id: "test-conn",
+        };
+
+        let params = serde_json::json!({
+            "sessionKey": "main",
+            "message": "hello"
+        });
+
+        let _ = handle_chat_send(&state, context, "req-1", params).await;
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "exactly one response frame expected");
+
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["type"], "res");
+        assert_eq!(parsed["id"], "req-1");
+        assert_eq!(parsed["ok"], true);
+
+        let payload = &parsed["payload"];
+        assert!(payload["runId"].as_str().is_some(), "runId must be present");
+        assert_eq!(payload["status"], "accepted");
     }
 }

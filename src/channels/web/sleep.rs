@@ -1,8 +1,4 @@
 //! Sleep batch audit API endpoints.
-//!
-//! Provides REST handlers for listing agents with sleep run records,
-//! listing sleep runs, and retrieving individual run details with
-//! associated memory snapshots.
 
 use std::collections::HashMap;
 
@@ -16,23 +12,6 @@ use crate::storage::call_blocking;
 use super::WebState;
 
 const DEFAULT_LIMIT: i64 = 20;
-
-/// Lists distinct agent IDs that have sleep run records.
-pub(super) async fn list_agents(
-    State(state): State<WebState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let db = Arc::clone(&state.app_state.db);
-    match call_blocking(db, |db| db.list_distinct_agent_ids()).await {
-        Ok(agents) => Ok(Json(serde_json::json!({"ok": true, "agents": agents}))),
-        Err(error) => {
-            tracing::warn!(%error, "failed to list distinct agent IDs");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            ))
-        }
-    }
-}
 
 /// Lists sleep runs, optionally filtered by agent_id.
 ///
@@ -253,36 +232,6 @@ mod tests {
             rusqlite::params![id, run_id, agent_id],
         )
         .expect("insert memory snapshot");
-    }
-
-    #[tokio::test]
-    async fn api_agents_returns_distinct_agent_ids() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let web_state = test_web_state(&dir);
-
-        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-2", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-3", "agent-b", "[]");
-
-        let result = list_agents(AxumState(web_state)).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
-        let agents = body["agents"].as_array().expect("agents array");
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0], "agent-a");
-        assert_eq!(agents[1], "agent-b");
-    }
-
-    #[tokio::test]
-    async fn api_agents_returns_empty_array() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let web_state = test_web_state(&dir);
-
-        let result = list_agents(AxumState(web_state)).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
-        let agents = body["agents"].as_array().expect("agents array");
-        assert!(agents.is_empty());
     }
 
     #[tokio::test]

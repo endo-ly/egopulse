@@ -166,6 +166,7 @@ impl Database {
             Ok(SessionSummary {
                 chat_id: row.get(0)?,
                 channel: channel.clone(),
+                external_chat_id: external_chat_id.clone(),
                 surface_thread: logical_session_thread(
                     &channel,
                     &external_chat_id,

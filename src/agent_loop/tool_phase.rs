@@ -59,6 +59,8 @@ pub(crate) struct ToolResultPhase {
     pub(crate) tool_result_preview: String,
 }
 
+pub(crate) fn ignore_delta(_: String) {}
+
 pub(crate) enum ToolPhaseResponse {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
@@ -75,10 +77,11 @@ pub(crate) struct ToolPhaseRequest<'a> {
     pub(crate) caller_channel: &'a str,
     pub(crate) request_kind: &'static str,
     pub(crate) usage_log_failure: &'static str,
-    pub(crate) log_scope: &'static str,
+    pub(crate) log_scope: &'a str,
     pub(crate) send_failure_log: &'static str,
     pub(crate) iteration: usize,
     pub(crate) scope: ConversationScope,
+    pub(crate) on_delta: &'a (dyn Fn(String) + Send + Sync),
 }
 
 pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str) -> Vec<ToolCall> {
@@ -114,7 +117,12 @@ pub(crate) async fn send_tool_phase_request(
 ) -> Result<ToolPhaseResponse, EgoPulseError> {
     let response = request
         .llm
-        .send_message(request.system_prompt, request.messages, request.tools)
+        .send_message_streaming(
+            request.system_prompt,
+            request.messages,
+            request.tools,
+            request.on_delta,
+        )
         .await
         .inspect_err(|e| {
             warn!(

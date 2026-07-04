@@ -10,6 +10,8 @@ use serde::Serialize;
 pub(crate) enum AgentEvent {
     /// Iteration counter.
     Iteration { iteration: usize },
+    /// Incremental text chunk from LLM streaming.
+    Delta { text: String },
     /// Tool execution started.
     ToolStart {
         name: String,

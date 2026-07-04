@@ -207,6 +207,7 @@ impl StoredMessage {
 pub(crate) struct SessionSummary {
     pub chat_id: i64,
     pub channel: String,
+    pub external_chat_id: String,
     pub surface_thread: String,
     pub chat_title: Option<String>,
     pub last_message_time: String,

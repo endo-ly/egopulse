@@ -384,6 +384,11 @@ impl TurnExecutor<'_> {
             let request_messages =
                 request_messages_for_iteration(&mut loop_state, iteration, &channel_context_msg);
 
+            let delta_emitter = self.on_event.clone();
+            let on_delta = move |text: String| {
+                delta_emitter.emit(AgentEvent::Delta { text });
+            };
+
             let phase_response = send_tool_phase_request(ToolPhaseRequest {
                 state: self.state,
                 llm: prepared.channel_llm.as_ref(),
@@ -398,6 +403,7 @@ impl TurnExecutor<'_> {
                 send_failure_log: "LLM send_message failed",
                 iteration,
                 scope: self.context.scope,
+                on_delta: &on_delta,
             })
             .await?;
 
@@ -983,6 +989,56 @@ enum PersistConflictOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct DeltaEmittingProvider {
+    pub(crate) chunks: Vec<String>,
+    pub(crate) final_response: String,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::llm::LlmProvider for DeltaEmittingProvider {
+    async fn send_message(
+        &self,
+        _system: &str,
+        _messages: Arc<Vec<Message>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        Ok(crate::llm::MessagesResponse {
+            content: self.final_response.clone(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+
+    async fn send_message_streaming(
+        &self,
+        _system: &str,
+        _messages: Arc<Vec<Message>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        for chunk in self.chunks.clone() {
+            on_delta(chunk);
+        }
+        Ok(crate::llm::MessagesResponse {
+            content: self.final_response.clone(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn provider_name(&self) -> &str {
+        "delta-test"
+    }
+
+    fn model_name(&self) -> &str {
+        "delta-model"
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct FakeProvider {
     pub(crate) responses: std::sync::Mutex<Vec<crate::llm::MessagesResponse>>,
 }
@@ -1180,14 +1236,15 @@ pub(crate) fn build_state_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{
-        FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
+        DeltaEmittingProvider, FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
         build_state_with_provider, cli_context,
     };
     use serial_test::serial;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::agent_loop::ConversationScope;
-    use crate::agent_loop::process_turn;
+    use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::channels::web::sse::AgentEvent;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::storage::{SenderKind, call_blocking};
@@ -1293,6 +1350,51 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(error, EgoPulseError::Llm(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_loop_emits_delta_events_during_llm_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = DeltaEmittingProvider {
+            chunks: vec!["Hello".to_string(), " world".to_string()],
+            final_response: "Hello world".to_string(),
+        };
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&collected);
+        let reply = process_turn_with_events(
+            &state,
+            &cli_context("delta-stream"),
+            "hello",
+            move |event| {
+                collector.lock().expect("collector").push(event);
+            },
+        )
+        .await
+        .expect("process turn");
+
+        assert_eq!(reply, "Hello world");
+
+        let events = collected.lock().expect("collector");
+        let deltas: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Delta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hello".to_string(), " world".to_string()]);
+
+        let last = events.last().expect("at least one event");
+        assert!(matches!(
+            last,
+            AgentEvent::FinalResponse { text } if text == "Hello world"
+        ));
     }
 
     // -----------------------------------------------------------------------

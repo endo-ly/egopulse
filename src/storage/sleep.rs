@@ -410,15 +410,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub(crate) fn list_distinct_agent_ids(&self) -> Result<Vec<String>, StorageError> {
-        let conn = self.get_conn()?;
-        let mut stmt =
-            conn.prepare_cached("SELECT DISTINCT agent_id FROM sleep_runs ORDER BY agent_id")?;
-        stmt.query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
     pub(crate) fn list_all_sleep_runs(&self, limit: i64) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
@@ -1368,26 +1359,6 @@ mod tests {
             .expect("get latest")
             .expect("should exist");
         assert_eq!(latest.id, id_2);
-    }
-
-    #[test]
-    fn list_distinct_agent_ids_returns_sorted_agents() {
-        let (db, _dir) = test_db();
-
-        create_test_sleep_run(&db, "charlie");
-        create_test_sleep_run(&db, "alpha");
-        create_test_sleep_run(&db, "bravo");
-
-        let agents = db.list_distinct_agent_ids().expect("list");
-        assert_eq!(agents, vec!["alpha", "bravo", "charlie"]);
-    }
-
-    #[test]
-    fn list_distinct_agent_ids_empty_when_no_runs() {
-        let (db, _dir) = test_db();
-
-        let agents = db.list_distinct_agent_ids().expect("list");
-        assert!(agents.is_empty());
     }
 
     #[test]

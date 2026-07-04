@@ -1,10 +1,8 @@
-import React from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "./components/App";
 import "./app.css";
+import { WebUI } from "./app/WebUI";
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+const root = document.getElementById("root");
+if (root) {
+  createRoot(root).render(<WebUI />);
+}

@@ -7,7 +7,7 @@ use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::tool_phase::{
     MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
-    build_tool_result_phase, send_tool_phase_request,
+    build_tool_result_phase, ignore_delta, send_tool_phase_request,
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
@@ -123,6 +123,7 @@ pub(crate) async fn run_activation(
             send_failure_log: "pulse LLM send_message failed",
             iteration,
             scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
         })
         .await?;
 
