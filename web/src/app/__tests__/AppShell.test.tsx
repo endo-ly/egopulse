@@ -95,7 +95,7 @@ describe("App shell", () => {
     expect(screen.getByText("SESSIONS")).toBeTruthy();
     expect(screen.getByText("Lyre")).toBeTruthy();
     expect(screen.getByText("Web Chat")).toBeTruthy();
-    expect(screen.getByText("Chat").closest(".tab")?.className).toContain(
+    expect(screen.getByRole("button", { name: "Chat" }).className).toContain(
       "active",
     );
 

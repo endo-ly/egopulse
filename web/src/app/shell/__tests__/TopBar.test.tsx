@@ -22,16 +22,16 @@ describe("TopBar", () => {
 
     const labels = ["Chat", "Sleep", "Pulse", "Metrics", "Config"];
     for (const label of labels) {
-      expect(screen.queryByText(label)).not.toBeNull();
+      expect(screen.getByRole("button", { name: label })).toBeTruthy();
     }
 
-    const chatTab = screen.getByText("Chat").closest(".tab");
-    expect(chatTab?.className).toContain("active");
-    expect(chatTab?.getAttribute("aria-current")).toBe("page");
+    const chatTab = screen.getByRole("button", { name: "Chat" });
+    expect(chatTab.className).toContain("active");
+    expect(chatTab.getAttribute("aria-current")).toBe("page");
 
     for (const label of ["Pulse", "Metrics", "Config"]) {
-      const tab = screen.getByText(label).closest(".tab");
-      expect(tab?.hasAttribute("disabled")).toBe(true);
+      const tab = screen.getByRole("button", { name: label });
+      expect(tab.hasAttribute("disabled")).toBe(true);
     }
 
     const health = document.querySelector(".health-badge");
@@ -51,7 +51,7 @@ describe("TopBar", () => {
         healthStatus="ok"
       />,
     );
-    const pulseTab = screen.getByText("Pulse").closest(".tab") as HTMLElement;
+    const pulseTab = screen.getByRole("button", { name: "Pulse" });
     fireEvent.click(pulseTab);
     expect(onTabChange).not.toHaveBeenCalled();
   });

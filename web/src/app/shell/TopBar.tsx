@@ -71,6 +71,18 @@ export function TopBar({
           </button>
         ))}
       </nav>
+      <select
+        className="tab-select"
+        aria-label="Primary navigation"
+        value={activeTab}
+        onChange={(e) => onTabChange(e.target.value as TabId)}
+      >
+        {TABS.map((tab) => (
+          <option key={tab.id} value={tab.id} disabled={tab.disabled}>
+            {tab.label}
+          </option>
+        ))}
+      </select>
 
       <div className="health-badge" title="Runtime health">
         <StatusDot tone={healthTone(healthStatus)} />

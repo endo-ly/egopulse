@@ -421,6 +421,25 @@
     cursor: not-allowed;
   }
 
+  /* Mobile-only dropdown for primary navigation (see the mobile media query). */
+  .tab-select {
+    display: none;
+    min-height: 36px;
+    padding: 0 var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-panel);
+    color: var(--color-text);
+    font-family: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .tab-select:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
   .health-badge {
     display: inline-flex;
     align-items: center;
@@ -1158,27 +1177,7 @@
 
   @media (max-width: 639px) {
     .message-row {
-      width: 100%;
-      max-width: 100%;
-    }
-
-    .message-row.bubble-user,
-    .message-row.bubble-assistant,
-    .message-row.bubble-tool {
-      align-self: stretch;
-    }
-
-    .message-row.bubble-user {
-      align-items: flex-end;
-    }
-
-    .message-row.bubble-user .message-body {
-      width: auto;
-      max-width: 100%;
-    }
-
-    .topbar-content {
-      overflow: hidden;
+      max-width: 85%;
     }
 
     .topbar-content .palette-trigger {
@@ -1191,18 +1190,11 @@
     }
 
     .tabs {
-      flex: 0 0 auto;
-      justify-content: flex-start;
-      overflow: hidden;
-    }
-
-    .tab {
-      padding-left: var(--space-sm);
-      padding-right: var(--space-sm);
-    }
-
-    .tab:disabled {
       display: none;
+    }
+
+    .tab-select {
+      display: block;
     }
   }
 
