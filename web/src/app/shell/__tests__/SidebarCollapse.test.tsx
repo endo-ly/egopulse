@@ -28,7 +28,7 @@ describe("Sidebar collapse", () => {
     const hiddenBrand = container.querySelector(".sidebar-brand-name");
     expect(hiddenBrand).toBeFalsy();
 
-    const sections = container.querySelectorAll(".sidebar-section");
-    expect(sections.length).toBe(0);
+    const body = container.querySelectorAll(".sidebar-body");
+    expect(body.length).toBe(0);
   });
 });

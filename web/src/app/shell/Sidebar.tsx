@@ -57,8 +57,8 @@ export function Sidebar({
 
       {!collapsed && (
         <div className="sidebar-body">
-          <section className="sidebar-section">{agents}</section>
-          <section className="sidebar-section">{sessions}</section>
+          {agents}
+          {sessions}
         </div>
       )}
 

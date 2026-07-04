@@ -33,4 +33,33 @@
     outline: 2px solid var(--color-accent);
     outline-offset: 2px;
   }
+
+  *,
+  *::before,
+  *::after {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-muted-2) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-muted-2);
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    border-radius: var(--radius-full);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-muted);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
 }
