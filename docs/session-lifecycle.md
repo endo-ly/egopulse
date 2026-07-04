@@ -179,9 +179,9 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 最初の LLM 呼び出し前と、tool result 追加後の次回 LLM 呼び出し前に判定する。推定 prompt tokens が usable context の `compaction_threshold_ratio`（デフォルト 80%）に達したら発火。
 
-推定は bytes-based 近似（`bytes / 3`）をベースに、実測 usage で校正した補正係数を掛ける。system prompt・messages・tool schema を含めて raw estimate を算出し、LLM レスポンスの `usage.input_tokens` が返る経路では `(provider, model, request_kind, has_tools)` 単位の係数を EMA で更新する。
+推定は会話量の概算を出し、LLM レスポンスに含まれる実測 usage で補正する。実測が返る provider では、日本語や tool schema の影響で概算が小さく出る場合も、以後の判定が実際の使用量に近づく。
 
-未計測 key ではコード内定数 `DEFAULT_FACTOR` を使い、起動直後や usage を返さない provider でも過小評価側に倒れにくくする。補正係数はメモリ内のみで保持し、設定・DB 永続化・外部 tokenizer 依存は追加しない。
+まだ実測がない場合は、保守的に少し多めに見積もる。補正値は実行中のメモリだけに保持し、設定や DB には保存しない。外部 tokenizer も使わない。
 
 ### Algorithm
 
@@ -194,7 +194,7 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 | **old** | 古いメッセージ。summary 対象 |
 | **recent** | `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護 |
 
-**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も補正後推定で target を超える場合は、recent を保護したまま summary 本文をさらに縮める。
+**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も目標サイズを超える場合は、recent を保護したまま summary 本文だけをさらに縮める。
 
 **要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
 
