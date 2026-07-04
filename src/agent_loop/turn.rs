@@ -254,6 +254,7 @@ impl TurnExecutor<'_> {
             let prompt_ctx = PromptContext {
                 system_prompt: &prepared.system_prompt,
                 tools_json: prepared.tools_json.as_deref(),
+                has_tools: !prepared.tool_defs.is_empty(),
             };
 
             // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。

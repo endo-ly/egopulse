@@ -36,6 +36,7 @@ use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
+use crate::llm::calibration::UsageCalibrator;
 use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
@@ -69,6 +70,8 @@ pub struct AppState {
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
+    /// Learns prompt-token estimate correction factors from observed LLM usage.
+    pub(crate) usage_calibrator: Arc<UsageCalibrator>,
     _sealed: (),
 }
 
@@ -130,6 +133,7 @@ impl AppState {
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
             runtime_status: parts.runtime_status,
+            usage_calibrator: Arc::new(UsageCalibrator::new()),
             _sealed: (),
         }
     }
