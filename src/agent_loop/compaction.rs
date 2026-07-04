@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::error::{EgoPulseError, LlmError};
+use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, Message, MessagesResponse};
 use crate::runtime::AppState;
 use tracing::{info, warn};
@@ -41,6 +42,7 @@ const SUMMARIZER_SYSTEM_PROMPT: &str = "You are a helpful summarizer. Summarize 
 pub(crate) struct PromptContext<'a> {
     pub system_prompt: &'a str,
     pub tools_json: Option<&'a str>,
+    pub has_tools: bool,
 }
 
 pub(crate) async fn maybe_compact_messages(
@@ -56,8 +58,11 @@ pub(crate) async fn maybe_compact_messages(
         .config
         .resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
-    let estimated =
+    let raw_estimate =
         estimate_prompt_tokens(prompt_ctx.system_prompt, messages, prompt_ctx.tools_json);
+    let calibration_key = agent_loop_calibration_key(llm.as_ref(), prompt_ctx.has_tools);
+    let factor = state.usage_calibrator.factor(&calibration_key).await;
+    let estimated = calibrated_estimate(raw_estimate, factor);
 
     if !should_compact(estimated, usable, state.config.compaction_threshold_ratio) {
         return Ok(messages.to_vec());
@@ -74,12 +79,15 @@ pub(crate) async fn maybe_compact_messages(
 
     safety_compact(
         state,
-        context,
-        chat_id,
-        messages,
-        llm,
-        usable,
-        state.config.compaction_target_ratio,
+        SafetyCompactInput {
+            context,
+            chat_id,
+            messages,
+            llm,
+            usable,
+            target_ratio: state.config.compaction_target_ratio,
+            calibration_factor: factor,
+        },
     )
     .await
 }
@@ -101,14 +109,22 @@ pub(crate) async fn force_compact(
         .resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
 
+    let factor = state
+        .usage_calibrator
+        .factor(&agent_loop_calibration_key(llm.as_ref(), false))
+        .await;
+
     safety_compact(
         state,
-        context,
-        chat_id,
-        messages,
-        llm,
-        usable,
-        state.config.compaction_target_ratio,
+        SafetyCompactInput {
+            context,
+            chat_id,
+            messages,
+            llm,
+            usable,
+            target_ratio: state.config.compaction_target_ratio,
+            calibration_factor: factor,
+        },
     )
     .await
 }
@@ -131,6 +147,10 @@ pub(crate) fn estimate_prompt_tokens(
         total_chars += tools.len();
     }
     (total_chars / CHARS_PER_TOKEN_ESTIMATE).max(1)
+}
+
+fn calibrated_estimate(raw_estimate: usize, factor: f64) -> usize {
+    ((raw_estimate as f64) * factor).ceil().max(1.0) as usize
 }
 
 pub(crate) fn usable_context_tokens(context_window_tokens: usize) -> usize {
@@ -188,6 +208,17 @@ struct CompactionResultInput<'a> {
     summary: &'a str,
     usable_context: usize,
     target_ratio: f64,
+    calibration_factor: f64,
+}
+
+struct SafetyCompactInput<'a> {
+    context: &'a SurfaceContext,
+    chat_id: i64,
+    messages: &'a [Message],
+    llm: &'a std::sync::Arc<dyn LlmProvider>,
+    usable: usize,
+    target_ratio: f64,
+    calibration_factor: f64,
 }
 
 enum SummarizeOutcome {
@@ -197,44 +228,41 @@ enum SummarizeOutcome {
 
 async fn safety_compact(
     state: &AppState,
-    context: &SurfaceContext,
-    chat_id: i64,
-    messages: &[Message],
-    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
-    usable_context: usize,
-    target_ratio: f64,
+    input: SafetyCompactInput<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    archive_current_conversation(state, context, chat_id, messages).await;
+    archive_current_conversation(state, input.context, input.chat_id, input.messages).await;
 
-    let Some(slices) = select_compaction_slices(messages, state.config.compact_keep_recent) else {
-        return Ok(messages.to_vec());
+    let Some(slices) = select_compaction_slices(input.messages, state.config.compact_keep_recent)
+    else {
+        return Ok(input.messages.to_vec());
     };
 
     let summary = match summarize_old_messages(
         state,
-        context,
-        chat_id,
+        input.context,
+        input.chat_id,
         slices.old_messages,
-        llm,
-        usable_context,
-        target_ratio,
+        input.llm,
+        input.usable,
+        input.target_ratio,
     )
     .await
     {
         SummarizeOutcome::Summary(summary) => summary,
-        SummarizeOutcome::KeepOriginal => return Ok(messages.to_vec()),
+        SummarizeOutcome::KeepOriginal => return Ok(input.messages.to_vec()),
     };
 
     let compacted = build_compaction_result(CompactionResultInput {
-        context,
-        chat_id,
-        llm,
-        original_count: messages.len(),
+        context: input.context,
+        chat_id: input.chat_id,
+        llm: input.llm,
+        original_count: input.messages.len(),
         old_count: slices.old_messages.len(),
         recent_messages: slices.recent_messages,
         summary: &summary,
-        usable_context,
-        target_ratio,
+        usable_context: input.usable,
+        target_ratio: input.target_ratio,
+        calibration_factor: input.calibration_factor,
     });
 
     Ok(compacted)
@@ -286,10 +314,20 @@ async fn summarize_old_messages(
     let mut summary_input = build_summary_input(old_messages, usable_context, target_ratio);
     summary_input = redact_summary_text(&summary_input, state);
     let timeout_secs = state.config.compaction_timeout_secs;
+    let summary_messages = Arc::new(vec![Message::text("user", summary_input)]);
+    let raw_estimate = estimate_prompt_tokens(SUMMARIZER_SYSTEM_PROMPT, &summary_messages, None);
+    let calibration_key =
+        CalibrationKey::new(llm.provider_name(), llm.model_name(), "compaction", false);
 
-    let summary_result = send_summary_request(llm, summary_input, timeout_secs).await;
+    let summary_result = send_summary_request(llm, summary_messages, timeout_secs).await;
     let summary = match summary_result {
         Ok(response) => {
+            if let Some(usage) = &response.usage {
+                state
+                    .usage_calibrator
+                    .record(calibration_key, raw_estimate, usage.input_tokens)
+                    .await;
+            }
             log_summarizer_usage(state, context, chat_id, llm, &response);
             strip_thinking(&response.content)
         }
@@ -324,16 +362,12 @@ enum SummarizeError {
 
 async fn send_summary_request(
     llm: &std::sync::Arc<dyn LlmProvider>,
-    summary_input: String,
+    messages: Arc<Vec<Message>>,
     timeout_secs: u64,
 ) -> Result<MessagesResponse, SummarizeError> {
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        llm.send_message(
-            SUMMARIZER_SYSTEM_PROMPT,
-            Arc::new(vec![Message::text("user", summary_input)]),
-            None,
-        ),
+        llm.send_message(SUMMARIZER_SYSTEM_PROMPT, messages, None),
     )
     .await
     .map_err(|_| SummarizeError::Timeout)?
@@ -378,7 +412,12 @@ fn log_summarizer_usage(
 
 fn build_compaction_result(input: CompactionResultInput<'_>) -> Vec<Message> {
     let target = compaction_target_tokens(input.usable_context, input.target_ratio);
-    let compacted = build_targeted_compacted_messages(input.summary, input.recent_messages, target);
+    let compacted = build_targeted_compacted_messages(
+        input.summary,
+        input.recent_messages,
+        target,
+        input.calibration_factor,
+    );
 
     let new_count = compacted.len();
     log_compaction_metrics(
@@ -391,7 +430,10 @@ fn build_compaction_result(input: CompactionResultInput<'_>) -> Vec<Message> {
         true,
     );
 
-    let post_tokens = estimate_prompt_tokens("", &compacted, None);
+    let post_tokens = calibrated_estimate(
+        estimate_prompt_tokens("", &compacted, None),
+        input.calibration_factor,
+    );
     if post_tokens > target {
         warn!(
             channel = %input.context.channel,
@@ -410,12 +452,17 @@ fn build_targeted_compacted_messages(
     summary: &str,
     recent_messages: &[Message],
     target_tokens: usize,
+    calibration_factor: f64,
 ) -> Vec<Message> {
     let compacted = build_compacted_messages(summary, recent_messages);
     if target_tokens == 0 {
         return compacted;
     }
-    if estimate_prompt_tokens("", &compacted, None) <= target_tokens {
+    if calibrated_estimate(
+        estimate_prompt_tokens("", &compacted, None),
+        calibration_factor,
+    ) <= target_tokens
+    {
         return compacted;
     }
 
@@ -426,7 +473,11 @@ fn build_targeted_compacted_messages(
         let mid = low + (high - low) / 2;
         let candidate_summary = truncate_summary_for_target(summary, mid);
         let candidate = build_compacted_messages(&candidate_summary, recent_messages);
-        if estimate_prompt_tokens("", &candidate, None) <= target_tokens {
+        if calibrated_estimate(
+            estimate_prompt_tokens("", &candidate, None),
+            calibration_factor,
+        ) <= target_tokens
+        {
             best = Some(candidate);
             low = mid + 1;
         } else if mid == 0 {
@@ -437,6 +488,15 @@ fn build_targeted_compacted_messages(
     }
 
     best.unwrap_or_else(|| build_compacted_messages("", recent_messages))
+}
+
+fn agent_loop_calibration_key(llm: &dyn LlmProvider, has_tools: bool) -> CalibrationKey {
+    CalibrationKey::new(
+        llm.provider_name(),
+        llm.model_name(),
+        "agent_loop",
+        has_tools,
+    )
 }
 
 fn truncate_summary_for_target(summary: &str, max_chars: usize) -> String {
@@ -720,6 +780,7 @@ mod tests {
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
     use crate::error::LlmError;
+    use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall};
     use crate::storage::Database;
     use crate::storage::call_blocking;
@@ -793,6 +854,13 @@ mod tests {
     }
 
     #[test]
+    fn applies_calibration_factor_to_prompt_estimate() {
+        // Act + Assert
+        assert_eq!(calibrated_estimate(10, 1.6), 16);
+        assert_eq!(calibrated_estimate(1, 0.5), 1);
+    }
+
+    #[test]
     fn targets_configured_compaction_ratio() {
         let usable = 100_000;
         assert_eq!(compaction_target_tokens(usable, 0.40), 40_000);
@@ -834,13 +902,17 @@ mod tests {
 
     #[test]
     fn shrinks_compacted_summary_to_target() {
+        // Arrange
         let recent = vec![Message::text("user", "fresh question")];
         let full = build_compacted_messages(&"summary ".repeat(1000), &recent);
         let minimum = build_compacted_messages("", &recent);
         let target = estimate_prompt_tokens("", &minimum, None) + 10;
 
-        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target);
+        // Act
+        let result =
+            build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target, 1.0);
 
+        // Assert
         assert!(estimate_prompt_tokens("", &full, None) > target);
         assert!(estimate_prompt_tokens("", &result, None) <= target);
         assert!(
@@ -856,10 +928,28 @@ mod tests {
     }
 
     #[test]
+    fn shrinks_compacted_summary_using_calibrated_estimate() {
+        // Arrange
+        let recent = vec![Message::text("user", "fresh question")];
+        let minimum = build_compacted_messages("", &recent);
+        let target = calibrated_estimate(estimate_prompt_tokens("", &minimum, None), 2.0) + 10;
+
+        // Act
+        let result =
+            build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, target, 2.0);
+
+        // Assert
+        assert!(
+            calibrated_estimate(estimate_prompt_tokens("", &result, None), 2.0) <= target,
+            "compacted result must fit the calibrated target"
+        );
+    }
+
+    #[test]
     fn keeps_protected_recent_when_target_is_impossible() {
         let recent = vec![Message::text("user", "fresh question".repeat(500))];
 
-        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, 1);
+        let result = build_targeted_compacted_messages(&"summary ".repeat(1000), &recent, 1, 1.0);
 
         assert_eq!(result.last().expect("recent").role, "user");
         assert!(
@@ -1475,5 +1565,136 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("compaction usage log was not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_trigger_uses_calibrated_agent_loop_estimate() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "summary text".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let mut config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
+        config.default_context_window_tokens = 10_000;
+        config.compaction_threshold_ratio = 0.80;
+        let state = build_state(config, Box::new(provider));
+        let context = cli_context("calibrated-trigger");
+        let llm = state.llm_for_context(&context).expect("llm");
+        let key = CalibrationKey::new("test", "test-model", "agent_loop", false);
+        state.usage_calibrator.record(key, 100, 300).await;
+        let messages = vec![
+            Message::text("user", "old request"),
+            Message::text("assistant", "old answer"),
+            Message::text("user", "x".repeat(3000)),
+        ];
+        let raw = estimate_prompt_tokens("", &messages, None);
+        let usable = usable_context_tokens(10_000);
+        assert!(!should_compact(raw, usable, 0.80));
+
+        // Act
+        let result = maybe_compact_messages(
+            &state,
+            &context,
+            1,
+            &messages,
+            &llm,
+            &PromptContext {
+                system_prompt: "",
+                tools_json: None,
+                has_tools: false,
+            },
+        )
+        .await
+        .expect("compaction");
+
+        // Assert
+        assert!(
+            result[0]
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER),
+            "calibrated estimate should trigger compaction"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_summarizer_usage_updates_calibration() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "summary text".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 500,
+                        output_tokens: 20,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config =
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let state = build_state(config, Box::new(provider));
+        let context = cli_context("compaction-calibration");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:compaction-calibration:agent:default",
+                Some("compaction-calibration"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+
+        // Act
+        let reply = process_turn(&state, &context, "fresh question")
+            .await
+            .expect("process turn");
+
+        // Assert
+        assert_eq!(reply, "final answer");
+
+        let factor = state
+            .usage_calibrator
+            .factor(&CalibrationKey::new(
+                "test",
+                "test-model",
+                "compaction",
+                false,
+            ))
+            .await;
+        assert!(factor > DEFAULT_FACTOR);
     }
 }

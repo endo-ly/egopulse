@@ -6,12 +6,14 @@ use futures_util::future::join_all;
 use tracing::warn;
 
 use crate::agent_loop::ConversationScope;
+use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
     format_tool_result, message_to_text, sanitize_assistant_response_text,
     summarize_tool_calls_with_content, tool_message_content,
 };
 use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
+use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::runtime::AppState;
 use crate::storage::call_blocking;
@@ -115,6 +117,27 @@ pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str
 pub(crate) async fn send_tool_phase_request(
     request: ToolPhaseRequest<'_>,
 ) -> Result<ToolPhaseResponse, EgoPulseError> {
+    let has_tools = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let tools_json = request
+        .tools
+        .as_deref()
+        .filter(|tools| !tools.is_empty())
+        .and_then(|tools| serde_json::to_string(tools).ok());
+    let raw_estimate = estimate_prompt_tokens(
+        request.system_prompt,
+        &request.messages,
+        tools_json.as_deref(),
+    );
+    let calibration_key = CalibrationKey::new(
+        request.llm.provider_name(),
+        request.llm.model_name(),
+        request.request_kind,
+        has_tools,
+    );
+
     let response = request
         .llm
         .send_message_streaming(
@@ -134,6 +157,11 @@ pub(crate) async fn send_tool_phase_request(
         })?;
 
     if let Some(usage) = &response.usage {
+        request
+            .state
+            .usage_calibrator
+            .record(calibration_key, raw_estimate, usage.input_tokens)
+            .await;
         log_llm_usage(
             request.state,
             request.scope,
@@ -354,7 +382,8 @@ mod tests {
     use super::*;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{RecordingProvider, build_state_with_provider, cli_context};
-    use crate::llm::{Message, MessagesResponse, ToolCall};
+    use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
+    use crate::llm::{Message, MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;
 
     fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -689,6 +718,192 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("usage log was not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn send_tool_phase_request_records_usage_calibration_before_payload_move() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello world".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: Some(crate::llm::LlmUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 20,
+                }),
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("usage-calibration");
+        let llm = state.llm_for_context(&context).expect("llm");
+        let tools = Arc::new(vec![ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }]);
+
+        // Act
+        let response = send_tool_phase_request(ToolPhaseRequest {
+            state: &state,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: Some(tools),
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        })
+        .await
+        .expect("tool phase response");
+
+        // Assert
+        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        let factor = state
+            .usage_calibrator
+            .factor(&CalibrationKey::new(
+                "test",
+                "test-model",
+                "agent_loop",
+                true,
+            ))
+            .await;
+        assert!(factor > DEFAULT_FACTOR);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn send_tool_phase_request_skips_calibration_when_usage_missing() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello world".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("usage-calibration-none");
+        let llm = state.llm_for_context(&context).expect("llm");
+
+        // Act
+        let response = send_tool_phase_request(ToolPhaseRequest {
+            state: &state,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        })
+        .await
+        .expect("tool phase response");
+
+        // Assert
+        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        let factor = state
+            .usage_calibrator
+            .factor(&CalibrationKey::new(
+                "test",
+                "test-model",
+                "agent_loop",
+                false,
+            ))
+            .await;
+        assert_eq!(factor, DEFAULT_FACTOR);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn send_tool_phase_request_treats_empty_tools_as_no_tools_for_calibration() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello world".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: Some(crate::llm::LlmUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 20,
+                }),
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("usage-calibration-empty-tools");
+        let llm = state.llm_for_context(&context).expect("llm");
+
+        // Act
+        let response = send_tool_phase_request(ToolPhaseRequest {
+            state: &state,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: Some(Arc::new(Vec::new())),
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        })
+        .await
+        .expect("tool phase response");
+
+        // Assert
+        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        let without_tools = state
+            .usage_calibrator
+            .factor(&CalibrationKey::new(
+                "test",
+                "test-model",
+                "agent_loop",
+                false,
+            ))
+            .await;
+        let with_tools = state
+            .usage_calibrator
+            .factor(&CalibrationKey::new(
+                "test",
+                "test-model",
+                "agent_loop",
+                true,
+            ))
+            .await;
+        assert!(without_tools > DEFAULT_FACTOR);
+        assert_eq!(with_tools, DEFAULT_FACTOR);
     }
 
     #[tokio::test]
