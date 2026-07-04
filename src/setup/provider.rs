@@ -225,7 +225,7 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "lmstudio",
         label: "LM Studio (local)",
-        default_base_url: "",
+        default_base_url: "http://127.0.0.1:1234/v1",
         default_model: "custom-model",
         models: &["google/gemma-4-e4b"],
     },
@@ -275,6 +275,14 @@ mod tests {
     #[test]
     fn find_provider_preset_returns_none_for_unknown() {
         assert!(super::find_provider_preset("nonexistent").is_none());
+    }
+
+    #[test]
+    fn provider_default_base_url_returns_lmstudio_default() {
+        assert_eq!(
+            super::provider_default_base_url("lmstudio"),
+            Some("http://127.0.0.1:1234/v1")
+        );
     }
 
     #[test]

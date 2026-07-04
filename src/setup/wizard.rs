@@ -20,6 +20,7 @@ use crate::setup::summary::{ExistingConfig, parse_existing_config, save_config};
 
 /// Web UI のデフォルトアクセス URL。
 const WEB_UI_URL: &str = "http://127.0.0.1:10961";
+const CUSTOM_MODEL_LABEL: &str = "Custom model...";
 
 /// Review 画面でユーザーが "no" を選択した際の次アクション。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,8 @@ pub(crate) fn build_review_summary(inputs: &SetupInputs) -> String {
     };
 
     [
+        String::new(),
+        "== Review ==".to_string(),
         "About to save the configuration file with the following values:".to_string(),
         String::new(),
         format!("  Agent:    {} (id: {})", inputs.agent_label, agent_id),
@@ -66,8 +69,6 @@ pub(crate) fn build_review_summary(inputs: &SetupInputs) -> String {
         format!("  Web:      {}", web_line),
         format!("  Discord:  {}", enabled_label(inputs.discord_enabled)),
         format!("  Telegram: {}", enabled_label(inputs.telegram_enabled)),
-        String::new(),
-        "Save? (Y/n)".to_string(),
     ]
     .join("\n")
 }
@@ -75,6 +76,8 @@ pub(crate) fn build_review_summary(inputs: &SetupInputs) -> String {
 /// Additional Options ステップの固定案内テキストを返す (`docs/setup-redesign.md §4.2`)。
 pub(crate) fn build_additional_options_text() -> String {
     [
+        "",
+        "== Additional options ==",
         "The configuration has been saved. The following options were not configured in",
         "this setup, but can be set by editing ~/.egopulse/egopulse.config.yaml:",
         "",
@@ -118,7 +121,11 @@ pub(crate) fn build_done_message(
     config_path: &str,
     backup_path: Option<&str>,
 ) -> String {
-    let mut lines = vec![format!("Configuration saved: {config_path}")];
+    let mut lines = vec![
+        String::new(),
+        "== Done ==".to_string(),
+        format!("Configuration saved: {config_path}"),
+    ];
 
     if let Some(backup) = backup_path {
         lines.push(format!("Backup: {backup}"));
@@ -148,6 +155,18 @@ pub(crate) fn build_done_message(
     }
 
     lines.join("\n")
+}
+
+fn build_welcome_message(config_path: &Path) -> String {
+    [
+        "== EgoPulse Setup ==".to_string(),
+        "This wizard will create the minimum configuration needed to run an AI agent.".to_string(),
+        String::new(),
+        format!("Config file: {}", config_path.to_string_lossy()),
+        String::new(),
+        "Non-secret answers remain visible. API keys and bot tokens stay hidden.".to_string(),
+    ]
+    .join("\n")
 }
 
 /// API key 空欄時に確認ダイアログを表示すべきか判定する。
@@ -264,9 +283,13 @@ fn provider_select_items() -> Vec<String> {
 }
 
 fn model_select_items(provider_id: &str) -> Vec<String> {
-    find_provider_preset(provider_id)
+    let mut items: Vec<String> = find_provider_preset(provider_id)
         .map(|p| p.models.iter().map(|m| m.to_string()).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !items.is_empty() {
+        items.push(CUSTOM_MODEL_LABEL.to_string());
+    }
+    items
 }
 
 fn load_existing(
@@ -289,7 +312,7 @@ fn load_existing(
         Err(e) => {
             sink.println(&format!("WARNING: {e}"));
             if source
-                .confirm("Continue with empty defaults? (y/N)", false)
+                .confirm("Continue with empty defaults?", false)
                 .map_err(SetupWizardError::Prompt)?
             {
                 Ok(ExistingConfig {
@@ -401,10 +424,19 @@ fn prompt_model(
                 .map_err(SetupWizardError::Prompt)?;
             return Ok(input.trim().to_string());
         }
-        let default_idx = items.iter().position(|m| m == default).unwrap_or(0);
+        let default_idx = items
+            .iter()
+            .position(|m| m == default)
+            .unwrap_or_else(|| items.len().saturating_sub(1));
         let idx = source
             .select("Choose the model to use:", &items, default_idx)
             .map_err(SetupWizardError::Prompt)?;
+        if items[idx] == CUSTOM_MODEL_LABEL {
+            let input = source
+                .text("Enter the model name:", default)
+                .map_err(SetupWizardError::Prompt)?;
+            return Ok(input.trim().to_string());
+        }
         Ok(items[idx].clone())
     }
 }
@@ -424,7 +456,7 @@ fn prompt_api_key(
         if key.trim().is_empty() && should_confirm_empty_api_key(provider_id, base_url) {
             let confirm = format!(
                 "WARNING: {provider_label} usually requires an API key. \
-                 Proceed with an empty key? (y/N)"
+                 Proceed with an empty key?"
             );
             if !source
                 .confirm(&confirm, false)
@@ -441,7 +473,7 @@ fn prompt_web(source: &dyn PromptSource, default: bool) -> Result<bool, SetupWiz
     source
         .confirm(
             &format!(
-                "Enable the Web UI? (Y/n)\n\
+                "Enable the Web UI?\n\
                  You can access it at {WEB_UI_URL} from your browser."
             ),
             default,
@@ -454,7 +486,7 @@ fn prompt_discord(
     default: bool,
 ) -> Result<(bool, String), SetupWizardError> {
     let enabled = source
-        .confirm("Configure a Discord bot? (y/N)", default)
+        .confirm("Configure a Discord bot?", default)
         .map_err(SetupWizardError::Prompt)?;
     if enabled {
         let token = source
@@ -471,7 +503,7 @@ fn prompt_telegram(
     default: bool,
 ) -> Result<(bool, String), SetupWizardError> {
     let enabled = source
-        .confirm("Configure a Telegram bot? (y/N)", default)
+        .confirm("Configure a Telegram bot?", default)
         .map_err(SetupWizardError::Prompt)?;
     if enabled {
         let token = source
@@ -527,8 +559,7 @@ pub(crate) fn run_with_source_and_sink(
         }
     };
 
-    sink.println("Welcome to EgoPulse setup.");
-    sink.println("Answer a few questions to configure the minimum settings to run your AI agent.");
+    sink.println(&build_welcome_message(&resolved_path));
 
     let existing = load_existing(source, sink, &resolved_path)?;
     let prefill = extract_prefill(&existing);
@@ -545,7 +576,7 @@ pub(crate) fn run_with_source_and_sink(
         sink.println(&build_review_summary(&inputs));
 
         if source
-            .confirm("Save? (Y/n)", true)
+            .confirm("Save configuration?", true)
             .map_err(SetupWizardError::Prompt)?
         {
             return save_and_finish(sink, &inputs, &existing, &resolved_path);
@@ -700,6 +731,21 @@ mod tests {
         assert!(!should_ask_model_as_free_text("deepseek"));
     }
 
+    #[test]
+    fn model_select_items_appends_custom_model_choice() {
+        let items = model_select_items("openai");
+
+        assert_eq!(items.last().map(String::as_str), Some(CUSTOM_MODEL_LABEL));
+        assert!(items.iter().any(|item| item == "gpt-5.2"));
+    }
+
+    #[test]
+    fn model_select_items_returns_empty_for_custom_provider() {
+        let items = model_select_items("custom");
+
+        assert!(items.is_empty());
+    }
+
     use crate::setup::prompts::test_mocks::{MockPromptSource, VecOutputSink};
     use serial_test::serial;
 
@@ -723,6 +769,37 @@ mod tests {
         assert!(
             content.contains("default_provider"),
             "saved config must contain default_provider"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn wizard_allows_custom_model_for_preset_provider() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+
+        let source = MockPromptSource::new();
+        let sink = VecOutputSink::new();
+
+        let openai_custom_model_index = model_select_items("openai").len() - 1;
+        source
+            .expect_text("Name your agent", "Partner")
+            .expect_select("Choose the LLM provider", 0)
+            .expect_select("Choose the model", openai_custom_model_index)
+            .expect_text("Enter the model name", "gpt-next-preview")
+            .expect_password("API key", "sk-test-key")
+            .expect_confirm("Web UI", true)
+            .expect_confirm("Discord", false)
+            .expect_confirm("Telegram", false)
+            .expect_confirm("Save configuration", true);
+
+        run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
+            .expect("wizard should save custom model for preset provider");
+
+        let content = std::fs::read_to_string(config_path).expect("read saved config");
+        assert!(
+            content.contains("gpt-next-preview"),
+            "custom model must be saved in the generated config"
         );
     }
 
@@ -757,7 +834,7 @@ mod tests {
         let sink = VecOutputSink::new();
 
         setup_happy_path(&source);
-        source.expect_confirm("Save?", true);
+        source.expect_confirm("Save configuration", true);
 
         run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
             .expect("wizard should succeed");
@@ -804,12 +881,12 @@ mod tests {
         // Round 1: review -> no -> StartOver
         setup_happy_path(&source);
         source
-            .expect_confirm("Save?", false)
+            .expect_confirm("Save configuration", false)
             .expect_select("What would you like to do?", 0);
 
         // Round 2: review -> yes -> save
         setup_happy_path(&source);
-        source.expect_confirm("Save?", true);
+        source.expect_confirm("Save configuration", true);
 
         run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
             .expect("wizard should succeed after StartOver loop");
@@ -828,7 +905,7 @@ mod tests {
 
         setup_happy_path(&source);
         source
-            .expect_confirm("Save?", false)
+            .expect_confirm("Save configuration", false)
             .expect_select("What would you like to do?", 1);
 
         let result = run_with_source_and_sink(&source, &sink, Some(config_path.clone()));
@@ -851,7 +928,7 @@ mod tests {
 
         setup_happy_path(&source);
         source
-            .expect_confirm("Save?", false)
+            .expect_confirm("Save configuration", false)
             .expect_select("What would you like to do?", 2);
 
         run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
@@ -870,7 +947,7 @@ mod tests {
         let sink = VecOutputSink::new();
 
         setup_happy_path(&source);
-        source.expect_confirm("Save?", true);
+        source.expect_confirm("Save configuration", true);
 
         run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
             .expect("wizard should succeed on direct yes");
@@ -924,7 +1001,7 @@ mod tests {
 
         source.expect_confirm("Continue with empty defaults", true);
         setup_happy_path(&source);
-        source.expect_confirm("Save?", true);
+        source.expect_confirm("Save configuration", true);
 
         run_with_source_and_sink(&source, &sink, Some(config_path.clone()))
             .expect("wizard should continue after accepting parse error");

@@ -6,6 +6,8 @@
 
 use std::io::Write;
 
+use dialoguer::theme::ColorfulTheme;
+
 /// API key を Review 画面向けに部分マスクして返す。
 ///
 /// 空文字列の場合は `"(empty)"` を返す。
@@ -75,7 +77,8 @@ impl Default for DialoguerPromptSource {
 
 impl PromptSource for DialoguerPromptSource {
     fn text(&self, label: &str, default: &str) -> Result<String, String> {
-        dialoguer::Input::<String>::new()
+        let theme = ColorfulTheme::default();
+        dialoguer::Input::<String>::with_theme(&theme)
             .with_prompt(label)
             .with_initial_text(default)
             .allow_empty(true)
@@ -84,7 +87,8 @@ impl PromptSource for DialoguerPromptSource {
     }
 
     fn password(&self, label: &str) -> Result<String, String> {
-        dialoguer::Password::new()
+        let theme = ColorfulTheme::default();
+        dialoguer::Password::with_theme(&theme)
             .with_prompt(label)
             .allow_empty_password(true)
             .interact()
@@ -92,7 +96,8 @@ impl PromptSource for DialoguerPromptSource {
     }
 
     fn select(&self, label: &str, items: &[String], default: usize) -> Result<usize, String> {
-        dialoguer::Select::new()
+        let theme = ColorfulTheme::default();
+        dialoguer::Select::with_theme(&theme)
             .with_prompt(label)
             .items(items)
             .default(default)
@@ -101,11 +106,38 @@ impl PromptSource for DialoguerPromptSource {
     }
 
     fn confirm(&self, label: &str, default: bool) -> Result<bool, String> {
-        dialoguer::Confirm::new()
-            .with_prompt(label)
-            .default(default)
-            .interact()
-            .map_err(|e| format!("Confirm error: {e}"))
+        prompt_visible_confirm(label, default)
+    }
+}
+
+fn prompt_visible_confirm(label: &str, default: bool) -> Result<bool, String> {
+    let theme = ColorfulTheme::default();
+    let prompt = format!("{label} {}", confirm_hint(default));
+
+    loop {
+        let input = dialoguer::Input::<String>::with_theme(&theme)
+            .with_prompt(&prompt)
+            .allow_empty(true)
+            .interact_text()
+            .map_err(|e| format!("Confirm error: {e}"))?;
+
+        match parse_confirm_answer(&input, default) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("Please answer yes or no."),
+        }
+    }
+}
+
+fn confirm_hint(default: bool) -> &'static str {
+    if default { "(Y/n)" } else { "(y/N)" }
+}
+
+fn parse_confirm_answer(input: &str, default: bool) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -316,7 +348,7 @@ pub(crate) mod test_mocks {
 
 #[cfg(test)]
 mod tests {
-    use super::format_api_key_for_review;
+    use super::{format_api_key_for_review, parse_confirm_answer};
 
     #[test]
     fn format_api_key_for_review_masks_long_values() {
@@ -333,5 +365,16 @@ mod tests {
     fn format_api_key_for_review_fully_masks_short_values() {
         assert_eq!(format_api_key_for_review("abc"), "********");
         assert_eq!(format_api_key_for_review("sk-1234"), "********");
+    }
+
+    #[test]
+    fn parse_confirm_answer_accepts_visible_yes_no_values() {
+        assert_eq!(parse_confirm_answer("", true), Some(true));
+        assert_eq!(parse_confirm_answer("", false), Some(false));
+        assert_eq!(parse_confirm_answer("y", false), Some(true));
+        assert_eq!(parse_confirm_answer("yes", false), Some(true));
+        assert_eq!(parse_confirm_answer("n", true), Some(false));
+        assert_eq!(parse_confirm_answer("no", true), Some(false));
+        assert_eq!(parse_confirm_answer("maybe", true), None);
     }
 }
