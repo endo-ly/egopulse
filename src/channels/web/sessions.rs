@@ -62,11 +62,7 @@ pub(super) async fn list_sessions(
                 format!("chat:{}", session.chat_id)
             };
             SessionItem {
-                label: session
-                    .chat_title
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| session_key.clone()),
+                label: session.external_chat_id.clone(),
                 session_key,
                 chat_id: session.chat_id,
                 channel: session.channel,
