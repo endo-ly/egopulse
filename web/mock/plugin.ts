@@ -74,12 +74,41 @@ const MESSAGES = [
     message_kind: "text",
   },
   {
+    id: "m-tool-1",
+    sender_id: "lyre",
+    sender_kind: "tool" as const,
+    content: JSON.stringify({
+      tool: "read",
+      status: "success",
+      result:
+        "  .agent-row.active {\n    background: var(--color-accent-soft);\n    border-color: var(--color-border-strong);\n  }",
+      input: { path: "web/src/styles/app.css" },
+      duration_ms: 87,
+    }),
+    timestamp: "2026-07-03T10:27:30.000Z",
+    message_kind: "tool_result",
+  },
+  {
     id: "m3",
     sender_id: "user",
     sender_kind: "user" as const,
     content: "お願いします",
     timestamp: "2026-07-03T10:28:00.000Z",
     message_kind: "text",
+  },
+  {
+    id: "m-tool-2",
+    sender_id: "lyre",
+    sender_kind: "tool" as const,
+    content: JSON.stringify({
+      tool: "edit",
+      status: "success",
+      result: "replaced 5 occurrences of accent-soft with panel-2 and accent-2 color-mix",
+      input: { path: "web/src/styles/app.css", old: "accent-soft", new: "panel-2" },
+      duration_ms: 142,
+    }),
+    timestamp: "2026-07-03T10:29:00.000Z",
+    message_kind: "tool_result",
   },
   {
     id: "m4",
@@ -92,7 +121,7 @@ const MESSAGES = [
 ];
 
 export function mockApiPlugin(): Plugin | null {
-  if (process.env.EGOPULSE_MOCK !== "1") return null;
+  if (process.env.VITE_MOCK !== "1") return null;
 
   return {
     name: "egopulse-mock-api",

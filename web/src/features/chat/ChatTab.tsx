@@ -1,9 +1,10 @@
 import { Badge } from "../../shared/ui/Badge";
 import { Timeline } from "./Timeline";
 import { MessageBubble } from "./MessageBubble";
+import { ToolCard } from "./ToolCard";
 import { Composer } from "./Composer";
 import { ReadOnlyBanner } from "./ReadOnlyBanner";
-import type { ChatMessage } from "../../shared/api/types";
+import type { ChatMessage, ToolEventData } from "../../shared/api/types";
 
 export interface ChatTabProps {
   sessionLabel: string;
@@ -25,6 +26,31 @@ function channelLabel(channel: string): string {
     voice: "Voice",
   };
   return map[channel] ?? channel;
+}
+
+function parseToolEvent(message: ChatMessage): ToolEventData | null {
+  if (message.sender_kind !== "tool") return null;
+  try {
+    const raw = JSON.parse(message.content) as {
+      tool?: string;
+      status?: string;
+      result?: string;
+      input?: unknown;
+      duration_ms?: number;
+    };
+    if (typeof raw.tool !== "string") return null;
+    const isError = raw.status === "error";
+    return {
+      name: raw.tool,
+      state: isError ? "error" : "success",
+      output: raw.result,
+      is_error: isError,
+      input: raw.input,
+      duration_ms: raw.duration_ms,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function ChatTab({
@@ -52,9 +78,17 @@ export function ChatTab({
         </div>
       </header>
       <Timeline searchTarget={searchTarget}>
-        {messages.map((m) => (
-          <MessageBubble key={m.id} message={m} />
-        ))}
+        {messages.map((m) => {
+          const toolEvent = parseToolEvent(m);
+          if (toolEvent) {
+            return (
+              <div key={m.id} className="message-row bubble-tool">
+                <ToolCard event={toolEvent} />
+              </div>
+            );
+          }
+          return <MessageBubble key={m.id} message={m} />;
+        })}
       </Timeline>
       <div className="composer">
         {readOnly ? (

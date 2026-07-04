@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "dev:mock": "EGOPULSE_MOCK=1 vite",
+    "dev:mock": "VITE_MOCK=1 vite",
     "test": "vitest run"
   },
   "dependencies": {
