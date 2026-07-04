@@ -27,26 +27,6 @@ export function Sidebar({
   return (
     <nav className={`sidebar-nav ${collapsed ? "collapsed" : ""}`} aria-label="Sidebar">
       <div className="sidebar-brand">
-        <svg
-          className="sidebar-brand-logo"
-          width="32"
-          height="32"
-          viewBox="0 0 32 32"
-          aria-hidden="true"
-        >
-          <path
-            d="M16 3 L29 16 L16 29 L3 16 Z"
-            fill="none"
-            stroke="var(--color-accent)"
-            strokeWidth="2"
-          />
-          <path
-            d="M16 9 L23 16 L16 23 L9 16 Z"
-            fill="var(--color-accent-2-soft)"
-            stroke="var(--color-accent-2)"
-            strokeWidth="1.5"
-          />
-        </svg>
         {!collapsed && (
           <>
             <span className="sidebar-brand-name">EgoPulse</span>
@@ -79,11 +59,6 @@ export function Sidebar({
         <div className="sidebar-body">
           <section className="sidebar-section">{agents}</section>
           <section className="sidebar-section">{sessions}</section>
-        </div>
-      )}
-      {collapsed && (
-        <div className="sidebar-body collapsed-icons">
-          <section className="sidebar-section">{agents}</section>
         </div>
       )}
 

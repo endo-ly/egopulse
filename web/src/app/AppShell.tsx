@@ -85,9 +85,11 @@ export function App({
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);
 
+  const showCollapsed = !isMobile && sidebarCollapsed;
+
   return (
-    <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>
+    <div className={`app-shell ${showCollapsed ? "sidebar-collapsed" : ""}`}>
+      <aside className={`sidebar ${sidebarOpen ? "open" : "closed"} ${showCollapsed ? "collapsed" : ""}`}>
         <Sidebar
           onNewSession={onNewSession}
           healthStatus={healthStatus}
