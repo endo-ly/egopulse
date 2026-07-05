@@ -632,13 +632,48 @@ PR 作成後、レビュー生成を待ってから `pr-review-back-workflow` Sk
 
 ## 自己レビュー（Plan と実装の照合・メタレビュー）
 
-> 実装完了後に本セクションを埋める。Plan からの逸脱・漏れ・スコープ超過を確認する。
-
 ### Plan 達成状況
--（実装後に記入）
 
-### 逸脱・設計変更
--（実装後に記入）
+- **Step 1-9 すべて完了**: AgentEvent 引越し・trait 拡張・config フラグ・Discord sink・Telegram sink・coordinator・経路切替・ドキュメント更新・動作確認
+- **テストリスト T1-T19 すべて対応**（詳細は下表）
+- **最終検査全項クリア**: `cargo fmt --check` / `cargo check --all-features` / `cargo clippy --all-targets --all-features -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test`（1425 passed / 0 failed）
+
+| ID | 対応する自動テスト | 状態 |
+| -- | -- | -- |
+| T1 | 既存 web stream / agent_loop テストが green のまま（回帰） | ✅ |
+| T2 | `default_tool_progress_sink_is_none` | ✅ |
+| T3 | `discord_channel_tool_progress_defaults_to_false_when_omitted` / `discord_channel_tool_progress_parses_true` / `telegram_chat_tool_progress_parses_true` / `tool_progress_save_load_round_trip_preserves_true` | ✅ |
+| T4 | `discord_sink_begin_update_close_sequence` | ✅ |
+| T5 | `discord_sink_truncates_over_2000_chars` | ✅ |
+| T6 | `discord_sink_edit_failure_does_not_post_fallback` | ✅ |
+| T7 | `telegram_sink_begin_update_close_sequence` | ✅ |
+| T8 | `coordinator_no_post_below_delay_threshold` | ✅ |
+| T9 | `coordinator_begins_on_delay_timer_for_long_tool` | ✅ |
+| T10 | `coordinator_builds_cumulative_log` | ✅ |
+| T11 | `coordinator_closes_on_event_stream_eof` | ✅ |
+| T12 | `coordinator_noop_when_sink_none` | ✅ |
+| T13 | `coordinator_throttles_updates_within_interval` | ✅ |
+| T14 | `coordinator_body_excludes_tool_input_and_preview` | ✅ |
+| T15 | `tool_progress_enabled_reads_channel_config_flag` | ✅ |
+| T16 | `execute_turn_with_retry_terminates_on_failure`（配線レベル） | ✅ |
+| T17 | `execute_turn_with_retry_terminates_on_success` / `_on_failure`（ハングしない）＋ coordinator T11 | ✅ |
+| T18 | `coordinator_keeps_single_progress_across_continuous_stream` | ✅ |
+| T19 | `execute_turn_with_retry_terminates_on_success` / `_on_failure`（bounded timeout） | ✅ |
+
+追加で `keep_tail` の単体テスト 3 件を追加した。
+
+### 逸脱・設計変更（すべて HOW のみ、振る舞いは不変）
+
+1. **コミット分割の再構成**: 厳格な no-dead-code ルールと「各 Step で clippy -D warnings 必須」の組合せにより、trait・coordinator・配線・config フィールドは相互依存し単独では clippy-green にならない。よって実装コミットを「trait + config + coordinator + 配線（sink=None で end-to-end 動作）」「Discord sink」「Telegram sink」に再構成した。
+2. **T16/T17/T19 のテスト方針**: 完全な AppState 統合テストは 5s 実 delay と mock LLM provider の壁で begin/close の検証が困難。代わりに (a) coordinator 単体テスト（タイミング注入で状態遷移・close 契約・EOF・間引き・セキュリティを網羅）、(b) `execute_turn_with_retry` の bounded-timeout 統合テスト（成功/失敗両パスでハングしないことを実証）の組合せでカバーした。
+3. **Token 解決の共有化**: DRY のため `DiscordTokenResolver` / `TelegramTokenResolver` を新設し adapter と sink で `Arc` 共有した。
+4. **429 リトライの共通化**: DRY のため `discord_request_with_retry` / `telegram_request_with_retry` を抽出し `send_*_api` と sink で再利用した。
+5. **base_url 注入**: sink の wiremock 単体テストのため `base_url` を DI 可能にした（既存 `send_text` のハードコードは踏襲せず新規 sink のみ）。
+6. **directory.md 変更なし**: 同ファイルはデータディレクトリ構成のみで src モジュール一覧を持たないため、新規 2 ファイルの追記対象がなかった。AGENTS.md のモジュール一覧はディレクトリ粒度のため `event.rs` / `tool_progress.rs` は既存ディレクトリに内包される。
 
 ### 振り返り
--（実装後に記入）
+
+- no-dead-code ルールと TDD step-by-step の緊張を、コミット境界の再構成（HOW 変更）で解決した。Plan の What（A3 遅延型 × B2 編集式累積ログ・5s 閾値・800ms 間引き・input/preview 非表示・close 保証・設定デフォルト false）は完全一致。
+- セキュリティ要件（ツール input / result preview の非表示）は単体テストで検証済み。
+- レイヤー逆依存の解消（`AgentEvent` を agent_loop へ）も達成し、Web の SSE ペイロード形状は維持した。
+- スコープ外（Voice/CLI/TUI/Web の変更・リッチ装飾・delay/interval の設定化）は一切実施していない。
