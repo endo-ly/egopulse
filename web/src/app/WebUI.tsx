@@ -67,8 +67,17 @@ export function WebUI() {
 
   useEffect(() => {
     if (sessionExplicit) return;
-    if (sessions.some((session) => session.session_key === selectedSession)) return;
-    const firstAgentSession = sessions.find((session) => session.agent_id === selectedAgent);
+    if (
+      sessions.some(
+        (session) =>
+          session.session_key === selectedSession &&
+          session.agent_id === selectedAgent,
+      )
+    )
+      return;
+    const firstAgentSession = sessions.find(
+      (session) => session.agent_id === selectedAgent,
+    );
     if (firstAgentSession) {
       setSelectedSession(firstAgentSession.session_key);
     }
