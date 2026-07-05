@@ -310,6 +310,7 @@ web_fetch:
 | `agents` | `list<string>` | `[]`（正規化後は `[default_agent]`） | チャンネルで使用するエージェント ID のリスト。空の場合はグローバル `default_agent` が設定される |
 | `multi_agent` | `bool` | `false` | `true` の場合複数エージェントで応答。`agents` に 2 つ以上指定が必要 |
 | `secret` | `bool` | `false` | `true` の場合、このチャネルの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャネルの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照） |
+| `tool_progress` | `bool` | `false` | `true` の場合、5 秒以上かかるターンでツール実行状況を編集式の累積ログとして投稿する（[channels.md §ツール進捗表示](./channels.md#3-discord) 参照） |
 
 ### 3.5 Telegram チャネル（`channels.telegram`）
 
@@ -339,6 +340,7 @@ Telegram は Discord と同一の Multi-Agent 仕様をサポートする。
 | `agents` | `[string]` | `["default"]` | チャットにバインドするエージェント ID リスト |
 | `multi_agent` | `bool` | `false` | `true` の場合 Multi-Agent ルームとして動作。`@mention` で Bot に紐づくエージェントが応答し、非メンション時は Channel Log のみ記録 |
 | `secret` | `bool` | `false` | `true` の場合、このチャットの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャットの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照） |
+| `tool_progress` | `bool` | `false` | `true` の場合、5 秒以上かかるターンでツール実行状況を編集式の累積ログとして投稿する（[channels.md §ツール進捗表示](./channels.md#4-telegram) 参照） |
 
 ### 3.6 Voice チャネル（`channels.voice`）
 
