@@ -156,6 +156,23 @@ pub(super) async fn get_history(
         let timestamp = tool_call.timestamp.clone();
         let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
             .unwrap_or(serde_json::Value::Null);
+        let (status, result) = if let Some(ref output) = tool_call.tool_output {
+            let parsed = serde_json::from_str::<serde_json::Value>(output)
+                .unwrap_or(serde_json::Value::Null);
+            let status = parsed
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("success")
+                .to_string();
+            let result = parsed
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| output.to_string());
+            (status, result)
+        } else {
+            ("pending".to_string(), String::new())
+        };
         entries.push((
             timestamp,
             serde_json::json!({
@@ -164,8 +181,8 @@ pub(super) async fn get_history(
                 "sender_kind": "assistant",
                 "content": serde_json::to_string(&serde_json::json!({
                     "tool": tool_call.tool_name,
-                    "status": "success",
-                    "result": tool_call.tool_output,
+                    "status": status,
+                    "result": result,
                     "input": input,
                 })).unwrap_or_default(),
                 "timestamp": tool_call.timestamp,

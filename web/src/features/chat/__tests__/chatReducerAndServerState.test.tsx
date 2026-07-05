@@ -69,7 +69,7 @@ describe("chatReducer", () => {
       input: { path: "a.txt" },
     });
     const pending = state.messages.find((m) => m.id === "tool:call-1");
-    expect(pending?.sender_kind).toBe("assistant");
+    expect(pending?.sender_kind).toBe("tool");
     expect(JSON.parse(pending?.content ?? "{}")).toMatchObject({
       tool: "read",
       status: "pending",
