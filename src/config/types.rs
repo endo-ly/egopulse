@@ -80,6 +80,8 @@ pub(crate) struct DiscordChannelConfig {
     pub multi_agent: bool,
     /// Whether this channel routes conversations to the isolated `secret.db`.
     pub secret: bool,
+    /// Whether long-running turns post an editable tool-progress log.
+    pub tool_progress: bool,
 }
 
 /// Per-chat Telegram configuration stored inside `ChannelConfig.telegram_channels`.
@@ -93,6 +95,8 @@ pub(crate) struct TelegramChatConfig {
     pub multi_agent: bool,
     /// Whether this chat routes conversations to the isolated `secret.db`.
     pub secret: bool,
+    /// Whether long-running turns post an editable tool-progress log.
+    pub tool_progress: bool,
 }
 
 /// Per-bot Telegram configuration stored under `channels.telegram.telegram_bots.<bot_id>`.

@@ -9,6 +9,7 @@ pub mod logging;
 pub(crate) mod metrics;
 pub(crate) mod runtime_status;
 pub mod status;
+pub(crate) mod tool_progress;
 pub(crate) mod turn_scheduler;
 
 pub(crate) use channel_input::{
@@ -676,8 +677,48 @@ async fn execute_turn_with_retry(
     context: &crate::agent_loop::SurfaceContext,
     input: &str,
 ) -> Result<String, EgoPulseError> {
+    let adapter = state.channels.get(&context.channel);
+    let external_chat_id = context.session_key();
+    let sink = adapter
+        .and_then(|adapter| adapter.tool_progress_sink())
+        .filter(|_| tool_progress_enabled(&state.config, context));
+
+    let (evt_tx, evt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
+    let coordinator = tool_progress::ToolProgressCoordinator::new(sink, external_chat_id.clone());
+    let coordinator_handle = tokio::spawn(coordinator.run(evt_rx));
+
+    let result = run_retry_loop(state, context, input, &evt_tx).await;
+
+    // `evt_tx` を全て drop してから await する（さもないと coordinator が EOF を検出できずハングする）。
+    drop(evt_tx);
+    match tokio::time::timeout(Duration::from_secs(2), coordinator_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            error = %error,
+            "tool progress coordinator task failed"
+        ),
+        Err(_) => {
+            tracing::warn!("tool progress coordinator did not finish within timeout; proceeding")
+        }
+    }
+    result
+}
+
+/// リトライループで `process_turn_with_events` を呼び、イベントを進捗 coordinator へ転送する。
+async fn run_retry_loop(
+    state: &AppState,
+    context: &crate::agent_loop::SurfaceContext,
+    input: &str,
+    evt_tx: &tokio::sync::mpsc::UnboundedSender<crate::agent_loop::event::AgentEvent>,
+) -> Result<String, EgoPulseError> {
     for attempt in 0..=MAX_TURN_RETRIES {
-        let result = crate::agent_loop::process_turn(state, context, input).await;
+        let evt_tx = evt_tx.clone();
+        let result =
+            crate::agent_loop::process_turn_with_events(state, context, input, move |event| {
+                let _ = evt_tx.send(event);
+            })
+            .await;
         match result {
             Ok(response) => return Ok(response),
             Err(error) if error.is_retryable() && attempt < MAX_TURN_RETRIES => {
@@ -709,6 +750,37 @@ async fn execute_turn_with_retry(
         }
     }
     unreachable!("loop always returns via match arms on final iteration")
+}
+
+/// 当該チャネルで進捗表示が有効かを設定からルックアップする。
+fn tool_progress_enabled(
+    config: &crate::config::Config,
+    context: &crate::agent_loop::SurfaceContext,
+) -> bool {
+    let channel_config = config.channels.get(context.channel.as_str());
+    match context.channel.as_str() {
+        "discord" => channel_config
+            .and_then(|c| c.discord_channels.as_ref())
+            .and_then(|channels| {
+                context
+                    .surface_thread
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|id| channels.get(&id))
+            })
+            .is_some_and(|c| c.tool_progress),
+        "telegram" => channel_config
+            .and_then(|c| c.telegram_channels.as_ref())
+            .and_then(|channels| {
+                context
+                    .surface_thread
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|id| channels.get(&id))
+            })
+            .is_some_and(|c| c.tool_progress),
+        _ => false,
+    }
 }
 
 async fn send_turn_failure_to_channel(
@@ -1020,6 +1092,74 @@ mod tests {
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
+    }
+
+    #[test]
+    fn tool_progress_enabled_reads_channel_config_flag() {
+        use crate::agent_loop::SurfaceContext;
+        use crate::config::{ChannelConfig, ChannelName, DiscordChannelConfig};
+        use std::collections::HashMap;
+
+        // Arrange: discord channel 123 has tool_progress on, 456 off
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let mut discord_channels = HashMap::new();
+        discord_channels.insert(
+            123u64,
+            DiscordChannelConfig {
+                tool_progress: true,
+                ..Default::default()
+            },
+        );
+        discord_channels.insert(
+            456u64,
+            DiscordChannelConfig {
+                tool_progress: false,
+                ..Default::default()
+            },
+        );
+        config.channels.insert(
+            ChannelName::new("discord"),
+            ChannelConfig {
+                discord_channels: Some(discord_channels),
+                ..Default::default()
+            },
+        );
+
+        let ctx = |thread: &str| {
+            SurfaceContext::new(
+                "discord".to_string(),
+                "user".to_string(),
+                thread.to_string(),
+                "discord".to_string(),
+                "lyre".to_string(),
+            )
+        };
+
+        // Act + Assert
+        assert!(
+            tool_progress_enabled(&config, &ctx("123")),
+            "channel 123 enabled"
+        );
+        assert!(
+            !tool_progress_enabled(&config, &ctx("456")),
+            "channel 456 disabled"
+        );
+        assert!(
+            !tool_progress_enabled(&config, &ctx("999")),
+            "unknown channel disabled"
+        );
+        let web_ctx = SurfaceContext::new(
+            "web".to_string(),
+            "user".to_string(),
+            "session".to_string(),
+            "web".to_string(),
+            "lyre".to_string(),
+        );
+        assert!(
+            !tool_progress_enabled(&config, &web_ctx),
+            "web never enabled"
+        );
     }
 
     #[tokio::test]

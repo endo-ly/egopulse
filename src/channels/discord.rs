@@ -1174,6 +1174,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret: false,
+            ..Default::default()
         }
     }
 
@@ -2125,6 +2126,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret,
+            ..Default::default()
         }
     }
 
