@@ -1162,6 +1162,102 @@ mod tests {
         );
     }
 
+    // --- tool progress wiring (T16/T17/T19): coordinator must never hang the turn ---
+
+    struct StubFinalProvider;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for StubFinalProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+        fn model_name(&self) -> &str {
+            "stub-model"
+        }
+        async fn send_message(
+            &self,
+            _: &str,
+            _: std::sync::Arc<Vec<crate::llm::Message>>,
+            _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            Ok(crate::llm::MessagesResponse {
+                content: "ok".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct StubFailingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for StubFailingProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+        fn model_name(&self) -> &str {
+            "stub-model"
+        }
+        async fn send_message(
+            &self,
+            _: &str,
+            _: std::sync::Arc<Vec<crate::llm::Message>>,
+            _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            Err(crate::error::LlmError::InvalidResponse(
+                "stub failure".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_turn_with_retry_terminates_on_success() {
+        // Arrange: a turn whose coordinator has no sink (web/cli channel).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(StubFinalProvider),
+        );
+        let context = crate::test_util::cli_context("progress-success");
+
+        // Act: a bounded timeout proves the coordinator never hangs the turn.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_turn_with_retry(&state, &context, "hello"),
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok(), "execute_turn_with_retry must not hang");
+        assert_eq!(result.unwrap().expect("turn ok"), "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_turn_with_retry_terminates_on_failure() {
+        // Arrange: the LLM always fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(StubFailingProvider),
+        );
+        let context = crate::test_util::cli_context("progress-failure");
+
+        // Act: the failure path must also drop evt_tx and return bounded.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_turn_with_retry(&state, &context, "hello"),
+        )
+        .await;
+
+        // Assert
+        assert!(
+            result.is_ok(),
+            "execute_turn_with_retry must not hang on failure"
+        );
+        assert!(result.unwrap().is_err(), "turn should fail");
+    }
+
     #[tokio::test]
     async fn build_app_state_contains_soul_agents_loader() {
         let dir = tempfile::tempdir().expect("tempdir");
