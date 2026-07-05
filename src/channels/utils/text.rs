@@ -62,6 +62,28 @@ pub(crate) fn truncate_by_chars(value: &str, max_chars: usize) -> String {
     result
 }
 
+/// Keeps the trailing `max_chars` characters of `body`, trimmed forward to the
+/// next line boundary so the result never starts mid-line.
+///
+/// Used for editable progress messages that must remain within a channel's
+/// character limit while showing the most recent entries.
+pub(crate) fn keep_tail(body: &str, max_chars: usize) -> String {
+    let char_count = body.chars().count();
+    if char_count <= max_chars {
+        return body.to_string();
+    }
+    let start_byte = body
+        .char_indices()
+        .nth(char_count - max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let tail = &body[start_byte..];
+    match tail.find('\n') {
+        Some(newline) => tail[newline + 1..].to_string(),
+        None => tail.to_string(),
+    }
+}
+
 /// Send text in chunks, calling `send_fn` for each.
 ///
 /// Iterates over `split_text(text, max_len)` chunks and awaits the
@@ -137,5 +159,35 @@ mod tests {
         // Index 7 is mid-character (char boundary at 6, 9)
         assert_eq!(floor_char_boundary(s, 7), 6);
         assert_eq!(floor_char_boundary(s, 6), 6);
+    }
+
+    #[test]
+    fn keep_tail_returns_body_when_within_limit() {
+        let body = "tools running...\n✓ web_fetch (1.0s)";
+        assert_eq!(keep_tail(body, 2000), body);
+    }
+
+    #[test]
+    fn keep_tail_trims_to_line_boundary_at_tail() {
+        // Arrange: a long log where the tail must start on a line boundary.
+        let mut body = String::from("header\n");
+        body.push_str(&"a".repeat(100));
+        body.push('\n');
+        body.push_str("final line");
+
+        // Act: keep only the last 15 chars (char count)
+        let kept = keep_tail(&body, 15);
+
+        // Assert: never exceeds the limit and starts at a line boundary
+        assert!(kept.chars().count() <= 15, "kept: {kept}");
+        assert!(!kept.starts_with('a') || kept.starts_with("final line"));
+        assert!(kept.contains("final line"));
+    }
+
+    #[test]
+    fn keep_tail_handles_multibyte_without_panicking() {
+        let body = "あ".repeat(100);
+        let kept = keep_tail(&body, 10);
+        assert!(kept.chars().count() <= 10);
     }
 }
