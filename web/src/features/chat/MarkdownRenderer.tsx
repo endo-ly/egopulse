@@ -1,6 +1,8 @@
 import { useState, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github-dark.css";
 
 const FOLD_THRESHOLD = 20;
 
@@ -13,6 +15,7 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
     <div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
         components={{ pre: CodeBlockPre }}
       >
         {content}
@@ -23,13 +26,14 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
 
 type PreProps = Omit<ComponentProps<"pre">, "node">;
 
-function CodeBlockPre({ node: _, ...props }: PreProps & { node?: unknown }) {
+function CodeBlockPre({ node: _, children, ...props }: PreProps & { node?: unknown }) {
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
-  const rawText = extractText(props.children).replace(/^\n+|\n+$/g, "");
-  const lines = rawText.split("\n");
-  const isLong = lines.length > FOLD_THRESHOLD;
+  const rawText = extractText(children).replace(/^\n+|\n+$/g, "");
+  const lineCount = rawText.split("\n").length;
+  const isLong = lineCount > FOLD_THRESHOLD;
+  const collapsed = isLong && !expanded;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(rawText).then(() => {
@@ -38,12 +42,8 @@ function CodeBlockPre({ node: _, ...props }: PreProps & { node?: unknown }) {
     });
   };
 
-  const displayChildren = isLong && !expanded
-    ? lines.slice(0, FOLD_THRESHOLD).join("\n")
-    : rawText;
-
   return (
-    <pre {...props}>
+    <pre {...props} className={collapsed ? "code-block-collapsed" : undefined}>
       <button
         type="button"
         className="code-block-copy"
@@ -51,16 +51,14 @@ function CodeBlockPre({ node: _, ...props }: PreProps & { node?: unknown }) {
       >
         {copied ? "Copied" : "Copy"}
       </button>
-      <code>{displayChildren}</code>
+      {children}
       {isLong && (
         <button
           type="button"
           className="code-block-fold"
           onClick={() => setExpanded((e) => !e)}
         >
-          {expanded
-            ? "Collapse"
-            : `Show all (${lines.length} lines)`}
+          {expanded ? "Collapse" : `Show all (${lineCount} lines)`}
         </button>
       )}
     </pre>

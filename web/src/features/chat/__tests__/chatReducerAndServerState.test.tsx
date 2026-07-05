@@ -60,21 +60,37 @@ describe("chatReducer", () => {
     expect(finalized?.content).toBe("Hello world");
   });
 
-  it("tool_start_and_result_create_tool_events", () => {
+  it("tool_start_and_result_inject_tool_messages", () => {
     let state = initialChatState();
 
-    state = reduceToolStart(state, "run-1", { name: "read" });
-    const pending = state.toolEvents["run-1:read"];
-    expect(pending?.state).toBe("pending");
-
-    state = reduceToolResult(state, "run-1", {
+    state = reduceToolStart(state, {
+      callId: "call-1",
       name: "read",
-      is_error: false,
-      duration_ms: 120,
+      input: { path: "a.txt" },
     });
-    const result = state.toolEvents["run-1:read"];
-    expect(result?.state).toBe("success");
-    expect(result?.duration_ms).toBe(120);
+    const pending = state.messages.find((m) => m.id === "tool:call-1");
+    expect(pending?.sender_kind).toBe("assistant");
+    expect(JSON.parse(pending?.content ?? "{}")).toMatchObject({
+      tool: "read",
+      status: "pending",
+      input: { path: "a.txt" },
+    });
+
+    state = reduceToolResult(state, {
+      callId: "call-1",
+      name: "read",
+      isError: false,
+      preview: "done",
+      durationMs: 120,
+    });
+    const result = state.messages.find((m) => m.id === "tool:call-1");
+    expect(JSON.parse(result?.content ?? "{}")).toMatchObject({
+      tool: "read",
+      status: "success",
+      result: "done",
+      duration_ms: 120,
+      input: { path: "a.txt" },
+    });
   });
 });
 

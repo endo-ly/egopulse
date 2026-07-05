@@ -14,11 +14,13 @@ pub(crate) enum AgentEvent {
     Delta { text: String },
     /// Tool execution started.
     ToolStart {
+        call_id: String,
         name: String,
         input: serde_json::Value,
     },
     /// Tool execution completed.
     ToolResult {
+        call_id: String,
         name: String,
         is_error: bool,
         preview: String,

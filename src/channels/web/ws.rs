@@ -352,7 +352,7 @@ fn handle_connect(
             },
             features: ConnectFeatures {
                 methods: vec!["connect", "chat.send"],
-                events: vec!["connect.challenge", "chat"],
+                events: vec!["connect.challenge", "chat", "tool_start", "tool_result"],
             },
         },
     )
@@ -583,6 +583,18 @@ fn forward_run_event(
                 return true;
             }
             true
+        }
+        "tool_start" => {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                return false;
+            };
+            send_event(tx, "tool_start", payload).is_err()
+        }
+        "tool_result" => {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                return false;
+            };
+            send_event(tx, "tool_result", payload).is_err()
         }
         _ => false,
     }
@@ -945,5 +957,63 @@ mod tests {
         let payload = &parsed["payload"];
         assert!(payload["runId"].as_str().is_some(), "runId must be present");
         assert_eq!(payload["status"], "accepted");
+    }
+
+    #[test]
+    fn ws_forwards_tool_start_and_result_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let start_event = RunEvent {
+            id: 1,
+            event: "tool_start".to_string(),
+            data: serde_json::to_string(&serde_json::json!({
+                "callId": "call-1",
+                "name": "read",
+                "input": {"path": "a.txt"}
+            }))
+            .unwrap(),
+        };
+        assert!(!forward_run_event(
+            &tx,
+            "run-1",
+            "sess-1",
+            &seq,
+            start_event
+        ));
+
+        let result_event = RunEvent {
+            id: 2,
+            event: "tool_result".to_string(),
+            data: serde_json::to_string(&serde_json::json!({
+                "callId": "call-1",
+                "name": "read",
+                "isError": false,
+                "preview": "done",
+                "durationMs": 42
+            }))
+            .unwrap(),
+        };
+        assert!(!forward_run_event(
+            &tx,
+            "run-1",
+            "sess-1",
+            &seq,
+            result_event
+        ));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 2);
+
+        let start: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(start["type"], "event");
+        assert_eq!(start["event"], "tool_start");
+        assert_eq!(start["payload"]["callId"], "call-1");
+        assert_eq!(start["payload"]["input"]["path"], "a.txt");
+
+        let result: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(result["event"], "tool_result");
+        assert_eq!(result["payload"]["isError"], false);
+        assert_eq!(result["payload"]["durationMs"], 42);
     }
 }

@@ -13,7 +13,7 @@ pub(crate) mod soul_agents;
 pub(crate) mod tool_phase;
 pub(crate) mod turn;
 
-pub(crate) use session::{list_sessions, load_session_messages};
+pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 
