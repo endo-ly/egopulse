@@ -418,7 +418,7 @@ where
         let resp = build_request(client)
             .send()
             .await
-            .map_err(|e| format!("Discord API request failed: {e}"))?;
+            .map_err(|_| "Discord API request failed".to_string())?;
 
         let status = resp.status();
         if status.is_success() {

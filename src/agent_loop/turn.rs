@@ -795,6 +795,7 @@ async fn execute_tool_calls(
             start_emitter.emit(AgentEvent::ToolStart {
                 name: tool_call.name.clone(),
                 input: tool_call.arguments.clone(),
+                tool_call_id: tool_call.id.clone(),
             });
         })),
         on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
@@ -803,6 +804,7 @@ async fn execute_tool_calls(
                 is_error: outcome.result.is_error,
                 preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
                 duration_ms: outcome.duration_ms,
+                tool_call_id: outcome.tool_call.id.clone(),
             });
         })),
     };

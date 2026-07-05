@@ -687,6 +687,8 @@ async fn execute_turn_with_retry(
         tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
     let coordinator = tool_progress::ToolProgressCoordinator::new(sink, external_chat_id.clone());
     let coordinator_handle = tokio::spawn(coordinator.run(evt_rx));
+    // timeout 枝でタスクを確実に停止できるよう abort handle を保持する。
+    let coordinator_abort = coordinator_handle.abort_handle();
 
     let result = run_retry_loop(state, context, input, &evt_tx).await;
 
@@ -699,7 +701,8 @@ async fn execute_turn_with_retry(
             "tool progress coordinator task failed"
         ),
         Err(_) => {
-            tracing::warn!("tool progress coordinator did not finish within timeout; proceeding")
+            coordinator_abort.abort();
+            tracing::warn!("tool progress coordinator did not finish within timeout; aborted");
         }
     }
     result

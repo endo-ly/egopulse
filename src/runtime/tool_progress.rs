@@ -82,9 +82,21 @@ impl ToolProgressCoordinator {
                         state.close().await;
                         return;
                     }
-                    Some(AgentEvent::ToolStart { name, .. }) => state.on_tool_start(name).await,
-                    Some(AgentEvent::ToolResult { name, is_error, duration_ms, .. }) => {
-                        state.on_tool_result(name, is_error, duration_ms).await;
+                    Some(AgentEvent::ToolStart {
+                        name,
+                        tool_call_id,
+                        ..
+                    }) => state.on_tool_start(tool_call_id, name).await,
+                    Some(AgentEvent::ToolResult {
+                        name,
+                        is_error,
+                        duration_ms,
+                        tool_call_id,
+                        ..
+                    }) => {
+                        state
+                            .on_tool_result(tool_call_id, name, is_error, duration_ms)
+                            .await;
                     }
                     Some(AgentEvent::FinalResponse { .. }) => {
                         state.close().await;
@@ -132,13 +144,19 @@ impl CoordinatorState {
         }
     }
 
-    async fn on_tool_start(&mut self, name: String) {
-        self.log.start(name);
+    async fn on_tool_start(&mut self, tool_call_id: String, name: String) {
+        self.log.start(tool_call_id, name);
         self.refresh_display().await;
     }
 
-    async fn on_tool_result(&mut self, name: String, is_error: bool, duration_ms: u128) {
-        self.log.finish(&name, is_error, duration_ms);
+    async fn on_tool_result(
+        &mut self,
+        tool_call_id: String,
+        name: String,
+        is_error: bool,
+        duration_ms: u128,
+    ) {
+        self.log.finish(&tool_call_id, &name, is_error, duration_ms);
         self.refresh_display().await;
     }
 
@@ -163,7 +181,7 @@ impl CoordinatorState {
         let body = self.log.render();
         match self.sink.begin(&self.external_chat_id, &body).await {
             Ok(handle) => self.display = Some(ActiveDisplay::new(handle)),
-            Err(error) => warn!(error = %error, "tool progress: begin failed"),
+            Err(_error) => warn!("tool progress: begin failed"),
         }
     }
 
@@ -178,8 +196,8 @@ impl CoordinatorState {
             .is_none_or(|last| now.duration_since(last) >= self.min_edit_interval);
         if due {
             let body = self.log.render();
-            if let Err(error) = display.handle.update(&body).await {
-                warn!(error = %error, "tool progress: update failed");
+            if display.handle.update(&body).await.is_err() {
+                warn!("tool progress: update failed");
             }
             display.last_edit = Some(now);
             display.dirty = false;
@@ -196,12 +214,12 @@ impl CoordinatorState {
         let mut handle = display.handle;
         if display.dirty {
             let body = self.log.render();
-            if let Err(error) = handle.update(&body).await {
-                warn!(error = %error, "tool progress: final update failed");
+            if handle.update(&body).await.is_err() {
+                warn!("tool progress: final update failed");
             }
         }
-        if let Err(error) = handle.close().await {
-            warn!(error = %error, "tool progress: close failed");
+        if handle.close().await.is_err() {
+            warn!("tool progress: close failed");
         }
     }
 }
@@ -235,17 +253,19 @@ impl ProgressLog {
     }
 
     /// 実行中ツールを末尾に追加する。
-    fn start(&mut self, name: String) {
+    fn start(&mut self, tool_call_id: String, name: String) {
         self.entries.push(ToolEntry {
             name,
+            tool_call_id,
             status: ToolStatus::Running,
             duration_ms: None,
         });
     }
 
-    /// 同名の最も新しい実行中エントリを完了/エラーに遷移させる。
+    /// 同じ `tool_call_id` の実行中エントリを完了/エラーに遷移させる。
+    /// `tool_call_id` で紐付けるため、並列実行される同名ツールとの取り違えが起きない。
     /// 対応する開始がない場合は完了状態のエントリを追加する（防御的）。
-    fn finish(&mut self, name: &str, is_error: bool, duration_ms: u128) {
+    fn finish(&mut self, tool_call_id: &str, name: &str, is_error: bool, duration_ms: u128) {
         let status = if is_error {
             ToolStatus::Error
         } else {
@@ -255,13 +275,14 @@ impl ProgressLog {
             .entries
             .iter_mut()
             .rev()
-            .find(|e| e.name == name && matches!(e.status, ToolStatus::Running))
+            .find(|e| e.tool_call_id == tool_call_id && matches!(e.status, ToolStatus::Running))
         {
             entry.status = status;
             entry.duration_ms = Some(duration_ms);
         } else {
             self.entries.push(ToolEntry {
                 name: name.to_string(),
+                tool_call_id: tool_call_id.to_string(),
                 status,
                 duration_ms: Some(duration_ms),
             });
@@ -293,6 +314,7 @@ impl ProgressLog {
 
 struct ToolEntry {
     name: String,
+    tool_call_id: String,
     status: ToolStatus,
     duration_ms: Option<u128>,
 }
@@ -411,6 +433,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "read".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::FinalResponse {
@@ -441,6 +464,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "read".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::ToolResult {
@@ -448,6 +472,7 @@ mod tests {
             is_error: false,
             preview: "SECRET".to_string(),
             duration_ms: 10,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         drop(tx);
@@ -478,6 +503,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "web_fetch".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "web_fetch".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -511,6 +537,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "bash".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -519,6 +546,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "read".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::ToolResult {
@@ -526,6 +554,7 @@ mod tests {
             is_error: false,
             preview: String::new(),
             duration_ms: 1800,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         // Allow the (throttled) state to flush on close.
@@ -566,6 +595,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "bash".to_string(),
             input: serde_json::json!({ "command": secret_input }),
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -576,6 +606,7 @@ mod tests {
             is_error: true,
             preview: secret_preview.to_string(),
             duration_ms: 300,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         drop(tx);
@@ -620,6 +651,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "bash".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -652,6 +684,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "bash".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -662,11 +695,13 @@ mod tests {
             is_error: false,
             preview: String::new(),
             duration_ms: 100,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::ToolStart {
             name: "read".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::ToolResult {
@@ -674,6 +709,7 @@ mod tests {
             is_error: false,
             preview: String::new(),
             duration_ms: 50,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         // Keep the burst well inside the throttle window before observing.
@@ -690,6 +726,62 @@ mod tests {
         let tail = drain_calls(&calls);
         assert_eq!(tail.updates.len(), 1, "close flushes the deferred state");
         assert_eq!(tail.closes, 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_matches_tool_result_by_call_id_not_name() {
+        // Arrange: two read-only tools with the same name run concurrently, each
+        // with a distinct tool_call_id. The second one finishes first; its result
+        // must attach to the correct entry, not the most-recent same-name entry.
+        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
+        let notify = Arc::new(Notify::new());
+        let sink: Arc<dyn ToolProgressSink> =
+            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        tx.send(AgentEvent::ToolStart {
+            name: "read".to_string(),
+            input: serde_json::Value::Null,
+            tool_call_id: "call-A".to_string(),
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        tx.send(AgentEvent::ToolStart {
+            name: "read".to_string(),
+            input: serde_json::Value::Null,
+            tool_call_id: "call-B".to_string(),
+        })
+        .unwrap();
+        // call-B finishes first (out of order); only it is marked done.
+        tx.send(AgentEvent::ToolResult {
+            name: "read".to_string(),
+            is_error: false,
+            preview: String::new(),
+            duration_ms: 42,
+            tool_call_id: "call-B".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: the final body shows exactly one completed read (call-B) and one
+        // still-running read (call-A). Name-based matching would have completed the
+        // most-recent entry regardless, but here only call-B is done.
+        let snapshot = calls.lock().unwrap().clone();
+        let final_body = snapshot.updates.last().expect("at least one update");
+        let done_count = final_body.matches("✓ read").count();
+        let running_count = final_body.matches("... read").count();
+        assert_eq!(done_count, 1, "exactly one completed read: {final_body}");
+        assert_eq!(
+            running_count, 1,
+            "exactly one still-running read: {final_body}"
+        );
     }
 
     #[tokio::test]
@@ -711,6 +803,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "bash".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "bash".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -720,6 +813,7 @@ mod tests {
         tx.send(AgentEvent::ToolStart {
             name: "read".to_string(),
             input: serde_json::Value::Null,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         tx.send(AgentEvent::ToolResult {
@@ -727,6 +821,7 @@ mod tests {
             is_error: false,
             preview: String::new(),
             duration_ms: 5,
+            tool_call_id: "read".to_string(),
         })
         .unwrap();
         drop(tx);

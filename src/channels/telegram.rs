@@ -577,7 +577,7 @@ async fn telegram_request_with_retry(
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Telegram API request failed: {e}"))?;
+            .map_err(|_| "Telegram API request failed".to_string())?;
 
         let status = resp.status();
         if status.is_success() {
