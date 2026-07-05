@@ -19,6 +19,11 @@ export function WebUI() {
   const [activeTab, setActiveTab] = useState<TabId>("chat");
   const [selectedAgent, setSelectedAgent] = useState("");
   const [selectedSession, setSelectedSession] = useState(DEFAULT_SESSION_KEY);
+  // Tracks whether the user explicitly chose a session (sidebar, palette, or new
+  // session). The auto-select effect must not clobber an explicit selection —
+  // otherwise a freshly created session is instantly replaced by the first
+  // session of the active agent.
+  const [sessionExplicit, setSessionExplicit] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [authToken, setAuthToken] = useState(loadAuthToken);
   const [authDraft, setAuthDraft] = useState(authToken);
@@ -61,18 +66,50 @@ export function WebUI() {
   }, [agents, selectedAgent]);
 
   useEffect(() => {
-    if (sessions.some((session) => session.session_key === selectedSession)) return;
-    const firstAgentSession = sessions.find((session) => session.agent_id === selectedAgent);
+    if (sessionExplicit) return;
+    if (
+      sessions.some(
+        (session) =>
+          session.session_key === selectedSession &&
+          session.agent_id === selectedAgent,
+      )
+    )
+      return;
+    const firstAgentSession = sessions.find(
+      (session) => session.agent_id === selectedAgent,
+    );
     if (firstAgentSession) {
       setSelectedSession(firstAgentSession.session_key);
     }
-  }, [selectedAgent, selectedSession, sessions]);
+  }, [selectedAgent, selectedSession, sessions, sessionExplicit]);
+
+  const handleSelectSession = useCallback((key: string) => {
+    setSelectedSession(key);
+    setSessionExplicit(true);
+  }, []);
+
+  const handleSelectAgent = useCallback((id: string) => {
+    setSelectedAgent(id);
+    setSessionExplicit(false);
+  }, []);
+
+  const handleSessionResolved = useCallback((key: string) => {
+    setSelectedSession(key);
+    setSessionExplicit(true);
+  }, []);
+
+  const handleNewSession = () => {
+    setSelectedSession(createSessionKey());
+    setSessionExplicit(true);
+    setActiveTab("chat");
+  };
 
   const transport = useChatTransport({
     sessionKey: selectedSession,
     authToken,
     onAuthRequired: setAuthMessage,
     onError: setTransportError,
+    onSessionResolved: handleSessionResolved,
     onDone: () => {
       invalidateQueries("sessions");
       invalidateQueries(`history:${selectedSession}`);
@@ -89,11 +126,6 @@ export function WebUI() {
     () => [...(historyState.data ?? []), ...transport.state.messages],
     [historyState.data, transport.state.messages],
   );
-
-  const handleNewSession = () => {
-    setSelectedSession(createSessionKey());
-    setActiveTab("chat");
-  };
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -153,8 +185,8 @@ export function WebUI() {
         activeTab={activeTab}
         healthStatus={transport.connectionState === "closed" ? "degraded" : "ok"}
         onTabChange={setActiveTab}
-        onSelectAgent={setSelectedAgent}
-        onSelectSession={setSelectedSession}
+        onSelectAgent={handleSelectAgent}
+        onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
         main={
@@ -175,8 +207,8 @@ export function WebUI() {
         sessions={sessions}
         selectedAgent={selectedAgent}
         onNavigate={setActiveTab}
-        onSelectAgent={setSelectedAgent}
-        onSelectSession={setSelectedSession}
+        onSelectAgent={handleSelectAgent}
+        onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
         onRefresh={refreshCurrentTab}
       />

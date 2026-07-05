@@ -18,7 +18,9 @@ export interface ChatTabProps {
 }
 
 function parseToolEvent(message: ChatMessage): ToolEventData | null {
-  if (message.sender_kind !== "tool") return null;
+  if (message.message_kind !== "tool_call") {
+    return null;
+  }
   try {
     const raw = JSON.parse(message.content) as {
       tool?: string;
@@ -29,9 +31,10 @@ function parseToolEvent(message: ChatMessage): ToolEventData | null {
     };
     if (typeof raw.tool !== "string") return null;
     const isError = raw.status === "error";
+    const isPending = raw.status === "pending";
     return {
       name: raw.tool,
-      state: isError ? "error" : "success",
+      state: isError ? "error" : isPending ? "pending" : "success",
       output: raw.result,
       is_error: isError,
       input: raw.input,

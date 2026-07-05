@@ -261,10 +261,11 @@ GET /api/sessions
   "ok": true,
   "sessions": [
     {
-      "session_key": "main",
-      "label": "Web Chat",
+      "session_key": "chat:1",
+      "label": "web:main:agent:lyre",
       "chat_id": 1,
       "channel": "web",
+      "agent_id": "lyre",
       "last_message_time": "2026-04-12T14:03:58Z",
       "last_message_preview": "最新メッセージの先頭..."
     }
@@ -274,10 +275,11 @@ GET /api/sessions
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `session_key` | `string` | セッション識別キー |
-| `label` | `string` | 表示ラベル |
+| `session_key` | `string` | セッション識別キー。全チャネルで `chat:{chat_id}` 形式に統一されており、`GET /api/history` や WebSocket `chat.send` でそのまま指定できる |
+| `label` | `string` | 表示ラベル（`external_chat_id`） |
 | `chat_id` | `number` | 内部チャット ID |
 | `channel` | `string` | チャネル種別（`web`, `discord`, `telegram` 等） |
+| `agent_id` | `string` | セッションを所有する agent ID |
 | `last_message_time` | `string` | 最終メッセージ時刻 (RFC 3339) |
 | `last_message_preview` | `string \| null` | 最終メッセージの先頭プレビュー |
 
@@ -301,25 +303,39 @@ GET /api/history?session_key=main&limit=100
 ```json
 {
   "ok": true,
-  "session_key": "main",
+  "session_key": "chat:1",
   "messages": [
     {
-      "id": 1,
-      "sender_name": "User",
+      "id": "m1",
+      "sender_id": "user:web",
+      "sender_kind": "user",
       "content": "こんにちは",
-      "is_from_bot": false,
-      "timestamp": "2026-04-12T14:00:00Z"
+      "timestamp": "2026-04-12T14:00:00Z",
+      "message_kind": "message"
     },
     {
-      "id": 2,
-      "sender_name": "EgoPulse",
+      "id": "m2",
+      "sender_id": "lyre",
+      "sender_kind": "assistant",
       "content": "こんにちは！何かお手伝いできますか？",
-      "is_from_bot": true,
-      "timestamp": "2026-04-12T14:00:05Z"
+      "timestamp": "2026-04-12T14:00:05Z",
+      "message_kind": "message"
+    },
+    {
+      "id": "tool:call_1",
+      "sender_id": "assistant",
+      "sender_kind": "assistant",
+      "content": "{\"tool\":\"read\",\"status\":\"success\",\"result\":\"...\",\"input\":{\"path\":\"a.txt\"}}",
+      "timestamp": "2026-04-12T14:00:06Z",
+      "message_kind": "tool_call"
     }
   ]
 }
 ```
+
+`session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
+
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。ツール呼び出し履歴は `tool_calls` テーブルから時系列順でテキストメッセージにマージされる（LLM コンテキストには含まれない）。
 
 ---
 
@@ -623,7 +639,7 @@ JSON-RPC 風の双方向メッセージング。
     "server": { "version": "0.1.0", "connId": "uuid" },
     "features": {
       "methods": ["connect", "chat.send"],
-      "events": ["connect.challenge", "chat"]
+      "events": ["connect.challenge", "chat", "tool_start", "tool_result"]
     }
   }
 }
@@ -681,8 +697,45 @@ JSON-RPC 風の双方向メッセージング。
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 完了。`message` に最終応答を含む |
+| `done` | 完了。`message` に最終応答を含む。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
 | `error` | エラー。`errorMessage` を含む |
+
+#### ツールイベント受信
+
+エージェントがツールを実行すると、専用のイベントで通知される。WebUI はこれらを受信して折りたたみ可能なツールカードを描画する。
+
+```json
+{
+  "type": "event",
+  "event": "tool_start",
+  "payload": {
+    "callId": "call_1",
+    "name": "read",
+    "input": {"path": "a.txt"}
+  }
+}
+```
+
+```json
+{
+  "type": "event",
+  "event": "tool_result",
+  "payload": {
+    "callId": "call_1",
+    "name": "read",
+    "isError": false,
+    "preview": "ファイル内容の先頭...",
+    "durationMs": 87
+  }
+}
+```
+
+| イベント | 説明 |
+|---------|------|
+| `tool_start` | ツール実行開始。`callId`, `name`, `input` を含む |
+| `tool_result` | ツール実行完了。`callId`, `name`, `isError`, `preview`, `durationMs` を含む。同じ `callId` の `tool_start` を更新する |
+
+`preview` はツール出力の先頭（最大 200 文字）。完全な出力は履歴取得時に `tool_calls` テーブルから復元される。
 
 ---
 

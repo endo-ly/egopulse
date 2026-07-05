@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
 import { Spinner } from "../../shared/ui/Spinner";
 import type { ToolEventData } from "../../shared/api/types";
 
@@ -43,16 +43,7 @@ function summarizeInput(name: string, input: unknown): string {
 }
 
 export function ToolCard({ event, defaultExpanded }: ToolCardProps) {
-  const autoExpand = event.state === "error";
-  const [expanded, setExpanded] = useState(defaultExpanded ?? autoExpand);
-  const prevState = useRef(event.state);
-
-  useEffect(() => {
-    if (event.state === "error" && prevState.current !== "error") {
-      setExpanded(true);
-    }
-    prevState.current = event.state;
-  }, [event.state]);
+  const [expanded, setExpanded] = useState(defaultExpanded ?? false);
 
   const summary = buildSummary(event);
 

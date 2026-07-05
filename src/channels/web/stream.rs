@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::agent_loop::{SurfaceContext, process_turn_with_events};
+use crate::agent_loop::{SurfaceContext, process_turn_with_events, resolve_chat_id};
 use tracing::error;
 
 use super::sessions::parse_chat_id_from_session_key;
@@ -25,14 +25,20 @@ struct StatusPayload {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ToolStartPayload {
+    call_id: String,
     name: String,
+    input: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ToolResultPayload {
+    call_id: String,
     name: String,
     is_error: bool,
+    preview: String,
     duration_ms: u128,
 }
 
@@ -175,6 +181,31 @@ pub(super) async fn api_stream(
     ))
 }
 
+/// Resolves (or creates) the web chat for a fresh session key and returns the
+/// canonical `chat:{id}` session key together with the surface context.
+///
+/// New web sessions are addressed by `chat:{id}` from the moment they are sent
+/// so the WebUI can adopt the persisted key immediately and reload history.
+async fn resolve_new_web_session(
+    state: &WebState,
+    raw_session_key: &str,
+    actor: &str,
+) -> Result<(String, SurfaceContext), (StatusCode, String)> {
+    let default_agent = state.app_state.config.default_agent.to_string();
+    let surface_thread = web_session_key(raw_session_key);
+    let context = SurfaceContext::new(
+        "web".to_string(),
+        actor.to_string(),
+        surface_thread,
+        "web".to_string(),
+        default_agent,
+    );
+    let chat_id = resolve_chat_id(&state.app_state, &context)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((format!("chat:{chat_id}"), context))
+}
+
 /// Creates a run and spawns the background task that publishes its events.
 pub(super) async fn start_stream_run(
     state: WebState,
@@ -213,32 +244,10 @@ pub(super) async fn start_stream_run(
                     ),
                 )
             }
-            None => {
-                let key = web_session_key(raw_session_key);
-                (
-                    key.clone(),
-                    SurfaceContext::new(
-                        "web".to_string(),
-                        actor.to_string(),
-                        key,
-                        "web".to_string(),
-                        state.app_state.config.default_agent.to_string(),
-                    ),
-                )
-            }
+            None => resolve_new_web_session(&state, raw_session_key, actor).await?,
         }
     } else {
-        let key = web_session_key(raw_session_key);
-        (
-            key.clone(),
-            SurfaceContext::new(
-                "web".to_string(),
-                actor.to_string(),
-                key,
-                "web".to_string(),
-                state.app_state.config.default_agent.to_string(),
-            ),
-        )
+        resolve_new_web_session(&state, raw_session_key, actor).await?
     };
 
     let run_id = Uuid::new_v4().to_string();
@@ -335,29 +344,40 @@ pub(super) async fn start_stream_run(
                             )
                             .await;
                     }
-                    AgentEvent::ToolStart { name, .. } => {
+                    AgentEvent::ToolStart {
+                        call_id,
+                        name,
+                        input,
+                    } => {
                         run_hub
                             .publish(
                                 &run_id_for_events,
                                 "tool_start",
-                                serde_json::to_string(&ToolStartPayload { name })
-                                    .unwrap_or_default(),
+                                serde_json::to_string(&ToolStartPayload {
+                                    call_id,
+                                    name,
+                                    input,
+                                })
+                                .unwrap_or_default(),
                             )
                             .await;
                     }
                     AgentEvent::ToolResult {
+                        call_id,
                         name,
                         is_error,
+                        preview,
                         duration_ms,
-                        ..
                     } => {
                         run_hub
                             .publish(
                                 &run_id_for_events,
                                 "tool_result",
                                 serde_json::to_string(&ToolResultPayload {
+                                    call_id,
                                     name,
                                     is_error,
+                                    preview,
                                     duration_ms,
                                 })
                                 .unwrap_or_default(),
@@ -454,23 +474,31 @@ mod tests {
         assert_eq!(status_parsed["message"], "running");
 
         let tool_start_json = serde_json::to_string(&ToolStartPayload {
+            call_id: "call_1".to_string(),
             name: "read".to_string(),
+            input: serde_json::json!({"path": "a.txt"}),
         })
         .unwrap();
         let tool_start_parsed: serde_json::Value = serde_json::from_str(&tool_start_json).unwrap();
+        assert_eq!(tool_start_parsed["callId"], "call_1");
         assert_eq!(tool_start_parsed["name"], "read");
+        assert_eq!(tool_start_parsed["input"]["path"], "a.txt");
 
         let tool_result_json = serde_json::to_string(&ToolResultPayload {
+            call_id: "call_1".to_string(),
             name: "write".to_string(),
             is_error: false,
+            preview: "done".to_string(),
             duration_ms: 123,
         })
         .unwrap();
         let tool_result_parsed: serde_json::Value =
             serde_json::from_str(&tool_result_json).unwrap();
+        assert_eq!(tool_result_parsed["callId"], "call_1");
         assert_eq!(tool_result_parsed["name"], "write");
-        assert_eq!(tool_result_parsed["is_error"], false);
-        assert_eq!(tool_result_parsed["duration_ms"], 123);
+        assert_eq!(tool_result_parsed["isError"], false);
+        assert_eq!(tool_result_parsed["durationMs"], 123);
+        assert_eq!(tool_result_parsed["preview"], "done");
     }
 
     #[tokio::test]

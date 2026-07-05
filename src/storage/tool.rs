@@ -83,9 +83,12 @@ impl Database {
         )?;
         Ok(conn.last_insert_rowid())
     }
-}
-#[cfg(test)]
-impl Database {
+
+    /// Loads persisted tool calls for a chat, ordered by execution time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
     pub(crate) fn get_tool_calls_for_chat(
         &self,
         chat_id: i64,
@@ -110,7 +113,9 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(calls)
     }
-
+}
+#[cfg(test)]
+impl Database {
     pub(crate) fn get_llm_usage_summary(
         &self,
         chat_id: Option<i64>,

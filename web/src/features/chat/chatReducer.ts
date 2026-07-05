@@ -1,4 +1,4 @@
-import type { ChatMessage, ToolEventData } from "../../shared/api/types";
+import type { ChatMessage } from "../../shared/api/types";
 
 export interface ChatEventPayload {
   runId: string;
@@ -14,13 +14,12 @@ export interface ChatEventPayload {
 
 export interface ChatState {
   messages: ChatMessage[];
-  toolEvents: Record<string, ToolEventData>;
   runId: string | null;
   error: string | null;
 }
 
 export function initialChatState(): ChatState {
-  return { messages: [], toolEvents: {}, runId: null, error: null };
+  return { messages: [], runId: null, error: null };
 }
 
 export function reduceChatEvent(state: ChatState, event: ChatEventPayload): ChatState {
@@ -103,55 +102,97 @@ export function parseStatusEvent(payload: StatusEventPayload): string | null {
 }
 
 export interface ToolStartPayload {
+  callId: string;
   name: string;
-  callId?: string;
   input?: unknown;
 }
 
 export interface ToolResultPayload {
+  callId: string;
   name: string;
-  is_error: boolean;
-  duration_ms: number;
-  callId?: string;
+  isError: boolean;
+  preview: string;
+  durationMs: number;
+}
+
+interface ToolContent {
+  tool: string;
+  status: "pending" | "success" | "error";
+  input?: unknown;
+  result?: string;
+  durationMs?: number;
+}
+
+function toolMessageId(callId: string): string {
+  return `tool:${callId}`;
+}
+
+function encodeToolContent(fields: ToolContent): string {
+  return JSON.stringify({
+    tool: fields.tool,
+    status: fields.status,
+    input: fields.input ?? null,
+    result: fields.result,
+    duration_ms: fields.durationMs,
+  });
+}
+
+function decodeToolInput(content: string): unknown {
+  try {
+    return (JSON.parse(content) as { input?: unknown }).input;
+  } catch {
+    return undefined;
+  }
+}
+
+function upsertToolMessage(
+  messages: ChatMessage[],
+  message: ChatMessage,
+): ChatMessage[] {
+  return messages.some((m) => m.id === message.id)
+    ? messages.map((m) => (m.id === message.id ? message : m))
+    : [...messages, message];
 }
 
 export function reduceToolStart(
   state: ChatState,
-  runId: string,
   payload: ToolStartPayload,
 ): ChatState {
-  const key = payload.callId
-    ? `${runId}:${payload.callId}`
-    : `${runId}:${payload.name}`;
-  return {
-    ...state,
-    toolEvents: {
-      ...state.toolEvents,
-      [key]: { name: payload.name, state: "pending", input: payload.input },
-    },
+  const message: ChatMessage = {
+    id: toolMessageId(payload.callId),
+    sender_id: "assistant",
+    sender_kind: "tool",
+    content: encodeToolContent({
+      tool: payload.name,
+      status: "pending",
+      input: payload.input,
+    }),
+    timestamp: new Date().toISOString(),
+    message_kind: "tool_call",
   };
+  return { ...state, messages: upsertToolMessage(state.messages, message) };
 }
 
 export function reduceToolResult(
   state: ChatState,
-  runId: string,
   payload: ToolResultPayload,
 ): ChatState {
-  const key = payload.callId
-    ? `${runId}:${payload.callId}`
-    : `${runId}:${payload.name}`;
-  const existing = state.toolEvents[key];
-  return {
-    ...state,
-    toolEvents: {
-      ...state.toolEvents,
-      [key]: {
-        name: payload.name,
-        state: payload.is_error ? "error" : "success",
-        is_error: payload.is_error,
-        duration_ms: payload.duration_ms,
-        input: existing?.input,
-      },
-    },
+  const existing = state.messages.find(
+    (m) => m.id === toolMessageId(payload.callId),
+  );
+  const message: ChatMessage = {
+    id: toolMessageId(payload.callId),
+    sender_id: "assistant",
+    sender_kind: "tool",
+    content: encodeToolContent({
+      tool: payload.name,
+      status: payload.isError ? "error" : "success",
+      input: existing ? decodeToolInput(existing.content) : undefined,
+      result: payload.preview,
+      durationMs: payload.durationMs,
+    }),
+    timestamp: new Date().toISOString(),
+    message_kind: "tool_call",
   };
+  return { ...state, messages: upsertToolMessage(state.messages, message) };
 }

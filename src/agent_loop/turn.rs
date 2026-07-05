@@ -755,10 +755,11 @@ async fn persist_tool_result_messages(
 
     let mut messages_with_tools = messages;
     messages_with_tools.extend(tool_messages.iter().cloned());
+    let tool_summary = StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
     persist_phase_messages(
         state,
         scope,
-        StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview),
+        tool_summary,
         tool_messages,
         &messages_with_tools,
         session_updated_at,
@@ -793,12 +794,14 @@ async fn execute_tool_calls(
     let hooks = ToolExecutionHooks {
         on_start: Some(Arc::new(move |tool_call: &ToolCall| {
             start_emitter.emit(AgentEvent::ToolStart {
+                call_id: tool_call.id.clone(),
                 name: tool_call.name.clone(),
                 input: tool_call.arguments.clone(),
             });
         })),
         on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
             result_emitter.emit(AgentEvent::ToolResult {
+                call_id: outcome.tool_call.id.clone(),
                 name: outcome.tool_call.name.clone(),
                 is_error: outcome.result.is_error,
                 preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
