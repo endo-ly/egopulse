@@ -258,6 +258,7 @@ define_enum! {
         Message => "message",
         AgentSend => "agent_send",
         SystemEvent => "system_event",
+        ToolCall => "tool_call",
     }
 }
 

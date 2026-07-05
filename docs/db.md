@@ -243,7 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 | chat_id | INTEGER | PK（複合） | chats.chat_id への参照 |
 | sender_id | TEXT | NOT NULL | 統一送信者識別子（例: `"lyre"`, `"user:discord:123"`, `"system"`, `"pulse"`） |
 | content | TEXT | NOT NULL | メッセージ本文 |
-| sender_kind | TEXT | NOT NULL DEFAULT 'user' | 送信者種別（`user`, `assistant`, `system`, `tool`） |
+| sender_kind | TEXT | NOT NULL DEFAULT 'user' | 送信者種別（`user`, `assistant`, `system`）。`tool` はエージェント間通信（`agent_send`）専用のレガシー値 |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 | message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`） |
 | recipient_agent_id | TEXT | nullable | 受信エージェント ID。Multi-Agent Room で使用 |
@@ -261,6 +261,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 | `message` | 通常のチャットメッセージ（デフォルト） |
 | `agent_send` | エージェント間通信。`sender_kind` は `tool`、`recipient_agent_id` に宛先エージェント ID が設定される |
 | `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_id` は `"system"`、`sender_kind` は `system`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
+| `tool_call` | ツール実行結果。`sender_kind` は `assistant`、`content` は JSON 文字列（`{tool, status, result, input}`） |
 
 ---
 

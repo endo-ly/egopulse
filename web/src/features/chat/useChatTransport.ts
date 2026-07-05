@@ -2,8 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   initialChatState,
   reduceChatEvent,
+  reduceToolResult,
+  reduceToolStart,
   type ChatEventPayload,
   type ChatState,
+  type ToolResultPayload,
+  type ToolStartPayload,
 } from "./chatReducer";
 import { AuthRequiredError } from "../../shared/api/auth";
 import { wsUrl } from "../../shared/api/ws";
@@ -15,6 +19,7 @@ export interface UseChatTransportOptions {
   onDone?: () => void;
   onAuthRequired?: (message: string) => void;
   onError?: (message: string) => void;
+  onSessionResolved?: (sessionKey: string) => void;
 }
 
 interface ResponseFrame {
@@ -38,6 +43,7 @@ export function useChatTransport({
   onDone,
   onAuthRequired,
   onError,
+  onSessionResolved,
 }: UseChatTransportOptions) {
   const [state, setState] = useState<ChatState>(initialChatState);
   const [connectionState, setConnectionState] = useState<
@@ -47,6 +53,10 @@ export function useChatTransport({
   const connectPromiseRef = useRef<Promise<void> | null>(null);
   const connectResolveRef = useRef<(() => void) | null>(null);
   const connectRejectRef = useRef<((error: Error) => void) | null>(null);
+  const sessionKeyRef = useRef(sessionKey);
+  sessionKeyRef.current = sessionKey;
+  const onSessionResolvedRef = useRef(onSessionResolved);
+  onSessionResolvedRef.current = onSessionResolved;
 
   useEffect(() => {
     setState(initialChatState());
@@ -98,10 +108,28 @@ export function useChatTransport({
         const event = parsed.payload as ChatEventPayload;
         setState((prev) => reduceChatEvent(prev, event));
         if (event.state === "done") {
+          if (
+            event.sessionKey &&
+            event.sessionKey !== sessionKeyRef.current &&
+            onSessionResolvedRef.current
+          ) {
+            onSessionResolvedRef.current(event.sessionKey);
+          }
           invalidateQueries("sessions");
           invalidateQueries("history");
           onDone?.();
         }
+        return;
+      }
+
+      if (parsed.type === "event" && parsed.event === "tool_start" && parsed.payload) {
+        setState((prev) => reduceToolStart(prev, parsed.payload as ToolStartPayload));
+        return;
+      }
+
+      if (parsed.type === "event" && parsed.event === "tool_result" && parsed.payload) {
+        setState((prev) => reduceToolResult(prev, parsed.payload as ToolResultPayload));
+        return;
       }
     },
     [authToken, onAuthRequired, onDone, onError],

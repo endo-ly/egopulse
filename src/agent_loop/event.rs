@@ -19,7 +19,7 @@ pub(crate) enum AgentEvent {
         name: String,
         input: serde_json::Value,
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
-        tool_call_id: String,
+        call_id: String,
     },
     /// Tool execution completed.
     ToolResult {
@@ -28,7 +28,7 @@ pub(crate) enum AgentEvent {
         preview: String,
         duration_ms: u128,
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
-        tool_call_id: String,
+        call_id: String,
     },
     /// Final response.
     FinalResponse { text: String },

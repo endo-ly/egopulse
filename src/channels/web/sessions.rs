@@ -56,11 +56,10 @@ pub(super) async fn list_sessions(
     let items = sessions
         .into_iter()
         .map(|session| {
-            let session_key = if session.channel == "web" {
-                web_session_key(&session.surface_thread)
-            } else {
-                format!("chat:{}", session.chat_id)
-            };
+            // All channels share the canonical `chat:{id}` key so the WebUI can
+            // round-trip a selected session back to history via `get_chat_by_id`,
+            // regardless of the agent-scoped `external_chat_id` shape.
+            let session_key = format!("chat:{}", session.chat_id);
             SessionItem {
                 label: session.external_chat_id.clone(),
                 session_key,
@@ -119,8 +118,14 @@ pub(super) async fn get_history(
         }
     };
 
-    let messages = match call_blocking(db, move |db| db.get_recent_messages(chat_id, limit)).await {
-        Ok(messages) => messages,
+    let (messages, tool_calls) = match call_blocking(db, move |db| {
+        let messages = db.get_recent_messages(chat_id, limit)?;
+        let tool_calls = db.get_tool_calls_for_chat(chat_id)?;
+        Ok::<_, crate::error::StorageError>((messages, tool_calls))
+    })
+    .await
+    {
+        Ok(value) => value,
         Err(error) => {
             tracing::warn!(chat_id, error = %error, "failed to load message history");
             return Err((
@@ -130,17 +135,69 @@ pub(super) async fn get_history(
         }
     };
 
+    // Interleave text messages with persisted tool calls by timestamp so the
+    // WebUI can render collapsible tool cards inline within the conversation.
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+    for message in messages {
+        let timestamp = message.timestamp.clone();
+        entries.push((
+            timestamp,
+            serde_json::json!({
+                "id": message.id,
+                "sender_id": message.sender_id,
+                "sender_kind": message.sender_kind.to_string(),
+                "content": message.content,
+                "timestamp": message.timestamp,
+                "message_kind": message.message_kind.to_string(),
+            }),
+        ));
+    }
+    for tool_call in tool_calls {
+        let timestamp = tool_call.timestamp.clone();
+        let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
+            .unwrap_or(serde_json::Value::Null);
+        let (status, result) = if let Some(ref output) = tool_call.tool_output {
+            let parsed = serde_json::from_str::<serde_json::Value>(output)
+                .unwrap_or(serde_json::Value::Null);
+            let status = parsed
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("success")
+                .to_string();
+            let result = parsed
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| output.to_string());
+            (status, result)
+        } else {
+            ("pending".to_string(), String::new())
+        };
+        entries.push((
+            timestamp,
+            serde_json::json!({
+                "id": format!("tool:{}", tool_call.id),
+                "sender_id": "assistant",
+                "sender_kind": "assistant",
+                "content": serde_json::to_string(&serde_json::json!({
+                    "tool": tool_call.tool_name,
+                    "status": status,
+                    "result": result,
+                    "input": input,
+                })).unwrap_or_default(),
+                "timestamp": tool_call.timestamp,
+                "message_kind": "tool_call",
+            }),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let messages_json: Vec<serde_json::Value> =
+        entries.into_iter().map(|(_, value)| value).collect();
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "session_key": session_key,
-        "messages": messages.into_iter().map(|message| serde_json::json!({
-            "id": message.id,
-            "sender_id": message.sender_id,
-            "sender_kind": message.sender_kind.to_string(),
-            "content": message.content,
-            "timestamp": message.timestamp,
-            "message_kind": message.message_kind.to_string(),
-        })).collect::<Vec<_>>()
+        "messages": messages_json,
     })))
 }
 
@@ -265,6 +322,74 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"message"));
         assert!(kinds.contains(&"system_event"));
+    }
+
+    #[tokio::test]
+    async fn api_sessions_exposes_chat_id_key_regardless_of_external_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+
+        let result = list_sessions(AxumState(web_state)).await.expect("ok");
+        let body = result.0;
+        let sessions = body["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_key"], format!("chat:{chat_id}"));
+    }
+
+    #[tokio::test]
+    async fn api_history_interleaves_tool_calls() {
+        use crate::storage::ToolCall;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-tool:agent:lyre", "lyre");
+
+        let user_msg = StoredMessage::user(
+            chat_id,
+            "user:web".to_string(),
+            "please read the file".to_string(),
+        );
+        db.store_message_only(&user_msg)
+            .expect("store user message");
+
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            chat_id,
+            message_id: user_msg.id.clone(),
+            tool_name: "read".to_string(),
+            tool_input: r#"{"path":"a.txt"}"#.to_string(),
+            tool_output: Some("file contents".to_string()),
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+        };
+        db.store_tool_call(&tool_call).expect("store tool call");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+
+        let tool_message = messages
+            .iter()
+            .find(|m| m["message_kind"] == "tool_call")
+            .expect("tool message present");
+        assert_eq!(tool_message["id"], "tool:call-1");
+        let content = serde_json::from_str::<serde_json::Value>(
+            tool_message["content"].as_str().expect("content string"),
+        )
+        .expect("content json");
+        assert_eq!(content["tool"], "read");
+        assert_eq!(content["status"], "success");
+        assert_eq!(content["result"], "file contents");
+        assert_eq!(content["input"]["path"], "a.txt");
     }
 
     #[test]

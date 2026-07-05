@@ -109,9 +109,10 @@ Timeline 内キーワード検索機能。
 | `sender_kind` | 配置 | 背景 | 備考 |
 |---|---|---|---|
 | `user` | 右寄せ | `accent-2-soft`（パープル系） | ユーザー入力 |
-| `assistant` | 左寄せ | `panel`（85% opacity） | LLM 応答・Pulse 通知 |
+| `assistant` | 中央 | `panel`（85% opacity） | LLM 応答・Pulse 通知 |
 | `system` | 中央（幅 60% 程度） | `panel-2` | システムメッセージ |
-| `tool` | 左寄せ・assistant の下 | `panel-2` | ツール結果 |
+
+ツール実行結果は `message_kind: "tool_call"` で判定し、assistant と同じ中央配置で、内側のカード幅のみ短く表示する。左端は assistant と揃える。
 
 - bubble の最大幅：`min(760px, 80%)`
 - panel 相当の radius・shadow
