@@ -755,8 +755,7 @@ async fn persist_tool_result_messages(
 
     let mut messages_with_tools = messages;
     messages_with_tools.extend(tool_messages.iter().cloned());
-    let tool_summary =
-        StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
+    let tool_summary = StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
     persist_phase_messages(
         state,
         scope,
