@@ -280,7 +280,7 @@ GET /api/sessions
 | `chat_id` | `number` | 内部チャット ID |
 | `channel` | `string` | チャネル種別（`web`, `discord`, `telegram` 等） |
 | `agent_id` | `string` | セッションを所有する agent ID |
-| `last_message_time` | `string` | 最終メッセージ時刻 (RFC 3339) |
+| `last_message_time` | `string` | 当該チャットの最新メッセージのタイムスタンプ (RFC 3339)。メッセージが無い場合はチャット作成時刻。レスポンスはこの値の降順（同一値は `chat_id` 降順）でソートされる |
 | `last_message_preview` | `string \| null` | 最終メッセージの先頭プレビュー |
 
 ---

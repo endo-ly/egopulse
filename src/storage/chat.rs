@@ -147,7 +147,8 @@ impl Database {
                 c.channel,
                 c.external_chat_id,
                 c.chat_title,
-                c.last_message_time,
+                COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.chat_id = c.chat_id), c.last_message_time)
+                    AS last_message_time,
                 (
                     SELECT m.content
                     FROM messages m
@@ -157,7 +158,7 @@ impl Database {
                 ) AS last_message_preview,
                 c.agent_id
              FROM chats c
-             ORDER BY c.last_message_time DESC, c.chat_id DESC",
+             ORDER BY last_message_time DESC, c.chat_id DESC",
         )?;
         stmt.query_map([], |row| {
             let channel: String = row.get(1)?;
@@ -807,6 +808,33 @@ mod tests {
             )
             .expect("reopen chat");
         assert_eq!(reopened_chat_id, chat_id);
+    }
+
+    #[test]
+    fn list_sessions_orders_by_latest_message_timestamp() {
+        let (db, _dir) = test_db();
+
+        // Two chats created in order; A is older at creation time.
+        let chat_a = db
+            .resolve_or_create_chat_id("cli", "cli:a", Some("a"), "cli", "default")
+            .expect("create chat A");
+        let chat_b = db
+            .resolve_or_create_chat_id("cli", "cli:b", Some("b"), "cli", "default")
+            .expect("create chat B");
+
+        // Same initial message time, then A receives a newer message later.
+        // A must sort above B even though B was created more recently.
+        store_msg(&db, "m-a1", chat_a, "a-first", "2024-01-01T00:00:00Z");
+        store_msg(&db, "m-b1", chat_b, "b-first", "2024-01-01T00:00:00Z");
+        store_msg(&db, "m-a2", chat_a, "a-second", "2024-01-02T00:00:00Z");
+
+        let sessions = db.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions[0].chat_id, chat_a,
+            "chat with the latest message must sort first"
+        );
+        assert_eq!(sessions[1].chat_id, chat_b);
     }
 
     #[test]
