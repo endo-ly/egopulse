@@ -321,7 +321,7 @@ pulse:
 | -------------------------- | -------------------------------- |
 | `pulse.enabled`            | Pulse 全体の有効化                     |
 | `pulse.tick_interval`      | due scan の周期（Duration 形式: `30s`, `1m`, `1h`） |
-| `pulse.timezone`           | daily / weekly 判定の timezone      |
+| `pulse.timezone`           | daily / weekly / interval 判定の timezone      |
 
 Temporal Intention の中身は config に置かない。
 それは agent の注意方針なので、`agents/{agent_id}/PULSE.md` に置く。
@@ -330,7 +330,7 @@ Temporal Intention の中身は config に置かない。
 
 # 4. Temporal Intention 仕様
 
-Phase 1 で対応する schedule は3種類のみ。
+Phase 1 で対応する schedule は以下の 4 種類。
 
 ## daily
 
@@ -349,16 +349,46 @@ schedule:
   at: "21:00"
 ```
 
+## interval
+
+`interval_days` 日ごとに発火する。起点は**前回成功した発火日**（`pulse_runs.status = success` の最新 `started_at`）。
+
+```yaml
+schedule:
+  kind: interval
+  interval_days: 3
+  at: "09:00"
+```
+
+`daily` / `weekly` がカレンダー期間固定の絶対基準であるのに対し、`interval` は**意図の達成（=成功）を起点とする相対基準**である。この違いにより、失敗時の扱いが異なる。
+
+### 失敗時の挙動（意図駆動リトライ）
+
+前回成功日を起点にするため、失敗しても起点は更新されず、`interval_days` 経過後は**成功するまで毎日再評価される**。ただし `due_key` が評価日単位で進むため、1 日 1 回まで（翌日リトライ）。
+
+| 日付 | 状態 | due | 備考 |
+|---|---|:---:|---|
+| 07/03 | 成功 | — | `last_success = 07/03` に更新 |
+| 07/04〜05 | skip | ✗ | `07/03 + 3日 = 07/06` 未到 |
+| 07/06 | 発火→**失敗** | ✓ | `last_success` は更新されず `07/03` のまま |
+| 07/07 | 発火→成功 | ✓ | `due_key` が 07/07 に進むため再試行可能 |
+| 07/08〜09 | skip | ✗ | `07/07 + 3日 = 07/10` 未到 |
+| 07/10 | 発火 | ✓ | — |
+
+初回（`last_success = None`）は時刻判定のみで due になる。
+
 ## validation
 
 | 項目                          | 仕様                          |
 | --------------------------- | --------------------------- |
 | `id`                        | agent 内で一意                  |
 | `enabled`                   | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
-| `schedule.kind`             | `daily` / `weekly` |
+| `schedule.kind`             | `daily` / `weekly` / `interval` |
 | `daily.at`                  | `HH:MM`                     |
 | `weekly.day`                | `mon`〜`sun`                 |
 | `weekly.at`                 | `HH:MM`                     |
+| `interval.interval_days`    | `1` 以上の整数                 |
+| `interval.at`               | `HH:MM`                     |
 | `attention`                 | LLM に渡す注意対象。実行命令ではない        |
 | `default_delivery`          | 省略可能。agent レベルのデフォルト配送先     |
 | `default_delivery.channel`  | `discord` / `telegram` のみ   |
@@ -389,7 +419,7 @@ schedule:
                ▼
 ┌──────────────────────────────┐
 │        Temporal Due Resolver  │
-│ daily / weekly 判定     │
+│ daily / weekly / interval 判定     │
 └──────────────┬───────────────┘
                │ due
                ▼
@@ -438,6 +468,13 @@ weekly:
   今日の曜日 == day
   かつ 今日の日付 + at <= now
   かつ due_key 未実行
+
+interval:
+  今日のローカル日付 >= 前回成功日 + interval_days
+  かつ 今日の日付 + at <= now
+  かつ due_key 未実行
+  ※ 前回成功日 = pulse_runs.status='success' の最新 started_at
+  ※ 前回成功日が無い（初回）場合は日付条件をスキップ（時刻判定のみ）
 ```
 
 ## due_key
@@ -448,6 +485,9 @@ weekly:
 | -------- | -------------------------------------------- |
 | daily    | `lyre:morning_review:2026-05-10`             |
 | weekly   | `kitara:weekly_reflection:2026-W19`          |
+| interval | `lyre:periodic_report:2026-05-10`            |
+
+`interval` の `due_key` は評価日（今日のローカル日付）。前回成功日ではない。これにより、失敗した日は `due_key` が消費され、翌日は別の `due_key` で再評価される（意図駆動リトライ）。
 
 ---
 
@@ -684,7 +724,7 @@ src/
 | ------------------------------ | ----------------------------------------------------- |
 | `pulse` config                 | enabled / tick_interval / timezone |
 | `PULSE.md` front matter parser | Temporal Intention を読む                                |
-| due 判定                         | daily / weekly                                 |
+| due 判定                         | daily / weekly / interval                                 |
 | duplicate 判定                   | `pulse_runs` の `due_key`                              |
 | active turn defer              | agent active 中は起こさない                                  |
 | Home Surface 解決                | agent の最後の会話場所を使う                                     |
@@ -738,7 +778,7 @@ src/
   Attention:
   {attention}
   ```
-  - `Schedule` は `daily 08:00`, `weekly sun 21:00` の形式
+  - `Schedule` は `daily 08:00`, `weekly sun 21:00`, `every 3 days 09:00` の形式
   - `Attention` は PULSE.md の intention 定義そのまま
 - sender_name は `Pulse`、message_kind は `SystemEvent`
 - ユーザーが Pulse 通知に返信すると、通常 turn が文脈（intention の目的・スケジュール・指示内容）を引き継げる
