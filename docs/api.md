@@ -337,7 +337,7 @@ GET /api/history?session_key=main&limit=100
 
 メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。ツール呼び出し履歴は `tool_calls` テーブルから時系列順でテキストメッセージにマージされる（LLM コンテキストには含まれない）。
 
-ツール呼び出しを伴うターンでは、`messages` テーブルにエージェントのテキストとツール名を併記したプレビュー（`[tool_call] {name}` 形式）が assistant メッセージとして保存される。これはテキストベースチャネル（TUI / Discord など）の表示用で、WebUI でも発言内容を残すためにそのまま返却される。一方、ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...` 形式）は Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルの内容と完全重複するため、`GET /api/history` では除外される。
+ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言内容を残すために返却される。
 
 ---
 

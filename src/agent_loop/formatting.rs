@@ -87,9 +87,9 @@ pub(crate) fn summarize_tool_calls_with_content(content: &str, tool_calls: &[Too
         .map(|tool_call| tool_call.name.as_str())
         .collect::<Vec<_>>();
     if content.trim().is_empty() {
-        format!("[tool_call] {}", names.join(", "))
+        format!("{TOOL_CALL_PREFIX}{}", names.join(", "))
     } else {
-        format!("{} [tool_call] {}", content.trim(), names.join(", "))
+        format!("{} {TOOL_CALL_PREFIX}{}", content.trim(), names.join(", "))
     }
 }
 
@@ -167,17 +167,21 @@ fn render_tool_body(payload: &str, truncate: bool) -> String {
     strip_thinking(payload)
 }
 
+const TOOL_CALL_PREFIX: &str = "[tool_call] ";
 const TOOL_RESULT_PREFIX: &str = "[tool_result]: ";
 const TOOL_ERROR_PREFIX: &str = "[tool_error]: ";
 
-/// Returns `true` when `content` is a tool-result/tool-error preview message
-/// (`[tool_result]: ...` / `[tool_error]: ...`).
+/// Returns `true` when `content` is a tool preview message persisted for
+/// text-only channels (`[tool_call] {name}`, `[tool_result]: ...`, or
+/// `[tool_error]: ...`).
 ///
-/// These previews are emitted by [`render_tool_message_text`] for text-only
-/// channels. Structured UIs that render tool results from the `tool_calls`
-/// table can use this to skip the duplicate preview.
-pub(crate) fn is_tool_result_preview(content: &str) -> bool {
-    content.starts_with(TOOL_RESULT_PREFIX) || content.starts_with(TOOL_ERROR_PREFIX)
+/// These previews are emitted by [`summarize_tool_calls_with_content`] and
+/// [`render_tool_message_text`]. Structured UIs that render tool results from
+/// the `tool_calls` table can use this to skip the duplicate preview.
+pub(crate) fn is_tool_preview_message(content: &str) -> bool {
+    content.starts_with(TOOL_CALL_PREFIX)
+        || content.starts_with(TOOL_RESULT_PREFIX)
+        || content.starts_with(TOOL_ERROR_PREFIX)
 }
 
 fn tool_message_prefix(message: &Message) -> &'static str {
@@ -533,18 +537,18 @@ mod tests {
     }
 
     #[test]
-    fn is_tool_result_preview_detects_generated_prefixes() {
-        assert!(is_tool_result_preview("[tool_result]: done"));
-        assert!(is_tool_result_preview("[tool_error]: boom"));
+    fn is_tool_preview_message_detects_generated_prefixes() {
+        assert!(is_tool_preview_message("[tool_call] read"));
+        assert!(is_tool_preview_message("[tool_result]: done"));
+        assert!(is_tool_preview_message("[tool_error]: boom"));
     }
 
     #[test]
-    fn is_tool_result_preview_rejects_other_messages() {
-        assert!(!is_tool_result_preview("[tool_call] read"));
-        assert!(!is_tool_result_preview(
+    fn is_tool_preview_message_rejects_other_messages() {
+        assert!(!is_tool_preview_message(
             "ファイルを読みます [tool_call] read"
         ));
-        assert!(!is_tool_result_preview("regular assistant text"));
-        assert!(!is_tool_result_preview(""));
+        assert!(!is_tool_preview_message("regular assistant text"));
+        assert!(!is_tool_preview_message(""));
     }
 }

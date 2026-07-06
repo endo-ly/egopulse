@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::agent_loop::formatting::is_tool_result_preview;
+use crate::agent_loop::formatting::is_tool_preview_message;
 use crate::storage::{SenderKind, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
@@ -139,13 +139,15 @@ pub(super) async fn get_history(
     // Interleave text messages with persisted tool calls by timestamp so the
     // WebUI can render collapsible tool cards inline within the conversation.
     //
-    // Tool-result/error previews (`[tool_result]: ...` / `[tool_error]: ...`)
-    // are skipped: Markdown parses the bracket-prefix form as a reference
-    // link definition and renders it empty, and the same data is already
-    // exposed via the structured tool cards below.
+    // Tool preview messages (`[tool_call] {name}`, `[tool_result]: ...`,
+    // `[tool_error]: ...`) are skipped: the no-narration tool_call form and
+    // the result/error forms either duplicate the structured tool cards below
+    // or render empty in Markdown (the bracket-prefix parses as a reference
+    // link definition). Tool_call previews that lead with agent narration
+    // stay.
     let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
     for message in messages {
-        if message.sender_kind == SenderKind::Assistant && is_tool_result_preview(&message.content)
+        if message.sender_kind == SenderKind::Assistant && is_tool_preview_message(&message.content)
         {
             continue;
         }
@@ -403,16 +405,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_history_skips_tool_result_preview_messages() {
+    async fn api_history_skips_tool_preview_messages() {
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
         let db = Arc::clone(&web_state.app_state.db);
 
         let chat_id = insert_web_chat(&db, "web:session-preview:agent:lyre", "lyre");
 
-        // Tool-result/error previews render empty in Markdown (parsed as a
-        // reference link definition) and duplicate the structured tool card,
-        // so they must be filtered out of the WebUI history.
+        // Tool previews persisted for text-only channels: filtered because
+        // they duplicate the structured tool cards (and the result/error forms
+        // render empty in Markdown as reference link definitions).
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "[tool_call] read".to_string(),
+        ))
+        .expect("store tool_call preview");
         db.store_message_only(&StoredMessage::assistant(
             chat_id,
             "lyre".to_string(),
@@ -426,7 +434,7 @@ mod tests {
         ))
         .expect("store tool_error preview");
 
-        // A tool_call preview that carries user-facing narration stays.
+        // A tool_call preview that leads with agent narration stays.
         db.store_message_only(&StoredMessage::assistant(
             chat_id,
             "lyre".to_string(),
