@@ -215,9 +215,16 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(raw
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc)))
+        raw.map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    StorageError::InvalidAsset(format!(
+                        "corrupt pulse_run started_at value {s:?}: {e}"
+                    ))
+                })
+        })
+        .transpose()
     }
 
     /// Returns `true` when any record exists for `(agent_id, intention_id,
@@ -771,6 +778,32 @@ mod tests {
             db.get_last_success_started_at("agent-a", "int-9")
                 .expect("query")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn get_last_success_started_at_surfaces_corrupt_timestamp_as_error() {
+        let (db, _dir) = test_db();
+
+        // Arrange: a success row whose started_at is not a valid RFC3339 value.
+        // Must not be silently coerced to None, because interval schedules
+        // would then treat the intention as "never succeeded" and fire
+        // immediately (duplicate / unintended activation).
+        insert_terminal_pulse_run(
+            &db,
+            "run-corrupt",
+            "agent-a",
+            "int-1",
+            "2025-01-01",
+            "not-a-valid-timestamp",
+            PulseRunStatus::Success,
+        );
+
+        let result = db.get_last_success_started_at("agent-a", "int-1");
+
+        assert!(
+            matches!(result, Err(StorageError::InvalidAsset(_))),
+            "corrupt started_at should surface as InvalidAsset, got: {result:?}"
         );
     }
 

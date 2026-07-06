@@ -160,9 +160,13 @@ async fn process_intention_with_activation_timeout(
     }
 
     // 2. Check due
-    //    `interval` schedules anchor on the last successful activation, so we
-    //    fetch it before evaluating. `daily`/`weekly` ignore this value.
-    let last_success_at =
+    //    `interval` schedules anchor on the most recent successful activation,
+    //    so we fetch it only for that schedule kind. `daily`/`weekly` never
+    //    consult this value and must not be affected by a fetch failure.
+    let last_success_at = if matches!(
+        intention.schedule,
+        super::definition::TemporalSchedule::Interval { .. }
+    ) {
         match load_last_success_started_at(&state.db, agent_id_str, &intention.id).await {
             Ok(dt) => dt,
             Err(e) => {
@@ -174,7 +178,10 @@ async fn process_intention_with_activation_timeout(
                 );
                 return;
             }
-        };
+        }
+    } else {
+        None
+    };
     let due_check =
         super::definition::check_due(agent_id_str, intention, now, timezone, last_success_at);
     if !due_check.due {
