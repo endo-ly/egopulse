@@ -31,9 +31,15 @@ export function invalidateQueries(prefix: string) {
   }
 }
 
+export interface UseServerStateOptions {
+  /** When set, refetch at this interval while the tab is visible. */
+  pollIntervalMs?: number;
+}
+
 export function useServerState<T>(
   key: string,
   fetcher: () => Promise<T>,
+  options?: UseServerStateOptions,
 ): { data: T | undefined; loading: boolean; error: Error | null; invalidate: () => void } {
   const [, forceUpdate] = useState(0);
   const rerender = useCallback(() => forceUpdate((n) => n + 1), []);
@@ -48,17 +54,24 @@ export function useServerState<T>(
 
   const entry = cache.get(key) as CacheEntry<T> | undefined;
 
-  const doFetch = useCallback(async () => {
-    const current = cache.get(key) as CacheEntry<T> | undefined;
-    if (current && (current.data !== undefined || current.loading)) return;
-    cache.set(key, { data: undefined, loading: true, error: null, timestamp: Date.now() });
+  // Refresh in the background, keeping the previous data to avoid flicker.
+  const refetch = useCallback(async () => {
+    const prev = cache.get(key) as CacheEntry<T> | undefined;
+    cache.set(key, {
+      data: prev?.data,
+      // Mark loading on first fetch so the initial-fetch guard in the
+      // mount effect does not re-trigger and loop.
+      loading: prev?.loading ?? true,
+      error: null,
+      timestamp: Date.now(),
+    });
     notify(key);
     try {
       const data = await fetcher();
       cache.set(key, { data, loading: false, error: null, timestamp: Date.now() });
     } catch (e) {
       cache.set(key, {
-        data: undefined,
+        data: prev?.data,
         loading: false,
         error: e instanceof Error ? e : new Error(String(e)),
         timestamp: Date.now(),
@@ -69,14 +82,46 @@ export function useServerState<T>(
 
   useEffect(() => {
     if (!entry || (entry.data === undefined && !entry.loading && !entry.error)) {
-      doFetch();
+      refetch();
     }
-  }, [entry, doFetch]);
+  }, [entry, refetch]);
+
+  // Poll while the tab is visible, refetch immediately on visibility regain,
+  // and pause while hidden to avoid wasted requests.
+  useEffect(() => {
+    const intervalMs = options?.pollIntervalMs;
+    if (!intervalMs) return;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const stop = () => {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    const start = () => {
+      if (timer !== null) return;
+      timer = setInterval(refetch, intervalMs);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        refetch();
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [options?.pollIntervalMs, refetch]);
 
   const invalidate = useCallback(() => {
     invalidateQuery(key);
-    doFetch();
-  }, [key, doFetch]);
+    refetch();
+  }, [key, refetch]);
 
   return {
     data: entry?.data,

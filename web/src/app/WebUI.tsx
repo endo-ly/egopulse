@@ -31,9 +31,13 @@ export function WebUI() {
   const [transportError, setTransportError] = useState<string | null>(null);
 
   const agentsState = useServerState("agents", () => fetchAgents(authToken));
-  const sessionsState = useServerState("sessions", () => fetchSessions(authToken));
-  const historyState = useServerState(`history:${selectedSession}`, () =>
-    fetchHistory(authToken, selectedSession),
+  const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
+    pollIntervalMs: 10_000,
+  });
+  const historyState = useServerState(
+    `history:${selectedSession}`,
+    () => fetchHistory(authToken, selectedSession),
+    { pollIntervalMs: 10_000 },
   );
 
   const agents = agentsState.data ?? [];
