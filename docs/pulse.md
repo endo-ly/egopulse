@@ -330,7 +330,7 @@ Temporal Intention の中身は config に置かない。
 
 # 4. Temporal Intention 仕様
 
-Phase 1 で対応する schedule は以下の 4 種類。
+対応する schedule は以下の 4 種類。
 
 ## daily
 

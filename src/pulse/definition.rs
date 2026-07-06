@@ -405,7 +405,7 @@ pub(crate) fn check_due(
     timezone: &str,
     last_success_at: Option<DateTime<Utc>>,
 ) -> DueCheck {
-    let due_key = generate_due_key(agent_id, intention, now, timezone, last_success_at);
+    let due_key = generate_due_key(agent_id, intention, now, timezone);
     let due = match &intention.schedule {
         TemporalSchedule::Daily { at } => is_daily_due(at, now, timezone),
         TemporalSchedule::Weekly { day, at } => is_weekly_due(day, at, now, timezone),
@@ -429,7 +429,6 @@ pub(crate) fn generate_due_key(
     intention: &TemporalIntention,
     now: DateTime<Utc>,
     timezone: &str,
-    _last_success_at: Option<DateTime<Utc>>,
 ) -> String {
     let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
     let local_now = now.with_timezone(&tz);
@@ -982,7 +981,7 @@ body
             delivery: None,
         };
         let now = utc(2026, 5, 10, 0, 0, 0);
-        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo", None);
+        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo");
         assert_eq!(key, "lyre:morning_review:2026-05-10");
     }
 
@@ -999,7 +998,7 @@ body
             delivery: None,
         };
         let now = utc(2026, 5, 10, 12, 0, 0);
-        let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo", None);
+        let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo");
         assert_eq!(key, "kitara:weekly_reflection:2026-W19");
     }
 
@@ -1133,19 +1132,13 @@ body
     fn due_key_interval_uses_local_evaluation_date() {
         let intention = make_interval(3, "09:00");
         let now = utc(2026, 7, 6, 0, 0, 0); // 2026-07-06 09:00 JST
-        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo", None);
+        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo");
         assert_eq!(key, "lyre:test_intention:2026-07-06");
 
-        // due_key advances each day regardless of last_success, enabling
-        // next-day retry after a failure.
+        // due_key advances each evaluation day, enabling a next-day retry
+        // after a failed run within the same open interval window.
         let next_day = utc(2026, 7, 7, 0, 0, 0);
-        let key = generate_due_key(
-            "lyre",
-            &intention,
-            next_day,
-            "Asia/Tokyo",
-            Some(utc(2026, 7, 6, 0, 0, 0)),
-        );
+        let key = generate_due_key("lyre", &intention, next_day, "Asia/Tokyo");
         assert_eq!(key, "lyre:test_intention:2026-07-07");
     }
 
