@@ -186,6 +186,47 @@ impl Database {
         Ok(())
     }
 
+    /// Returns the `started_at` timestamp of the most recent `success` pulse
+    /// run for `(agent_id, intention_id)`, or `None` when no successful run
+    /// exists.
+    ///
+    /// Used by the Pulse scheduler to evaluate `interval` schedules relative
+    /// to the last successful activation (see `docs/pulse.md` §4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query execution
+    /// failures.
+    pub(crate) fn get_last_success_started_at(
+        &self,
+        agent_id: &str,
+        intention_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
+        use rusqlite::OptionalExtension;
+
+        let conn = self.get_conn()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT started_at FROM pulse_runs
+                 WHERE agent_id = ?1 AND intention_id = ?2 AND status = ?3
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                params![agent_id, intention_id, PulseRunStatus::Success.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    StorageError::InvalidAsset(format!(
+                        "corrupt pulse_run started_at value {s:?}: {e}"
+                    ))
+                })
+        })
+        .transpose()
+    }
+
     /// Returns `true` when any record exists for `(agent_id, intention_id,
     /// due_key)`, regardless of status.
     ///
@@ -320,6 +361,36 @@ mod tests {
     ) {
         db.try_create_pulse_run(id, agent_id, intention_id, due_key)
             .expect("create pulse run");
+    }
+
+    /// Inserts a pulse run row with an explicit `started_at` and terminal
+    /// `status`, bypassing the `Running` lifecycle. Used to verify
+    /// `get_last_success_started_at` ordering deterministically.
+    fn insert_terminal_pulse_run(
+        db: &Database,
+        id: &str,
+        agent_id: &str,
+        intention_id: &str,
+        due_key: &str,
+        started_at: &str,
+        status: PulseRunStatus,
+    ) {
+        let conn = db.get_conn().expect("conn");
+        conn.execute(
+            "INSERT INTO pulse_runs
+                 (id, agent_id, intention_id, due_key, chat_id, message_id,
+                  status, started_at, finished_at, output_kind, output_text, error_message)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?6, NULL, NULL, NULL)",
+            params![
+                id,
+                agent_id,
+                intention_id,
+                due_key,
+                status.to_string(),
+                started_at
+            ],
+        )
+        .expect("insert terminal pulse run");
     }
 
     #[test]
@@ -560,6 +631,180 @@ mod tests {
 
         // Assert
         assert_eq!(reaped, 0, "empty DB should return 0");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_last_success_started_at
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_last_success_started_at_returns_none_when_no_runs() {
+        let (db, _dir) = test_db();
+
+        let result = db
+            .get_last_success_started_at("agent-a", "int-1")
+            .expect("query");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_last_success_started_at_ignores_non_success_rows() {
+        let (db, _dir) = test_db();
+
+        // Arrange: only running / failed / skipped rows exist
+        create_test_pulse_run(&db, "run-r", "agent-a", "int-1", "2025-01-01");
+        insert_terminal_pulse_run(
+            &db,
+            "run-f",
+            "agent-a",
+            "int-1",
+            "2025-01-02",
+            "2025-01-02T00:00:00Z",
+            PulseRunStatus::Failed,
+        );
+        insert_terminal_pulse_run(
+            &db,
+            "run-k",
+            "agent-a",
+            "int-1",
+            "2025-01-03",
+            "2025-01-03T00:00:00Z",
+            PulseRunStatus::Skipped,
+        );
+
+        let result = db
+            .get_last_success_started_at("agent-a", "int-1")
+            .expect("query");
+
+        assert!(result.is_none(), "non-success rows must not be considered");
+    }
+
+    #[test]
+    fn get_last_success_started_at_returns_latest_success_started_at() {
+        let (db, _dir) = test_db();
+
+        // Arrange: two success runs, the later one must win
+        insert_terminal_pulse_run(
+            &db,
+            "run-old",
+            "agent-a",
+            "int-1",
+            "2025-01-01",
+            "2025-01-01T09:00:00Z",
+            PulseRunStatus::Success,
+        );
+        insert_terminal_pulse_run(
+            &db,
+            "run-new",
+            "agent-a",
+            "int-1",
+            "2025-01-05",
+            "2025-01-05T09:00:00Z",
+            PulseRunStatus::Success,
+        );
+        // A newer failed run must NOT shadow the older success
+        insert_terminal_pulse_run(
+            &db,
+            "run-failed",
+            "agent-a",
+            "int-1",
+            "2025-01-06",
+            "2025-01-06T09:00:00Z",
+            PulseRunStatus::Failed,
+        );
+
+        let result = db
+            .get_last_success_started_at("agent-a", "int-1")
+            .expect("query");
+
+        let expected = chrono::DateTime::parse_from_rfc3339("2025-01-05T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn get_last_success_started_at_scopes_to_agent_and_intention() {
+        let (db, _dir) = test_db();
+
+        insert_terminal_pulse_run(
+            &db,
+            "run-a",
+            "agent-a",
+            "int-1",
+            "2025-01-01",
+            "2025-01-01T09:00:00Z",
+            PulseRunStatus::Success,
+        );
+        insert_terminal_pulse_run(
+            &db,
+            "run-b",
+            "agent-b",
+            "int-1",
+            "2025-01-02",
+            "2025-01-02T09:00:00Z",
+            PulseRunStatus::Success,
+        );
+        insert_terminal_pulse_run(
+            &db,
+            "run-c",
+            "agent-a",
+            "int-2",
+            "2025-01-03",
+            "2025-01-03T09:00:00Z",
+            PulseRunStatus::Success,
+        );
+
+        assert_eq!(
+            db.get_last_success_started_at("agent-a", "int-1")
+                .expect("query"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2025-01-01T09:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(
+            db.get_last_success_started_at("agent-b", "int-1")
+                .expect("query"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2025-01-02T09:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert!(
+            db.get_last_success_started_at("agent-a", "int-9")
+                .expect("query")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_last_success_started_at_surfaces_corrupt_timestamp_as_error() {
+        let (db, _dir) = test_db();
+
+        // Arrange: a success row whose started_at is not a valid RFC3339 value.
+        // Must not be silently coerced to None, because interval schedules
+        // would then treat the intention as "never succeeded" and fire
+        // immediately (duplicate / unintended activation).
+        insert_terminal_pulse_run(
+            &db,
+            "run-corrupt",
+            "agent-a",
+            "int-1",
+            "2025-01-01",
+            "not-a-valid-timestamp",
+            PulseRunStatus::Success,
+        );
+
+        let result = db.get_last_success_started_at("agent-a", "int-1");
+
+        assert!(
+            matches!(result, Err(StorageError::InvalidAsset(_))),
+            "corrupt started_at should surface as InvalidAsset, got: {result:?}"
+        );
     }
 
     // ---------------------------------------------------------------------------
