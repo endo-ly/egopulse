@@ -172,7 +172,9 @@ impl CoordinatorState {
 
     /// 遅延タイマー発火時に、保留中ログがあれば初回 begin する。
     async fn begin_if_pending(&mut self) {
-        if self.display.is_none() && !self.log.is_empty() {
+        // 遅延タイマー経由の begin は「実行中ツールが残っている」場合のみ。
+        // 速いツールが完了した後の重い最終応答生成でノイズ投稿しないため。
+        if self.display.is_none() && self.log.has_running() {
             self.begin().await;
         }
     }
@@ -196,11 +198,13 @@ impl CoordinatorState {
             .is_none_or(|last| now.duration_since(last) >= self.min_edit_interval);
         if due {
             let body = self.log.render();
-            if display.handle.update(&body).await.is_err() {
+            let succeeded = display.handle.update(&body).await.is_ok();
+            if !succeeded {
                 warn!("tool progress: update failed");
             }
             display.last_edit = Some(now);
-            display.dirty = false;
+            // 失敗時は dirty を保持したまま次回（または close）で再送できるようにする。
+            display.dirty = !succeeded;
         } else {
             display.dirty = true;
         }
@@ -248,8 +252,11 @@ struct ProgressLog {
 }
 
 impl ProgressLog {
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    /// 実行中（未完了）のツールエントリがあるか。
+    fn has_running(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.status, ToolStatus::Running))
     }
 
     /// 実行中ツールを末尾に追加する。
@@ -481,6 +488,51 @@ mod tests {
         // Assert: no progress posted for a sub-threshold turn
         let snapshot = calls.lock().unwrap().clone();
         assert!(snapshot.begins.is_empty());
+        assert!(snapshot.updates.is_empty());
+        assert_eq!(snapshot.closes, 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_no_post_on_timer_when_no_tool_running() {
+        // Arrange: a tool starts and finishes fast, then the delay timer fires
+        // while the (slow) final-response generation is still going. The timer
+        // must NOT post progress because no tool is running at that point.
+        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
+        let notify = Arc::new(Notify::new());
+        let sink: Arc<dyn ToolProgressSink> =
+            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(40),
+            Duration::from_millis(800),
+        );
+
+        // Act: fast tool completes well before the delay timer fires.
+        tx.send(AgentEvent::ToolStart {
+            name: "read".to_string(),
+            input: serde_json::Value::Null,
+            call_id: "read".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::ToolResult {
+            name: "read".to_string(),
+            is_error: false,
+            preview: String::new(),
+            duration_ms: 5,
+            call_id: "read".to_string(),
+        })
+        .unwrap();
+        // Wait past the delay deadline so the timer definitely fires.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: no progress posted — the completed tool is not "running"
+        let snapshot = calls.lock().unwrap().clone();
+        assert!(
+            snapshot.begins.is_empty(),
+            "no begin without a running tool"
+        );
         assert!(snapshot.updates.is_empty());
         assert_eq!(snapshot.closes, 0);
     }
