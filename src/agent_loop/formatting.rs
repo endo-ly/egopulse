@@ -167,11 +167,24 @@ fn render_tool_body(payload: &str, truncate: bool) -> String {
     strip_thinking(payload)
 }
 
+const TOOL_RESULT_PREFIX: &str = "[tool_result]: ";
+const TOOL_ERROR_PREFIX: &str = "[tool_error]: ";
+
+/// Returns `true` when `content` is a tool-result/tool-error preview message
+/// (`[tool_result]: ...` / `[tool_error]: ...`).
+///
+/// These previews are emitted by [`render_tool_message_text`] for text-only
+/// channels. Structured UIs that render tool results from the `tool_calls`
+/// table can use this to skip the duplicate preview.
+pub(crate) fn is_tool_result_preview(content: &str) -> bool {
+    content.starts_with(TOOL_RESULT_PREFIX) || content.starts_with(TOOL_ERROR_PREFIX)
+}
+
 fn tool_message_prefix(message: &Message) -> &'static str {
     if is_tool_error_message(message) {
-        "[tool_error]: "
+        TOOL_ERROR_PREFIX
     } else {
-        "[tool_result]: "
+        TOOL_RESULT_PREFIX
     }
 }
 
@@ -517,5 +530,21 @@ mod tests {
             "sent".to_string(),
         );
         assert_eq!(format_channel_log_message(&msg), "[tool/lyre] sent");
+    }
+
+    #[test]
+    fn is_tool_result_preview_detects_generated_prefixes() {
+        assert!(is_tool_result_preview("[tool_result]: done"));
+        assert!(is_tool_result_preview("[tool_error]: boom"));
+    }
+
+    #[test]
+    fn is_tool_result_preview_rejects_other_messages() {
+        assert!(!is_tool_result_preview("[tool_call] read"));
+        assert!(!is_tool_result_preview(
+            "ファイルを読みます [tool_call] read"
+        ));
+        assert!(!is_tool_result_preview("regular assistant text"));
+        assert!(!is_tool_result_preview(""));
     }
 }

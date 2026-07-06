@@ -8,7 +8,8 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::storage::call_blocking;
+use crate::agent_loop::formatting::is_tool_result_preview;
+use crate::storage::{SenderKind, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
 
@@ -137,8 +138,17 @@ pub(super) async fn get_history(
 
     // Interleave text messages with persisted tool calls by timestamp so the
     // WebUI can render collapsible tool cards inline within the conversation.
+    //
+    // Tool-result/error previews (`[tool_result]: ...` / `[tool_error]: ...`)
+    // are skipped: Markdown parses the bracket-prefix form as a reference
+    // link definition and renders it empty, and the same data is already
+    // exposed via the structured tool cards below.
     let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
     for message in messages {
+        if message.sender_kind == SenderKind::Assistant && is_tool_result_preview(&message.content)
+        {
+            continue;
+        }
         let timestamp = message.timestamp.clone();
         entries.push((
             timestamp,
@@ -390,6 +400,68 @@ mod tests {
         assert_eq!(content["status"], "success");
         assert_eq!(content["result"], "file contents");
         assert_eq!(content["input"]["path"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn api_history_skips_tool_result_preview_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-preview:agent:lyre", "lyre");
+
+        // Tool-result/error previews render empty in Markdown (parsed as a
+        // reference link definition) and duplicate the structured tool card,
+        // so they must be filtered out of the WebUI history.
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "[tool_result]: file contents".to_string(),
+        ))
+        .expect("store tool_result preview");
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "[tool_error]: boom".to_string(),
+        ))
+        .expect("store tool_error preview");
+
+        // A tool_call preview that carries user-facing narration stays.
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "読みますね [tool_call] read".to_string(),
+        ))
+        .expect("store tool_call narration");
+
+        // A plain assistant message stays.
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "hello there".to_string(),
+        ))
+        .expect("store plain assistant");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|m| m["content"].as_str().expect("content string"))
+            .collect();
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "only narration + plain message remain: {contents:?}"
+        );
+        assert!(contents.contains(&"読みますね [tool_call] read"));
+        assert!(contents.contains(&"hello there"));
     }
 
     #[test]
