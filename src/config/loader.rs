@@ -74,6 +74,8 @@ struct FileDiscordChannelConfig {
     multi_agent: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     secret: bool,
+    #[serde(default)]
+    tool_progress: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -87,6 +89,8 @@ struct FileTelegramChatConfig {
     multi_agent: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     secret: bool,
+    #[serde(default)]
+    tool_progress: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -546,6 +550,7 @@ fn normalize_discord_channels(
                 agents,
                 multi_agent,
                 secret: v.secret,
+                tool_progress: v.tool_progress.unwrap_or(false),
             },
         );
     }
@@ -620,6 +625,7 @@ fn normalize_telegram_channels(
                 agents,
                 multi_agent,
                 secret: v.secret,
+                tool_progress: v.tool_progress.unwrap_or(false),
             },
         );
     }

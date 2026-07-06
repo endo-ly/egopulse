@@ -1,33 +1,6 @@
-//! SSE イベント表現を定義するモジュール。
+//! Web SSE 向けのイベント型を agent_loop から再公開するモジュール。
 //!
-//! agent loop の内部イベントを定義する。
+//! [`crate::agent_loop::event::AgentEvent`] が正統な定義場所。
+//! Web チャネルは SSE ペイロード生成のために本モジュール経由で参照する。
 
-use serde::Serialize;
-
-/// Represents internal events emitted while the agent processes a turn.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum AgentEvent {
-    /// Iteration counter.
-    Iteration { iteration: usize },
-    /// Incremental text chunk from LLM streaming.
-    Delta { text: String },
-    /// Tool execution started.
-    ToolStart {
-        call_id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// Tool execution completed.
-    ToolResult {
-        call_id: String,
-        name: String,
-        is_error: bool,
-        preview: String,
-        duration_ms: u128,
-    },
-    /// Final response.
-    FinalResponse { text: String },
-    /// Error occurred.
-    Error { message: String },
-}
+pub(crate) use crate::agent_loop::event::AgentEvent;

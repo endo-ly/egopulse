@@ -4,6 +4,7 @@
 //! 1 本の turn loop としてまとめて扱う。
 
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::event::AgentEvent;
 use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
@@ -19,7 +20,6 @@ use crate::agent_loop::tool_phase::{
 };
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::utils::text::truncate_by_chars;
-use crate::channels::web::sse::AgentEvent;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
 use crate::runtime::{AppState, build_app_state};
@@ -1247,8 +1247,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::agent_loop::ConversationScope;
+    use crate::agent_loop::event::AgentEvent;
     use crate::agent_loop::{process_turn, process_turn_with_events};
-    use crate::channels::web::sse::AgentEvent;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::storage::{SenderKind, call_blocking};

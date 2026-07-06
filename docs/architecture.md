@@ -334,6 +334,7 @@ pub(crate) struct SurfaceContext {
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント |
 | **Conversation Scope Routing** | `runtime/` AppState | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`db_for(scope)` / `storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+| **Tool Progress Coordinator** | `runtime/tool_progress.rs` | `AgentEvent` ストリームを購読し A3 遅延型 × B2 編集式累積ログでチャネル進捗を駆動。sink（Discord/Telegram）は投稿・編集・残置のみ担い、状態機械・遅延タイマー・間引きは coordinator が一元管理 |
 
 ---
 

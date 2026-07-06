@@ -24,9 +24,9 @@ use teloxide::types::{FileId, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::{ConversationScope, SurfaceContext};
-use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
-use crate::channels::utils::text::split_text;
+use crate::channels::adapter::{ChannelAdapter, ToolProgressHandle, ToolProgressSink};
+use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::TelegramChatConfig;
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
@@ -342,25 +342,20 @@ impl TelegramHandler {
 // ---------------------------------------------------------------------------
 
 /// Telegram チャネルアダプター。
-///
-/// アウトバウンドメッセージ送信用。Telegram Bot REST API 経由でメッセージを送信する。
-pub(crate) struct TelegramAdapter {
+/// `external_chat_id` から Telegram bot token を解決する共有データ。
+/// [`TelegramAdapter`] と進捗 sink が `Arc` で共有する。
+struct TelegramTokenResolver {
     /// `bot_id → token` のマップ。
-    bot_tokens: std::collections::HashMap<String, String>,
+    bot_tokens: HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
-    agent_bot_map: std::collections::HashMap<String, String>,
-    http_client: reqwest::Client,
+    agent_bot_map: HashMap<String, String>,
 }
 
-impl TelegramAdapter {
-    pub(crate) fn new_multi(
-        bot_tokens: std::collections::HashMap<String, String>,
-        agent_bot_map: std::collections::HashMap<String, String>,
-    ) -> Self {
+impl TelegramTokenResolver {
+    fn new(bot_tokens: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
         Self {
             bot_tokens,
             agent_bot_map,
-            http_client: reqwest::Client::new(),
         }
     }
 
@@ -385,6 +380,40 @@ impl TelegramAdapter {
     }
 }
 
+///
+/// アウトバウンドメッセージ送信用。Telegram Bot REST API 経由でメッセージを送信する。
+pub(crate) struct TelegramAdapter {
+    /// bot token 解決用の共有データ（進捗 sink と共有）。
+    tokens: Arc<TelegramTokenResolver>,
+    http_client: reqwest::Client,
+    /// 進捗表示器（`Arc` クローン返却）。進捗非対応なら `None`。
+    tool_progress_sink: Option<Arc<dyn ToolProgressSink>>,
+}
+
+impl TelegramAdapter {
+    pub(crate) fn new_multi(
+        bot_tokens: HashMap<String, String>,
+        agent_bot_map: HashMap<String, String>,
+    ) -> Self {
+        let tokens = Arc::new(TelegramTokenResolver::new(bot_tokens, agent_bot_map));
+        let http_client = reqwest::Client::new();
+        let sink: Arc<dyn ToolProgressSink> = Arc::new(TelegramToolProgressSink::new(
+            Arc::clone(&tokens),
+            http_client.clone(),
+        ));
+        Self {
+            tokens,
+            http_client,
+            tool_progress_sink: Some(sink),
+        }
+    }
+
+    /// Resolve the bot token for a given external_chat_id.
+    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+        self.tokens.select_token(external_chat_id)
+    }
+}
+
 #[async_trait]
 impl ChannelAdapter for TelegramAdapter {
     fn name(&self) -> &str {
@@ -402,6 +431,10 @@ impl ChannelAdapter for TelegramAdapter {
             ("telegram_supergroup", ConversationKind::Group),
             ("telegram_channel", ConversationKind::Group),
         ]
+    }
+
+    fn tool_progress_sink(&self) -> Option<Arc<dyn ToolProgressSink>> {
+        self.tool_progress_sink.clone()
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
@@ -514,13 +547,28 @@ impl ChannelAdapter for TelegramAdapter {
 /// 429 レート制限時は自動リトライする。
 const MAX_RETRIES: u32 = 3;
 
+/// Telegram Bot API のベース URL。
+const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
+
 async fn send_telegram_api(
     client: &reqwest::Client,
     token: &str,
     method: &str,
     body: serde_json::Value,
 ) -> Result<(), String> {
-    let url = format!("https://api.telegram.org/bot{token}/{method}");
+    telegram_request_with_retry(client, TELEGRAM_API_BASE_URL, token, method, body).await?;
+    Ok(())
+}
+
+/// Telegram Bot API にリクエストを送信し、429 を自動リトライして成功時のレスポンスを返す。
+async fn telegram_request_with_retry(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> Result<reqwest::Response, String> {
+    let url = format!("{base_url}/bot{token}/{method}");
     let mut attempt = 0;
     loop {
         let resp = client
@@ -529,11 +577,11 @@ async fn send_telegram_api(
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Telegram API request failed: {e}"))?;
+            .map_err(|_| "Telegram API request failed".to_string())?;
 
         let status = resp.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(resp);
         }
 
         if status.as_u16() == 429 && attempt < MAX_RETRIES {
@@ -557,6 +605,110 @@ async fn send_telegram_api(
             "Telegram API error: HTTP {status} {}",
             response_body.chars().take(300).collect::<String>()
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ツール進捗表示器（編集式累積ログ）
+// ---------------------------------------------------------------------------
+
+/// Telegram 向けのツール進捗 sink。進捗メッセージを1件投稿し、編集で更新する。
+pub(crate) struct TelegramToolProgressSink {
+    tokens: Arc<TelegramTokenResolver>,
+    http_client: reqwest::Client,
+    base_url: String,
+}
+
+impl TelegramToolProgressSink {
+    fn new(tokens: Arc<TelegramTokenResolver>, http_client: reqwest::Client) -> Self {
+        Self::with_base_url(tokens, http_client, TELEGRAM_API_BASE_URL.to_string())
+    }
+
+    /// ベース URL を明示指定して生成する（単体テストでモックサーバを指すため）。
+    fn with_base_url(
+        tokens: Arc<TelegramTokenResolver>,
+        http_client: reqwest::Client,
+        base_url: String,
+    ) -> Self {
+        Self {
+            tokens,
+            http_client,
+            base_url,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolProgressSink for TelegramToolProgressSink {
+    async fn begin(
+        &self,
+        external_chat_id: &str,
+        body: &str,
+    ) -> Result<Box<dyn ToolProgressHandle>, String> {
+        let chat_id = parse_telegram_chat_id(external_chat_id)?;
+        let token = self.tokens.select_token(external_chat_id)?.to_string();
+        let text = keep_tail(body, TELEGRAM_MAX_MESSAGE_LEN);
+        let payload = serde_json::json!({ "chat_id": chat_id, "text": text });
+        let response = telegram_request_with_retry(
+            &self.http_client,
+            &self.base_url,
+            &token,
+            "sendMessage",
+            payload,
+        )
+        .await?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Telegram create progress message: invalid JSON: {e}"))?;
+        let message_id = body
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| "Telegram create progress message: missing message_id".to_string())?;
+
+        Ok(Box::new(TelegramToolProgressHandle {
+            http_client: self.http_client.clone(),
+            base_url: self.base_url.clone(),
+            chat_id,
+            message_id,
+            token,
+        }))
+    }
+}
+
+/// 投稿済み進捗メッセージの編集ハンドル。
+struct TelegramToolProgressHandle {
+    http_client: reqwest::Client,
+    base_url: String,
+    chat_id: i64,
+    message_id: i64,
+    token: String,
+}
+
+#[async_trait]
+impl ToolProgressHandle for TelegramToolProgressHandle {
+    async fn update(&mut self, body: &str) -> Result<(), String> {
+        let text = keep_tail(body, TELEGRAM_MAX_MESSAGE_LEN);
+        let payload = serde_json::json!({
+            "chat_id": self.chat_id,
+            "message_id": self.message_id,
+            "text": text,
+        });
+        telegram_request_with_retry(
+            &self.http_client,
+            &self.base_url,
+            &self.token,
+            "editMessageText",
+            payload,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), String> {
+        // 進捗メッセージは完了ログとして常に残置する（no-op）。
+        Ok(())
     }
 }
 
@@ -1060,6 +1212,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret: false,
+            ..Default::default()
         }
     }
 
@@ -1632,6 +1785,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret,
+            ..Default::default()
         }
     }
 
@@ -1659,5 +1813,53 @@ mod tests {
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "-100789", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
+    }
+
+    // --- tool progress sink (Step 5) ---
+
+    fn telegram_progress_sink(base_url: String) -> TelegramToolProgressSink {
+        let mut bot_tokens = HashMap::new();
+        bot_tokens.insert("main".to_string(), "tg-token".to_string());
+        let mut agent_bot_map = HashMap::new();
+        agent_bot_map.insert("lyre".to_string(), "main".to_string());
+        let tokens = Arc::new(TelegramTokenResolver::new(bot_tokens, agent_bot_map));
+        TelegramToolProgressSink::with_base_url(tokens, reqwest::Client::new(), base_url)
+    }
+
+    #[tokio::test]
+    async fn telegram_sink_begin_update_close_sequence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange: sendMessage returns a message id; editMessageText must be accepted once.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottg-token/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 777}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bottg-token/editMessageText"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Act
+        let sink = telegram_progress_sink(server.uri());
+        let mut handle = sink
+            .begin("telegram:-100:agent:lyre", "tools running...")
+            .await
+            .expect("begin");
+        handle
+            .update("tools running...\n✓ bash (0.4s)")
+            .await
+            .expect("update");
+        handle.close().await.expect("close");
+
+        // Assert: the edit was applied exactly once (verified at server drop via expect(1))
     }
 }

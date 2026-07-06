@@ -24,8 +24,10 @@ use tracing::{error, info, warn};
 
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
-use crate::channels::adapter::{ChannelAdapter, TurnActivity};
-use crate::channels::utils::text::split_text;
+use crate::channels::adapter::{
+    ChannelAdapter, ToolProgressHandle, ToolProgressSink, TurnActivity,
+};
+use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::DiscordChannelConfig;
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 
@@ -158,46 +160,20 @@ impl RouteDecision {
     }
 }
 
-/// Discord REST API 経由でアウトバウンドメッセージを送信するアダプター。
-pub(crate) struct DiscordAdapter {
+/// `external_chat_id` から Discord bot token を解決する共有データ。
+/// [`DiscordAdapter`] と進捗 sink が `Arc` で共有する。
+struct DiscordTokenResolver {
     /// `bot_id → token` のマップ（[`Config::discord_bots`] から構築）。
-    bot_token_map: std::collections::HashMap<String, String>,
+    bot_token_map: HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
-    agent_bot_map: std::collections::HashMap<String, String>,
-    http_client: reqwest::Client,
+    agent_bot_map: HashMap<String, String>,
 }
 
-struct DiscordTypingActivity {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl TurnActivity for DiscordTypingActivity {}
-
-impl Drop for DiscordTypingActivity {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
-impl DiscordAdapter {
-    pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
-        let bot_tokens: std::collections::HashMap<String, String> = config
-            .discord_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
-            .collect();
-        let agent_bots = config
-            .agents
-            .iter()
-            .filter_map(|(agent_id, agent)| {
-                let bot_id = agent.discord_bot.as_ref()?;
-                Some((agent_id.to_string(), bot_id.to_string()))
-            })
-            .collect();
+impl DiscordTokenResolver {
+    fn new(bot_token_map: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
         Self {
-            bot_token_map: bot_tokens,
-            agent_bot_map: agent_bots,
-            http_client: reqwest::Client::new(),
+            bot_token_map,
+            agent_bot_map,
         }
     }
 
@@ -232,6 +208,61 @@ impl DiscordAdapter {
     }
 }
 
+/// Discord REST API 経由でアウトバウンドメッセージを送信するアダプター。
+pub(crate) struct DiscordAdapter {
+    /// bot token 解決用の共有データ（進捗 sink と共有）。
+    tokens: Arc<DiscordTokenResolver>,
+    http_client: reqwest::Client,
+    /// 進捗表示器（`Arc` クローン返却）。進捗非対応なら `None`。
+    tool_progress_sink: Option<Arc<dyn ToolProgressSink>>,
+}
+
+struct DiscordTypingActivity {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TurnActivity for DiscordTypingActivity {}
+
+impl Drop for DiscordTypingActivity {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl DiscordAdapter {
+    pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
+        let bot_tokens: std::collections::HashMap<String, String> = config
+            .discord_bots()
+            .into_iter()
+            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
+            .collect();
+        let agent_bots = config
+            .agents
+            .iter()
+            .filter_map(|(agent_id, agent)| {
+                let bot_id = agent.discord_bot.as_ref()?;
+                Some((agent_id.to_string(), bot_id.to_string()))
+            })
+            .collect();
+        let tokens = Arc::new(DiscordTokenResolver::new(bot_tokens, agent_bots));
+        let http_client = reqwest::Client::new();
+        let sink: Arc<dyn ToolProgressSink> = Arc::new(DiscordToolProgressSink::new(
+            Arc::clone(&tokens),
+            http_client.clone(),
+        ));
+        Self {
+            tokens,
+            http_client,
+            tool_progress_sink: Some(sink),
+        }
+    }
+
+    /// `external_chat_id` から該当する bot token を解決する。
+    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+        self.tokens.select_token(external_chat_id)
+    }
+}
+
 #[async_trait]
 impl ChannelAdapter for DiscordAdapter {
     fn name(&self) -> &str {
@@ -240,6 +271,10 @@ impl ChannelAdapter for DiscordAdapter {
 
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
         vec![("discord", ConversationKind::Private)]
+    }
+
+    fn tool_progress_sink(&self) -> Option<Arc<dyn ToolProgressSink>> {
+        self.tool_progress_sink.clone()
     }
 
     async fn begin_turn_activity(
@@ -366,16 +401,28 @@ async fn send_discord_api<F>(client: &reqwest::Client, build_request: F) -> Resu
 where
     F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
 {
+    discord_request_with_retry(client, build_request).await?;
+    Ok(())
+}
+
+/// Discord API リクエストを送信し、429 を自動リトライして成功時のレスポンスを返す。
+async fn discord_request_with_retry<F>(
+    client: &reqwest::Client,
+    build_request: F,
+) -> Result<reqwest::Response, String>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
     let mut attempt = 0;
     loop {
         let resp = build_request(client)
             .send()
             .await
-            .map_err(|e| format!("Discord API request failed: {e}"))?;
+            .map_err(|_| "Discord API request failed".to_string())?;
 
         let status = resp.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(resp);
         }
 
         if status.as_u16() == 429 && attempt < DISCORD_MAX_RETRIES {
@@ -395,6 +442,128 @@ where
             "Discord API error: HTTP {status} {}",
             body.chars().take(300).collect::<String>()
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ツール進捗表示器（編集式累積ログ）
+// ---------------------------------------------------------------------------
+
+/// Discord API のベース URL。
+const DISCORD_API_BASE_URL: &str = "https://discord.com/api/v10";
+
+/// Discord 向けのツール進捗 sink。進捗メッセージを1件投稿し、編集で更新する。
+pub(crate) struct DiscordToolProgressSink {
+    tokens: Arc<DiscordTokenResolver>,
+    http_client: reqwest::Client,
+    base_url: String,
+}
+
+impl DiscordToolProgressSink {
+    fn new(tokens: Arc<DiscordTokenResolver>, http_client: reqwest::Client) -> Self {
+        Self::with_base_url(tokens, http_client, DISCORD_API_BASE_URL.to_string())
+    }
+
+    /// ベース URL を明示指定して生成する（単体テストでモックサーバを指すため）。
+    fn with_base_url(
+        tokens: Arc<DiscordTokenResolver>,
+        http_client: reqwest::Client,
+        base_url: String,
+    ) -> Self {
+        Self {
+            tokens,
+            http_client,
+            base_url,
+        }
+    }
+
+    fn build_message_payload(content: &str) -> serde_json::Value {
+        json!({
+            "content": content,
+            "allowed_mentions": {
+                "parse": [],
+                "users": extract_user_mention_ids(content),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl ToolProgressSink for DiscordToolProgressSink {
+    async fn begin(
+        &self,
+        external_chat_id: &str,
+        body: &str,
+    ) -> Result<Box<dyn ToolProgressHandle>, String> {
+        let channel_id = parse_discord_chat_id(external_chat_id)?;
+        let token = self.tokens.select_token(external_chat_id)?.to_string();
+        let content = keep_tail(body, DISCORD_MAX_MESSAGE_LEN);
+        let payload = Self::build_message_payload(&content);
+        let url = format!("{}/channels/{channel_id}/messages", self.base_url);
+
+        let response = discord_request_with_retry(&self.http_client, |client| {
+            client
+                .post(&url)
+                .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+                .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&payload)
+        })
+        .await?;
+        let message: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Discord create progress message: invalid JSON: {e}"))?;
+        let message_id = message
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Discord create progress message: missing id".to_string())?
+            .to_string();
+
+        Ok(Box::new(DiscordToolProgressHandle {
+            http_client: self.http_client.clone(),
+            channel_id,
+            message_id,
+            token,
+            base_url: self.base_url.clone(),
+        }))
+    }
+}
+
+/// 投稿済み進捗メッセージの編集ハンドル。
+struct DiscordToolProgressHandle {
+    http_client: reqwest::Client,
+    channel_id: u64,
+    message_id: String,
+    token: String,
+    base_url: String,
+}
+
+#[async_trait]
+impl ToolProgressHandle for DiscordToolProgressHandle {
+    async fn update(&mut self, body: &str) -> Result<(), String> {
+        let content = keep_tail(body, DISCORD_MAX_MESSAGE_LEN);
+        let payload = DiscordToolProgressSink::build_message_payload(&content);
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.base_url, self.channel_id, self.message_id
+        );
+        let token = self.token.clone();
+        discord_request_with_retry(&self.http_client, |client| {
+            client
+                .patch(&url)
+                .timeout(Duration::from_secs(DISCORD_REQUEST_TIMEOUT_SECS))
+                .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&payload)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), String> {
+        // 進捗メッセージは完了ログとして常に残置する（no-op）。
+        Ok(())
     }
 }
 
@@ -1137,9 +1306,9 @@ mod tests {
 
     fn test_adapter() -> DiscordAdapter {
         DiscordAdapter {
-            bot_token_map: HashMap::new(),
-            agent_bot_map: HashMap::new(),
+            tokens: Arc::new(DiscordTokenResolver::new(HashMap::new(), HashMap::new())),
             http_client: reqwest::Client::new(),
+            tool_progress_sink: None,
         }
     }
 
@@ -1147,16 +1316,18 @@ mod tests {
         bot_tokens: &[(&str, &str)],
         agent_bots: &[(&str, &str)],
     ) -> DiscordAdapter {
+        let bot_token_map: HashMap<String, String> = bot_tokens
+            .iter()
+            .map(|(bot_id, token)| ((*bot_id).to_string(), (*token).to_string()))
+            .collect();
+        let agent_bot_map: HashMap<String, String> = agent_bots
+            .iter()
+            .map(|(agent_id, bot_id)| ((*agent_id).to_string(), (*bot_id).to_string()))
+            .collect();
         DiscordAdapter {
-            bot_token_map: bot_tokens
-                .iter()
-                .map(|(bot_id, token)| ((*bot_id).to_string(), (*token).to_string()))
-                .collect(),
-            agent_bot_map: agent_bots
-                .iter()
-                .map(|(agent_id, bot_id)| ((*agent_id).to_string(), (*bot_id).to_string()))
-                .collect(),
+            tokens: Arc::new(DiscordTokenResolver::new(bot_token_map, agent_bot_map)),
             http_client: reqwest::Client::new(),
+            tool_progress_sink: None,
         }
     }
 
@@ -1174,6 +1345,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret: false,
+            ..Default::default()
         }
     }
 
@@ -2125,6 +2297,7 @@ mod tests {
             agents: agent_ids.iter().map(|id| agent_id(id)).collect(),
             multi_agent,
             secret,
+            ..Default::default()
         }
     }
 
@@ -2152,5 +2325,130 @@ mod tests {
         let handler = test_handler(channels);
         let ctx = handler.make_context("user", "789", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
+    }
+
+    // --- tool progress sink (Steps 4-6) ---
+
+    fn progress_sink(base_url: String) -> DiscordToolProgressSink {
+        let mut bot_token_map = HashMap::new();
+        bot_token_map.insert("main".to_string(), "TOKEN".to_string());
+        let mut agent_bot_map = HashMap::new();
+        agent_bot_map.insert("lyre".to_string(), "main".to_string());
+        let tokens = Arc::new(DiscordTokenResolver::new(bot_token_map, agent_bot_map));
+        DiscordToolProgressSink::with_base_url(tokens, reqwest::Client::new(), base_url)
+    }
+
+    #[tokio::test]
+    async fn discord_sink_begin_update_close_sequence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange: begin POST returns a message id; PATCH edits must be accepted.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/123/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "msg-42"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels/123/messages/msg-42"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Act
+        let sink = progress_sink(server.uri());
+        let mut handle = sink
+            .begin("discord:123:agent:lyre", "tools running...")
+            .await
+            .expect("begin");
+        handle
+            .update("tools running...\n✓ bash (0.5s)")
+            .await
+            .expect("update");
+        handle.close().await.expect("close");
+
+        // Assert: the edit was applied exactly once (verified at server drop via expect(1))
+    }
+
+    #[tokio::test]
+    async fn discord_sink_truncates_over_2000_chars() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/123/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "msg-1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels/123/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Act: a body far over the 2000-char limit is pushed through update.
+        let sink = progress_sink(server.uri());
+        let mut handle = sink
+            .begin("discord:123:agent:lyre", "tools running...")
+            .await
+            .expect("begin");
+        let huge = format!("tools running...\n{}", "x".repeat(5000));
+        handle.update(&huge).await.expect("update");
+
+        // Assert: the PATCH content stayed within Discord's 2000-char limit.
+        let requests = server.received_requests().await.expect("recorded requests");
+        let patch = requests
+            .iter()
+            .rev()
+            .find(|r| r.method.as_str() == "PATCH")
+            .expect("patch recorded");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("json body");
+        let content = body["content"].as_str().expect("content field");
+        assert!(
+            content.chars().count() <= DISCORD_MAX_MESSAGE_LEN,
+            "content was {} chars",
+            content.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_sink_edit_failure_does_not_post_fallback() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange: begin succeeds exactly once; every PATCH fails.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/123/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "msg-1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels/123/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        // Act
+        let sink = progress_sink(server.uri());
+        let mut handle = sink
+            .begin("discord:123:agent:lyre", "tools running...")
+            .await
+            .expect("begin");
+        let result = handle.update("tools running...\n✓ bash").await;
+
+        // Assert: edit failure propagates as Err and triggers no extra POST.
+        assert!(result.is_err(), "edit failure should propagate");
+        let requests = server.received_requests().await.expect("recorded requests");
+        let posts = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        assert_eq!(posts, 1, "no fallback post on edit failure");
     }
 }

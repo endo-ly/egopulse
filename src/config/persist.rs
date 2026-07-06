@@ -42,6 +42,8 @@ struct SerializableDiscordChannel {
     multi_agent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     secret: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tool_progress: bool,
 }
 
 fn is_default(b: &bool) -> bool {
@@ -211,6 +213,8 @@ struct SerializableTelegramChannel {
     multi_agent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     secret: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tool_progress: bool,
 }
 
 fn serialize_optional_yaml_value<S>(
@@ -334,6 +338,7 @@ impl From<&Config> for SerializableConfig {
                                                 .collect(),
                                             multi_agent: ch_config.multi_agent,
                                             secret: ch_config.secret,
+                                            tool_progress: ch_config.tool_progress,
                                         },
                                     )
                                 })
@@ -366,6 +371,7 @@ impl From<&Config> for SerializableConfig {
                                                 .collect(),
                                             multi_agent: ch_config.multi_agent,
                                             secret: ch_config.secret,
+                                            tool_progress: ch_config.tool_progress,
                                         },
                                     )
                                 })

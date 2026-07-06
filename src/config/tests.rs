@@ -1899,6 +1899,141 @@ fn discord_channels_parses_require_mention() {
 
 #[test]
 #[serial]
+fn discord_channel_tool_progress_defaults_to_false_when_omitted() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN"#,
+            Some(r#"      "123": {}"#),
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let discord = config.channels.get("discord").expect("discord");
+    let ch = discord
+        .discord_channels
+        .as_ref()
+        .expect("channels")
+        .get(&123u64)
+        .expect("channel");
+    assert!(!ch.tool_progress);
+}
+
+#[test]
+#[serial]
+fn discord_channel_tool_progress_parses_true() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN"#,
+            Some(
+                r#"      "123":
+          tool_progress: true"#,
+            ),
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let discord = config.channels.get("discord").expect("discord");
+    let ch = discord
+        .discord_channels
+        .as_ref()
+        .expect("channels")
+        .get(&123u64)
+        .expect("channel");
+    assert!(ch.tool_progress);
+}
+
+#[test]
+#[serial]
+fn telegram_chat_tool_progress_parses_true() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: default
+agents:
+  default:
+    label: Default
+channels:
+  telegram:
+    enabled: true
+    telegram_bots:
+      main:
+        token: test-token
+
+    telegram_channels:
+      "456":
+        tool_progress: true"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let channels = config.telegram_channels();
+    let chat = channels.get(&456i64).expect("chat");
+    assert!(chat.tool_progress);
+}
+
+#[test]
+#[serial]
+fn tool_progress_save_load_round_trip_preserves_true() {
+    use crate::config::persist::save_config_with_secrets;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    write_env(&temp_dir, "MY_TOKEN=tok\n");
+    let file_path = write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+              main:
+                token:
+                  source: env
+                  id: MY_TOKEN"#,
+            Some(
+                r#"      "123":
+          tool_progress: true"#,
+            ),
+        ),
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let saved_path = temp_dir.path().join("egopulse.config.yaml");
+    save_config_with_secrets(&config, &saved_path).expect("save config");
+    let reloaded = Config::load_allow_missing_api_key(Some(&saved_path)).expect("reload config");
+
+    let discord = reloaded.channels.get("discord").expect("discord");
+    let ch = discord
+        .discord_channels
+        .as_ref()
+        .expect("channels")
+        .get(&123u64)
+        .expect("channel");
+    assert!(ch.tool_progress);
+}
+
+#[test]
+#[serial]
 fn discord_channels_parses_agent_override() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
