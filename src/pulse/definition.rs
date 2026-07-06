@@ -29,8 +29,20 @@ pub(crate) struct TemporalIntention {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TemporalSchedule {
-    Daily { at: String },
-    Weekly { day: String, at: String },
+    Daily {
+        at: String,
+    },
+    Weekly {
+        day: String,
+        at: String,
+    },
+    /// Fire every `interval_days` days, anchored to the most recent successful
+    /// activation. Re-evaluates as due each day once the interval has elapsed
+    /// until a run succeeds; see `docs/pulse.md` §4.
+    Interval {
+        interval_days: u32,
+        at: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +94,7 @@ struct ScheduleRaw {
     kind: String,
     at: String,
     day: Option<String>,
+    interval_days: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +250,15 @@ fn validate_and_build_schedule(
                 at: raw.schedule.at.clone(),
             })
         }
+        "interval" => {
+            let interval_days = raw.schedule.interval_days.unwrap_or(0);
+            validate_interval_days(agent_id, &raw.id, interval_days)?;
+            validate_hhmm(agent_id, &raw.id, &raw.schedule.at)?;
+            Ok(TemporalSchedule::Interval {
+                interval_days,
+                at: raw.schedule.at.clone(),
+            })
+        }
         "once" => Err(PulseParseError::InvalidSchedule {
             agent_id: agent_id.to_string(),
             intention_id: raw.id.clone(),
@@ -271,6 +293,21 @@ fn validate_hhmm(agent_id: &str, intention_id: &str, at: &str) -> Result<(), Pul
     Ok(())
 }
 
+fn validate_interval_days(
+    agent_id: &str,
+    intention_id: &str,
+    interval_days: u32,
+) -> Result<(), PulseParseError> {
+    if interval_days == 0 {
+        return Err(PulseParseError::InvalidSchedule {
+            agent_id: agent_id.to_string(),
+            intention_id: intention_id.to_string(),
+            detail: "interval_days must be >= 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 const VALID_WEEKDAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 fn validate_weekday(agent_id: &str, intention_id: &str, day: &str) -> Result<(), PulseParseError> {
@@ -298,10 +335,14 @@ fn is_safe_agent_id(id: &str) -> bool {
 /// # Examples
 /// - `Daily { at: "08:00" }` → `"daily 08:00"`
 /// - `Weekly { day: "sun", at: "21:00" }` → `"weekly sun 21:00"`
+/// - `Interval { interval_days: 3, at: "09:00" }` → `"every 3 days 09:00"`
 pub(crate) fn format_schedule(schedule: &TemporalSchedule) -> String {
     match schedule {
         TemporalSchedule::Daily { at } => format!("daily {at}"),
         TemporalSchedule::Weekly { day, at } => format!("weekly {day} {at}"),
+        TemporalSchedule::Interval { interval_days, at } => {
+            format!("every {interval_days} days {at}")
+        }
     }
 }
 
@@ -353,17 +394,24 @@ pub(crate) struct DueCheck {
 ///
 /// `agent_id` identifies the agent for due_key generation.
 /// `now` is the current UTC time.
-/// `timezone` is the IANA timezone for daily/weekly evaluation (e.g. "Asia/Tokyo").
+/// `timezone` is the IANA timezone for daily/weekly/interval evaluation (e.g. "Asia/Tokyo").
+/// `last_success_at` is the most recent successful activation time for this
+/// `(agent_id, intention_id)`. Only `interval` schedules consult it; `daily`
+/// and `weekly` ignore it.
 pub(crate) fn check_due(
     agent_id: &str,
     intention: &TemporalIntention,
     now: DateTime<Utc>,
     timezone: &str,
+    last_success_at: Option<DateTime<Utc>>,
 ) -> DueCheck {
-    let due_key = generate_due_key(agent_id, intention, now, timezone);
+    let due_key = generate_due_key(agent_id, intention, now, timezone, last_success_at);
     let due = match &intention.schedule {
         TemporalSchedule::Daily { at } => is_daily_due(at, now, timezone),
         TemporalSchedule::Weekly { day, at } => is_weekly_due(day, at, now, timezone),
+        TemporalSchedule::Interval { interval_days, at } => {
+            is_interval_due(*interval_days, at, now, timezone, last_success_at)
+        }
     };
     DueCheck { due, due_key }
 }
@@ -371,18 +419,22 @@ pub(crate) fn check_due(
 /// Generate the deduplication key for a given intention at the current evaluation time.
 ///
 /// Format per schedule kind:
-/// - daily:  `{agent_id}:{intention_id}:{YYYY-MM-DD}` (local date)
-/// - weekly: `{agent_id}:{intention_id}:{YYYY-WNN}`   (ISO week)
+/// - daily:    `{agent_id}:{intention_id}:{YYYY-MM-DD}` (local date)
+/// - weekly:   `{agent_id}:{intention_id}:{YYYY-WNN}`   (ISO week)
+/// - interval: `{agent_id}:{intention_id}:{YYYY-MM-DD}` (local evaluation date;
+///   advances each day so a failed run can be retried on the next day while
+///   the interval window remains open)
 pub(crate) fn generate_due_key(
     agent_id: &str,
     intention: &TemporalIntention,
     now: DateTime<Utc>,
     timezone: &str,
+    _last_success_at: Option<DateTime<Utc>>,
 ) -> String {
     let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+    let local_now = now.with_timezone(&tz);
     match &intention.schedule {
-        TemporalSchedule::Daily { .. } => {
-            let local_now = now.with_timezone(&tz);
+        TemporalSchedule::Daily { .. } | TemporalSchedule::Interval { .. } => {
             format!(
                 "{agent_id}:{}:{}",
                 intention.id,
@@ -390,7 +442,6 @@ pub(crate) fn generate_due_key(
             )
         }
         TemporalSchedule::Weekly { .. } => {
-            let local_now = now.with_timezone(&tz);
             let iso = local_now.iso_week();
             format!(
                 "{agent_id}:{}:{}-W{:02}",
@@ -465,6 +516,42 @@ fn is_weekly_due(day: &str, at: &str, now: DateTime<Utc>, timezone: &str) -> boo
     is_daily_due(at, now, timezone)
 }
 
+/// Evaluate interval schedule: fire when the local date has reached
+/// `last_success_date + interval_days`, then delegate to the daily time
+/// check.
+///
+/// - `last_success_at = None` (first activation): only the time-of-day check applies.
+/// - Once due, the same condition stays true on subsequent days until a run
+///   succeeds, because `last_success_at` only advances on success. The
+///   per-day deduplication is handled by the `due_key` (local evaluation
+///   date), so a failed run is retried on the following day.
+fn is_interval_due(
+    interval_days: u32,
+    at: &str,
+    now: DateTime<Utc>,
+    timezone: &str,
+    last_success_at: Option<DateTime<Utc>>,
+) -> bool {
+    let tz: Tz = match timezone.parse() {
+        Ok(tz) => tz,
+        Err(e) => {
+            tracing::warn!("invalid timezone \"{timezone}\": {e}");
+            return false;
+        }
+    };
+
+    let local_today = now.with_timezone(&tz).date_naive();
+    if let Some(last_success) = last_success_at {
+        let target_date = last_success.with_timezone(&tz).date_naive()
+            + chrono::Duration::days(interval_days as i64);
+        if local_today < target_date {
+            return false;
+        }
+    }
+
+    is_daily_due(at, now, timezone)
+}
+
 /// Parse a `HH:MM` time string into a [`NaiveTime`].
 fn parse_hhmm(at: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(at, "%H:%M").ok()
@@ -503,6 +590,15 @@ mod tests {
             at: "21:00".to_string(),
         };
         assert_eq!(format_schedule(&schedule), "weekly sun 21:00");
+    }
+
+    #[test]
+    fn format_schedule_interval() {
+        let schedule = TemporalSchedule::Interval {
+            interval_days: 3,
+            at: "09:00".to_string(),
+        };
+        assert_eq!(format_schedule(&schedule), "every 3 days 09:00");
     }
 
     fn valid_pulse_md() -> String {
@@ -592,6 +688,76 @@ body
         assert!(
             matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "event_check"),
             "expected InvalidSchedule for once, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_interval_intention() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: periodic_report
+    schedule:
+      kind: interval
+      interval_days: 3
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        assert!(matches!(
+            &result.intentions[0].schedule,
+            TemporalSchedule::Interval { interval_days, at }
+                if *interval_days == 3 && at == "09:00"
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_zero_interval_days() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: periodic_report
+    schedule:
+      kind: interval
+      interval_days: 0
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "periodic_report"),
+            "expected InvalidSchedule for interval_days=0, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_interval_with_missing_interval_days() {
+        let content = "\
+---
+version: 1
+intentions:
+  - id: periodic_report
+    schedule:
+      kind: interval
+      at: \"09:00\"
+    attention: test
+---
+
+body
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "periodic_report"),
+            "missing interval_days should be rejected, got: {err}"
         );
     }
 
@@ -762,6 +928,19 @@ body
         }
     }
 
+    fn make_interval(interval_days: u32, at: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: "test_intention".to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Interval {
+                interval_days,
+                at: at.to_string(),
+            },
+            attention: String::new(),
+            delivery: None,
+        }
+    }
+
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
@@ -770,7 +949,7 @@ body
     fn daily_due_after_local_time() {
         let intention = make_daily("09:00");
         let now = utc(2026, 5, 10, 0, 1, 0);
-        let result = check_due("lyre", &intention, now, "Asia/Tokyo");
+        let result = check_due("lyre", &intention, now, "Asia/Tokyo", None);
         assert!(result.due);
     }
 
@@ -778,7 +957,7 @@ body
     fn daily_not_due_before_local_time() {
         let intention = make_daily("09:00");
         let now = utc(2026, 5, 9, 23, 59, 0);
-        let result = check_due("lyre", &intention, now, "Asia/Tokyo");
+        let result = check_due("lyre", &intention, now, "Asia/Tokyo", None);
         assert!(!result.due);
     }
 
@@ -786,9 +965,9 @@ body
     fn weekly_due_only_on_matching_day() {
         let intention = make_weekly("sun", "21:00");
         let sunday = utc(2026, 5, 10, 12, 1, 0);
-        assert!(check_due("lyre", &intention, sunday, "Asia/Tokyo").due);
+        assert!(check_due("lyre", &intention, sunday, "Asia/Tokyo", None).due);
         let saturday = utc(2026, 5, 9, 12, 1, 0);
-        assert!(!check_due("lyre", &intention, saturday, "Asia/Tokyo").due);
+        assert!(!check_due("lyre", &intention, saturday, "Asia/Tokyo", None).due);
     }
 
     #[test]
@@ -803,7 +982,7 @@ body
             delivery: None,
         };
         let now = utc(2026, 5, 10, 0, 0, 0);
-        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo");
+        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo", None);
         assert_eq!(key, "lyre:morning_review:2026-05-10");
     }
 
@@ -820,15 +999,167 @@ body
             delivery: None,
         };
         let now = utc(2026, 5, 10, 12, 0, 0);
-        let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo");
+        let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo", None);
         assert_eq!(key, "kitara:weekly_reflection:2026-W19");
+    }
+
+    // --- interval schedule tests ---
+
+    #[test]
+    fn interval_due_on_first_run_without_last_success() {
+        // interval=3, at=09:00 JST. last_success=None → only time-of-day applies.
+        let intention = make_interval(3, "09:00");
+        let before = utc(2026, 7, 5, 23, 59, 0); // 08:59 JST
+        assert!(!check_due("lyre", &intention, before, "Asia/Tokyo", None).due);
+        let after = utc(2026, 7, 6, 0, 1, 0); // 09:01 JST
+        assert!(check_due("lyre", &intention, after, "Asia/Tokyo", None).due);
+    }
+
+    #[test]
+    fn interval_not_due_before_interval_elapsed() {
+        // last_success = 2026-07-03 09:01 JST, interval=3 → next target = 2026-07-06
+        let intention = make_interval(3, "09:00");
+        let last_success = utc(2026, 7, 3, 0, 1, 0); // 2026-07-03 09:01 JST
+
+        // 2026-07-05 09:01 JST: interval not yet elapsed → not due
+        let within_interval = utc(2026, 7, 5, 0, 1, 0);
+        assert!(
+            !check_due(
+                "lyre",
+                &intention,
+                within_interval,
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+    }
+
+    #[test]
+    fn interval_due_on_target_day_after_last_success() {
+        // last_success = 2026-07-03 09:01 JST, interval=3 → target = 2026-07-06
+        let intention = make_interval(3, "09:00");
+        let last_success = utc(2026, 7, 3, 0, 1, 0); // 2026-07-03 09:01 JST
+
+        // 2026-07-06 08:59 JST: target day but before at → not due
+        let before_at = utc(2026, 7, 5, 23, 59, 0);
+        assert!(
+            !check_due(
+                "lyre",
+                &intention,
+                before_at,
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+
+        // 2026-07-06 09:01 JST: due
+        let on_target = utc(2026, 7, 6, 0, 1, 0);
+        assert!(
+            check_due(
+                "lyre",
+                &intention,
+                on_target,
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+    }
+
+    #[test]
+    fn interval_remains_due_each_day_until_success() {
+        // Failure recovery: last_success stays at 2026-07-03, so every day
+        // from 2026-07-06 onward is due (one run per day via due_key).
+        let intention = make_interval(3, "09:00");
+        let last_success = utc(2026, 7, 3, 0, 1, 0);
+
+        // 2026-07-06 09:01 JST (target day)
+        assert!(
+            check_due(
+                "lyre",
+                &intention,
+                utc(2026, 7, 6, 0, 1, 0),
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+        // 2026-07-07 09:01 JST (still past target, last_success unchanged)
+        assert!(
+            check_due(
+                "lyre",
+                &intention,
+                utc(2026, 7, 7, 0, 1, 0),
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+    }
+
+    #[test]
+    fn interval_due_advances_when_last_success_passes_target() {
+        // A success on 2026-07-06 shifts the next target to 2026-07-09.
+        let intention = make_interval(3, "09:00");
+        let last_success = utc(2026, 7, 6, 0, 1, 0); // success on target day
+
+        // 2026-07-08 09:01 JST: new interval not yet elapsed → not due
+        assert!(
+            !check_due(
+                "lyre",
+                &intention,
+                utc(2026, 7, 8, 0, 1, 0),
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+        // 2026-07-09 09:01 JST: new target reached → due
+        assert!(
+            check_due(
+                "lyre",
+                &intention,
+                utc(2026, 7, 9, 0, 1, 0),
+                "Asia/Tokyo",
+                Some(last_success)
+            )
+            .due
+        );
+    }
+
+    #[test]
+    fn due_key_interval_uses_local_evaluation_date() {
+        let intention = make_interval(3, "09:00");
+        let now = utc(2026, 7, 6, 0, 0, 0); // 2026-07-06 09:00 JST
+        let key = generate_due_key("lyre", &intention, now, "Asia/Tokyo", None);
+        assert_eq!(key, "lyre:test_intention:2026-07-06");
+
+        // due_key advances each day regardless of last_success, enabling
+        // next-day retry after a failure.
+        let next_day = utc(2026, 7, 7, 0, 0, 0);
+        let key = generate_due_key(
+            "lyre",
+            &intention,
+            next_day,
+            "Asia/Tokyo",
+            Some(utc(2026, 7, 6, 0, 0, 0)),
+        );
+        assert_eq!(key, "lyre:test_intention:2026-07-07");
     }
 
     #[test]
     fn due_resolver_handles_dst_gap_and_fold() {
         let gap_intention = make_daily("02:30");
         let now_after_gap = utc(2026, 3, 8, 7, 30, 0);
-        let result = check_due("test", &gap_intention, now_after_gap, "America/New_York");
+        let result = check_due(
+            "test",
+            &gap_intention,
+            now_after_gap,
+            "America/New_York",
+            None,
+        );
         assert!(
             !result.due,
             "intention at 02:30 should not be due during DST gap"
@@ -842,6 +1173,7 @@ body
             &fold_intention,
             now_after_earlier,
             "America/New_York",
+            None,
         );
         assert!(result.due);
 
@@ -851,6 +1183,7 @@ body
             &fold_intention,
             now_before_earlier,
             "America/New_York",
+            None,
         );
         assert!(!result.due);
     }

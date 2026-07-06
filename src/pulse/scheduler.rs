@@ -160,7 +160,23 @@ async fn process_intention_with_activation_timeout(
     }
 
     // 2. Check due
-    let due_check = super::definition::check_due(agent_id_str, intention, now, timezone);
+    //    `interval` schedules anchor on the last successful activation, so we
+    //    fetch it before evaluating. `daily`/`weekly` ignore this value.
+    let last_success_at =
+        match load_last_success_started_at(&state.db, agent_id_str, &intention.id).await {
+            Ok(dt) => dt,
+            Err(e) => {
+                warn!(
+                    agent_id = agent_id_str,
+                    intention_id = %intention.id,
+                    error = %e,
+                    "pulse scan: failed to load last_success_at, skipping intention"
+                );
+                return;
+            }
+        };
+    let due_check =
+        super::definition::check_due(agent_id_str, intention, now, timezone, last_success_at);
     if !due_check.due {
         return;
     }
@@ -375,6 +391,22 @@ async fn load_recent_messages(db: &Arc<Database>, chat_id: i64) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Load the most recent successful activation time for `(agent_id,
+/// intention_id)`. Used to evaluate `interval` schedules relative to the
+/// last success; `daily`/`weekly` intentions ignore the result.
+async fn load_last_success_started_at(
+    db: &Arc<Database>,
+    agent_id: &str,
+    intention_id: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::error::StorageError> {
+    let agent_id = agent_id.to_string();
+    let intention_id = intention_id.to_string();
+    crate::storage::call_blocking(Arc::clone(db), move |db| {
+        db.get_last_success_started_at(&agent_id, &intention_id)
+    })
+    .await
+}
+
 /// Run the pulse scheduler tick loop.
 ///
 /// Sleeps for the configured tick interval between scans.
@@ -466,6 +498,52 @@ intentions:
 Some notes.
 "
         .to_string()
+    }
+
+    fn valid_interval_pulse_md() -> String {
+        "\
+---
+version: 1
+intentions:
+  - id: periodic_report
+    schedule:
+      kind: interval
+      interval_days: 3
+      at: \"00:00\"
+    attention: Periodic report.
+---
+
+# Notes
+Some notes.
+"
+        .to_string()
+    }
+
+    /// Inserts a terminal `success` pulse_run with an explicit `started_at`,
+    /// bypassing the running→success lifecycle. Used to simulate a past
+    /// successful activation when testing `interval` schedules.
+    fn insert_success_run(
+        db: &Arc<Database>,
+        id: &str,
+        agent_id: &str,
+        intention_id: &str,
+        started_at: &str,
+    ) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO pulse_runs
+                 (id, agent_id, intention_id, due_key, chat_id, message_id,
+                  status, started_at, finished_at, output_kind, output_text, error_message)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'success', ?5, ?5, 'silent', 'PULSE_OK', NULL)",
+            rusqlite::params![
+                id,
+                agent_id,
+                intention_id,
+                format!("{agent_id}:{intention_id}:past"),
+                started_at
+            ],
+        )
+        .expect("insert success run");
     }
 
     fn count_agent_runs(db: &Arc<Database>, agent_id: &str) -> usize {
@@ -617,6 +695,102 @@ body
             count_agent_runs(&state.db, "agent-b"),
             1,
             "agent-b should have 1 run"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_interval_intention_on_first_scan() {
+        // Arrange: no prior success → first activation should fire immediately
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", &valid_interval_pulse_md())],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "first interval scan should fire once"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_skips_interval_intention_within_window() {
+        // Arrange: a success 1 day ago, interval=3 → window not yet elapsed
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", &valid_interval_pulse_md())],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        let one_day_ago = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        insert_success_run(
+            &state.db,
+            "past-success",
+            "default",
+            "periodic_report",
+            &one_day_ago,
+        );
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert: no new run created (only the pre-inserted success remains)
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "should not fire within the interval window after a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_fires_interval_intention_after_window_elapsed() {
+        // Arrange: a success 5 days ago, interval=3 → window elapsed → due
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(
+            &dir,
+            enabled_pulse_config(),
+            vec![("default", &valid_interval_pulse_md())],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        let five_days_ago = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        insert_success_run(
+            &state.db,
+            "past-success",
+            "default",
+            "periodic_report",
+            &five_days_ago,
+        );
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert: a new run is created on top of the pre-inserted one
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            2,
+            "should fire once the interval window has elapsed"
         );
     }
 
