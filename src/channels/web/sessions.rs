@@ -8,8 +8,10 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use crate::agent_loop::formatting::is_tool_preview_message;
-use crate::storage::{SenderKind, call_blocking};
+use crate::storage::{SenderKind, StoredMessage, ToolCall, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
 
@@ -136,39 +138,69 @@ pub(super) async fn get_history(
         }
     };
 
-    // Interleave text messages with persisted tool calls by timestamp so the
-    // WebUI can render collapsible tool cards inline within the conversation.
-    //
-    // Tool preview messages (`[tool_call] {name}`, `[tool_result]: ...`,
-    // `[tool_error]: ...`) are skipped: the no-narration tool_call form and
-    // the result/error forms either duplicate the structured tool cards below
-    // or render empty in Markdown (the bracket-prefix parses as a reference
-    // link definition). Tool_call previews that lead with agent narration
-    // stay.
-    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
-    for message in messages {
-        if message.sender_kind == SenderKind::Assistant && is_tool_preview_message(&message.content)
-        {
-            continue;
-        }
-        let timestamp = message.timestamp.clone();
-        entries.push((
-            timestamp,
-            serde_json::json!({
+    // Group tool calls by their parent message id so each card anchors
+    // right after the message that issued it, regardless of timestamp skew
+    // between the messages and tool_calls tables.
+    let mut tools_by_message: HashMap<&str, Vec<&ToolCall>> = HashMap::new();
+    for tool_call in &tool_calls {
+        tools_by_message
+            .entry(tool_call.message_id.as_str())
+            .or_default()
+            .push(tool_call);
+    }
+
+    // Order messages by timestamp and attach each tool card to its parent.
+    // Tool preview messages (no-narration `[tool_call]`, `[tool_result]:`,
+    // `[tool_error]:`) are hidden — they duplicate the cards or render
+    // empty in Markdown — but their slot still places the cards.
+    let mut sorted_messages: Vec<&StoredMessage> = messages.iter().collect();
+    sorted_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for message in &sorted_messages {
+        let skip_preview = message.sender_kind == SenderKind::Assistant
+            && is_tool_preview_message(&message.content);
+        if !skip_preview {
+            entries.push(serde_json::json!({
                 "id": message.id,
                 "sender_id": message.sender_id,
                 "sender_kind": message.sender_kind.to_string(),
                 "content": message.content,
                 "timestamp": message.timestamp,
                 "message_kind": message.message_kind.to_string(),
-            }),
-        ));
+            }));
+        }
+        if let Some(tools) = tools_by_message.remove(message.id.as_str()) {
+            for tool_call in tools {
+                entries.push(tool_call_entry(tool_call));
+            }
+        }
     }
-    for tool_call in tool_calls {
-        let timestamp = tool_call.timestamp.clone();
-        let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
-            .unwrap_or(serde_json::Value::Null);
-        let (status, result) = if let Some(ref output) = tool_call.tool_output {
+
+    // Tool calls whose parent message is missing (e.g. rotated out by the
+    // limit) fall back to timestamp order.
+    let mut orphan_tools: Vec<&ToolCall> = tools_by_message.into_values().flatten().collect();
+    orphan_tools.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    for tool_call in orphan_tools {
+        entries.push(tool_call_entry(tool_call));
+    }
+
+    let messages_json: Vec<serde_json::Value> = entries;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_key": session_key,
+        "messages": messages_json,
+    })))
+}
+
+/// Builds the `message_kind: "tool_call"` JSON entry for a persisted tool
+/// call, decoding its structured input/output payload for the WebUI card.
+fn tool_call_entry(tool_call: &ToolCall) -> serde_json::Value {
+    let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
+        .unwrap_or(serde_json::Value::Null);
+    let (status, result) = match tool_call.tool_output.as_ref() {
+        Some(output) => {
             let parsed = serde_json::from_str::<serde_json::Value>(output)
                 .unwrap_or(serde_json::Value::Null);
             let status = parsed
@@ -182,35 +214,23 @@ pub(super) async fn get_history(
                 .map(String::from)
                 .unwrap_or_else(|| output.to_string());
             (status, result)
-        } else {
-            ("pending".to_string(), String::new())
-        };
-        entries.push((
-            timestamp,
-            serde_json::json!({
-                "id": format!("tool:{}", tool_call.id),
-                "sender_id": "assistant",
-                "sender_kind": "assistant",
-                "content": serde_json::to_string(&serde_json::json!({
-                    "tool": tool_call.tool_name,
-                    "status": status,
-                    "result": result,
-                    "input": input,
-                })).unwrap_or_default(),
-                "timestamp": tool_call.timestamp,
-                "message_kind": "tool_call",
-            }),
-        ));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let messages_json: Vec<serde_json::Value> =
-        entries.into_iter().map(|(_, value)| value).collect();
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "session_key": session_key,
-        "messages": messages_json,
-    })))
+        }
+        None => ("pending".to_string(), String::new()),
+    };
+    serde_json::json!({
+        "id": format!("tool:{}", tool_call.id),
+        "sender_id": "assistant",
+        "sender_kind": "assistant",
+        "content": serde_json::to_string(&serde_json::json!({
+            "tool": tool_call.tool_name,
+            "status": status,
+            "result": result,
+            "input": input,
+        }))
+        .unwrap_or_default(),
+        "timestamp": tool_call.timestamp,
+        "message_kind": "tool_call",
+    })
 }
 
 #[cfg(test)]
@@ -470,6 +490,54 @@ mod tests {
         );
         assert!(contents.contains(&"読みますね [tool_call] read"));
         assert!(contents.contains(&"hello there"));
+    }
+
+    #[tokio::test]
+    async fn api_history_anchors_tool_calls_to_parent_message() {
+        use crate::storage::ToolCall;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-anchor:agent:lyre", "lyre");
+
+        let user_msg = StoredMessage::user(chat_id, "user:web".to_string(), "やって".to_string());
+        db.store_message_only(&user_msg).expect("store user");
+
+        let assistant_msg = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "やります [tool_call] read".to_string(),
+        );
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant");
+
+        // Persist the tool call with a timestamp earlier than its parent to
+        // model timestamp skew; the card must still land right after the parent.
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            chat_id,
+            message_id: assistant_msg.id.clone(),
+            tool_name: "read".to_string(),
+            tool_input: r#"{"path":"a.txt"}"#.to_string(),
+            tool_output: Some(r#"{"result":"ok","status":"success"}"#.to_string()),
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+        };
+        db.store_tool_call(&tool_call).expect("store tool call");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 3, "user + assistant + tool card");
+        assert_eq!(messages[0]["content"], "やって");
+        assert_eq!(messages[1]["content"], "やります [tool_call] read");
+        assert_eq!(messages[2]["message_kind"], "tool_call");
+        assert_eq!(messages[2]["id"], "tool:call-1");
     }
 
     #[test]
