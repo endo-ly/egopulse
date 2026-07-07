@@ -14,7 +14,8 @@ use super::secret_ref::{
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DatabaseConfig,
     DiscordBotConfig, DiscordChannelConfig, ProviderConfig, ProviderId, PulseConfig,
-    SleepBatchConfig, TelegramBotConfig, TelegramChatConfig, web_fetch::WebFetchConfig,
+    SleepBatchConfig, TelegramBotConfig, TelegramChatConfig, WebhookReceiverConfig,
+    WebhookReceiverId, WebhookTargetConfig, WebhooksConfig, web_fetch::WebFetchConfig,
 };
 use crate::error::ConfigError;
 
@@ -165,6 +166,27 @@ struct FileWebFetchContentValidationConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct FileWebhooksConfig {
+    receivers: Option<HashMap<String, FileWebhookReceiverConfig>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileWebhookReceiverConfig {
+    token: Option<StringOrRef>,
+    target: FileWebhookTargetConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileWebhookTargetConfig {
+    channel: Option<String>,
+    thread: Option<String>,
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileDatabaseConfig {
     #[serde(default)]
     backup: FileBackupConfig,
@@ -201,6 +223,7 @@ struct FileConfig {
     pulse: Option<FilePulseConfig>,
     db: Option<FileDatabaseConfig>,
     web_fetch: Option<FileWebFetchConfig>,
+    webhooks: Option<FileWebhooksConfig>,
 }
 
 pub(super) fn build_config(
@@ -234,6 +257,7 @@ pub(super) fn build_config(
         pulse: file_pulse,
         db: file_db,
         web_fetch: file_web_fetch,
+        webhooks: file_webhooks,
     } = read_file_config(resolved_config_path.as_deref())?;
 
     let default_provider =
@@ -304,6 +328,8 @@ pub(super) fn build_config(
 
     let web_fetch = normalize_web_fetch(file_web_fetch);
 
+    let webhooks = normalize_webhooks(file_webhooks, &dotenv)?;
+
     let config = Config {
         default_provider,
         default_model,
@@ -324,12 +350,14 @@ pub(super) fn build_config(
         pulse,
         db,
         web_fetch,
+        webhooks,
     };
 
     validate_compaction_config(&config)?;
 
     validate_discord_bot_references(&config)?;
     validate_telegram_bot_references(&config)?;
+    validate_webhook_receivers(&config)?;
 
     if config.web_enabled() && config.web_auth_token().is_none() {
         return Err(ConfigError::MissingWebAuthToken);
@@ -1102,6 +1130,31 @@ fn validate_telegram_bot_references(config: &Config) -> Result<(), ConfigError> 
     Ok(())
 }
 
+fn validate_webhook_receivers(config: &Config) -> Result<(), ConfigError> {
+    for (receiver_id, receiver) in &config.webhooks.receivers {
+        if receiver.token.is_none() {
+            return Err(ConfigError::WebhookReceiverTokenMissing {
+                receiver_id: receiver_id.to_string(),
+            });
+        }
+
+        let channel = receiver.target.channel.as_str();
+        if channel.is_empty() {
+            return Err(ConfigError::WebhookTargetChannelMissing {
+                receiver_id: receiver_id.to_string(),
+            });
+        }
+
+        if channel != "web" && receiver.target.thread.trim().is_empty() {
+            return Err(ConfigError::WebhookTargetThreadRequired {
+                receiver_id: receiver_id.to_string(),
+                channel: channel.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_provider_references<'a>(
     providers: &HashMap<ProviderId, ProviderConfig>,
     references: impl IntoIterator<Item = Option<&'a String>>,
@@ -1235,4 +1288,49 @@ fn normalize_web_fetch(file: Option<FileWebFetchConfig>) -> WebFetchConfig {
             .unwrap_or_default(),
     }
     .normalize()
+}
+
+fn normalize_webhooks(
+    file: Option<FileWebhooksConfig>,
+    dotenv: &HashMap<String, String>,
+) -> Result<WebhooksConfig, ConfigError> {
+    let Some(fw) = file else {
+        return Ok(WebhooksConfig::default());
+    };
+
+    let mut receivers = HashMap::new();
+    for (raw_id, fr) in fw.receivers.unwrap_or_default() {
+        let receiver_id = WebhookReceiverId::new(&raw_id);
+        if receiver_id.as_str().is_empty() {
+            return Err(ConfigError::InvalidWebhookReceiverId { id: raw_id });
+        }
+
+        let resolved_token = resolve_string_or_ref(fr.token, dotenv)?;
+        let file_token = resolved_token.as_ref().map(|rv| {
+            if matches!(rv, ResolvedValue::Literal(_)) {
+                yaml_serde::Value::String(rv.value().to_string())
+            } else {
+                rv.to_yaml_value()
+            }
+        });
+
+        let target = WebhookTargetConfig {
+            channel: ChannelName::new(&fr.target.channel.unwrap_or_default()),
+            thread: fr.target.thread.unwrap_or_default(),
+            agent: normalize_string(fr.target.agent)
+                .as_deref()
+                .map(AgentId::new),
+        };
+
+        receivers.insert(
+            receiver_id,
+            WebhookReceiverConfig {
+                token: resolved_token,
+                file_token,
+                target,
+            },
+        );
+    }
+
+    Ok(WebhooksConfig { receivers })
 }

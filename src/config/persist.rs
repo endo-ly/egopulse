@@ -33,6 +33,31 @@ struct SerializableTelegramBot {
 }
 
 #[derive(Serialize)]
+struct SerializableWebhookTarget {
+    channel: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    thread: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SerializableWebhookReceiver {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_yaml_value"
+    )]
+    token: Option<yaml_serde::Value>,
+    target: SerializableWebhookTarget,
+}
+
+#[derive(Serialize)]
+struct SerializableWebhooksConfig {
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    receivers: HashMap<String, SerializableWebhookReceiver>,
+}
+
+#[derive(Serialize)]
 struct SerializableDiscordChannel {
     #[serde(skip_serializing_if = "is_default")]
     require_mention: bool,
@@ -156,6 +181,8 @@ struct SerializableConfig {
     db: Option<SerializableDb>,
     #[serde(skip_serializing_if = "Option::is_none")]
     web_fetch: Option<SerializableWebFetchConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    webhooks: Option<SerializableWebhooksConfig>,
 }
 
 #[derive(Serialize)]
@@ -525,6 +552,32 @@ impl From<&Config> for SerializableConfig {
                     })
                 }
             },
+            webhooks: {
+                if config.webhooks.receivers.is_empty() {
+                    None
+                } else {
+                    Some(SerializableWebhooksConfig {
+                        receivers: config
+                            .webhooks
+                            .receivers
+                            .iter()
+                            .map(|(id, r)| {
+                                (
+                                    id.to_string(),
+                                    SerializableWebhookReceiver {
+                                        token: r.file_token.clone(),
+                                        target: SerializableWebhookTarget {
+                                            channel: r.target.channel.to_string(),
+                                            thread: r.target.thread.clone(),
+                                            agent: r.target.agent.as_ref().map(|a| a.to_string()),
+                                        },
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                }
+            },
         }
     }
 }
@@ -596,6 +649,13 @@ fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
                 let _ = bot_id;
             }
         }
+    }
+
+    for (receiver_id, receiver) in &config.webhooks.receivers {
+        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &receiver.token {
+            entries.push((env_id.clone(), value.clone()));
+        }
+        let _ = receiver_id;
     }
 
     entries
@@ -765,6 +825,7 @@ mod tests {
             pulse: crate::config::PulseConfig::default(),
             db: crate::config::DatabaseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
+            webhooks: crate::config::WebhooksConfig::default(),
         }
     }
 
@@ -1125,5 +1186,67 @@ channels:
             .get(&crate::config::AgentId::new("reviewer"))
             .expect("reviewer agent");
         assert_eq!(agent.discord_bot.as_ref(), Some(&BotId::new("main")));
+    }
+
+    #[test]
+    #[serial]
+    fn webhook_receivers_persist_with_secret_refs_on_config_save() {
+        use crate::config::{
+            ChannelName, WebhookReceiverConfig, WebhookReceiverId, WebhookTargetConfig,
+            WebhooksConfig,
+        };
+        use crate::test_env::EnvVarGuard;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+
+        let mut config = sample_config();
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(env_resolved_value(
+                        "EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN",
+                        "egograph-secret",
+                    )),
+                    file_token: Some(env_yaml_value("EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN")),
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "1234567890123456789".to_string(),
+                        agent: Some(crate::config::AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("webhooks:"));
+        assert!(yaml.contains("egograph:"));
+        assert!(yaml.contains("source: env"));
+        assert!(yaml.contains("id: EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN"));
+        assert!(!yaml.contains("egograph-secret"));
+
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert!(dotenv.contains("EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN=egograph-secret"));
+
+        let _guard = EnvVarGuard::set("HOME", dir.path());
+        let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("reload");
+        let receivers = loaded.webhook_receivers();
+        assert_eq!(receivers.len(), 1);
+        let egograph = receivers
+            .get(&WebhookReceiverId::new("egograph"))
+            .expect("egograph receiver");
+        assert_eq!(
+            egograph.token.as_ref().expect("token").value(),
+            "egograph-secret"
+        );
+        assert_eq!(egograph.target.channel.as_str(), "discord");
+        assert_eq!(egograph.target.thread, "1234567890123456789");
+        assert_eq!(
+            egograph.target.agent.as_ref().expect("agent"),
+            &crate::config::AgentId::new("default")
+        );
     }
 }

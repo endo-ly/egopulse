@@ -73,6 +73,11 @@ define_lowercase_id! {
     pub(crate) struct BotId
 }
 
+define_lowercase_id! {
+    /// Trimmed + lowercased webhook receiver identifier.
+    pub(crate) struct WebhookReceiverId
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DiscordChannelConfig {
     pub require_mention: bool,
@@ -443,6 +448,34 @@ impl std::fmt::Debug for AgentConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WebhookTargetConfig {
+    pub channel: ChannelName,
+    pub thread: String,
+    pub agent: Option<AgentId>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WebhookReceiverConfig {
+    pub token: Option<ResolvedValue>,
+    pub file_token: Option<yaml_serde::Value>,
+    pub target: WebhookTargetConfig,
+}
+
+impl std::fmt::Debug for WebhookReceiverConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookReceiverConfig")
+            .field("token", &debug_secret(self.token.as_ref()))
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WebhooksConfig {
+    pub receivers: HashMap<WebhookReceiverId, WebhookReceiverConfig>,
+}
+
 /// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
@@ -465,6 +498,7 @@ pub struct Config {
     pub(crate) pulse: PulseConfig,
     pub(crate) db: DatabaseConfig,
     pub(crate) web_fetch: super::web_fetch::WebFetchConfig,
+    pub(crate) webhooks: WebhooksConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -495,6 +529,7 @@ impl std::fmt::Debug for Config {
             .field("pulse", &self.pulse)
             .field("db", &self.db)
             .field("web_fetch", &self.web_fetch)
+            .field("webhooks", &self.webhooks)
             .finish()
     }
 }

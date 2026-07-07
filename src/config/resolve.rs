@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId,
-    PulseConfig, ResolvedLlmConfig,
+    PulseConfig, ResolvedLlmConfig, WebhookReceiverConfig, WebhookReceiverId,
 };
 use crate::error::ConfigError;
 
@@ -446,6 +446,10 @@ impl Config {
     pub(crate) fn needs_secret_db(&self) -> bool {
         self.discord_channels().values().any(|c| c.secret)
             || self.telegram_channels().values().any(|c| c.secret)
+    }
+
+    pub(crate) fn webhook_receivers(&self) -> &HashMap<WebhookReceiverId, WebhookReceiverConfig> {
+        &self.webhooks.receivers
     }
 }
 

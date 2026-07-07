@@ -420,6 +420,7 @@ mod tests {
             pulse: crate::config::PulseConfig::default(),
             db: crate::config::DatabaseConfig::default(),
             web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
+            webhooks: crate::config::WebhooksConfig::default(),
         };
         let updates = HashMap::from([(
             "openai".to_string(),

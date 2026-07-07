@@ -273,6 +273,10 @@ pub(crate) fn save_config(
             .as_ref()
             .map(|c| c.web_fetch.clone())
             .unwrap_or_default(),
+        webhooks: existing_config
+            .as_ref()
+            .map(|c| c.webhooks.clone())
+            .unwrap_or_default(),
     };
 
     config
