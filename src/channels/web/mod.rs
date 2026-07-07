@@ -367,6 +367,11 @@ fn build_router(web_state: WebState) -> Router {
             ))
     });
 
+    let webhook_routes = Router::new().route(
+        "/api/webhooks/{receiver_id}",
+        post(crate::webhooks::handler::receive_webhook),
+    );
+
     let mut app = Router::new()
         .route("/", get(index_html))
         .route("/ws", get(ws::ws_handler))
@@ -376,6 +381,7 @@ fn build_router(web_state: WebState) -> Router {
     if let Some(routes) = voice_routes {
         app = app.merge(routes);
     }
+    app = app.merge(webhook_routes);
     app.fallback(index_or_asset).with_state(web_state)
 }
 
@@ -387,7 +393,11 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::turn::FakeProvider;
-    use crate::config::{ChannelConfig, ChannelName};
+    use crate::config::secret_ref::ResolvedValue;
+    use crate::config::{
+        AgentId, ChannelConfig, ChannelName, WebhookReceiverConfig, WebhookReceiverId,
+        WebhookTargetConfig, WebhooksConfig,
+    };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
 
@@ -617,5 +627,142 @@ mod tests {
         assert_eq!(turn.channel, "voice");
         assert_eq!(turn.agent_id, "default");
         assert!(turn.ok);
+    }
+
+    fn webhook_test_router(dir: &tempfile::TempDir) -> Router {
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([
+                (
+                    WebhookReceiverId::new("egograph"),
+                    WebhookReceiverConfig {
+                        token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                        file_token: None,
+                        target: WebhookTargetConfig {
+                            channel: ChannelName::new("discord"),
+                            thread: "123".to_string(),
+                            agent: Some(AgentId::new("default")),
+                        },
+                    },
+                ),
+                (
+                    WebhookReceiverId::new("github"),
+                    WebhookReceiverConfig {
+                        token: Some(ResolvedValue::Literal("github-secret".to_string())),
+                        file_token: None,
+                        target: WebhookTargetConfig {
+                            channel: ChannelName::new("telegram"),
+                            thread: "-100".to_string(),
+                            agent: Some(AgentId::new("default")),
+                        },
+                    },
+                ),
+            ]),
+        };
+        let state = build_state_with_config(config, None, None, None, None);
+        build_router(WebState {
+            config_path: None,
+            app_state: Arc::new(state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[tokio::test]
+    async fn webhook_route_accepts_only_matching_receiver_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+        let other_receiver_token = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer github-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(other_receiver_token.status(), StatusCode::UNAUTHORIZED);
+
+        let web_token = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer web-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(web_token.status(), StatusCode::UNAUTHORIZED);
+
+        let no_token = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_unknown_receiver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/unknown")
+                    .header(header::AUTHORIZATION, "Bearer anything")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_payload_over_fixed_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let oversized = "x".repeat(64 * 1024 + 1);
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
