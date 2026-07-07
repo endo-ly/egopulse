@@ -649,7 +649,6 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `invalid_params` | 400 | JSON 不正 |
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
-| `webhook_enqueue_failed` | 500 | TurnScheduler への投入に失敗 |
 
 ---
 

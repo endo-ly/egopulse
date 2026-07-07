@@ -205,7 +205,6 @@ Voice は初期 target 対象外とする。Voice は同期 HTTP response を正
 | JSON 不正 | 400 | `invalid_params` |
 | payload size 超過 | 413 | `payload_too_large` |
 | target channel 未登録、voice 指定、agent 不在、非 Web target の thread 空 | 400 | `invalid_target` |
-| enqueue 失敗 | 500 | `webhook_enqueue_failed` |
 
 turn 実行中の LLM / tool エラーは HTTP response には反映しない。Webhook sender には受信可否のみを返す。
 

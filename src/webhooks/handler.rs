@@ -10,7 +10,7 @@ use crate::channels::web::auth::constant_time_eq;
 use crate::config::{Config, WebhookReceiverId};
 use crate::runtime::channel_scope_from_secret;
 
-pub(super) const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 64 * 1024;
 
 pub(crate) async fn receive_webhook(
     State(state): State<WebState>,
@@ -49,14 +49,6 @@ pub(crate) async fn receive_webhook(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "invalid receiver token",
-        );
-    }
-
-    if body.len() > MAX_WEBHOOK_PAYLOAD_BYTES {
-        return super::error::webhook_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "payload exceeds 64KB limit",
         );
     }
 

@@ -367,10 +367,14 @@ fn build_router(web_state: WebState) -> Router {
             ))
     });
 
-    let webhook_routes = Router::new().route(
-        "/api/webhooks/{receiver_id}",
-        post(crate::webhooks::handler::receive_webhook),
-    );
+    let webhook_routes = Router::new()
+        .route(
+            "/api/webhooks/{receiver_id}",
+            post(crate::webhooks::handler::receive_webhook),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::webhooks::handler::MAX_WEBHOOK_PAYLOAD_BYTES,
+        ));
 
     let mut app = Router::new()
         .route("/", get(index_html))
