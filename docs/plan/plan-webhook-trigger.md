@@ -14,7 +14,7 @@ Webhook を外部 trigger として受け取り、receiver ごとに設定した
 - Discord / Telegram target が既存 channel config で `secret: true` の場合、通常チャネル入力と同じく `SurfaceContext.scope = ConversationScope::Secret` に解決する。Webhook 経由でも storage 境界を緩めない。
 - payload format は設定項目化しない。EgoGraph Pipelines payload は自動整形し、それ以外の JSON は generic formatter で扱う。
 - 初期実装では HMAC、replay protection、rule engine、複雑な条件分岐 routing は扱わない。payload size limit は固定 64KB とする。
-- 関連 docs は `docs/api.md`, `docs/config.md`, `docs/channels.md` を更新対象とする。既存未コミット差分がある場合は内容を確認して上書きしない。
+- 関連 docs は `docs/api.md`, `docs/config.md`, `docs/channels.md` を更新対象とする。
 
 ## TDD 方針
 

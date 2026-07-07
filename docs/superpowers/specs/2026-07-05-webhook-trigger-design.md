@@ -80,7 +80,7 @@ webhooks:
 |---|:---:|---|
 | `webhooks.receivers.<id>.token` | 必須 | receiver 専用 Bearer token。SecretRef を使用できる |
 | `target.channel` | 必須 | turn を投入する既存チャネル名。例: `discord`, `telegram`, `web` |
-| `target.thread` | 必須 | target channel 上の会話先 ID。Discord は channel/thread ID、Telegram は chat ID、Web は session key。Web の空値は `main` に正規化する |
+| `target.thread` | 条件付き | target channel 上の会話先 ID。Discord は channel/thread ID、Telegram は chat ID、Web は session key。`channel != "web"` の場合は必須。Web の空値は `main` に正規化する |
 | `target.agent` | 任意 | 行動する agent ID。省略時は `default_agent` |
 
 ### Target validation

@@ -18,7 +18,7 @@
    - [3.9 DB バックアップ設定](#39-db-バックアップ設定dbbackup)
    - [3.10 Web Fetch 設定](#310-web-fetch-設定web_fetch)
    - [3.11 エージェント定義](#311-エージェント定義agentsid)
-   - [3.12 Webhook 設定](#312-webhook-設定webhooks)
+   - [3.12 Webhook 設定](#312-webhook-設定)
 4. [モデル解決チェーン](#4-モデル解決チェーン)
 5. [SecretRef（シークレット参照）](#5-secretrefシークレット参照)
 6. [環境変数オーバーライド](#6-環境変数オーバーライド)
@@ -458,7 +458,7 @@ agents:
 
 ---
 
-### 3.12 Webhook 設定 (`webhooks`)
+### 3.12 Webhook 設定
 
 外部イベントを trigger として受け取り、receiver ごとに設定した target channel 上で agent を行動させる。Webhook は会話チャネルではなく、`ChannelRegistry` にも登録されない。応答は target channel の通常配送経路で送信される。
 

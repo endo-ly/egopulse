@@ -174,6 +174,7 @@ struct FileWebhooksConfig {
 #[serde(deny_unknown_fields)]
 struct FileWebhookReceiverConfig {
     token: Option<StringOrRef>,
+    #[serde(default)]
     target: FileWebhookTargetConfig,
 }
 
@@ -1316,7 +1317,7 @@ fn normalize_webhooks(
 
         let target = WebhookTargetConfig {
             channel: ChannelName::new(&fr.target.channel.unwrap_or_default()),
-            thread: fr.target.thread.unwrap_or_default(),
+            thread: normalize_string(fr.target.thread).unwrap_or_default(),
             agent: normalize_string(fr.target.agent)
                 .as_deref()
                 .map(AgentId::new),
