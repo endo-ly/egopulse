@@ -910,4 +910,86 @@ mod tests {
             .expect("response");
         assert_eq!(blank_thread.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn webhook_route_accepts_and_enqueues_turn_without_waiting_for_completion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123456789".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let provider = FakeProvider {
+            responses: std::sync::Mutex::new(vec![MessagesResponse {
+                content: "Pipeline failure investigated.".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            }]),
+        };
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(provider)),
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let payload = serde_json::json!({
+            "source": "urn:egograph:pipelines",
+            "type": "egograph.pipelines.workflow_failed",
+            "data": {
+                "workflow_id": "test_workflow",
+                "run_id": "test_run",
+                "error_message": "test error"
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let turns = app_state.runtime_status.recent_turns();
+            if turns.iter().any(|t| t.channel == "discord" && t.ok) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("webhook turn was not enqueued within 5 seconds");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
