@@ -116,7 +116,7 @@ src/llm/
 
 ### 4.1 `UsageCalibrator`（`src/llm/calibration.rs` 新規）
 
-`(provider, model, request_kind, has_tools)` 単位の補正係数をメモリ内で保持する。非永続化（プロセス再起動で未計測状態に戻る）。
+`(provider, model, request_kind, has_tools)` 単位の補正係数をメモリ内で保持する。観測は `llm_usage_logs` に永続化し、起動時に最近 N 件から EMA で再構築する（プロセス再起動後も学習状態が維持される）。
 
 ```rust
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -151,7 +151,7 @@ impl UsageCalibrator {
 - **EMA（指数移動平均）**: 単発のスパイク（ツール結果が異常に大きい等）で係数が振れるのを防ぐ。
 - **クリップ [0.5, 3.0]**: 係数が極端になると推定が暴走する。下限 0.5（過大評価時の修正）、上限 3.0（過小評価時の修正、今回の日本語ケース相当）。
 - **estimated == 0 を除外**: 推定が 0 の場合は記録しない（ゼロ除算・異常係数防止）。
-- **非永続化**: プロセス再起動で未計測状態に戻る。未計測時は `DEFAULT_FACTOR` を使うため、DB 永続化や起動時 warm start は追加しない。
+- **永続化**: 観測（生推定値と実測 `input_tokens` のペア）は `llm_usage_logs` に保存し、起動時に最近 N 件から EMA で再構築する。これにより再起動後も学習状態が維持され、コールドスタート時の過大 `DEFAULT_FACTOR` による誤発火を防ぐ。
 
 ### 4.2 `estimate_prompt_tokens`（既存、維持）
 
@@ -165,7 +165,7 @@ impl UsageCalibrator {
 
 ```rust
 /// chars/3 の日本語過小評価を未計測時から補う保守係数。
-const DEFAULT_FACTOR: f64 = 1.6;
+const DEFAULT_FACTOR: f64 = 1.3;
 
 fn calibrated_estimate(raw_estimate: usize, factor: f64) -> usize {
     ((raw_estimate as f64) * factor).ceil().max(1.0) as usize
@@ -321,7 +321,7 @@ persist_user_turn_with_compaction / tool 後 maybe_compact_messages
 
 ## 11. 未解決 / 保留
 
-- **`DEFAULT_FACTOR` の値**: 1.6 で妥当か。実データ（V1）を見て、必要なら同じ定数のみ調整する。
+- **`DEFAULT_FACTOR` の値**: 1.3 に調整。永続化により DEFAULT に頼るのは未知の provider/model の初回のみとなったため、過大だった 1.6 から引き下げた。
 - **EMA の重み α**: 0.3 で妥当か。収束速度とスパイク耐性のトレードオフを実データで調整。
 - **クリップ範囲 `[0.5, 3.0]`**: 実データで不適切（広すぎる/狭すぎる）なら調整。
 - **`sleep/orchestrator.rs` の `context_tokens`**: `resolve_context_window_tokens` の戻り値（設定値そのもの）を使用している場合は本プランの影響なし。実装修正時に確認。

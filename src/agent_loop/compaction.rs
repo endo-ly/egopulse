@@ -328,7 +328,7 @@ async fn summarize_old_messages(
                     .record(calibration_key, raw_estimate, usage.input_tokens)
                     .await;
             }
-            log_summarizer_usage(state, context, chat_id, llm, &response);
+            log_summarizer_usage(state, context, chat_id, llm, &response, raw_estimate);
             strip_thinking(&response.content)
         }
         Err(SummarizeError::Provider(error)) => {
@@ -380,6 +380,7 @@ fn log_summarizer_usage(
     chat_id: i64,
     llm: &std::sync::Arc<dyn LlmProvider>,
     response: &MessagesResponse,
+    raw_estimate: usize,
 ) {
     let Some(usage) = &response.usage else {
         return;
@@ -391,6 +392,7 @@ fn log_summarizer_usage(
     let model = llm.model_name().to_string();
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
+    let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
     tokio::spawn(async move {
@@ -403,6 +405,8 @@ fn log_summarizer_usage(
                 input_tokens,
                 output_tokens,
                 request_kind: "compaction",
+                estimated_tokens,
+                has_tools: false,
             })
         })
         .await

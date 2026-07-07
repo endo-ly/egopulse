@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent_loop::ConversationScope;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
@@ -153,6 +153,30 @@ impl AppState {
                 .as_ref()
                 .expect("secret db required but not initialized"),
         }
+    }
+
+    /// Rebuilds calibration factors from persisted usage observations.
+    ///
+    /// Loads recent observations from both normal and secret databases and
+    /// replays them through the calibrator so learned factors survive restarts.
+    /// Load failures fall back to whatever was loaded (possibly empty), leaving
+    /// unmeasured keys at `DEFAULT_FACTOR`.
+    pub(crate) async fn warm_up_calibrator(&self) {
+        const REPLAY_LIMIT_PER_KEY: usize = 30;
+        let mut observations = match self.db.load_calibration_observations(REPLAY_LIMIT_PER_KEY) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "calibration load failed (normal db); using defaults");
+                Vec::new()
+            }
+        };
+        if let Some(secret_db) = &self.secret_db {
+            match secret_db.load_calibration_observations(REPLAY_LIMIT_PER_KEY) {
+                Ok(o) => observations.extend(o),
+                Err(e) => warn!(error = %e, "calibration load failed (secret db); using defaults"),
+            }
+        }
+        self.usage_calibrator.replay(&observations).await;
     }
 
     /// Resolves the database and archive root for the given conversation scope.
@@ -316,6 +340,7 @@ pub async fn build_app_state_with_path(
         turn_sender,
         runtime_status: Arc::clone(&runtime_status),
     });
+    state.warm_up_calibrator().await;
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);
 

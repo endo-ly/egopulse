@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 9;
+pub(super) const SCHEMA_VERSION: i64 = 10;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -639,6 +639,37 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 9;
     }
 
+    if version < 10 {
+        let tx = conn.unchecked_transaction()?;
+        // Idempotent: rollback tests re-run migrations on an already-current
+        // schema, so only add the columns when they are still missing.
+        let needs_columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(llm_usage_logs)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            !names.iter().any(|name| name == "estimated_tokens")
+        };
+        if needs_columns {
+            // Old rows predate the calibration columns and carry no raw prompt
+            // estimate to pair with their input_tokens. Drop them and add the
+            // new columns as NOT NULL rather than maintaining a NULL/fallback
+            // branch.
+            tx.execute_batch(
+                "DELETE FROM llm_usage_logs;
+                 ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE llm_usage_logs ADD COLUMN has_tools INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        set_schema_version_in_tx(
+            &tx,
+            10,
+            "add estimated_tokens and has_tools to llm_usage_logs for calibration rebuild",
+        )?;
+        tx.commit()?;
+        version = 10;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -646,7 +677,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 1;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 2;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -655,7 +686,7 @@ pub(super) const SECRET_SCHEMA_VERSION: i64 = 1;
 pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageError> {
     let mut version = schema_version(conn)?;
 
-    if version < SECRET_SCHEMA_VERSION {
+    if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -716,6 +747,35 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
             "initial secret schema: chats, messages, sessions, llm_usage_logs",
         )?;
         version = 1;
+    }
+
+    if version < 2 {
+        // Idempotent: rollback tests re-run migrations on an already-current
+        // schema, so only add the columns when they are still missing.
+        let needs_columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(llm_usage_logs)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            !names.iter().any(|name| name == "estimated_tokens")
+        };
+        if needs_columns {
+            // Old rows predate the calibration columns and carry no raw prompt
+            // estimate to pair with their input_tokens. Drop them and add the
+            // new columns as NOT NULL rather than maintaining a NULL/fallback
+            // branch.
+            conn.execute_batch(
+                "DELETE FROM llm_usage_logs;
+                 ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE llm_usage_logs ADD COLUMN has_tools INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        set_schema_version(
+            conn,
+            2,
+            "add estimated_tokens and has_tools to llm_usage_logs for calibration rebuild",
+        )?;
+        version = 2;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
@@ -1928,7 +1988,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("version");
-        assert_eq!(version.parse::<i64>().unwrap(), 9);
+        assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
 
         // Assert: existing snapshot preserved
         let count: i64 = conn

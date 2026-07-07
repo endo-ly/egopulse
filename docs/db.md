@@ -357,6 +357,8 @@ CREATE TABLE IF NOT EXISTS llm_usage_logs (
     output_tokens INTEGER NOT NULL,
     total_tokens INTEGER NOT NULL,
     request_kind TEXT NOT NULL DEFAULT 'agent_loop',
+    estimated_tokens INTEGER NOT NULL DEFAULT 0,
+    has_tools INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -378,10 +380,13 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_created
 | output_tokens | INTEGER | NOT NULL | 出力トークン数 |
 | total_tokens | INTEGER | NOT NULL | 合計トークン数（input + output） |
 | request_kind | TEXT | NOT NULL DEFAULT 'agent_loop' | リクエスト種別 |
+| estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（chars/3）。補正係数の再構築に使用 |
+| has_tools | INTEGER | NOT NULL DEFAULT 0 | tool 定義を含む payload か（0/1） |
 | created_at | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 
 **操作**:
-- `log_llm_usage(chat_id, caller_channel, provider, model, input_tokens, output_tokens, request_kind)` — INSERT（total_tokens は自動計算）
+- `log_llm_usage(chat_id, caller_channel, provider, model, input_tokens, output_tokens, request_kind, estimated_tokens, has_tools)` — INSERT（total_tokens は自動計算）
+- `load_calibration_observations(limit_per_key)` — 補正係数再構築用の観測を最近 N 件/キー取得（oldest-first）
 - `get_llm_usage_summary(chat_id, since)` — 集計サマリ（requests, input/output/total tokens, last_request_at）
 - `get_llm_usage_by_model(chat_id, since)` — モデル別集計（total_tokens 降順）
 

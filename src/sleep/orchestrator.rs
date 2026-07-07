@@ -1565,7 +1565,6 @@ async fn finalize_batch(
     {
         if run.input_tokens > 0 || run.output_tokens > 0 {
             let provider_name = ctx.provider.provider_name().to_string();
-            let model_name = ctx.provider.model_name().to_string();
             crate::runtime::metrics::inc_llm_tokens_total(
                 "input",
                 &provider_name,
@@ -1576,24 +1575,9 @@ async fn finalize_batch(
                 &provider_name,
                 run.output_tokens,
             );
-            let db_for_usage = Arc::clone(db);
-            let input_tokens = run.input_tokens;
-            let output_tokens = run.output_tokens;
-            tokio::spawn(async move {
-                let _ = crate::storage::call_blocking(db_for_usage, move |db| {
-                    db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                        chat_id: 0,
-                        caller_channel: "sleep_batch",
-                        provider: &provider_name,
-                        model: &model_name,
-                        input_tokens,
-                        output_tokens,
-                        request_kind: "sleep_batch",
-                    })
-                })
-                .await
-                .inspect_err(|e| warn!(error = %e, "sleep batch llm usage logging failed"));
-            });
+            // Per-call usage is logged by each sleep step's LLM call. The
+            // batch-level aggregate has no single prompt estimate to pair
+            // with, so it is not written to llm_usage_logs.
         }
     }
 

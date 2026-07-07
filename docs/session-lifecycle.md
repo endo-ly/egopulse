@@ -181,7 +181,7 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 推定は会話量の概算を出し、LLM レスポンスに含まれる実測 usage で補正する。実測が返る provider では、日本語や tool schema の影響で概算が小さく出る場合も、以後の判定が実際の使用量に近づく。
 
-まだ実測がない場合は、保守的に少し多めに見積もる。補正値は実行中のメモリだけに保持し、設定や DB には保存しない。外部 tokenizer も使わない。
+まだ実測がない場合（未知の provider/model の初回ターン等）は、保守係数 `DEFAULT_FACTOR`（1.3）を適用して少し多めに見積もる。補正値は `llm_usage_logs` に観測（生推定値 `estimated_tokens` と実測 `input_tokens` のペア）として永続化し、再起動時に最近 N 件から EMA で再構築する。これにより再起動後も学習済みの補正状態が維持され、コールドスタート時の過大 DEFAULT による誤発火を防ぐ。外部 tokenizer は使わない。
 
 ### Algorithm
 
