@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent_loop::formatting::is_tool_preview_message;
 use crate::storage::{SenderKind, StoredMessage, ToolCall, call_blocking};
@@ -138,21 +138,27 @@ pub(super) async fn get_history(
         }
     };
 
-    // Group tool calls by their parent message id so each card anchors
-    // right after the message that issued it, regardless of timestamp skew
-    // between the messages and tool_calls tables.
+    // Keep only tool calls whose parent message is in the fetched window:
+    // get_tool_calls_for_chat returns every row for the chat, but the
+    // history view is bounded by the message limit, so attaching older
+    // cards would pile them up at the end.
+    let message_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
     let mut tools_by_message: HashMap<&str, Vec<&ToolCall>> = HashMap::new();
     for tool_call in &tool_calls {
+        if !message_ids.contains(tool_call.message_id.as_str()) {
+            continue;
+        }
         tools_by_message
             .entry(tool_call.message_id.as_str())
             .or_default()
             .push(tool_call);
     }
 
-    // Order messages by timestamp and attach each tool card to its parent.
-    // Tool preview messages (no-narration `[tool_call]`, `[tool_result]:`,
-    // `[tool_error]:`) are hidden — they duplicate the cards or render
-    // empty in Markdown — but their slot still places the cards.
+    // Order messages by timestamp and attach each tool card to its parent,
+    // regardless of timestamp skew between the tables. Tool preview messages
+    // (no-narration `[tool_call]`, `[tool_result]:`, `[tool_error]:`) are
+    // hidden — they duplicate the cards or render empty in Markdown — but
+    // their slot still places the cards.
     let mut sorted_messages: Vec<&StoredMessage> = messages.iter().collect();
     sorted_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
@@ -175,14 +181,6 @@ pub(super) async fn get_history(
                 entries.push(tool_call_entry(tool_call));
             }
         }
-    }
-
-    // Tool calls whose parent message is missing (e.g. rotated out by the
-    // limit) fall back to timestamp order.
-    let mut orphan_tools: Vec<&ToolCall> = tools_by_message.into_values().flatten().collect();
-    orphan_tools.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    for tool_call in orphan_tools {
-        entries.push(tool_call_entry(tool_call));
     }
 
     let messages_json: Vec<serde_json::Value> = entries;
@@ -389,16 +387,26 @@ mod tests {
         db.store_message_only(&user_msg)
             .expect("store user message");
 
-        let tool_call = ToolCall {
+        // Tool calls are anchored to their issuing assistant message and carry
+        // a structured JSON payload (result/status), matching what
+        // format_tool_result persists.
+        let assistant_msg = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "読みます [tool_call] read".to_string(),
+        );
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant message");
+        db.store_tool_call(&ToolCall {
             id: "call-1".to_string(),
             chat_id,
-            message_id: user_msg.id.clone(),
+            message_id: assistant_msg.id.clone(),
             tool_name: "read".to_string(),
             tool_input: r#"{"path":"a.txt"}"#.to_string(),
-            tool_output: Some("file contents".to_string()),
+            tool_output: Some(r#"{"result":"file contents","status":"success"}"#.to_string()),
             timestamp: "2024-01-01T00:00:01Z".to_string(),
-        };
-        db.store_tool_call(&tool_call).expect("store tool call");
+        })
+        .expect("store tool call");
 
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
@@ -407,7 +415,7 @@ mod tests {
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
         let messages = body["messages"].as_array().expect("messages array");
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3, "user + assistant + tool card");
 
         let tool_message = messages
             .iter()
@@ -538,6 +546,63 @@ mod tests {
         assert_eq!(messages[1]["content"], "やります [tool_call] read");
         assert_eq!(messages[2]["message_kind"], "tool_call");
         assert_eq!(messages[2]["id"], "tool:call-1");
+    }
+
+    #[tokio::test]
+    async fn api_history_drops_tool_calls_outside_message_window() {
+        use crate::storage::ToolCall;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-window:agent:lyre", "lyre");
+
+        // An older assistant turn with its tool call, then several newer
+        // messages that push it out of a small history window.
+        let old_assistant = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "古いやります [tool_call] read".to_string(),
+        );
+        db.store_message_only(&old_assistant)
+            .expect("store old assistant");
+        db.store_tool_call(&ToolCall {
+            id: "old-tool".to_string(),
+            chat_id,
+            message_id: old_assistant.id.clone(),
+            tool_name: "read".to_string(),
+            tool_input: r#"{"path":"old.txt"}"#.to_string(),
+            tool_output: Some(r#"{"result":"old","status":"success"}"#.to_string()),
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .expect("store old tool");
+        for i in 0..3 {
+            db.store_message_only(&StoredMessage::user(
+                chat_id,
+                "user:web".to_string(),
+                format!("recent {i}"),
+            ))
+            .expect("store recent");
+        }
+
+        // limit=1 keeps only the newest message; the old turn (and its tool
+        // card) is outside the window and must not surface.
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: Some(1),
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let messages = result.0["messages"].as_array().expect("messages array");
+
+        let tool_ids: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["message_kind"] == "tool_call")
+            .map(|m| m["id"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !tool_ids.contains(&"tool:old-tool"),
+            "tool call outside the message window must not appear: {tool_ids:?}"
+        );
     }
 
     #[test]
