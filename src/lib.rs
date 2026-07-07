@@ -19,6 +19,7 @@ pub(crate) mod slash_commands;
 pub mod sleep;
 pub mod storage;
 pub(crate) mod tools;
+pub(crate) mod webhooks;
 
 #[cfg(test)]
 mod test_env;
