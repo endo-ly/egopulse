@@ -393,6 +393,7 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::turn::FakeProvider;
+    use crate::channels::adapter::ChannelRegistry;
     use crate::config::secret_ref::ResolvedValue;
     use crate::config::{
         AgentId, ChannelConfig, ChannelName, WebhookReceiverConfig, WebhookReceiverId,
@@ -400,6 +401,23 @@ mod tests {
     };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
+
+    struct NoopChannelAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl ChannelAdapter for NoopChannelAdapter {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
+            Vec::new()
+        }
+
+        async fn send_text(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn web_adapter_properties() {
@@ -629,48 +647,61 @@ mod tests {
         assert!(turn.ok);
     }
 
-    fn webhook_test_router(dir: &tempfile::TempDir) -> Router {
+    fn webhook_test_router_with_receivers(
+        dir: &tempfile::TempDir,
+        receivers: HashMap<WebhookReceiverId, WebhookReceiverConfig>,
+    ) -> Router {
         let mut config = test_config(dir.path().to_str().expect("state root"));
         config
             .channels
             .get_mut("web")
             .expect("web config")
             .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
-        config.webhooks = WebhooksConfig {
-            receivers: HashMap::from([
-                (
-                    WebhookReceiverId::new("egograph"),
-                    WebhookReceiverConfig {
-                        token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
-                        file_token: None,
-                        target: WebhookTargetConfig {
-                            channel: ChannelName::new("discord"),
-                            thread: "123".to_string(),
-                            agent: Some(AgentId::new("default")),
-                        },
-                    },
-                ),
-                (
-                    WebhookReceiverId::new("github"),
-                    WebhookReceiverConfig {
-                        token: Some(ResolvedValue::Literal("github-secret".to_string())),
-                        file_token: None,
-                        target: WebhookTargetConfig {
-                            channel: ChannelName::new("telegram"),
-                            thread: "-100".to_string(),
-                            agent: Some(AgentId::new("default")),
-                        },
-                    },
-                ),
-            ]),
-        };
-        let state = build_state_with_config(config, None, None, None, None);
+        config.webhooks = WebhooksConfig { receivers };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        registry.register(Arc::new(NoopChannelAdapter("telegram")));
+        let state = build_state_with_config(config, None, None, None, Some(Arc::new(registry)));
         build_router(WebState {
             config_path: None,
             app_state: Arc::new(state),
             run_hub: RunHub::default(),
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn default_webhook_receivers() -> HashMap<WebhookReceiverId, WebhookReceiverConfig> {
+        HashMap::from([
+            (
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("github"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("github-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("telegram"),
+                        thread: "-100".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ])
+    }
+
+    fn webhook_test_router(dir: &tempfile::TempDir) -> Router {
+        webhook_test_router_with_receivers(dir, default_webhook_receivers())
     }
 
     #[tokio::test]
@@ -764,5 +795,119 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_unregistered_or_voice_target_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receivers = HashMap::from([
+            (
+                WebhookReceiverId::new("bad-channel"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("missing"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("voice-target"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("voice"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ]);
+        let app = webhook_test_router_with_receivers(&dir, receivers);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/bad-channel")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let voice = app
+            .oneshot(
+                Request::post("/api/webhooks/voice-target")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(voice.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_missing_agent_and_blank_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receivers = HashMap::from([
+            (
+                WebhookReceiverId::new("bad-agent"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("nonexistent")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("blank-thread"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "   ".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ]);
+        let app = webhook_test_router_with_receivers(&dir, receivers);
+
+        let bad_agent = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/bad-agent")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bad_agent.status(), StatusCode::BAD_REQUEST);
+
+        let blank_thread = app
+            .oneshot(
+                Request::post("/api/webhooks/blank-thread")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(blank_thread.status(), StatusCode::BAD_REQUEST);
     }
 }

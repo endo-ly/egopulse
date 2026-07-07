@@ -58,6 +58,36 @@ pub(crate) async fn receive_webhook(
         );
     }
 
+    let target_channel = receiver.target.channel.as_str();
+    if target_channel == "voice" || state.app_state.channels.get(target_channel).is_none() {
+        return super::error::webhook_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "target channel is not active or is voice",
+        );
+    }
+
+    let agent_id = receiver
+        .target
+        .agent
+        .as_ref()
+        .unwrap_or(&state.app_state.config.default_agent);
+    if !state.app_state.config.agents.contains_key(agent_id) {
+        return super::error::webhook_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "target agent is not configured",
+        );
+    }
+
+    if target_channel != "web" && receiver.target.thread.trim().is_empty() {
+        return super::error::webhook_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "target thread is required for non-web channels",
+        );
+    }
+
     (
         StatusCode::ACCEPTED,
         axum::Json(json!({
