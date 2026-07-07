@@ -159,10 +159,16 @@ fn build_webhook_context(
         .as_ref()
         .unwrap_or(&config.default_agent);
 
+    let surface_thread = if target_channel == "web" {
+        crate::channels::web::web_session_key(&receiver.target.thread)
+    } else {
+        receiver.target.thread.trim().to_string()
+    };
+
     let mut context = SurfaceContext::new(
         target_channel.to_string(),
         format!("webhook:{receiver_id}"),
-        receiver.target.thread.clone(),
+        surface_thread,
         target_channel.to_string(),
         agent_id.to_string(),
     );
@@ -278,5 +284,34 @@ mod tests {
         let normal_config = test_config_with_discord_secret("123", false);
         let normal_context = build_webhook_context(&normal_config, &receiver_id, &receiver);
         assert_eq!(normal_context.scope, ConversationScope::Normal);
+    }
+
+    #[test]
+    fn webhook_web_target_normalizes_thread_like_web_session_key() {
+        let config = test_config_with_discord_secret("123", false);
+        let receiver_id = WebhookReceiverId::new("egograph");
+
+        for (input, expected) in [
+            ("web:main", "main"),
+            ("web:   ", "main"),
+            ("", "main"),
+            ("custom", "custom"),
+            ("  web:foo  ", "foo"),
+        ] {
+            let receiver = WebhookReceiverConfig {
+                token: None,
+                file_token: None,
+                target: WebhookTargetConfig {
+                    channel: ChannelName::new("web"),
+                    thread: input.to_string(),
+                    agent: Some(AgentId::new("default")),
+                },
+            };
+            let context = build_webhook_context(&config, &receiver_id, &receiver);
+            assert_eq!(
+                context.surface_thread, expected,
+                "web target thread '{input}' should normalize to '{expected}'"
+            );
+        }
     }
 }
