@@ -254,6 +254,17 @@ pub enum ConfigError {
     },
     #[error("invalid_backup_config: {0}")]
     InvalidBackupConfig(String),
+    #[error("invalid_webhook_receiver_id: {id}")]
+    InvalidWebhookReceiverId { id: String },
+    #[error("webhook_receiver_token_missing: {receiver_id}")]
+    WebhookReceiverTokenMissing { receiver_id: String },
+    #[error("webhook_target_channel_missing: {receiver_id}")]
+    WebhookTargetChannelMissing { receiver_id: String },
+    #[error("webhook_target_thread_required: {receiver_id} channel={channel}")]
+    WebhookTargetThreadRequired {
+        receiver_id: String,
+        channel: String,
+    },
 }
 
 /// TUI (Terminal User Interface) rendering and event errors.

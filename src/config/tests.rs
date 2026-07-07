@@ -407,6 +407,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -807,6 +808,7 @@ fn persists_agents_without_discord_config_surface() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -1590,6 +1592,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     // Act
@@ -2537,6 +2540,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -2805,6 +2809,7 @@ fn persist_preserves_sleep_batch_config() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -3216,6 +3221,7 @@ fn persist_preserves_sleep_batch_scheduler_config() {
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     };
 
     save_config_with_secrets(&config, &path).expect("save config");
@@ -3769,6 +3775,7 @@ fn minimal_config_with_channels(
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     }
 }
 
@@ -3847,6 +3854,7 @@ fn profile_config(
         pulse: super::PulseConfig::default(),
         db: super::DatabaseConfig::default(),
         web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
     }
 }
 
@@ -4503,4 +4511,139 @@ channels:
         .get(&-1009876543210i64)
         .expect("chat");
     assert!(!tc.secret, "telegram secret should default to false");
+}
+
+#[test]
+#[serial]
+fn webhook_receivers_config_resolves_declared_targets() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvVarGuard::set("HOME", temp_dir.path())
+        .also_set("EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN", "egograph-secret")
+        .also_set("EGOPULSE_WEBHOOK_GITHUB_TOKEN", "github-secret");
+
+    let body = format!(
+        r#"{sample}
+webhooks:
+  receivers:
+    egograph:
+      token:
+        source: env
+        id: EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN
+      target:
+        channel: discord
+        thread: "1234567890123456789"
+        agent: default
+    github:
+      token:
+        source: env
+        id: EGOPULSE_WEBHOOK_GITHUB_TOKEN
+      target:
+        channel: telegram
+        thread: "-1001234567890"
+        agent: default
+"#,
+        sample = sample_config()
+    );
+    let file_path = write_config(&temp_dir, &body);
+
+    let config = Config::load(Some(&file_path)).expect("load webhook config");
+
+    let receivers = config.webhook_receivers();
+    assert_eq!(receivers.len(), 2);
+
+    let egograph = receivers
+        .get(&crate::config::WebhookReceiverId::new("egograph"))
+        .expect("egograph receiver");
+    assert_eq!(
+        egograph.token.as_ref().expect("token").value(),
+        "egograph-secret"
+    );
+    assert_eq!(egograph.target.channel.as_str(), "discord");
+    assert_eq!(egograph.target.thread, "1234567890123456789");
+    assert_eq!(
+        egograph.target.agent.as_ref().expect("agent"),
+        &crate::config::AgentId::new("default")
+    );
+
+    let github = receivers
+        .get(&crate::config::WebhookReceiverId::new("github"))
+        .expect("github receiver");
+    assert_eq!(
+        github.token.as_ref().expect("token").value(),
+        "github-secret"
+    );
+    assert_eq!(github.target.channel.as_str(), "telegram");
+    assert_eq!(github.target.thread, "-1001234567890");
+}
+
+#[test]
+#[serial]
+fn webhook_receiver_requires_token_channel_and_non_web_thread() {
+    fn webhook_body(extra: &str) -> String {
+        format!(
+            "{sample}\nwebhooks:\n  receivers:\n{extra}",
+            sample = sample_config()
+        )
+    }
+
+    {
+        let missing_token = r#"    egograph:
+      target:
+        channel: discord
+        thread: "123"
+"#;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, &webhook_body(missing_token));
+        let error = Config::load(Some(&file_path)).expect_err("missing token");
+        assert!(matches!(
+            error,
+            ConfigError::WebhookReceiverTokenMissing { .. }
+        ));
+    }
+
+    {
+        let missing_channel = r#"    egograph:
+      token: some-token
+      target:
+        thread: "123"
+"#;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, &webhook_body(missing_channel));
+        let error = Config::load(Some(&file_path)).expect_err("empty channel");
+        assert!(matches!(
+            error,
+            ConfigError::WebhookTargetChannelMissing { .. }
+        ));
+    }
+
+    {
+        let discord_empty_thread = r#"    egograph:
+      token: some-token
+      target:
+        channel: discord
+"#;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, &webhook_body(discord_empty_thread));
+        let error = Config::load(Some(&file_path)).expect_err("discord empty thread");
+        assert!(matches!(
+            error,
+            ConfigError::WebhookTargetThreadRequired { .. }
+        ));
+    }
+
+    {
+        let web_empty_thread = r#"    egograph:
+      token: some-token
+      target:
+        channel: web
+"#;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("HOME", temp_dir.path());
+        let file_path = write_config(&temp_dir, &webhook_body(web_empty_thread));
+        let config = Config::load(Some(&file_path)).expect("web empty thread is allowed");
+        assert_eq!(config.webhook_receivers().len(), 1);
+    }
 }

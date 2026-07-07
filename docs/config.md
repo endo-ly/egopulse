@@ -18,6 +18,7 @@
    - [3.9 DB バックアップ設定](#39-db-バックアップ設定dbbackup)
    - [3.10 Web Fetch 設定](#310-web-fetch-設定web_fetch)
    - [3.11 エージェント定義](#311-エージェント定義agentsid)
+   - [3.12 Webhook 設定](#312-webhook-設定)
 4. [モデル解決チェーン](#4-モデル解決チェーン)
 5. [SecretRef（シークレット参照）](#5-secretrefシークレット参照)
 6. [環境変数オーバーライド](#6-環境変数オーバーライド)
@@ -454,6 +455,49 @@ agents:
         provider: openrouter
         model: gpt-4.1-mini
 ```
+
+---
+
+### 3.12 Webhook 設定
+
+外部イベントを trigger として受け取り、receiver ごとに設定した target channel 上で agent を行動させる。Webhook は会話チャネルではなく、`ChannelRegistry` にも登録されない。応答は target channel の通常配送経路で送信される。
+
+```yaml
+webhooks:
+  receivers:
+    egograph:
+      token:
+        source: env
+        id: EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN
+      target:
+        channel: discord
+        thread: "1234567890123456789"
+        agent: default
+
+    github:
+      token:
+        source: env
+        id: EGOPULSE_WEBHOOK_GITHUB_TOKEN
+      target:
+        channel: telegram
+        thread: "-1001234567890"
+        agent: reviewer
+```
+
+#### `webhooks.receivers.<id>`
+
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|:---:|---|---|
+| `token` | `SecretRef` | 必須 | なし | receiver 専用 Bearer token。SecretRef（§5）または文字列直接指定 |
+| `target.channel` | `string` | 必須 | なし | turn を投入する既存チャネル名（`discord` / `telegram` / `web`）。`voice` は不可 |
+| `target.thread` | `string` | 条件付き | なし | target channel 上の会話先 ID。`channel != "web"` の場合は必須。Web の空値は `main` に正規化 |
+| `target.agent` | `string` | 任意 | `default_agent` | 行動する agent ID |
+
+#### Target validation
+
+- `target.channel` は Config 上の `channels` 定義ではなく、起動中 `ChannelRegistry` の登録状態で判定する
+- `target.channel == "voice"` は対象外（Voice は同期 HTTP response を正規応答経路とするため）
+- Discord / Telegram target が `secret: true` の場合、`ConversationScope::Secret` に解決する
 
 ---
 

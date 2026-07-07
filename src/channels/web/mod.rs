@@ -367,6 +367,15 @@ fn build_router(web_state: WebState) -> Router {
             ))
     });
 
+    let webhook_routes = Router::new()
+        .route(
+            "/api/webhooks/{receiver_id}",
+            post(crate::webhooks::handler::receive_webhook),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::webhooks::handler::MAX_WEBHOOK_PAYLOAD_BYTES,
+        ));
+
     let mut app = Router::new()
         .route("/", get(index_html))
         .route("/ws", get(ws::ws_handler))
@@ -376,6 +385,7 @@ fn build_router(web_state: WebState) -> Router {
     if let Some(routes) = voice_routes {
         app = app.merge(routes);
     }
+    app = app.merge(webhook_routes);
     app.fallback(index_or_asset).with_state(web_state)
 }
 
@@ -387,9 +397,31 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::turn::FakeProvider;
-    use crate::config::{ChannelConfig, ChannelName};
+    use crate::channels::adapter::ChannelRegistry;
+    use crate::config::secret_ref::ResolvedValue;
+    use crate::config::{
+        AgentId, ChannelConfig, ChannelName, WebhookReceiverConfig, WebhookReceiverId,
+        WebhookTargetConfig, WebhooksConfig,
+    };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
+
+    struct NoopChannelAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl ChannelAdapter for NoopChannelAdapter {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
+            Vec::new()
+        }
+
+        async fn send_text(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn web_adapter_properties() {
@@ -617,5 +649,469 @@ mod tests {
         assert_eq!(turn.channel, "voice");
         assert_eq!(turn.agent_id, "default");
         assert!(turn.ok);
+    }
+
+    fn webhook_test_router_with_receivers(
+        dir: &tempfile::TempDir,
+        receivers: HashMap<WebhookReceiverId, WebhookReceiverConfig>,
+    ) -> Router {
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        config.webhooks = WebhooksConfig { receivers };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        registry.register(Arc::new(NoopChannelAdapter("telegram")));
+        let state = build_state_with_config(config, None, None, None, Some(Arc::new(registry)));
+        build_router(WebState {
+            config_path: None,
+            app_state: Arc::new(state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn default_webhook_receivers() -> HashMap<WebhookReceiverId, WebhookReceiverConfig> {
+        HashMap::from([
+            (
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("github"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("github-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("telegram"),
+                        thread: "-100".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ])
+    }
+
+    fn webhook_test_router(dir: &tempfile::TempDir) -> Router {
+        webhook_test_router_with_receivers(dir, default_webhook_receivers())
+    }
+
+    #[tokio::test]
+    async fn webhook_route_accepts_only_matching_receiver_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+        let other_receiver_token = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer github-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(other_receiver_token.status(), StatusCode::UNAUTHORIZED);
+
+        let web_token = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer web-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(web_token.status(), StatusCode::UNAUTHORIZED);
+
+        let no_token = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_unknown_receiver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/unknown")
+                    .header(header::AUTHORIZATION, "Bearer anything")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_payload_over_fixed_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let oversized = "x".repeat(64 * 1024 + 1);
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_unregistered_or_voice_target_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receivers = HashMap::from([
+            (
+                WebhookReceiverId::new("bad-channel"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("missing"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("voice-target"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("voice"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ]);
+        let app = webhook_test_router_with_receivers(&dir, receivers);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/bad-channel")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let voice = app
+            .oneshot(
+                Request::post("/api/webhooks/voice-target")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(voice.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_missing_agent_and_blank_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receivers = HashMap::from([
+            (
+                WebhookReceiverId::new("bad-agent"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("nonexistent")),
+                    },
+                },
+            ),
+            (
+                WebhookReceiverId::new("blank-thread"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "   ".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            ),
+        ]);
+        let app = webhook_test_router_with_receivers(&dir, receivers);
+
+        let bad_agent = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/bad-agent")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bad_agent.status(), StatusCode::BAD_REQUEST);
+
+        let blank_thread = app
+            .oneshot(
+                Request::post("/api/webhooks/blank-thread")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(blank_thread.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_route_accepts_and_enqueues_turn_without_waiting_for_completion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123456789".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let provider = FakeProvider {
+            responses: std::sync::Mutex::new(vec![MessagesResponse {
+                content: "Pipeline failure investigated.".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            }]),
+        };
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(provider)),
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let payload = serde_json::json!({
+            "source": "urn:egograph:pipelines",
+            "type": "egograph.pipelines.workflow_failed",
+            "data": {
+                "workflow_id": "test_workflow",
+                "run_id": "test_run",
+                "error_message": "test error"
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let turns = app_state.runtime_status.recent_turns();
+            if turns.iter().any(|t| t.channel == "discord" && t.ok) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("webhook turn was not enqueued within 5 seconds");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_route_is_not_protected_by_web_api_auth_middleware() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "webhook route must not be gated by web API auth middleware"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_turn_persists_to_target_session_without_channel_log_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "999888777".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let provider = FakeProvider {
+            responses: std::sync::Mutex::new(vec![MessagesResponse {
+                content: "Investigated.".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            }]),
+        };
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(provider)),
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let payload = serde_json::json!({
+            "source": "urn:egograph:pipelines",
+            "type": "egograph.pipelines.workflow_failed",
+            "data": { "workflow_id": "wf", "error_message": "err" }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let turns = app_state.runtime_status.recent_turns();
+            if turns.iter().any(|t| t.channel == "discord" && t.ok) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("webhook turn was not enqueued within 5 seconds");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let sessions = app_state.db.list_sessions().expect("list sessions");
+        let session = sessions
+            .iter()
+            .find(|s| s.channel == "discord" && s.surface_thread == "999888777")
+            .expect("target session");
+        let messages = app_state
+            .db
+            .get_all_messages(session.chat_id)
+            .expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[0]
+                .content
+                .contains("External webhook event from egograph.")
+        );
+        assert_eq!(messages[1].content, "Investigated.");
     }
 }
