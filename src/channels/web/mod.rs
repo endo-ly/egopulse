@@ -992,4 +992,27 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
+
+    #[tokio::test]
+    async fn webhook_route_is_not_protected_by_web_api_auth_middleware() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = webhook_test_router(&dir);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "webhook route must not be gated by web API auth middleware"
+        );
+    }
 }
