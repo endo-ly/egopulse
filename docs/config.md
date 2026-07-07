@@ -158,6 +158,7 @@ channels:
         agents: [alice, reviewer]
         multi_agent: true
         secret: true
+        tool_progress: true
 
   telegram:
     enabled: false

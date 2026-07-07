@@ -78,31 +78,11 @@ impl ToolProgressCoordinator {
             tokio::select! {
                 biased;
                 evt = evt_rx.recv() => match evt {
-                    None => {
+                    None | Some(AgentEvent::FinalResponse { .. }) => {
                         state.close().await;
                         return;
                     }
-                    Some(AgentEvent::ToolStart {
-                        name,
-                        call_id,
-                        ..
-                    }) => state.on_tool_start(call_id, name).await,
-                    Some(AgentEvent::ToolResult {
-                        name,
-                        is_error,
-                        duration_ms,
-                        call_id,
-                        ..
-                    }) => {
-                        state
-                            .on_tool_result(call_id, name, is_error, duration_ms)
-                            .await;
-                    }
-                    Some(AgentEvent::FinalResponse { .. }) => {
-                        state.close().await;
-                        return;
-                    }
-                    Some(_) => {}
+                    Some(event) => state.on_event(event).await,
                 },
                 _ = &mut delay_timer, if !state.delay_elapsed => {
                     state.delay_elapsed = true;
@@ -118,6 +98,10 @@ struct CoordinatorState {
     sink: Arc<dyn ToolProgressSink>,
     external_chat_id: String,
     log: ProgressLog,
+    /// ツールコール前に挟まれるアシスタント発言（`Delta`）の結合バッファ。
+    /// `ToolStart` 到着時に [`Self::flush_narration`] で累積ログへ確定する。
+    /// `Iteration` 到着時（前 iteration が最終応答だった場合）は破棄する。
+    pending_narration: String,
     display: Option<ActiveDisplay>,
     started: Instant,
     delay: Duration,
@@ -136,6 +120,7 @@ impl CoordinatorState {
             sink,
             external_chat_id,
             log: ProgressLog::default(),
+            pending_narration: String::new(),
             display: None,
             started: Instant::now(),
             delay,
@@ -144,20 +129,35 @@ impl CoordinatorState {
         }
     }
 
-    async fn on_tool_start(&mut self, call_id: String, name: String) {
-        self.log.start(call_id, name);
-        self.refresh_display().await;
+    /// イベント 1 件を処理して進捗表示を更新する。
+    /// 終了系（EOF / `FinalResponse`）は [`ToolProgressCoordinator::run`] で処理済み。
+    async fn on_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Delta { text } => self.pending_narration.push_str(&text),
+            AgentEvent::Iteration { .. } => self.pending_narration.clear(),
+            AgentEvent::ToolStart { name, call_id, .. } => {
+                self.flush_narration();
+                self.log.start(call_id, name);
+                self.refresh_display().await;
+            }
+            AgentEvent::ToolResult {
+                name,
+                is_error,
+                duration_ms,
+                call_id,
+                ..
+            } => {
+                self.log.finish(&call_id, &name, is_error, duration_ms);
+                self.refresh_display().await;
+            }
+            AgentEvent::Error { .. } | AgentEvent::FinalResponse { .. } => {}
+        }
     }
 
-    async fn on_tool_result(
-        &mut self,
-        call_id: String,
-        name: String,
-        is_error: bool,
-        duration_ms: u128,
-    ) {
-        self.log.finish(&call_id, &name, is_error, duration_ms);
-        self.refresh_display().await;
+    /// 保留中の narration を累積ログへ確定する。空白のみは無視される。
+    fn flush_narration(&mut self) {
+        let pending = std::mem::take(&mut self.pending_narration);
+        self.log.push_narration(pending);
     }
 
     /// 表示中なら間引き update、遅延閾値超過なら初回 begin、それ以外は保留する。
@@ -246,27 +246,45 @@ impl ActiveDisplay {
 }
 
 /// ツール実行の累積ログ。本文ビルドに使う情報のみを保持する。
+/// narration（アシスタント発言）と tool を時系列で混在させる。
 #[derive(Default)]
 struct ProgressLog {
-    entries: Vec<ToolEntry>,
+    lines: Vec<LogLine>,
+}
+
+/// 累積ログの1行。
+enum LogLine {
+    /// アシスタントの発言（ツールコール前に挟む一言）。
+    Narration(String),
+    /// ツール実行エントリ。
+    Tool(ToolEntry),
 }
 
 impl ProgressLog {
     /// 実行中（未完了）のツールエントリがあるか。
     fn has_running(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| matches!(e.status, ToolStatus::Running))
+        self.lines.iter().any(|line| match line {
+            LogLine::Tool(entry) => matches!(entry.status, ToolStatus::Running),
+            LogLine::Narration(_) => false,
+        })
     }
 
     /// 実行中ツールを末尾に追加する。
     fn start(&mut self, call_id: String, name: String) {
-        self.entries.push(ToolEntry {
+        self.lines.push(LogLine::Tool(ToolEntry {
             name,
             call_id,
             status: ToolStatus::Running,
             duration_ms: None,
-        });
+        }));
+    }
+
+    /// アシスタントの発言を末尾に追加する。空白のみは無視する。
+    fn push_narration(&mut self, text: String) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            self.lines.push(LogLine::Narration(trimmed.to_string()));
+        }
     }
 
     /// 同じ `call_id` の実行中エントリを完了/エラーに遷移させる。
@@ -278,42 +296,48 @@ impl ProgressLog {
         } else {
             ToolStatus::Done
         };
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .rev()
-            .find(|e| e.call_id == call_id && matches!(e.status, ToolStatus::Running))
-        {
+        let matched = self.lines.iter_mut().rev().find_map(|line| match line {
+            LogLine::Tool(entry)
+                if entry.call_id == call_id && matches!(entry.status, ToolStatus::Running) =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        });
+        if let Some(entry) = matched {
             entry.status = status;
             entry.duration_ms = Some(duration_ms);
         } else {
-            self.entries.push(ToolEntry {
+            self.lines.push(LogLine::Tool(ToolEntry {
                 name: name.to_string(),
                 call_id: call_id.to_string(),
                 status,
                 duration_ms: Some(duration_ms),
-            });
+            }));
         }
     }
 
     /// 累積ログ本文を構築する。`input` / `preview` は絶対に含めない。
     fn render(&self) -> String {
-        let mut lines: Vec<String> = Vec::with_capacity(self.entries.len() + 1);
+        let mut lines: Vec<String> = Vec::with_capacity(self.lines.len() + 1);
         lines.push("tools running...".to_string());
-        for entry in &self.entries {
-            lines.push(match entry.status {
-                ToolStatus::Running => format!("... {}", entry.name),
-                ToolStatus::Done => {
-                    format!("✓ {} ({})", entry.name, format_duration(entry.duration_ms))
-                }
-                ToolStatus::Error => {
-                    format!(
-                        "✗ {} ({}) エラー",
-                        entry.name,
-                        format_duration(entry.duration_ms)
-                    )
-                }
-            });
+        for line in &self.lines {
+            match line {
+                LogLine::Narration(text) => lines.push(format!("💬 {text}")),
+                LogLine::Tool(entry) => lines.push(match entry.status {
+                    ToolStatus::Running => format!("... {}", entry.name),
+                    ToolStatus::Done => {
+                        format!("✓ {} ({})", entry.name, format_duration(entry.duration_ms))
+                    }
+                    ToolStatus::Error => {
+                        format!(
+                            "✗ {} ({}) エラー",
+                            entry.name,
+                            format_duration(entry.duration_ms)
+                        )
+                    }
+                }),
+            }
         }
         lines.join("\n")
     }
@@ -404,6 +428,40 @@ mod tests {
         }
     }
 
+    /// モック sink と、呼び出し記録・`begin` 完了通知を生成する。
+    fn mock_sink() -> (
+        Arc<dyn ToolProgressSink>,
+        Arc<Mutex<ProgressCalls>>,
+        Arc<Notify>,
+    ) {
+        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
+        let notify = Arc::new(Notify::new());
+        let sink: Arc<dyn ToolProgressSink> =
+            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        (sink, calls, notify)
+    }
+
+    /// 入力を持たない `ToolStart` を生成する。
+    fn tool_start(call_id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolStart {
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            call_id: call_id.to_string(),
+        }
+    }
+
+    /// preview 空の `ToolResult` を生成する。
+    fn tool_result(call_id: &str, name: &str, is_error: bool, duration_ms: u128) -> AgentEvent {
+        AgentEvent::ToolResult {
+            name: name.to_string(),
+            is_error,
+            preview: String::new(),
+            duration_ms,
+            call_id: call_id.to_string(),
+        }
+    }
+
+    /// 記録をスナップショットしてクリアする（間引き途中観察用）。
     fn drain_calls(calls: &Arc<Mutex<ProgressCalls>>) -> ProgressCalls {
         let snapshot = calls.lock().unwrap().clone();
         *calls.lock().unwrap() = ProgressCalls::default();
@@ -430,6 +488,8 @@ mod tests {
         (tx, handle)
     }
 
+    // === 投稿制御: いつ初回 begin を投稿するか ===
+
     #[tokio::test]
     async fn coordinator_noop_when_sink_none() {
         // Arrange
@@ -437,12 +497,7 @@ mod tests {
             spawn_coordinator(None, Duration::from_secs(5), Duration::from_millis(800));
 
         // Act: send events then close the stream
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
             text: "done".to_string(),
         })
@@ -455,12 +510,8 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_no_post_below_delay_threshold() {
-        // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
-        // Fast turn: delay is long so the timer cannot fire before EOF.
+        // Arrange: fast turn — delay is long so the timer cannot fire before EOF.
+        let (sink, calls, _notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_secs(30),
@@ -468,20 +519,8 @@ mod tests {
         );
 
         // Act: tool starts and finishes immediately, then the stream ends.
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolResult {
-            name: "read".to_string(),
-            is_error: false,
-            preview: "SECRET".to_string(),
-            duration_ms: 10,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tx.send(tool_result("read", "read", false, 10)).unwrap();
         drop(tx);
         let () = handle.await.unwrap();
 
@@ -497,10 +536,7 @@ mod tests {
         // Arrange: a tool starts and finishes fast, then the delay timer fires
         // while the (slow) final-response generation is still going. The timer
         // must NOT post progress because no tool is running at that point.
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (sink, calls, _notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(40),
@@ -508,20 +544,8 @@ mod tests {
         );
 
         // Act: fast tool completes well before the delay timer fires.
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolResult {
-            name: "read".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 5,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tx.send(tool_result("read", "read", false, 5)).unwrap();
         // Wait past the delay deadline so the timer definitely fires.
         tokio::time::sleep(Duration::from_millis(120)).await;
         drop(tx);
@@ -539,12 +563,8 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_begins_on_delay_timer_for_long_tool() {
-        // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
-        // Small delay so the timer fires quickly while the tool is still running.
+        // Arrange: small delay so the timer fires quickly while the tool runs.
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(40),
@@ -552,12 +572,7 @@ mod tests {
         );
 
         // Act: a single long-running tool starts (no result yet) and the delay timer fires.
-        tx.send(AgentEvent::ToolStart {
-            name: "web_fetch".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "web_fetch".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("web_fetch", "web_fetch")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin should fire on delay timer");
@@ -572,13 +587,12 @@ mod tests {
         let () = handle.await.unwrap();
     }
 
+    // === 累積ログ: 本文の中身 ===
+
     #[tokio::test]
     async fn coordinator_builds_cumulative_log() {
         // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(20),
@@ -586,29 +600,12 @@ mod tests {
         );
 
         // Act: tool A starts, delay elapses and begin fires, then B starts and A finishes.
-        tx.send(AgentEvent::ToolStart {
-            name: "bash".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("bash", "bash")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolResult {
-            name: "bash".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 1800,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tx.send(tool_result("bash", "bash", false, 1800)).unwrap();
         // Allow the (throttled) state to flush on close.
         drop(tx);
         let () = handle.await.unwrap();
@@ -630,11 +627,8 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_body_excludes_tool_input_and_preview() {
-        // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        // Arrange: secrets are passed via input/preview to prove they never render.
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(20),
@@ -687,12 +681,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_matches_tool_result_by_call_id_not_name() {
+        // Arrange: two read-only tools with the same name run concurrently, each
+        // with a distinct call_id. The second one finishes first; its result
+        // must attach to the correct entry, not the most-recent same-name entry.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        tx.send(tool_start("call-A", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        tx.send(tool_start("call-B", "read")).unwrap();
+        // call-B finishes first (out of order); only it is marked done.
+        tx.send(tool_result("call-B", "read", false, 42)).unwrap();
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: exactly one completed read (call-B) and one still-running read (call-A).
+        let snapshot = calls.lock().unwrap().clone();
+        let final_body = snapshot.updates.last().expect("at least one update");
+        let done_count = final_body.matches("✓ read").count();
+        let running_count = final_body.matches("... read").count();
+        assert_eq!(done_count, 1, "exactly one completed read: {final_body}");
+        assert_eq!(
+            running_count, 1,
+            "exactly one still-running read: {final_body}"
+        );
+    }
+
+    // === ライフサイクル: close と間引き ===
+
+    #[tokio::test]
     async fn coordinator_closes_on_event_stream_eof() {
         // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(20),
@@ -700,12 +727,7 @@ mod tests {
         );
 
         // Act: drive into the active state, then drop the sender (EOF) without FinalResponse.
-        tx.send(AgentEvent::ToolStart {
-            name: "bash".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("bash", "bash")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
@@ -720,12 +742,8 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_throttles_updates_within_interval() {
-        // Arrange
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
-        // Long throttle window so a rapid burst cannot sneak in a second edit.
+        // Arrange: long throttle window so a rapid burst cannot sneak in a second edit.
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(20),
@@ -733,37 +751,13 @@ mod tests {
         );
 
         // Act: begin, then a rapid burst of state-changing events.
-        tx.send(AgentEvent::ToolStart {
-            name: "bash".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("bash", "bash")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
-        tx.send(AgentEvent::ToolResult {
-            name: "bash".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 100,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolResult {
-            name: "read".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 50,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_result("bash", "bash", false, 100)).unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tx.send(tool_result("read", "read", false, 50)).unwrap();
         // Keep the burst well inside the throttle window before observing.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mid = drain_calls(&calls);
@@ -781,70 +775,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_matches_tool_result_by_call_id_not_name() {
-        // Arrange: two read-only tools with the same name run concurrently, each
-        // with a distinct call_id. The second one finishes first; its result
-        // must attach to the correct entry, not the most-recent same-name entry.
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
-        let (tx, handle) = spawn_coordinator(
-            Some(sink),
-            Duration::from_millis(20),
-            Duration::from_millis(800),
-        );
-
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "call-A".to_string(),
-        })
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), notify.notified())
-            .await
-            .expect("begin");
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "call-B".to_string(),
-        })
-        .unwrap();
-        // call-B finishes first (out of order); only it is marked done.
-        tx.send(AgentEvent::ToolResult {
-            name: "read".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 42,
-            call_id: "call-B".to_string(),
-        })
-        .unwrap();
-        drop(tx);
-        let () = handle.await.unwrap();
-
-        // Assert: the final body shows exactly one completed read (call-B) and one
-        // still-running read (call-A). Name-based matching would have completed the
-        // most-recent entry regardless, but here only call-B is done.
-        let snapshot = calls.lock().unwrap().clone();
-        let final_body = snapshot.updates.last().expect("at least one update");
-        let done_count = final_body.matches("✓ read").count();
-        let running_count = final_body.matches("... read").count();
-        assert_eq!(done_count, 1, "exactly one completed read: {final_body}");
-        assert_eq!(
-            running_count, 1,
-            "exactly one still-running read: {final_body}"
-        );
-    }
-
-    #[tokio::test]
     async fn coordinator_keeps_single_progress_across_continuous_stream() {
         // Arrange: simulates a turn whose events flow continuously across what the
         // wiring treats as multiple retry attempts (no FinalResponse until the end).
         // The coordinator must keep a single progress message for the whole stream.
-        let calls = Arc::new(Mutex::new(ProgressCalls::default()));
-        let notify = Arc::new(Notify::new());
-        let sink: Arc<dyn ToolProgressSink> =
-            MockSink::new(Arc::clone(&calls), Arc::clone(&notify));
+        let (sink, calls, notify) = mock_sink();
         let (tx, handle) = spawn_coordinator(
             Some(sink),
             Duration::from_millis(20),
@@ -852,30 +787,13 @@ mod tests {
         );
 
         // Act: attempt-1-like burst, then attempt-2-like burst, then EOF.
-        tx.send(AgentEvent::ToolStart {
-            name: "bash".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "bash".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("bash", "bash")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
         // A "retry" happens: more tool events arrive without a FinalResponse.
-        tx.send(AgentEvent::ToolStart {
-            name: "read".to_string(),
-            input: serde_json::Value::Null,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolResult {
-            name: "read".to_string(),
-            is_error: false,
-            preview: String::new(),
-            duration_ms: 5,
-            call_id: "read".to_string(),
-        })
-        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tx.send(tool_result("read", "read", false, 5)).unwrap();
         drop(tx);
         let () = handle.await.unwrap();
 
@@ -887,5 +805,209 @@ mod tests {
             "single begin across the whole stream"
         );
         assert_eq!(snapshot.closes, 1, "closed exactly once");
+    }
+
+    // === narration: アシスタントの「一言」表示 ===
+
+    #[tokio::test]
+    async fn coordinator_shows_narration_before_tool() {
+        // Arrange: the LLM streams a short narration, then invokes a tool.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act: Delta chunks stream the narration, then a tool starts.
+        tx.send(AgentEvent::Delta {
+            text: "ファイルを".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::Delta {
+            text: "確認します".to_string(),
+        })
+        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: the narration (concatenated) appears above the tool line.
+        let snapshot = calls.lock().unwrap().clone();
+        let body = snapshot.begins.first().expect("begin posted");
+        assert!(
+            body.contains("💬 ファイルを確認します"),
+            "narration missing: {body}"
+        );
+        assert!(body.contains("... read"), "tool line missing: {body}");
+        // narration precedes the tool in the rendered body.
+        let narration_idx = body.find("💬").unwrap();
+        let tool_idx = body.find("... read").unwrap();
+        assert!(
+            narration_idx < tool_idx,
+            "narration must precede tool: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_skips_narration_for_plain_tool_call() {
+        // Arrange: a tool starts with no preceding narration.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act
+        tx.send(tool_start("read", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: no narration line when the LLM emitted no Delta.
+        let snapshot = calls.lock().unwrap().clone();
+        let body = snapshot.begins.first().expect("begin posted");
+        assert!(!body.contains('💬'), "unexpected narration: {body}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_skips_final_response_narration() {
+        // Arrange: the final response is streamed as Delta, then FinalResponse arrives.
+        // The narration must NOT appear because it duplicates the final response.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act: drive into the active state first (so a progress message exists),
+        // then the final-response narration is streamed and the turn ends.
+        tx.send(tool_start("bash", "bash")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        tx.send(AgentEvent::Delta {
+            text: "完了した結果をお伝えします".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::FinalResponse {
+            text: "完了した結果をお伝えします".to_string(),
+        })
+        .unwrap();
+        let () = handle.await.unwrap();
+
+        // Assert: the final-response narration is discarded (no 💬 line).
+        let snapshot = calls.lock().unwrap().clone();
+        let bodies: Vec<&str> = snapshot
+            .begins
+            .iter()
+            .chain(snapshot.updates.iter())
+            .map(String::as_str)
+            .collect();
+        assert!(
+            bodies.iter().all(|b| !b.contains('💬')),
+            "final-response narration leaked: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_keeps_narrations_across_iterations() {
+        // Arrange: two tool iterations each preceded by a narration. The delay
+        // timer fires once so a single progress message accumulates both lines.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act: iteration 1 (narration + tool + result), then iteration 2 likewise.
+        tx.send(AgentEvent::Iteration { iteration: 1 }).unwrap();
+        tx.send(AgentEvent::Delta {
+            text: "まず確認します".to_string(),
+        })
+        .unwrap();
+        tx.send(tool_start("call-1", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        tx.send(tool_result("call-1", "read", false, 5)).unwrap();
+        tx.send(AgentEvent::Iteration { iteration: 2 }).unwrap();
+        tx.send(AgentEvent::Delta {
+            text: "次に実行します".to_string(),
+        })
+        .unwrap();
+        tx.send(tool_start("call-2", "bash")).unwrap();
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: both narrations appear, in iteration order.
+        let snapshot = calls.lock().unwrap().clone();
+        let body = snapshot
+            .updates
+            .last()
+            .or(snapshot.begins.last())
+            .expect("at least one body");
+        assert!(
+            body.contains("💬 まず確認します"),
+            "narration 1 missing: {body}"
+        );
+        assert!(
+            body.contains("💬 次に実行します"),
+            "narration 2 missing: {body}"
+        );
+        let n1 = body.find("💬 まず確認します").unwrap();
+        let n2 = body.find("💬 次に実行します").unwrap();
+        assert!(n1 < n2, "narrations out of order: {body}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_discards_pending_narration_on_iteration_change() {
+        // Arrange: iteration 1 streams a narration but ends without a ToolStart
+        // (treated as not-yet-final). The pending narration must be discarded on
+        // the next Iteration so it does not leak into iteration 2's narration.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act: iteration 1 narration, then iteration 2 begins and reaches a tool.
+        tx.send(AgentEvent::Iteration { iteration: 1 }).unwrap();
+        tx.send(AgentEvent::Delta {
+            text: "破棄されるべき".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::Iteration { iteration: 2 }).unwrap();
+        tx.send(AgentEvent::Delta {
+            text: "残るべき".to_string(),
+        })
+        .unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: only iteration 2's narration survived.
+        let snapshot = calls.lock().unwrap().clone();
+        let body = snapshot.begins.first().expect("begin posted");
+        assert!(
+            !body.contains("破棄されるべき"),
+            "stale narration leaked: {body}"
+        );
+        assert!(
+            body.contains("💬 残るべき"),
+            "fresh narration missing: {body}"
+        );
     }
 }
