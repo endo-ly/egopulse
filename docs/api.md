@@ -340,7 +340,14 @@ GET /api/history?session_key=main&limit=100
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
-メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。ツール呼び出し履歴は `tool_calls` テーブルから復元し、発行元のアシスタントメッセージ（`message_id` で紐付け）の直後に配置する。両テーブルのタイムスタンプは保存タイミングのズレ（Pulse/Sleep 実行などで顕著）で逆転し得るため、時系列ではなく親子関係で順序を保証する（LLM コンテキストには含まれない）。
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。
+
+エントリの並び順は次の 2 層で決まる:
+
+1. `messages` を `timestamp` 昇順にソートする
+2. 各メッセージの直後に、それを親（`tool_calls.message_id`）とするツール呼び出しを `timestamp` 昇順で挿入する
+
+これにより、`tool_calls` と発行元メッセージ間の timestamp ズレによらずツールカードは親メッセージの直後に固定される。`messages` 同士の順序は timestamp に依存するため、一括永続化パス（Pulse など）では永続化の都度新鮮な timestamp を採番し、保存順と時系列順が一致するよう保証している。いずれの履歴も LLM コンテキストには含まれない。
 
 ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言内容を残すために返却される。
 
