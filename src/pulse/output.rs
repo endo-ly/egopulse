@@ -22,7 +22,7 @@ use crate::pulse::capsule::HomeSurface;
 use crate::pulse::definition::{TemporalIntention, format_schedule};
 use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
-use crate::storage::{MessageKind, PulseOutputKind, SenderKind, StoredMessage};
+use crate::storage::{MessageKind, PulseOutputKind, StoredMessage};
 
 /// Result of output handling.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,19 +239,17 @@ async fn persist_notification_with_session(
     chat_id: i64,
     activation_result: &ActivationResult,
 ) -> Result<String, EgoPulseError> {
-    let now = chrono::Utc::now().to_rfc3339();
     let output_text = &activation_result.output_text;
 
-    let synthetic_content = format_synthetic_content(intention);
     let synthetic_input = StoredMessage {
         id: format!("pulse-in-{}", uuid::Uuid::new_v4()),
-        chat_id,
         sender_id: "pulse".to_string(),
-        content: synthetic_content.clone(),
-        sender_kind: SenderKind::User,
-        timestamp: now.clone(),
         message_kind: MessageKind::SystemEvent,
-        recipient_agent_id: None,
+        ..StoredMessage::user(
+            chat_id,
+            "pulse".to_string(),
+            format_synthetic_content(intention),
+        )
     };
 
     let loaded = crate::agent_loop::session::load_messages_for_turn(
@@ -286,13 +284,11 @@ async fn persist_notification_with_session(
             ConversationScope::Normal,
             StoredMessage {
                 id: phase.assistant_message_id.clone(),
-                chat_id,
-                sender_id: agent_id.to_string(),
-                content: phase.assistant_preview.clone(),
-                sender_kind: SenderKind::Assistant,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                message_kind: MessageKind::Message,
-                recipient_agent_id: None,
+                ..StoredMessage::assistant(
+                    chat_id,
+                    agent_id.to_string(),
+                    phase.assistant_preview.clone(),
+                )
             },
             phase.assistant_message.clone(),
             &session_messages,
@@ -314,16 +310,11 @@ async fn persist_notification_with_session(
                 ConversationScope::Normal,
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
-                    chat_id,
-                    sender_id: agent_id.to_string(),
-                    content: truncate_by_chars(
-                        &phase.tool_result_preview,
-                        MAX_TOOL_RESULT_TEXT_CHARS,
-                    ),
-                    sender_kind: SenderKind::Assistant,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    message_kind: MessageKind::Message,
-                    recipient_agent_id: None,
+                    ..StoredMessage::assistant(
+                        chat_id,
+                        agent_id.to_string(),
+                        truncate_by_chars(&phase.tool_result_preview, MAX_TOOL_RESULT_TEXT_CHARS),
+                    )
                 },
                 phase.tool_messages.clone(),
                 &session_messages,
@@ -338,13 +329,7 @@ async fn persist_notification_with_session(
     let assistant_id = format!("pulse-out-{}", uuid::Uuid::new_v4());
     let assistant_msg = StoredMessage {
         id: assistant_id.clone(),
-        chat_id,
-        sender_id: agent_id.to_string(),
-        content: output_text.to_string(),
-        sender_kind: SenderKind::Assistant,
-        timestamp: now,
-        message_kind: MessageKind::Message,
-        recipient_agent_id: None,
+        ..StoredMessage::assistant(chat_id, agent_id.to_string(), output_text.to_string())
     };
 
     session_messages.push(Message::text("assistant", output_text));
@@ -756,6 +741,45 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].message_id, "assistant-tool-1");
         assert!(tool_calls[0].tool_output.is_some());
+
+        let synthetic = messages
+            .iter()
+            .find(|message| message.content.starts_with("[Pulse: tool_phase_test]"))
+            .expect("synthetic input persisted");
+        let tool_phase_assistant = messages
+            .iter()
+            .find(|message| message.id == "assistant-tool-1")
+            .expect("tool phase assistant persisted");
+        let tool_result = messages
+            .iter()
+            .find(|message| message.content == "ok")
+            .expect("tool result persisted");
+        let final_response = messages
+            .iter()
+            .find(|message| message.content == notification_text)
+            .expect("final response persisted");
+
+        assert!(
+            synthetic.timestamp <= tool_phase_assistant.timestamp,
+            "synthetic must not follow tool phase assistant: {} > {}",
+            synthetic.timestamp,
+            tool_phase_assistant.timestamp
+        );
+        assert!(
+            tool_phase_assistant.timestamp <= tool_result.timestamp,
+            "tool phase assistant must not follow tool result: {} > {}",
+            tool_phase_assistant.timestamp,
+            tool_result.timestamp
+        );
+        assert!(
+            tool_result.timestamp <= final_response.timestamp,
+            "final response must not precede tool result. \
+             Regression: reusing an earlier timestamp would let /api/history's \
+             timestamp sort pull the final response ahead of the tool cards. \
+             tool_result={}, final_response={}",
+            tool_result.timestamp,
+            final_response.timestamp
+        );
     }
 
     #[tokio::test]
