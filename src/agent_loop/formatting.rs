@@ -4,53 +4,16 @@ use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 use crate::storage::{SenderKind, StoredMessage};
 
-const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 pub(crate) fn format_tool_result(
     tool_call: &ToolCall,
     result: &crate::tools::ToolResult,
 ) -> String {
-    let mut content = result.content.clone();
-    let details = result.details.clone();
-
-    loop {
-        let serialized =
-            serialize_tool_payload(tool_call, result.is_error, &content, details.as_ref());
-        let char_count = serialized.chars().count();
-
-        if char_count <= MAX_TOOL_RESULT_CHARS {
-            return serialized;
-        }
-
-        if let Some(serialized_without_details) = details
-            .as_ref()
-            .map(|_| serialize_tool_payload(tool_call, result.is_error, &content, None))
-            .filter(|serialized| serialized.chars().count() <= MAX_TOOL_RESULT_CHARS)
-        {
-            return serialized_without_details;
-        }
-
-        let excess = char_count.saturating_sub(MAX_TOOL_RESULT_CHARS);
-        let current_content_len = content.chars().count();
-        let new_len = current_content_len.saturating_sub(excess + 100);
-        if new_len == 0 {
-            return serialize_tool_payload(tool_call, result.is_error, "...", None);
-        }
-        content = format!("{}...", content.chars().take(new_len).collect::<String>());
-    }
-}
-
-fn serialize_tool_payload(
-    tool_call: &ToolCall,
-    is_error: bool,
-    content: &str,
-    details: Option<&serde_json::Value>,
-) -> String {
     let mut payload = serde_json::json!({
         "tool": tool_call.name,
-        "status": if is_error { "error" } else { "success" },
-        "result": content,
+        "status": if result.is_error { "error" } else { "success" },
+        "result": &result.content,
     });
-    if let Some(details) = details {
+    if let Some(details) = &result.details {
         payload["details"] = details.clone();
     }
     payload.to_string()

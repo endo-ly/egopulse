@@ -434,8 +434,21 @@ impl McpManager {
             }
         };
 
-        Ok(format_mcp_tool_result(result))
+        let output = format_mcp_tool_result(result);
+        Ok(truncate_to_max_bytes(output))
     }
+}
+
+fn truncate_to_max_bytes(output: String) -> String {
+    let max = super::DEFAULT_MAX_BYTES;
+    if output.len() <= max {
+        return output;
+    }
+    let mut cut = max;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n... (output truncated to {max} bytes)", &output[..cut])
 }
 
 fn format_mcp_tool_result(result: CallToolResult) -> String {
@@ -888,5 +901,41 @@ mod tests {
                 .and_then(|a| a.read_only_hint),
             None
         );
+    }
+
+    #[test]
+    fn truncate_to_max_bytes_preserves_output_under_limit() {
+        let output = "hello world".to_string();
+        assert_eq!(truncate_to_max_bytes(output.clone()), output);
+    }
+
+    #[test]
+    fn truncate_to_max_bytes_preserves_output_at_exact_boundary() {
+        let max = super::super::DEFAULT_MAX_BYTES;
+        let exactly_at_limit = "a".repeat(max);
+        assert_eq!(
+            truncate_to_max_bytes(exactly_at_limit.clone()),
+            exactly_at_limit
+        );
+    }
+
+    #[test]
+    fn truncate_to_max_bytes_truncates_output_over_limit() {
+        let max = super::super::DEFAULT_MAX_BYTES;
+        let large = "a".repeat(max + 1000);
+        let result = truncate_to_max_bytes(large);
+        let notice = format!("\n... (output truncated to {max} bytes)");
+        assert!(result.ends_with(&notice));
+        let content = &result[..result.len() - notice.len()];
+        assert!(content.len() <= max);
+    }
+
+    #[test]
+    fn truncate_to_max_bytes_preserves_utf8_boundaries() {
+        let large = "あ".repeat(20_000);
+        let result = truncate_to_max_bytes(large);
+        assert!(result.contains("... (output truncated to"));
+        let first_line = result.lines().next().expect("content before notice");
+        assert!(first_line.chars().all(|c| c == 'あ'));
     }
 }
