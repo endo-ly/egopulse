@@ -321,7 +321,7 @@ persist_user_turn_with_compaction / tool 後 maybe_compact_messages
 
 ## 11. 未解決 / 保留
 
-- **`DEFAULT_FACTOR` の値**: 1.3 に調整。永続化により DEFAULT に頼るのは未知の provider/model の初回のみとなったため、過大だった 1.6 から引き下げた。
+- **`DEFAULT_FACTOR` の値**: 1.3。未知の provider/model の初回ターンのみ適用される。
 - **EMA の重み α**: 0.3 で妥当か。収束速度とスパイク耐性のトレードオフを実データで調整。
 - **クリップ範囲 `[0.5, 3.0]`**: 実データで不適切（広すぎる/狭すぎる）なら調整。
 - **`sleep/orchestrator.rs` の `context_tokens`**: `resolve_context_window_tokens` の戻り値（設定値そのもの）を使用している場合は本プランの影響なし。実装修正時に確認。

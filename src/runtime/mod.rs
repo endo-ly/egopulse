@@ -159,11 +159,17 @@ impl AppState {
     ///
     /// Loads recent observations from both normal and secret databases and
     /// replays them through the calibrator so learned factors survive restarts.
-    /// Load failures fall back to whatever was loaded (possibly empty), leaving
-    /// unmeasured keys at `DEFAULT_FACTOR`.
+    /// Observations are merged in chronological order so shared
+    /// [`CalibrationKey`](crate::llm::calibration::CalibrationKey)s replay their
+    /// true history. Load failures fall back to whatever was loaded (possibly
+    /// empty), leaving unmeasured keys at `DEFAULT_FACTOR`.
     pub(crate) async fn warm_up_calibrator(&self) {
         const REPLAY_LIMIT_PER_KEY: usize = 30;
-        let mut observations = match self.db.load_calibration_observations(REPLAY_LIMIT_PER_KEY) {
+        let mut observations = match crate::storage::call_blocking(Arc::clone(&self.db), |db| {
+            db.load_calibration_observations(REPLAY_LIMIT_PER_KEY)
+        })
+        .await
+        {
             Ok(o) => o,
             Err(e) => {
                 warn!(error = %e, "calibration load failed (normal db); using defaults");
@@ -171,11 +177,16 @@ impl AppState {
             }
         };
         if let Some(secret_db) = &self.secret_db {
-            match secret_db.load_calibration_observations(REPLAY_LIMIT_PER_KEY) {
+            match crate::storage::call_blocking(Arc::clone(secret_db), |db| {
+                db.load_calibration_observations(REPLAY_LIMIT_PER_KEY)
+            })
+            .await
+            {
                 Ok(o) => observations.extend(o),
                 Err(e) => warn!(error = %e, "calibration load failed (secret db); using defaults"),
             }
         }
+        observations.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         self.usage_calibrator.replay(&observations).await;
     }
 

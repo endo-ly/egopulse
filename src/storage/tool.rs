@@ -154,10 +154,11 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Keep the most recent `limit_per_key` per key (rows are DESC), then
-        // reverse each bucket to oldest-first for chronological EMA replay.
-        // `created_at` is only used for the SQL ordering and discarded here.
-        let mut grouped: HashMap<CalibrationKey, Vec<(usize, i64)>> = HashMap::new();
-        for (provider, model, request_kind, has_tools, estimated, input, _created_at) in rows {
+        // reverse each bucket to oldest-first. `created_at` is retained so the
+        // caller can merge observations from multiple databases in true
+        // chronological order before replaying the EMA.
+        let mut grouped: HashMap<CalibrationKey, Vec<(usize, i64, String)>> = HashMap::new();
+        for (provider, model, request_kind, has_tools, estimated, input, created_at) in rows {
             let key = CalibrationKey {
                 provider,
                 model,
@@ -166,14 +167,14 @@ impl Database {
             };
             let bucket = grouped.entry(key).or_default();
             if bucket.len() < limit_per_key {
-                bucket.push((estimated as usize, input));
+                bucket.push((estimated as usize, input, created_at));
             }
         }
 
         let mut out = Vec::new();
         for (key, mut pairs) in grouped {
             pairs.reverse();
-            for (estimated, input) in pairs {
+            for (estimated, input, created_at) in pairs {
                 out.push(CalibrationObservation {
                     provider: key.provider.clone(),
                     model: key.model.clone(),
@@ -181,6 +182,7 @@ impl Database {
                     has_tools: key.has_tools,
                     estimated_tokens: estimated,
                     input_tokens: input,
+                    created_at,
                 });
             }
         }

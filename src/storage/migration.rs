@@ -651,13 +651,11 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
             !names.iter().any(|name| name == "estimated_tokens")
         };
         if needs_columns {
-            // Old rows predate the calibration columns and carry no raw prompt
-            // estimate to pair with their input_tokens. Drop them and add the
-            // new columns as NOT NULL rather than maintaining a NULL/fallback
-            // branch.
+            // Existing rows keep DEFAULT 0 and are excluded from calibration
+            // rebuild by the `estimated_tokens > 0` filter, preserving
+            // usage/cost history.
             tx.execute_batch(
-                "DELETE FROM llm_usage_logs;
-                 ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
+                "ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE llm_usage_logs ADD COLUMN has_tools INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
@@ -760,13 +758,11 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
             !names.iter().any(|name| name == "estimated_tokens")
         };
         if needs_columns {
-            // Old rows predate the calibration columns and carry no raw prompt
-            // estimate to pair with their input_tokens. Drop them and add the
-            // new columns as NOT NULL rather than maintaining a NULL/fallback
-            // branch.
+            // Existing rows keep DEFAULT 0 and are excluded from calibration
+            // rebuild by the `estimated_tokens > 0` filter, preserving
+            // usage/cost history.
             conn.execute_batch(
-                "DELETE FROM llm_usage_logs;
-                 ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
+                "ALTER TABLE llm_usage_logs ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE llm_usage_logs ADD COLUMN has_tools INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
