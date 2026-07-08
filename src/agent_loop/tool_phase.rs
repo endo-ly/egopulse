@@ -170,6 +170,8 @@ pub(crate) async fn send_tool_phase_request(
             request.llm,
             usage,
             request.request_kind,
+            raw_estimate,
+            has_tools,
             request.usage_log_failure,
         );
     }
@@ -242,6 +244,8 @@ pub(crate) fn log_llm_usage(
     llm: &dyn LlmProvider,
     usage: &LlmUsage,
     request_kind: &'static str,
+    raw_estimate: usize,
+    has_tools: bool,
     failure_message: &'static str,
 ) {
     let db = Arc::clone(state.db_for(scope));
@@ -250,6 +254,7 @@ pub(crate) fn log_llm_usage(
     let model = llm.model_name().to_string();
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
+    let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
 
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
@@ -264,6 +269,8 @@ pub(crate) fn log_llm_usage(
                 input_tokens,
                 output_tokens,
                 request_kind,
+                estimated_tokens,
+                has_tools,
             })
         })
         .await
