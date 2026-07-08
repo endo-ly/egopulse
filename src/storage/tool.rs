@@ -1,8 +1,7 @@
 use rusqlite::params;
-use std::collections::HashMap;
 
 use crate::error::StorageError;
-use crate::llm::calibration::{CalibrationKey, CalibrationObservation};
+use crate::llm::calibration::CalibrationObservation;
 
 use super::{Database, LlmUsageLogEntry, ToolCall};
 
@@ -134,59 +133,41 @@ impl Database {
     ) -> Result<Vec<CalibrationObservation>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT provider, model, request_kind, has_tools, estimated_tokens, input_tokens, created_at
-             FROM llm_usage_logs
-             WHERE estimated_tokens > 0 AND input_tokens > 0
+            "WITH ranked AS (
+                 SELECT provider, model, request_kind, has_tools,
+                        estimated_tokens, input_tokens, created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY provider, model, request_kind, has_tools
+                            ORDER BY created_at DESC
+                        ) AS rn
+                 FROM llm_usage_logs
+                 WHERE estimated_tokens > 0 AND input_tokens > 0
+             )
+             SELECT provider, model, request_kind, has_tools,
+                    estimated_tokens, input_tokens, created_at
+             FROM ranked
+             WHERE rn <= ?1
              ORDER BY created_at DESC",
         )?;
-        let rows: Vec<(String, String, String, bool, i64, i64, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get::<_, i64>(3)? != 0,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
+        let mut observations: Vec<CalibrationObservation> = stmt
+            .query_map(params![limit_per_key as i64], |row| {
+                Ok(CalibrationObservation {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    request_kind: row.get(2)?,
+                    has_tools: row.get::<_, i64>(3)? != 0,
+                    estimated_tokens: row.get::<_, i64>(4)? as usize,
+                    input_tokens: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-
-        // Keep the most recent `limit_per_key` per key (rows are DESC), then
-        // reverse each bucket to oldest-first. `created_at` is retained so the
-        // caller can merge observations from multiple databases in true
-        // chronological order before replaying the EMA.
-        let mut grouped: HashMap<CalibrationKey, Vec<(usize, i64, String)>> = HashMap::new();
-        for (provider, model, request_kind, has_tools, estimated, input, created_at) in rows {
-            let key = CalibrationKey {
-                provider,
-                model,
-                request_kind,
-                has_tools,
-            };
-            let bucket = grouped.entry(key).or_default();
-            if bucket.len() < limit_per_key {
-                bucket.push((estimated as usize, input, created_at));
-            }
-        }
-
-        let mut out = Vec::new();
-        for (key, mut pairs) in grouped {
-            pairs.reverse();
-            for (estimated, input, created_at) in pairs {
-                out.push(CalibrationObservation {
-                    provider: key.provider.clone(),
-                    model: key.model.clone(),
-                    request_kind: key.request_kind.clone(),
-                    has_tools: key.has_tools,
-                    estimated_tokens: estimated,
-                    input_tokens: input,
-                    created_at,
-                });
-            }
-        }
-        Ok(out)
+        // SQL returns newest-first; reverse to oldest-first so the calibrator
+        // can replay each key's history chronologically. `created_at` is kept
+        // so callers can merge observations from multiple databases in true
+        // chronological order.
+        observations.reverse();
+        Ok(observations)
     }
 }
 

@@ -37,7 +37,7 @@ use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
 use crate::config::Config;
 use crate::error::{ChannelError, EgoPulseError};
-use crate::llm::calibration::UsageCalibrator;
+use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalibrator};
 use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
@@ -186,8 +186,39 @@ impl AppState {
                 Err(e) => warn!(error = %e, "calibration load failed (secret db); using defaults"),
             }
         }
-        observations.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Each database already applied the per-key cap; re-cap after merging
+        // so a key present in both databases still replays at most N.
+        Self::cap_observations_per_key(&mut observations, REPLAY_LIMIT_PER_KEY);
         self.usage_calibrator.replay(&observations).await;
+    }
+
+    /// Keeps at most `limit_per_key` observations per [`CalibrationKey`], then
+    /// restores oldest-first order for chronological EMA replay. Applied after
+    /// merging normal and secret observations so a key present in both still
+    /// replays at most N entries.
+    fn cap_observations_per_key(
+        observations: &mut Vec<CalibrationObservation>,
+        limit_per_key: usize,
+    ) {
+        use std::collections::HashMap;
+        observations.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let mut counts: HashMap<CalibrationKey, usize> = HashMap::new();
+        observations.retain(|o| {
+            let key = CalibrationKey {
+                provider: o.provider.clone(),
+                model: o.model.clone(),
+                request_kind: o.request_kind.clone(),
+                has_tools: o.has_tools,
+            };
+            let count = counts.entry(key).or_insert(0);
+            if *count < limit_per_key {
+                *count += 1;
+                true
+            } else {
+                false
+            }
+        });
+        observations.reverse();
     }
 
     /// Resolves the database and archive root for the given conversation scope.
@@ -1468,6 +1499,37 @@ mod tests {
         let state = build_sleep_app_state_with_path(config, None).expect("build sleep state");
         let snap = state.runtime_status.snapshot();
         assert!(!snap.version.is_empty());
+    }
+
+    #[test]
+    fn cap_observations_per_key_keeps_newest_n_for_shared_keys() {
+        let mk = |created_at: &str, input: i64| CalibrationObservation {
+            provider: "p".into(),
+            model: "m".into(),
+            request_kind: "agent_loop".into(),
+            has_tools: true,
+            estimated_tokens: 100,
+            input_tokens: input,
+            created_at: created_at.into(),
+        };
+        // Simulate two databases each contributing observations for one key,
+        // already individually capped but exceeding N once merged.
+        let mut observations = vec![
+            mk("2026-01-01T00:00:01Z", 1),
+            mk("2026-01-01T00:00:02Z", 2),
+            mk("2026-01-01T00:00:03Z", 3),
+            mk("2026-01-01T00:00:04Z", 4),
+            mk("2026-01-01T00:00:05Z", 5),
+            mk("2026-01-01T00:00:06Z", 6),
+        ];
+
+        AppState::cap_observations_per_key(&mut observations, 3);
+
+        // Assert: only the 3 newest (4, 5, 6), oldest-first
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].input_tokens, 4);
+        assert_eq!(observations[1].input_tokens, 5);
+        assert_eq!(observations[2].input_tokens, 6);
     }
 
     fn build_sleep_state(dir: &tempfile::TempDir) -> AppState {
