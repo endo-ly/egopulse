@@ -937,6 +937,17 @@ body
                 }),
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     #[tokio::test]
@@ -1091,6 +1102,17 @@ intentions:
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             std::future::pending().await
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     struct PanickingLlm;
@@ -1112,6 +1134,17 @@ intentions:
             _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
             panic!("panicking-mock-llm: boom from send_message")
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
         }
     }
 

@@ -168,10 +168,7 @@ pub(crate) trait LlmProvider: Send + Sync {
         messages: Arc<Vec<Message>>,
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<MessagesResponse, LlmError> {
-        let _ = on_delta;
-        self.send_message(system, messages, tools).await
-    }
+    ) -> Result<MessagesResponse, LlmError>;
 }
 
 /// Create the default LLM provider based on the resolved request-time configuration.
@@ -722,6 +719,17 @@ mod tests {
                 let _ = tools;
                 unreachable!()
             }
+
+            async fn send_message_streaming(
+                &self,
+                _system: &str,
+                _messages: Arc<Vec<Message>>,
+                tools: Option<Arc<Vec<ToolDefinition>>>,
+                on_delta: &(dyn Fn(String) + Send + Sync),
+            ) -> Result<MessagesResponse, LlmError> {
+                let _ = (tools, on_delta);
+                unreachable!()
+            }
         }
 
         let stub = StubProvider;
@@ -755,6 +763,16 @@ mod tests {
                 _system: &str,
                 _messages: Arc<Vec<Message>>,
                 _tools: Option<Arc<Vec<ToolDefinition>>>,
+            ) -> Result<MessagesResponse, LlmError> {
+                unreachable!()
+            }
+
+            async fn send_message_streaming(
+                &self,
+                _system: &str,
+                _messages: Arc<Vec<Message>>,
+                _tools: Option<Arc<Vec<ToolDefinition>>>,
+                _on_delta: &(dyn Fn(String) + Send + Sync),
             ) -> Result<MessagesResponse, LlmError> {
                 unreachable!()
             }

@@ -1074,6 +1074,17 @@ impl crate::llm::LlmProvider for FakeProvider {
         Ok(locked.remove(0))
     }
 
+    async fn send_message_streaming(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        let _ = on_delta;
+        self.send_message(system, messages, tools).await
+    }
+
     fn provider_name(&self) -> &str {
         "test"
     }
@@ -1093,6 +1104,17 @@ impl crate::llm::LlmProvider for FailingProvider {
         _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         Err(crate::error::LlmError::InvalidResponse("boom".to_string()))
+    }
+
+    async fn send_message_streaming(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        let _ = on_delta;
+        self.send_message(system, messages, tools).await
     }
 
     fn provider_name(&self) -> &str {
@@ -1126,6 +1148,17 @@ impl crate::llm::LlmProvider for RecordingProvider {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         self.responses.lock().expect("responses").remove(0)
+    }
+
+    async fn send_message_streaming(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        let _ = on_delta;
+        self.send_message(system, messages, tools).await
     }
 
     fn provider_name(&self) -> &str {

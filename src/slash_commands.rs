@@ -832,6 +832,17 @@ mod tests {
                 usage: None,
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     fn build_test_state() -> (AppState, tempfile::TempDir) {

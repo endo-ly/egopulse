@@ -272,6 +272,17 @@ impl LlmProvider for OpenAiProvider {
         let body: OpenAiResponse = response.json().await?;
         parse_openai_response(body)
     }
+
+    async fn send_message_streaming(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse, LlmError> {
+        let _ = on_delta;
+        self.send_message(system, messages, tools).await
+    }
 }
 
 pub(crate) fn should_preserve_reasoning_content(
