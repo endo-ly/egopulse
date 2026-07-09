@@ -3,6 +3,7 @@ use super::{messages::*, responses::*};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -356,6 +357,7 @@ fn parse_chat_completion_usage(usage: &serde_json::Value) -> Option<LlmUsage> {
 struct ChatCompletionAccumulator {
     content: String,
     reasoning_content: Option<String>,
+    tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<LlmUsage>,
 }
 
@@ -364,6 +366,7 @@ impl ChatCompletionAccumulator {
         Self {
             content: String::new(),
             reasoning_content: None,
+            tool_calls: BTreeMap::new(),
             usage: None,
         }
     }
@@ -390,15 +393,58 @@ impl ChatCompletionAccumulator {
                     None => self.reasoning_content = Some(reasoning.to_string()),
                 }
             }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                for entry in tool_calls {
+                    self.ingest_tool_call_delta(entry);
+                }
+            }
         }
         if let Some(usage_value) = value.get("usage") {
             self.usage = parse_chat_completion_usage(usage_value);
         }
     }
 
-    fn finish(self) -> Result<MessagesResponse, LlmError> {
-        assemble_response(self.content, self.reasoning_content, Vec::new(), self.usage)
+    fn ingest_tool_call_delta(&mut self, entry: &serde_json::Value) {
+        let Some(index) = entry.get("index").and_then(|v| v.as_u64()) else {
+            return;
+        };
+        let slot = self.tool_calls.entry(index as usize).or_default();
+        if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+            slot.id = Some(id.to_string());
+        }
+        if let Some(function) = entry.get("function") {
+            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                slot.name = Some(name.to_string());
+            }
+            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+                slot.arguments.push_str(arguments);
+            }
+        }
     }
+
+    fn finish(self) -> Result<MessagesResponse, LlmError> {
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|slot| {
+                let name = slot.name.unwrap_or_default();
+                let arguments = parse_tool_arguments(&slot.arguments, &name)?;
+                Ok(ToolCall {
+                    id: slot.id.unwrap_or_default(),
+                    name,
+                    arguments,
+                })
+            })
+            .collect::<Result<Vec<_>, LlmError>>()?;
+        assemble_response(self.content, self.reasoning_content, tool_calls, self.usage)
+    }
+}
+
+#[derive(Default)]
+struct StreamingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 #[cfg(test)]
@@ -409,7 +455,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::ResolvedLlmConfig;
-    use crate::llm::{LlmProvider, LlmUsage, Message};
+    use crate::llm::{LlmProvider, LlmUsage, Message, ToolCall};
 
     use super::OpenAiProvider;
 
@@ -480,5 +526,112 @@ mod tests {
             })
         );
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accumulates_streaming_tool_calls_by_index_in_order() {
+        let server = MockServer::start().await;
+        // index:1 arguments arrive before index:0 finishes, yet the result
+        // must be ordered [0, 1].
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"README.md\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_delta = move |delta: String| {
+            recorded_for_closure
+                .lock()
+                .expect("on_delta lock poisoned")
+                .push(delta);
+        };
+
+        let response = provider
+            .send_message_streaming("", message("use tools"), None, &on_delta)
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.tool_calls,
+            vec![
+                ToolCall {
+                    id: "call_a".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                },
+                ToolCall {
+                    id: "call_b".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "foo"}),
+                },
+            ]
+        );
+        assert!(response.content.is_empty());
+        assert!(recorded.lock().expect("lock poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_delta_when_content_empty_tool_only() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"list\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_delta = move |delta: String| {
+            recorded_for_closure
+                .lock()
+                .expect("on_delta lock poisoned")
+                .push(delta);
+        };
+
+        let response = provider
+            .send_message_streaming("", message("tool only"), None, &on_delta)
+            .await
+            .expect("response");
+
+        assert!(recorded.lock().expect("lock poisoned").is_empty());
+        assert!(response.content.is_empty());
+        assert_eq!(
+            response.tool_calls,
+            vec![ToolCall {
+                id: "call_x".to_string(),
+                name: "list".to_string(),
+                arguments: serde_json::json!({}),
+            }]
+        );
     }
 }
