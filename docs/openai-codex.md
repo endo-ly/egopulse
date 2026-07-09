@@ -75,7 +75,7 @@ tools がある場合:
 
 | Event | 扱い |
 |---|---|
-| `response.output_text.delta` | text 差分として連結 |
+| `response.output_text.delta` | text 差分として連結しつつ `on_delta` で即時転送（ツール進捗の narration 表示用） |
 | `response.output_text.done` | 完成 text として採用 |
 | `response.output_item.done` | `item` を `ResponsesOutputItem` として parse |
 | `response.completed` / `response.done` | final response として保持 |
