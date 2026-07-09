@@ -251,100 +251,157 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
     if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
         return Ok(parsed);
     }
-    let mut last_response: Option<ResponsesApiResponse> = None;
-    let mut streamed_text = String::with_capacity(8192);
-    let mut streamed_items = Vec::with_capacity(32);
 
+    let mut accumulator = ResponsesAccumulator::new();
     for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with("data:") {
+        let Some(payload) = crate::llm::sse::data_payload(line.trim()) else {
             continue;
+        };
+        if accumulator.process_event(payload, &|_| {}) {
+            break;
         }
-        let payload = line.trim_start_matches("data:").trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
+    }
+
+    accumulator.into_api_response().map_err(|_| {
+        LlmError::InvalidResponse(format!(
+            "Failed to parse Codex response payload. Body: {}",
+            preview_body(text)
+        ))
+    })
+}
+
+/// Accumulates Responses API SSE events into a final [`ResponsesApiResponse`].
+///
+/// Shared by the non-stream Codex path ([`parse_codex_responses_payload`]) and
+/// the streaming Responses/Codex paths in `send_message_streaming` to keep
+/// delta extraction and final response assembly consistent.
+pub(crate) struct ResponsesAccumulator {
+    streamed_text: String,
+    streamed_items: Vec<ResponsesOutputItem>,
+    last_response: Option<ResponsesApiResponse>,
+}
+
+impl ResponsesAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            streamed_text: String::with_capacity(8192),
+            streamed_items: Vec::with_capacity(32),
+            last_response: None,
         }
+    }
+
+    /// Processes one SSE `data:` payload (JSON text without the `data:` prefix).
+    ///
+    /// Calls `on_delta` for each `response.output_text.delta` event. Returns
+    /// `true` when a terminal event (`response.completed` / `response.done`)
+    /// carrying a valid `response` object has been consumed.
+    pub(crate) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            continue;
+            return false;
         };
 
         if let Some(item_value) = value.get_mut("item")
             && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.take())
             && !matches!(item, ResponsesOutputItem::Ignored)
         {
-            streamed_items.push(item);
+            self.streamed_items.push(item);
         }
 
-        let event_type = value.get("type").and_then(|v| v.as_str()).map(String::from);
+        let event_type = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         match event_type.as_deref() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                    streamed_text.push_str(delta);
+                    on_delta(delta.to_string());
+                    self.streamed_text.push_str(delta);
                 }
             }
             Some("response.output_text.done") => {
                 if let Some(done_text) = value.get("text").and_then(|v| v.as_str())
                     && !done_text.is_empty()
                 {
-                    streamed_text.clear();
-                    streamed_text.push_str(done_text);
+                    self.streamed_text.clear();
+                    self.streamed_text.push_str(done_text);
                 }
             }
             _ => {}
         }
 
-        if let Some(response_value) = value.get_mut("response") {
-            if let Ok(parsed) =
+        if let Some(response_value) = value.get_mut("response")
+            && let Ok(parsed) =
                 serde_json::from_value::<ResponsesApiResponse>(response_value.take())
+        {
+            self.last_response = Some(parsed);
+            if event_type.as_deref() == Some("response.done")
+                || event_type.as_deref() == Some("response.completed")
             {
-                last_response = Some(parsed);
-                if event_type.as_deref() == Some("response.done")
-                    || event_type.as_deref() == Some("response.completed")
-                {
-                    break;
-                }
+                return true;
             }
         }
+
+        false
     }
 
-    if let Some(mut response) = last_response {
-        if response.output.is_empty() {
-            if !streamed_items.is_empty() {
-                response.output = streamed_items;
-            } else if !streamed_text.trim().is_empty() {
-                response.output.push(ResponsesOutputItem::Message {
+    /// Assembles the final [`ResponsesApiResponse`] from accumulated state.
+    ///
+    /// Prefers the `response` object from a terminal event. Falls back to
+    /// streamed text/items when the terminal response had empty output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::InvalidResponse`] when no response or streamed data
+    /// was accumulated.
+    pub(crate) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
+        if let Some(mut response) = self.last_response {
+            if response.output.is_empty() {
+                if !self.streamed_items.is_empty() {
+                    response.output = self.streamed_items;
+                } else if !self.streamed_text.trim().is_empty() {
+                    response.output.push(ResponsesOutputItem::Message {
+                        role: Some("assistant".to_string()),
+                        content: vec![ResponsesOutputPart::OutputText {
+                            text: self.streamed_text,
+                        }],
+                    });
+                }
+            }
+            return Ok(response);
+        }
+
+        if !self.streamed_items.is_empty() || !self.streamed_text.trim().is_empty() {
+            let mut output = self.streamed_items;
+            if output.is_empty() {
+                output.push(ResponsesOutputItem::Message {
                     role: Some("assistant".to_string()),
                     content: vec![ResponsesOutputPart::OutputText {
-                        text: streamed_text,
+                        text: self.streamed_text,
                     }],
                 });
             }
-        }
-        return Ok(response);
-    }
-
-    if !streamed_items.is_empty() || !streamed_text.trim().is_empty() {
-        let mut output = streamed_items;
-        if output.is_empty() {
-            output.push(ResponsesOutputItem::Message {
-                role: Some("assistant".to_string()),
-                content: vec![ResponsesOutputPart::OutputText {
-                    text: streamed_text,
-                }],
+            return Ok(ResponsesApiResponse {
+                status: Some("completed".to_string()),
+                output,
+                usage: None,
+                incomplete_details: None,
             });
         }
-        return Ok(ResponsesApiResponse {
-            status: Some("completed".to_string()),
-            output,
-            usage: None,
-            incomplete_details: None,
-        });
+
+        Err(LlmError::InvalidResponse(
+            "no response data in Responses API stream".to_string(),
+        ))
     }
 
-    Err(LlmError::InvalidResponse(format!(
-        "Failed to parse Codex response payload. Body: {}",
-        preview_body(text)
-    )))
+    /// Convenience: assembles and parses the final response in one call.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::into_api_response`] and [`parse_responses_response`].
+    pub(crate) fn finish(self) -> Result<MessagesResponse, LlmError> {
+        parse_responses_response(self.into_api_response()?)
+    }
 }
 
 pub(crate) fn preview_body(body: &str) -> String {

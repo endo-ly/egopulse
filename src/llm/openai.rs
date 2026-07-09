@@ -205,6 +205,82 @@ impl OpenAiProvider {
             retry_after_secs,
         }
     }
+
+    async fn stream_responses_api(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse, LlmError> {
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut body = build_responses_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref().map(|arc| arc.as_slice()),
+        );
+        body["stream"] = serde_json::Value::Bool(true);
+
+        let response = self
+            .http
+            .post(url)
+            .headers(self.build_headers()?)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            return Err(Self::api_error(
+                status,
+                response.text().await.unwrap_or_default(),
+                retry_after,
+            ));
+        }
+
+        let mut accumulator = ResponsesAccumulator::new();
+        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
+        while let Some(payload) = data_stream.next().await {
+            if accumulator.process_event(&payload, on_delta) {
+                break;
+            }
+        }
+        accumulator.finish()
+    }
+
+    async fn stream_codex_responses(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse, LlmError> {
+        crate::llm::codex_auth::refresh_if_needed(&self.http).await;
+
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut body = build_responses_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref().map(|arc| arc.as_slice()),
+        );
+        body["store"] = serde_json::Value::Bool(false);
+        body["stream"] = serde_json::Value::Bool(true);
+
+        let text = self.send_codex_with_retry(&url, &body).await?;
+
+        let mut accumulator = ResponsesAccumulator::new();
+        for line in text.lines() {
+            let Some(payload) = crate::llm::sse::data_payload(line.trim()) else {
+                continue;
+            };
+            if accumulator.process_event(payload, on_delta) {
+                break;
+            }
+        }
+        accumulator.finish()
+    }
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -283,12 +359,14 @@ impl LlmProvider for OpenAiProvider {
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<MessagesResponse, LlmError> {
         if self.is_codex {
-            let _ = on_delta;
-            return self.send_message(system, messages, tools).await;
+            return self
+                .stream_codex_responses(system, messages, tools, on_delta)
+                .await;
         }
         if should_use_responses_api(&messages) {
-            let _ = on_delta;
-            return self.send_message(system, messages, tools).await;
+            return self
+                .stream_responses_api(system, messages, tools, on_delta)
+                .await;
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -455,7 +533,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::ResolvedLlmConfig;
-    use crate::llm::{LlmProvider, LlmUsage, Message, ToolCall};
+    use crate::llm::{
+        LlmProvider, LlmUsage, Message, MessageContent, MessageContentPart, ToolCall,
+    };
 
     use super::OpenAiProvider;
 
@@ -632,6 +712,132 @@ mod tests {
                 name: "list".to_string(),
                 arguments: serde_json::json!({}),
             }]
+        );
+    }
+
+    fn multimodal_message() -> Arc<Vec<Message>> {
+        Arc::new(vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::parts(vec![
+                MessageContentPart::InputText {
+                    text: "describe this image".to_string(),
+                },
+                MessageContentPart::InputImage {
+                    image_url: "data:image/png;base64,AAAA".to_string(),
+                    detail: Some("auto".to_string()),
+                },
+            ]),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }])
+    }
+
+    #[tokio::test]
+    async fn streams_responses_api_text_deltas_via_on_delta() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ファイルを\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"確認します\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ファイルを確認します\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_delta = move |delta: String| {
+            recorded_for_closure
+                .lock()
+                .expect("on_delta lock poisoned")
+                .push(delta);
+        };
+
+        let response = provider
+            .send_message_streaming("", multimodal_message(), None, &on_delta)
+            .await
+            .expect("response");
+
+        assert_eq!(
+            recorded.lock().expect("lock poisoned").as_slice(),
+            ["ファイルを".to_string(), "確認します".to_string()]
+        );
+        assert_eq!(response.content, "ファイルを確認します");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_codex_text_deltas_via_on_delta() {
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-token")
+                .also_set("CODEX_HOME", codex_dir.path());
+        crate::llm::codex_auth::clear_auth_cache();
+
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" carefully\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let codex_config = ResolvedLlmConfig {
+            provider: "openai-codex".to_string(),
+            label: "Codex".to_string(),
+            base_url: format!("{}/v1", server.uri()),
+            api_key: None,
+            model: "gpt-5.3-codex".to_string(),
+        };
+        let provider = OpenAiProvider::new(&codex_config).expect("provider");
+
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_delta = move |delta: String| {
+            recorded_for_closure
+                .lock()
+                .expect("on_delta lock poisoned")
+                .push(delta);
+        };
+
+        let response = provider
+            .send_message_streaming("", message("hello"), None, &on_delta)
+            .await
+            .expect("response");
+
+        assert_eq!(
+            recorded.lock().expect("lock poisoned").as_slice(),
+            ["thinking".to_string(), " carefully".to_string()]
+        );
+        assert_eq!(response.content, "thinking carefully");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 3,
+                output_tokens: 7,
+            })
         );
     }
 }

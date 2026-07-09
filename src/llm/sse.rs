@@ -34,23 +34,26 @@ where
             while let Some(newline) = buffer.find('\n') {
                 let line: String = buffer.drain(..=newline).collect();
                 if let Some(payload) = data_payload(line.trim()) {
-                    yield payload;
+                    yield payload.to_string();
                 }
             }
         }
         if let Some(payload) = data_payload(buffer.trim()) {
-            yield payload;
+            yield payload.to_string();
         }
     };
     produced.boxed()
 }
 
-fn data_payload(line: &str) -> Option<String> {
+/// Extracts the JSON payload from a single SSE `data:` line.
+///
+/// Returns `None` for blank payloads, `[DONE]` markers, and non-`data:` lines.
+pub(crate) fn data_payload(line: &str) -> Option<&str> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload.is_empty() || payload == "[DONE]" {
         return None;
     }
-    Some(payload.to_string())
+    Some(payload)
 }
 
 #[cfg(test)]
