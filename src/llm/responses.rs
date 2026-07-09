@@ -300,17 +300,20 @@ impl ResponsesAccumulator {
             return false;
         };
 
-        if let Some(item_value) = value.get_mut("item")
+        let event_type = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Only the `done` item is complete; `added` carries an in_progress
+        // partial item that would duplicate the finalized one.
+        if event_type.as_deref() == Some("response.output_item.done")
+            && let Some(item_value) = value.get_mut("item")
             && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.take())
             && !matches!(item, ResponsesOutputItem::Ignored)
         {
             self.streamed_items.push(item);
         }
-
-        let event_type = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
 
         match event_type.as_deref() {
             Some("response.output_text.delta") => {
@@ -880,6 +883,26 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
         let parsed = parse_codex_responses_payload(item).expect("item");
         let resp = parse_responses_response(parsed).expect("resp");
         assert_eq!(resp.content, "item-content");
+    }
+
+    #[test]
+    fn dedupes_output_item_across_added_and_done_events() {
+        let payload = r#"
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "get_weather");
     }
 
     #[test]

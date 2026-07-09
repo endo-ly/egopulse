@@ -79,11 +79,9 @@ impl OpenAiProvider {
         }
 
         if self.is_codex {
-            return self
-                .send_codex_with_retry(&url, &body)
-                .await
-                .and_then(|text| parse_codex_responses_payload(&text))
-                .and_then(parse_responses_response);
+            let response = self.send_codex_with_retry(&url, &body).await?;
+            let text = response.text().await.map_err(LlmError::RequestFailed)?;
+            return parse_codex_responses_payload(&text).and_then(parse_responses_response);
         }
 
         let response = self
@@ -110,14 +108,16 @@ impl OpenAiProvider {
 
     /// Sends a Codex request with exponential-backoff retry on 429 responses.
     ///
-    /// On success, returns the raw response text (which may be plain JSON or SSE).
-    /// On non-429 failure, attempts to extract a structured error message from the
-    /// response body before returning.
+    /// On success, returns the streaming `reqwest::Response` so callers can
+    /// either consume the body as text (non-stream path) or iterate its
+    /// `bytes_stream` for incremental delta emission (stream path).
+    /// On non-429 failure, attempts to extract a structured error message from
+    /// the response body before returning.
     async fn send_codex_with_retry(
         &self,
         url: &str,
         body: &serde_json::Value,
-    ) -> Result<String, LlmError> {
+    ) -> Result<reqwest::Response, LlmError> {
         let max_retries: u32 = 3;
         let mut retries = 0u32;
 
@@ -132,7 +132,7 @@ impl OpenAiProvider {
 
             let status = response.status();
             if status.is_success() {
-                return response.text().await.map_err(LlmError::RequestFailed);
+                return Ok(response);
             }
 
             if status.as_u16() == 429 && retries < max_retries {
@@ -268,14 +268,12 @@ impl OpenAiProvider {
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
 
-        let text = self.send_codex_with_retry(&url, &body).await?;
+        let response = self.send_codex_with_retry(&url, &body).await?;
 
         let mut accumulator = ResponsesAccumulator::new();
-        for line in text.lines() {
-            let Some(payload) = crate::llm::sse::data_payload(line.trim()) else {
-                continue;
-            };
-            if accumulator.process_event(payload, on_delta) {
+        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
+        while let Some(payload) = data_stream.next().await {
+            if accumulator.process_event(&payload, on_delta) {
                 break;
             }
         }

@@ -12,33 +12,38 @@ use futures_util::stream::BoxStream;
 ///
 /// Each yielded `String` is the JSON text following `data:`. Stream item
 /// errors are logged and treated as end-of-stream.
+///
+/// Bytes are accumulated raw and lines are decoded individually so that a
+/// multibyte UTF-8 character bisected by a TCP segment boundary is reassembled
+/// rather than dropped.
 pub(crate) fn data_lines<S>(stream: S) -> BoxStream<'static, String>
 where
     S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let produced = stream! {
         let mut stream = stream.boxed();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else {
                 tracing::warn!("SSE stream chunk error, stopping consumption");
                 break;
             };
-            match std::str::from_utf8(chunk.as_ref()) {
-                Ok(text) => buffer.push_str(text),
-                Err(_) => {
-                    tracing::warn!("non-UTF-8 chunk in SSE stream, skipping");
-                    continue;
-                }
-            }
-            while let Some(newline) = buffer.find('\n') {
-                let line: String = buffer.drain(..=newline).collect();
-                if let Some(payload) = data_payload(line.trim()) {
-                    yield payload.to_string();
+            buffer.extend_from_slice(chunk.as_ref());
+            while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=newline).collect();
+                match std::str::from_utf8(&line_bytes) {
+                    Ok(line) => {
+                        if let Some(payload) = data_payload(line.trim()) {
+                            yield payload.to_string();
+                        }
+                    }
+                    Err(_) => tracing::warn!("non-UTF-8 line in SSE stream, skipping"),
                 }
             }
         }
-        if let Some(payload) = data_payload(buffer.trim()) {
+        if let Ok(line) = std::str::from_utf8(&buffer)
+            && let Some(payload) = data_payload(line.trim())
+        {
             yield payload.to_string();
         }
     };
@@ -99,6 +104,25 @@ mod tests {
     async fn flushes_trailing_line_without_newline() {
         let mut lines = data_lines(stream::iter([chunk(b"data: tail")]));
         assert_eq!(lines.next().await.as_deref(), Some("tail"));
+        assert_eq!(lines.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn reassembles_multibyte_char_split_across_chunks() {
+        // Split the SSE line `data: {"a":"ファイル"}\n\n` at a byte offset
+        // that falls inside the 3-byte sequence of フ (U+30D5), simulating a
+        // TCP segment boundary that bisects a multibyte UTF-8 character.
+        let full = "data: {\"a\":\"ファイル\"}\n\n";
+        let bytes = full.as_bytes();
+        let char_start = full.find('フ').expect("フ present");
+        let split_at = char_start + 1;
+
+        let mut lines = data_lines(stream::iter([
+            chunk(&bytes[..split_at]),
+            chunk(&bytes[split_at..]),
+        ]));
+
+        assert_eq!(lines.next().await.as_deref(), Some(r#"{"a":"ファイル"}"#));
         assert_eq!(lines.next().await, None);
     }
 }
