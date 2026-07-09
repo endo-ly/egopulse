@@ -2536,4 +2536,195 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-end: real OpenAiProvider streaming → coordinator narration
+    // -----------------------------------------------------------------------
+
+    #[derive(Default, Clone)]
+    struct NarrationCalls {
+        begins: Vec<String>,
+        updates: Vec<String>,
+        closes: usize,
+    }
+
+    struct NarrationSink {
+        calls: Arc<Mutex<NarrationCalls>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::adapter::ToolProgressSink for NarrationSink {
+        async fn begin(
+            &self,
+            _external_chat_id: &str,
+            body: &str,
+        ) -> Result<Box<dyn crate::channels::adapter::ToolProgressHandle>, String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .begins
+                .push(body.to_string());
+            Ok(Box::new(NarrationHandle {
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    struct NarrationHandle {
+        calls: Arc<Mutex<NarrationCalls>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::adapter::ToolProgressHandle for NarrationHandle {
+        async fn update(&mut self, body: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .updates
+                .push(body.to_string());
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<(), String> {
+            self.calls.lock().expect("calls lock").closes += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provider_streaming_drives_coordinator_narration() {
+        use std::time::Duration;
+
+        use crate::channels::adapter::ToolProgressSink;
+        use crate::config::ResolvedLlmConfig;
+        use crate::llm::OpenAiProvider;
+        use crate::runtime::tool_progress::ToolProgressCoordinator;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange: a wiremock SSE server returning two sequential responses.
+        let server = MockServer::start().await;
+
+        // 1st request only: narration deltas + a read tool call.
+        // Mounted first so insertion-order precedence picks it before the fallback.
+        let tool_args = serde_json::json!({"path": "note.txt"}).to_string();
+        let sse_first = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"ファイルを"}}]})
+            ),
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"確認します"}}]})
+            ),
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-narration","type":"function","function":{"name":"read","arguments":tool_args}}]}}]})
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_first, "text/event-stream"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Fallback (2nd+ request): final answer, no tool calls.
+        let sse_final = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"読み取りが完了しました。"}}]})
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_final, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        // Build a *real* OpenAiProvider pointed at the wiremock server.
+        let provider = OpenAiProvider::new(&ResolvedLlmConfig {
+            provider: "test".to_string(),
+            label: "Test".to_string(),
+            base_url: format!("{}/v1", server.uri()),
+            api_key: Some(secrecy::SecretString::new(
+                "sk-test".to_string().into_boxed_str(),
+            )),
+            model: "gpt-4o-mini".to_string(),
+        })
+        .expect("provider");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        // Workspace file the `read` tool will open.
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(workspace.join("note.txt"), "hello world").expect("write note");
+
+        // Bridge agent-loop events into a ToolProgressCoordinator with a mock sink.
+        let calls = Arc::new(Mutex::new(NarrationCalls::default()));
+        let sink: Arc<dyn ToolProgressSink> = Arc::new(NarrationSink {
+            calls: Arc::clone(&calls),
+        });
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let coordinator = ToolProgressCoordinator::with_timings(
+            Some(sink),
+            "discord:1:agent:default".to_string(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let coord_handle = tokio::spawn(coordinator.run(evt_rx));
+
+        // Act: run a full turn through the real OpenAiProvider. Each event
+        // is forwarded to the coordinator. Dropping the closure on return
+        // closes the channel, signalling EOF to the coordinator.
+        let reply = process_turn_with_events(
+            &state,
+            &cli_context("narration-e2e"),
+            "please read note.txt",
+            move |event| {
+                let _ = evt_tx.send(event);
+            },
+        )
+        .await
+        .expect("process turn");
+
+        // Wait for the coordinator to drain and close.
+        let () = coord_handle.await.expect("coordinator join");
+
+        // Assert: the posted progress body contains the narration (💬) before
+        // the tool line (... read), proving the provider→Delta→coordinator path.
+        let snapshot = calls.lock().expect("calls").clone();
+        assert!(
+            snapshot.closes >= 1,
+            "coordinator should have closed the progress message"
+        );
+        let body = snapshot
+            .begins
+            .first()
+            .or_else(|| snapshot.updates.last())
+            .expect("at least one progress body");
+        assert!(
+            body.contains("💬 ファイルを確認します"),
+            "narration missing from body: {body}"
+        );
+        assert!(body.contains("... read"), "tool line missing: {body}");
+        let narration_idx = body.find('💬').expect("narration position");
+        let tool_idx = body.find("... read").expect("tool position");
+        assert!(
+            narration_idx < tool_idx,
+            "narration must precede tool: {body}"
+        );
+        assert!(!reply.is_empty(), "turn should produce a final response");
+    }
 }
