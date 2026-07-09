@@ -16,7 +16,7 @@ use futures_util::stream::BoxStream;
 /// Bytes are accumulated raw and lines are decoded individually so that a
 /// multibyte UTF-8 character bisected by a TCP segment boundary is reassembled
 /// rather than dropped.
-pub(crate) fn data_lines<S>(stream: S) -> BoxStream<'static, String>
+pub(super) fn data_lines<S>(stream: S) -> BoxStream<'static, String>
 where
     S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
@@ -53,7 +53,7 @@ where
 /// Extracts the JSON payload from a single SSE `data:` line.
 ///
 /// Returns `None` for blank payloads, `[DONE]` markers, and non-`data:` lines.
-pub(crate) fn data_payload(line: &str) -> Option<&str> {
+pub(super) fn data_payload(line: &str) -> Option<&str> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload.is_empty() || payload == "[DONE]" {
         return None;

@@ -262,9 +262,9 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
         }
     }
 
-    accumulator.into_api_response().map_err(|_| {
+    accumulator.into_api_response().map_err(|error| {
         LlmError::InvalidResponse(format!(
-            "Failed to parse Codex response payload. Body: {}",
+            "Failed to parse Codex response payload ({error}). Body: {}",
             preview_body(text)
         ))
     })
@@ -275,14 +275,14 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
 /// Shared by the non-stream Codex path ([`parse_codex_responses_payload`]) and
 /// the streaming Responses/Codex paths in `send_message_streaming` to keep
 /// delta extraction and final response assembly consistent.
-pub(crate) struct ResponsesAccumulator {
+pub(super) struct ResponsesAccumulator {
     streamed_text: String,
     streamed_items: Vec<ResponsesOutputItem>,
     last_response: Option<ResponsesApiResponse>,
 }
 
 impl ResponsesAccumulator {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             streamed_text: String::with_capacity(8192),
             streamed_items: Vec::with_capacity(32),
@@ -295,7 +295,7 @@ impl ResponsesAccumulator {
     /// Calls `on_delta` for each `response.output_text.delta` event. Returns
     /// `true` when a terminal event (`response.completed` / `response.done`)
     /// carrying a valid `response` object has been consumed.
-    pub(crate) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
+    pub(super) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
             return false;
         };
@@ -357,7 +357,7 @@ impl ResponsesAccumulator {
     ///
     /// Returns [`LlmError::InvalidResponse`] when no response or streamed data
     /// was accumulated.
-    pub(crate) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
+    pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
         if let Some(mut response) = self.last_response {
             if response.output.is_empty() {
                 if !self.streamed_items.is_empty() {
@@ -402,7 +402,7 @@ impl ResponsesAccumulator {
     /// # Errors
     ///
     /// See [`Self::into_api_response`] and [`parse_responses_response`].
-    pub(crate) fn finish(self) -> Result<MessagesResponse, LlmError> {
+    pub(super) fn finish(self) -> Result<MessagesResponse, LlmError> {
         parse_responses_response(self.into_api_response()?)
     }
 }
