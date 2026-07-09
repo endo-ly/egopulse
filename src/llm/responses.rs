@@ -1,28 +1,50 @@
 use super::*;
 
 pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
-    let usage = body.usage;
     let choice = body
         .choices
         .into_iter()
         .next()
         .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-    let mut tool_calls = choice
+    let tool_calls = choice
         .message
         .tool_calls
         .unwrap_or_default()
         .into_iter()
         .map(parse_tool_call)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut content = extract_text(
+    let content = extract_text(
         choice
             .message
             .content
             .unwrap_or(OpenAiMessageContent::Text(String::new())),
     );
     let reasoning_content = choice.message.reasoning_content;
+    let usage = body.usage.and_then(|u| {
+        u.prompt_tokens
+            .zip(u.completion_tokens)
+            .map(|(pt, ct)| LlmUsage {
+                input_tokens: pt,
+                output_tokens: ct,
+            })
+    });
 
+    assemble_response(content, reasoning_content, tool_calls, usage)
+}
+
+/// Assembles the final `MessagesResponse` from accumulated Chat Completions
+/// fields, applying raw tool-use rescue when structured tool calls are absent.
+///
+/// Shared by the non-stream JSON path (`parse_openai_response`) and the SSE
+/// stream path (`ChatCompletionAccumulator`) to keep both consistent.
+pub(super) fn assemble_response(
+    content: String,
+    reasoning_content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<LlmUsage>,
+) -> Result<MessagesResponse, LlmError> {
+    let mut content = content.trim().to_string();
+    let mut tool_calls = tool_calls;
     if tool_calls.is_empty()
         && let Some((rescued_calls, stripped_content)) = rescue_raw_tool_calls(&content)
     {
@@ -40,14 +62,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
         content,
         reasoning_content,
         tool_calls,
-        usage: usage.and_then(|u| {
-            u.prompt_tokens
-                .zip(u.completion_tokens)
-                .map(|(pt, ct)| LlmUsage {
-                    input_tokens: pt,
-                    output_tokens: ct,
-                })
-        }),
+        usage,
     })
 }
 
@@ -166,7 +181,10 @@ fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
     }
 }
 
-fn parse_tool_arguments(arguments: &str, name: &str) -> Result<serde_json::Value, LlmError> {
+pub(super) fn parse_tool_arguments(
+    arguments: &str,
+    name: &str,
+) -> Result<serde_json::Value, LlmError> {
     if arguments.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }

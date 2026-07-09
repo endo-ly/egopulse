@@ -8,6 +8,7 @@ pub(crate) mod codex_auth;
 mod messages;
 mod openai;
 mod responses;
+mod sse;
 
 use std::sync::Arc;
 

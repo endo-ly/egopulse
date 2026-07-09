@@ -1,5 +1,6 @@
 use super::*;
 use super::{messages::*, responses::*};
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
 use std::sync::Arc;
@@ -280,8 +281,49 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<MessagesResponse, LlmError> {
-        let _ = on_delta;
-        self.send_message(system, messages, tools).await
+        if self.is_codex {
+            let _ = on_delta;
+            return self.send_message(system, messages, tools).await;
+        }
+        if should_use_responses_api(&messages) {
+            let _ = on_delta;
+            return self.send_message(system, messages, tools).await;
+        }
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let headers = self.build_headers()?;
+        let body = build_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref().map(|arc| arc.as_slice()),
+            Some(true),
+            should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
+        );
+
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            return Err(Self::api_error(
+                status,
+                response.text().await.unwrap_or_default(),
+                retry_after,
+            ));
+        }
+
+        let mut accumulator = ChatCompletionAccumulator::new();
+        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
+        while let Some(payload) = data_stream.next().await {
+            accumulator.process_chunk(&payload, on_delta);
+        }
+        accumulator.finish()
     }
 }
 
@@ -300,4 +342,143 @@ fn is_deepseek_base_url(base_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
+}
+
+fn parse_chat_completion_usage(usage: &serde_json::Value) -> Option<LlmUsage> {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64())?;
+    let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_i64())?;
+    Some(LlmUsage {
+        input_tokens: prompt_tokens,
+        output_tokens: completion_tokens,
+    })
+}
+
+struct ChatCompletionAccumulator {
+    content: String,
+    reasoning_content: Option<String>,
+    usage: Option<LlmUsage>,
+}
+
+impl ChatCompletionAccumulator {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            reasoning_content: None,
+            usage: None,
+        }
+    }
+
+    fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            tracing::warn!("skipping malformed SSE data line");
+            return;
+        };
+        if let Some(delta) = value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("delta"))
+        {
+            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    on_delta(text.to_string());
+                }
+                self.content.push_str(text);
+            }
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                match &mut self.reasoning_content {
+                    Some(existing) => existing.push_str(reasoning),
+                    None => self.reasoning_content = Some(reasoning.to_string()),
+                }
+            }
+        }
+        if let Some(usage_value) = value.get("usage") {
+            self.usage = parse_chat_completion_usage(usage_value);
+        }
+    }
+
+    fn finish(self) -> Result<MessagesResponse, LlmError> {
+        assemble_response(self.content, self.reasoning_content, Vec::new(), self.usage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::config::ResolvedLlmConfig;
+    use crate::llm::{LlmProvider, LlmUsage, Message};
+
+    use super::OpenAiProvider;
+
+    fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
+        ResolvedLlmConfig {
+            provider: "test".to_string(),
+            label: "Test".to_string(),
+            base_url,
+            api_key: api_key
+                .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
+            model: model.to_string(),
+        }
+    }
+
+    fn message(content: &str) -> Arc<Vec<Message>> {
+        Arc::new(vec![Message::text("user", content)])
+    }
+
+    #[tokio::test]
+    async fn streams_chat_completions_text_deltas_via_on_delta() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ファイルを\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"確認します\",\"reasoning_content\":\"考えている\"}}]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+            "garbage line\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_delta = move |delta: String| {
+            recorded_for_closure
+                .lock()
+                .expect("on_delta lock poisoned")
+                .push(delta);
+        };
+
+        let response = provider
+            .send_message_streaming("", message("hello"), None, &on_delta)
+            .await
+            .expect("response");
+
+        assert_eq!(
+            recorded.lock().expect("lock poisoned").as_slice(),
+            ["ファイルを".to_string(), "確認します".to_string()]
+        );
+        assert_eq!(response.content, "ファイルを確認します");
+        assert_eq!(response.reasoning_content.as_deref(), Some("考えている"));
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        );
+        assert!(response.tool_calls.is_empty());
+    }
 }
