@@ -280,7 +280,7 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
 pub(super) struct ResponsesAccumulator {
     streamed_text: String,
     streamed_items: Vec<ResponsesOutputItem>,
-    last_response: Option<ResponsesApiResponse>,
+    completed_response: Option<ResponsesApiResponse>,
 }
 
 impl ResponsesAccumulator {
@@ -288,7 +288,7 @@ impl ResponsesAccumulator {
         Self {
             streamed_text: String::with_capacity(8192),
             streamed_items: Vec::with_capacity(32),
-            last_response: None,
+            completed_response: None,
         }
     }
 
@@ -335,16 +335,17 @@ impl ResponsesAccumulator {
             _ => {}
         }
 
-        if let Some(response_value) = value.get_mut("response")
+        let is_terminal = matches!(
+            event_type.as_deref(),
+            Some("response.completed" | "response.done")
+        );
+        if is_terminal
+            && let Some(response_value) = value.get_mut("response")
             && let Ok(parsed) =
                 serde_json::from_value::<ResponsesApiResponse>(response_value.take())
         {
-            self.last_response = Some(parsed);
-            if event_type.as_deref() == Some("response.done")
-                || event_type.as_deref() == Some("response.completed")
-            {
-                return true;
-            }
+            self.completed_response = Some(parsed);
+            return true;
         }
 
         false
@@ -361,7 +362,7 @@ impl ResponsesAccumulator {
     /// (`response.completed` / `response.done`) was received; partial streamed
     /// data is rejected rather than synthesized into a success.
     pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
-        let Some(mut response) = self.last_response else {
+        let Some(mut response) = self.completed_response else {
             return Err(LlmError::InvalidResponse(
                 "Responses API stream ended without a completion event".to_string(),
             ));
@@ -891,7 +892,12 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
 
     #[test]
     fn parse_codex_responses_payload_errors_without_completion_event() {
+        // `response.created` carries a `response` object but is not terminal;
+        // the stream must still be rejected without `response.completed`.
         let payload = r#"
+event: response.created
+data: {"type":"response.created","response":{"output":[]}}
+
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","delta":"partial"}
 
