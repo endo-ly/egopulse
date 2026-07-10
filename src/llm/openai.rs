@@ -239,14 +239,7 @@ impl OpenAiProvider {
             ));
         }
 
-        let mut accumulator = ResponsesAccumulator::new();
-        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
-        while let Some(payload) = data_stream.next().await {
-            if accumulator.process_event(&payload, on_delta) {
-                break;
-            }
-        }
-        accumulator.finish()
+        consume_responses_stream(response.bytes_stream(), on_delta).await
     }
 
     async fn stream_codex_responses(
@@ -270,14 +263,7 @@ impl OpenAiProvider {
 
         let response = self.send_codex_with_retry(&url, &body).await?;
 
-        let mut accumulator = ResponsesAccumulator::new();
-        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
-        while let Some(payload) = data_stream.next().await {
-            if accumulator.process_event(&payload, on_delta) {
-                break;
-            }
-        }
-        accumulator.finish()
+        consume_responses_stream(response.bytes_stream(), on_delta).await
     }
 }
 
@@ -395,12 +381,7 @@ impl LlmProvider for OpenAiProvider {
             ));
         }
 
-        let mut accumulator = ChatCompletionAccumulator::new();
-        let mut data_stream = crate::llm::sse::data_lines(response.bytes_stream());
-        while let Some(payload) = data_stream.next().await {
-            accumulator.process_chunk(&payload, on_delta);
-        }
-        accumulator.finish()
+        consume_chat_completion_stream(response.bytes_stream(), on_delta).await
     }
 }
 
@@ -435,6 +416,7 @@ struct ChatCompletionAccumulator {
     reasoning_content: Option<String>,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<LlmUsage>,
+    has_finish: bool,
 }
 
 impl ChatCompletionAccumulator {
@@ -444,6 +426,7 @@ impl ChatCompletionAccumulator {
             reasoning_content: None,
             tool_calls: BTreeMap::new(),
             usage: None,
+            has_finish: false,
         }
     }
 
@@ -474,6 +457,15 @@ impl ChatCompletionAccumulator {
                     self.ingest_tool_call_delta(entry);
                 }
             }
+        }
+        if let Some(finish_reason) = value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            && !finish_reason.is_empty()
+        {
+            self.has_finish = true;
         }
         if let Some(usage_value) = value.get("usage") {
             self.usage = parse_chat_completion_usage(usage_value);
@@ -523,6 +515,62 @@ struct StreamingToolCall {
     arguments: String,
 }
 
+async fn consume_chat_completion_stream(
+    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    on_delta: &(dyn Fn(String) + Send + Sync),
+) -> Result<MessagesResponse, LlmError> {
+    let mut accumulator = ChatCompletionAccumulator::new();
+    let mut data_stream = crate::llm::sse::data_lines(stream);
+    let mut done = false;
+    while let Some(result) = data_stream.next().await {
+        match result {
+            Ok(crate::llm::sse::SseItem::Data(payload)) => {
+                accumulator.process_chunk(&payload, on_delta);
+            }
+            Ok(crate::llm::sse::SseItem::Done) => {
+                done = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !done && !accumulator.has_finish {
+        return Err(LlmError::InvalidResponse(
+            "chat completions stream ended without [DONE] or finish_reason".into(),
+        ));
+    }
+    accumulator.finish()
+}
+
+async fn consume_responses_stream(
+    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    on_delta: &(dyn Fn(String) + Send + Sync),
+) -> Result<MessagesResponse, LlmError> {
+    let mut accumulator = ResponsesAccumulator::new();
+    let mut data_stream = crate::llm::sse::data_lines(stream);
+    let mut completed = false;
+    while let Some(result) = data_stream.next().await {
+        match result {
+            Ok(crate::llm::sse::SseItem::Data(payload)) => {
+                if accumulator.process_event(&payload, on_delta) {
+                    completed = true;
+                    break;
+                }
+            }
+            Ok(crate::llm::sse::SseItem::Done) => {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !completed {
+        return Err(LlmError::InvalidResponse(
+            "responses stream ended without completion event".into(),
+        ));
+    }
+    accumulator.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -535,7 +583,10 @@ mod tests {
         LlmProvider, LlmUsage, Message, MessageContent, MessageContentPart, ToolCall,
     };
 
-    use super::OpenAiProvider;
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    use super::{OpenAiProvider, consume_chat_completion_stream, consume_responses_stream};
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
         ResolvedLlmConfig {
@@ -836,6 +887,73 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 7,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_propagates_chunk_error() {
+        // Arrange: create a real reqwest::Error by connecting to a closed port.
+        let stream_error = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("client")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connection refused");
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"途中まで\"}}]}\n\n",
+            )),
+            Err(stream_error),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_errors_on_eof_without_done_or_finish() {
+        // Arrange: stream that ends with a content delta but no [DONE] or
+        // finish_reason.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ))];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("without [DONE] or finish_reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_responses_stream_errors_on_eof_without_completion() {
+        // Arrange: stream with a text delta but no response.completed event.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        ))];
+
+        // Act
+        let result = consume_responses_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("without completion event")
         );
     }
 }

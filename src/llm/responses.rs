@@ -254,10 +254,12 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
 
     let mut accumulator = ResponsesAccumulator::new();
     for line in text.lines() {
-        let Some(payload) = crate::llm::sse::data_payload(line.trim()) else {
+        let Some(crate::llm::sse::SseItem::Data(payload)) =
+            crate::llm::sse::classify_line(line.trim())
+        else {
             continue;
         };
-        if accumulator.process_event(payload, &|_| {}) {
+        if accumulator.process_event(&payload, &|_| {}) {
             break;
         }
     }
