@@ -479,10 +479,6 @@ impl Database {
         Ok(())
     }
 
-    /// Persists a stop-reason system event to the Channel Log.
-    ///
-    /// Content format: `{"reason": "StopReasonVariant"}`.
-    /// Sender: `sender_id = "system"`, `sender_kind = System`.
     /// Persists a system event message to a Channel Log chat.
     ///
     /// `reason` is rendered via its `Display` implementation into a JSON object

@@ -216,6 +216,16 @@ impl TurnTracker {
         }
     }
 
+    /// Records the reason a turn chain stopped for the given origin.
+    ///
+    /// The reason is stored on the origin's state so later turns can read it via
+    /// [`TurnTracker::terminal_reason`]. If the origin is not yet tracked, an
+    /// entry is created with this reason and a zero turn count. Stale origins
+    /// are pruned before the write so expired chains do not resurface.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal tracker lock is poisoned.
     pub(crate) fn set_terminal_reason(&self, origin_id: &str, reason: StopReason) {
         let mut origins = self.origins.lock().expect("turn_tracker lock");
         self.prune_stale_locked(&mut origins);
@@ -233,6 +243,16 @@ impl TurnTracker {
             });
     }
 
+    /// Returns the terminal reason previously recorded for an origin, if any.
+    ///
+    /// `None` means the origin has no recorded terminal reason: the chain is
+    /// still active or never stopped. Callers combine this with the origin's
+    /// turn count to decide whether a new turn may start. Stale origins are
+    /// pruned before the read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal tracker lock is poisoned.
     pub(crate) fn terminal_reason(&self, origin_id: &str) -> Option<StopReason> {
         let mut origins = self.origins.lock().expect("turn_tracker lock");
         self.prune_stale_locked(&mut origins);
@@ -356,11 +376,11 @@ impl TurnScheduler {
             .get(&session_key)
             .is_some_and(|s| s.queue.len() >= MAX_QUEUED_TURNS_PER_SESSION);
         if session_full {
-            metrics::inc_turn_queue_rejections("session_full");
+            metrics::inc_turn_queue_rejections(RejectReason::SessionQueueFull.as_str());
             return ScheduleResult::Rejected(RejectReason::SessionQueueFull);
         }
         if inner.global_queued >= MAX_GLOBAL_QUEUED_TURNS {
-            metrics::inc_turn_queue_rejections("global_full");
+            metrics::inc_turn_queue_rejections(RejectReason::GlobalQueueFull.as_str());
             return ScheduleResult::Rejected(RejectReason::GlobalQueueFull);
         }
 

@@ -1942,8 +1942,10 @@ mod tests {
         let per_chat = needed.div_ceil(n_chats);
         for i in 0..n_chats {
             let cid = create_chat(db, agent_id, &format!("-{i}"));
+            // Distinct pending ages per chat so ordering is observable.
+            let ts = format!("2025-06-01T00:{i:02}:00Z");
             for j in 0..per_chat {
-                store_msg(db, &format!("m{i}-{j}"), cid, "hi", "2025-06-01T00:00:00Z");
+                store_msg(db, &format!("m{i}-{j}"), cid, "hi", &ts);
             }
             db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
                 .expect("save session");
@@ -2930,15 +2932,16 @@ mod tests {
         seed_sessions_above_threshold(&db, "test-agent", MAX_SOURCE_SESSIONS);
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
-        let json_str = match &result {
+        let (sessions, source_chats_json) = match &result {
             InputDecision::Proceed {
-                source_chats_json, ..
-            } => source_chats_json,
+                sessions,
+                source_chats_json,
+            } => (sessions, source_chats_json),
             other => panic!("expected Proceed, got {other:?}"),
         };
 
         let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(json_str).expect("valid JSON array");
+            serde_json::from_str(source_chats_json).expect("valid JSON array");
         assert!(
             parsed.len() >= 2,
             "need at least 2 entries to check ordering"
@@ -2949,6 +2952,19 @@ mod tests {
             .map(|entry| entry["chat_id"].as_i64().expect("chat id"))
             .collect();
         assert_eq!(chat_ids.len(), parsed.len(), "source chats must be unique");
+
+        // Sessions must be ordered oldest-pending-first: the chat with the
+        // oldest updated_at must appear first.
+        for w in sessions.windows(2) {
+            assert!(
+                w[0].updated_at <= w[1].updated_at,
+                "sessions must be sorted oldest-pending-first"
+            );
+        }
+        assert!(
+            sessions.first().unwrap().updated_at <= sessions.last().unwrap().updated_at,
+            "oldest session must appear first"
+        );
     }
 
     #[test]

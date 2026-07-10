@@ -355,7 +355,7 @@ main ブランチで CI が成功した commit に対してのみ GitHub Release
 
 ### 自動リリースの仕組み
 
-```
+```text
 main へマージ → CI workflow 実行
          ↓
 CI が success で完了 → release workflow が workflow_run で起動

@@ -157,7 +157,7 @@ fn resolve_target_scope(
             .map(|c| channel_scope_from_secret(c.secret))
             .ok_or("telegram target thread is not configured"),
         "web" => Ok(ConversationScope::Normal),
-        _ => Ok(ConversationScope::Normal),
+        _ => Err("invalid target scope"),
     }
 }
 
@@ -473,5 +473,23 @@ mod tests {
             build_webhook_context(&telegram_only_config, &receiver_id, &unregistered_telegram)
                 .expect_err("unregistered telegram thread must be rejected");
         assert_eq!(err, "telegram target thread is not configured");
+    }
+
+    #[test]
+    fn webhook_context_rejects_unknown_channel_instead_of_falling_back_to_normal() {
+        let config = test_config_with_discord_secret("123", false);
+        let receiver_id = WebhookReceiverId::new("egograph");
+        let receiver = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("unknown-channel"),
+                thread: "123".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let err = build_webhook_context(&config, &receiver_id, &receiver)
+            .expect_err("unknown channel must be rejected");
+        assert_eq!(err, "invalid target scope");
     }
 }

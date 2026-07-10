@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 10;
+pub(super) const SCHEMA_VERSION: i64 = 11;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -689,6 +689,16 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         )?;
         tx.commit()?;
         version = 10;
+    }
+
+    if version < 11 {
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_chats_agent_id ON chats(agent_id)")?;
+        set_schema_version(
+            conn,
+            11,
+            "add index on chats(agent_id) for sleep pending-message queries",
+        )?;
+        version = 11;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
