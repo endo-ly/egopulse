@@ -425,26 +425,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub(crate) fn get_latest_successful_run(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<SleepRun>, StorageError> {
-        let conn = self.get_conn()?;
-        conn.query_row(
-            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md,
-                    input_tokens, output_tokens, total_tokens, error_message
-             FROM sleep_runs
-             WHERE agent_id = ?1 AND status = 'success'
-             ORDER BY finished_at DESC
-             LIMIT 1",
-            params![agent_id],
-            row_to_sleep_run,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
     /// Marks a sleep run step as running and sets `started_at`.
     ///
     /// # Errors
@@ -890,29 +870,41 @@ impl Database {
         .map_err(Into::into)
     }
 
-    pub(crate) fn count_agent_messages_since(
+    pub(crate) fn count_agent_pending_sleep_messages(
         &self,
         agent_id: &str,
-        since: Option<&str>,
     ) -> Result<i64, StorageError> {
         let conn = self.get_conn()?;
         conn.query_row(
-            "SELECT COUNT(*)
+            "SELECT COUNT(DISTINCT m.id)
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE c.agent_id = ?1 AND (?2 IS NULL OR m.timestamp > ?2)
-             -- TODO(temp): exclude voice channel from sleep batch; remove when no longer needed
-             AND c.chat_type != 'voice'",
-            params![agent_id, since],
+             LEFT JOIN sleep_step_checkpoints event_checkpoint
+               ON event_checkpoint.agent_id = c.agent_id
+              AND event_checkpoint.step_name = 'event_extraction'
+              AND event_checkpoint.source_kind = 'messages'
+              AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+             LEFT JOIN sleep_step_checkpoints prospective_checkpoint
+               ON prospective_checkpoint.agent_id = c.agent_id
+              AND prospective_checkpoint.step_name = 'prospective_update'
+              AND prospective_checkpoint.source_kind = 'messages'
+              AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+             WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+               AND (
+                    event_checkpoint.cursor_at IS NULL
+                    OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
+                    OR prospective_checkpoint.cursor_at IS NULL
+                    OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
+               )",
+            params![agent_id],
             |row| row.get(0),
         )
         .map_err(Into::into)
     }
 
-    pub(crate) fn get_agent_sessions_since(
+    pub(crate) fn get_agent_sessions_with_pending_sleep_messages(
         &self,
         agent_id: &str,
-        since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AgentSessionInfo>, StorageError> {
         let conn = self.get_conn()?;
@@ -926,13 +918,29 @@ impl Database {
                 LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
              FROM chats c
              JOIN sessions s ON c.chat_id = s.chat_id
-             WHERE c.agent_id = ?1 AND (?2 IS NULL OR s.updated_at > ?2)
-             -- TODO(temp): exclude voice channel from sleep batch; remove when no longer needed
-             AND c.chat_type != 'voice'
-             ORDER BY s.updated_at DESC
-             LIMIT ?3",
+             JOIN messages m ON m.chat_id = c.chat_id
+             LEFT JOIN sleep_step_checkpoints event_checkpoint
+               ON event_checkpoint.agent_id = c.agent_id
+              AND event_checkpoint.step_name = 'event_extraction'
+              AND event_checkpoint.source_kind = 'messages'
+              AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+             LEFT JOIN sleep_step_checkpoints prospective_checkpoint
+               ON prospective_checkpoint.agent_id = c.agent_id
+              AND prospective_checkpoint.step_name = 'prospective_update'
+              AND prospective_checkpoint.source_kind = 'messages'
+              AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+             WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+               AND (
+                    event_checkpoint.cursor_at IS NULL
+                    OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
+                    OR prospective_checkpoint.cursor_at IS NULL
+                    OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
+               )
+             GROUP BY c.chat_id
+             ORDER BY MIN(m.timestamp) ASC, MIN(m.id) ASC, c.chat_id ASC
+             LIMIT ?2",
         )?;
-        stmt.query_map(params![agent_id, since, limit as i64], |row| {
+        stmt.query_map(params![agent_id, limit as i64], |row| {
             Ok(AgentSessionInfo {
                 chat_id: row.get(0)?,
                 channel: row.get(1)?,
@@ -1340,25 +1348,6 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, id_a3);
         assert_eq!(runs[1].id, id_a2);
-    }
-
-    #[test]
-    fn get_latest_successful_run() {
-        let (db, _dir) = test_db();
-
-        let id_1 = create_test_sleep_run(&db, "agent-a");
-        db.update_sleep_run_success(&id_1, "[]", None, 10, 5)
-            .expect("success 1");
-
-        let id_2 = create_test_sleep_run(&db, "agent-a");
-        db.update_sleep_run_success(&id_2, "[]", None, 20, 10)
-            .expect("success 2");
-
-        let latest = db
-            .get_latest_successful_run("agent-a")
-            .expect("get latest")
-            .expect("should exist");
-        assert_eq!(latest.id, id_2);
     }
 
     #[test]

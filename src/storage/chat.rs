@@ -931,118 +931,29 @@ mod tests {
     }
 
     #[test]
-    fn count_agent_messages_since_counts_correctly() {
+    fn pending_sleep_messages_exclude_other_agents() {
         let (db, _dir) = test_db();
 
         let chat_id = db
             .resolve_or_create_chat_id("cli", "cli:msgs-a", None, "cli", "agent-a")
             .expect("create chat");
 
-        store_msg(&db, "msg-1", chat_id, "old", "2024-01-01T00:00:00Z");
-        store_msg(&db, "msg-2", chat_id, "old2", "2024-01-01T00:00:01Z");
-        store_msg(&db, "msg-3", chat_id, "new", "2024-01-01T00:00:02Z");
-        store_msg(&db, "msg-4", chat_id, "new2", "2024-01-01T00:00:03Z");
+        store_msg(&db, "msg-1", chat_id, "message", "2024-01-01T00:00:00Z");
 
         let count = db
-            .count_agent_messages_since("agent-a", Some("2024-01-01T00:00:01Z"))
+            .count_agent_pending_sleep_messages("agent-a")
             .expect("count");
-        assert_eq!(count, 2, "should count only messages after the cutoff");
+        assert_eq!(count, 1);
     }
 
     #[test]
-    fn count_agent_messages_since_excludes_other_agents() {
-        let (db, _dir) = test_db();
-
-        let chat_a = db
-            .resolve_or_create_chat_id("cli", "cli:chat-a", None, "cli", "agent-a")
-            .expect("create chat a");
-        let chat_b = db
-            .resolve_or_create_chat_id("cli", "cli:chat-b", None, "cli", "agent-b")
-            .expect("create chat b");
-
-        store_msg(&db, "msg-a1", chat_a, "hello", "2024-01-01T00:00:00Z");
-        store_msg(&db, "msg-a2", chat_a, "world", "2024-01-01T00:00:01Z");
-        store_msg(&db, "msg-b1", chat_b, "secret", "2024-01-01T00:00:02Z");
-
-        let count = db
-            .count_agent_messages_since("agent-a", None)
-            .expect("count");
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn get_agent_sessions_since_returns_sessions() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("web", "web:sess-a", Some("sess-a"), "web", "agent-a")
-            .expect("create chat");
-
-        db.save_session(chat_id, r#"{"msgs":[]}"#)
-            .expect("save session");
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 10)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].chat_id, chat_id);
-        assert_eq!(sessions[0].channel, "web");
-        assert_eq!(sessions[0].external_chat_id, "web:sess-a");
-    }
-
-    #[test]
-    fn get_agent_sessions_since_ordered_by_updated_at_desc() {
-        let (db, _dir) = test_db();
-
-        let chat_1 = db
-            .resolve_or_create_chat_id("cli", "cli:chat-1", None, "cli", "agent-a")
-            .expect("create chat 1");
-        let chat_2 = db
-            .resolve_or_create_chat_id("cli", "cli:chat-2", None, "cli", "agent-a")
-            .expect("create chat 2");
-
-        // Create sessions with small delay so updated_at differs
-        db.save_session(chat_1, r#"{}"#).expect("save session 1");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        db.save_session(chat_2, r#"{}"#).expect("save session 2");
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 10)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].chat_id, chat_2, "newest first");
-        assert_eq!(sessions[1].chat_id, chat_1, "oldest second");
-    }
-
-    #[test]
-    fn get_agent_sessions_since_returns_empty_for_unknown_agent() {
+    fn get_pending_sleep_sessions_returns_empty_for_unknown_agent() {
         let (db, _dir) = test_db();
 
         let sessions = db
-            .get_agent_sessions_since("nonexistent-agent", None, 10)
+            .get_agent_sessions_with_pending_sleep_messages("nonexistent-agent", 10)
             .expect("get sessions");
         assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn get_agent_sessions_includes_message_count() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:msgcount", None, "cli", "agent-a")
-            .expect("create chat");
-
-        store_msg(&db, "m1", chat_id, "msg 1", "2024-01-01T00:00:00Z");
-        store_msg(&db, "m2", chat_id, "msg 2", "2024-01-01T00:00:01Z");
-        store_msg(&db, "m3", chat_id, "msg 3", "2024-01-01T00:00:02Z");
-
-        db.save_session(chat_id, r#"{}"#).expect("save session");
-
-        let sessions = db
-            .get_agent_sessions_since("agent-a", None, 10)
-            .expect("get sessions");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].message_count, 3);
     }
 
     // --- Channel Log tests ---

@@ -200,8 +200,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
 - `resolve_or_create_chat_id(channel, external_chat_id, chat_title, chat_type)` — Upsert（`ON CONFLICT DO UPDATE`）
 - `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
-- `count_agent_messages_since(agent_id, since: Option<&str>)` — agent の新規メッセージ数をカウント（JOIN messages + chats）
-- `get_agent_sessions_since(agent_id, since: Option<&str>, limit)` — agent のセッション一覧を updated_at 降順で取得（JOIN chats + sessions）。message_count と estimated_tokens（chars/3 近似）を含む
 
 #### Channel Log (Multi-Agent Room)
 
@@ -442,7 +440,8 @@ CREATE INDEX idx_sleep_runs_agent_status
 - `update_sleep_run_skipped(id)` — status=skipped 更新
 - `get_sleep_run(id)` — id で取得
 - `list_sleep_runs(agent_id, limit)` — agent_id 絞り込み + started_at 降順
-- `get_latest_successful_run(agent_id)` — success の最新1件。スリープ入力収集のカットオフタイムスタンプ決定に使用
+- `count_agent_pending_sleep_messages(agent_id)` — `event_extraction` / `prospective_update` いずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複除外して計数（Sleep 候補判定の cursor として `finished_at` ではなく checkpoint を使用）
+- `get_agent_sessions_with_pending_sleep_messages(agent_id, limit)` — 同じ pending 条件でセッションを「最古の pending message が古い順、同値なら `chat_id` 順」で取得（hot session による backlog 飢餖防止）
 
 **設計ポイント**:
 - `trigger` は SQLite 予約語のため `trigger_type` にリネーム

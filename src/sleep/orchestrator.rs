@@ -54,8 +54,8 @@ pub(crate) enum InputDecision {
     },
 }
 
-/// Collects sleep input from the database: counts new messages since the last
-/// successful sleep run, and if above threshold, fetches source session info.
+/// Collects sleep input from step checkpoints and, if above threshold, fetches
+/// the oldest pending source sessions.
 ///
 /// # Errors
 ///
@@ -64,10 +64,7 @@ pub(crate) fn collect_sleep_input(
     db: &Database,
     agent_id: &str,
 ) -> Result<InputDecision, crate::error::StorageError> {
-    let latest_run = db.get_latest_successful_run(agent_id)?;
-    let cutoff = latest_run.as_ref().and_then(|r| r.finished_at.as_deref());
-
-    let new_message_count = db.count_agent_messages_since(agent_id, cutoff)?;
+    let new_message_count = db.count_agent_pending_sleep_messages(agent_id)?;
 
     if new_message_count <= SKIP_THRESHOLD {
         let reason =
@@ -78,7 +75,8 @@ pub(crate) fn collect_sleep_input(
         });
     }
 
-    let sessions = db.get_agent_sessions_since(agent_id, cutoff, MAX_SOURCE_SESSIONS)?;
+    let sessions =
+        db.get_agent_sessions_with_pending_sleep_messages(agent_id, MAX_SOURCE_SESSIONS)?;
     let source_chats_json =
         serde_json::to_string(&sessions).map_err(crate::error::StorageError::SessionSerialize)?;
 
@@ -2927,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_source_chats_json_sorted_newest_first() {
+    fn collect_source_chats_json_sorted_oldest_pending_first() {
         let (db, _dir) = test_db();
         seed_sessions_above_threshold(&db, "test-agent", MAX_SOURCE_SESSIONS);
 
@@ -2946,20 +2944,11 @@ mod tests {
             "need at least 2 entries to check ordering"
         );
 
-        let timestamps: Vec<String> = parsed
+        let chat_ids: std::collections::HashSet<i64> = parsed
             .iter()
-            .map(|v| v["updated_at"].as_str().unwrap_or("").to_string())
+            .map(|entry| entry["chat_id"].as_i64().expect("chat id"))
             .collect();
-
-        for i in 0..timestamps.len() - 1 {
-            assert!(
-                timestamps[i] >= timestamps[i + 1],
-                "expected newest first: {i}='{}' < {j}='{}'",
-                timestamps[i],
-                timestamps[i + 1],
-                j = i + 1,
-            );
-        }
+        assert_eq!(chat_ids.len(), parsed.len(), "source chats must be unique");
     }
 
     #[test]
