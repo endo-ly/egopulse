@@ -39,7 +39,7 @@ pub fn init_metrics() -> &'static PrometheusHandle {
         );
         describe_counter!(
             "egopulse_turn_queue_rejections_total",
-            "Turns rejected by the scheduler queue capacity"
+            "Turns rejected at intake (scheduler queue full, origin tracker full, or chain terminated)"
         );
 
         handle

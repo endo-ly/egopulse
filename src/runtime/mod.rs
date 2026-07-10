@@ -551,20 +551,30 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        // Turn count was reserved at acceptance; read it (do not increment) so
-        // per-chain stop conditions still see the correct depth.
-        let turn_count = state.turn_tracker.count(&origin_id).unwrap_or(0);
+        // The origin was already reserved at acceptance, but a reserve only
+        // bumps `pending_reservations` — never the executed count. Gate the
+        // turn on the prospective executed count (current executed + 1) so a
+        // burst of accepted turns cannot trip the per-chain turn limit early,
+        // and so a turn rejected by the stop-condition evaluator never inflates
+        // the executed count the limit is enforced against.
+        let prospective_turn_count = state.turn_tracker.executed_count(&origin_id) + 1;
 
-        if let Some(reason) =
-            turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)
-        {
+        if let Some(reason) = turn_scheduler::evaluate_stop_conditions(
+            chain_depth,
+            prospective_turn_count,
+            agent_id,
+            &valid_ids,
+        ) {
             tracing::warn!(
                 agent_id = %agent_id,
                 chain_depth,
-                turn_count,
+                prospective_turn_count,
                 reason = ?reason,
                 "scheduled turn rejected by stop condition evaluator"
             );
+            // This turn will not execute: release its reservation and record the
+            // terminal reason so queued turns for the same origin are refused.
+            state.turn_tracker.release(&origin_id);
             state
                 .turn_tracker
                 .set_terminal_reason(&origin_id, reason.clone());
@@ -589,6 +599,13 @@ pub(crate) fn execute_scheduled_turn(
             }
             return;
         }
+
+        // The chain is alive and within the per-chain turn limit: commit the
+        // reservation to an actual execution, converting one pending reservation
+        // into an executed turn. Done here (after the stop-condition gate,
+        // before the turn runs) so the executed count only reflects turns that
+        // actually started.
+        state.turn_tracker.begin_execution(&origin_id);
 
         let adapter = state.channels.get(&turn.context.channel);
         let external_chat_id = turn.context.session_key();

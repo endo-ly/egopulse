@@ -1391,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn process_turn_runs_tool_once_when_subsequent_llm_call_fails() {
+    async fn observed_turn_runs_tool_once_when_subsequent_llm_call_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let relative_path = format!("tests/{}/side_effect.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
@@ -1419,9 +1419,17 @@ mod tests {
         std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
         std::fs::write(&note_path, "side effect content").expect("notes");
 
-        let error = process_turn(&state, &cli_context("tool-once"), "please read the note")
-            .await
-            .expect_err("should fail because the subsequent LLM call errors");
+        // Exercise the runtime boundary (execute_observed_turn ->
+        // execute_turn_with_progress), not the bare agent-loop entry point, so
+        // the tool-after-LLM-failure behavior is verified on the path that
+        // actually runs in production.
+        let error = crate::runtime::execute_observed_turn(
+            &state,
+            &cli_context("tool-once"),
+            "please read the note",
+        )
+        .await
+        .expect_err("should fail because the subsequent LLM call errors");
         assert!(matches!(error, EgoPulseError::Llm(_)));
 
         let seen_messages = provider.seen_messages();

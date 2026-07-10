@@ -129,6 +129,20 @@ impl RejectReason {
             Self::ChainTerminated => "chain_terminated",
         }
     }
+
+    /// User-facing message describing why the turn was rejected.
+    ///
+    /// Used in API/webhook responses so the reason is not masked behind a
+    /// generic "queue at capacity" string when the rejection is actually a
+    /// tracker-capacity or chain-terminated condition.
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            Self::SessionQueueFull => "session turn queue is at capacity",
+            Self::GlobalQueueFull => "global turn queue is at capacity",
+            Self::OriginTrackerFull => "origin turn tracker is at capacity",
+            Self::ChainTerminated => "turn chain already terminated",
+        }
+    }
 }
 
 impl std::fmt::Display for RejectReason {
@@ -184,7 +198,14 @@ pub(crate) struct TurnTracker {
 }
 
 struct OriginState {
-    turn_count: usize,
+    /// Number of turns for this origin that have actually started executing.
+    /// This is what the per-chain turn limit is measured against, and it only
+    /// advances when a turn begins running — never at acceptance.
+    executed_turn_count: usize,
+    /// Number of turns reserved at acceptance but not yet executed. Capacity is
+    /// reserved up front so a rejected turn is refused before `202 Accepted`,
+    /// but reservations must not inflate [`executed_turn_count`].
+    pending_reservations: usize,
     terminal_reason: Option<StopReason>,
     last_touched: Instant,
 }
@@ -197,89 +218,113 @@ impl TurnTracker {
         }
     }
 
-    /// Increments the turn count for `origin_id`.
-    ///
-    /// Returns `Some(new_count)` when tracked. Returns `None` when the tracker
-    /// is at [`MAX_TRACKED_ORIGINS`] capacity (after TTL pruning) and
-    /// `origin_id` is new — the caller must reject the turn rather than execute
-    /// it untracked. Existing origins are always updatable, even at capacity.
-    pub(crate) fn increment(&self, origin_id: &str) -> Option<usize> {
-        let mut origins = self.origins.lock().expect("turn_tracker lock");
-        self.prune_stale_locked(&mut origins);
-        let now = self.clock.now();
-        if let Some(state) = origins.get_mut(origin_id) {
-            state.turn_count += 1;
-            state.last_touched = now;
-            Some(state.turn_count)
-        } else if origins.len() >= MAX_TRACKED_ORIGINS {
-            None
-        } else {
-            origins.insert(
-                origin_id.to_string(),
-                OriginState {
-                    turn_count: 1,
-                    terminal_reason: None,
-                    last_touched: now,
-                },
-            );
-            Some(1)
-        }
-    }
-
     /// Reserves tracker capacity for `origin_id` at turn acceptance.
     ///
-    /// Performs the two checks that used to happen asynchronously inside turn
-    /// execution, but at the acceptance boundary so a rejected turn is refused
-    /// before any `202 Accepted` is returned to the caller:
+    /// Performs the acceptance-time checks atomically in a single lock so a
+    /// rejected turn is refused before any `202 Accepted` is returned to the
+    /// caller:
     ///
     /// 1. If the origin already has a terminal stop reason, returns
     ///    `Err(ChainTerminated)` — the chain already ended.
-    /// 2. Otherwise reserves the origin (incrementing its turn count), returning
-    ///    `Err(OriginTrackerFull)` when [`MAX_TRACKED_ORIGINS`] is reached for a
-    ///    new origin.
+    /// 2. Otherwise, for a brand-new origin, returns `Err(OriginTrackerFull)`
+    ///    when [`MAX_TRACKED_ORIGINS`] capacity is reached. Existing origins are
+    ///    always reservable.
     ///
-    /// On success the origin is reserved; call [`TurnTracker::release`] if the
-    /// turn is later refused by the scheduler queue so the reservation does not
-    /// leak capacity.
+    /// On success the origin's pending reservation count is incremented. The
+    /// reservation is independent of the executed turn count (see
+    /// [`TurnTracker::begin_execution`]): a turn is only counted as executed
+    /// once it actually starts running, so fan-out or burst submissions never
+    /// inflate the per-chain turn limit that execution is measured against.
+    ///
+    /// Call [`TurnTracker::release`] if the turn is later refused downstream
+    /// (e.g. by the scheduler queue) so the reservation does not leak capacity.
     ///
     /// # Errors
     ///
     /// Returns the [`RejectReason`] when the origin must be refused.
     pub(crate) fn reserve(&self, origin_id: &str) -> Result<(), RejectReason> {
-        if self.terminal_reason(origin_id).is_some() {
-            return Err(RejectReason::ChainTerminated);
+        let mut origins = self.origins.lock().expect("turn_tracker lock");
+        self.prune_stale_locked(&mut origins);
+        let now = self.clock.now();
+        if let Some(state) = origins.get_mut(origin_id) {
+            if state.terminal_reason.is_some() {
+                return Err(RejectReason::ChainTerminated);
+            }
+            state.pending_reservations += 1;
+            state.last_touched = now;
+            return Ok(());
         }
-        match self.increment(origin_id) {
-            Some(_) => Ok(()),
-            None => Err(RejectReason::OriginTrackerFull),
+        if origins.len() >= MAX_TRACKED_ORIGINS {
+            return Err(RejectReason::OriginTrackerFull);
         }
+        origins.insert(
+            origin_id.to_string(),
+            OriginState {
+                executed_turn_count: 0,
+                pending_reservations: 1,
+                terminal_reason: None,
+                last_touched: now,
+            },
+        );
+        Ok(())
     }
 
     /// Releases a reservation made by [`TurnTracker::reserve`].
     ///
     /// Called when a turn that reserved capacity is refused downstream (e.g. by
-    /// the scheduler queue). Decrements the origin's turn count and, for a
-    /// brand-new origin that never executed, removes the entry so it does not
-    /// occupy tracker capacity.
+    /// the scheduler queue). Decrements the origin's pending reservation count
+    /// and, for an origin that never executed and has no terminal reason,
+    /// removes the entry so it does not occupy tracker capacity.
     pub(crate) fn release(&self, origin_id: &str) {
         let mut origins = self.origins.lock().expect("turn_tracker lock");
         if let Some(state) = origins.get_mut(origin_id) {
-            state.turn_count = state.turn_count.saturating_sub(1);
-            if state.turn_count == 0 && state.terminal_reason.is_none() {
+            state.pending_reservations = state.pending_reservations.saturating_sub(1);
+            if state.pending_reservations == 0
+                && state.executed_turn_count == 0
+                && state.terminal_reason.is_none()
+            {
                 origins.remove(origin_id);
             }
         }
     }
 
-    /// Returns the current turn count for `origin_id`, or `None` if untracked.
+    /// Consumes one pending reservation and records the turn as executed.
     ///
-    /// Used by turn execution to evaluate per-chain stop conditions after the
-    /// origin was already reserved at acceptance. Stale origins are pruned
-    /// before the read.
-    pub(crate) fn count(&self, origin_id: &str) -> Option<usize> {
+    /// Called at execution start (after the terminal-reason re-check) so the
+    /// per-chain turn limit is measured against turns that actually ran, not
+    /// turns merely accepted. Returns the origin's executed turn count, which
+    /// the caller passes to [`evaluate_stop_conditions`].
+    ///
+    /// Keeping reservations and executions in separate counters is what lets
+    /// [`TurnTracker::reserve`] reject at capacity at acceptance without
+    /// inflating the executed count the turn limit is enforced against.
+    pub(crate) fn begin_execution(&self, origin_id: &str) -> usize {
         let mut origins = self.origins.lock().expect("turn_tracker lock");
-        self.prune_stale_locked(&mut origins);
-        origins.get(origin_id).map(|s| s.turn_count)
+        let now = self.clock.now();
+        let state = origins.entry(origin_id.to_string()).or_insert(OriginState {
+            executed_turn_count: 0,
+            pending_reservations: 0,
+            terminal_reason: None,
+            last_touched: now,
+        });
+        state.pending_reservations = state.pending_reservations.saturating_sub(1);
+        state.executed_turn_count += 1;
+        state.last_touched = now;
+        state.executed_turn_count
+    }
+
+    /// Returns the number of turns that have actually begun execution for
+    /// `origin_id`, or `0` if the origin is not tracked.
+    ///
+    /// Used by turn execution to evaluate per-chain stop conditions against the
+    /// executed count (never the pending reservation count) before committing a
+    /// turn. Does not prune or mutate any state.
+    pub(crate) fn executed_count(&self, origin_id: &str) -> usize {
+        let origins = self.origins.lock().expect("turn_tracker lock");
+        origins
+            .get(origin_id)
+            .map(|state| state.executed_turn_count)
+            .unwrap_or(0)
     }
 
     /// Records the reason a turn chain stopped for the given origin.
@@ -303,7 +348,8 @@ impl TurnTracker {
                 s.last_touched = now;
             })
             .or_insert(OriginState {
-                turn_count: 0,
+                executed_turn_count: 0,
+                pending_reservations: 0,
                 terminal_reason: Some(reason),
                 last_touched: now,
             });
@@ -339,10 +385,10 @@ impl TurnTracker {
             let stale = now
                 .checked_duration_since(state.last_touched)
                 .is_some_and(|elapsed| elapsed > ORIGIN_TTL);
-            if stale && (state.turn_count > 0 || state.terminal_reason.is_some()) {
+            if stale && (state.executed_turn_count > 0 || state.terminal_reason.is_some()) {
                 tracing::debug!(
                     origin_id = %origin_id,
-                    turn_count = state.turn_count,
+                    executed_turn_count = state.executed_turn_count,
                     terminal_reason = ?state.terminal_reason,
                     "pruning stale origin from turn tracker (ttl elapsed)"
                 );
@@ -781,17 +827,23 @@ mod tests {
     #[test]
     fn turn_tracker_increments_per_origin() {
         let tracker = TurnTracker::new();
-        assert_eq!(tracker.increment("orig-1"), Some(1));
-        assert_eq!(tracker.increment("orig-1"), Some(2));
-        assert_eq!(tracker.increment("orig-1"), Some(3));
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(tracker.begin_execution("orig-1"), 1);
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(tracker.begin_execution("orig-1"), 2);
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(tracker.begin_execution("orig-1"), 3);
     }
 
     #[test]
     fn turn_tracker_different_origins_independent() {
         let tracker = TurnTracker::new();
-        assert_eq!(tracker.increment("orig-1"), Some(1));
-        assert_eq!(tracker.increment("orig-1"), Some(2));
-        assert_eq!(tracker.increment("orig-2"), Some(1));
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(tracker.begin_execution("orig-1"), 1);
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(tracker.begin_execution("orig-1"), 2);
+        tracker.reserve("orig-2").unwrap();
+        assert_eq!(tracker.begin_execution("orig-2"), 1);
     }
 
     #[test]
@@ -803,6 +855,11 @@ mod tests {
             tracker.terminal_reason("orig-1"),
             Some(StopReason::ChainDepthExceeded)
         );
+        // A reserve after a terminal reason is refused.
+        assert_eq!(
+            tracker.reserve("orig-1"),
+            Err(RejectReason::ChainTerminated)
+        );
     }
 
     #[test]
@@ -810,21 +867,24 @@ mod tests {
         let clock = MockClock::new();
         let tracker = TurnTracker::new_with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
 
-        assert_eq!(tracker.increment("stale"), Some(1));
+        assert_eq!(tracker.reserve("stale"), Ok(()));
+        tracker.begin_execution("stale");
         assert_eq!(tracker.tracked_len(), 1);
 
         // Just under TTL: still retained.
         clock.advance(ORIGIN_TTL - Duration::from_secs(1));
-        assert_eq!(tracker.increment("fresh"), Some(1));
+        assert_eq!(tracker.reserve("fresh"), Ok(()));
+        tracker.begin_execution("fresh");
         assert_eq!(tracker.tracked_len(), 2);
 
         // Past TTL for "stale": pruned on the next operation. "fresh" is
         // retained and its count keeps climbing.
         clock.advance(Duration::from_secs(2));
-        assert_eq!(tracker.increment("fresh"), Some(2));
+        assert_eq!(tracker.reserve("fresh"), Ok(()));
+        assert_eq!(tracker.begin_execution("fresh"), 2);
         assert_eq!(tracker.tracked_len(), 1);
-        // "stale" was evicted, so re-incrementing starts fresh at 1.
-        assert_eq!(tracker.increment("stale"), Some(1));
+        // "stale" was evicted, so re-reserving starts fresh.
+        assert_eq!(tracker.reserve("stale"), Ok(()));
     }
 
     #[test]
@@ -835,19 +895,63 @@ mod tests {
         // Fill to capacity with distinct origins.
         for i in 0..MAX_TRACKED_ORIGINS {
             assert_eq!(
-                tracker.increment(&format!("orig-{i}")),
-                Some(1),
+                tracker.reserve(&format!("orig-{i}")),
+                Ok(()),
                 "origin {i} should be tracked"
             );
         }
         assert_eq!(tracker.tracked_len(), MAX_TRACKED_ORIGINS);
 
-        // A brand-new origin is rejected.
-        assert_eq!(tracker.increment("orig-new"), None);
+        // A brand-new origin is rejected at capacity.
+        assert_eq!(
+            tracker.reserve("orig-new"),
+            Err(RejectReason::OriginTrackerFull)
+        );
 
-        // An existing origin is still updatable at capacity.
-        assert_eq!(tracker.increment("orig-0"), Some(2));
+        // An existing origin is still reservable at capacity.
+        assert_eq!(tracker.reserve("orig-0"), Ok(()));
         assert_eq!(tracker.tracked_len(), MAX_TRACKED_ORIGINS);
+    }
+
+    #[test]
+    fn reserve_does_not_inflate_executed_turn_count() {
+        let tracker = TurnTracker::new();
+        // 13 turns accepted (reserved) for the same origin/session before any
+        // executes. The reservation must NOT count toward the executed-turn
+        // limit that execution is measured against.
+        for _ in 0..13 {
+            tracker.reserve("orig-1").unwrap();
+        }
+        // The first 12 turns execute without tripping the limit.
+        for executed in 1..=12 {
+            assert_eq!(tracker.begin_execution("orig-1"), executed);
+        }
+        // Only the 13th actual execution reaches the limit.
+        assert_eq!(tracker.begin_execution("orig-1"), 13);
+        assert_eq!(
+            evaluate_stop_conditions(0, 13, "agent_a", &["agent_a"]),
+            Some(StopReason::TurnCountExceeded)
+        );
+    }
+
+    #[test]
+    fn concurrent_reserve_never_observes_inflated_executed_count() {
+        let tracker = TurnTracker::new();
+        // A burst of 13 reserved turns for one origin/session.
+        for _ in 0..13 {
+            tracker.reserve("orig-1").unwrap();
+        }
+        // A concurrent submitter observing the executed count must see 0 until
+        // turns actually run -- the acceptance reserves never inflated it.
+        assert_eq!(tracker.executed_count("orig-1"), 0);
+        // The chain only reaches the limit as turns actually execute.
+        for executed in 1..=12 {
+            assert_eq!(tracker.begin_execution("orig-1"), executed);
+        }
+        assert_eq!(tracker.executed_count("orig-1"), 12);
+        // The 13th execution is the one that would trip the limit; a submitter
+        // that only reserves never observes 13 without an actual 13th execution.
+        assert_eq!(tracker.begin_execution("orig-1"), 13);
     }
 
     // -----------------------------------------------------------------------

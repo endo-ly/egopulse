@@ -112,7 +112,7 @@ pub(crate) async fn receive_webhook(
         return super::error::webhook_error(
             StatusCode::TOO_MANY_REQUESTS,
             reason.as_str(),
-            "scheduler queue at capacity",
+            reason.message(),
         );
     }
 

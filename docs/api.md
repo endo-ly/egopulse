@@ -660,6 +660,8 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
 | `session_queue_full` | 429 | 対象セッションのキューが上限（32）に達し、受付を拒否した |
 | `global_queue_full` | 429 | Runtime 全体のキューが上限（512）に達し、受付を拒否した |
+| `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
+| `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 
 ---
 
