@@ -876,26 +876,29 @@ impl Database {
     ) -> Result<i64, StorageError> {
         let conn = self.get_conn()?;
         conn.query_row(
-            "SELECT COUNT(DISTINCT m.id)
-             FROM messages m
-             JOIN chats c ON m.chat_id = c.chat_id
-             LEFT JOIN sleep_step_checkpoints event_checkpoint
-               ON event_checkpoint.agent_id = c.agent_id
-              AND event_checkpoint.step_name = 'event_extraction'
-              AND event_checkpoint.source_kind = 'messages'
-              AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-             LEFT JOIN sleep_step_checkpoints prospective_checkpoint
-               ON prospective_checkpoint.agent_id = c.agent_id
-              AND prospective_checkpoint.step_name = 'prospective_update'
-              AND prospective_checkpoint.source_kind = 'messages'
-              AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-             WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
-               AND (
-                    event_checkpoint.cursor_at IS NULL
-                    OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
-                    OR prospective_checkpoint.cursor_at IS NULL
-                    OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
-               )",
+            "SELECT COUNT(*) FROM (
+                SELECT m.chat_id, m.id
+                FROM messages m
+                JOIN chats c ON m.chat_id = c.chat_id
+                LEFT JOIN sleep_step_checkpoints event_checkpoint
+                  ON event_checkpoint.agent_id = c.agent_id
+                 AND event_checkpoint.step_name = 'event_extraction'
+                 AND event_checkpoint.source_kind = 'messages'
+                 AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+                LEFT JOIN sleep_step_checkpoints prospective_checkpoint
+                  ON prospective_checkpoint.agent_id = c.agent_id
+                 AND prospective_checkpoint.step_name = 'prospective_update'
+                 AND prospective_checkpoint.source_kind = 'messages'
+                 AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+                WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+                  AND (
+                       event_checkpoint.cursor_at IS NULL
+                       OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
+                       OR prospective_checkpoint.cursor_at IS NULL
+                       OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
+                  )
+                GROUP BY m.chat_id, m.id
+             )",
             params![agent_id],
             |row| row.get(0),
         )
@@ -909,35 +912,51 @@ impl Database {
     ) -> Result<Vec<AgentSessionInfo>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT
-                c.chat_id,
-                c.channel,
-                c.external_chat_id,
-                s.updated_at,
-                (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
-                LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens
-             FROM chats c
-             JOIN sessions s ON c.chat_id = s.chat_id
-             JOIN messages m ON m.chat_id = c.chat_id
-             LEFT JOIN sleep_step_checkpoints event_checkpoint
-               ON event_checkpoint.agent_id = c.agent_id
-              AND event_checkpoint.step_name = 'event_extraction'
-              AND event_checkpoint.source_kind = 'messages'
-              AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-             LEFT JOIN sleep_step_checkpoints prospective_checkpoint
-               ON prospective_checkpoint.agent_id = c.agent_id
-              AND prospective_checkpoint.step_name = 'prospective_update'
-              AND prospective_checkpoint.source_kind = 'messages'
-              AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-             WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
-               AND (
-                    event_checkpoint.cursor_at IS NULL
-                    OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
-                    OR prospective_checkpoint.cursor_at IS NULL
-                    OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
-               )
-             GROUP BY c.chat_id
-             ORDER BY MIN(m.timestamp) ASC, MIN(m.id) ASC, c.chat_id ASC
+            "WITH pending_messages AS (
+                SELECT
+                    c.chat_id,
+                    c.channel,
+                    c.external_chat_id,
+                    s.updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
+                    LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens,
+                    m.timestamp AS pending_ts,
+                    m.id AS pending_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.chat_id
+                        ORDER BY m.timestamp ASC, m.id ASC
+                    ) AS rn
+                FROM chats c
+                JOIN sessions s ON c.chat_id = s.chat_id
+                JOIN messages m ON m.chat_id = c.chat_id
+                LEFT JOIN sleep_step_checkpoints event_checkpoint
+                  ON event_checkpoint.agent_id = c.agent_id
+                 AND event_checkpoint.step_name = 'event_extraction'
+                 AND event_checkpoint.source_kind = 'messages'
+                 AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+                LEFT JOIN sleep_step_checkpoints prospective_checkpoint
+                  ON prospective_checkpoint.agent_id = c.agent_id
+                 AND prospective_checkpoint.step_name = 'prospective_update'
+                 AND prospective_checkpoint.source_kind = 'messages'
+                 AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
+                WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+                  AND (
+                       event_checkpoint.cursor_at IS NULL
+                       OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
+                       OR prospective_checkpoint.cursor_at IS NULL
+                       OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
+                  )
+             )
+             SELECT
+                 chat_id,
+                 channel,
+                 external_chat_id,
+                 updated_at,
+                 message_count,
+                 estimated_tokens
+             FROM pending_messages
+             WHERE rn = 1
+             ORDER BY pending_ts ASC, pending_id ASC, chat_id ASC
              LIMIT ?2",
         )?;
         stmt.query_map(params![agent_id, limit as i64], |row| {

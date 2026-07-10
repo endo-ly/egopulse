@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::runtime::AppState;
+use crate::runtime::metrics;
 use crate::runtime::turn_scheduler::{ScheduleResult, SubmitOutcome};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
@@ -123,6 +124,24 @@ pub(crate) fn submit_agent_turn(
 }
 
 pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+    // Reserve tracker capacity at acceptance so an origin at the tracker limit
+    // (or an already-terminated chain) is refused here, before any `202
+    // Accepted` is returned. Execution no longer performs this check.
+    let mut scheduled = scheduled;
+    if scheduled.origin_id.is_empty() {
+        scheduled.origin_id = uuid::Uuid::new_v4().to_string();
+    }
+    let origin_id = scheduled.origin_id.clone();
+
+    if let Err(reason) = state.turn_tracker.reserve(&origin_id) {
+        tracing::warn!(
+            reason = %reason,
+            "turn rejected at acceptance: origin tracker"
+        );
+        metrics::inc_turn_queue_rejections(reason.as_str());
+        return SubmitOutcome::Rejected(reason);
+    }
+
     match state.turn_scheduler.submit(scheduled) {
         ScheduleResult::Started(turn) => {
             let turn = *turn;
@@ -134,10 +153,15 @@ pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) 
         }
         ScheduleResult::Queued => SubmitOutcome::Queued,
         ScheduleResult::Rejected(reason) => {
+            // Scheduler refused after we reserved: roll the reservation back so
+            // the origin does not occupy tracker capacity for a turn that will
+            // never run.
+            state.turn_tracker.release(&origin_id);
             tracing::warn!(
                 reason = %reason,
                 "turn rejected: scheduler queue at capacity"
             );
+            metrics::inc_turn_queue_rejections(reason.as_str());
             SubmitOutcome::Rejected(reason)
         }
     }

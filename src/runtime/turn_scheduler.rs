@@ -108,6 +108,14 @@ pub(crate) enum RejectReason {
     SessionQueueFull,
     /// The runtime-wide queue reached [`MAX_GLOBAL_QUEUED_TURNS`].
     GlobalQueueFull,
+    /// The origin tracker reached [`MAX_TRACKED_ORIGINS`] capacity for a new
+    /// origin. The turn is refused at acceptance so it is never silently
+    /// dropped after a `202 Accepted` was already returned.
+    OriginTrackerFull,
+    /// The origin already recorded a terminal stop reason (its chain
+    /// terminated earlier). Refused at acceptance rather than accepted and
+    /// dropped later.
+    ChainTerminated,
 }
 
 impl RejectReason {
@@ -117,6 +125,8 @@ impl RejectReason {
         match self {
             Self::SessionQueueFull => "session_queue_full",
             Self::GlobalQueueFull => "global_queue_full",
+            Self::OriginTrackerFull => "tracker_full",
+            Self::ChainTerminated => "chain_terminated",
         }
     }
 }
@@ -214,6 +224,62 @@ impl TurnTracker {
             );
             Some(1)
         }
+    }
+
+    /// Reserves tracker capacity for `origin_id` at turn acceptance.
+    ///
+    /// Performs the two checks that used to happen asynchronously inside turn
+    /// execution, but at the acceptance boundary so a rejected turn is refused
+    /// before any `202 Accepted` is returned to the caller:
+    ///
+    /// 1. If the origin already has a terminal stop reason, returns
+    ///    `Err(ChainTerminated)` — the chain already ended.
+    /// 2. Otherwise reserves the origin (incrementing its turn count), returning
+    ///    `Err(OriginTrackerFull)` when [`MAX_TRACKED_ORIGINS`] is reached for a
+    ///    new origin.
+    ///
+    /// On success the origin is reserved; call [`TurnTracker::release`] if the
+    /// turn is later refused by the scheduler queue so the reservation does not
+    /// leak capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RejectReason`] when the origin must be refused.
+    pub(crate) fn reserve(&self, origin_id: &str) -> Result<(), RejectReason> {
+        if self.terminal_reason(origin_id).is_some() {
+            return Err(RejectReason::ChainTerminated);
+        }
+        match self.increment(origin_id) {
+            Some(_) => Ok(()),
+            None => Err(RejectReason::OriginTrackerFull),
+        }
+    }
+
+    /// Releases a reservation made by [`TurnTracker::reserve`].
+    ///
+    /// Called when a turn that reserved capacity is refused downstream (e.g. by
+    /// the scheduler queue). Decrements the origin's turn count and, for a
+    /// brand-new origin that never executed, removes the entry so it does not
+    /// occupy tracker capacity.
+    pub(crate) fn release(&self, origin_id: &str) {
+        let mut origins = self.origins.lock().expect("turn_tracker lock");
+        if let Some(state) = origins.get_mut(origin_id) {
+            state.turn_count = state.turn_count.saturating_sub(1);
+            if state.turn_count == 0 && state.terminal_reason.is_none() {
+                origins.remove(origin_id);
+            }
+        }
+    }
+
+    /// Returns the current turn count for `origin_id`, or `None` if untracked.
+    ///
+    /// Used by turn execution to evaluate per-chain stop conditions after the
+    /// origin was already reserved at acceptance. Stale origins are pruned
+    /// before the read.
+    pub(crate) fn count(&self, origin_id: &str) -> Option<usize> {
+        let mut origins = self.origins.lock().expect("turn_tracker lock");
+        self.prune_stale_locked(&mut origins);
+        origins.get(origin_id).map(|s| s.turn_count)
     }
 
     /// Records the reason a turn chain stopped for the given origin.
@@ -428,7 +494,7 @@ impl TurnScheduler {
 
     /// Returns the total number of queued turns across all sessions.
     #[cfg(test)]
-    fn global_queued(&self) -> usize {
+    pub(crate) fn global_queued(&self) -> usize {
         let inner = self.inner.lock().expect("turn_scheduler lock");
         inner.global_queued
     }

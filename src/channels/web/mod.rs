@@ -1316,4 +1316,84 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(body["error"], "session_queue_full");
     }
+
+    #[tokio::test]
+    async fn webhook_route_returns_429_when_tracker_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        add_discord_channel(&mut config, 123);
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            None,
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        // Fill the origin tracker to capacity with distinct origins. No turns
+        // are executed; this only occupies tracker capacity so the next fresh
+        // origin must be refused at acceptance rather than accepted and later
+        // dropped.
+        for i in 0..crate::runtime::turn_scheduler::MAX_TRACKED_ORIGINS {
+            app_state
+                .turn_tracker
+                .reserve(&format!("fill-{i}"))
+                .expect("reserve distinct origin");
+        }
+
+        // The webhook handler generates a fresh origin id per request, so it
+        // collides with the full tracker and must be rejected before `202
+        // Accepted` is returned.
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(rejected.status(), StatusCode::ACCEPTED);
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(rejected.into_body(), 1024)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"], "tracker_full");
+
+        // No agent turn was started: the rejection happened before the
+        // scheduler was ever touched.
+        assert_eq!(app_state.turn_scheduler.global_queued(), 0);
+    }
 }

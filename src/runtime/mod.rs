@@ -530,6 +530,9 @@ pub(crate) fn execute_scheduled_turn(
             .runtime_status
             .touch_channel_activity(&turn.context.channel);
 
+        // The origin was already reserved at acceptance (submit_scheduled_turn).
+        // Re-check here for queued turns whose chain terminated while waiting in
+        // the scheduler; release the reservation so capacity is not leaked.
         if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
             tracing::warn!(
                 agent_id = %turn.context.agent_id,
@@ -537,6 +540,7 @@ pub(crate) fn execute_scheduled_turn(
                 reason = ?reason,
                 "dropping turn: origin already has terminal stop reason"
             );
+            state.turn_tracker.release(&origin_id);
             if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
                 execute_scheduled_turn(state, next).await;
             }
@@ -547,28 +551,9 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        let turn_count = match state.turn_tracker.increment(&origin_id) {
-            Some(count) => count,
-            None => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    origin_id = %origin_id,
-                    "turn rejected: origin tracker at capacity"
-                );
-                state.runtime_status.push_error(
-                    &origin_id,
-                    "tracker_full",
-                    agent_id,
-                    &turn.context.channel,
-                    "turn tracker at capacity",
-                );
-                crate::runtime::metrics::inc_turn_errors_total("tracker_full", agent_id);
-                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                    execute_scheduled_turn(state, next).await;
-                }
-                return;
-            }
-        };
+        // Turn count was reserved at acceptance; read it (do not increment) so
+        // per-chain stop conditions still see the correct depth.
+        let turn_count = state.turn_tracker.count(&origin_id).unwrap_or(0);
 
         if let Some(reason) =
             turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)
