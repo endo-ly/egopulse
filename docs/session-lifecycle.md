@@ -153,6 +153,10 @@ turn 開始時は次の順で session を復元する。
 
 ## 4. Turn 中の保存
 
+### Turn failure
+
+Runtime は、LLM の429・5xx・接続失敗を理由に、保存やTool実行を含むTurn全体を自動で再実行しない。現在のTurnはerrorとして終了し、再試行は次の利用者入力で開始される。Codex認証の401では次回Turn向けにtoken refreshを試みるが、失敗したTurnを再開しない。
+
 turn 中の保存は phase ごとに進む。
 
 1. user message を session 末尾に追加する
