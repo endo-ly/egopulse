@@ -357,46 +357,28 @@ impl ResponsesAccumulator {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidResponse`] when no response or streamed data
-    /// was accumulated.
+    /// Returns [`LlmError::InvalidResponse`] when no completion event
+    /// (`response.completed` / `response.done`) was received; partial streamed
+    /// data is rejected rather than synthesized into a success.
     pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
-        if let Some(mut response) = self.last_response {
-            if response.output.is_empty() {
-                if !self.streamed_items.is_empty() {
-                    response.output = self.streamed_items;
-                } else if !self.streamed_text.trim().is_empty() {
-                    response.output.push(ResponsesOutputItem::Message {
-                        role: Some("assistant".to_string()),
-                        content: vec![ResponsesOutputPart::OutputText {
-                            text: self.streamed_text,
-                        }],
-                    });
-                }
-            }
-            return Ok(response);
-        }
-
-        if !self.streamed_items.is_empty() || !self.streamed_text.trim().is_empty() {
-            let mut output = self.streamed_items;
-            if output.is_empty() {
-                output.push(ResponsesOutputItem::Message {
+        let Some(mut response) = self.last_response else {
+            return Err(LlmError::InvalidResponse(
+                "Responses API stream ended without a completion event".to_string(),
+            ));
+        };
+        if response.output.is_empty() {
+            if !self.streamed_items.is_empty() {
+                response.output = self.streamed_items;
+            } else if !self.streamed_text.trim().is_empty() {
+                response.output.push(ResponsesOutputItem::Message {
                     role: Some("assistant".to_string()),
                     content: vec![ResponsesOutputPart::OutputText {
                         text: self.streamed_text,
                     }],
                 });
             }
-            return Ok(ResponsesApiResponse {
-                status: Some("completed".to_string()),
-                output,
-                usage: None,
-                incomplete_details: None,
-            });
         }
-
-        Err(LlmError::InvalidResponse(
-            "no response data in Responses API stream".to_string(),
-        ))
+        Ok(response)
     }
 
     /// Convenience: assembles and parses the final response in one call.
@@ -905,6 +887,25 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
 
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn parse_codex_responses_payload_errors_without_completion_event() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+"#;
+
+        let error = parse_codex_responses_payload(payload).expect_err("incomplete payload");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("completion event"),
+            "expected completion-event error, got: {text}"
+        );
     }
 
     #[test]
