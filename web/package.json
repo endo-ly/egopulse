@@ -7,7 +7,8 @@
     "build": "vite build",
     "dev": "vite",
     "dev:mock": "VITE_MOCK=1 vite",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",
