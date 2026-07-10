@@ -36,7 +36,7 @@ describe("ToolCard", () => {
     expect(duration?.textContent).toBe("120ms");
   });
 
-  it("tool_card_error_auto_expands", () => {
+  it("tool_card_initial_error_auto_expands", () => {
     const { container } = render(
       <ToolCard event={evt({ state: "error", output: "Error: something failed badly" })} />,
     );
@@ -44,6 +44,28 @@ describe("ToolCard", () => {
     expect(header.getAttribute("aria-expanded")).toBe("true");
     const errBadge = container.querySelector(".tool-card-error-badge");
     expect(errBadge).toBeTruthy();
+  });
+
+  it("tool_card_error_transition_auto_expands", () => {
+    const { container, rerender } = render(
+      <ToolCard event={evt({ state: "pending" })} defaultExpanded={false} />,
+    );
+    const header = container.querySelector(".tool-card-header") as HTMLElement;
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    rerender(<ToolCard event={evt({ state: "error" })} defaultExpanded={false} />);
+
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("tool_card_can_be_collapsed_after_error_auto_expand", () => {
+    const { container } = render(<ToolCard event={evt({ state: "error" })} />);
+    const header = container.querySelector(".tool-card-header") as HTMLElement;
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(header);
+
+    expect(header.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("tool_card_header_toggles_expansion", () => {

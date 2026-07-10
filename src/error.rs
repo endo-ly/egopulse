@@ -325,6 +325,14 @@ pub enum StorageError {
     NotFound(String),
     #[error("storage_conflict: {0}")]
     Conflict(String),
+    #[error(
+        "storage_unsupported_schema_version: database={database} found={found} supported={supported}"
+    )]
+    UnsupportedSchemaVersion {
+        database: &'static str,
+        found: i64,
+        supported: i64,
+    },
 }
 
 /// Channel (Web / Discord / Telegram) operational errors.
