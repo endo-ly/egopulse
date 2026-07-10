@@ -232,7 +232,7 @@ impl TurnTracker {
     ///
     /// On success the origin's pending reservation count is incremented. The
     /// reservation is independent of the executed turn count (see
-    /// [`TurnTracker::begin_execution`]): a turn is only counted as executed
+    /// [`TurnTracker::try_begin_execution`]): a turn is only counted as executed
     /// once it actually starts running, so fan-out or burst submissions never
     /// inflate the per-chain turn limit that execution is measured against.
     ///
@@ -288,18 +288,41 @@ impl TurnTracker {
         }
     }
 
-    /// Consumes one pending reservation and records the turn as executed.
+    /// Atomically gates a turn on every stop condition and commits it to
+    /// execution, all under a single tracker lock.
     ///
-    /// Called at execution start (after the terminal-reason re-check) so the
-    /// per-chain turn limit is measured against turns that actually ran, not
-    /// turns merely accepted. Returns the origin's executed turn count, which
-    /// the caller passes to [`evaluate_stop_conditions`].
+    /// This is the only place a pending reservation is converted into an
+    /// executed turn. Performing the per-chain turn-count check and the
+    /// executed-count increment inside the same lock guarantees that two
+    /// concurrent turns for the same origin (which may run on separate
+    /// scheduler sessions, since the session key includes the agent id) cannot
+    /// both pass the limit — the second sees the first's increment.
     ///
-    /// Keeping reservations and executions in separate counters is what lets
-    /// [`TurnTracker::reserve`] reject at capacity at acceptance without
-    /// inflating the executed count the turn limit is enforced against.
-    pub(crate) fn begin_execution(&self, origin_id: &str) -> usize {
+    /// Steps, all under one lock:
+    /// 1. If the origin already has a terminal stop reason, refuse and release
+    ///    the reservation.
+    /// 2. Evaluate every stop condition (chain depth, per-chain turn count,
+    ///    agent validity) against the prospective executed count (`current + 1`).
+    /// 3. On failure, record the terminal reason and release the reservation.
+    /// 4. On success, decrement `pending_reservations` and increment
+    ///    `executed_turn_count`, returning the new count.
+    ///
+    /// Returns `Ok(executed_turn_count)` when the turn may proceed, or
+    /// `Err(reason)` when it must be rejected. On either path the reservation is
+    /// consumed here, so the caller must not call [`TurnTracker::release`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal tracker lock is poisoned.
+    pub(crate) fn try_begin_execution(
+        &self,
+        origin_id: &str,
+        chain_depth: usize,
+        agent_id: &str,
+        valid_agent_ids: &[&str],
+    ) -> Result<usize, StopReason> {
         let mut origins = self.origins.lock().expect("turn_tracker lock");
+        self.prune_stale_locked(&mut origins);
         let now = self.clock.now();
         let state = origins.entry(origin_id.to_string()).or_insert(OriginState {
             executed_turn_count: 0,
@@ -307,19 +330,37 @@ impl TurnTracker {
             terminal_reason: None,
             last_touched: now,
         });
-        state.pending_reservations = state.pending_reservations.saturating_sub(1);
-        state.executed_turn_count += 1;
         state.last_touched = now;
-        state.executed_turn_count
+
+        // A chain that already terminated refuses further turns. Release this
+        // turn's reservation without incrementing the executed count.
+        if let Some(existing) = state.terminal_reason.clone() {
+            state.pending_reservations = state.pending_reservations.saturating_sub(1);
+            return Err(existing);
+        }
+
+        // Evaluate every stop condition against the prospective executed count,
+        // atomically with the commit below so the check and the increment
+        // cannot be split by a concurrent turn.
+        let prospective = state.executed_turn_count + 1;
+        if let Some(reason) =
+            evaluate_stop_conditions(chain_depth, prospective, agent_id, valid_agent_ids)
+        {
+            state.terminal_reason = Some(reason.clone());
+            state.pending_reservations = state.pending_reservations.saturating_sub(1);
+            return Err(reason);
+        }
+
+        state.pending_reservations = state.pending_reservations.saturating_sub(1);
+        state.executed_turn_count = prospective;
+        Ok(state.executed_turn_count)
     }
 
     /// Returns the number of turns that have actually begun execution for
-    /// `origin_id`, or `0` if the origin is not tracked.
-    ///
-    /// Used by turn execution to evaluate per-chain stop conditions against the
-    /// executed count (never the pending reservation count) before committing a
-    /// turn. Does not prune or mutate any state.
-    pub(crate) fn executed_count(&self, origin_id: &str) -> usize {
+    /// `origin_id`, or `0` if the origin is not tracked. Test-only assertion
+    /// helper; production reads happen inside [`try_begin_execution`].
+    #[cfg(test)]
+    fn executed_count(&self, origin_id: &str) -> usize {
         let origins = self.origins.lock().expect("turn_tracker lock");
         origins
             .get(origin_id)
@@ -463,7 +504,9 @@ impl TurnScheduler {
     ///   full — the turn is refused and must not be executed.
     ///
     /// Per-session and global limits are checked under a single lock and no
-    /// async work runs while the lock is held.
+    /// async work runs while the lock is held. Rejection metrics are recorded
+    /// by the caller ([`submit_scheduled_turn`](crate::runtime::channel_input)),
+    /// not here, so each rejected turn is counted exactly once.
     pub(crate) fn submit(&self, turn: ScheduledTurn) -> ScheduleResult {
         let mut inner = self.inner.lock().expect("turn_scheduler lock");
         let session_key = turn.session_key();
@@ -488,11 +531,9 @@ impl TurnScheduler {
             .get(&session_key)
             .is_some_and(|s| s.queue.len() >= MAX_QUEUED_TURNS_PER_SESSION);
         if session_full {
-            metrics::inc_turn_queue_rejections(RejectReason::SessionQueueFull.as_str());
             return ScheduleResult::Rejected(RejectReason::SessionQueueFull);
         }
         if inner.global_queued >= MAX_GLOBAL_QUEUED_TURNS {
-            metrics::inc_turn_queue_rejections(RejectReason::GlobalQueueFull.as_str());
             return ScheduleResult::Rejected(RejectReason::GlobalQueueFull);
         }
 
@@ -828,22 +869,40 @@ mod tests {
     fn turn_tracker_increments_per_origin() {
         let tracker = TurnTracker::new();
         tracker.reserve("orig-1").unwrap();
-        assert_eq!(tracker.begin_execution("orig-1"), 1);
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
         tracker.reserve("orig-1").unwrap();
-        assert_eq!(tracker.begin_execution("orig-1"), 2);
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(2)
+        );
         tracker.reserve("orig-1").unwrap();
-        assert_eq!(tracker.begin_execution("orig-1"), 3);
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(3)
+        );
     }
 
     #[test]
     fn turn_tracker_different_origins_independent() {
         let tracker = TurnTracker::new();
         tracker.reserve("orig-1").unwrap();
-        assert_eq!(tracker.begin_execution("orig-1"), 1);
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
         tracker.reserve("orig-1").unwrap();
-        assert_eq!(tracker.begin_execution("orig-1"), 2);
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(2)
+        );
         tracker.reserve("orig-2").unwrap();
-        assert_eq!(tracker.begin_execution("orig-2"), 1);
+        assert_eq!(
+            tracker.try_begin_execution("orig-2", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
     }
 
     #[test]
@@ -860,6 +919,13 @@ mod tests {
             tracker.reserve("orig-1"),
             Err(RejectReason::ChainTerminated)
         );
+        // try_begin_execution also refuses a terminated chain without executing.
+        tracker.reserve("orig-2").unwrap();
+        tracker.set_terminal_reason("orig-2", StopReason::TurnCountExceeded);
+        assert_eq!(
+            tracker.try_begin_execution("orig-2", 0, "agent_a", &["agent_a"]),
+            Err(StopReason::TurnCountExceeded)
+        );
     }
 
     #[test]
@@ -868,20 +934,29 @@ mod tests {
         let tracker = TurnTracker::new_with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
 
         assert_eq!(tracker.reserve("stale"), Ok(()));
-        tracker.begin_execution("stale");
+        assert_eq!(
+            tracker.try_begin_execution("stale", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
         assert_eq!(tracker.tracked_len(), 1);
 
         // Just under TTL: still retained.
         clock.advance(ORIGIN_TTL - Duration::from_secs(1));
         assert_eq!(tracker.reserve("fresh"), Ok(()));
-        tracker.begin_execution("fresh");
+        assert_eq!(
+            tracker.try_begin_execution("fresh", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
         assert_eq!(tracker.tracked_len(), 2);
 
         // Past TTL for "stale": pruned on the next operation. "fresh" is
         // retained and its count keeps climbing.
         clock.advance(Duration::from_secs(2));
         assert_eq!(tracker.reserve("fresh"), Ok(()));
-        assert_eq!(tracker.begin_execution("fresh"), 2);
+        assert_eq!(
+            tracker.try_begin_execution("fresh", 0, "agent_a", &["agent_a"]),
+            Ok(2)
+        );
         assert_eq!(tracker.tracked_len(), 1);
         // "stale" was evicted, so re-reserving starts fresh.
         assert_eq!(tracker.reserve("stale"), Ok(()));
@@ -922,36 +997,61 @@ mod tests {
         for _ in 0..13 {
             tracker.reserve("orig-1").unwrap();
         }
-        // The first 12 turns execute without tripping the limit.
+        // Reserving 13 times never advanced the executed count.
+        assert_eq!(tracker.executed_count("orig-1"), 0);
+        // The first 12 turns begin executing without tripping the limit.
         for executed in 1..=12 {
-            assert_eq!(tracker.begin_execution("orig-1"), executed);
+            assert_eq!(
+                tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+                Ok(executed)
+            );
         }
-        // Only the 13th actual execution reaches the limit.
-        assert_eq!(tracker.begin_execution("orig-1"), 13);
+        // The 13th is rejected before it executes, and the executed count stays
+        // at 12 — the hard limit is never exceeded.
         assert_eq!(
-            evaluate_stop_conditions(0, 13, "agent_a", &["agent_a"]),
-            Some(StopReason::TurnCountExceeded)
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Err(StopReason::TurnCountExceeded)
         );
+        assert_eq!(tracker.executed_count("orig-1"), 12);
     }
 
     #[test]
-    fn concurrent_reserve_never_observes_inflated_executed_count() {
-        let tracker = TurnTracker::new();
-        // A burst of 13 reserved turns for one origin/session.
-        for _ in 0..13 {
+    fn concurrent_try_begin_execution_never_exceeds_turn_limit() {
+        let tracker = Arc::new(TurnTracker::new());
+        // Reserve and execute 11 turns so the next is the 12th (last allowed).
+        for _ in 0..11 {
             tracker.reserve("orig-1").unwrap();
+            tracker
+                .try_begin_execution("orig-1", 0, "agent_a", &["agent_a"])
+                .unwrap();
         }
-        // A concurrent submitter observing the executed count must see 0 until
-        // turns actually run -- the acceptance reserves never inflated it.
-        assert_eq!(tracker.executed_count("orig-1"), 0);
-        // The chain only reaches the limit as turns actually execute.
-        for executed in 1..=12 {
-            assert_eq!(tracker.begin_execution("orig-1"), executed);
+        // Two more turns reserved for the same origin; both contend for the
+        // single remaining slot (the 12th).
+        tracker.reserve("orig-1").unwrap();
+        tracker.reserve("orig-1").unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let tracker = Arc::clone(&tracker);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"])
+            }));
         }
+        let h1 = handles.remove(0);
+        let h2 = handles.remove(0);
+        let r1 = h1.join().expect("turn thread 1");
+        let r2 = h2.join().expect("turn thread 2");
+
+        // Exactly one turn wins the 12th slot; the other is rejected.
+        let (winner, loser) = if r1.is_ok() { (r1, r2) } else { (r2, r1) };
+        assert_eq!(winner, Ok(12));
+        assert_eq!(loser, Err(StopReason::TurnCountExceeded));
+
+        // The hard limit is never exceeded: executed count is 12, not 13.
         assert_eq!(tracker.executed_count("orig-1"), 12);
-        // The 13th execution is the one that would trip the limit; a submitter
-        // that only reserves never observes 13 without an actual 13th execution.
-        assert_eq!(tracker.begin_execution("orig-1"), 13);
     }
 
     // -----------------------------------------------------------------------

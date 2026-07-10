@@ -551,61 +551,48 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        // The origin was already reserved at acceptance, but a reserve only
-        // bumps `pending_reservations` — never the executed count. Gate the
-        // turn on the prospective executed count (current executed + 1) so a
-        // burst of accepted turns cannot trip the per-chain turn limit early,
-        // and so a turn rejected by the stop-condition evaluator never inflates
-        // the executed count the limit is enforced against.
-        let prospective_turn_count = state.turn_tracker.executed_count(&origin_id) + 1;
-
-        if let Some(reason) = turn_scheduler::evaluate_stop_conditions(
-            chain_depth,
-            prospective_turn_count,
-            agent_id,
-            &valid_ids,
-        ) {
-            tracing::warn!(
-                agent_id = %agent_id,
-                chain_depth,
-                prospective_turn_count,
-                reason = ?reason,
-                "scheduled turn rejected by stop condition evaluator"
-            );
-            // This turn will not execute: release its reservation and record the
-            // terminal reason so queued turns for the same origin are refused.
-            state.turn_tracker.release(&origin_id);
-            state
-                .turn_tracker
-                .set_terminal_reason(&origin_id, reason.clone());
-            state.runtime_status.push_error(
-                &turn.context.trace_id,
-                "stop_condition",
-                agent_id,
-                &turn.context.channel,
-                &format!("{reason:?}"),
-            );
-            crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
-            if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(error) = state
-                    .db_for(turn.context.scope)
-                    .store_system_event(log_chat_id, &reason)
-                {
-                    tracing::warn!(error = %error, "failed to store system event for stop condition");
+        // Atomically gate the turn and commit it to execution in a single
+        // tracker lock: the per-chain turn-count check and the executed-count
+        // increment happen together, so two concurrent turns for the same origin
+        // (different agent sessions share an origin) cannot both pass the limit.
+        // try_begin_execution consumes the reservation on both paths, so it must
+        // not be paired with a release() here. A turn whose chain already
+        // terminated while queued is dropped quietly by the re-check above; a
+        // new rejection records the terminal reason inside the call.
+        match state
+            .turn_tracker
+            .try_begin_execution(&origin_id, chain_depth, agent_id, &valid_ids)
+        {
+            Ok(_executed_turn_count) => {}
+            Err(reason) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    chain_depth,
+                    reason = ?reason,
+                    "scheduled turn rejected by stop condition evaluator"
+                );
+                state.runtime_status.push_error(
+                    &turn.context.trace_id,
+                    "stop_condition",
+                    agent_id,
+                    &turn.context.channel,
+                    &format!("{reason:?}"),
+                );
+                crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
+                if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                    if let Err(error) = state
+                        .db_for(turn.context.scope)
+                        .store_system_event(log_chat_id, &reason)
+                    {
+                        tracing::warn!(error = %error, "failed to store system event for stop condition");
+                    }
                 }
+                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                    execute_scheduled_turn(state, next).await;
+                }
+                return;
             }
-            if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                execute_scheduled_turn(state, next).await;
-            }
-            return;
         }
-
-        // The chain is alive and within the per-chain turn limit: commit the
-        // reservation to an actual execution, converting one pending reservation
-        // into an executed turn. Done here (after the stop-condition gate,
-        // before the turn runs) so the executed count only reflects turns that
-        // actually started.
-        state.turn_tracker.begin_execution(&origin_id);
 
         let adapter = state.channels.get(&turn.context.channel);
         let external_chat_id = turn.context.session_key();
