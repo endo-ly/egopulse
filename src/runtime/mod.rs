@@ -1257,6 +1257,17 @@ mod tests {
                 usage: None,
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     struct StubFailingProvider;
@@ -1278,6 +1289,17 @@ mod tests {
             Err(crate::error::LlmError::InvalidResponse(
                 "stub failure".to_string(),
             ))
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: std::sync::Arc<Vec<crate::llm::Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
         }
     }
 

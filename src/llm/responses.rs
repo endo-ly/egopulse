@@ -1,28 +1,50 @@
 use super::*;
 
 pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
-    let usage = body.usage;
     let choice = body
         .choices
         .into_iter()
         .next()
         .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-    let mut tool_calls = choice
+    let tool_calls = choice
         .message
         .tool_calls
         .unwrap_or_default()
         .into_iter()
         .map(parse_tool_call)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut content = extract_text(
+    let content = extract_text(
         choice
             .message
             .content
             .unwrap_or(OpenAiMessageContent::Text(String::new())),
     );
     let reasoning_content = choice.message.reasoning_content;
+    let usage = body.usage.and_then(|u| {
+        u.prompt_tokens
+            .zip(u.completion_tokens)
+            .map(|(pt, ct)| LlmUsage {
+                input_tokens: pt,
+                output_tokens: ct,
+            })
+    });
 
+    assemble_response(content, reasoning_content, tool_calls, usage)
+}
+
+/// Assembles the final `MessagesResponse` from accumulated Chat Completions
+/// fields, applying raw tool-use rescue when structured tool calls are absent.
+///
+/// Shared by the non-stream JSON path (`parse_openai_response`) and the SSE
+/// stream path (`ChatCompletionAccumulator`) to keep both consistent.
+pub(super) fn assemble_response(
+    content: String,
+    reasoning_content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<LlmUsage>,
+) -> Result<MessagesResponse, LlmError> {
+    let mut content = content.trim().to_string();
+    let mut tool_calls = tool_calls;
     if tool_calls.is_empty()
         && let Some((rescued_calls, stripped_content)) = rescue_raw_tool_calls(&content)
     {
@@ -40,14 +62,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
         content,
         reasoning_content,
         tool_calls,
-        usage: usage.and_then(|u| {
-            u.prompt_tokens
-                .zip(u.completion_tokens)
-                .map(|(pt, ct)| LlmUsage {
-                    input_tokens: pt,
-                    output_tokens: ct,
-                })
-        }),
+        usage,
     })
 }
 
@@ -166,7 +181,10 @@ fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
     }
 }
 
-fn parse_tool_arguments(arguments: &str, name: &str) -> Result<serde_json::Value, LlmError> {
+pub(super) fn parse_tool_arguments(
+    arguments: &str,
+    name: &str,
+) -> Result<serde_json::Value, LlmError> {
     if arguments.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
@@ -233,100 +251,145 @@ pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiRe
     if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
         return Ok(parsed);
     }
-    let mut last_response: Option<ResponsesApiResponse> = None;
-    let mut streamed_text = String::with_capacity(8192);
-    let mut streamed_items = Vec::with_capacity(32);
 
+    let mut accumulator = ResponsesAccumulator::new();
     for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with("data:") {
-            continue;
-        }
-        let payload = line.trim_start_matches("data:").trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        let Some(crate::llm::sse::SseItem::Data(payload)) =
+            crate::llm::sse::classify_line(line.trim())
+        else {
             continue;
         };
+        if accumulator.process_event(&payload, &|_| {}) {
+            break;
+        }
+    }
 
-        if let Some(item_value) = value.get_mut("item")
+    accumulator.into_api_response().map_err(|error| {
+        LlmError::InvalidResponse(format!(
+            "Failed to parse Codex response payload ({error}). Body: {}",
+            preview_body(text)
+        ))
+    })
+}
+
+/// Accumulates Responses API SSE events into a final [`ResponsesApiResponse`].
+///
+/// Shared by the non-stream Codex path ([`parse_codex_responses_payload`]) and
+/// the streaming Responses/Codex paths in `send_message_streaming` to keep
+/// delta extraction and final response assembly consistent.
+pub(super) struct ResponsesAccumulator {
+    streamed_text: String,
+    streamed_items: Vec<ResponsesOutputItem>,
+    completed_response: Option<ResponsesApiResponse>,
+}
+
+impl ResponsesAccumulator {
+    pub(super) fn new() -> Self {
+        Self {
+            streamed_text: String::with_capacity(8192),
+            streamed_items: Vec::with_capacity(32),
+            completed_response: None,
+        }
+    }
+
+    /// Processes one SSE `data:` payload (JSON text without the `data:` prefix).
+    ///
+    /// Calls `on_delta` for each `response.output_text.delta` event. Returns
+    /// `true` when a terminal event (`response.completed` / `response.done`)
+    /// carrying a valid `response` object has been consumed.
+    pub(super) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return false;
+        };
+
+        let event_type = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Only the `done` item is complete; `added` carries an in_progress
+        // partial item that would duplicate the finalized one.
+        if event_type.as_deref() == Some("response.output_item.done")
+            && let Some(item_value) = value.get_mut("item")
             && let Ok(item) = serde_json::from_value::<ResponsesOutputItem>(item_value.take())
             && !matches!(item, ResponsesOutputItem::Ignored)
         {
-            streamed_items.push(item);
+            self.streamed_items.push(item);
         }
 
-        let event_type = value.get("type").and_then(|v| v.as_str()).map(String::from);
         match event_type.as_deref() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                    streamed_text.push_str(delta);
+                    on_delta(delta.to_string());
+                    self.streamed_text.push_str(delta);
                 }
             }
             Some("response.output_text.done") => {
                 if let Some(done_text) = value.get("text").and_then(|v| v.as_str())
                     && !done_text.is_empty()
                 {
-                    streamed_text.clear();
-                    streamed_text.push_str(done_text);
+                    self.streamed_text.clear();
+                    self.streamed_text.push_str(done_text);
                 }
             }
             _ => {}
         }
 
-        if let Some(response_value) = value.get_mut("response") {
-            if let Ok(parsed) =
+        let is_terminal = matches!(
+            event_type.as_deref(),
+            Some("response.completed" | "response.done")
+        );
+        if is_terminal
+            && let Some(response_value) = value.get_mut("response")
+            && let Ok(parsed) =
                 serde_json::from_value::<ResponsesApiResponse>(response_value.take())
-            {
-                last_response = Some(parsed);
-                if event_type.as_deref() == Some("response.done")
-                    || event_type.as_deref() == Some("response.completed")
-                {
-                    break;
-                }
-            }
+        {
+            self.completed_response = Some(parsed);
+            return true;
         }
+
+        false
     }
 
-    if let Some(mut response) = last_response {
+    /// Assembles the final [`ResponsesApiResponse`] from accumulated state.
+    ///
+    /// Prefers the `response` object from a terminal event. Falls back to
+    /// streamed text/items when the terminal response had empty output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::InvalidResponse`] when no completion event
+    /// (`response.completed` / `response.done`) was received; partial streamed
+    /// data is rejected rather than synthesized into a success.
+    pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
+        let Some(mut response) = self.completed_response else {
+            return Err(LlmError::InvalidResponse(
+                "Responses API stream ended without a completion event".to_string(),
+            ));
+        };
         if response.output.is_empty() {
-            if !streamed_items.is_empty() {
-                response.output = streamed_items;
-            } else if !streamed_text.trim().is_empty() {
+            if !self.streamed_items.is_empty() {
+                response.output = self.streamed_items;
+            } else if !self.streamed_text.trim().is_empty() {
                 response.output.push(ResponsesOutputItem::Message {
                     role: Some("assistant".to_string()),
                     content: vec![ResponsesOutputPart::OutputText {
-                        text: streamed_text,
+                        text: self.streamed_text,
                     }],
                 });
             }
         }
-        return Ok(response);
+        Ok(response)
     }
 
-    if !streamed_items.is_empty() || !streamed_text.trim().is_empty() {
-        let mut output = streamed_items;
-        if output.is_empty() {
-            output.push(ResponsesOutputItem::Message {
-                role: Some("assistant".to_string()),
-                content: vec![ResponsesOutputPart::OutputText {
-                    text: streamed_text,
-                }],
-            });
-        }
-        return Ok(ResponsesApiResponse {
-            status: Some("completed".to_string()),
-            output,
-            usage: None,
-            incomplete_details: None,
-        });
+    /// Convenience: assembles and parses the final response in one call.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::into_api_response`] and [`parse_responses_response`].
+    pub(super) fn finish(self) -> Result<MessagesResponse, LlmError> {
+        parse_responses_response(self.into_api_response()?)
     }
-
-    Err(LlmError::InvalidResponse(format!(
-        "Failed to parse Codex response payload. Body: {}",
-        preview_body(text)
-    )))
 }
 
 pub(crate) fn preview_body(body: &str) -> String {
@@ -805,6 +868,50 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
         let parsed = parse_codex_responses_payload(item).expect("item");
         let resp = parse_responses_response(parsed).expect("resp");
         assert_eq!(resp.content, "item-content");
+    }
+
+    #[test]
+    fn dedupes_output_item_across_added_and_done_events() {
+        let payload = r#"
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+
+        let parsed = parse_codex_responses_payload(payload).expect("payload");
+        let response = parse_responses_response(parsed).expect("response");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn parse_codex_responses_payload_errors_without_completion_event() {
+        // `response.created` carries a `response` object but is not terminal;
+        // the stream must still be rejected without `response.completed`.
+        let payload = r#"
+event: response.created
+data: {"type":"response.created","response":{"output":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
+"#;
+
+        let error = parse_codex_responses_payload(payload).expect_err("incomplete payload");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("completion event"),
+            "expected completion-event error, got: {text}"
+        );
     }
 
     #[test]

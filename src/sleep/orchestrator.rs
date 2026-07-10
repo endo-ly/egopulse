@@ -1883,6 +1883,17 @@ mod tests {
                 },
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     fn test_db() -> (Database, tempfile::TempDir) {
@@ -2335,6 +2346,17 @@ mod tests {
                 usage: None,
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     #[tokio::test]
@@ -2444,6 +2466,17 @@ mod tests {
                     output_tokens,
                 }),
             })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
         }
     }
 

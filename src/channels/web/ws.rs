@@ -734,6 +734,17 @@ mod tests {
                 usage: None,
             })
         }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<LlmMessage>>,
+            tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     fn test_web_state(dir: &tempfile::TempDir) -> WebState {
