@@ -483,13 +483,18 @@ impl Database {
     ///
     /// Content format: `{"reason": "StopReasonVariant"}`.
     /// Sender: `sender_id = "system"`, `sender_kind = System`.
+    /// Persists a system event message to a Channel Log chat.
+    ///
+    /// `reason` is rendered via its `Display` implementation into a JSON object
+    /// (`{"reason": "..."}`) so both chain-stop reasons and queue-capacity
+    /// rejections can be recorded through the same path.
     pub(crate) fn store_system_event(
         &self,
         channel_log_chat_id: i64,
-        reason: &crate::runtime::turn_scheduler::StopReason,
+        reason: &impl std::fmt::Display,
     ) -> Result<(), StorageError> {
         let content = serde_json::json!({
-            "reason": format!("{reason:?}")
+            "reason": reason.to_string()
         })
         .to_string();
 
@@ -1163,7 +1168,7 @@ mod tests {
         .expect("store");
 
         let msgs = db.get_all_messages(chat_id).expect("messages");
-        let found = msgs.iter().find(|m| m.content.contains("LlmFailure"));
+        let found = msgs.iter().find(|m| m.content.contains("llm_failure"));
         assert!(found.is_some(), "should find system event by content");
         assert_eq!(found.unwrap().sender_kind, SenderKind::System);
     }

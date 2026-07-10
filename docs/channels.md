@@ -361,10 +361,13 @@ Webhook sender
   → receiver token 認証
   → payload 整形 (EgoGraph / generic JSON)
   → target channel / thread / agent から SurfaceContext を生成
-  → TurnScheduler へ enqueue
-  → 202 Accepted
+  → TurnScheduler へ enqueue (Started / Queued / Rejected)
+  ├─ Started / Queued → 202 Accepted
+  └─ Rejected (queue full) → 429 Too Many Requests
   → agent response は target channel adapter で送信
 ```
+
+`202` は in-memory scheduler への受付成功（即時開始 or キュー投入）のみを意味し、Webhook job の永続化は行わない。スケジューラのキューが満杯（セッション単位 32 / Runtime 全体 512）の場合は `429`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。詳細は [api.md](./api.md) §2.9 を参照。
 
 `SurfaceContext.channel` は `webhook` ではなく target channel を使用する。Discord / Telegram target の scope は、`target.thread` が `channels.<channel>` の登録エントリに解決できた場合のみ、その channel の `secret` 値から決定する（`secret: true` なら `ConversationScope::Secret`）。解決できない thread（数値 parse 不能・未登録・channel map 欠落）は `Normal` へ降格せず `400 invalid_target_scope` で拒否し、agent turn を enqueue しない。
 

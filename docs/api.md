@@ -605,7 +605,7 @@ Content-Type: application/json
 
 `receiver_id` は設定済み receiver 名。未設定の場合は `404 webhook_receiver_not_found`。
 
-成功時は turn 完了を待たず `202 Accepted` を返す。
+成功時は turn 完了を待たず `202 Accepted` を返す。`202` は「in-memory scheduler への受付成功（即時開始 or キュー投入）」のみを意味し、Webhook job の永続化は行わない。したがって受付後のプロセス再起動でキューは失われる。スケジューラの in-memory queue が満杯の場合は `429` を返す（後述）。
 
 ```json
 {
@@ -658,6 +658,8 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
 | `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
+| `session_queue_full` | 429 | 対象セッションのキューが上限（32）に達し、受付を拒否した |
+| `global_queue_full` | 429 | Runtime 全体のキューが上限（512）に達し、受付を拒否した |
 
 ---
 

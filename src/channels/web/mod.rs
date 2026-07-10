@@ -1209,4 +1209,111 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(body["error"], "invalid_target_scope");
     }
+
+    /// LLM provider that blocks forever on each call, keeping the started turn
+    /// busy so the per-session queue can be filled deterministically.
+    struct BlockingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for BlockingProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<crate::llm::Message>>,
+            tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            self.send_message(system, messages, tools).await
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_route_returns_429_when_session_queue_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        add_discord_channel(&mut config, 123);
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "123".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(BlockingProvider)),
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let post = || {
+            app.clone().oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+        };
+
+        // First request starts the turn; the blocking provider keeps it busy.
+        let started = post().await.expect("response");
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        // Fill the per-session queue up to the limit; each is accepted (202).
+        for _ in 0..crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {
+            let resp = post().await.expect("response");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        // The next request exceeds the per-session queue limit → 429, not 202.
+        let rejected = post().await.expect("response");
+        assert_ne!(rejected.status(), StatusCode::ACCEPTED);
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(rejected.into_body(), 1024)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"], "session_queue_full");
+    }
 }

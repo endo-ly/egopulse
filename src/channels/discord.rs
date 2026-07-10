@@ -908,7 +908,17 @@ impl EventHandler for Handler {
             "Discord message received"
         );
 
-        crate::runtime::submit_agent_turn(&self.app_state, context, combined_text);
+        let outcome = crate::runtime::submit_agent_turn(&self.app_state, context, combined_text);
+        if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+            warn!(reason = %reason, "discord turn rejected: scheduler queue full");
+            let _ = msg
+                .channel_id
+                .say(
+                    &ctx,
+                    "The agent is currently busy and cannot accept new input right now. Please try again shortly.",
+                )
+                .await;
+        }
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {

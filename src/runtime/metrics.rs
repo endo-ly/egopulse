@@ -33,6 +33,14 @@ pub fn init_metrics() -> &'static PrometheusHandle {
         describe_counter!("egopulse_llm_tokens_total", "Total LLM tokens used");
         describe_counter!("egopulse_tool_calls_total", "Total tool calls executed");
         describe_gauge!("egopulse_active_turns", "Number of currently active turns");
+        describe_gauge!(
+            "egopulse_turn_queue_depth",
+            "Number of turns queued in the in-memory scheduler"
+        );
+        describe_counter!(
+            "egopulse_turn_queue_rejections_total",
+            "Turns rejected by the scheduler queue capacity"
+        );
 
         handle
     })
@@ -68,6 +76,14 @@ pub(crate) fn set_active_turns_gauge(count: usize) {
     gauge!("egopulse_active_turns").set(count as f64);
 }
 
+pub(crate) fn set_turn_queue_depth(count: usize) {
+    gauge!("egopulse_turn_queue_depth").set(count as f64);
+}
+
+pub(crate) fn inc_turn_queue_rejections(reason: &str) {
+    counter!("egopulse_turn_queue_rejections_total", "reason" => reason.to_owned()).increment(1);
+}
+
 pub(crate) fn inc_tool_calls_total(tool: &str, status: &str) {
     counter!("egopulse_tool_calls_total", "tool" => tool.to_owned(), "status" => status.to_owned())
         .increment(1);
@@ -88,6 +104,8 @@ mod tests {
         inc_llm_tokens_total("input", "openai", 42);
         inc_tool_calls_total("shell", "ok");
         set_active_turns_gauge(3);
+        set_turn_queue_depth(5);
+        inc_turn_queue_rejections("session_full");
 
         let output = metrics_output();
 
@@ -115,6 +133,14 @@ mod tests {
             output.contains("egopulse_active_turns"),
             "should contain active_turns: {output}"
         );
+        assert!(
+            output.contains("egopulse_turn_queue_depth"),
+            "should contain turn_queue_depth: {output}"
+        );
+        assert!(
+            output.contains("egopulse_turn_queue_rejections_total"),
+            "should contain turn_queue_rejections_total: {output}"
+        );
     }
 
     #[test]
@@ -126,6 +152,8 @@ mod tests {
         inc_llm_tokens_total("input", "openai", 1);
         inc_tool_calls_total("shell", "ok");
         set_active_turns_gauge(0);
+        set_turn_queue_depth(0);
+        inc_turn_queue_rejections("global_full");
 
         let output = metrics_output();
         for line in output.lines() {

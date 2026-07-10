@@ -1039,7 +1039,16 @@ async fn handle_message(
         "Telegram message received"
     );
 
-    crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text);
+    let outcome = crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text);
+    if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+        warn!(reason = %reason, "telegram turn rejected: scheduler queue full");
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                "The agent is currently busy and cannot accept new input right now. Please try again shortly.",
+            )
+            .await;
+    }
 
     Ok(())
 }

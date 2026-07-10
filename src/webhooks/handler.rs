@@ -106,7 +106,15 @@ pub(crate) async fn receive_webhook(
         }
     };
 
-    crate::runtime::channel_input::submit_agent_turn(&state.app_state, context, input);
+    let outcome =
+        crate::runtime::channel_input::submit_agent_turn(&state.app_state, context, input);
+    if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+        return super::error::webhook_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            reason.as_str(),
+            "scheduler queue at capacity",
+        );
+    }
 
     (
         StatusCode::ACCEPTED,

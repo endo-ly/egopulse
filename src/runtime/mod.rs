@@ -483,13 +483,29 @@ fn spawn_agent_turn_worker(
 ) {
     tokio::spawn(async move {
         while let Some(pending) = receiver.recv().await {
+            let channel_log_chat_id = pending.context.channel_log_chat_id;
+            let scope = pending.context.scope;
             let scheduled = crate::agent_loop::ScheduledTurn {
                 context: pending.context,
                 input: pending.input,
                 origin_id: pending.origin_id,
             };
 
-            channel_input::submit_scheduled_turn(&state, scheduled);
+            if let turn_scheduler::SubmitOutcome::Rejected(reason) =
+                channel_input::submit_scheduled_turn(&state, scheduled)
+            {
+                // Log + metric are already recorded centrally in the submit
+                // path; store a system event so the async rejection surfaces in
+                // the channel log instead of being silently dropped.
+                if let Some(chat_id) = channel_log_chat_id {
+                    if let Err(error) = state.db_for(scope).store_system_event(chat_id, &reason) {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to store system event for agent_send queue rejection"
+                        );
+                    }
+                }
+            }
         }
     });
 }
@@ -531,8 +547,28 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        state.turn_tracker.increment(&origin_id);
-        let turn_count = state.turn_tracker.count(&origin_id);
+        let turn_count = match state.turn_tracker.increment(&origin_id) {
+            Some(count) => count,
+            None => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    origin_id = %origin_id,
+                    "turn rejected: origin tracker at capacity"
+                );
+                state.runtime_status.push_error(
+                    &origin_id,
+                    "tracker_full",
+                    agent_id,
+                    &turn.context.channel,
+                    "turn tracker at capacity",
+                );
+                crate::runtime::metrics::inc_turn_errors_total("tracker_full", agent_id);
+                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                    execute_scheduled_turn(state, next).await;
+                }
+                return;
+            }
+        };
 
         if let Some(reason) =
             turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)

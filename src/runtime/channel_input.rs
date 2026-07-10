@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::runtime::AppState;
+use crate::runtime::turn_scheduler::{ScheduleResult, SubmitOutcome};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
 /// Platform-specific key used to resolve a multi-agent Channel Log chat.
@@ -102,7 +103,15 @@ pub(crate) async fn store_human_channel_log_message(
 }
 
 /// Submits an agent turn and starts execution immediately when the session is idle.
-pub(crate) fn submit_agent_turn(state: &AppState, context: SurfaceContext, input: String) {
+///
+/// Returns [`SubmitOutcome`] so callers can distinguish an accepted turn
+/// (started or queued) from a queue-capacity rejection. Rejections are logged
+/// centrally here so no turn is silently dropped.
+pub(crate) fn submit_agent_turn(
+    state: &AppState,
+    context: SurfaceContext,
+    input: String,
+) -> SubmitOutcome {
     submit_scheduled_turn(
         state,
         ScheduledTurn {
@@ -110,15 +119,27 @@ pub(crate) fn submit_agent_turn(state: &AppState, context: SurfaceContext, input
             context,
             input,
         },
-    );
+    )
 }
 
-pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) {
-    if let Some(turn) = state.turn_scheduler.submit(scheduled) {
-        let state = state.clone();
-        tokio::spawn(async move {
-            crate::runtime::execute_scheduled_turn(&state, turn).await;
-        });
+pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+    match state.turn_scheduler.submit(scheduled) {
+        ScheduleResult::Started(turn) => {
+            let turn = *turn;
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::runtime::execute_scheduled_turn(&state, turn).await;
+            });
+            SubmitOutcome::Started
+        }
+        ScheduleResult::Queued => SubmitOutcome::Queued,
+        ScheduleResult::Rejected(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                "turn rejected: scheduler queue at capacity"
+            );
+            SubmitOutcome::Rejected(reason)
+        }
     }
 }
 
