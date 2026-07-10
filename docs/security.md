@@ -118,8 +118,16 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 
 起動時に Config から収集したシークレット値と完全一致する文字列を `[REDACTED:<キー名>]` に置換する。
 
-- 収集対象: `providers.*.api_key`, `channels.*.auth_token`, `channels.*.file_auth_token`, `channels.*.bot_token`, `channels.*.file_bot_token`, `codex.bearer_token`（`openai-codex` プロバイダー使用時）
-- 8 文字未満の値はスキップ（誤検出防止）
+- 収集対象（`ResolvedValue::value()` から取得）:
+  - `providers.<provider>.api_key`
+  - `channels.<channel>.auth_token`
+  - `channels.<channel>.bots.<bot_id>.token`（Discord）
+  - `channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）
+  - `webhooks.receivers.<receiver_id>.token`
+  - `codex.bearer_token`（`openai-codex` プロバイダー使用時）
+- `file_token` / `file_auth_token` の YAML 表現は秘密値の正本として使わない
+- 空文字列は登録しない（誤検出防止）
+- 同じ値が複数経路に存在する場合は値で deduplicate し、置換結果を決定的にする
 - 長い値から順に置換（部分一致の誤検出防止）
 
 #### パターンベースリダクション
@@ -145,6 +153,14 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `sk_live_` | Stripe Live Secret Key |
 | `sk_test_` | Stripe Test Secret Key |
 | `rk_live_` | Stripe Live Restricted Key |
+
+#### 保証範囲と限界
+
+Phase 1 時点の出力リダクションは、上記のとおり Config に登録された既知の秘密値と well-known パターンを対象とする。これは「ツール出力経由の偶発的・低レベルな秘密露出」に対する防御であり、Shell ツールの OS sandbox ではない。
+
+- Shell ツール（`bash` / `write` / `edit`）によるプロセス外への秘密書き出しは、本リダクションでは防げない。OS レベルの隔離は Phase 3 の対象。
+- LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。パターンベース・値ベースの二層リダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
+- ツール実行そのものを禁止・隔離する境界は事前検査（コマンド・パス検閲）と Phase 3 の sandbox が担う。
 
 ---
 

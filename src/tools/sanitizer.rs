@@ -183,6 +183,24 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
                 }
             }
         }
+        if let Some(bots) = &channel.telegram_bots {
+            for (bot_id, bot) in bots {
+                if let Some(rv) = &bot.token {
+                    secrets.push((
+                        format!("channels.{name}.telegram_bots.{bot_id}.token"),
+                        rv.value().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    for (receiver_id, receiver) in &config.webhooks.receivers {
+        if let Some(token) = &receiver.token {
+            secrets.push((
+                format!("webhooks.receivers.{receiver_id}.token"),
+                token.value().to_string(),
+            ));
+        }
     }
     let has_codex = config
         .providers
@@ -193,6 +211,9 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
             secrets.push(("codex.bearer_token".to_string(), auth.bearer_token));
         }
     }
+    secrets.retain(|(_, value)| !value.is_empty());
+    secrets.sort_by(|left, right| left.0.cmp(&right.0));
+    secrets.dedup_by(|left, right| left.1 == right.1);
     secrets
 }
 
@@ -204,6 +225,33 @@ mod tests {
     use crate::llm::{MessageContent, MessageContentPart};
     use crate::test_env::EnvVarGuard;
     use serde_json::json;
+
+    /// Build a Config with no providers/channels/webhooks secrets, for tests that
+    /// customize a subset of secret sources.
+    fn base_config(state_root: &str) -> Config {
+        Config {
+            default_provider: ProviderId::new("local"),
+            default_model: None,
+            providers: std::collections::HashMap::new(),
+            state_root: state_root.to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.80,
+            compaction_target_ratio: 0.40,
+            channels: std::collections::HashMap::new(),
+            default_agent: crate::config::AgentId::new("default"),
+            agents: std::collections::HashMap::new(),
+            timezone: "UTC".to_string(),
+            sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
+            db: crate::config::DatabaseConfig::default(),
+            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
+            webhooks: crate::config::WebhooksConfig::default(),
+        }
+    }
 
     /// redact_secrets: Config 由来のシークレット値を [REDACTED:key] に置換する。
     #[test]
@@ -707,5 +755,251 @@ mod tests {
             !keys.iter().any(|k| k.starts_with("codex.")),
             "codex entries should not exist: {keys:?}"
         );
+    }
+
+    /// collect_config_secrets: channels.telegram.telegram_bots.<bot_id>.token が抽出される。
+    #[test]
+    fn test_collect_config_secrets_extracts_telegram_bot_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::TelegramBotConfig {
+                token: Some(ResolvedValue::Literal("tg-bot-token-value".to_string())),
+                file_token: None,
+            },
+        );
+
+        let mut config = base_config(dir.path().to_str().expect("path"));
+        config.channels.insert(
+            ChannelName::new("telegram"),
+            ChannelConfig {
+                telegram_bots: Some(bots),
+                ..Default::default()
+            },
+        );
+
+        let secrets = collect_config_secrets(&config);
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].0, "channels.telegram.telegram_bots.main.token");
+        assert_eq!(secrets[0].1, "tg-bot-token-value");
+    }
+
+    /// collect_config_secrets: webhooks.receivers.<receiver_id>.token が抽出される。
+    #[test]
+    fn test_collect_config_secrets_extracts_webhook_receiver_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut config = base_config(dir.path().to_str().expect("path"));
+        config.webhooks.receivers.insert(
+            crate::config::WebhookReceiverId::new("egograph"),
+            crate::config::WebhookReceiverConfig {
+                token: Some(ResolvedValue::Literal("wh-receiver-token".to_string())),
+                file_token: None,
+                target: crate::config::WebhookTargetConfig {
+                    channel: ChannelName::new("web"),
+                    thread: "main".to_string(),
+                    agent: None,
+                },
+            },
+        );
+
+        let secrets = collect_config_secrets(&config);
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].0, "webhooks.receivers.egograph.token");
+        assert_eq!(secrets[0].1, "wh-receiver-token");
+    }
+
+    /// collect_config_secrets: 空値は除外し、同じ値は 1 件に deduplicate される。
+    #[test]
+    fn test_collect_config_secrets_skips_empty_and_deduplicates_by_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut discord_bots = std::collections::HashMap::new();
+        discord_bots.insert(
+            crate::config::BotId::new("a"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("dup-tok".to_string())),
+                file_token: None,
+            },
+        );
+        let mut telegram_bots = std::collections::HashMap::new();
+        telegram_bots.insert(
+            crate::config::BotId::new("b"),
+            crate::config::TelegramBotConfig {
+                token: Some(ResolvedValue::Literal("dup-tok".to_string())),
+                file_token: None,
+            },
+        );
+
+        let mut config = base_config(dir.path().to_str().expect("path"));
+        // Empty API key must be skipped.
+        config.providers.insert(
+            ProviderId::new("empty"),
+            ProviderConfig {
+                label: "Empty".to_string(),
+                base_url: "https://example.com".to_string(),
+                api_key: Some(ResolvedValue::Literal(String::new())),
+                default_model: "m".to_string(),
+                models: std::collections::HashMap::new(),
+            },
+        );
+        config.channels.insert(
+            ChannelName::new("discord"),
+            ChannelConfig {
+                discord_bots: Some(discord_bots),
+                ..Default::default()
+            },
+        );
+        config.channels.insert(
+            ChannelName::new("telegram"),
+            ChannelConfig {
+                telegram_bots: Some(telegram_bots),
+                ..Default::default()
+            },
+        );
+        config.webhooks.receivers.insert(
+            crate::config::WebhookReceiverId::new("r"),
+            crate::config::WebhookReceiverConfig {
+                token: Some(ResolvedValue::Literal("unique-wh".to_string())),
+                file_token: None,
+                target: crate::config::WebhookTargetConfig {
+                    channel: ChannelName::new("web"),
+                    thread: "main".to_string(),
+                    agent: None,
+                },
+            },
+        );
+
+        let secrets = collect_config_secrets(&config);
+
+        // "dup-tok" appears once (deduplicated), "unique-wh" once, empty excluded.
+        assert_eq!(secrets.len(), 2, "secrets = {secrets:?}");
+        assert!(
+            secrets.iter().all(|(_, v)| !v.is_empty()),
+            "empty values must be skipped: {secrets:?}"
+        );
+        let dup_count = secrets.iter().filter(|(_, v)| v == "dup-tok").count();
+        assert_eq!(
+            dup_count, 1,
+            "duplicate value must be deduplicated: {secrets:?}"
+        );
+        // Sorted by key; the discord bot key sorts before the webhook receiver key.
+        assert_eq!(secrets[0].0, "channels.discord.bots.a.token");
+        assert_eq!(secrets[0].1, "dup-tok");
+        assert_eq!(secrets[1].0, "webhooks.receivers.r.token");
+        assert_eq!(secrets[1].1, "unique-wh");
+    }
+
+    /// collect_config_secrets + sanitize: 複数種の秘密値が string / JSON details / LLM content の全経路でマスクされる。
+    #[test]
+    fn test_sanitize_redacts_multiple_secret_kinds_across_outputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut discord_bots = std::collections::HashMap::new();
+        discord_bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("discord-bot-tok".to_string())),
+                file_token: None,
+            },
+        );
+        let mut telegram_bots = std::collections::HashMap::new();
+        telegram_bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::TelegramBotConfig {
+                token: Some(ResolvedValue::Literal("tg-bot-tok".to_string())),
+                file_token: None,
+            },
+        );
+
+        let mut config = base_config(dir.path().to_str().expect("path"));
+        config.providers.insert(
+            ProviderId::new("openai"),
+            ProviderConfig {
+                label: "OpenAI".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: Some(ResolvedValue::Literal("sk-prod-123".to_string())),
+                default_model: "gpt-4o".to_string(),
+                models: std::collections::HashMap::new(),
+            },
+        );
+        config.channels.insert(
+            ChannelName::new("discord"),
+            ChannelConfig {
+                discord_bots: Some(discord_bots),
+                ..Default::default()
+            },
+        );
+        config.channels.insert(
+            ChannelName::new("telegram"),
+            ChannelConfig {
+                telegram_bots: Some(telegram_bots),
+                ..Default::default()
+            },
+        );
+        config.webhooks.receivers.insert(
+            crate::config::WebhookReceiverId::new("egograph"),
+            crate::config::WebhookReceiverConfig {
+                token: Some(ResolvedValue::Literal("wh-receiver-tok".to_string())),
+                file_token: None,
+                target: crate::config::WebhookTargetConfig {
+                    channel: ChannelName::new("web"),
+                    thread: "main".to_string(),
+                    agent: None,
+                },
+            },
+        );
+
+        let secrets = collect_config_secrets(&config);
+        let values: Vec<&str> = secrets.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(values.contains(&"sk-prod-123"), "secrets = {secrets:?}");
+        assert!(values.contains(&"discord-bot-tok"), "secrets = {secrets:?}");
+        assert!(values.contains(&"tg-bot-tok"), "secrets = {secrets:?}");
+        assert!(values.contains(&"wh-receiver-tok"), "secrets = {secrets:?}");
+
+        // (1) Plain string output containing every secret value.
+        let text = "keys: sk-prod-123 discord-bot-tok tg-bot-tok wh-receiver-tok";
+        let redacted_text = sanitize_output_string(text, &secrets);
+        assert!(!redacted_text.contains("sk-prod-123"));
+        assert!(!redacted_text.contains("discord-bot-tok"));
+        assert!(!redacted_text.contains("tg-bot-tok"));
+        assert!(!redacted_text.contains("wh-receiver-tok"));
+        assert!(redacted_text.contains("[REDACTED:"));
+
+        // (2) Nested JSON details.
+        let details = json!({
+            "trace": "discord-bot-tok leaked",
+            "nested": { "items": ["tg-bot-tok", { "deep": "wh-receiver-tok" }] }
+        });
+        let redacted_json = sanitize_json_value(details, &secrets);
+        let rendered = redacted_json.to_string();
+        assert!(!rendered.contains("discord-bot-tok"));
+        assert!(!rendered.contains("tg-bot-tok"));
+        assert!(!rendered.contains("wh-receiver-tok"));
+
+        // (3) LLM message content.
+        let content = MessageContent::parts(vec![MessageContentPart::InputText {
+            text: "sk-prod-123 and wh-receiver-tok in content".to_string(),
+        }]);
+        let redacted_content = sanitize_message_content(content, &secrets);
+        match redacted_content {
+            MessageContent::Parts(parts) => match &parts[0] {
+                MessageContentPart::InputText { text } => {
+                    assert!(!text.contains("sk-prod-123"));
+                    assert!(!text.contains("wh-receiver-tok"));
+                    assert!(text.contains("[REDACTED:"));
+                }
+                other => panic!("expected InputText, got {other:?}"),
+            },
+            other => panic!("expected Parts, got {other:?}"),
+        }
     }
 }

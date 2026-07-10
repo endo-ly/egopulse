@@ -627,7 +627,7 @@ receiver の `target.channel / target.thread / target.agent` から `SurfaceCont
 | `chat_type` | `target.channel` |
 | `agent_id` | `target.agent`（省略時 `default_agent`） |
 | `origin_id` | webhook event ごとの UUID |
-| `scope` | Discord / Telegram target が `secret: true` なら `Secret`、それ以外は `Normal` |
+| `scope` | Discord / Telegram target は `target.thread` が対応する channel map に解決できた場合、その channel の `secret` 値から決定（`secret: true` なら `Secret`、そうでなければ `Normal`）。Web target は常に `Normal`。解決できない場合は受付を拒否する（下記 Validation / Webhook エラー参照） |
 
 #### Payload 整形
 
@@ -646,6 +646,7 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 - `target.channel` が `ChannelRegistry` に登録済みで `voice` ではない
 - 解決後 agent が `config.agents` に存在
 - 非 Web target の `target.thread` が空でない
+- Discord / Telegram target の `target.thread` が `channels.<channel>` の登録エントリに解決できること（数値として parse 可能・未登録 thread・channel map 欠落は拒否。`Normal` への降格なし）
 
 #### Webhook エラー
 
@@ -656,6 +657,7 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `invalid_params` | 400 | JSON 不正 |
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
+| `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
 
 ---
 

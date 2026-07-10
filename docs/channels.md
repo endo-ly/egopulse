@@ -366,7 +366,7 @@ Webhook sender
   → agent response は target channel adapter で送信
 ```
 
-`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。Discord / Telegram target が `secret: true` の場合は `ConversationScope::Secret` に解決する。
+`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。Discord / Telegram target の scope は、`target.thread` が `channels.<channel>` の登録エントリに解決できた場合のみ、その channel の `secret` 値から決定する（`secret: true` なら `ConversationScope::Secret`）。解決できない thread（数値 parse 不能・未登録・channel map 欠落）は `Normal` へ降格せず `400 invalid_target_scope` で拒否し、agent turn を enqueue しない。
 
 ### Channel Log
 

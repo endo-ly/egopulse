@@ -400,8 +400,8 @@ mod tests {
     use crate::channels::adapter::ChannelRegistry;
     use crate::config::secret_ref::ResolvedValue;
     use crate::config::{
-        AgentId, ChannelConfig, ChannelName, WebhookReceiverConfig, WebhookReceiverId,
-        WebhookTargetConfig, WebhooksConfig,
+        AgentId, ChannelConfig, ChannelName, Config, DiscordChannelConfig, TelegramChatConfig,
+        WebhookReceiverConfig, WebhookReceiverId, WebhookTargetConfig, WebhooksConfig,
     };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
@@ -651,6 +651,30 @@ mod tests {
         assert!(turn.ok);
     }
 
+    /// Registers a non-secret Discord channel map entry so webhook target scope
+    /// resolution can resolve `thread` to a configured channel.
+    fn add_discord_channel(config: &mut Config, thread: u64) {
+        config.channels.insert(
+            ChannelName::new("discord"),
+            ChannelConfig {
+                discord_channels: Some(HashMap::from([(thread, DiscordChannelConfig::default())])),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Registers a non-secret Telegram chat map entry so webhook target scope
+    /// resolution can resolve `chat_id` to a configured chat.
+    fn add_telegram_channel(config: &mut Config, chat_id: i64) {
+        config.channels.insert(
+            ChannelName::new("telegram"),
+            ChannelConfig {
+                telegram_channels: Some(HashMap::from([(chat_id, TelegramChatConfig::default())])),
+                ..Default::default()
+            },
+        );
+    }
+
     fn webhook_test_router_with_receivers(
         dir: &tempfile::TempDir,
         receivers: HashMap<WebhookReceiverId, WebhookReceiverConfig>,
@@ -661,6 +685,10 @@ mod tests {
             .get_mut("web")
             .expect("web config")
             .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        // Default receivers target discord:123 and telegram:-100; register both
+        // channel maps so scope resolution succeeds instead of failing closed.
+        add_discord_channel(&mut config, 123);
+        add_telegram_channel(&mut config, -100);
         config.webhooks = WebhooksConfig { receivers };
         let mut registry = ChannelRegistry::new();
         registry.register(Arc::new(WebAdapter));
@@ -924,6 +952,7 @@ mod tests {
             .get_mut("web")
             .expect("web config")
             .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        add_discord_channel(&mut config, 123456789);
         config.webhooks = WebhooksConfig {
             receivers: HashMap::from([(
                 WebhookReceiverId::new("egograph"),
@@ -1029,6 +1058,7 @@ mod tests {
             .get_mut("web")
             .expect("web config")
             .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        add_discord_channel(&mut config, 999888777);
         config.webhooks = WebhooksConfig {
             receivers: HashMap::from([(
                 WebhookReceiverId::new("egograph"),
@@ -1113,5 +1143,70 @@ mod tests {
                 .contains("External webhook event from egograph.")
         );
         assert_eq!(messages[1].content, "Investigated.");
+    }
+
+    #[tokio::test]
+    async fn webhook_route_rejects_unresolvable_scope_without_enqueuing_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        // Discord channel 123 is registered, but the receiver targets 999 which
+        // is not configured, so scope resolution must fail closed.
+        add_discord_channel(&mut config, 123);
+        config.webhooks = WebhooksConfig {
+            receivers: HashMap::from([(
+                WebhookReceiverId::new("egograph"),
+                WebhookReceiverConfig {
+                    token: Some(ResolvedValue::Literal("egograph-secret".to_string())),
+                    file_token: None,
+                    target: WebhookTargetConfig {
+                        channel: ChannelName::new("discord"),
+                        thread: "999".to_string(),
+                        agent: Some(AgentId::new("default")),
+                    },
+                },
+            )]),
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(NoopChannelAdapter("discord")));
+        let app_state = Arc::new(build_state_with_config(
+            config,
+            None,
+            None,
+            None,
+            Some(Arc::new(registry)),
+        ));
+        let app = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let response = app
+            .oneshot(
+                Request::post("/api/webhooks/egograph")
+                    .header(header::AUTHORIZATION, "Bearer egograph-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // The only path to 202 ACCEPTED is through `submit_agent_turn`; any other
+        // status proves the turn was never enqueued.
+        assert_ne!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"], "invalid_target_scope");
     }
 }

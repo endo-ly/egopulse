@@ -95,7 +95,16 @@ pub(crate) async fn receive_webhook(
 
     let input = super::formatter::format_webhook_payload(&receiver_id.to_string(), &payload);
 
-    let context = build_webhook_context(&state.app_state.config, &receiver_id, receiver);
+    let context = match build_webhook_context(&state.app_state.config, &receiver_id, receiver) {
+        Ok(context) => context,
+        Err(code) => {
+            return super::error::webhook_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_target_scope",
+                code,
+            );
+        }
+    };
 
     crate::runtime::channel_input::submit_agent_turn(&state.app_state, context, input);
 
@@ -119,7 +128,11 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-fn resolve_target_scope(config: &Config, channel: &str, thread: &str) -> ConversationScope {
+fn resolve_target_scope(
+    config: &Config,
+    channel: &str,
+    thread: &str,
+) -> Result<ConversationScope, &'static str> {
     match channel {
         "discord" => config
             .channels
@@ -127,15 +140,16 @@ fn resolve_target_scope(config: &Config, channel: &str, thread: &str) -> Convers
             .and_then(|ch| ch.discord_channels.as_ref())
             .and_then(|channels| thread.parse::<u64>().ok().and_then(|id| channels.get(&id)))
             .map(|c| channel_scope_from_secret(c.secret))
-            .unwrap_or(ConversationScope::Normal),
+            .ok_or("discord target thread is not configured"),
         "telegram" => config
             .channels
             .get("telegram")
             .and_then(|ch| ch.telegram_channels.as_ref())
             .and_then(|channels| thread.parse::<i64>().ok().and_then(|id| channels.get(&id)))
             .map(|c| channel_scope_from_secret(c.secret))
-            .unwrap_or(ConversationScope::Normal),
-        _ => ConversationScope::Normal,
+            .ok_or("telegram target thread is not configured"),
+        "web" => Ok(ConversationScope::Normal),
+        _ => Ok(ConversationScope::Normal),
     }
 }
 
@@ -143,7 +157,7 @@ fn build_webhook_context(
     config: &Config,
     receiver_id: &WebhookReceiverId,
     receiver: &crate::config::WebhookReceiverConfig,
-) -> SurfaceContext {
+) -> Result<SurfaceContext, &'static str> {
     let target_channel = receiver.target.channel.as_str();
     let agent_id = receiver
         .target
@@ -165,8 +179,8 @@ fn build_webhook_context(
         agent_id.to_string(),
     );
     context.origin_id = uuid::Uuid::new_v4().to_string();
-    context.scope = resolve_target_scope(config, target_channel, &receiver.target.thread);
-    context
+    context.scope = resolve_target_scope(config, target_channel, &receiver.target.thread)?;
+    Ok(context)
 }
 
 #[cfg(test)]
@@ -232,6 +246,59 @@ mod tests {
         }
     }
 
+    fn test_config_with_telegram_secret(chat_id: i64, secret: bool) -> Config {
+        Config {
+            default_provider: ProviderId::new("openai"),
+            default_model: None,
+            providers: std::collections::HashMap::from([(
+                ProviderId::new("openai"),
+                ProviderConfig {
+                    label: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: None,
+                    default_model: "gpt-4o-mini".to_string(),
+                    models: std::collections::HashMap::new(),
+                },
+            )]),
+            state_root: "/tmp/test".to_string(),
+            log_level: "info".to_string(),
+            compaction_timeout_secs: 180,
+            max_history_messages: 50,
+            compact_keep_recent: 20,
+            default_context_window_tokens: 32768,
+            compaction_threshold_ratio: 0.8,
+            compaction_target_ratio: 0.4,
+            channels: std::collections::HashMap::from([(
+                ChannelName::new("telegram"),
+                ChannelConfig {
+                    enabled: Some(true),
+                    telegram_channels: Some(std::collections::HashMap::from([(
+                        chat_id,
+                        crate::config::TelegramChatConfig {
+                            secret,
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            default_agent: AgentId::new("default"),
+            agents: std::collections::HashMap::from([(
+                AgentId::new("default"),
+                crate::config::AgentConfig {
+                    label: "Default".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            timezone: "UTC".to_string(),
+            sleep_batch: crate::config::SleepBatchConfig::default(),
+            pulse: crate::config::PulseConfig::default(),
+            db: crate::config::DatabaseConfig::default(),
+            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
+            webhooks: crate::config::WebhooksConfig::default(),
+        }
+    }
+
     #[test]
     fn webhook_context_uses_target_channel_and_receiver_surface_user() {
         let config = test_config_with_discord_secret("123", false);
@@ -246,7 +313,7 @@ mod tests {
         };
         let receiver_id = WebhookReceiverId::new("egograph");
 
-        let context = build_webhook_context(&config, &receiver_id, &receiver);
+        let context = build_webhook_context(&config, &receiver_id, &receiver).expect("context");
 
         assert_eq!(context.channel, "discord");
         assert_eq!(context.surface_user, "webhook:egograph");
@@ -270,11 +337,13 @@ mod tests {
         };
         let receiver_id = WebhookReceiverId::new("egograph");
 
-        let secret_context = build_webhook_context(&secret_config, &receiver_id, &receiver);
+        let secret_context =
+            build_webhook_context(&secret_config, &receiver_id, &receiver).expect("secret context");
         assert_eq!(secret_context.scope, ConversationScope::Secret);
 
         let normal_config = test_config_with_discord_secret("123", false);
-        let normal_context = build_webhook_context(&normal_config, &receiver_id, &receiver);
+        let normal_context =
+            build_webhook_context(&normal_config, &receiver_id, &receiver).expect("normal context");
         assert_eq!(normal_context.scope, ConversationScope::Normal);
     }
 
@@ -299,11 +368,102 @@ mod tests {
                     agent: Some(AgentId::new("default")),
                 },
             };
-            let context = build_webhook_context(&config, &receiver_id, &receiver);
+            let context = build_webhook_context(&config, &receiver_id, &receiver).expect("context");
             assert_eq!(
                 context.surface_thread, expected,
                 "web target thread '{input}' should normalize to '{expected}'"
             );
         }
+    }
+
+    #[test]
+    fn webhook_context_resolves_telegram_target_scope_from_channel_secret() {
+        let receiver = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("telegram"),
+                thread: "-100".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let receiver_id = WebhookReceiverId::new("egograph");
+
+        let secret_context = build_webhook_context(
+            &test_config_with_telegram_secret(-100, true),
+            &receiver_id,
+            &receiver,
+        )
+        .expect("secret context");
+        assert_eq!(secret_context.scope, ConversationScope::Secret);
+
+        let normal_context = build_webhook_context(
+            &test_config_with_telegram_secret(-100, false),
+            &receiver_id,
+            &receiver,
+        )
+        .expect("normal context");
+        assert_eq!(normal_context.scope, ConversationScope::Normal);
+    }
+
+    #[test]
+    fn webhook_context_rejects_unresolvable_target_scope_instead_of_falling_back_to_normal() {
+        let discord_config = test_config_with_discord_secret("123", false);
+        let telegram_only_config = test_config_with_telegram_secret(-100, false);
+        let receiver_id = WebhookReceiverId::new("egograph");
+
+        let unparseable = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("discord"),
+                thread: "not-a-number".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let err = build_webhook_context(&discord_config, &receiver_id, &unparseable)
+            .expect_err("unparseable thread must be rejected");
+        assert_eq!(err, "discord target thread is not configured");
+
+        let unregistered = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("discord"),
+                thread: "999".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let err = build_webhook_context(&discord_config, &receiver_id, &unregistered)
+            .expect_err("unregistered thread must be rejected");
+        assert_eq!(err, "discord target thread is not configured");
+
+        // Discord target with no Discord channel map configured at all.
+        let missing_map = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("discord"),
+                thread: "123".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let err = build_webhook_context(&telegram_only_config, &receiver_id, &missing_map)
+            .expect_err("missing channel map must be rejected");
+        assert_eq!(err, "discord target thread is not configured");
+
+        let unregistered_telegram = WebhookReceiverConfig {
+            token: None,
+            file_token: None,
+            target: WebhookTargetConfig {
+                channel: ChannelName::new("telegram"),
+                thread: "-999".to_string(),
+                agent: Some(AgentId::new("default")),
+            },
+        };
+        let err =
+            build_webhook_context(&telegram_only_config, &receiver_id, &unregistered_telegram)
+                .expect_err("unregistered telegram thread must be rejected");
+        assert_eq!(err, "telegram target thread is not configured");
     }
 }
