@@ -3,6 +3,8 @@
 //! Config 由来のシークレット値と well-known パターンの二層リダクションにより、
 //! ツール出力に秘密情報が漏洩しないようマスクする。
 
+use std::collections::HashSet;
+
 use crate::config::Config;
 use crate::llm::codex_auth::{is_codex_provider, resolve_codex_auth};
 use crate::tools::ToolResult;
@@ -213,7 +215,8 @@ pub(crate) fn collect_config_secrets(config: &Config) -> Vec<(String, String)> {
     }
     secrets.retain(|(_, value)| !value.is_empty());
     secrets.sort_by(|left, right| left.0.cmp(&right.0));
-    secrets.dedup_by(|left, right| left.1 == right.1);
+    let mut seen_values = HashSet::new();
+    secrets.retain(|(_, value)| seen_values.insert(value.clone()));
     secrets
 }
 
