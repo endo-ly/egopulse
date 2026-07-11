@@ -1391,6 +1391,72 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn observed_turn_runs_tool_once_when_subsequent_llm_call_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/side_effect.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Let me check.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::InvalidResponse("boom".to_string())),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
+        std::fs::write(&note_path, "side effect content").expect("notes");
+
+        // Exercise the runtime boundary (execute_observed_turn ->
+        // execute_turn_with_progress), not the bare agent-loop entry point, so
+        // the tool-after-LLM-failure behavior is verified on the path that
+        // actually runs in production.
+        let error = crate::runtime::execute_observed_turn(
+            &state,
+            &cli_context("tool-once"),
+            "please read the note",
+        )
+        .await
+        .expect_err("should fail because the subsequent LLM call errors");
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:tool-once:agent:default",
+                Some("tool-once"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "read");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn agent_loop_emits_delta_events_during_llm_stream() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = DeltaEmittingProvider {

@@ -35,7 +35,7 @@ describe("api client", () => {
   });
 
   it("create_session_key_keeps_web_session_format", () => {
-    const key = createSessionKey(new Date("2026-07-03T12:34:56Z"));
+    const key = createSessionKey(new Date(2026, 6, 3, 12, 34, 56));
 
     expect(key).toBe("session-20260703123456");
   });

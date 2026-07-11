@@ -206,6 +206,21 @@ async fn resolve_new_web_session(
     Ok((format!("chat:{chat_id}"), context))
 }
 
+fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -> SurfaceContext {
+    let surface_thread = info
+        .external_chat_id
+        .strip_prefix(&format!("{}:", info.channel))
+        .unwrap_or(&info.external_chat_id)
+        .to_string();
+    SurfaceContext::new(
+        info.channel,
+        actor.to_string(),
+        surface_thread,
+        info.chat_type,
+        info.agent_id,
+    )
+}
+
 /// Creates a run and spawns the background task that publishes its events.
 pub(super) async fn start_stream_run(
     state: WebState,
@@ -227,23 +242,10 @@ pub(super) async fn start_stream_run(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         match chat_info {
-            Some(info) => {
-                let surface_thread = info
-                    .external_chat_id
-                    .strip_prefix(&format!("{}:", info.channel))
-                    .unwrap_or(&info.external_chat_id)
-                    .to_string();
-                (
-                    format!("chat:{}", chat_id),
-                    SurfaceContext::new(
-                        info.channel,
-                        actor.to_string(),
-                        surface_thread,
-                        info.chat_type,
-                        state.app_state.config.default_agent.to_string(),
-                    ),
-                )
-            }
+            Some(info) => (
+                format!("chat:{chat_id}"),
+                surface_context_from_chat_info(info, actor),
+            ),
             None => resolve_new_web_session(&state, raw_session_key, actor).await?,
         }
     } else {
@@ -449,6 +451,27 @@ pub(super) async fn start_stream_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_chat_context_preserves_stored_identity() {
+        // Arrange
+        let info = crate::storage::ChatInfo {
+            chat_id: 42,
+            channel: "web".to_string(),
+            external_chat_id: "web:stored-thread".to_string(),
+            chat_type: "dm".to_string(),
+            agent_id: "non-default-agent".to_string(),
+        };
+
+        // Act
+        let context = surface_context_from_chat_info(info, "web-user");
+
+        // Assert
+        assert_eq!(context.channel, "web");
+        assert_eq!(context.surface_thread, "stored-thread");
+        assert_eq!(context.chat_type, "dm");
+        assert_eq!(context.agent_id, "non-default-agent");
+    }
 
     #[test]
     fn stream_event_format_matches() {

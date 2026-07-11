@@ -483,13 +483,29 @@ fn spawn_agent_turn_worker(
 ) {
     tokio::spawn(async move {
         while let Some(pending) = receiver.recv().await {
+            let channel_log_chat_id = pending.context.channel_log_chat_id;
+            let scope = pending.context.scope;
             let scheduled = crate::agent_loop::ScheduledTurn {
                 context: pending.context,
                 input: pending.input,
                 origin_id: pending.origin_id,
             };
 
-            channel_input::submit_scheduled_turn(&state, scheduled);
+            if let turn_scheduler::SubmitOutcome::Rejected(reason) =
+                channel_input::submit_scheduled_turn(&state, scheduled)
+            {
+                // Log + metric are already recorded centrally in the submit
+                // path; store a system event so the async rejection surfaces in
+                // the channel log instead of being silently dropped.
+                if let Some(chat_id) = channel_log_chat_id {
+                    if let Err(error) = state.db_for(scope).store_system_event(chat_id, &reason) {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to store system event for agent_send queue rejection"
+                        );
+                    }
+                }
+            }
         }
     });
 }
@@ -514,6 +530,9 @@ pub(crate) fn execute_scheduled_turn(
             .runtime_status
             .touch_channel_activity(&turn.context.channel);
 
+        // The origin was already reserved at acceptance (submit_scheduled_turn).
+        // Re-check here for queued turns whose chain terminated while waiting in
+        // the scheduler; release the reservation so capacity is not leaked.
         if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
             tracing::warn!(
                 agent_id = %turn.context.agent_id,
@@ -521,6 +540,7 @@ pub(crate) fn execute_scheduled_turn(
                 reason = ?reason,
                 "dropping turn: origin already has terminal stop reason"
             );
+            state.turn_tracker.release(&origin_id);
             if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
                 execute_scheduled_turn(state, next).await;
             }
@@ -531,42 +551,47 @@ pub(crate) fn execute_scheduled_turn(
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
-        state.turn_tracker.increment(&origin_id);
-        let turn_count = state.turn_tracker.count(&origin_id);
-
-        if let Some(reason) =
-            turn_scheduler::evaluate_stop_conditions(chain_depth, turn_count, agent_id, &valid_ids)
+        // Atomically gate the turn and commit it to execution in a single
+        // tracker lock: the per-chain turn-count check and the executed-count
+        // increment happen together, so two concurrent turns for the same origin
+        // (different agent sessions share an origin) cannot both pass the limit.
+        // try_begin_execution consumes the reservation on both paths, so it must
+        // not be paired with a release() here. A turn whose chain already
+        // terminated while queued is dropped quietly by the re-check above; a
+        // new rejection records the terminal reason inside the call.
+        match state
+            .turn_tracker
+            .try_begin_execution(&origin_id, chain_depth, agent_id, &valid_ids)
         {
-            tracing::warn!(
-                agent_id = %agent_id,
-                chain_depth,
-                turn_count,
-                reason = ?reason,
-                "scheduled turn rejected by stop condition evaluator"
-            );
-            state
-                .turn_tracker
-                .set_terminal_reason(&origin_id, reason.clone());
-            state.runtime_status.push_error(
-                &turn.context.trace_id,
-                "stop_condition",
-                agent_id,
-                &turn.context.channel,
-                &format!("{reason:?}"),
-            );
-            crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
-            if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(error) = state
-                    .db_for(turn.context.scope)
-                    .store_system_event(log_chat_id, &reason)
-                {
-                    tracing::warn!(error = %error, "failed to store system event for stop condition");
+            Ok(_executed_turn_count) => {}
+            Err(reason) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    chain_depth,
+                    reason = ?reason,
+                    "scheduled turn rejected by stop condition evaluator"
+                );
+                state.runtime_status.push_error(
+                    &turn.context.trace_id,
+                    "stop_condition",
+                    agent_id,
+                    &turn.context.channel,
+                    &format!("{reason:?}"),
+                );
+                crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
+                if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                    if let Err(error) = state
+                        .db_for(turn.context.scope)
+                        .store_system_event(log_chat_id, &reason)
+                    {
+                        tracing::warn!(error = %error, "failed to store system event for stop condition");
+                    }
                 }
+                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
+                    execute_scheduled_turn(state, next).await;
+                }
+                return;
             }
-            if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                execute_scheduled_turn(state, next).await;
-            }
-            return;
         }
 
         let adapter = state.channels.get(&turn.context.channel);
@@ -589,7 +614,7 @@ pub(crate) fn execute_scheduled_turn(
         let started_at = chrono::Utc::now().to_rfc3339();
         let started = std::time::Instant::now();
 
-        let turn_result = execute_turn_with_retry(state, &turn.context, &turn.input).await;
+        let turn_result = execute_turn_with_progress(state, &turn.context, &turn.input).await;
         let duration = started.elapsed().as_secs_f64();
 
         match turn_result {
@@ -691,8 +716,6 @@ pub(crate) fn execute_scheduled_turn(
     })
 }
 
-const MAX_TURN_RETRIES: u32 = 2;
-
 /// Executes one agent turn while recording runtime activity and telemetry.
 ///
 /// The crate-visible helper accepts the shared [`AppState`], a
@@ -703,8 +726,7 @@ const MAX_TURN_RETRIES: u32 = 2;
 ///
 /// # Errors
 ///
-/// Propagates any [`EgoPulseError`] returned by `execute_turn_with_retry`,
-/// including a final turn failure after retryable errors exhaust their retries.
+/// Propagates any [`EgoPulseError`] returned by the single turn execution.
 /// Such failures are also recorded through `runtime_status.push_error`.
 pub(crate) async fn execute_observed_turn(
     state: &AppState,
@@ -716,7 +738,7 @@ pub(crate) async fn execute_observed_turn(
         .touch_channel_activity(&context.channel);
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
-    let result = execute_turn_with_retry(state, context, input).await;
+    let result = execute_turn_with_progress(state, context, input).await;
     let duration = started.elapsed().as_secs_f64();
     state.runtime_status.push_turn(
         &context.trace_id,
@@ -739,7 +761,7 @@ pub(crate) async fn execute_observed_turn(
     result
 }
 
-async fn execute_turn_with_retry(
+async fn execute_turn_with_progress(
     state: &AppState,
     context: &crate::agent_loop::SurfaceContext,
     input: &str,
@@ -757,7 +779,23 @@ async fn execute_turn_with_retry(
     // timeout 枝でタスクを確実に停止できるよう abort handle を保持する。
     let coordinator_abort = coordinator_handle.abort_handle();
 
-    let result = run_retry_loop(state, context, input, &evt_tx).await;
+    let event_sender = evt_tx.clone();
+    let result = crate::agent_loop::process_turn_with_events(state, context, input, move |event| {
+        let _ = event_sender.send(event);
+    })
+    .await;
+
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is_codex_auth_error())
+    {
+        tracing::warn!("codex 401 detected, refreshing token for a later turn");
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+        crate::llm::codex_auth::force_refresh_codex_token(&http).await;
+    }
 
     // `evt_tx` を全て drop してから await する（さもないと coordinator が EOF を検出できずハングする）。
     drop(evt_tx);
@@ -773,53 +811,6 @@ async fn execute_turn_with_retry(
         }
     }
     result
-}
-
-/// リトライループで `process_turn_with_events` を呼び、イベントを進捗 coordinator へ転送する。
-async fn run_retry_loop(
-    state: &AppState,
-    context: &crate::agent_loop::SurfaceContext,
-    input: &str,
-    evt_tx: &tokio::sync::mpsc::UnboundedSender<crate::agent_loop::event::AgentEvent>,
-) -> Result<String, EgoPulseError> {
-    for attempt in 0..=MAX_TURN_RETRIES {
-        let evt_tx = evt_tx.clone();
-        let result =
-            crate::agent_loop::process_turn_with_events(state, context, input, move |event| {
-                let _ = evt_tx.send(event);
-            })
-            .await;
-        match result {
-            Ok(response) => return Ok(response),
-            Err(error) if error.is_retryable() && attempt < MAX_TURN_RETRIES => {
-                let delay = error
-                    .retry_after_secs()
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| Duration::from_secs(2u64.pow(attempt)));
-                tracing::warn!(
-                    attempt,
-                    max_retries = MAX_TURN_RETRIES,
-                    delay_secs = delay.as_secs(),
-                    error = %error,
-                    "turn failed with retryable error, retrying"
-                );
-                tokio::time::sleep(delay).await;
-            }
-            Err(error) if error.is_codex_auth_error() && attempt == 0 => {
-                tracing::warn!(
-                    error = %error,
-                    "codex 401 detected, attempting token refresh"
-                );
-                let http = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(15))
-                    .build()
-                    .unwrap_or_default();
-                crate::llm::codex_auth::force_refresh_codex_token(&http).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("loop always returns via match arms on final iteration")
 }
 
 /// 当該チャネルで進捗表示が有効かを設定からルックアップする。
@@ -1155,6 +1146,9 @@ fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::agent_loop::ConversationScope;
     use crate::agent_loop::soul_agents::SoulAgentsLoader;
@@ -1303,8 +1297,48 @@ mod tests {
         }
     }
 
+    struct RetryableFailingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for RetryableFailingProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn model_name(&self) -> &str {
+            "stub-model"
+        }
+
+        async fn send_message(
+            &self,
+            _: &str,
+            _: Arc<Vec<crate::llm::Message>>,
+            _: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(crate::error::LlmError::ApiError {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                body_preview: "test failure".to_string(),
+                retry_after_secs: None,
+            })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<crate::llm::Message>>,
+            tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
+    }
+
     #[tokio::test]
-    async fn execute_turn_with_retry_terminates_on_success() {
+    async fn execute_turn_with_progress_terminates_on_success() {
         // Arrange: a turn whose coordinator has no sink (web/cli channel).
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::test_util::build_state_with_provider(
@@ -1316,17 +1350,17 @@ mod tests {
         // Act: a bounded timeout proves the coordinator never hangs the turn.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_retry(&state, &context, "hello"),
+            execute_turn_with_progress(&state, &context, "hello"),
         )
         .await;
 
         // Assert
-        assert!(result.is_ok(), "execute_turn_with_retry must not hang");
+        assert!(result.is_ok(), "execute_turn_with_progress must not hang");
         assert_eq!(result.unwrap().expect("turn ok"), "ok");
     }
 
     #[tokio::test]
-    async fn execute_turn_with_retry_terminates_on_failure() {
+    async fn execute_turn_with_progress_terminates_on_failure() {
         // Arrange: the LLM always fails.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::test_util::build_state_with_provider(
@@ -1338,16 +1372,46 @@ mod tests {
         // Act: the failure path must also drop evt_tx and return bounded.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_retry(&state, &context, "hello"),
+            execute_turn_with_progress(&state, &context, "hello"),
         )
         .await;
 
         // Assert
         assert!(
             result.is_ok(),
-            "execute_turn_with_retry must not hang on failure"
+            "execute_turn_with_progress must not hang on failure"
         );
         assert!(result.unwrap().is_err(), "turn should fail");
+    }
+
+    #[tokio::test]
+    async fn retryable_llm_failure_executes_one_turn_and_persists_one_input() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(RetryableFailingProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let context = crate::test_util::cli_context("retryable-failure");
+
+        // Act
+        let result = execute_turn_with_progress(&state, &context, "hello").await;
+
+        // Assert
+        assert!(result.is_err(), "retryable failure must reach the caller");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "LLM must be called once");
+        let conn = state.db.get_conn().expect("connection");
+        let user_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE sender_kind = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count user messages");
+        assert_eq!(user_messages, 1, "input must be persisted once");
     }
 
     #[tokio::test]

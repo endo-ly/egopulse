@@ -91,44 +91,12 @@ impl EgoPulseError {
         }
     }
 
-    /// Returns `true` if the error represents a transient failure that may succeed on retry.
-    ///
-    /// Covers:
-    /// - LLM API 5xx (server error) and 429 (rate limit)
-    /// - LLM network / connection failures (`RequestFailed`)
-    pub(crate) fn is_retryable(&self) -> bool {
-        match self {
-            Self::Llm(llm) => llm.is_retryable(),
-            _ => false,
-        }
-    }
-
-    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
-        match self {
-            Self::Llm(LlmError::ApiError {
-                retry_after_secs, ..
-            }) => *retry_after_secs,
-            _ => None,
-        }
-    }
-
     pub(crate) fn is_codex_auth_error(&self) -> bool {
         matches!(
             self,
             Self::Llm(LlmError::ApiError { status, .. })
                 if status.as_u16() == 401
         )
-    }
-}
-
-impl LlmError {
-    /// Returns `true` if this LLM error may succeed on retry.
-    pub(crate) fn is_retryable(&self) -> bool {
-        match self {
-            Self::ApiError { status, .. } => status.is_server_error() || status.as_u16() == 429,
-            Self::RequestFailed(_) => true,
-            _ => false,
-        }
     }
 }
 
@@ -325,6 +293,14 @@ pub enum StorageError {
     NotFound(String),
     #[error("storage_conflict: {0}")]
     Conflict(String),
+    #[error(
+        "storage_unsupported_schema_version: database={database} found={found} supported={supported}"
+    )]
+    UnsupportedSchemaVersion {
+        database: &'static str,
+        found: i64,
+        supported: i64,
+    },
 }
 
 /// Channel (Web / Discord / Telegram) operational errors.

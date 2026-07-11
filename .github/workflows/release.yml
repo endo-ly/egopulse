@@ -1,28 +1,44 @@
 name: Release
 
+# Release runs only after the CI workflow on `main` completes successfully.
+# The released SHA is always the CI run's head SHA, so "tested code",
+# "shipped code", and "tagged code" stay on the same commit. The tag is created
+# only after every artifact build succeeds; it is never pushed first.
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-permissions:
-  contents: write
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
+concurrency:
+  group: release-main
+  # Do not cancel an in-flight release; a second push will wait or skip via the
+  # tag collision checks rather than racing the publish step.
+  cancel-in-progress: false
 
 jobs:
-  create-tag:
-    name: Create Release Tag
+  compute-version:
+    name: Compute Release Version
+    # Only release commits whose CI run actually succeeded.
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
       release_version: ${{ steps.version.outputs.version }}
+      head_sha: ${{ steps.sha.outputs.head_sha }}
     steps:
-      - name: Checkout
+      - name: Resolve CI head SHA
+        id: sha
+        run: echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout CI SHA
         uses: actions/checkout@v4
         with:
+          ref: ${{ steps.sha.outputs.head_sha }}
           fetch-depth: 0
 
       - name: Read version from Cargo.toml
@@ -31,36 +47,30 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "//;s/"//')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Create release tag
+      - name: Compute candidate tag
         id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          DATE=$(date +%Y%m%d)
+          # Derive the date from the commit itself (not the wall clock) so the
+          # candidate is stable across reruns of this release run for the same
+          # SHA. The run number disambiguates same-day releases.
+          COMMIT_DATE=$(git show -s --format=%cd --date=format:'%Y%m%d' "${HEAD_SHA}")
           RUN=${{ github.run_number }}
-          RELEASE_TAG="${DATE}.${RUN}"
-
-          # Avoid duplicate tags
-          if git tag -l "${RELEASE_TAG}" | grep -q .; then
-            echo "Tag ${RELEASE_TAG} already exists, appending commit SHA suffix"
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            RELEASE_TAG="${RELEASE_TAG}-${SHORT_SHA}"
-          fi
-
-          git tag "${RELEASE_TAG}"
-          git push origin "${RELEASE_TAG}"
-
+          RELEASE_TAG="${COMMIT_DATE}.${RUN}"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "Created tag: ${RELEASE_TAG}"
+          echo "Candidate release tag: ${RELEASE_TAG} (not created yet)"
 
   build-web:
     name: Build Web Assets
+    needs: [compute-version]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout CI SHA
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.compute-version.outputs.head_sha }}
+          persist-credentials: false
 
-      - name: Setup Node
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -68,6 +78,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Build embedded web assets
+        env:
+          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
         run: |
           npm --prefix web ci
           npm --prefix web run build
@@ -82,7 +94,7 @@ jobs:
   build-assets:
     name: Build ${{ matrix.target.label }}
     runs-on: ${{ matrix.target.os }}
-    needs: [create-tag, build-web]
+    needs: [compute-version, build-web]
     strategy:
       fail-fast: false
       matrix:
@@ -107,8 +119,11 @@ jobs:
             archive_ext: tar.gz
 
     steps:
-      - name: Checkout
+      - name: Checkout CI SHA
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.compute-version.outputs.head_sha }}
+          persist-credentials: false
 
       - name: Download web assets
         uses: actions/download-artifact@v4
@@ -116,7 +131,7 @@ jobs:
           name: web-assets
           path: web/dist
 
-      - name: Setup Rust
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust artifacts
@@ -127,13 +142,14 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          EGOPULSE_RELEASE_TAG: ${{ needs.create-tag.outputs.release_tag }}
+          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
         run: cargo build --release
 
       - name: Package archive
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.compute-version.outputs.release_version }}
         run: |
-          RELEASE_VERSION="${{ needs.create-tag.outputs.release_version }}"
           ASSET_NAME="egopulse-${RELEASE_VERSION}-${{ matrix.target.asset_triple }}.tar.gz"
           tar -czf "$ASSET_NAME" -C target/release "${{ matrix.target.bin }}"
           echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
@@ -148,14 +164,18 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [create-tag, build-assets]
+    needs: [compute-version, build-assets]
+    permissions:
+      contents: write
     env:
-      RELEASE_TAG: ${{ needs.create-tag.outputs.release_tag }}
+      RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
+      HEAD_SHA: ${{ needs.compute-version.outputs.head_sha }}
 
     steps:
-      - name: Checkout
+      - name: Checkout CI SHA
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.HEAD_SHA }}
           fetch-depth: 0
 
       - name: Download artifacts
@@ -170,13 +190,47 @@ jobs:
           cd dist
           sha256sum *.tar.gz > SHA256SUMS.txt
 
+      - name: Create or reuse release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+          # If the candidate tag already exists, it must point at the same SHA.
+          # We never move an existing tag to a different commit.
+          EXISTING_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null || echo "")
+          if [ -n "${EXISTING_SHA}" ]; then
+            if [ "${EXISTING_SHA}" = "${HEAD_SHA}" ]; then
+              echo "Tag ${RELEASE_TAG} already exists at ${HEAD_SHA}; reusing (rerun-safe)"
+            else
+              echo "Tag ${RELEASE_TAG} exists at ${EXISTING_SHA}; refusing to move it to ${HEAD_SHA}" >&2
+              exit 1
+            fi
+          else
+            git tag "${RELEASE_TAG}" "${HEAD_SHA}"
+            git push origin "${RELEASE_TAG}"
+            echo "Created tag ${RELEASE_TAG} at ${HEAD_SHA}"
+          fi
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            -t "${RELEASE_TAG}" \
-            --generate-notes \
-            --target "${{ github.sha }}" \
-            dist/*.tar.gz dist/SHA256SUMS.txt
+          set -euo pipefail
+          # Idempotent: if the release already exists (e.g. a previous run
+          # created the tag and release but failed uploading assets), upload
+          # the artifacts again instead of creating a duplicate release.
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; uploading assets"
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              dist/*.tar.gz dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              -t "${RELEASE_TAG}" \
+              --generate-notes \
+              --target "${HEAD_SHA}" \
+              dist/*.tar.gz dist/SHA256SUMS.txt
+          fi

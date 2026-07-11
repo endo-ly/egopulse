@@ -351,25 +351,47 @@ curl -s http://127.0.0.1:10961/telemetry | jq .
 
 ## 6. リリースプロセス
 
-main ブランチへのマージ時に自動で GitHub Release が作成される。
+main ブランチで CI が成功した commit に対してのみ GitHub Release が作成される。CI が失敗した commit へはタグ・Release ともに作成されない。
 
 ### 自動リリースの仕組み
 
+```text
+main へマージ → CI workflow 実行
+         ↓
+CI が success で完了 → release workflow が workflow_run で起動
+         ↓
+CI run の head SHA をリリース対象 SHA として固定
+         ↓
+候補タグ名を計算（まだ作成しない）
+         ↓
+Web asset をビルド → Rust release binary を各 target で並列ビルド
+         ↓
+全 artifact ビルド成功後のみタグを作成・push
+         ↓
+同じ SHA / タグで GitHub Release を作成し全バイナリ + SHA256SUMS.txt を添付
 ```
-main へマージ
-         ↓
-Cargo.toml のバージョン + 日付 + run番号 でタグを自動生成
-  例: v0.1.0-20260404.1
-         ↓
-Linux/macOS × x86_64/aarch64 の 4 ターゲットを並列ビルド
-         ↓
-GitHub Release に全バイナリ + SHA256SUMS.txt をアップロード
-```
+
+CI・Web build・いずれかの target build が失敗した commit にはタグが作成されない。手動リリースが必要な場合は main 上で CI を `workflow_dispatch` で再実行し、その成功 run から Release を起動する（Release 単体の `workflow_dispatch` は存在しない）。
 
 ### タグ命名規則
 
-`v{バージョン}-{YYYYMMDD}.{run_number}`
+`{YYYYMMDD}.{run_number}`
 
-例: `v0.1.0-20260404.1`
+例: `20260404.1`
 
-バージョンは `Cargo.toml` の `version` フィールドから取得する。
+- `YYYYMMDD` はリリース対象 commit の committer date（実行時の壁時計時刻ではないため、同一 SHA の再実行でタグ名が安定する）
+- `run_number` は release workflow の run 番号
+
+### タグ衝突・再実行の挙動
+
+- 候補タグが同一 SHA に既に存在する場合は再利用する（Release 作成だけ失敗した再実行でタグを増殖させない）
+- 候補タグが異なる SHA に存在する場合はタグを付け替えず明示的に失敗する
+- Release が既に存在する場合は asset を再アップロード（`--clobber`）し、別 Release を増殖させない
+
+### リリース対象ターゲット
+
+- `linux-x86_64` (x86_64-unknown-linux-gnu)
+- `linux-arm64` (aarch64-unknown-linux-gnu)
+- `macos-arm64` (aarch64-apple-darwin)
+
+各ターゲットのバイナリは `egopulse-{version}-{asset_triple}.tar.gz` として公開される。

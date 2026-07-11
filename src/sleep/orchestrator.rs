@@ -54,8 +54,8 @@ pub(crate) enum InputDecision {
     },
 }
 
-/// Collects sleep input from the database: counts new messages since the last
-/// successful sleep run, and if above threshold, fetches source session info.
+/// Collects sleep input from step checkpoints and, if above threshold, fetches
+/// the oldest pending source sessions.
 ///
 /// # Errors
 ///
@@ -64,10 +64,7 @@ pub(crate) fn collect_sleep_input(
     db: &Database,
     agent_id: &str,
 ) -> Result<InputDecision, crate::error::StorageError> {
-    let latest_run = db.get_latest_successful_run(agent_id)?;
-    let cutoff = latest_run.as_ref().and_then(|r| r.finished_at.as_deref());
-
-    let new_message_count = db.count_agent_messages_since(agent_id, cutoff)?;
+    let new_message_count = db.count_agent_pending_sleep_messages(agent_id)?;
 
     if new_message_count <= SKIP_THRESHOLD {
         let reason =
@@ -78,7 +75,8 @@ pub(crate) fn collect_sleep_input(
         });
     }
 
-    let sessions = db.get_agent_sessions_since(agent_id, cutoff, MAX_SOURCE_SESSIONS)?;
+    let sessions =
+        db.get_agent_sessions_with_pending_sleep_messages(agent_id, MAX_SOURCE_SESSIONS)?;
     let source_chats_json =
         serde_json::to_string(&sessions).map_err(crate::error::StorageError::SessionSerialize)?;
 
@@ -1944,12 +1942,45 @@ mod tests {
         let per_chat = needed.div_ceil(n_chats);
         for i in 0..n_chats {
             let cid = create_chat(db, agent_id, &format!("-{i}"));
+            // Distinct pending ages per chat so ordering is observable.
+            let ts = format!("2025-06-01T00:{i:02}:00Z");
             for j in 0..per_chat {
-                store_msg(db, &format!("m{i}-{j}"), cid, "hi", "2025-06-01T00:00:00Z");
+                store_msg(db, &format!("m{i}-{j}"), cid, "hi", &ts);
             }
             db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
                 .expect("save session");
         }
+    }
+
+    /// Seeds one chat whose oldest pending message is `(oldest_ts, oldest_id)`.
+    ///
+    /// A second message `(second_ts, second_id)` is added so that `MIN(timestamp)`
+    /// and `MIN(id)` come from different rows (the bug the window-function query
+    /// fixes), plus `n - 2` filler messages that never become the oldest tuple.
+    /// Returns the created chat id.
+    fn seed_oldest_pending_chat(
+        db: &Database,
+        agent_id: &str,
+        suffix: &str,
+        oldest: (&str, &str),
+        second: (&str, &str),
+        n: usize,
+    ) -> i64 {
+        let cid = create_chat(db, agent_id, suffix);
+        store_msg(db, oldest.1, cid, "hi", oldest.0);
+        store_msg(db, second.1, cid, "hi", second.0);
+        for j in 0..n.saturating_sub(2) {
+            store_msg(
+                db,
+                &format!("zz{j}"),
+                cid,
+                "hi",
+                &format!("2025-06-01T00:12:{j:02}Z"),
+            );
+        }
+        db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+        cid
     }
 
     fn build_test_state(db: Database, dir: &std::path::Path) -> AppState {
@@ -1999,6 +2030,75 @@ mod tests {
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_drains_25_sessions_across_two_runs() {
+        let (db, dir) = test_db();
+        const N_CHATS: usize = 25;
+        // 25 * PER_CHAT exceeds SKIP_THRESHOLD; after run 1 drains the first
+        // MAX_SOURCE_SESSIONS (20) chats, the remaining 5 * PER_CHAT must stay above
+        // SKIP_THRESHOLD so run 2 still proceeds. PER_CHAT = 13 -> 5 * 13 = 65 > 64.
+        const PER_CHAT: usize = 13;
+        let mut chat_ids = Vec::with_capacity(N_CHATS);
+        for i in 0..N_CHATS {
+            let cid = create_chat(&db, "test-agent", &format!("-{i}"));
+            for j in 0..PER_CHAT {
+                let ts = format!("2025-06-01T00:{i:02}:{j:02}Z");
+                store_msg(&db, &format!("m{i}-{j}"), cid, "hi", &ts);
+            }
+            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
+                .expect("save session");
+            chat_ids.push(cid);
+        }
+
+        let llm = Arc::new(DrainMockProvider);
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("run 1 should drain the first 20 sessions");
+
+        let hot_cid = chat_ids[0];
+        store_msg(&state.db, "hot-1", hot_cid, "hi", "2025-12-01T00:00:00Z");
+        let decision =
+            collect_sleep_input(&state.db, "test-agent").expect("collect after hot message");
+        let sessions = match &decision {
+            InputDecision::Proceed { sessions, .. } => sessions,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+        let ids: Vec<i64> = sessions.iter().map(|s| s.chat_id).collect();
+        let unprocessed = &chat_ids[20..25];
+        for u in unprocessed {
+            assert!(
+                ids.contains(u),
+                "unprocessed chat {u} must remain pending; collected ids = {ids:?}"
+            );
+        }
+        let hot_pos = ids
+            .iter()
+            .position(|c| *c == hot_cid)
+            .expect("hot chat present");
+        for u in unprocessed {
+            let u_pos = ids
+                .iter()
+                .position(|c| *c == *u)
+                .expect("unprocessed present");
+            assert!(
+                u_pos < hot_pos,
+                "unprocessed chat {u} must precede hot chat {hot_cid}"
+            );
+        }
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("run 2 should drain the remaining sessions");
+
+        let third = collect_sleep_input(&state.db, "test-agent").expect("collect run 3");
+        assert!(
+            matches!(third, InputDecision::Skip { .. }),
+            "expected Skip after all 25 sessions drained, got {third:?}"
+        );
     }
 
     #[tokio::test]
@@ -2347,6 +2447,57 @@ mod tests {
             })
         }
 
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
+    }
+
+    /// Provider for the multi-run drain test: returns an event-extraction-shaped
+    /// response for event/rollup calls and a 2-key semantic/prospective response
+    /// for the long-term memory update step (whose parser requires exactly those
+    /// two keys). The memory step is identified by its prompt's unique wording.
+    struct DrainMockProvider;
+
+    #[async_trait]
+    impl LlmProvider for DrainMockProvider {
+        fn provider_name(&self) -> &str {
+            "drain-mock"
+        }
+        fn model_name(&self) -> &str {
+            "drain-mock-model"
+        }
+        async fn send_message(
+            &self,
+            system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let content = if system.contains("更新を担う") {
+                serde_json::json!({
+                    "semantic": "# Semantic\n\n- fact",
+                    "prospective": "# Prospective\n\n- todo"
+                })
+                .to_string()
+            } else if system.to_lowercase().contains("rollup") || system.contains("ロールアップ")
+            {
+                r#"{"rollups":[]}"#.to_string()
+            } else {
+                r#"{"events":[]}"#.to_string()
+            };
+            Ok(MessagesResponse {
+                content,
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
         async fn send_message_streaming(
             &self,
             system: &str,
@@ -2927,39 +3078,73 @@ mod tests {
     }
 
     #[test]
-    fn collect_source_chats_json_sorted_newest_first() {
+    fn count_pending_counts_same_message_id_across_chats() {
         let (db, _dir) = test_db();
-        seed_sessions_above_threshold(&db, "test-agent", MAX_SOURCE_SESSIONS);
+        // The messages table has a composite primary key (id, chat_id), so the
+        // same message id may exist in two different chats. The pending count
+        // must be based on that composite identity, not on DISTINCT m.id alone.
+        let c1 = create_chat(&db, "test-agent", "-1");
+        store_msg(&db, "1", c1, "hi", "2025-01-01T00:00:01Z");
+        let c2 = create_chat(&db, "test-agent", "-2");
+        store_msg(&db, "1", c2, "hi", "2025-01-01T00:00:02Z");
+        db.save_session(c1, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+        db.save_session(c2, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+
+        let count = db
+            .count_agent_pending_sleep_messages("test-agent")
+            .expect("count");
+        assert_eq!(
+            count, 2,
+            "duplicate message id across distinct chats must both count as pending"
+        );
+    }
+
+    #[test]
+    fn collect_source_chats_json_sorted_oldest_pending_first() {
+        let (db, _dir) = test_db();
+        // Three chats are created in order cA, cB, cC, but their oldest pending
+        // (timestamp, id) tuples are deliberately ordered cC < cB < cA. This
+        // differs from both the creation/save (updated_at) order and the buggy
+        // MIN(timestamp)/MIN(id) ordering, so the test fails if ordering regresses.
+        let c_a = seed_oldest_pending_chat(
+            &db,
+            "test-agent",
+            "-a",
+            ("2025-06-01T00:10:00Z", "z"),
+            ("2025-06-01T00:11:00Z", "a"),
+            22,
+        );
+        let c_b = seed_oldest_pending_chat(
+            &db,
+            "test-agent",
+            "-b",
+            ("2025-06-01T00:10:00Z", "a"),
+            ("2025-06-01T00:11:00Z", "z"),
+            22,
+        );
+        let c_c = seed_oldest_pending_chat(
+            &db,
+            "test-agent",
+            "-c",
+            ("2025-06-01T00:09:00Z", "m"),
+            ("2025-06-01T00:11:00Z", "zzz"),
+            22,
+        );
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
-        let json_str = match &result {
-            InputDecision::Proceed {
-                source_chats_json, ..
-            } => source_chats_json,
+        let sessions = match &result {
+            InputDecision::Proceed { sessions, .. } => sessions,
             other => panic!("expected Proceed, got {other:?}"),
         };
 
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(json_str).expect("valid JSON array");
-        assert!(
-            parsed.len() >= 2,
-            "need at least 2 entries to check ordering"
+        let ids: Vec<i64> = sessions.iter().map(|s| s.chat_id).collect();
+        assert_eq!(
+            ids,
+            vec![c_c, c_b, c_a],
+            "sessions must be ordered by each chat's oldest pending (timestamp, id)"
         );
-
-        let timestamps: Vec<String> = parsed
-            .iter()
-            .map(|v| v["updated_at"].as_str().unwrap_or("").to_string())
-            .collect();
-
-        for i in 0..timestamps.len() - 1 {
-            assert!(
-                timestamps[i] >= timestamps[i + 1],
-                "expected newest first: {i}='{}' < {j}='{}'",
-                timestamps[i],
-                timestamps[i + 1],
-                j = i + 1,
-            );
-        }
     }
 
     #[test]

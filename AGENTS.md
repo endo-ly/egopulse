@@ -44,7 +44,9 @@ cargo deny check                # ライセンス・重複・脆弱性
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps  # ドキュメント lint
 
 # === WebUI ===
-npm install --prefix web
+npm ci --prefix web          # CI と同じ install
+npm run typecheck --prefix web
+npm test --prefix web
 npm run build --prefix web
 cd web && npm run dev
 
@@ -114,7 +116,7 @@ coderabbit --prompt-only -t committed --base main
 
 - GitHub Flow: ブランチ `<type>/<desc>`
 - コミット: Conventional Commits（英語）
-- ワークフロー: `ci.yml`(テスト), `release.yml`(リリース)
+- ワークフロー: `ci.yml`(Rust + Web 品質ゲート), `release.yml`(CI 成功後に起動するリリース)
 - ブレインストーミングや壁打ち系など、**計画なし**で進めた実装: mainブランチで作業やプッシュしてよい
 - Issue, Planなど、**計画あり**で進めた実装: Git Worktreeを作成しその中で作業する（`worktree-create` skill使用）
 - PR description は日本語。該当Issueがある場合は `Close #XX` 明記

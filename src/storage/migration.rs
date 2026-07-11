@@ -8,19 +8,21 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 10;
+pub(super) const SCHEMA_VERSION: i64 = 11;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
-/// テーブルが存在しない場合は作成し、バージョン未設定なら `0` を返す。
+/// テーブルが存在しない場合またはバージョン未設定なら `0` を返す。この読み取りは
+/// forward-version guard より前にDDL/DMLを実行しない。
 fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS db_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
+    let has_db_meta: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'db_meta')",
         [],
+        |row| row.get(0),
     )?;
+    if !has_db_meta {
+        return Ok(0);
+    }
     let raw: Option<String> = conn
         .query_row(
             "SELECT value FROM db_meta WHERE key = 'schema_version'",
@@ -29,6 +31,18 @@ fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
         )
         .optional()?;
     Ok(raw.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
+}
+
+/// Creates the schema metadata table after the forward-version guard has run.
+fn ensure_schema_meta(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS db_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
 }
 
 /// スキーマバージョンを更新し、`schema_migrations` に適用履歴を記録する。
@@ -84,6 +98,15 @@ fn set_schema_version_in_tx(
 /// 未適用のマイグレーションを逐次実行する。
 pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     let mut version = schema_version(conn)?;
+
+    if version > SCHEMA_VERSION {
+        return Err(StorageError::UnsupportedSchemaVersion {
+            database: "normal",
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    ensure_schema_meta(conn)?;
 
     if version < SCHEMA_VERSION {
         conn.execute_batch(
@@ -668,6 +691,16 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 10;
     }
 
+    if version < 11 {
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_chats_agent_id ON chats(agent_id)")?;
+        set_schema_version(
+            conn,
+            11,
+            "add index on chats(agent_id) for sleep pending-message queries",
+        )?;
+        version = 11;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -683,6 +716,15 @@ pub(super) const SECRET_SCHEMA_VERSION: i64 = 2;
 /// のみを作成する。`tool_calls`, `sleep_runs`, `pulse_runs` 等は含まない。
 pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageError> {
     let mut version = schema_version(conn)?;
+
+    if version > SECRET_SCHEMA_VERSION {
+        return Err(StorageError::UnsupportedSchemaVersion {
+            database: "secret",
+            found: version,
+            supported: SECRET_SCHEMA_VERSION,
+        });
+    }
+    ensure_schema_meta(conn)?;
 
     if version < 1 {
         conn.execute_batch(
@@ -780,6 +822,103 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
 
 #[cfg(test)]
 mod tests {
+    fn set_future_schema_version(conn: &rusqlite::Connection, version: i64) {
+        conn.execute(
+            "UPDATE db_meta SET value = ?1 WHERE key = 'schema_version'",
+            [version.to_string()],
+        )
+        .expect("set future schema version");
+    }
+
+    fn schema_version(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT value FROM db_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("schema version")
+        .parse()
+        .expect("schema version is an integer")
+    }
+
+    #[test]
+    fn normal_future_schema_is_rejected_without_writes() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("current db");
+        let conn = db.get_conn().expect("connection");
+        let future_version = super::SCHEMA_VERSION + 1;
+        set_future_schema_version(&conn, future_version);
+        conn.execute(
+            "INSERT INTO chats (chat_id, chat_type, last_message_time, agent_id)
+             VALUES (9001, 'test', '2026-01-01T00:00:00Z', 'agent')",
+            [],
+        )
+        .expect("insert preserved data");
+
+        // Act
+        let error = super::run_migrations(&conn).expect_err("future schema must fail");
+
+        // Assert
+        assert!(matches!(
+            error,
+            crate::error::StorageError::UnsupportedSchemaVersion {
+                database: "normal",
+                found,
+                supported: super::SCHEMA_VERSION,
+            } if found == future_version
+        ));
+        assert_eq!(schema_version(&conn), future_version);
+        let chats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chats WHERE chat_id = 9001",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved data");
+        assert_eq!(chats, 1);
+    }
+
+    #[test]
+    fn secret_future_schema_is_rejected_without_writes() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("secret.db");
+        let db = super::super::Database::new_secret(&db_path).expect("current secret db");
+        let conn = db.get_conn().expect("connection");
+        let future_version = super::SECRET_SCHEMA_VERSION + 1;
+        set_future_schema_version(&conn, future_version);
+        conn.execute(
+            "INSERT INTO chats (chat_id, chat_type, last_message_time, agent_id)
+             VALUES (9001, 'test', '2026-01-01T00:00:00Z', 'agent')",
+            [],
+        )
+        .expect("insert preserved data");
+
+        // Act
+        let error = super::run_secret_migrations(&conn).expect_err("future schema must fail");
+
+        // Assert
+        assert!(matches!(
+            error,
+            crate::error::StorageError::UnsupportedSchemaVersion {
+                database: "secret",
+                found,
+                supported: super::SECRET_SCHEMA_VERSION,
+            } if found == future_version
+        ));
+        assert_eq!(schema_version(&conn), future_version);
+        let chats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chats WHERE chat_id = 9001",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved data");
+        assert_eq!(chats, 1);
+    }
+
     #[test]
     fn fresh_db_applies_all_migrations() {
         let dir = tempfile::tempdir().expect("tempdir");

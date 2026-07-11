@@ -605,7 +605,7 @@ Content-Type: application/json
 
 `receiver_id` は設定済み receiver 名。未設定の場合は `404 webhook_receiver_not_found`。
 
-成功時は turn 完了を待たず `202 Accepted` を返す。
+成功時は turn 完了を待たず `202 Accepted` を返す。`202` は「in-memory scheduler への受付成功（即時開始 or キュー投入）」のみを意味し、Webhook job の永続化は行わない。したがって受付後のプロセス再起動でキューは失われる。スケジューラの in-memory queue が満杯の場合は `429` を返す（後述）。
 
 ```json
 {
@@ -627,7 +627,7 @@ receiver の `target.channel / target.thread / target.agent` から `SurfaceCont
 | `chat_type` | `target.channel` |
 | `agent_id` | `target.agent`（省略時 `default_agent`） |
 | `origin_id` | webhook event ごとの UUID |
-| `scope` | Discord / Telegram target が `secret: true` なら `Secret`、それ以外は `Normal` |
+| `scope` | Discord / Telegram target は `target.thread` が対応する channel map に解決できた場合、その channel の `secret` 値から決定（`secret: true` なら `Secret`、そうでなければ `Normal`）。Web target は常に `Normal`。解決できない場合は受付を拒否する（下記 Validation / Webhook エラー参照） |
 
 #### Payload 整形
 
@@ -646,6 +646,7 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 - `target.channel` が `ChannelRegistry` に登録済みで `voice` ではない
 - 解決後 agent が `config.agents` に存在
 - 非 Web target の `target.thread` が空でない
+- Discord / Telegram target の `target.thread` が `channels.<channel>` の登録エントリに解決できること（数値として parse 可能・未登録 thread・channel map 欠落は拒否。`Normal` への降格なし）
 
 #### Webhook エラー
 
@@ -656,6 +657,11 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `invalid_params` | 400 | JSON 不正 |
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
+| `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
+| `session_queue_full` | 429 | 対象セッションのキューが上限（32）に達し、受付を拒否した |
+| `global_queue_full` | 429 | Runtime 全体のキューが上限（512）に達し、受付を拒否した |
+| `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
+| `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 
 ---
 
