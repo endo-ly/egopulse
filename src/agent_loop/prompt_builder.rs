@@ -428,6 +428,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         }
     }
 

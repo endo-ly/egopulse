@@ -196,6 +196,8 @@ impl Tool for AgentSendTool {
             origin_id: context.origin_id.clone(),
             trace_id: String::new(),
             scope: context.scope,
+
+            request_key: String::new(),
         };
 
         let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");

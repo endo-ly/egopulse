@@ -265,6 +265,26 @@ pub enum LlmError {
     RequestConstructionFailed(String),
 }
 
+impl LlmError {
+    /// Returns `true` when the error represents a transient failure that is
+    /// safe to retry without side effects: a network/timeout failure before
+    /// the provider returned any body, or a 429 / 5xx response.
+    ///
+    /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
+    /// `RequestConstructionFailed`, and 4xx other than 429) either indicate a
+    /// deterministic problem or imply the provider already produced a response
+    /// that must not be silently discarded.
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::RequestFailed(_) => true,
+            Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
+            Self::InitFailed(_) | Self::InvalidResponse(_) | Self::RequestConstructionFailed(_) => {
+                false
+            }
+        }
+    }
+}
+
 /// Logging subsystem initialization errors.
 #[derive(Debug, Error)]
 pub enum LoggingError {

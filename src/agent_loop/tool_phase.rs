@@ -173,7 +173,8 @@ pub(crate) async fn send_tool_phase_request(
             raw_estimate,
             has_tools,
             request.usage_log_failure,
-        );
+        )
+        .await;
     }
 
     if response.tool_calls.is_empty() {
@@ -236,7 +237,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn log_llm_usage(
+pub(crate) async fn log_llm_usage(
     state: &AppState,
     scope: ConversationScope,
     chat_id: i64,
@@ -259,23 +260,21 @@ pub(crate) fn log_llm_usage(
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
 
-    tokio::spawn(async move {
-        let _ = call_blocking(db, move |db| {
-            db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                chat_id,
-                caller_channel: &channel,
-                provider: &provider,
-                model: &model,
-                input_tokens,
-                output_tokens,
-                request_kind,
-                estimated_tokens,
-                has_tools,
-            })
+    let _ = call_blocking(db, move |db| {
+        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+            chat_id,
+            caller_channel: &channel,
+            provider: &provider,
+            model: &model,
+            input_tokens,
+            output_tokens,
+            request_kind,
+            estimated_tokens,
+            has_tools,
         })
-        .await
-        .inspect_err(|e| warn!(error = %e, failure_message, "llm usage logging failed"));
-    });
+    })
+    .await
+    .inspect_err(|e| warn!(error = %e, failure_message, "llm usage logging failed"));
 }
 
 pub(crate) async fn execute_tool_calls<'a>(

@@ -846,6 +846,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         assert_eq!(context.agent_id, "default");
@@ -872,6 +874,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
@@ -884,6 +888,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let chat_a = super::resolve_chat_id(&state, &ctx_a)
@@ -920,6 +926,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
@@ -941,6 +949,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
         let telegram_ctx = SurfaceContext {
             channel: "telegram".to_string(),
@@ -953,6 +963,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         assert_eq!(web_ctx.session_key(), "web:s1:agent:default");
@@ -1004,6 +1016,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let first = super::resolve_chat_id(&state, &ctx).await.expect("first");

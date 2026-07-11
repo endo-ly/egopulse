@@ -70,8 +70,8 @@ mod tool;
 
 pub(crate) use backup::BackupSettings;
 pub(crate) use repositories::{
-    ClaimOutcome, ClaimParams, ConversationStore, ToolExecutionRepository, canonical_tool_input,
-    input_hash,
+    AcceptOutcome, ClaimOutcome, ClaimParams, ConversationStore, ToolExecutionRepository,
+    TurnRepository, TurnRun, canonical_tool_input, input_hash,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -301,6 +301,73 @@ define_enum! {
         Succeeded => "succeeded",
         Failed => "failed",
         Uncertain => "uncertain",
+    }
+}
+
+// Turn実行の永続状態 (`turn_runs.state`)。
+//
+// Phase 2 Package 4: `TurnRepository` が中央遷移ルール
+// (`TurnRunState::can_transition`) を経由してのみ状態を更新する。
+// 自由文字列での更新は禁止し、許可されていない遷移はDB更新前に拒否する。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TurnRunState {
+        Accepted => "accepted",
+        InputCommitted => "input_committed",
+        ModelPending => "model_pending",
+        ModelCompleted => "model_completed",
+        ToolsPending => "tools_pending",
+        ToolsCompleted => "tools_completed",
+        Completed => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        Uncertain => "uncertain",
+    }
+}
+
+impl TurnRunState {
+    /// 永続状態としてこれ以上遷移しない終端状態か。
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Uncertain
+        )
+    }
+
+    /// 許可された状態遷移のみ true を返す中央遷移ルール。
+    ///
+    /// 任意のmoduleから自由文字列で状態を更新することを防ぐため、
+    /// `TurnRepository` はこの関数で遷移を検証してからDB更新する。
+    pub(crate) fn can_transition(from: Self, to: Self) -> bool {
+        use TurnRunState::*;
+        if from == to {
+            return false;
+        }
+        if from.is_terminal() {
+            return false;
+        }
+        match from {
+            Accepted => matches!(to, InputCommitted | Failed | Uncertain | Cancelled),
+            InputCommitted => matches!(to, ModelPending | Failed | Uncertain | Cancelled),
+            ModelPending => {
+                matches!(to, ModelCompleted | Failed | Uncertain | Cancelled)
+            }
+            ModelCompleted => matches!(
+                to,
+                ToolsPending | Completed | ModelPending | Failed | Uncertain | Cancelled
+            ),
+            ToolsPending => {
+                matches!(to, ToolsCompleted | Failed | Uncertain | Cancelled)
+            }
+            ToolsCompleted => {
+                matches!(
+                    to,
+                    ModelPending | Completed | Failed | Uncertain | Cancelled
+                )
+            }
+            // 終端状態は上で弾いているのでここには来ない。
+            Completed | Failed | Cancelled | Uncertain => false,
+        }
     }
 }
 
@@ -679,6 +746,14 @@ impl Database {
     /// the current synchronous write operation.
     pub(crate) fn tool_execution_store(&self) -> ToolExecutionRepository<'_> {
         ToolExecutionRepository::new(self)
+    }
+
+    /// Borrows a [`TurnRepository`] scoped to this database.
+    ///
+    /// The repository borrows `self` for its lifetime, so it must not escape
+    /// the current synchronous write operation.
+    pub(crate) fn turn_run_store(&self) -> TurnRepository<'_> {
+        TurnRepository::new(self)
     }
 
     /// Creates a pool-backed Database without running migrations.

@@ -384,9 +384,64 @@ pub async fn build_app_state_with_path(
     });
     state.warm_up_calibrator().await;
 
+    // Phase 2: recover durable Turn / Tool state left non-terminal by a prior
+    // crash. Running Tools become uncertain (or pending for read-only /
+    // idempotent), and interrupted turn_runs stop safely (Plan §7.6, §2.4).
+    recover_durable_state(&state).await;
+
     spawn_agent_turn_worker(state.clone(), turn_receiver);
 
     Ok(state)
+}
+
+/// Recovers durable Turn / Tool state on startup.
+///
+/// Runs against both the primary and (when present) secret databases:
+/// `running` tool_calls are transitioned by [`ToolExecutionRepository::recover_running`],
+/// and non-terminal `turn_runs` are stopped safely by [`TurnRepository::recover_interrupted`].
+/// Failures are logged but never abort startup so the runtime can still serve
+/// new turns.
+async fn recover_durable_state(state: &AppState) {
+    recover_durable_state_for_db(&state.db, ConversationScope::Normal);
+    if let Some(secret_db) = &state.secret_db {
+        recover_durable_state_for_db(secret_db, ConversationScope::Secret);
+    }
+}
+
+fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
+    match db.as_ref().tool_execution_store().recover_running() {
+        Ok(recovered) if !recovered.is_empty() => {
+            for tool in &recovered {
+                tracing::info!(
+                    scope = %scope,
+                    turn_id = %tool.turn_id,
+                    tool_call_id = %tool.tool_call_id,
+                    tool_name = %tool.tool_name,
+                    from = "running",
+                    to = %tool.recovered_to,
+                    "recovered tool_call on startup"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
+    }
+    match db.as_ref().turn_run_store().recover_interrupted() {
+        Ok(recovered) if !recovered.is_empty() => {
+            for turn in &recovered {
+                tracing::info!(
+                    scope = %scope,
+                    turn_id = %turn.turn_id,
+                    chat_id = turn.chat_id,
+                    from = %turn.from,
+                    to = %turn.recovered_to,
+                    "recovered turn_run on startup"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, scope = %scope, "turn_runs recovery failed"),
+    }
 }
 
 /// Builds the minimal application state needed for manual sleep batch execution.
@@ -1424,9 +1479,15 @@ mod tests {
         // Act
         let result = execute_turn_with_progress(&state, &context, "hello").await;
 
-        // Assert
+        // Assert: Package 4 retries the same model iteration up to
+        // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
+        // single Turn with a single persisted input.
         assert!(result.is_err(), "retryable failure must reach the caller");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "LLM must be called once");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::agent_loop::turn::MAX_LLM_RETRIES,
+            "LLM must be retried up to MAX_LLM_RETRIES within the same iteration"
+        );
         let conn = state.db.get_conn().expect("connection");
         let user_messages: i64 = conn
             .query_row(

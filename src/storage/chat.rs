@@ -250,6 +250,25 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    /// Loads the `content` column of a single message by its id.
+    ///
+    /// Used by the durable Turn path to return the saved final response of a
+    /// `completed` Turn on re-acceptance, without re-invoking the LLM.
+    pub(crate) fn get_message_content(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let content = conn
+            .query_row(
+                "SELECT content FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(content)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -874,6 +874,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         }
     }
 
@@ -1209,6 +1211,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1250,6 +1254,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1331,6 +1337,8 @@ agents:
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1378,6 +1386,8 @@ agents:
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
