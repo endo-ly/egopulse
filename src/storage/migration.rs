@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 11;
+pub(super) const SCHEMA_VERSION: i64 = 12;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -92,6 +92,32 @@ fn set_schema_version_in_tx(
          VALUES(?1, ?2, ?3)",
         params![version, chrono::Utc::now().to_rfc3339(), note],
     )?;
+    Ok(())
+}
+
+/// Adds a column to `table` only when it is not already present.
+///
+/// Migrations must be safe to re-run after a version rollback (the test
+/// suite does this), so every `ALTER TABLE ADD COLUMN` is guarded by a
+/// `pragma_table_info` existence check.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    type_def: &str,
+) -> Result<(), StorageError> {
+    let exists: bool = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        names.iter().any(|name| name == column)
+    };
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {type_def}"
+        ))?
+    }
     Ok(())
 }
 
@@ -701,6 +727,157 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 11;
     }
 
+    if version < 12 {
+        let tx = conn.unchecked_transaction()?;
+
+        // --- chats: integer revision CAS + per-chat message sequence ------
+        add_column_if_missing(&tx, "chats", "revision", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(
+            &tx,
+            "chats",
+            "next_message_seq",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+
+        // --- messages: causal seq, turn ownership, parent linkage -----------
+        add_column_if_missing(&tx, "messages", "seq", "INTEGER")?;
+        add_column_if_missing(&tx, "messages", "turn_id", "TEXT")?;
+        add_column_if_missing(&tx, "messages", "parent_message_id", "TEXT")?;
+
+        // --- sessions: how far the snapshot covers -------------------------
+        add_column_if_missing(
+            &tx,
+            "sessions",
+            "snapshot_through_seq",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        // --- tool_calls: execution ledger columns --------------------------
+        add_column_if_missing(&tx, "tool_calls", "turn_id", "TEXT")?;
+        add_column_if_missing(
+            &tx,
+            "tool_calls",
+            "state",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        )?;
+        add_column_if_missing(&tx, "tool_calls", "input_hash", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "idempotency_class", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "idempotency_key", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "started_at", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "finished_at", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "error_kind", "TEXT")?;
+        add_column_if_missing(&tx, "tool_calls", "error_message", "TEXT")?;
+
+        // --- turn_runs: durable Turn lifecycle -----------------------------
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_runs (
+                turn_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                request_key TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'accepted',
+                    'input_committed',
+                    'model_pending',
+                    'model_completed',
+                    'tools_pending',
+                    'tools_completed',
+                    'completed',
+                    'failed',
+                    'cancelled',
+                    'uncertain'
+                )),
+                current_iteration INTEGER NOT NULL DEFAULT 0,
+                input_message_id TEXT,
+                final_message_id TEXT,
+                config_revision INTEGER NOT NULL DEFAULT 0,
+                config_fingerprint TEXT,
+                model_request_hash TEXT,
+                model_attempt INTEGER NOT NULL DEFAULT 0,
+                output_published INTEGER NOT NULL DEFAULT 0,
+                error_kind TEXT,
+                error_message TEXT,
+                accepted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT,
+                UNIQUE(chat_id, request_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_turn_runs_chat ON turn_runs(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);",
+        )?;
+
+        // --- backfill messages.seq per chat in stable (timestamp, id) order.
+        // Only rows without an assigned seq are touched, so the statement is
+        // safe to re-run after a version rollback.
+        tx.execute_batch(
+            "UPDATE messages
+             SET seq = numbered.new_seq
+             FROM (
+                 SELECT rowid AS source_rowid,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY chat_id
+                            ORDER BY timestamp ASC, id ASC
+                        ) AS new_seq
+                 FROM messages
+             ) AS numbered
+             WHERE messages.rowid = numbered.source_rowid
+               AND messages.seq IS NULL",
+        )?;
+
+        // Causal order uniqueness for assigned seqs. NULL seqs (messages
+        // written by legacy paths until WP2 routes them through the store) are
+        // excluded so they never collide.
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_seq
+                ON messages(chat_id, seq)
+                WHERE seq IS NOT NULL",
+        )?;
+
+        // --- backfill chats.revision / next_message_seq from messages.
+        // revision starts at the message count (each legacy message is one
+        // conversation change); next_message_seq continues after the last seq.
+        tx.execute_batch(
+            "UPDATE chats
+             SET next_message_seq = COALESCE(
+                     (SELECT MAX(seq) + 1 FROM messages WHERE messages.chat_id = chats.chat_id),
+                     1
+                 ),
+                 revision = COALESCE(
+                     (SELECT COUNT(*) FROM messages WHERE messages.chat_id = chats.chat_id),
+                     0
+                 )",
+        )?;
+
+        // --- backfill sessions.snapshot_through_seq from the chat's max seq.
+        tx.execute_batch(
+            "UPDATE sessions
+             SET snapshot_through_seq = COALESCE(
+                 (SELECT MAX(seq) FROM messages WHERE messages.chat_id = sessions.chat_id),
+                 0
+             )",
+        )?;
+
+        // --- backfill tool_calls.state. Existing rows with output are
+        // treated as succeeded; rows without output cannot have their result
+        // verified, so they become uncertain rather than auto-retried.
+        tx.execute_batch(
+            "UPDATE tool_calls
+             SET state = CASE
+                 WHEN tool_output IS NOT NULL THEN 'succeeded'
+                 ELSE 'uncertain'
+             END
+             WHERE state = 'pending'",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            12,
+            "add turn_runs; extend chats/messages/sessions/tool_calls with durable turn + integer seq/revision state",
+        )?;
+        tx.commit()?;
+        version = 12;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -708,7 +885,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 2;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 3;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -814,6 +991,114 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
             "add estimated_tokens and has_tools to llm_usage_logs for calibration rebuild",
         )?;
         version = 2;
+    }
+
+    if version < 3 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Mirror the Phase 2 conversation + turn extensions on the secret DB.
+        // tool_calls is absent from the secret DB (secret mode skips tool
+        // persistence), so only the chat/message/session columns and turn_runs
+        // are added here.
+        add_column_if_missing(&tx, "chats", "revision", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(
+            &tx,
+            "chats",
+            "next_message_seq",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(&tx, "messages", "seq", "INTEGER")?;
+        add_column_if_missing(&tx, "messages", "turn_id", "TEXT")?;
+        add_column_if_missing(&tx, "messages", "parent_message_id", "TEXT")?;
+        add_column_if_missing(
+            &tx,
+            "sessions",
+            "snapshot_through_seq",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_runs (
+                turn_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                request_key TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'accepted',
+                    'input_committed',
+                    'model_pending',
+                    'model_completed',
+                    'tools_pending',
+                    'tools_completed',
+                    'completed',
+                    'failed',
+                    'cancelled',
+                    'uncertain'
+                )),
+                current_iteration INTEGER NOT NULL DEFAULT 0,
+                input_message_id TEXT,
+                final_message_id TEXT,
+                config_revision INTEGER NOT NULL DEFAULT 0,
+                config_fingerprint TEXT,
+                model_request_hash TEXT,
+                model_attempt INTEGER NOT NULL DEFAULT 0,
+                output_published INTEGER NOT NULL DEFAULT 0,
+                error_kind TEXT,
+                error_message TEXT,
+                accepted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT,
+                UNIQUE(chat_id, request_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_turn_runs_chat ON turn_runs(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);",
+        )?;
+
+        tx.execute_batch(
+            "UPDATE messages
+             SET seq = numbered.new_seq
+             FROM (
+                 SELECT rowid AS source_rowid,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY chat_id
+                            ORDER BY timestamp ASC, id ASC
+                        ) AS new_seq
+                 FROM messages
+             ) AS numbered
+             WHERE messages.rowid = numbered.source_rowid
+               AND messages.seq IS NULL",
+        )?;
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_seq
+                ON messages(chat_id, seq)
+                WHERE seq IS NOT NULL",
+        )?;
+        tx.execute_batch(
+            "UPDATE chats
+             SET next_message_seq = COALESCE(
+                     (SELECT MAX(seq) + 1 FROM messages WHERE messages.chat_id = chats.chat_id),
+                     1
+                 ),
+                 revision = COALESCE(
+                     (SELECT COUNT(*) FROM messages WHERE messages.chat_id = chats.chat_id),
+                     0
+                 )",
+        )?;
+        tx.execute_batch(
+            "UPDATE sessions
+             SET snapshot_through_seq = COALESCE(
+                 (SELECT MAX(seq) FROM messages WHERE messages.chat_id = sessions.chat_id),
+                 0
+             )",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            3,
+            "add turn_runs; extend chats/messages/sessions with durable turn + integer seq/revision state",
+        )?;
+        tx.commit()?;
+        version = 3;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
@@ -940,6 +1225,7 @@ mod tests {
             "episode_rollups",
             "sleep_run_steps",
             "sleep_step_checkpoints",
+            "turn_runs",
         ];
         for name in &expected_tables {
             let exists: bool = conn
@@ -2156,5 +2442,406 @@ mod tests {
             [],
         );
         assert!(invalid_run.is_err(), "should reject non-existent run_id");
+    }
+
+    // --- v12: durable turn + integer seq/revision -----------------------------
+
+    fn rollback_schema(db: &super::super::Database, to_version: i64, label: &str) {
+        let conn = db.get_conn().expect("conn");
+        conn.execute(
+            "UPDATE db_meta SET value = ?1 WHERE key = 'schema_version'",
+            [to_version.to_string()],
+        )
+        .unwrap_or_else(|e| panic!("rollback {label}: {e}"));
+        super::run_migrations(&conn).expect("re-run migrations");
+    }
+
+    #[test]
+    fn migration_v12_backfills_message_seq_in_timestamp_id_order() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-seq", None, "private", "default")
+            .expect("chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            // Insert out of id/timestamp order to confirm stable (timestamp, id) sorting.
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('m-b', ?1, 'a', 'second', 'assistant', '2024-01-01T00:00:01Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert b");
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('m-a', ?1, 'a', 'first', 'user', '2024-01-01T00:00:00Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert a");
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('m-c', ?1, 'a', 'third', 'assistant', '2024-01-01T00:00:02Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert c");
+        }
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert
+        let conn = db.get_conn().expect("conn");
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT id, seq FROM messages WHERE chat_id = ?1 ORDER BY seq")
+            .expect("prepare")
+            .query_map(rusqlite::params![chat], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![
+                ("m-a".to_string(), 1),
+                ("m-b".to_string(), 2),
+                ("m-c".to_string(), 3)
+            ],
+            "seq must follow (timestamp, id) order"
+        );
+    }
+
+    #[test]
+    fn migration_v12_assigns_deterministic_seq_for_same_timestamp() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-same-ts", None, "private", "default")
+            .expect("chat");
+        let timestamp = "2024-01-01T00:00:00Z";
+        {
+            let conn = db.get_conn().expect("conn");
+            for (id, content) in [("z-id", "z"), ("a-id", "a"), ("m-id", "m")] {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
+                    rusqlite::params![id, chat, content, timestamp],
+                )
+                .expect("insert");
+            }
+        }
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert: identical timestamps resolve by id ascending.
+        let conn = db.get_conn().expect("conn");
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT id, seq FROM messages WHERE chat_id = ?1 ORDER BY seq")
+            .expect("prepare")
+            .query_map(rusqlite::params![chat], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![
+                ("a-id".to_string(), 1),
+                ("m-id".to_string(), 2),
+                ("z-id".to_string(), 3)
+            ],
+        );
+    }
+
+    #[test]
+    fn migration_v12_backfills_chats_revision_and_next_message_seq() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat_with_msgs = db
+            .resolve_or_create_chat_id("cli", "cli:v12-chats", None, "private", "default")
+            .expect("chat");
+        let empty_chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-empty", None, "private", "default")
+            .expect("empty chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
+                    rusqlite::params![
+                        format!("m-{i}"),
+                        chat_with_msgs,
+                        format!("c{i}"),
+                        format!("2024-01-01T00:00:0{i}Z")
+                    ],
+                )
+                .expect("insert");
+            }
+        }
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert
+        let conn = db.get_conn().expect("conn");
+        let (revision, next_seq): (i64, i64) = conn
+            .query_row(
+                "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
+                rusqlite::params![chat_with_msgs],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(revision, 3, "revision = message count");
+        assert_eq!(next_seq, 4, "next_message_seq = max seq + 1");
+
+        let (revision, next_seq): (i64, i64) = conn
+            .query_row(
+                "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
+                rusqlite::params![empty_chat],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(revision, 0, "empty chat has 0 changes");
+        assert_eq!(next_seq, 1, "empty chat starts at seq 1");
+    }
+
+    #[test]
+    fn migration_v12_backfills_sessions_snapshot_through_seq() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-sess", None, "private", "default")
+            .expect("chat");
+        let llm_context = r#"[{"role":"user","content":"hi"}]"#;
+        db.save_session(chat, llm_context).expect("session");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('m-1', ?1, 'a', 'hi', 'user', '2024-01-01T00:00:00Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert");
+        }
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert
+        let conn = db.get_conn().expect("conn");
+        let (snapshot_through, json): (i64, String) = conn
+            .query_row(
+                "SELECT snapshot_through_seq, messages_json FROM sessions WHERE chat_id = ?1",
+                rusqlite::params![chat],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(snapshot_through, 1, "snapshot covers the legacy message");
+        assert_eq!(json, llm_context, "LLM context must be preserved verbatim");
+    }
+
+    #[test]
+    fn migration_v12_backfills_tool_calls_state_from_output_presence() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-tools", None, "private", "default")
+            .expect("chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+                 VALUES ('tc-done', ?1, 'm-1', 'shell', '{}', '{\"ok\":true}', '2024-01-01T00:00:00Z')",
+                rusqlite::params![chat],
+            )
+            .expect("insert done");
+            conn.execute(
+                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+                 VALUES ('tc-pending', ?1, 'm-2', 'shell', '{}', NULL, '2024-01-01T00:00:01Z')",
+                rusqlite::params![chat],
+            )
+            .expect("insert pending");
+        }
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert
+        let conn = db.get_conn().expect("conn");
+        let done: String = conn
+            .query_row(
+                "SELECT state FROM tool_calls WHERE id = 'tc-done'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        let pending: String = conn
+            .query_row(
+                "SELECT state FROM tool_calls WHERE id = 'tc-pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(done, "succeeded", "output present => succeeded");
+        assert_eq!(
+            pending, "uncertain",
+            "no output => uncertain, never auto-retried"
+        );
+    }
+
+    #[test]
+    fn migration_v12_is_idempotent_on_rerun() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-idem", None, "private", "default")
+            .expect("chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('m-1', ?1, 'a', 'only', 'user', '2024-01-01T00:00:00Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert");
+        }
+
+        // Act: roll back and re-run the v12 block twice.
+        rollback_schema(&db, 11, "v12 first");
+        rollback_schema(&db, 11, "v12 second");
+
+        // Assert: no duplicated seq, no duplicate turn_runs, schema version is current.
+        let conn = db.get_conn().expect("conn");
+        let seqs: Vec<i64> = conn
+            .prepare("SELECT seq FROM messages WHERE chat_id = ?1 ORDER BY seq")
+            .expect("prepare")
+            .query_map(rusqlite::params![chat], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(seqs, vec![1], "no duplicate events");
+        let turn_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turn_runs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(turn_count, 0, "backfill creates no turns");
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version");
+        assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v12_preserves_web_history_order_and_content() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-preserve", None, "private", "default")
+            .expect("chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            for (id, content, ts) in [
+                ("m-1", "hello", "2024-01-01T00:00:00Z"),
+                ("m-2", "world", "2024-01-01T00:00:01Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
+                    rusqlite::params![id, chat, content, ts],
+                )
+                .expect("insert");
+            }
+        }
+        let before = db.get_all_messages(chat).expect("messages before");
+
+        // Act
+        rollback_schema(&db, 11, "v12");
+
+        // Assert: messages table content/order unchanged (only seq added).
+        let after = db.get_all_messages(chat).expect("messages after");
+        assert_eq!(
+            before
+                .iter()
+                .map(|m| (&m.id, &m.content))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|m| (&m.id, &m.content))
+                .collect::<Vec<_>>(),
+            "web history must be unchanged by migration"
+        );
+    }
+
+    #[test]
+    fn secret_migration_v3_backfills_conversation_extensions() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("secret.db");
+        let db = super::super::Database::new_secret(&db_path).expect("secret db");
+        let chat = db
+            .resolve_or_create_chat_id("discord", "discord:9:agent:x", None, "private", "x")
+            .expect("chat");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                 VALUES ('s-1', ?1, 'u', 'secret hello', 'user', '2024-01-01T00:00:00Z', 'message')",
+                rusqlite::params![chat],
+            )
+            .expect("insert");
+            conn.execute(
+                "UPDATE db_meta SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("rollback to v2");
+            super::run_secret_migrations(&conn).expect("re-run secret migrations");
+        }
+
+        // Assert
+        let conn = db.get_conn().expect("conn");
+        let seq: i64 = conn
+            .query_row("SELECT seq FROM messages WHERE id = 's-1'", [], |row| {
+                row.get(0)
+            })
+            .expect("seq");
+        assert_eq!(seq, 1);
+        let (revision, next_seq): (i64, i64) = conn
+            .query_row(
+                "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
+                rusqlite::params![chat],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("chats");
+        assert_eq!(revision, 1);
+        assert_eq!(next_seq, 2);
+        // turn_runs exists on secret DB too so secret conversations get the same lifecycle.
+        let turn_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("turn_runs presence");
+        assert_eq!(turn_table, 1);
     }
 }

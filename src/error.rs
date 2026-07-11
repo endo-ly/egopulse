@@ -301,6 +301,9 @@ pub enum StorageError {
         found: i64,
         supported: i64,
     },
+    /// migration 前の DB backup に失敗した。schema 変更は開始しない。
+    #[error("storage_migration_backup_failed: {detail}")]
+    MigrationBackupFailed { detail: String },
 }
 
 /// Channel (Web / Discord / Telegram) operational errors.

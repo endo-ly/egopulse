@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn database_new_with_backup_continues_when_startup_backup_fails() {
+    fn database_new_with_backup_aborts_when_startup_backup_fails() {
         // Arrange: existing DB, but dest_dir is a regular file (unwritable as dir)
         let src = tempfile::tempdir().expect("src");
         let db_path = src.path().join("runtime").join("egopulse.db");
@@ -763,9 +763,19 @@ mod tests {
         let settings = backup_settings(bogus_dest.clone());
 
         // Act
-        let db = Database::new_with_backup(&db_path, &settings);
+        let result = Database::new_with_backup(&db_path, &settings);
 
-        // Assert: open succeeds even though backup could not write
-        assert!(db.is_ok(), "startup should succeed despite backup failure");
+        // Assert: Phase 2 requires startup to abort when the pre-migration backup
+        // fails, so an irreversible schema change never runs without a safety net.
+        match result {
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    crate::error::StorageError::MigrationBackupFailed { .. }
+                ),
+                "expected MigrationBackupFailed, got {error}"
+            ),
+            Ok(_db) => panic!("startup must abort on backup failure, not succeed"),
+        }
     }
 }

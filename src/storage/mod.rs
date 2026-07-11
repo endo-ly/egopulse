@@ -583,8 +583,17 @@ impl Database {
     ) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
         if db_path.exists() && settings.enabled {
+            // Phase 2: a failed pre-migration backup must abort startup before
+            // any irreversible schema change touches the existing database.
+            // Continuing without the safety net would risk unrecoverable data
+            // loss on a bad migration.
             if let Err(error) = backup::run_startup_backup(db_path, settings) {
-                tracing::warn!(%error, "startup backup failed; continuing");
+                return Err(StorageError::MigrationBackupFailed {
+                    detail: format!(
+                        "pre-migration backup for {} failed: {error}",
+                        db_path.display()
+                    ),
+                });
             }
         }
         initialize_database_file(db_path)?;
