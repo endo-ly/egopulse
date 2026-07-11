@@ -441,6 +441,30 @@ fn build_app_state_dependencies(
         &config.db_path(),
         &backup_settings,
     )?);
+
+    // Phase 2 Package 3: recover Tool executions interrupted by a crash before
+    // any new Turn claims a slot. A `running` row means the process died
+    // mid-execution; its result cannot be verified, so it is moved to
+    // `uncertain` (or `pending` for read-only / idempotent Tools that are safe
+    // to retry on the next claim).
+    let recovered = db.tool_execution_store().recover_running()?;
+    if !recovered.is_empty() {
+        tracing::warn!(
+            recovered_count = recovered.len(),
+            "recovering interrupted tool executions"
+        );
+        for tool in &recovered {
+            tracing::warn!(
+                turn_id = %tool.turn_id,
+                tool_call_id = %tool.tool_call_id,
+                tool_name = %tool.tool_name,
+                recovered_to = %tool.recovered_to,
+                idempotency_class = %tool.idempotency_class,
+                "recovered interrupted tool call"
+            );
+        }
+    }
+
     let secret_db = if config.needs_secret_db() {
         Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
     } else {

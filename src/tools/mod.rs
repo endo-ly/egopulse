@@ -62,6 +62,10 @@ pub(crate) struct ToolExecutionContext {
     pub chain_depth: usize,
     /// Origin ID: UUID tracking all turns caused by a single human input.
     pub origin_id: String,
+    /// Turn ID: UUID identifying the current Turn. Anchors Tool execution
+    /// ledger rows (`tool_calls.turn_id`) so a crash recovery can attribute a
+    /// Tool call to the Turn that claimed it.
+    pub turn_id: String,
     /// Sender half of the pending-agent-turn channel.
     /// Tools like `agent_send` use this to enqueue turns for target agents.
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
@@ -165,6 +169,31 @@ pub(crate) trait Tool: Send + Sync {
     /// appear in a single LLM response. Default is `false`.
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// Re-execution safety classification for the Tool execution ledger.
+    ///
+    /// Read-only tools never mutate external state and are safe to retry after
+    /// a crash. Non-idempotent tools (the default) may duplicate side effects
+    /// and are never auto-retried. Idempotent tools deduplicate on a stable
+    /// `idempotency_key` returned alongside the classification.
+    ///
+    /// The default derives from [`Tool::is_read_only`] so the explicit
+    /// read-only declaration is the single source of truth; tools that need
+    /// the `Idempotent` classification override this method directly.
+    fn idempotency_class(&self) -> crate::storage::IdempotencyClass {
+        if self.is_read_only() {
+            crate::storage::IdempotencyClass::ReadOnly
+        } else {
+            crate::storage::IdempotencyClass::NonIdempotent
+        }
+    }
+
+    /// Stable deduplication key for idempotent tools. `None` for read-only and
+    /// non-idempotent tools, and by default for idempotent tools that do not
+    /// derive a key from their input.
+    fn idempotency_key(&self, _input: &serde_json::Value) -> Option<String> {
+        None
     }
 }
 
@@ -312,6 +341,38 @@ impl ToolRegistry {
             }
         }
         false
+    }
+
+    /// Resolves the idempotency classification for a named tool. Built-in tools
+    /// derive it from their `is_read_only` declaration; MCP tools derive it from
+    /// the manager's read-only flag; unknown tools default to `NonIdempotent`.
+    pub(crate) async fn idempotency_class(&self, name: &str) -> crate::storage::IdempotencyClass {
+        if let Some(&idx) = self.tool_index.get(name) {
+            return self.tools[idx].idempotency_class();
+        }
+        if name.starts_with("mcp_") {
+            if let Some(mcp_manager) = &self.mcp_manager {
+                let guard = mcp_manager.read().await;
+                return if guard.is_tool_read_only(name) {
+                    crate::storage::IdempotencyClass::ReadOnly
+                } else {
+                    crate::storage::IdempotencyClass::NonIdempotent
+                };
+            }
+        }
+        crate::storage::IdempotencyClass::NonIdempotent
+    }
+
+    /// Resolves the idempotency key for a named tool and its input.
+    pub(crate) async fn idempotency_key(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
+        if let Some(&idx) = self.tool_index.get(name) {
+            return self.tools[idx].idempotency_key(input);
+        }
+        None
     }
 }
 

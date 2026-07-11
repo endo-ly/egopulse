@@ -869,6 +869,16 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
              WHERE state = 'pending'",
         )?;
 
+        // Causal identity for the Tool execution ledger: a Tool call is unique
+        // within its Turn so `claim` can detect a re-claim of the same
+        // (turn_id, tool_call_id) and reuse or block on the stored state.
+        // Legacy rows with NULL turn_id are excluded (NULL ≠ NULL in SQLite).
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_turn_id
+                ON tool_calls(turn_id, id)
+                WHERE turn_id IS NOT NULL",
+        )?;
+
         set_schema_version_in_tx(
             &tx,
             12,

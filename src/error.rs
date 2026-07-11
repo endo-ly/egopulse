@@ -293,6 +293,16 @@ pub enum StorageError {
     NotFound(String),
     #[error("storage_conflict: {0}")]
     Conflict(String),
+    /// 同一 `turn_id + tool_call_id` で異なる input hash で claim された。
+    /// 実行前に拒否し、結果を推測しない。
+    #[error(
+        "storage_tool_input_conflict: tool_call_id={tool_call_id} stored_hash={stored_hash} requested_hash={requested_hash}"
+    )]
+    ToolInputConflict {
+        tool_call_id: String,
+        stored_hash: String,
+        requested_hash: String,
+    },
     #[error(
         "storage_unsupported_schema_version: database={database} found={found} supported={supported}"
     )]

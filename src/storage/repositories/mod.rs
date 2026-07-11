@@ -4,5 +4,9 @@
 //! and centralizes every persistence path for its table group.
 
 mod conversation_store;
+mod tool_execution_store;
 
 pub(crate) use conversation_store::ConversationStore;
+pub(crate) use tool_execution_store::{
+    ClaimOutcome, ClaimParams, ToolExecutionRepository, canonical_tool_input, input_hash,
+};

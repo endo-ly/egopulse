@@ -17,6 +17,7 @@ use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::runtime::AppState;
 use crate::storage::call_blocking;
+use crate::storage::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
 use crate::tools::{ToolExecutionContext, ToolResult};
 
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -47,7 +48,6 @@ pub(crate) struct ExecutedToolCall {
     pub(crate) payload: String,
     pub(crate) message: Message,
     pub(crate) duration_ms: u128,
-    pub(crate) timestamp: String,
 }
 
 pub(crate) struct AssistantToolPhase {
@@ -281,6 +281,7 @@ pub(crate) fn log_llm_usage(
 pub(crate) async fn execute_tool_calls<'a>(
     state: &AppState,
     tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
     hooks: ToolExecutionHooks<'a>,
 ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
@@ -301,7 +302,15 @@ pub(crate) async fn execute_tool_calls<'a>(
             let block_futures = valid_tool_calls[block_start..cursor]
                 .iter()
                 .cloned()
-                .map(|tool_call| execute_single_tool(state, tool_context, tool_call, hooks.clone()))
+                .map(|tool_call| {
+                    execute_single_tool(
+                        state,
+                        tool_context,
+                        assistant_message_id,
+                        tool_call,
+                        hooks.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let block_results = join_all(block_futures).await;
             for result in block_results {
@@ -312,6 +321,7 @@ pub(crate) async fn execute_tool_calls<'a>(
                 execute_single_tool(
                     state,
                     tool_context,
+                    assistant_message_id,
                     valid_tool_calls[cursor].clone(),
                     hooks.clone(),
                 )
@@ -335,6 +345,7 @@ async fn read_only_flags(state: &AppState, valid_tool_calls: &[ToolCall]) -> Vec
 async fn execute_single_tool(
     state: &AppState,
     tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
     tool_call: ToolCall,
     hooks: ToolExecutionHooks<'_>,
 ) -> Result<ExecutedToolCall, EgoPulseError> {
@@ -343,18 +354,54 @@ async fn execute_single_tool(
     }
 
     let tool_start = std::time::Instant::now();
-    let result = state
-        .tools
-        .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
-        .await;
-    let duration_ms = tool_start.elapsed().as_millis();
-    let payload = format_tool_result(&tool_call, &result);
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let is_read_only = state.tools.is_read_only(&tool_call.name).await;
 
-    crate::runtime::metrics::inc_tool_calls_total(
-        &tool_call.name,
-        if result.is_error { "error" } else { "ok" },
-    );
+    // Claim the ledger slot before executing so a Tool call is never run
+    // before its durable row exists. Secret-scope conversations have no
+    // `tool_calls` table and skip the ledger entirely. Read-only Tools also
+    // skip the ledger because they have no side effects and may be safely
+    // retried after a crash; this avoids SQLite write contention during
+    // parallel execution.
+    let claim = if tool_context.scope == ConversationScope::Secret || is_read_only {
+        ClaimOutcome::Acquired
+    } else {
+        claim_tool_slot(state, tool_context, assistant_message_id, &tool_call).await?
+    };
+
+    let (result, payload, executed) = match claim {
+        ClaimOutcome::Acquired => {
+            let result = state
+                .tools
+                .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
+                .await;
+            let payload = format_tool_result(&tool_call, &result);
+            if tool_context.scope != ConversationScope::Secret && !is_read_only {
+                record_tool_outcome(state, tool_context, &tool_call, &result, &payload).await?;
+            }
+            (result, payload, true)
+        }
+        ClaimOutcome::Reused { tool_output } => {
+            // A prior execution already succeeded; return the stored output
+            // without re-running the Tool.
+            let result = ToolResult::success(tool_output.clone());
+            (result, tool_output, false)
+        }
+        ClaimOutcome::Blocked { state: tool_state } => {
+            // The ledger forbids execution (failed / uncertain / in flight).
+            let result = ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
+            let payload = format_tool_result(&tool_call, &result);
+            (result, payload, false)
+        }
+    };
+
+    let duration_ms = tool_start.elapsed().as_millis();
+
+    if executed {
+        crate::runtime::metrics::inc_tool_calls_total(
+            &tool_call.name,
+            if result.is_error { "error" } else { "ok" },
+        );
+    }
 
     let message = Message {
         role: "tool".to_string(),
@@ -370,7 +417,6 @@ async fn execute_single_tool(
         payload,
         message,
         duration_ms,
-        timestamp,
     };
 
     if let Some(on_result) = &hooks.on_result {
@@ -378,6 +424,82 @@ async fn execute_single_tool(
     }
 
     Ok(outcome)
+}
+
+/// Claims a Tool execution slot in the `tool_calls` ledger.
+///
+/// The canonical input and its hash are computed before any DB write so the
+/// retry identity is fixed at claim time. Idempotency classification comes
+/// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
+async fn claim_tool_slot(
+    state: &AppState,
+    tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
+    tool_call: &ToolCall,
+) -> Result<ClaimOutcome, EgoPulseError> {
+    let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
+    let hash = input_hash(&canonical);
+    let class = state.tools.idempotency_class(&tool_call.name).await;
+    let key = state
+        .tools
+        .idempotency_key(&tool_call.name, &tool_call.arguments)
+        .await;
+    let turn_id = tool_context.turn_id.clone();
+    let chat_id = tool_context.chat_id;
+    let message_id = assistant_message_id.to_string();
+    let tool_call_id = tool_call.id.clone();
+    let tool_name = tool_call.name.clone();
+    let canonical_for_closure = canonical.clone();
+    let hash_for_closure = hash.clone();
+    let key_for_closure = key;
+    Ok(call_blocking(Arc::clone(&state.db), move |db| {
+        db.tool_execution_store().claim(ClaimParams {
+            turn_id: &turn_id,
+            chat_id,
+            message_id: &message_id,
+            tool_call_id: &tool_call_id,
+            tool_name: &tool_name,
+            canonical_input: &canonical_for_closure,
+            input_hash: &hash_for_closure,
+            idempotency_class: class,
+            idempotency_key: key_for_closure.as_deref(),
+        })
+    })
+    .await?)
+}
+
+/// Records the Tool execution outcome (success or failure) in the ledger.
+///
+/// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
+/// so no secret reaches the persisted `tool_output` / `error_message`.
+async fn record_tool_outcome(
+    state: &AppState,
+    tool_context: &ToolExecutionContext,
+    tool_call: &ToolCall,
+    result: &ToolResult,
+    payload: &str,
+) -> Result<(), EgoPulseError> {
+    let turn_id = tool_context.turn_id.clone();
+    let tool_call_id = tool_call.id.clone();
+    if result.is_error {
+        let error_message = result.content.clone();
+        Ok(call_blocking(Arc::clone(&state.db), move |db| {
+            db.tool_execution_store().record_failure(
+                &turn_id,
+                &tool_call_id,
+                "tool_error",
+                &error_message,
+            )
+        })
+        .await?)
+    } else {
+        let payload = payload.to_string();
+        Ok(call_blocking(Arc::clone(&state.db), move |db| {
+            db.tool_execution_store()
+                .record_success(&turn_id, &tool_call_id, &payload)
+        })
+        .await?)
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +606,6 @@ mod tests {
                 tool_call_id: Some("call-1".to_string()),
             },
             duration_ms: 1,
-            timestamp: "2026-05-31T00:00:00Z".to_string(),
         };
         let second = ExecutedToolCall {
             tool_call: tool_call("call-2", "grep", json!({"pattern": "beta"})),
@@ -500,7 +621,6 @@ mod tests {
                 tool_call_id: Some("call-2".to_string()),
             },
             duration_ms: 2,
-            timestamp: "2026-05-31T00:00:01Z".to_string(),
         };
 
         // Act
@@ -590,8 +710,7 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+        assert_eq!(tool_calls.len(), 0, "read-only tools skip the ledger");
     }
 
     #[tokio::test]
@@ -657,8 +776,9 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+        assert_eq!(tool_calls.len(), 1, "only non-idempotent/bash is persisted");
+        assert_eq!(tool_calls[0].tool_name, "bash");
+        assert!(tool_calls[0].tool_output.is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -1074,12 +1194,13 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 4);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
-        assert_eq!(tool_calls[0].tool_name, "read");
-        assert_eq!(tool_calls[1].tool_name, "read");
-        assert_eq!(tool_calls[2].tool_name, "bash");
-        assert_eq!(tool_calls[3].tool_name, "read");
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "only bash is persisted; read-only tools skip the ledger"
+        );
+        assert_eq!(tool_calls[0].tool_name, "bash");
+        assert!(tool_calls[0].tool_output.is_some());
     }
 
     #[tokio::test]

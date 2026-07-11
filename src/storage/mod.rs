@@ -69,7 +69,10 @@ mod sleep;
 mod tool;
 
 pub(crate) use backup::BackupSettings;
-pub(crate) use repositories::ConversationStore;
+pub(crate) use repositories::{
+    ClaimOutcome, ClaimParams, ConversationStore, ToolExecutionRepository, canonical_tool_input,
+    input_hash,
+};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -259,7 +262,6 @@ pub(crate) struct AgentSessionInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCall {
     pub id: String,
-    pub chat_id: i64,
     pub message_id: String,
     pub tool_name: String,
     pub tool_input: String,
@@ -284,6 +286,35 @@ define_enum! {
         Assistant => "assistant",
         System => "system",
         Tool => "tool",
+    }
+}
+
+// Tool実行台帳 (`tool_calls.state`) の状態。
+//
+// Phase 2 Package 3: `ToolExecutionRepository` がこの enum と中央遷移ルール
+// を経由してのみ状態を更新する。自由文字列での更新は禁止。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ToolState {
+        Pending => "pending",
+        Running => "running",
+        Succeeded => "succeeded",
+        Failed => "failed",
+        Uncertain => "uncertain",
+    }
+}
+
+// Tool再実行可能性の分類 (`tool_calls.idempotency_class`)。
+//
+// `read_only` は外部状態を変更しない。`idempotent` は同じ idempotency key
+// で重複排除できる。`non_idempotent` は再実行で副作用が重複し得る。
+// 未指定Toolは `non_idempotent` として扱い、名称から推測しない。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum IdempotencyClass {
+        ReadOnly => "read_only",
+        Idempotent => "idempotent",
+        NonIdempotent => "non_idempotent",
     }
 }
 
@@ -640,6 +671,14 @@ impl Database {
     /// the current synchronous write operation.
     pub(crate) fn conversation_store(&self) -> ConversationStore<'_> {
         ConversationStore::new(self)
+    }
+
+    /// Borrows a [`ToolExecutionRepository`] scoped to this database.
+    ///
+    /// The repository borrows `self` for its lifetime, so it must not escape
+    /// the current synchronous write operation.
+    pub(crate) fn tool_execution_store(&self) -> ToolExecutionRepository<'_> {
+        ToolExecutionRepository::new(self)
     }
 
     /// Creates a pool-backed Database without running migrations.

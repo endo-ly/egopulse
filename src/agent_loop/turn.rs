@@ -23,7 +23,7 @@ use crate::channels::utils::text::truncate_by_chars;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
 use crate::runtime::{AppState, build_app_state};
-use crate::storage::{StoredMessage, ToolCall as StoredToolCall, call_blocking};
+use crate::storage::{StoredMessage, call_blocking};
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
@@ -319,6 +319,7 @@ impl TurnExecutor<'_> {
             channel_log_chat_id: self.context.channel_log_chat_id,
             chain_depth: self.context.chain_depth,
             origin_id: self.context.origin_id.clone(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
             turn_sender: self.state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             scope: self.context.scope,
@@ -778,17 +779,6 @@ async fn execute_tool_calls(
         return Ok(Vec::new());
     }
 
-    for tool_call in &valid_tool_calls {
-        store_pending_tool_call(
-            state,
-            tool_context.scope,
-            tool_context.chat_id,
-            assistant_message_id,
-            tool_call,
-        )
-        .await?;
-    }
-
     let start_emitter = on_event.clone();
     let result_emitter = on_event.clone();
     let hooks = ToolExecutionHooks {
@@ -813,69 +803,13 @@ async fn execute_tool_calls(
     let outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
         state,
         tool_context,
+        assistant_message_id,
         valid_tool_calls,
         hooks,
     )
     .await?;
 
-    for outcome in &outcomes {
-        update_tool_call_output(
-            state,
-            tool_context.scope,
-            tool_context.chat_id,
-            assistant_message_id,
-            &outcome.tool_call.id,
-            &outcome.payload,
-        )
-        .await?;
-    }
-
     Ok(outcomes)
-}
-
-async fn store_pending_tool_call(
-    state: &AppState,
-    scope: ConversationScope,
-    chat_id: i64,
-    message_id: &str,
-    tool_call: &ToolCall,
-) -> Result<(), EgoPulseError> {
-    if scope == ConversationScope::Secret {
-        return Ok(());
-    }
-    let record = StoredToolCall {
-        id: tool_call.id.clone(),
-        chat_id,
-        message_id: message_id.to_string(),
-        tool_name: tool_call.name.clone(),
-        tool_input: tool_call.arguments.to_string(),
-        tool_output: None,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
-        .await
-        .map_err(EgoPulseError::from)
-}
-
-async fn update_tool_call_output(
-    state: &AppState,
-    scope: ConversationScope,
-    chat_id: i64,
-    message_id: &str,
-    tool_call_id: &str,
-    output: &str,
-) -> Result<(), EgoPulseError> {
-    if scope == ConversationScope::Secret {
-        return Ok(());
-    }
-    let message_id = message_id.to_string();
-    let tool_call_id = tool_call_id.to_string();
-    let output = output.to_string();
-    call_blocking(Arc::clone(&state.db), move |db| {
-        db.update_tool_call_output_for_message(chat_id, &message_id, &tool_call_id, &output)
-    })
-    .await
-    .map_err(EgoPulseError::from)
 }
 
 async fn persist_user_turn_with_compaction(
@@ -1330,7 +1264,7 @@ mod tests {
             .expect("process turn");
         assert_eq!(reply, "All set");
 
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:tool-flow:agent:default",
@@ -1341,25 +1275,6 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].tool_name, "read");
-        let tool_output = tool_calls[0].tool_output.as_deref().expect("tool output");
-        let payload: serde_json::Value =
-            serde_json::from_str(tool_output).expect("tool output json");
-        assert_eq!(payload["status"], "success");
-        assert_eq!(payload["tool"], "read");
-        assert!(
-            payload["result"]
-                .as_str()
-                .expect("tool result string")
-                .contains("hello from tool")
-        );
-
         let seen_messages = provider.seen_messages();
         assert_eq!(seen_messages.len(), 2);
         assert_eq!(
@@ -1435,7 +1350,7 @@ mod tests {
         let seen_messages = provider.seen_messages();
         assert_eq!(seen_messages.len(), 2);
 
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:tool-once:agent:default",
@@ -1446,13 +1361,6 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].tool_name, "read");
     }
 
     #[tokio::test]
@@ -1563,7 +1471,7 @@ mod tests {
 
         assert_eq!(first, "First done.");
         assert_eq!(second, "Second done.");
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:repeated-tool-call-id:agent:default",
@@ -1574,14 +1482,6 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|call| call.id == "call-repeat"));
-        assert!(tool_calls.iter().all(|call| call.tool_output.is_some()));
     }
 
     #[tokio::test]
@@ -1631,7 +1531,7 @@ mod tests {
             .expect("process turn");
 
         assert_eq!(reply, "Done.");
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:duplicate-tool-call-id:agent:default",
@@ -1642,16 +1542,6 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call-duplicate");
-        assert!(tool_calls[0].tool_input.contains(&relative_path));
-        assert!(tool_calls[0].tool_output.is_some());
-
         let seen_messages = provider.seen_messages();
         assert_eq!(seen_messages.len(), 2);
         assert_eq!(seen_messages[1][1].role, "assistant");
