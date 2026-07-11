@@ -251,27 +251,6 @@ impl AppState {
         observations.reverse();
     }
 
-    /// Resolves the database and archive root for the given conversation scope.
-    ///
-    /// Kept on `AppState` so test builders and channel-side compaction callers
-    /// can reach it without constructing a [`TurnRuntime`].
-    #[allow(dead_code)]
-    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
-        match scope {
-            ConversationScope::Normal => ScopedStorage {
-                db: &self.db,
-                archive_root: self.config.groups_dir(),
-            },
-            ConversationScope::Secret => ScopedStorage {
-                db: self
-                    .secret_db
-                    .as_ref()
-                    .expect("secret db required but not initialized"),
-                archive_root: self.config.runtime_dir().join("secret_groups"),
-            },
-        }
-    }
-
     /// 現在の設定スナップショットを返す。
     pub fn current_config(&self) -> Arc<Config> {
         Arc::new(self.config.clone())
@@ -1801,50 +1780,6 @@ mod tests {
         let _ = state.db_for(ConversationScope::Secret);
     }
 
-    #[test]
-    fn storage_for_returns_archive_root_for_conversation_scope() {
-        // Arrange: create AppState with both normal and secret DBs
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_sleep_state(&dir);
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
-        state.secret_db = Some(Arc::clone(&secret_db));
-
-        // Act
-        let normal = state.storage_for(ConversationScope::Normal);
-        let secret = state.storage_for(ConversationScope::Secret);
-
-        // Assert: db pointer equality
-        assert!(
-            Arc::ptr_eq(normal.db, &state.db),
-            "Normal scope must resolve to the primary database"
-        );
-        assert!(
-            Arc::ptr_eq(secret.db, &secret_db),
-            "Secret scope must resolve to the isolated secret database"
-        );
-        assert!(
-            !Arc::ptr_eq(normal.db, secret.db),
-            "Normal and Secret scopes must resolve to different databases"
-        );
-
-        // Assert: archive root paths
-        assert!(
-            normal.archive_root.ends_with("groups"),
-            "Normal archive root must end with 'groups', got: {:?}",
-            normal.archive_root
-        );
-        assert!(
-            secret.archive_root.ends_with("secret_groups"),
-            "Secret archive root must end with 'secret_groups', got: {:?}",
-            secret.archive_root
-        );
-        assert_ne!(
-            normal.archive_root, secret.archive_root,
-            "Normal and Secret archive roots must differ"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
@@ -1915,50 +1850,5 @@ mod tests {
             !normal_has_reply,
             "normal DB should not contain the secret bot response"
         );
-    }
-
-    #[test]
-    fn normal_scope_does_not_require_secret_db() {
-        // Arrange: AppState with secret_db = None (no secret channels configured)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        assert!(
-            state.secret_db.is_none(),
-            "test precondition: secret_db is None"
-        );
-
-        // Act: call db_for and storage_for with Normal scope
-        let db = state.db_for(ConversationScope::Normal);
-        let storage = state.storage_for(ConversationScope::Normal);
-
-        // Assert: both succeed and resolve to the normal db and archive root
-        assert!(
-            Arc::ptr_eq(db, &state.db),
-            "db_for(Normal) must return the primary database"
-        );
-        assert!(
-            Arc::ptr_eq(storage.db, &state.db),
-            "storage_for(Normal) must return the primary database"
-        );
-        assert!(
-            storage.archive_root.ends_with("groups"),
-            "storage_for(Normal) archive root must end with 'groups', got: {:?}",
-            storage.archive_root
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "secret db required")]
-    fn secret_scope_requires_secret_database() {
-        // Arrange: AppState without secret_db
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        assert!(
-            state.secret_db.is_none(),
-            "test precondition: secret_db is None"
-        );
-
-        // Act + Assert: storage_for(Secret) must panic
-        let _ = state.storage_for(ConversationScope::Secret);
     }
 }

@@ -165,6 +165,7 @@ src/
 pub struct AppState {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,  // None = 秘密モード無効
+    pub(crate) config_manager: Arc<ConfigManager>,  // immutable snapshot
     pub(crate) config: Config,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
@@ -193,11 +194,24 @@ impl AppState {
             ConversationScope::Normal => &self.db,
         }
     }
-
-    /// スコープに応じたストレージ参照（DB + archive root）を返す
-    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage { /* ... */ }
 }
 ```
+
+### TurnRuntime
+
+Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnRuntime` を経由する。`TurnRuntime` は狭い repository 境界を通じて Turn の受付・状態遷移・model/tool loop・復旧判断を担う。
+
+```text
+TurnRuntime
+├── ConfigManager          — immutable Config snapshot（revision / fingerprint）
+├── ConversationStore      — chats / messages / sessions の原子的更新（revision CAS）
+├── TurnRepository         — turn_runs の作成・重複受付防止・状態遷移
+├── ToolExecutionRepository — tool_calls の claim・状態更新・結果再利用
+├── ProviderRegistry       — Config snapshot 対応の Provider 解決と cache
+└── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
+```
+
+Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnRuntime` へ到達する。詳細は [session-lifecycle.md §9](./session-lifecycle.md#9-durable-turn-state) を参照。
 
 ### SurfaceContext
 
@@ -215,6 +229,7 @@ pub(crate) struct SurfaceContext {
     pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
     pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
     pub scope: ConversationScope,// ストレージ境界。turn 全体の DB・archive ルーティングを決定
+    pub request_key: String,   // 同一受付の重複防止 key。UNIQUE(chat_id, request_key)
 }
 ```
 
@@ -333,7 +348,7 @@ pub(crate) struct SurfaceContext {
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
-| **Conversation Scope Routing** | `runtime/` AppState | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`db_for(scope)` / `storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+| **Conversation Scope Routing** | `runtime/` / `agent_loop/turn_runtime.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnRuntime::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
 | **Tool Progress Coordinator** | `runtime/tool_progress.rs` | `AgentEvent` ストリームを購読し A3 遅延型 × B2 編集式累積ログでチャネル進捗を駆動。sink（Discord/Telegram）は投稿・編集・残置のみ担い、状態機械・遅延タイマー・間引きは coordinator が一元管理 |
 
 ---
@@ -352,7 +367,7 @@ pub(crate) struct SurfaceContext {
 ### ライフサイクル
 
 1. **コンテキスト構築**: チャネルアダプタが YAML 設定の `secret: true` を読み取り、`SurfaceContext.scope = ConversationScope::Secret` を設定
-2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`AppState::storage_for(scope)` で DB + archive root を一意に解決
+2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`TurnRuntime::storage_for(scope)` で DB + archive root を一意に解決
 3. **Turn 全体への伝播**: `SurfaceContext.scope` が `ToolExecutionContext.scope` 経由で turn 全体に伝播し、session 読込・message 保存・compaction・LLM usage log のすべてが同じスコープの DB にルーティングされる
 
 ### 構造的保証

@@ -118,24 +118,6 @@ impl ConfigManager {
     pub(crate) fn current_blocking(&self) -> Arc<ConfigSnapshot> {
         Arc::clone(&*self.inner.read().expect("ConfigManager lock"))
     }
-
-    /// Atomically replaces the current snapshot with a new one.
-    ///
-    /// The revision is incremented, a new fingerprint is computed, and the
-    /// swap is all-or-nothing.  If construction fails the old snapshot
-    /// remains untouched.
-    #[allow(dead_code)]
-    pub(crate) fn swap(&self, new_config: Config, config_path: Option<&Path>) {
-        let new_revision = self
-            .inner
-            .read()
-            .expect("ConfigManager lock")
-            .revision
-            .saturating_add(1);
-        let new_snapshot = Arc::new(ConfigSnapshot::new(new_revision, new_config, config_path));
-        let mut guard = self.inner.write().expect("ConfigManager lock");
-        *guard = new_snapshot;
-    }
 }
 
 #[cfg(test)]

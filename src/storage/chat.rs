@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_session_messages_returns_false_on_stale_timestamp() {
+    fn clear_session_messages_returns_false_on_stale_revision() {
         let (db, _dir) = test_db();
         let chat_id = 200;
 
@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_session_messages_returns_false_on_stale_timestamp() {
+    fn truncate_session_messages_returns_false_on_stale_revision() {
         let (db, _dir) = test_db();
         let chat_id = 400;
 

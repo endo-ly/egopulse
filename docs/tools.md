@@ -81,6 +81,42 @@ MCP の詳細は以下を参照。
 
 - [mcp.md](./mcp.md)
 
+### Tool 実行台帳
+
+既存 `tool_calls` テーブルを Tool 実行台帳として拡張する（[db.md §tool_calls](./db.md#tool_calls)）。新規台帳テーブルは作らない。`ToolExecutionRepository` が claim・状態遷移・input 整合確認・結果再利用・uncertain 判定を担う。
+
+#### 実行フロー
+
+1. **claim**: Tool 実行前に `claim(turn_id, tool_call_id, canonical_input)` を呼ぶ。`turn_id + tool_call_id` で既存行を検索し、未登録なら `pending` 作成、`running` へ遷移する。canonical input の hash (`input_hash`) を保存し、既存行と hash が異なれば conflict として拒否する。
+2. **実行**: claim 成功後にのみ Tool を実行する。実行前に台帳行を作ることを保証する。
+3. **結果保存**: 成功時は `succeeded` + sanitized `tool_output` + `finished_at` を同一 transaction で保存する。失敗時は `failed` + `error_kind` + sanitized `error_message` を保存する。
+
+#### idempotency 分類
+
+Tool 定義に次のいずれかを明示する。未指定は `non_idempotent`。
+
+| 分類 | 意味 | 再実行 |
+|---|---|---|
+| `read_only` | 外部状態を変更しない | 可能 |
+| `idempotent` | 同じ idempotency key で重複排除可能 | 同一 key のみ可能 |
+| `non_idempotent` | 再実行で副作用が重複する可能性 | 不可 |
+
+#### 状態と再実行規則
+
+| Tool 状態 | 実行規則 |
+|---|---|
+| `pending` | claim 後に実行可能 |
+| `running` | 通常実行中。recovery 時は結果不明として `uncertain` へ移行 |
+| `succeeded` | 保存済み `tool_output` を返し、再実行しない |
+| `failed` | policy が許可しない限り自動再実行しない |
+| `uncertain` | 自動再実行しない |
+
+#### crash recovery
+
+起動時に `recover_running()` が `running` の Tool を原則 `uncertain` へ移行する。例外として、Tool が `read_only` または `idempotent` かつ同一 input hash・同一 idempotency key の場合のみ自動 retry を許可する。`non_idempotent` Tool は絶対に自動再実行しない。
+
+Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行しない（`succeeded` の結果を再利用する）。
+
 ## 3. `read`
 
 - 目的: ファイル内容を読む

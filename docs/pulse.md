@@ -301,6 +301,12 @@ intentions:
 | Markdown body            | LLM に渡す柔らかい注意メモ                         |
 | binary embedded contract | Pulse の内部契約・安全制約・出力契約                   |
 
+#### version 検証
+
+front matter の `version` は Pulse 定義フォーマットの版数である。runtime は `SUPPORTED_PULSE_VERSION`（現行 `1`）との一致を検証し、不一致の定義は `pulse_unsupported_version` エラーで読込を拒否する。未対応版を実行せず、読み取りだけで無視しない。
+
+これは DB schema version（[db.md](./db.md#db_meta)）や Config revision（[config.md §12.5](./config.md#125-3つのバージョン概念の区別)）とは独立した概念である。
+
 `PULSE.md` に内部仕様を詰め込まない。
 Pulse の内部契約はバイナリ側に埋め込む。
 

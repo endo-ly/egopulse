@@ -12,6 +12,7 @@
 6. [Fallback](#6-fallback)
 7. [Archive](#7-archive)
 8. [Conflict Retry](#8-conflict-retry)
+9. [Durable Turn State](#9-durable-turn-state)
 
 ---
 
@@ -162,9 +163,30 @@ turn 開始時は次の順で session を復元する。
 
 ## 4. Turn 中の保存
 
-### Turn failure
+### Turn failure と安全な再試行
 
-Runtime は、LLM の429・5xx・接続失敗を理由に、保存やTool実行を含むTurn全体を自動で再実行しない。現在のTurnはerrorとして終了し、再試行は次の利用者入力で開始される。Codex認証の401では次回Turn向けにtoken refreshを試みるが、失敗したTurnを再開しない。
+Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実行しない。ただし、同一 model iteration 内で **外部出力が一切発生していない** 場合に限り、安全な範囲で LLM 再試行を行う。
+
+**再試行条件**（すべて満たす場合のみ）:
+
+- 同一 Turn・同一 iteration である
+- `model_request_hash` が一致する（同じ request である）
+- assistant delta・narration・Tool Call を外部へ公開していない
+- assistant message を commit していない
+- Tool 実行を開始していない
+- error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout）
+- 試行回数が上限（3 回）以内
+
+**再試行禁止**（いずれか該当で `failed` または `uncertain` へ遷移）:
+
+- partial output を外部へ公開済み（`output_published = true`）
+- Tool Call を受信・保存済み
+- Tool 実行開始済み
+- response event または assistant message を commit 済み
+- request hash が一致しない
+- error の retryability が不明
+
+再試行回数上限に達した場合、または再試行禁止条件に該当した場合は Turn を `failed`（出力未公開）または `uncertain`（出力公開済み）として終了する。Codex 認証の 401 では次回 Turn 向けに token refresh を試みるが、失敗した Turn を再開しない。
 
 turn 中の保存は phase ごとに進む。
 
@@ -295,7 +317,7 @@ Sleep Batch も session クリア前に `archive_conversation_blocking`（compac
 
 ### Compaction Archive の出力先分離
 
-`AppState::storage_for(scope)` で解決される archive root に従い、Secret スコープの compaction アーカイブは `runtime/secret_groups/` に出力される。Normal スコープは `runtime/groups/` のまま。
+`TurnRuntime::storage_for(scope)` で解決される archive root に従い、Secret スコープの compaction アーカイブは `runtime/secret_groups/` に出力される。Normal スコープは `runtime/groups/` のまま。
 
 ```text
 Normal: <state_root>/runtime/groups/<channel>/<chat_id>/conversations/
@@ -328,6 +350,61 @@ stale snapshot に単純 append だけを再試行すると、compaction 前の 
 |---|---|
 | 最初の user-phase retry | compaction-aware |
 | 以降の assistant / tool phase retry | compaction はすでに終わっている前提で通常 persist |
+
+## 9. Durable Turn State
+
+Turn の受付・入力保存・model iteration・Tool 実行・完了を `turn_runs` テーブルへ永続化し、重複受付防止・安全な再試行・crash 後の復旧判断を DB から行う。
+
+### 9.1 request_key と重複受付防止
+
+各 Ingress はプラットフォーム安定 ID から `request_key` を生成する。
+
+| Ingress | request_key 候補 |
+|---|---|
+| Discord | channel／thread／platform message ID |
+| Telegram | chat ID／platform message ID |
+| Web | client request ID または user message ID |
+| Webhook | receiver ID／外部 event ID（存在しない場合は受付時 UUID） |
+| CLI / TUI | 1回の明示入力ごとに UUID |
+| Agent 間 Turn | origin ID／派生元 Turn ID／派生 sequence |
+
+`UNIQUE(chat_id, request_key)` 制約により、同じ受付を再受付しても新規 Turn を作らず既存 Turn を返す。既存 Turn が `completed` なら保存済み最終結果を LLM を呼ばずに返す。
+
+### 9.2 状態機械
+
+`turn_runs.state` は中央定義した遷移ルールで管理する。許可されていない遷移は DB 更新前に拒否する。
+
+```text
+accepted → input_committed → model_pending → model_completed → tools_pending → tools_completed → completed
+                                                                     ↓
+                                                            (error) → failed / uncertain / cancelled
+```
+
+各状態の意味は [db.md §turn_runs](./db.md#turn_runs) を参照。
+
+### 9.3 crash recovery
+
+起動時に `recover_interrupted()` が未端末 Turn を次の規則で処理する。
+
+| 状態 | 処理 |
+|---|---|
+| `accepted` | input 未保存の受付のみ。`failed` へ移行（input 未 commit のため再受付で再開可能） |
+| `input_committed` | Config fingerprint が一致すれば再受付で再開可能。不一致は `uncertain` |
+| `model_pending` / `model_completed` / `tools_pending` / `tools_completed` | 中間状態は結果が不明のため `uncertain` |
+| `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
+
+同時に `ToolExecutionRepository::recover_running()` が `running` の Tool を `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
+
+### 9.4 安全停止の原則
+
+再開条件を証明できない場合は、推測して処理を続けず `uncertain` で停止する。
+
+- Config fingerprint が不一致
+- partial output をすでに公開済み（`output_published = true`）
+- 同じ Tool Call ID に異なる input が渡された
+- Tool 実行結果が不明（`running` のまま停止）
+
+これらは Phase 3 の Supervisor / Durable Ingress が導入されるまで、人手による確認を促す安全弁として機能する。
 
 ---
 
