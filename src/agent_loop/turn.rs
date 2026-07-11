@@ -354,9 +354,16 @@ impl TurnExecutor<'_> {
     ) -> Result<TurnAcceptance, EgoPulseError> {
         let scope = self.context.scope;
         let request_key = request_key.to_string();
+        let snapshot = self.state.config_manager.current_blocking();
+        let config_revision = snapshot.revision as i64;
+        let config_fingerprint = snapshot.fingerprint.clone();
         let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.turn_run_store()
-                .accept_or_get(chat_id, &request_key, 0, None)
+            db.turn_run_store().accept_or_get(
+                chat_id,
+                &request_key,
+                config_revision,
+                Some(&config_fingerprint),
+            )
         })
         .await?;
 

@@ -258,14 +258,17 @@ impl PartialEq for ResolvedLlmConfig {
 impl Eq for ResolvedLlmConfig {}
 
 impl ResolvedLlmConfig {
-    /// Returns a deterministic hash of all config fields for use as a cache key.
+    /// Cache key that mixes in the `ConfigSnapshot` revision.
     ///
-    /// Includes `api_key` via `expose_secret()` so that different keys
-    /// produce different hashes. The key value itself is never stored.
-    pub(crate) fn cache_key(&self) -> u64 {
+    /// When `revision` is `0` this produces the same value as the old
+    /// revision-less cache key.  Used by [`ConfigManager`] so that a
+    /// credential change (new revision) does not reuse a provider created
+    /// under an old config generation.
+    pub(crate) fn cache_key_with_revision(&self, revision: u64) -> u64 {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        revision.hash(&mut hasher);
         self.provider.hash(&mut hasher);
         self.label.hash(&mut hasher);
         self.base_url.hash(&mut hasher);

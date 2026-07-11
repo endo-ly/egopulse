@@ -518,6 +518,9 @@ impl<'a> TurnRepository<'a> {
     ///   cannot prove no output was published, and without an immutable Config
     ///   snapshot (Package 5) the Config generation cannot be verified either.
     ///   Safe stop takes priority over speculative resume (Plan §2.4).
+    /// * If `current_fingerprint` is provided and differs from the persisted
+    ///   `config_fingerprint`, the Turn is always recovered to `uncertain`
+    ///   regardless of state (Plan §9.5).
     /// * Terminal states are left untouched.
     ///
     /// Returns the transitioned rows so the caller can log them. This does
@@ -527,13 +530,16 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite writes fail.
-    pub(crate) fn recover_interrupted(&self) -> Result<Vec<RecoveredTurnRun>, StorageError> {
+    pub(crate) fn recover_interrupted(
+        &self,
+        current_fingerprint: Option<&str>,
+    ) -> Result<Vec<RecoveredTurnRun>, StorageError> {
         let mut conn = self.db.get_conn()?;
         let tx = conn.transaction()?;
 
-        let interrupted: Vec<(String, i64, String)> = {
+        let interrupted: Vec<(String, i64, String, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT turn_id, chat_id, state
+                "SELECT turn_id, chat_id, state, config_fingerprint
                  FROM turn_runs
                  WHERE state IN (
                      'accepted', 'input_committed', 'model_pending',
@@ -545,21 +551,50 @@ impl<'a> TurnRepository<'a> {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
         let mut recovered = Vec::with_capacity(interrupted.len());
-        for (turn_id, chat_id, state_str) in interrupted {
+        for (turn_id, chat_id, state_str, stored_fingerprint) in interrupted {
             let from: TurnRunState = state_str
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
-            let to = match from {
-                TurnRunState::Accepted => TurnRunState::Failed,
-                _ => TurnRunState::Uncertain,
+
+            // Config fingerprint mismatch → always uncertain (Plan §9.5).
+            let fingerprint_mismatch = match (&stored_fingerprint, current_fingerprint) {
+                (Some(stored), Some(current)) => stored != current,
+                _ => true,
             };
+
+            let to = if fingerprint_mismatch {
+                TurnRunState::Uncertain
+            } else {
+                match from {
+                    TurnRunState::Accepted => TurnRunState::Failed,
+                    _ => TurnRunState::Uncertain,
+                }
+            };
+
             let now = chrono::Utc::now().to_rfc3339();
+            let (error_kind, error_message) = if fingerprint_mismatch {
+                (
+                    "config_mismatch",
+                    format!(
+                        "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
+                        stored = stored_fingerprint,
+                        current = current_fingerprint,
+                    ),
+                )
+            } else {
+                (
+                    "interrupted",
+                    "recovered on startup: process restart left the turn non-terminal".to_string(),
+                )
+            };
+
             tx.execute(
                 "UPDATE turn_runs
                  SET state = ?2,
@@ -568,13 +603,7 @@ impl<'a> TurnRepository<'a> {
                      finished_at = ?5,
                      updated_at = ?5
                  WHERE turn_id = ?1",
-                params![
-                    &turn_id,
-                    to.to_string(),
-                    "interrupted",
-                    "recovered on startup: process restart left the turn non-terminal",
-                    &now,
-                ],
+                params![&turn_id, to.to_string(), error_kind, error_message, &now,],
             )?;
             recovered.push(RecoveredTurnRun {
                 turn_id,
@@ -675,7 +704,7 @@ mod tests {
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
             .turn_run_store()
-            .accept_or_get(1, request_key, 0, None)
+            .accept_or_get(1, request_key, 1, Some("abc123"))
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -698,8 +727,8 @@ mod tests {
         assert_eq!(run.state, TurnRunState::Accepted);
         assert_eq!(run.chat_id, 1);
         assert_eq!(run.request_key, "discord:42:100");
-        assert_eq!(run.config_revision, 0);
-        assert!(run.config_fingerprint.is_none());
+        assert_eq!(run.config_revision, 1);
+        assert_eq!(run.config_fingerprint.as_deref(), Some("abc123"));
         assert_eq!(run.model_attempt, 0);
         assert!(!run.output_published);
     }
@@ -981,7 +1010,7 @@ mod tests {
             .expect("begin");
 
         // Act
-        let recovered = repo.recover_interrupted().expect("recover");
+        let recovered = repo.recover_interrupted(Some("abc123")).expect("recover");
 
         // Assert
         assert_eq!(recovered.len(), 2);
@@ -1002,7 +1031,7 @@ mod tests {
         repo.complete(&completed_id, "final").expect("complete");
 
         // Act
-        let recovered = repo.recover_interrupted().expect("recover");
+        let recovered = repo.recover_interrupted(Some("abc123")).expect("recover");
 
         // Assert
         assert!(recovered.is_empty(), "terminal turns are not recovered");
@@ -1018,11 +1047,29 @@ mod tests {
         repo.commit_input(&turn_id, "in").expect("commit");
 
         // Act
-        repo.recover_interrupted().expect("first");
-        let second = repo.recover_interrupted().expect("second");
+        repo.recover_interrupted(Some("abc123")).expect("first");
+        let second = repo.recover_interrupted(Some("abc123")).expect("second");
 
         // Assert: the now-uncertain turn is terminal and not recovered again.
         assert!(second.is_empty());
+        assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
+    }
+
+    #[test]
+    fn recover_interrupted_config_mismatch_always_uncertain() {
+        // Arrange: accepted turn with a stored fingerprint.
+        let (db, _dir) = test_db();
+        let repo = db.turn_run_store();
+        let turn_id = accept(&db, "mismatch").turn_id;
+
+        // Act: recovery with a different fingerprint.
+        let recovered = repo
+            .recover_interrupted(Some("different-fp"))
+            .expect("recover");
+
+        // Assert: even though the state is accepted, fingerprint mismatch
+        // forces uncertain (Plan §9.5).
+        assert_eq!(recovered.len(), 1);
         assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
     }
 }

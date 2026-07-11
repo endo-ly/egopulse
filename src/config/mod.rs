@@ -1,4 +1,5 @@
 pub(crate) mod loader;
+pub(crate) mod manager;
 pub(crate) mod persist;
 pub(crate) mod resolve;
 pub(crate) mod secret_ref;
@@ -6,6 +7,7 @@ pub(crate) mod types;
 pub(crate) mod web_fetch;
 
 pub(crate) use loader::is_valid_base_url;
+pub(crate) use manager::ConfigManager;
 pub use resolve::default_config_path;
 pub(crate) use resolve::{default_state_root, default_workspace_dir};
 pub use types::*;

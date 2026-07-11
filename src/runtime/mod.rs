@@ -35,7 +35,7 @@ use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
 use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
-use crate::config::Config;
+use crate::config::{Config, ConfigManager};
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalibrator};
 use crate::llm::{Message, create_provider};
@@ -51,6 +51,7 @@ pub struct AppState {
     /// Secret DB for isolated secret-mode storage. `None` when no secret channels are configured.
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
+    pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -118,7 +119,11 @@ impl AppState {
         Self {
             db: parts.db,
             secret_db: parts.secret_db,
-            config: parts.config,
+            config: parts.config.clone(),
+            config_manager: Arc::new(ConfigManager::new(
+                parts.config,
+                parts.config_path.as_deref(),
+            )),
             config_path: parts.config_path,
             llm_override: parts.llm_override,
             channels: parts.channels,
@@ -268,17 +273,19 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.try_current_config()?;
+        let snapshot = self.config_manager.current_blocking();
+        let config = &snapshot.config;
         let agent_id = crate::config::AgentId::new(&context.agent_id);
         let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        self.cached_provider(&resolved)
+        self.cached_provider(&resolved, snapshot.revision)
     }
 
     pub(crate) fn cached_provider(
         &self,
         resolved: &crate::config::ResolvedLlmConfig,
+        config_revision: u64,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        let key = resolved.cache_key();
+        let key = resolved.cache_key_with_revision(config_revision);
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
         if let Some(provider) = cache.get(&key) {
             return Ok(Arc::clone(provider));
@@ -402,13 +409,18 @@ pub async fn build_app_state_with_path(
 /// Failures are logged but never abort startup so the runtime can still serve
 /// new turns.
 async fn recover_durable_state(state: &AppState) {
-    recover_durable_state_for_db(&state.db, ConversationScope::Normal);
+    let fp = state.config_manager.current_blocking().fingerprint.clone();
+    recover_durable_state_for_db(&state.db, ConversationScope::Normal, Some(&fp));
     if let Some(secret_db) = &state.secret_db {
-        recover_durable_state_for_db(secret_db, ConversationScope::Secret);
+        recover_durable_state_for_db(secret_db, ConversationScope::Secret, Some(&fp));
     }
 }
 
-fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
+fn recover_durable_state_for_db(
+    db: &Arc<Database>,
+    scope: ConversationScope,
+    current_fingerprint: Option<&str>,
+) {
     match db.as_ref().tool_execution_store().recover_running() {
         Ok(recovered) if !recovered.is_empty() => {
             for tool in &recovered {
@@ -426,7 +438,11 @@ fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
     }
-    match db.as_ref().turn_run_store().recover_interrupted() {
+    match db
+        .as_ref()
+        .turn_run_store()
+        .recover_interrupted(current_fingerprint)
+    {
         Ok(recovered) if !recovered.is_empty() => {
             for turn in &recovered {
                 tracing::info!(
@@ -1556,21 +1572,21 @@ mod tests {
     fn cache_key_differs_when_provider_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_differs_when_model_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_differs_when_base_url_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
@@ -1580,14 +1596,14 @@ mod tests {
         b.api_key = Some(secrecy::SecretString::new(
             "sk-other".to_string().into_boxed_str(),
         ));
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_same_for_identical_configs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        assert_eq!(a.cache_key(), b.cache_key());
+        assert_eq!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[tokio::test]

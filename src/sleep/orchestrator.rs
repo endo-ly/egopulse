@@ -242,8 +242,9 @@ pub async fn run_events_extract(
             if let Some(override_provider) = state.llm_override.clone() {
                 override_provider
             } else {
+                let revision = state.config_manager.current_blocking().revision;
                 state
-                    .cached_provider(&resolved)
+                    .cached_provider(&resolved, revision)
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
@@ -555,8 +556,9 @@ async fn prepare_batch_context(
     {
         override_provider
     } else {
+        let revision = state.config_manager.current_blocking().revision;
         state
-            .cached_provider(&resolved)
+            .cached_provider(&resolved, revision)
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 
