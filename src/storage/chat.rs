@@ -21,6 +21,9 @@ pub(crate) fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result
         timestamp: row.get(5)?,
         message_kind,
         recipient_agent_id: row.get(7)?,
+        seq: row.get(8).ok(),
+        turn_id: row.get(9).ok(),
+        parent_message_id: row.get(10).ok(),
     })
 }
 
@@ -153,7 +156,7 @@ impl Database {
                     SELECT m.content
                     FROM messages m
                     WHERE m.chat_id = c.chat_id
-                    ORDER BY m.timestamp DESC, m.id DESC
+                    ORDER BY m.seq DESC
                     LIMIT 1
                 ) AS last_message_preview,
                 c.agent_id
@@ -217,10 +220,10 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
              FROM messages
              WHERE chat_id = ?1
-             ORDER BY timestamp DESC, id DESC
+             ORDER BY seq DESC
              LIMIT ?2",
         )?;
 
@@ -238,10 +241,10 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
              FROM messages
              WHERE chat_id = ?1
-             ORDER BY timestamp ASC, id ASC",
+             ORDER BY seq ASC",
         )?;
         stmt.query_map(params![chat_id], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
@@ -259,16 +262,8 @@ impl Database {
         chat_id: i64,
         messages_json: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.get_conn()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO sessions (chat_id, messages_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET
-                messages_json = ?2,
-                updated_at = ?3",
-            params![chat_id, messages_json, now],
-        )?;
+        self.conversation_store()
+            .update_session_snapshot(chat_id, messages_json, None)?;
         Ok(())
     }
 
@@ -276,35 +271,29 @@ impl Database {
     /// JSON array.  The session row itself and `messages` / `tool_calls`
     /// records are preserved.
     ///
-    /// Uses optimistic concurrency: the update only succeeds when
-    /// `expected_updated_at` matches the current row.  Returns `Ok(true)` if
-    /// the row was updated, `Ok(false)` if the row was not found or the
-    /// timestamp did not match (concurrent modification).
+    /// Uses optimistic concurrency on `chats.revision`: the update only
+    /// succeeds when `expected_revision` matches the current row.  Returns
+    /// `Ok(true)` if the snapshot was updated, `Ok(false)` if the revision did
+    /// not match (concurrent modification).
     pub(crate) fn clear_session_messages(
         &self,
         chat_id: i64,
-        expected_updated_at: &str,
+        expected_revision: i64,
     ) -> Result<bool, StorageError> {
-        let conn = self.get_conn()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let rows = conn.execute(
-            "UPDATE sessions SET messages_json = '[]', updated_at = ?1 \
-             WHERE chat_id = ?2 AND updated_at = ?3",
-            params![now, chat_id, expected_updated_at],
-        )?;
-        Ok(rows > 0)
+        self.conversation_store()
+            .clear_session_snapshot(chat_id, expected_revision)
     }
 
     /// Updates `sessions.messages_json` to `new_messages_json` and bumps
-    /// `updated_at`. Unlike [`Database::clear_session_messages`], which wipes
-    /// to `[]`, this keeps a caller-supplied payload — used by the sleep
+    /// `chats.revision`. Unlike [`Database::clear_session_messages`], which
+    /// wipes to `[]`, this keeps a caller-supplied payload — used by the sleep
     /// batch to retain the trailing N messages while still archiving the full
     /// conversation.
     ///
-    /// Uses optimistic concurrency: the update only succeeds when
-    /// `expected_updated_at` matches the current row. Returns `Ok(true)` if
-    /// the row was updated, `Ok(false)` on concurrent modification or missing
-    /// row.
+    /// Uses optimistic concurrency on `chats.revision`: the update only
+    /// succeeds when `expected_revision` matches the current row. Returns
+    /// `Ok(true)` if the snapshot was updated, `Ok(false)` on concurrent
+    /// modification or missing row.
     ///
     /// # Errors
     ///
@@ -312,69 +301,36 @@ impl Database {
     pub(crate) fn truncate_session_messages(
         &self,
         chat_id: i64,
-        expected_updated_at: &str,
+        expected_revision: i64,
         new_messages_json: &str,
     ) -> Result<bool, StorageError> {
-        let conn = self.get_conn()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let rows = conn.execute(
-            "UPDATE sessions SET messages_json = ?1, updated_at = ?2 \
-             WHERE chat_id = ?3 AND updated_at = ?4",
-            params![new_messages_json, now, chat_id, expected_updated_at],
-        )?;
-        Ok(rows > 0)
+        self.conversation_store().truncate_session_snapshot(
+            chat_id,
+            expected_revision,
+            new_messages_json,
+        )
     }
 
+    /// Persists one message and, when `messages_json` is provided, advances the
+    /// LLM session snapshot in the same transaction.
+    ///
+    /// Uses optimistic concurrency on `chats.revision`: `Some(n)` commits only
+    /// while the row is still at `n`, otherwise the whole transaction rolls
+    /// back with [`StorageError::SessionSnapshotConflict`]; `None` requires the
+    /// session row to not yet exist (initial seed). Returns the new
+    /// `chats.revision` to be used as the CAS token for the next mutation.
     pub(crate) fn store_message_with_session(
         &self,
         message: &StoredMessage,
         messages_json: &str,
-        expected_updated_at: Option<&str>,
-    ) -> Result<String, StorageError> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message.id,
-                message.chat_id,
-                message.sender_id,
-                message.content,
-                message.sender_kind.to_string(),
-                message.timestamp,
-                message.message_kind.to_string(),
-                message.recipient_agent_id.as_deref(),
-            ],
+        expected_revision: Option<i64>,
+    ) -> Result<i64, StorageError> {
+        let outcome = self.conversation_store().commit_message_struct(
+            message,
+            Some(messages_json),
+            expected_revision,
         )?;
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Some(expected_updated_at) = expected_updated_at {
-            let updated = tx.execute(
-                "UPDATE sessions
-                 SET messages_json = ?2,
-                     updated_at = ?3
-                 WHERE chat_id = ?1
-                   AND updated_at = ?4",
-                params![message.chat_id, messages_json, now, expected_updated_at],
-            )?;
-            if updated == 0 {
-                tx.rollback()?;
-                return Err(StorageError::SessionSnapshotConflict);
-            }
-        } else {
-            let inserted = tx.execute(
-                "INSERT INTO sessions (chat_id, messages_json, updated_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(chat_id) DO NOTHING",
-                params![message.chat_id, messages_json, now],
-            )?;
-            if inserted == 0 {
-                tx.rollback()?;
-                return Err(StorageError::SessionSnapshotConflict);
-            }
-        }
-        tx.commit()?;
-        Ok(now)
+        Ok(outcome.revision)
     }
 
     pub(crate) fn load_session_snapshot(
@@ -387,19 +343,28 @@ impl Database {
 
         let session = tx
             .query_row(
-                "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
+                "SELECT messages_json FROM sessions WHERE chat_id = ?1",
                 params![chat_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
+
+        let revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM chats WHERE chat_id = ?1",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
 
         let recent_messages = {
             let mut stmt = tx.prepare(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
                  FROM messages
                  WHERE chat_id = ?1
-                 ORDER BY timestamp DESC, id DESC
+                 ORDER BY seq DESC
                  LIMIT ?2",
             )?;
             let mut messages = stmt
@@ -411,13 +376,12 @@ impl Database {
 
         tx.commit()?;
 
-        let (messages_json, updated_at) = session
-            .map(|(messages_json, updated_at)| (Some(messages_json), Some(updated_at)))
-            .unwrap_or((None, None));
+        let messages_json = session.clone();
+        let session_revision = session.map(|_| revision);
 
         Ok(SessionSnapshot {
             messages_json,
-            updated_at,
+            session_revision,
             recent_messages,
         })
     }
@@ -461,22 +425,9 @@ impl Database {
     /// Stores a message without touching the session snapshot.
     /// Used for Channel Log entries (agent_send, system events) that have no session.
     pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
-        let conn = self.get_conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message.id,
-                message.chat_id,
-                message.sender_id,
-                message.content,
-                message.sender_kind.to_string(),
-                message.timestamp,
-                message.message_kind.to_string(),
-                message.recipient_agent_id.as_deref(),
-            ],
-        )?;
-        Ok(())
+        self.conversation_store()
+            .store_channel_log_message(message)
+            .map(|_| ())
     }
 
     /// Persists a system event message to a Channel Log chat.
@@ -489,15 +440,9 @@ impl Database {
         channel_log_chat_id: i64,
         reason: &impl std::fmt::Display,
     ) -> Result<(), StorageError> {
-        let content = serde_json::json!({
-            "reason": reason.to_string()
-        })
-        .to_string();
-
-        let mut message = StoredMessage::system(channel_log_chat_id, content);
-        message.message_kind = MessageKind::SystemEvent;
-
-        self.store_message_only(&message)
+        self.conversation_store()
+            .store_system_event(channel_log_chat_id, reason)
+            .map(|_| ())
     }
 
     /// Persists a bot response to the Channel Log.
@@ -509,17 +454,9 @@ impl Database {
         agent_id: &str,
         response: &str,
     ) -> Result<(), StorageError> {
-        let message = StoredMessage {
-            id: format!("cl-bot-{}", uuid::Uuid::new_v4()),
-            chat_id: channel_log_chat_id,
-            sender_id: agent_id.to_string(),
-            content: response.to_string(),
-            sender_kind: SenderKind::Assistant,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message_kind: MessageKind::Message,
-            recipient_agent_id: None,
-        };
-        self.store_message_only(&message)
+        self.conversation_store()
+            .store_channel_log_bot_response(channel_log_chat_id, agent_id, response)
+            .map(|_| ())
     }
 }
 
@@ -541,8 +478,9 @@ mod tests {
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.get_conn().expect("pool");
         conn.execute(
-                "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
                 rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
             )
             .expect("store message");
@@ -604,9 +542,9 @@ mod tests {
 
         let snapshot = db.load_session_snapshot(100, 10).expect("load session");
         assert_eq!(snapshot.messages_json.as_deref(), Some(json1));
-        assert!(snapshot.updated_at.is_some());
-        let first_updated_at = snapshot.updated_at.unwrap();
-        assert!(!first_updated_at.is_empty());
+        assert!(snapshot.session_revision.is_some());
+        let first_session_revision = snapshot.session_revision.unwrap();
+        assert!(first_session_revision > 0);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -617,7 +555,7 @@ mod tests {
             .load_session_snapshot(100, 10)
             .expect("load updated session");
         assert_eq!(snapshot.messages_json.as_deref(), Some(json2));
-        assert!(snapshot.updated_at.unwrap() >= first_updated_at);
+        assert!(snapshot.session_revision.unwrap() >= first_session_revision);
         assert!(
             db.load_session_snapshot(200, 10)
                 .expect("other chat")
@@ -637,10 +575,10 @@ mod tests {
         store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
-        let updated_at = snapshot.updated_at.as_deref().expect("has updated_at");
+        let session_revision = snapshot.session_revision.expect("has revision");
 
         let cleared = db
-            .clear_session_messages(chat_id, updated_at)
+            .clear_session_messages(chat_id, session_revision)
             .expect("clear session messages");
         assert!(cleared, "should have updated the row");
 
@@ -666,7 +604,7 @@ mod tests {
             .expect("save session");
 
         let cleared = db
-            .clear_session_messages(chat_id, "stale-timestamp")
+            .clear_session_messages(chat_id, 0)
             .expect("clear session messages");
         assert!(!cleared, "should not have updated the row");
 
@@ -688,11 +626,11 @@ mod tests {
         store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
-        let updated_at = snapshot.updated_at.as_deref().expect("has updated_at");
+        let session_revision = snapshot.session_revision.expect("has revision");
 
         let new_json = r#"[{"role":"assistant","content":"kept"}]"#;
         let truncated = db
-            .truncate_session_messages(chat_id, updated_at, new_json)
+            .truncate_session_messages(chat_id, session_revision, new_json)
             .expect("truncate session messages");
         assert!(truncated, "should have updated the row");
 
@@ -718,7 +656,7 @@ mod tests {
             .expect("save session");
 
         let truncated = db
-            .truncate_session_messages(chat_id, "stale-timestamp", r#"[]"#)
+            .truncate_session_messages(chat_id, 0, r#"[]"#)
             .expect("truncate session messages");
         assert!(!truncated, "should not have updated the row");
 
@@ -741,6 +679,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
 
         db.store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
@@ -756,6 +697,9 @@ mod tests {
                 timestamp: "2024-01-01T00:00:01Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             r#"[{"role":"user","content":"hello again"}]"#,
             None,
@@ -1050,14 +994,17 @@ mod tests {
             .resolve_or_create_chat_id("cli", "cli:sender-kind", None, "cli", "default")
             .expect("create chat");
         let message = StoredMessage {
-            id: "msg-assistant".to_string(),
+            id: "msg-assitant".to_string(),
             chat_id,
             sender_id: "lyre".to_string(),
-            content: "assistant says hi".to_string(),
+            content: "assitant says hi".to_string(),
             sender_kind: SenderKind::Assistant,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
 
         db.store_message_with_session(&message, r#"[]"#, None)

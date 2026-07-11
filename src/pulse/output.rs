@@ -263,21 +263,21 @@ async fn persist_notification_with_session(
     session_messages.push(Message::text("user", &synthetic_input.content));
 
     let PersistedTurn {
-        mut updated_at,
+        mut revision,
         messages: mut session_messages,
     } = persist_phase_once(
         state,
         ConversationScope::Normal,
         synthetic_input.clone(),
         &session_messages,
-        loaded.session_updated_at,
+        loaded.session_revision,
     )
     .await?;
 
     for phase in &activation_result.tool_phases {
         session_messages.push(phase.assistant_message.clone());
         let PersistedTurn {
-            updated_at: next_updated_at,
+            revision: next_revision,
             messages: persisted_messages,
         } = persist_phase(
             state,
@@ -292,10 +292,10 @@ async fn persist_notification_with_session(
             },
             phase.assistant_message.clone(),
             &session_messages,
-            Some(updated_at),
+            Some(revision),
         )
         .await?;
-        updated_at = next_updated_at;
+        revision = next_revision;
         session_messages = persisted_messages;
 
         persist_tool_call_records(state, phase.stored_tool_calls.clone()).await?;
@@ -303,7 +303,7 @@ async fn persist_notification_with_session(
         if !phase.tool_messages.is_empty() {
             session_messages.extend(phase.tool_messages.iter().cloned());
             let PersistedTurn {
-                updated_at: next_updated_at,
+                revision: next_revision,
                 messages: persisted_messages,
             } = persist_phase_messages(
                 state,
@@ -318,10 +318,10 @@ async fn persist_notification_with_session(
                 },
                 phase.tool_messages.clone(),
                 &session_messages,
-                Some(updated_at),
+                Some(revision),
             )
             .await?;
-            updated_at = next_updated_at;
+            revision = next_revision;
             session_messages = persisted_messages;
         }
     }
@@ -339,7 +339,7 @@ async fn persist_notification_with_session(
         ConversationScope::Normal,
         assistant_msg,
         &session_messages,
-        Some(updated_at),
+        Some(revision),
     )
     .await?;
 
@@ -975,6 +975,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::SystemEvent,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.sender_id, "pulse");

@@ -102,17 +102,17 @@ struct PreparedTurn {
 
 struct TurnLoopState {
     messages: Arc<Vec<Message>>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
     retry_messages: Option<Arc<Vec<Message>>>,
     empty_reply_retry_attempted: bool,
     declarative_retry_attempted: bool,
 }
 
 impl TurnLoopState {
-    fn new(messages: Arc<Vec<Message>>, session_updated_at: Option<String>) -> Self {
+    fn new(messages: Arc<Vec<Message>>, session_revision: Option<i64>) -> Self {
         Self {
             messages,
-            session_updated_at,
+            session_revision,
             retry_messages: None,
             empty_reply_retry_attempted: false,
             declarative_retry_attempted: false,
@@ -258,7 +258,7 @@ impl TurnExecutor<'_> {
             };
 
             // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
-            let (messages, session_updated_at) = self
+            let (messages, session_revision) = self
                 .persist_user_input(&prepared, user_input, &prompt_ctx)
                 .await?;
 
@@ -271,7 +271,7 @@ impl TurnExecutor<'_> {
                 &prompt_ctx,
                 channel_context_msg,
                 messages,
-                session_updated_at,
+                session_revision,
             )
             .await
         }
@@ -358,7 +358,7 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         user_input: &str,
         prompt_ctx: &PromptContext<'_>,
-    ) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
+    ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
         persist_user_turn_with_compaction(
             self.state,
             self.context,
@@ -377,9 +377,9 @@ impl TurnExecutor<'_> {
         prompt_ctx: &PromptContext<'_>,
         channel_context_msg: Option<Message>,
         messages: Arc<Vec<Message>>,
-        session_updated_at: Option<String>,
+        session_revision: Option<i64>,
     ) -> Result<String, EgoPulseError> {
-        let mut loop_state = TurnLoopState::new(messages, session_updated_at);
+        let mut loop_state = TurnLoopState::new(messages, session_revision);
         for iteration in 1..=MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
             let request_messages =
@@ -484,17 +484,17 @@ impl TurnExecutor<'_> {
                 Ok(PhaseOutcome::Continue)
             }
             ToolPhaseResponse::ToolCalls(assistant_phase) => {
-                let (updated_messages, updated_at) = execute_and_persist_tools(
+                let (updated_messages, session_revision) = execute_and_persist_tools(
                     self.state,
                     &self.on_event,
                     &prepared.tool_context,
                     Arc::clone(&loop_state.messages),
-                    loop_state.session_updated_at.clone(),
+                    loop_state.session_revision,
                     assistant_phase,
                 )
                 .await?;
                 loop_state.messages = updated_messages;
-                loop_state.session_updated_at = updated_at;
+                loop_state.session_revision = session_revision;
                 Ok(PhaseOutcome::ToolsExecuted)
             }
         }
@@ -513,7 +513,7 @@ impl TurnExecutor<'_> {
             prepared.chat_id,
             &self.context.agent_id,
             &mut loop_state.messages,
-            loop_state.session_updated_at.clone(),
+            loop_state.session_revision,
             &self.on_event,
             (final_content, reasoning_content),
         )
@@ -623,7 +623,7 @@ async fn persist_and_finalize(
     chat_id: i64,
     agent_id: &str,
     messages: &mut Arc<Vec<Message>>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
     on_event: &EventEmitter,
     response: (String, Option<String>),
 ) -> Result<String, EgoPulseError> {
@@ -640,7 +640,7 @@ async fn persist_and_finalize(
         StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone()),
         assistant_message,
         &updated,
-        session_updated_at,
+        session_revision,
     )
     .await?;
 
@@ -657,9 +657,9 @@ async fn execute_and_persist_tools(
     on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     messages: Arc<Vec<Message>>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
     assistant_phase: AssistantToolPhase,
-) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
+) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
     let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
     let persisted = persist_tool_call_assistant_message(
@@ -670,11 +670,11 @@ async fn execute_and_persist_tools(
         &assistant_message_id,
         &assistant_phase,
         messages_vec,
-        session_updated_at,
+        session_revision,
     )
     .await?;
     let mut messages = persisted.messages;
-    let session_updated_at = Some(persisted.updated_at);
+    let session_revision = Some(persisted.revision);
 
     let tool_outcomes = execute_tool_calls(
         state,
@@ -692,13 +692,13 @@ async fn execute_and_persist_tools(
         &tool_context.agent_id,
         messages,
         tool_result_phase,
-        session_updated_at,
+        session_revision,
     )
     .await?;
     messages = persisted.messages;
-    let session_updated_at = Some(persisted.updated_at);
+    let session_revision = Some(persisted.revision);
 
-    Ok((Arc::new(messages), session_updated_at))
+    Ok((Arc::new(messages), session_revision))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,7 +710,7 @@ async fn persist_tool_call_assistant_message(
     assistant_message_id: &str,
     assistant_phase: &AssistantToolPhase,
     mut messages: Vec<Message>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     let assistant_message = assistant_phase.assistant_message.clone();
     messages.push(assistant_message.clone());
@@ -728,7 +728,7 @@ async fn persist_tool_call_assistant_message(
         },
         assistant_message,
         &messages,
-        session_updated_at,
+        session_revision,
     )
     .await
 }
@@ -740,7 +740,7 @@ async fn persist_tool_result_messages(
     agent_id: &str,
     messages: Vec<Message>,
     tool_result_phase: ToolResultPhase,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     let ToolResultPhase {
         tool_messages,
@@ -748,7 +748,7 @@ async fn persist_tool_result_messages(
     } = tool_result_phase;
     if tool_messages.is_empty() {
         return Ok(PersistedTurn {
-            updated_at: session_updated_at.unwrap_or_default(),
+            revision: session_revision.unwrap_or(0),
             messages,
         });
     }
@@ -762,7 +762,7 @@ async fn persist_tool_result_messages(
         tool_summary,
         tool_messages,
         &messages_with_tools,
-        session_updated_at,
+        session_revision,
     )
     .await
 }
@@ -886,7 +886,7 @@ async fn persist_user_turn_with_compaction(
     user_input: &str,
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
-) -> Result<(Arc<Vec<Message>>, Option<String>), EgoPulseError> {
+) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
     let mut loaded = load_messages_for_turn(state, context.scope, chat_id).await?;
     let stored_message = StoredMessage::user(
         chat_id,
@@ -914,7 +914,7 @@ async fn persist_user_turn_with_compaction(
             context.scope,
             stored_message.clone(),
             &candidate_messages,
-            loaded.session_updated_at.clone(),
+            loaded.session_revision,
         )
         .await;
         let persisted = match persist_result {
@@ -927,7 +927,7 @@ async fn persist_user_turn_with_compaction(
             }
         };
 
-        return Ok((Arc::new(persisted.messages), Some(persisted.updated_at)));
+        return Ok((Arc::new(persisted.messages), Some(persisted.revision)));
     }
 
     Err(EgoPulseError::Storage(
@@ -1728,8 +1728,8 @@ mod tests {
     ) {
         let conn = db.get_conn().expect("pool");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE chat_id=?2))",
             rusqlite::params![id, chat_id, sender_id, content, sender_kind.to_string(), ts, "message"],
         )
         .expect("insert channel log message");

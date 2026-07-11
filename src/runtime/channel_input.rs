@@ -82,6 +82,9 @@ pub(crate) async fn store_human_channel_log_message(
                 timestamp: message.timestamp,
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             };
             if let Err(error) = call_blocking(db, move |db| db.store_message_only(&stored)).await {
                 tracing::warn!(

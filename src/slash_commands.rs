@@ -191,11 +191,11 @@ pub(crate) fn unknown_command_response() -> String {
 async fn handle_new(state: &AppState, scope: ConversationScope, chat_id: i64) -> Option<String> {
     match call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         let snapshot = db.load_session_snapshot(chat_id, 1)?;
-        let updated_at = match snapshot.updated_at {
-            Some(ts) => ts,
+        let session_revision = match snapshot.session_revision {
+            Some(rev) => rev,
             None => return Ok(true), // no session row — nothing to clear
         };
-        let cleared = db.clear_session_messages(chat_id, &updated_at)?;
+        let cleared = db.clear_session_messages(chat_id, session_revision)?;
         if !cleared {
             tracing::debug!(
                 chat_id,
@@ -897,6 +897,9 @@ mod tests {
                         timestamp: "2024-01-01T00:00:00Z".to_string(),
                         message_kind: MessageKind::Message,
                         recipient_agent_id: None,
+                        seq: None,
+                        turn_id: None,
+                        parent_message_id: None,
                     },
                     r#"[{"role":"user","content":"hello"}]"#,
                     None,

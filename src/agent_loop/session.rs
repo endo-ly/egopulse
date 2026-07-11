@@ -19,13 +19,13 @@ use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage,
 /// Holds the messages loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
     pub(crate) messages: Arc<Vec<Message>>,
-    pub(crate) session_updated_at: Option<String>,
+    pub(crate) session_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 /// Represents the updated snapshot returned after persisting one phase.
 pub(crate) struct PersistedTurn {
-    pub(crate) updated_at: String,
+    pub(crate) revision: i64,
     pub(crate) messages: Vec<Message>,
 }
 
@@ -104,9 +104,9 @@ pub(crate) async fn persist_phase_once(
     scope: ConversationScope,
     message: StoredMessage,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    store_phase_snapshot(state, scope, message, messages.to_vec(), session_updated_at)
+    store_phase_snapshot(state, scope, message, messages.to_vec(), session_revision)
         .await
         .map_err(EgoPulseError::Storage)
 }
@@ -118,7 +118,7 @@ pub(crate) async fn persist_phase(
     message: StoredMessage,
     phase_message: Message,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     persist_phase_messages(
         state,
@@ -126,7 +126,7 @@ pub(crate) async fn persist_phase(
         message,
         vec![phase_message],
         messages,
-        session_updated_at,
+        session_revision,
     )
     .await
 }
@@ -137,14 +137,14 @@ pub(crate) async fn persist_phase_messages(
     message: StoredMessage,
     phase_messages: Vec<Message>,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     let persisted = store_phase_snapshot(
         state,
         scope,
         message.clone(),
         messages.to_vec(),
-        session_updated_at.clone(),
+        session_revision,
     )
     .await;
     if let Some(turn) = persisted_turn_or_retry(persisted)? {
@@ -155,12 +155,12 @@ pub(crate) async fn persist_phase_messages(
     // 今回の phase 群だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
     let LoadedSession {
         messages: refreshed_messages,
-        session_updated_at: refreshed_updated_at,
+        session_revision: refreshed_revision,
     } = load_messages_for_turn(state, scope, message.chat_id).await?;
     let mut all_messages = Arc::try_unwrap(refreshed_messages).unwrap_or_else(|arc| (*arc).clone());
     all_messages.extend(phase_messages);
 
-    store_phase_snapshot(state, scope, message, all_messages, refreshed_updated_at)
+    store_phase_snapshot(state, scope, message, all_messages, refreshed_revision)
         .await
         .map_err(EgoPulseError::Storage)
 }
@@ -197,7 +197,7 @@ async fn snapshot_to_loaded(
 
     Ok(LoadedSession {
         messages: Arc::new(repair_orphan_tool_outputs(messages)),
-        session_updated_at: snapshot.updated_at,
+        session_revision: snapshot.session_revision,
     })
 }
 
@@ -278,7 +278,7 @@ fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
                 })
                 .collect(),
         ),
-        session_updated_at: snapshot.updated_at.clone(),
+        session_revision: snapshot.session_revision,
     }
 }
 
@@ -311,7 +311,7 @@ async fn store_phase_snapshot(
     scope: ConversationScope,
     message: StoredMessage,
     snapshot_messages: Vec<Message>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, StorageError> {
     let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
         .await
@@ -319,12 +319,12 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
-    let updated_at = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
-        db.store_message_with_session(&message, &session_json, session_updated_at.as_deref())
+    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.store_message_with_session(&message, &session_json, session_revision)
     })
     .await?;
     Ok(PersistedTurn {
-        updated_at,
+        revision,
         messages: snapshot_messages,
     })
 }
@@ -441,6 +441,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = seed_message.clone();
@@ -456,12 +459,12 @@ mod tests {
         .await
         .expect("seed session");
 
-        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
+        let stale_session_revision = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 1)
-                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
+                .map(|snapshot| snapshot.session_revision.expect("session revision"))
         })
         .await
-        .expect("stale updated_at");
+        .expect("stale revision");
 
         let concurrent_message = StoredMessage {
             id: "seed-assistant".to_string(),
@@ -472,15 +475,18 @@ mod tests {
             timestamp: "2024-01-01T00:00:01Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
-            let expected_updated_at = stale_session_updated_at.clone();
+            let expected_revision = stale_session_revision;
             move |db| {
                 db.store_message_with_session(
                     &message,
                     r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
-                    Some(&expected_updated_at),
+                    Some(expected_revision),
                 )
                 .map(|_| ())
             }
@@ -500,10 +506,13 @@ mod tests {
                 timestamp: "2024-01-01T00:00:02Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "next"),
             &[Message::text("user", "hello")],
-            Some(stale_session_updated_at),
+            Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
@@ -556,6 +565,9 @@ mod tests {
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             messages[0].clone(),
             &messages,
@@ -568,7 +580,7 @@ mod tests {
             db.load_session_snapshot(chat_id, 10).map(|snapshot| {
                 (
                     snapshot.messages_json.expect("session json"),
-                    snapshot.updated_at.expect("session updated_at"),
+                    snapshot.session_revision.expect("session revision"),
                 )
             })
         })
@@ -751,12 +763,12 @@ mod tests {
         .await
         .expect("save seed snapshot");
 
-        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
+        let stale_session_revision = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 1)
-                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
+                .map(|snapshot| snapshot.session_revision.expect("session revision"))
         })
         .await
-        .expect("stale updated_at");
+        .expect("stale revision");
 
         let concurrent_message = StoredMessage {
             id: "concurrent-assistant".to_string(),
@@ -767,6 +779,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:52Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         let mut latest_messages = seed_messages.clone();
         latest_messages.push(Message::text("assistant", "concurrent"));
@@ -775,9 +790,9 @@ mod tests {
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
             let latest_json = latest_json.clone();
-            let expected_updated_at = stale_session_updated_at.clone();
+            let expected_revision = stale_session_revision;
             move |db| {
-                db.store_message_with_session(&message, &latest_json, Some(&expected_updated_at))
+                db.store_message_with_session(&message, &latest_json, Some(expected_revision))
                     .map(|_| ())
             }
         })
@@ -798,10 +813,13 @@ mod tests {
                 timestamp: "2024-01-01T00:00:53Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "next"),
             &stale_messages,
-            Some(stale_session_updated_at),
+            Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
@@ -1074,6 +1092,9 @@ mod tests {
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     message_kind: MessageKind::Message,
                     recipient_agent_id: None,
+                    seq: None,
+                    turn_id: None,
+                    parent_message_id: None,
                 })
             }
         })
@@ -1091,6 +1112,9 @@ mod tests {
                     timestamp: "2024-01-01T00:00:01Z".to_string(),
                     message_kind: MessageKind::Message,
                     recipient_agent_id: None,
+                    seq: None,
+                    turn_id: None,
+                    parent_message_id: None,
                 })
             }
         })
@@ -1141,6 +1165,9 @@ mod tests {
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "test"),
             &messages,

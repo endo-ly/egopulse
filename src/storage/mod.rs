@@ -64,10 +64,12 @@ mod chat;
 mod episode;
 mod migration;
 mod pulse;
+mod repositories;
 mod sleep;
 mod tool;
 
 pub(crate) use backup::BackupSettings;
+pub(crate) use repositories::ConversationStore;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -145,6 +147,13 @@ pub(crate) struct StoredMessage {
     pub timestamp: String,
     pub message_kind: MessageKind,
     pub recipient_agent_id: Option<String>,
+    /// Per-chat causal ordering index issued by `ConversationStore`.
+    pub seq: Option<i64>,
+    /// Owning Turn identifier, set when persisted through a Turn path.
+    pub turn_id: Option<String>,
+    /// Parent message referenced by this row (e.g. a Tool Result to its
+    /// issuing assistant message).
+    pub parent_message_id: Option<String>,
 }
 
 impl StoredMessage {
@@ -164,6 +173,9 @@ impl StoredMessage {
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
             recipient_agent_id,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }
     }
 
@@ -227,7 +239,10 @@ pub(crate) struct ChatInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSnapshot {
     pub messages_json: Option<String>,
-    pub updated_at: Option<String>,
+    /// CAS token for the next mutation: `Some(chats.revision)` when a session
+    /// row exists, `None` when the chat has no session snapshot yet (so the
+    /// next write performs an initial seed rather than an optimistic update).
+    pub session_revision: Option<i64>,
     pub recent_messages: Vec<StoredMessage>,
 }
 
@@ -617,6 +632,14 @@ impl Database {
         self.pool
             .get()
             .map_err(|e| StorageError::InitFailed(e.to_string()))
+    }
+
+    /// Borrows a [`ConversationStore`] scoped to this database.
+    ///
+    /// The repository borrows `self` for its lifetime, so it must not escape
+    /// the current synchronous write operation.
+    pub(crate) fn conversation_store(&self) -> ConversationStore<'_> {
+        ConversationStore::new(self)
     }
 
     /// Creates a pool-backed Database without running migrations.
