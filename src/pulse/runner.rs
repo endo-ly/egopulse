@@ -103,14 +103,14 @@ pub(crate) async fn run_activation(
         scope: ConversationScope::Normal,
     };
 
-    let system_prompt = build_system_prompt(state, &context);
+    let system_prompt = build_system_prompt(&state.turn_runtime(), &context);
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let phase_response = send_tool_phase_request(ToolPhaseRequest {
-            state,
+            state: &state.turn_runtime(),
             llm: channel_llm.as_ref(),
             system_prompt: &system_prompt,
             messages: Arc::clone(&messages),
@@ -151,7 +151,7 @@ pub(crate) async fn run_activation(
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
         let tool_outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
-            state,
+            &state.turn_runtime(),
             &tool_context,
             &assistant_message_id,
             assistant_phase.tool_calls.clone(),

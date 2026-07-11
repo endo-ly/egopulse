@@ -144,6 +144,31 @@ impl AppState {
         }
     }
 
+    /// Builds a [`crate::agent_loop::TurnRuntime`] from the subset of this
+    /// `AppState` that Turn execution actually needs.
+    ///
+    /// Scheduling, channel dispatch, and runtime observability fields are
+    /// intentionally omitted so that Turn logic cannot accidentally depend on
+    /// them.
+    pub(crate) fn turn_runtime(&self) -> crate::agent_loop::TurnRuntime {
+        crate::agent_loop::TurnRuntime {
+            db: Arc::clone(&self.db),
+            secret_db: self.secret_db.clone(),
+            config_manager: Arc::clone(&self.config_manager),
+            config_path: self.config_path.clone(),
+            llm_override: self.llm_override.clone(),
+            llm_cache: Arc::clone(&self.llm_cache),
+            tools: Arc::clone(&self.tools),
+            skills: Arc::clone(&self.skills),
+            soul_agents: Arc::clone(&self.soul_agents),
+            memory_loader: Arc::clone(&self.memory_loader),
+            assets: Arc::clone(&self.assets),
+            usage_calibrator: Arc::clone(&self.usage_calibrator),
+            turn_sender: self.turn_sender.clone(),
+            active_turns: Arc::clone(&self.active_turns),
+        }
+    }
+
     /// Returns the appropriate `Database` reference based on `scope`.
     ///
     /// # Panics
@@ -228,13 +253,9 @@ impl AppState {
 
     /// Resolves the database and archive root for the given conversation scope.
     ///
-    /// Callers that need both the database handle and the archive directory
-    /// (e.g. compaction) should prefer this over [`Self::db_for`] to avoid
-    /// duplicating scope-specific path logic.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
+    /// Kept on `AppState` so test builders and channel-side compaction callers
+    /// can reach it without constructing a [`TurnRuntime`].
+    #[allow(dead_code)]
     pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
         match scope {
             ConversationScope::Normal => ScopedStorage {
@@ -833,7 +854,9 @@ pub(crate) async fn execute_observed_turn(
         .touch_channel_activity(&context.channel);
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
-    let result = execute_turn_with_progress(state, context, input).await;
+    let runtime = state.turn_runtime();
+    let result =
+        crate::agent_loop::process_turn_with_events(&runtime, context, input, |_| {}).await;
     let duration = started.elapsed().as_secs_f64();
     state.runtime_status.push_turn(
         &context.trace_id,
@@ -875,10 +898,12 @@ async fn execute_turn_with_progress(
     let coordinator_abort = coordinator_handle.abort_handle();
 
     let event_sender = evt_tx.clone();
-    let result = crate::agent_loop::process_turn_with_events(state, context, input, move |event| {
-        let _ = event_sender.send(event);
-    })
-    .await;
+    let runtime = state.turn_runtime();
+    let result =
+        crate::agent_loop::process_turn_with_events(&runtime, context, input, move |event| {
+            let _ = event_sender.send(event);
+        })
+        .await;
 
     if result
         .as_ref()

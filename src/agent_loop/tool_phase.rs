@@ -6,6 +6,7 @@ use futures_util::future::join_all;
 use tracing::warn;
 
 use crate::agent_loop::ConversationScope;
+use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
     format_tool_result, message_to_text, sanitize_assistant_response_text,
@@ -15,7 +16,6 @@ use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
-use crate::runtime::AppState;
 use crate::storage::call_blocking;
 use crate::storage::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
 use crate::tools::{ToolExecutionContext, ToolResult};
@@ -70,7 +70,7 @@ pub(crate) enum ToolPhaseResponse {
 }
 
 pub(crate) struct ToolPhaseRequest<'a> {
-    pub(crate) state: &'a AppState,
+    pub(crate) state: &'a TurnRuntime,
     pub(crate) llm: &'a dyn LlmProvider,
     pub(crate) system_prompt: &'a str,
     pub(crate) messages: Arc<Vec<Message>>,
@@ -238,7 +238,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_llm_usage(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     caller_channel: &str,
@@ -278,7 +278,7 @@ pub(crate) async fn log_llm_usage(
 }
 
 pub(crate) async fn execute_tool_calls<'a>(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
@@ -333,7 +333,7 @@ pub(crate) async fn execute_tool_calls<'a>(
     Ok(outcomes)
 }
 
-async fn read_only_flags(state: &AppState, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
+async fn read_only_flags(state: &TurnRuntime, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
     let mut flags = Vec::with_capacity(valid_tool_calls.len());
     for tool_call in valid_tool_calls {
         flags.push(state.tools.is_read_only(&tool_call.name).await);
@@ -342,7 +342,7 @@ async fn read_only_flags(state: &AppState, valid_tool_calls: &[ToolCall]) -> Vec
 }
 
 async fn execute_single_tool(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     tool_call: ToolCall,
@@ -431,7 +431,7 @@ async fn execute_single_tool(
 /// retry identity is fixed at claim time. Idempotency classification comes
 /// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
 async fn claim_tool_slot(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     tool_call: &ToolCall,
@@ -472,7 +472,7 @@ async fn claim_tool_slot(
 /// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
 /// so no secret reaches the persisted `tool_output` / `error_message`.
 async fn record_tool_outcome(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
     tool_call: &ToolCall,
     result: &ToolResult,
@@ -688,9 +688,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("parallel-read"), "read both")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("parallel-read"),
+            "read both",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -754,7 +758,7 @@ mod tests {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(&full, "hello").expect("write");
 
-        let reply = process_turn(&state, &cli_context("mixed-tools"), "mixed")
+        let reply = process_turn(&state.turn_runtime(), &cli_context("mixed-tools"), "mixed")
             .await
             .expect("turn");
         assert_eq!(reply, "Done.");
@@ -805,9 +809,13 @@ mod tests {
             Box::new(provider.clone()),
         );
 
-        let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("usage-log-single"),
+            "hi",
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "hello world");
 
         // Verify LLM resolution: exactly one call with the right system prompt.
@@ -877,7 +885,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -932,7 +940,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -990,7 +998,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -1073,9 +1081,13 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
         std::fs::write(&file_path, "data").expect("file");
 
-        let reply = process_turn(&state, &cli_context("usage-log-multi"), "read the file")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("usage-log-multi"),
+            "read the file",
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "done");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1172,9 +1184,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("partial-parallel"), "mixed")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("partial-parallel"),
+            "mixed",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1250,7 +1266,7 @@ mod tests {
         )
         .expect("dir");
 
-        let reply = process_turn(&state, &cli_context("seq-write"), "write it")
+        let reply = process_turn(&state.turn_runtime(), &cli_context("seq-write"), "write it")
             .await
             .expect("turn");
         assert_eq!(reply, "Done.");
@@ -1327,9 +1343,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("transcript-order"), "ordered")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("transcript-order"),
+            "ordered",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let seen = provider.seen_messages();

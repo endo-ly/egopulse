@@ -85,7 +85,7 @@ pub(crate) async fn process_slash_command(
         return SlashCommandOutcome::Respond(response);
     }
 
-    match resolve_chat_id(state, context).await {
+    match resolve_chat_id(&state.turn_runtime(), context).await {
         Ok(chat_id) => {
             let response = handle_slash_command(state, chat_id, context, text, sender_id)
                 .await
@@ -219,7 +219,7 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(state, context.scope, chat_id).await {
+    let loaded = match load_messages_for_turn(&state.turn_runtime(), context.scope, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
@@ -233,7 +233,15 @@ async fn handle_compact(
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
-    match force_compact(state, context, chat_id, &loaded.messages, &llm).await {
+    match force_compact(
+        &state.turn_runtime(),
+        context,
+        chat_id,
+        &loaded.messages,
+        &llm,
+    )
+    .await
+    {
         Ok(compacted) => {
             let json = match serde_json::to_string(&compacted) {
                 Ok(j) => j,

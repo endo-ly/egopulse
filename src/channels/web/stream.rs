@@ -200,7 +200,7 @@ async fn resolve_new_web_session(
         "web".to_string(),
         default_agent,
     );
-    let chat_id = resolve_chat_id(&state.app_state, &context)
+    let chat_id = resolve_chat_id(&state.app_state.turn_runtime(), &context)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((format!("chat:{chat_id}"), context))
@@ -412,7 +412,7 @@ pub(super) async fn start_stream_run(
 
         let evt_tx_clone = evt_tx.clone();
         let result = process_turn_with_events(
-            &state_for_task.app_state,
+            &state_for_task.app_state.turn_runtime(),
             &context_for_task,
             &message,
             move |event| {

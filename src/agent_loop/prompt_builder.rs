@@ -1,11 +1,10 @@
 //! System prompt construction for agent turns.
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
-use crate::runtime::AppState;
+use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
 
 const CORE_INSTRUCTIONS: &str = include_str!("prompts/core_instructions.md");
 
-pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
+pub(crate) fn build_system_prompt(state: &TurnRuntime, context: &SurfaceContext) -> String {
     let channel = &context.channel;
     let thread = &context.surface_thread;
 
@@ -47,7 +46,7 @@ pub(crate) fn build_system_prompt(state: &AppState, context: &SurfaceContext) ->
     prompt
 }
 
-fn build_soul_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+fn build_soul_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
     let soul_content = state.soul_agents.load_soul(
         &context.channel,
         &context.surface_thread,
@@ -61,8 +60,11 @@ fn build_soul_prompt_section(state: &AppState, context: &SurfaceContext) -> Opti
     )
 }
 
-fn build_model_instructions_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
-    let config = &state.config;
+fn build_model_instructions_section(
+    state: &TurnRuntime,
+    context: &SurfaceContext,
+) -> Option<String> {
+    let config = state.current_config();
     let agent_id = crate::config::AgentId::new(&context.agent_id);
     let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
         Ok(r) => r,
@@ -92,7 +94,7 @@ fn build_model_instructions_section(state: &AppState, context: &SurfaceContext) 
     ))
 }
 
-fn build_agents_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+fn build_agents_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
     state.soul_agents.build_agents_section(
         &context.channel,
         &context.surface_thread,
@@ -100,7 +102,7 @@ fn build_agents_prompt_section(state: &AppState, context: &SurfaceContext) -> Op
     )
 }
 
-fn build_secret_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+fn build_secret_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
     if context.scope != ConversationScope::Secret {
         return None;
     }
@@ -108,7 +110,7 @@ fn build_secret_prompt_section(state: &AppState, context: &SurfaceContext) -> Op
     Some(format!("<secret>\n{content}\n</secret>"))
 }
 
-fn build_skills_prompt_section(state: &AppState) -> Option<String> {
+fn build_skills_prompt_section(state: &TurnRuntime) -> Option<String> {
     let skills_catalog = state.skills.build_skills_catalog();
     if skills_catalog.is_empty() {
         return None;
@@ -122,7 +124,7 @@ fn build_skills_prompt_section(state: &AppState) -> Option<String> {
     Some(section)
 }
 
-fn build_memory_prompt_section(state: &AppState, context: &SurfaceContext) -> Option<String> {
+fn build_memory_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
     let memory = state.memory_loader.load(&context.agent_id)?;
 
     let mut section = String::from(
@@ -160,6 +162,9 @@ fn build_base_prompt(context: &SurfaceContext) -> String {
         .replace("{SESSION}", &context.surface_thread)
         .replace("{CHAT_TYPE}", &context.chat_type)
 }
+
+#[cfg(test)]
+use crate::runtime::AppState;
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +243,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state, &ctx);
+        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -267,7 +272,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state, &ctx);
+        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -296,7 +301,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state, &ctx);
+        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -320,7 +325,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state, &ctx);
+        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -346,7 +351,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state, &ctx);
+        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
 
         // Assert
         assert!(result.is_none(), "should return None when no memory files");
@@ -364,7 +369,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let prompt = build_system_prompt(&state, &ctx);
+        let prompt = build_system_prompt(&state.turn_runtime(), &ctx);
 
         // Assert
         assert!(
@@ -398,7 +403,7 @@ mod tests {
         let state = build_test_state(dir.path());
         let ctx = test_context("testagent");
 
-        let prompt = build_system_prompt(&state, &ctx);
+        let prompt = build_system_prompt(&state.turn_runtime(), &ctx);
 
         assert!(
             !prompt.contains("Long-term Memory"),
@@ -443,7 +448,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "I am a wise assistant.");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(prompt.contains("<soul>"), "should contain <soul> tag");
         assert!(prompt.contains("</soul>"), "should contain </soul> tag");
@@ -457,7 +462,7 @@ mod tests {
     fn system_prompt_uses_default_identity_when_no_soul() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             !prompt.contains("<soul>"),
@@ -477,7 +482,7 @@ mod tests {
             "Use Rust for all code tasks.",
         );
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(prompt.contains("# CONTEXT"), "should contain # CONTEXT");
         assert!(prompt.contains("<agents>"), "should contain <agents>");
@@ -491,7 +496,7 @@ mod tests {
     fn system_prompt_no_agents_section_when_no_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             !prompt.contains("# CONTEXT"),
@@ -508,7 +513,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "Soul content here");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         let soul_pos = prompt.find("<soul>").expect("should find <soul>");
         let identity_pos = prompt
@@ -531,7 +536,7 @@ mod tests {
             "---\nname: test-skill\ndescription: A test skill\n---\nInstructions",
         );
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         let context_pos = prompt.find("# CONTEXT").expect("should find # CONTEXT");
         let skills_pos = prompt
@@ -550,7 +555,7 @@ mod tests {
         let chat_agents = dir.path().join("runtime/groups/web/thread1/AGENTS.md");
         write_file(&chat_agents, "Chat-specific agents content");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("thread1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("thread1"));
 
         assert!(prompt.contains("<agents>"), "should contain <agents>");
         assert!(
@@ -574,7 +579,7 @@ mod tests {
         let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
         write_file(&chat_soul, "chat soul content");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("thread1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("thread1"));
 
         assert!(
             prompt.contains("global soul content"),
@@ -599,7 +604,10 @@ mod tests {
             responses: std::sync::Mutex::new(vec![]),
         });
         let state = crate::test_util::build_state_with_config(config, Some(llm), None, None, None);
-        let prompt = build_system_prompt(&state, &web_context_with_agent("s1", "alice"));
+        let prompt = build_system_prompt(
+            &state.turn_runtime(),
+            &web_context_with_agent("s1", "alice"),
+        );
 
         assert!(
             prompt.contains("Alice soul content"),
@@ -616,7 +624,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "Default soul content");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             prompt.contains("Default soul content"),
@@ -629,7 +637,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "Default soul");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             prompt.contains("Default soul"),
@@ -671,7 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "global soul content");
         let state = build_test_state_with_instructions(dir.path(), "You prefer terse output.");
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             prompt.contains("<model-instructions>"),
@@ -708,7 +716,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "global soul content");
         let state = build_test_state(dir.path());
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             !prompt.contains("<model-instructions>"),
@@ -744,7 +752,7 @@ mod tests {
             None,
         );
 
-        let prompt = build_system_prompt(&state, &web_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &web_context("s1"));
 
         assert!(
             !prompt.contains("<model-instructions>"),
@@ -775,7 +783,7 @@ mod tests {
         );
         let state = build_test_state(dir.path());
 
-        let prompt = build_system_prompt(&state, &secret_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &secret_context("s1"));
 
         assert!(
             prompt.contains("<secret>"),
@@ -796,7 +804,10 @@ mod tests {
         );
         let state = build_test_state(dir.path());
 
-        let prompt = build_system_prompt(&state, &web_context_with_agent("s1", "default"));
+        let prompt = build_system_prompt(
+            &state.turn_runtime(),
+            &web_context_with_agent("s1", "default"),
+        );
 
         assert!(
             !prompt.contains("<secret>"),
@@ -819,7 +830,7 @@ mod tests {
 
         let state = build_test_state(dir.path());
 
-        let prompt = build_system_prompt(&state, &secret_context("s1"));
+        let prompt = build_system_prompt(&state.turn_runtime(), &secret_context("s1"));
 
         let secret_pos = prompt
             .find("SECRET_MARKER")

@@ -18,11 +18,10 @@ use crate::agent_loop::tool_phase::{
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
     send_tool_phase_request,
 };
-use crate::agent_loop::{ConversationScope, SurfaceContext};
+use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
 use crate::channels::utils::text::truncate_by_chars;
 use crate::error::{EgoPulseError, LlmError, StorageError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
-use crate::runtime::{AppState, build_app_state};
 use crate::storage::{AcceptOutcome, StoredMessage, TurnRun, TurnRunState, call_blocking};
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
@@ -75,7 +74,7 @@ impl EventEmitter {
 
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
-    state: &'a AppState,
+    state: &'a TurnRuntime,
     agent_id: &'a str,
 }
 
@@ -160,7 +159,7 @@ impl TurnLoopState {
 }
 
 struct TurnExecutor<'a> {
-    state: &'a AppState,
+    state: &'a TurnRuntime,
     context: &'a SurfaceContext,
     on_event: EventEmitter,
 }
@@ -171,13 +170,13 @@ pub async fn ask_in_session(
     session: &str,
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
-    let state = build_app_state(config).await?;
+    let state = crate::runtime::build_app_state(config).await?;
     let context = SurfaceContext {
         channel: "cli".to_string(),
         surface_user: "local_user".to_string(),
         surface_thread: session.to_string(),
         chat_type: "cli".to_string(),
-        agent_id: state.config.default_agent.to_string(),
+        agent_id: state.current_config().default_agent.to_string(),
         channel_log_chat_id: None,
         chain_depth: 0,
         origin_id: String::new(),
@@ -187,15 +186,16 @@ pub async fn ask_in_session(
         request_key: String::new(),
     };
 
+    let runtime = state.turn_runtime();
     tokio::select! {
-        response = process_turn(&state, &context, prompt) => response,
+        response = process_turn(&runtime, &context, prompt) => response,
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
 }
 
 /// Processes a turn and aborts cleanly when Ctrl-C is received.
 pub(crate) async fn send_turn(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
@@ -232,7 +232,7 @@ fn format_current_time(tz: &str) -> String {
 
 /// Processes one user turn against the persisted session state.
 pub(crate) async fn process_turn(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
@@ -241,7 +241,7 @@ pub(crate) async fn process_turn(
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
 pub(crate) async fn process_turn_with_events<F>(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     user_input: &str,
     on_event: F,
@@ -253,7 +253,7 @@ where
 }
 
 async fn process_turn_inner(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     user_input: &str,
     on_event: EventEmitter,
@@ -505,7 +505,7 @@ impl TurnExecutor<'_> {
 
         let timestamp_line = format!(
             "[Current time: {}]\n",
-            format_current_time(&self.state.config.timezone)
+            format_current_time(&self.state.current_config().timezone)
         );
         let user_message = Message::text("user", format!("{timestamp_line}{user_input}"));
 
@@ -865,7 +865,7 @@ fn evaluate_malformed_response(
 
 #[allow(clippy::too_many_arguments)]
 async fn persist_and_finalize(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
@@ -903,7 +903,7 @@ async fn persist_and_finalize(
 }
 
 async fn execute_and_persist_tools(
-    state: &AppState,
+    state: &TurnRuntime,
     on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     messages: Arc<Vec<Message>>,
@@ -953,7 +953,7 @@ async fn execute_and_persist_tools(
 
 #[allow(clippy::too_many_arguments)]
 async fn persist_tool_call_assistant_message(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
@@ -984,7 +984,7 @@ async fn persist_tool_call_assistant_message(
 }
 
 async fn persist_tool_result_messages(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
@@ -1018,7 +1018,7 @@ async fn persist_tool_result_messages(
 }
 
 async fn execute_tool_calls(
-    state: &AppState,
+    state: &TurnRuntime,
     on_event: &EventEmitter,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
@@ -1063,7 +1063,7 @@ async fn execute_tool_calls(
 
 #[allow(clippy::too_many_arguments)]
 async fn persist_user_turn_with_compaction(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     chat_id: i64,
     input_message_id: &str,
@@ -1122,7 +1122,7 @@ async fn persist_user_turn_with_compaction(
 }
 
 async fn handle_user_turn_persist_error(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     attempt: usize,
@@ -1134,7 +1134,7 @@ async fn handle_user_turn_persist_error(
     }
 }
 
-async fn load_channel_context(state: &AppState, context: &SurfaceContext) -> Option<Message> {
+async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
     let messages = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
         db.get_channel_log_messages(log_chat_id, CHANNEL_CONTEXT_LIMIT)
@@ -1194,7 +1194,7 @@ enum PersistConflictOutcome {
 /// the Turn to `uncertain`. The `output_published` flag on [`ModelRequestError`]
 /// communicates that decision.
 async fn send_model_request_with_retry(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
     turn: &TurnRun,
     prepared: &PreparedTurn,
@@ -1320,6 +1320,9 @@ fn sanitize_error_message(error: &EgoPulseError) -> String {
     let summary = error.user_facing_summary();
     truncate_by_chars(&summary, 200)
 }
+
+#[cfg(test)]
+use crate::runtime::AppState;
 
 #[cfg(test)]
 pub(crate) struct DeltaEmittingProvider {
@@ -1698,9 +1701,13 @@ mod tests {
         std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
         std::fs::write(&note_path, "hello from tool").expect("notes");
 
-        let reply = process_turn(&state, &cli_context("tool-flow"), "please read the note")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("tool-flow"),
+            "please read the note",
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "All set");
 
         let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1737,7 +1744,7 @@ mod tests {
             Box::new(FailingProvider),
         );
 
-        let error = process_turn(&state, &cli_context("failure"), "hello")
+        let error = process_turn(&state.turn_runtime(), &cli_context("failure"), "hello")
             .await
             .expect_err("should fail");
         assert!(matches!(error, EgoPulseError::Llm(_)));
@@ -1818,7 +1825,7 @@ mod tests {
         let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let collector = Arc::clone(&collected);
         let reply = process_turn_with_events(
-            &state,
+            &state.turn_runtime(),
             &cli_context("delta-stream"),
             "hello",
             move |event| {
@@ -1901,10 +1908,10 @@ mod tests {
         std::fs::write(&file_path, "repeat content").expect("repeat.txt");
 
         let context = cli_context("repeated-tool-call-id");
-        let first = process_turn(&state, &context, "read once")
+        let first = process_turn(&state.turn_runtime(), &context, "read once")
             .await
             .expect("first turn");
-        let second = process_turn(&state, &context, "read again")
+        let second = process_turn(&state.turn_runtime(), &context, "read again")
             .await
             .expect("second turn");
 
@@ -1965,9 +1972,13 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
         std::fs::write(&file_path, "duplicate content").expect("duplicate.txt");
 
-        let reply = process_turn(&state, &cli_context("duplicate-tool-call-id"), "read it")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("duplicate-tool-call-id"),
+            "read it",
+        )
+        .await
+        .expect("process turn");
 
         assert_eq!(reply, "Done.");
         let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -2018,7 +2029,7 @@ mod tests {
             }),
         );
 
-        let error = process_turn(&state, &cli_context("malformed"), "test")
+        let error = process_turn(&state.turn_runtime(), &cli_context("malformed"), "test")
             .await
             .expect_err("should fail with malformed tool calls");
         assert!(matches!(error, EgoPulseError::Llm(_)));
@@ -2112,7 +2123,7 @@ mod tests {
         let context = multi_agent_context("ctx-loaded", log_chat_id);
 
         // Act
-        let reply = process_turn(&state, &context, "test input")
+        let reply = process_turn(&state.turn_runtime(), &context, "test input")
             .await
             .expect("turn");
         assert_eq!(reply, "ok");
@@ -2179,7 +2190,7 @@ mod tests {
         let context = multi_agent_context("ctx-limit-30", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state, &context, "test input")
+        let _reply = process_turn(&state.turn_runtime(), &context, "test input")
             .await
             .expect("turn");
 
@@ -2239,7 +2250,7 @@ mod tests {
         let context = multi_agent_context("ctx-direct-input", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state, &context, "my direct question")
+        let _reply = process_turn(&state.turn_runtime(), &context, "my direct question")
             .await
             .expect("turn");
 
@@ -2311,7 +2322,9 @@ mod tests {
                 Box::new(provider.clone()),
             );
 
-            let reply = process_turn(&state, &context, "hello").await.expect("turn");
+            let reply = process_turn(&state.turn_runtime(), &context, "hello")
+                .await
+                .expect("turn");
             assert_eq!(reply, "ok");
 
             let seen = provider.seen_messages();
@@ -2377,7 +2390,9 @@ mod tests {
         let context = multi_agent_context("ctx-no-persist", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state, &context, "hello").await.expect("turn");
+        let _reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn");
 
         // Assert: the agent session's messages_json does NOT contain channel context
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -2466,7 +2481,7 @@ mod tests {
 
         // First turn with channel context
         let context = multi_agent_context("int-full-flow", log_chat_id);
-        let reply1 = process_turn(&state, &context, "first question")
+        let reply1 = process_turn(&state.turn_runtime(), &context, "first question")
             .await
             .expect("turn 1");
         assert_eq!(reply1, "I'll help with that.");
@@ -2483,7 +2498,7 @@ mod tests {
         );
 
         // Second turn — verify session continuity
-        let reply2 = process_turn(&state, &context, "follow up")
+        let reply2 = process_turn(&state.turn_runtime(), &context, "follow up")
             .await
             .expect("turn 2");
         assert_eq!(reply2, "Following up.");
@@ -2636,7 +2651,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state, &context, "trace me")
+        let reply = process_turn(&state.turn_runtime(), &context, "trace me")
             .await
             .expect("turn");
 
@@ -2677,7 +2692,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state, &context, "auto trace me")
+        let reply = process_turn(&state.turn_runtime(), &context, "auto trace me")
             .await
             .expect("turn");
 
@@ -2767,7 +2782,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state, &context, "top secret input")
+        let reply = process_turn(&state.turn_runtime(), &context, "top secret input")
             .await
             .expect("turn");
 
@@ -2804,7 +2819,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state, &context, "normal input")
+        let reply = process_turn(&state.turn_runtime(), &context, "normal input")
             .await
             .expect("turn");
 
@@ -2844,7 +2859,7 @@ mod tests {
         let mut context = cli_context("secret-routing");
         context.scope = ConversationScope::Secret;
 
-        let chat_id = crate::agent_loop::session::resolve_chat_id(&state, &context)
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("resolve chat id");
         assert!(chat_id > 0, "secret chat should resolve to a positive id");
@@ -2902,7 +2917,7 @@ mod tests {
         let mut context = cli_context("secret-db-isolation");
         context.scope = ConversationScope::Secret;
 
-        let reply = process_turn(&state, &context, "top secret")
+        let reply = process_turn(&state.turn_runtime(), &context, "top secret")
             .await
             .expect("process turn");
         assert_eq!(reply, "secret reply");
@@ -3088,7 +3103,7 @@ mod tests {
         // is forwarded to the coordinator. Dropping the closure on return
         // closes the channel, signalling EOF to the coordinator.
         let reply = process_turn_with_events(
-            &state,
+            &state.turn_runtime(),
             &cli_context("narration-e2e"),
             "please read note.txt",
             move |event| {
@@ -3178,10 +3193,10 @@ mod tests {
         let context = context_with_request_key("dup-accept", "cli:duplicate:1");
 
         // Act: accept the same request_key twice.
-        let first = process_turn(&state, &context, "hi")
+        let first = process_turn(&state.turn_runtime(), &context, "hi")
             .await
             .expect("first turn");
-        let second = process_turn(&state, &context, "hi")
+        let second = process_turn(&state.turn_runtime(), &context, "hi")
             .await
             .expect("second turn");
 
@@ -3229,10 +3244,10 @@ mod tests {
         let context = context_with_request_key("reuse", "cli:reuse:1");
 
         // Act: run once (consumes the response), then re-accept.
-        let first = process_turn(&state, &context, "hello")
+        let first = process_turn(&state.turn_runtime(), &context, "hello")
             .await
             .expect("first");
-        let second = process_turn(&state, &context, "hello")
+        let second = process_turn(&state.turn_runtime(), &context, "hello")
             .await
             .expect("second");
 
@@ -3281,7 +3296,9 @@ mod tests {
         let context = context_with_request_key("retry", "cli:retry:1");
 
         // Act
-        let reply = process_turn(&state, &context, "hello").await.expect("turn");
+        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn");
 
         // Assert: the same iteration was retried and eventually succeeded.
         assert_eq!(reply, "recovered");
@@ -3309,7 +3326,7 @@ mod tests {
         let context = context_with_request_key("partial-delta", "cli:partial:1");
 
         // Act
-        let error = process_turn(&state, &context, "hello")
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
             .await
             .expect_err("should fail after partial delta");
 
@@ -3381,7 +3398,7 @@ mod tests {
         let context = context_with_request_key("tc-fail", "cli:tc-fail:1");
 
         // Act
-        let error = process_turn(&state, &context, "read the note")
+        let error = process_turn(&state.turn_runtime(), &context, "read the note")
             .await
             .expect_err("should fail on the second LLM call");
 

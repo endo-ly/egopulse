@@ -13,10 +13,12 @@ pub(crate) mod session_snapshot;
 pub(crate) mod soul_agents;
 pub(crate) mod tool_phase;
 pub(crate) mod turn;
+pub(crate) mod turn_runtime;
 
 pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
+pub(crate) use turn_runtime::TurnRuntime;
 
 /// A pending turn to be executed for a target agent, enqueued by `agent_send`.
 #[derive(Debug, Clone)]

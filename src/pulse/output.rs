@@ -253,7 +253,7 @@ async fn persist_notification_with_session(
     };
 
     let loaded = crate::agent_loop::session::load_messages_for_turn(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         chat_id,
     )
@@ -266,7 +266,7 @@ async fn persist_notification_with_session(
         mut revision,
         messages: mut session_messages,
     } = persist_phase_once(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         synthetic_input.clone(),
         &session_messages,
@@ -280,7 +280,7 @@ async fn persist_notification_with_session(
             revision: next_revision,
             messages: persisted_messages,
         } = persist_phase(
-            state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: phase.assistant_message_id.clone(),
@@ -304,7 +304,7 @@ async fn persist_notification_with_session(
                 revision: next_revision,
                 messages: persisted_messages,
             } = persist_phase_messages(
-                state,
+                &state.turn_runtime(),
                 ConversationScope::Normal,
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
@@ -333,7 +333,7 @@ async fn persist_notification_with_session(
     session_messages.push(Message::text("assistant", output_text));
 
     persist_phase_once(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         assistant_msg,
         &session_messages,
