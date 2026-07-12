@@ -385,7 +385,7 @@ impl TurnExecutor<'_> {
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
         let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.turn_run_store().accept_or_get(
+            db.accept_or_get_turn(
                 chat_id,
                 &request_key,
                 config_revision,
@@ -426,7 +426,7 @@ impl TurnExecutor<'_> {
         let message_id = prepared.input_message_id.clone();
         call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().commit_input(&turn_id, &message_id),
+            move |db| db.commit_turn_input(&turn_id, &message_id),
         )
         .await?;
         Ok(())
@@ -436,7 +436,7 @@ impl TurnExecutor<'_> {
         let scope = self.context.scope;
         let turn_id_owned = turn_id.to_string();
         let run = match call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.turn_run_store().get(&turn_id_owned)
+            db.get_turn_run(&turn_id_owned)
         })
         .await
         {
@@ -458,8 +458,7 @@ impl TurnExecutor<'_> {
         let error_message = sanitize_error_message(error);
         let turn_id_for_fail = turn_id.to_string();
         if let Err(e) = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.turn_run_store()
-                .fail(&turn_id_for_fail, target, error_kind, &error_message)
+            db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
         })
         .await
         {
@@ -654,7 +653,7 @@ impl TurnExecutor<'_> {
         let turn_id = turn_id.to_string();
         if let Err(e) = call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().mark_output_published(&turn_id),
+            move |db| db.mark_turn_output_published(&turn_id),
         )
         .await
         {
@@ -735,7 +734,7 @@ impl TurnExecutor<'_> {
         let turn_id = turn_id.to_string();
         call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().complete_model(&turn_id),
+            move |db| db.complete_turn_model(&turn_id),
         )
         .await?;
         Ok(())
@@ -745,7 +744,7 @@ impl TurnExecutor<'_> {
         let turn_id = turn_id.to_string();
         call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().begin_tools(&turn_id),
+            move |db| db.begin_turn_tools(&turn_id),
         )
         .await?;
         Ok(())
@@ -755,7 +754,7 @@ impl TurnExecutor<'_> {
         let turn_id = turn_id.to_string();
         call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().complete_tools(&turn_id),
+            move |db| db.complete_turn_tools(&turn_id),
         )
         .await?;
         Ok(())
@@ -796,7 +795,7 @@ impl TurnExecutor<'_> {
         let final_message_id = final_message_id.to_string();
         call_blocking(
             Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.turn_run_store().complete(&turn_id, &final_message_id),
+            move |db| db.complete_turn(&turn_id, &final_message_id),
         )
         .await?;
         Ok(())
@@ -1267,8 +1266,7 @@ async fn send_model_request_with_retry(
     let turn_id = turn.turn_id.clone();
     let hash_for_init = hash.clone();
     call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
-        db.turn_run_store()
-            .begin_model_iteration(&turn_id, iteration as i64, &hash_for_init)
+        db.begin_turn_model_iteration(&turn_id, iteration as i64, &hash_for_init)
     })
     .await
     .map_err(|e| ModelRequestError {
@@ -1310,7 +1308,7 @@ async fn send_model_request_with_retry(
                 if retryable && !published && attempt < MAX_LLM_RETRIES {
                     let turn_id = turn.turn_id.clone();
                     let _ = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
-                        db.turn_run_store().increment_model_attempt(&turn_id)
+                        db.increment_turn_model_attempt(&turn_id)
                     })
                     .await;
                     let backoff = llm_retry_backoff(attempt, &error);

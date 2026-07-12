@@ -451,7 +451,7 @@ async fn claim_tool_slot(
     let tool_input_for_closure = tool_input;
     let key_for_closure = key;
     Ok(call_blocking(Arc::clone(&state.db), move |db| {
-        db.tool_execution_store().claim(ClaimParams {
+        db.claim_tool_execution(ClaimParams {
             turn_id: &turn_id,
             chat_id,
             message_id: &message_id,
@@ -482,19 +482,13 @@ async fn record_tool_outcome(
     if result.is_error {
         let error_message = result.content.clone();
         Ok(call_blocking(Arc::clone(&state.db), move |db| {
-            db.tool_execution_store().record_failure(
-                &turn_id,
-                &tool_call_id,
-                "tool_error",
-                &error_message,
-            )
+            db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
         })
         .await?)
     } else {
         let payload = payload.to_string();
         Ok(call_blocking(Arc::clone(&state.db), move |db| {
-            db.tool_execution_store()
-                .record_success(&turn_id, &tool_call_id, &payload)
+            db.record_tool_success(&turn_id, &tool_call_id, &payload)
         })
         .await?)
     }

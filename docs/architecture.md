@@ -204,9 +204,10 @@ Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnR
 ```text
 TurnRuntime
 ├── ConfigManager          — immutable Config snapshot（revision / fingerprint）
-├── ConversationStore      — chats / messages / sessions の原子的更新（revision CAS）
-├── TurnRepository         — turn_runs の作成・重複受付防止・状態遷移
-├── ToolExecutionRepository — tool_calls の claim・状態更新・結果再利用
+├── Database
+│   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
+│   ├── turn.rs            — turn_runs の作成・重複受付防止・状態遷移
+│   └── tool.rs            — tool_calls の claim・状態更新・結果再利用
 ├── ProviderRegistry       — Config snapshot 対応の Provider 解決と cache
 └── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
 ```

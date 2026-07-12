@@ -62,17 +62,16 @@ macro_rules! parse_row_enum {
 pub(crate) mod backup;
 mod chat;
 mod episode;
+mod llm_usage;
 mod migration;
 mod pulse;
-mod repositories;
 mod sleep;
 mod tool;
+mod turn;
 
 pub(crate) use backup::BackupSettings;
-pub(crate) use repositories::{
-    AcceptOutcome, ClaimOutcome, ClaimParams, ConversationStore, ToolExecutionRepository,
-    TurnRepository, TurnRun, canonical_tool_input, input_hash,
-};
+pub(crate) use tool::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
+pub(crate) use turn::{AcceptOutcome, TurnRun};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -150,7 +149,8 @@ pub(crate) struct StoredMessage {
     pub timestamp: String,
     pub message_kind: MessageKind,
     pub recipient_agent_id: Option<String>,
-    /// Per-chat causal ordering index issued by `ConversationStore`.
+    /// Per-chat causal ordering index issued by the conversation commit path
+    /// (`commit_message_locked`).
     pub seq: Option<i64>,
     /// Owning Turn identifier, set when persisted through a Turn path.
     pub turn_id: Option<String>,
@@ -291,7 +291,7 @@ define_enum! {
 
 // Tool実行台帳 (`tool_calls.state`) の状態。
 //
-// `ToolExecutionRepository` がこの enum と中央遷移ルールを経由してのみ
+// `tool.rs` の `Database` メソッドがこの enum と中央遷移ルールを経由してのみ
 // 状態を更新する。自由文字列での更新は禁止。
 define_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +306,7 @@ define_enum! {
 
 // Turn実行の永続状態 (`turn_runs.state`)。
 //
-// `TurnRepository` が中央遷移ルール (`TurnRunState::can_transition`) を
+// `turn.rs` の `Database` メソッドが中央遷移ルール (`TurnRunState::can_transition`) を
 // 経由してのみ状態を更新する。自由文字列での更新は禁止し、許可されて
 // いない遷移はDB更新前に拒否する。
 define_enum! {
@@ -337,7 +337,7 @@ impl TurnRunState {
     /// 許可された状態遷移のみ true を返す中央遷移ルール。
     ///
     /// 任意のmoduleから自由文字列で状態を更新することを防ぐため、
-    /// `TurnRepository` はこの関数で遷移を検証してからDB更新する。
+    /// `Database` はこの関数で遷移を検証してからDB更新する。
     pub(crate) fn can_transition(from: Self, to: Self) -> bool {
         use TurnRunState::*;
         if from == to {
@@ -756,30 +756,6 @@ impl Database {
         self.pool
             .get()
             .map_err(|e| StorageError::InitFailed(e.to_string()))
-    }
-
-    /// Borrows a [`ConversationStore`] scoped to this database.
-    ///
-    /// The repository borrows `self` for its lifetime, so it must not escape
-    /// the current synchronous write operation.
-    pub(crate) fn conversation_store(&self) -> ConversationStore<'_> {
-        ConversationStore::new(self)
-    }
-
-    /// Borrows a [`ToolExecutionRepository`] scoped to this database.
-    ///
-    /// The repository borrows `self` for its lifetime, so it must not escape
-    /// the current synchronous write operation.
-    pub(crate) fn tool_execution_store(&self) -> ToolExecutionRepository<'_> {
-        ToolExecutionRepository::new(self)
-    }
-
-    /// Borrows a [`TurnRepository`] scoped to this database.
-    ///
-    /// The repository borrows `self` for its lifetime, so it must not escape
-    /// the current synchronous write operation.
-    pub(crate) fn turn_run_store(&self) -> TurnRepository<'_> {
-        TurnRepository::new(self)
     }
 
     /// Creates a pool-backed Database without running migrations.

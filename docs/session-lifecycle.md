@@ -394,7 +394,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed` | 中間状態は結果が不明のため `uncertain` |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-同時に `ToolExecutionRepository::recover_running()` が `running` の Tool を `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
+同時に `Database::recover_running_tools()` が `running` の Tool を `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
 
 ### 9.4 安全停止の原則
 

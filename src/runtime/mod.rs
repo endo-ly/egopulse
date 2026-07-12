@@ -404,8 +404,8 @@ pub async fn build_app_state_with_path(
 /// Recovers durable Turn / Tool state on startup.
 ///
 /// Runs against both the primary and (when present) secret databases:
-/// `running` tool_calls are transitioned by [`ToolExecutionRepository::recover_running`],
-/// and non-terminal `turn_runs` are stopped safely by [`TurnRepository::recover_interrupted`].
+/// `running` tool_calls are transitioned by [`Database::recover_running_tools`],
+/// and non-terminal `turn_runs` are stopped safely by [`Database::recover_interrupted_turns`].
 /// Failures are logged but never abort startup so the runtime can still serve
 /// new turns.
 async fn recover_durable_state(state: &AppState) {
@@ -421,7 +421,7 @@ fn recover_durable_state_for_db(
     scope: ConversationScope,
     current_fingerprint: Option<&str>,
 ) {
-    match db.as_ref().tool_execution_store().recover_running() {
+    match db.as_ref().recover_running_tools() {
         Ok(recovered) if !recovered.is_empty() => {
             for tool in &recovered {
                 tracing::info!(
@@ -438,11 +438,7 @@ fn recover_durable_state_for_db(
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
     }
-    match db
-        .as_ref()
-        .turn_run_store()
-        .recover_interrupted(current_fingerprint)
-    {
+    match db.as_ref().recover_interrupted_turns(current_fingerprint) {
         Ok(recovered) if !recovered.is_empty() => {
             for turn in &recovered {
                 tracing::info!(

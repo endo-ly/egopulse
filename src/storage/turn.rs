@@ -1,5 +1,4 @@
-//! `TurnRepository`: the single authoritative boundary for `turn_runs`
-//! persistence and the Turn state machine.
+//! Durable Turn lifecycle persistence (`turn_runs`) and the Turn state machine.
 //!
 //! Every Turn's lifecycle is persisted into the `turn_runs` table so that:
 //!
@@ -18,9 +17,6 @@
 //! `config_fingerprint` means the Config identity was not captured at
 //! acceptance time; recovery treats it as "cannot verify config integrity"
 //! and conservatively stops.
-//!
-//! The repository borrows the owning [`Database`] for its lifetime; construct
-//! one via [`Database::turn_run_store`].
 
 use rusqlite::OptionalExtension;
 use rusqlite::params;
@@ -51,7 +47,7 @@ pub(crate) struct TurnRun {
     pub request_payload_hash: Option<String>,
 }
 
-/// Outcome of [`TurnRepository::accept_or_get`].
+/// Outcome of [`Database::accept_or_get_turn`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcceptOutcome {
     /// A fresh `accepted` Turn was created and may proceed.
@@ -61,7 +57,7 @@ pub(crate) enum AcceptOutcome {
     Existing(TurnRun),
 }
 
-/// One Turn recovered by [`TurnRepository::recover_interrupted`].
+/// One Turn recovered by [`Database::recover_interrupted_turns`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredTurnRun {
     pub turn_id: String,
@@ -70,19 +66,112 @@ pub(crate) struct RecoveredTurnRun {
     pub recovered_to: TurnRunState,
 }
 
-/// Aggregates all `turn_runs` writes: idempotent acceptance, validated state
-/// transitions, model-iteration bookkeeping, terminal recording, and crash
-/// recovery. Reads that support those writes live here too; general Turn
-/// queries (e.g. listing) stay on [`Database`].
-pub(crate) struct TurnRepository<'a> {
-    db: &'a Database,
+const TURN_RUN_COLUMNS: &str = "turn_id, chat_id, request_key, state, current_iteration,
+    input_message_id, final_message_id, config_revision,
+    config_fingerprint, model_request_hash, model_attempt,
+    output_published, error_kind, error_message, accepted_at,
+    updated_at, finished_at, request_payload_hash";
+
+/// Loads and parses the current state of a Turn inside a transaction.
+/// Returns [`StorageError::NotFound`] when the row is missing, or
+/// [`StorageError::Conflict`] when the persisted state string is invalid.
+fn read_state_locked(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+) -> Result<TurnRunState, StorageError> {
+    let state_str: String = tx
+        .query_row(
+            "SELECT state FROM turn_runs WHERE turn_id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
+    state_str
+        .parse()
+        .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))
 }
 
-impl<'a> TurnRepository<'a> {
-    pub(crate) fn new(db: &'a Database) -> Self {
-        Self { db }
+fn transition_locked(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    from: TurnRunState,
+    to: TurnRunState,
+) -> Result<(), StorageError> {
+    let current = read_state_locked(tx, turn_id)?;
+    if current != from {
+        return Err(StorageError::Conflict(format!(
+            "turn state transition rejected: expected {from} but was {current}"
+        )));
     }
+    if !TurnRunState::can_transition(from, to) {
+        return Err(StorageError::Conflict(format!(
+            "turn state transition rejected: {from} -> {to}"
+        )));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    tx.execute(
+        "UPDATE turn_runs SET state = ?2, updated_at = ?3 WHERE turn_id = ?1",
+        params![turn_id, to.to_string(), &now],
+    )?;
+    Ok(())
+}
 
+fn require_state_locked(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    expected: TurnRunState,
+) -> Result<(), StorageError> {
+    let state = read_state_locked(tx, turn_id)?;
+    if state != expected {
+        return Err(StorageError::Conflict(format!(
+            "turn state transition rejected: expected {expected} but was {state}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_turn_run(
+    handle: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<TurnRun>, StorageError> {
+    let row = handle
+        .query_row(sql, params, |row| {
+            let state_str: String = row.get(3)?;
+            let state: TurnRunState = state_str.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })?;
+            Ok(TurnRun {
+                turn_id: row.get(0)?,
+                chat_id: row.get(1)?,
+                request_key: row.get(2)?,
+                state,
+                current_iteration: row.get(4)?,
+                input_message_id: row.get(5)?,
+                final_message_id: row.get(6)?,
+                config_revision: row.get(7)?,
+                config_fingerprint: row.get(8)?,
+                model_request_hash: row.get(9)?,
+                model_attempt: row.get(10)?,
+                output_published: row.get::<_, i64>(11)? != 0,
+                error_kind: row.get(12)?,
+                error_message: row.get(13)?,
+                accepted_at: row.get(14)?,
+                updated_at: row.get(15)?,
+                finished_at: row.get(16)?,
+                request_payload_hash: row.get(17)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+impl Database {
     /// Creates a new `accepted` Turn for `(chat_id, request_key)`, or returns
     /// the existing row if the same key was already accepted.
     ///
@@ -100,7 +189,7 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite write fails.
-    pub(crate) fn accept_or_get(
+    pub(crate) fn accept_or_get_turn(
         &self,
         chat_id: i64,
         request_key: &str,
@@ -108,7 +197,7 @@ impl<'a> TurnRepository<'a> {
         config_fingerprint: Option<&str>,
         request_payload_hash: &str,
     ) -> Result<AcceptOutcome, StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
         let proposed_turn_id = uuid::Uuid::new_v4().to_string();
@@ -129,15 +218,13 @@ impl<'a> TurnRepository<'a> {
             ],
         )?;
 
-        let run = Self::read_row(
+        let run = read_turn_run(
             &tx,
-            "SELECT turn_id, chat_id, request_key, state, current_iteration,
-                    input_message_id, final_message_id, config_revision,
-                    config_fingerprint, model_request_hash, model_attempt,
-                    output_published, error_kind, error_message, accepted_at,
-                    updated_at, finished_at, request_payload_hash
-             FROM turn_runs
-             WHERE chat_id = ?1 AND request_key = ?2",
+            &format!(
+                "SELECT {TURN_RUN_COLUMNS}
+                 FROM turn_runs
+                 WHERE chat_id = ?1 AND request_key = ?2"
+            ),
             params![chat_id, request_key],
         )?
         .ok_or_else(|| {
@@ -168,17 +255,15 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError::NotFound`] when no row exists.
-    pub(crate) fn get(&self, turn_id: &str) -> Result<TurnRun, StorageError> {
-        let conn = self.db.get_conn()?;
-        Self::read_row(
+    pub(crate) fn get_turn_run(&self, turn_id: &str) -> Result<TurnRun, StorageError> {
+        let conn = self.get_conn()?;
+        read_turn_run(
             &conn,
-            "SELECT turn_id, chat_id, request_key, state, current_iteration,
-                    input_message_id, final_message_id, config_revision,
-                    config_fingerprint, model_request_hash, model_attempt,
-                    output_published, error_kind, error_message, accepted_at,
-                    updated_at, finished_at, request_payload_hash
-             FROM turn_runs
-             WHERE turn_id = ?1",
+            &format!(
+                "SELECT {TURN_RUN_COLUMNS}
+                 FROM turn_runs
+                 WHERE turn_id = ?1"
+            ),
             params![turn_id],
         )?
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
@@ -194,61 +279,16 @@ impl<'a> TurnRepository<'a> {
     /// Returns [`StorageError::NotFound`] when no row exists, or
     /// [`StorageError::Conflict`] when the current state is not `from` or the
     /// transition is not permitted by [`TurnRunState::can_transition`].
-    fn transition(
+    fn transition_turn_state(
         &self,
         turn_id: &str,
         from: TurnRunState,
         to: TurnRunState,
     ) -> Result<(), StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        Self::transition_locked(&tx, turn_id, from, to)?;
+        transition_locked(&tx, turn_id, from, to)?;
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Loads and parses the current state of a Turn inside a transaction.
-    /// Returns [`StorageError::NotFound`] when the row is missing, or
-    /// [`StorageError::Conflict`] when the persisted state string is invalid.
-    fn read_state_locked(
-        tx: &rusqlite::Transaction<'_>,
-        turn_id: &str,
-    ) -> Result<TurnRunState, StorageError> {
-        let state_str: String = tx
-            .query_row(
-                "SELECT state FROM turn_runs WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
-        state_str
-            .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))
-    }
-
-    fn transition_locked(
-        tx: &rusqlite::Transaction<'_>,
-        turn_id: &str,
-        from: TurnRunState,
-        to: TurnRunState,
-    ) -> Result<(), StorageError> {
-        let current = Self::read_state_locked(tx, turn_id)?;
-        if current != from {
-            return Err(StorageError::Conflict(format!(
-                "turn state transition rejected: expected {from} but was {current}"
-            )));
-        }
-        if !TurnRunState::can_transition(from, to) {
-            return Err(StorageError::Conflict(format!(
-                "turn state transition rejected: {from} -> {to}"
-            )));
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "UPDATE turn_runs SET state = ?2, updated_at = ?3 WHERE turn_id = ?1",
-            params![turn_id, to.to_string(), &now],
-        )?;
         Ok(())
     }
 
@@ -259,14 +299,14 @@ impl<'a> TurnRepository<'a> {
     ///
     /// Returns [`StorageError`] if the row is missing or not in the `accepted`
     /// state.
-    pub(crate) fn commit_input(
+    pub(crate) fn commit_turn_input(
         &self,
         turn_id: &str,
         input_message_id: &str,
     ) -> Result<(), StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        Self::transition_locked(
+        transition_locked(
             &tx,
             turn_id,
             TurnRunState::Accepted,
@@ -289,8 +329,8 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError::NotFound`] when no row exists.
-    pub(crate) fn mark_output_published(&self, turn_id: &str) -> Result<(), StorageError> {
-        let conn = self.db.get_conn()?;
+    pub(crate) fn mark_turn_output_published(&self, turn_id: &str) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         let rows = conn.execute(
             "UPDATE turn_runs SET output_published = 1, updated_at = ?2 WHERE turn_id = ?1",
@@ -313,15 +353,15 @@ impl<'a> TurnRepository<'a> {
     ///
     /// Returns [`StorageError::Conflict`] when the current state cannot start
     /// a model iteration, or [`StorageError::NotFound`] when the row is missing.
-    pub(crate) fn begin_model_iteration(
+    pub(crate) fn begin_turn_model_iteration(
         &self,
         turn_id: &str,
         iteration: i64,
         model_request_hash: &str,
     ) -> Result<(), StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        let current = Self::read_state_locked(&tx, turn_id)?;
+        let current = read_state_locked(&tx, turn_id)?;
         if !matches!(
             current,
             TurnRunState::InputCommitted
@@ -354,10 +394,10 @@ impl<'a> TurnRepository<'a> {
     ///
     /// Returns [`StorageError::Conflict`] when the row is not `model_pending`,
     /// or [`StorageError::NotFound`] when the row is missing.
-    pub(crate) fn increment_model_attempt(&self, turn_id: &str) -> Result<(), StorageError> {
-        let mut conn = self.db.get_conn()?;
+    pub(crate) fn increment_turn_model_attempt(&self, turn_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        Self::require_state_locked(&tx, turn_id, TurnRunState::ModelPending)?;
+        require_state_locked(&tx, turn_id, TurnRunState::ModelPending)?;
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
             "UPDATE turn_runs
@@ -376,8 +416,8 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError::Conflict`] when the row is not `model_pending`.
-    pub(crate) fn complete_model(&self, turn_id: &str) -> Result<(), StorageError> {
-        self.transition(
+    pub(crate) fn complete_turn_model(&self, turn_id: &str) -> Result<(), StorageError> {
+        self.transition_turn_state(
             turn_id,
             TurnRunState::ModelPending,
             TurnRunState::ModelCompleted,
@@ -390,8 +430,8 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError::Conflict`] when the row is not `model_completed`.
-    pub(crate) fn begin_tools(&self, turn_id: &str) -> Result<(), StorageError> {
-        self.transition(
+    pub(crate) fn begin_turn_tools(&self, turn_id: &str) -> Result<(), StorageError> {
+        self.transition_turn_state(
             turn_id,
             TurnRunState::ModelCompleted,
             TurnRunState::ToolsPending,
@@ -403,8 +443,8 @@ impl<'a> TurnRepository<'a> {
     /// # Errors
     ///
     /// Returns [`StorageError::Conflict`] when the row is not `tools_pending`.
-    pub(crate) fn complete_tools(&self, turn_id: &str) -> Result<(), StorageError> {
-        self.transition(
+    pub(crate) fn complete_turn_tools(&self, turn_id: &str) -> Result<(), StorageError> {
+        self.transition_turn_state(
             turn_id,
             TurnRunState::ToolsPending,
             TurnRunState::ToolsCompleted,
@@ -419,14 +459,14 @@ impl<'a> TurnRepository<'a> {
     ///
     /// Returns [`StorageError::Conflict`] when the current state cannot
     /// finalize.
-    pub(crate) fn complete(
+    pub(crate) fn complete_turn(
         &self,
         turn_id: &str,
         final_message_id: &str,
     ) -> Result<(), StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        let current = Self::read_state_locked(&tx, turn_id)?;
+        let current = read_state_locked(&tx, turn_id)?;
         if !matches!(
             current,
             TurnRunState::ModelCompleted | TurnRunState::ToolsCompleted
@@ -464,7 +504,7 @@ impl<'a> TurnRepository<'a> {
     ///
     /// Returns [`StorageError::Conflict`] when the row is already terminal, or
     /// when `to` is not a failure state.
-    pub(crate) fn fail(
+    pub(crate) fn fail_turn(
         &self,
         turn_id: &str,
         to: TurnRunState,
@@ -476,9 +516,9 @@ impl<'a> TurnRepository<'a> {
                 "fail target must be failed or uncertain, got {to}"
             )));
         }
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
-        let current = Self::read_state_locked(&tx, turn_id)?;
+        let current = read_state_locked(&tx, turn_id)?;
         if current.is_terminal() {
             return Err(StorageError::Conflict(format!(
                 "fail rejected from terminal state {current}"
@@ -518,17 +558,17 @@ impl<'a> TurnRepository<'a> {
     /// cannot be verified.
     ///
     /// Returns the transitioned rows so the caller can log them. This does
-    /// **not** touch `tool_calls`; [`crate::storage::ToolExecutionRepository::recover_running`]
-    /// handles the Tool ledger separately.
+    /// **not** touch `tool_calls`; [`Database::recover_running_tools`] handles
+    /// the Tool ledger separately.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite writes fail.
-    pub(crate) fn recover_interrupted(
+    pub(crate) fn recover_interrupted_turns(
         &self,
         current_fingerprint: Option<&str>,
     ) -> Result<Vec<RecoveredTurnRun>, StorageError> {
-        let mut conn = self.db.get_conn()?;
+        let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         struct InterruptedRow {
@@ -577,39 +617,42 @@ impl<'a> TurnRepository<'a> {
                 _ => true,
             };
 
-            let (to, error_kind, error_message): (TurnRunState, Option<&str>, Option<String>) = if fingerprint_mismatch {
-                (
-                    TurnRunState::Uncertain,
-                    Some("config_mismatch"),
-                    Some(format!(
-                        "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
-                        stored = row.config_fingerprint,
-                        current = current_fingerprint,
-                    )),
-                )
-            } else {
-                match from {
-                    TurnRunState::Accepted => (
-                        TurnRunState::Failed,
-                        Some("interrupted"),
-                        Some(format!(
-                            "recovered on startup: accepted turn has no committed input (payload_hash={})",
-                            row.request_payload_hash.as_deref().unwrap_or("none")
-                        )),
-                    ),
-                    TurnRunState::ModelPending
-                        if row.output_published || row.model_request_hash.is_none() =>
+            let (to, error_kind, error_message): (TurnRunState, Option<&str>, Option<String>) =
+                if fingerprint_mismatch {
                     (
                         TurnRunState::Uncertain,
-                        Some("interrupted"),
+                        Some("config_mismatch"),
                         Some(format!(
-                            "recovered on startup: model_pending with output_published={} cannot prove safe retry",
-                            row.output_published
+                            "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
+                            stored = row.config_fingerprint,
+                            current = current_fingerprint,
                         )),
-                    ),
-                    _ => (from, None, None),
-                }
-            };
+                    )
+                } else {
+                    match from {
+                        TurnRunState::Accepted => (
+                            TurnRunState::Failed,
+                            Some("interrupted"),
+                            Some(format!(
+                                "recovered on startup: accepted turn has no committed input (payload_hash={})",
+                                row.request_payload_hash.as_deref().unwrap_or("none")
+                            )),
+                        ),
+                        TurnRunState::ModelPending
+                            if row.output_published || row.model_request_hash.is_none() =>
+                        {
+                            (
+                                TurnRunState::Uncertain,
+                                Some("interrupted"),
+                                Some(format!(
+                                    "recovered on startup: model_pending with output_published={} cannot prove safe retry",
+                                    row.output_published
+                                )),
+                            )
+                        }
+                        _ => (from, None, None),
+                    }
+                };
 
             if to != from {
                 let now = chrono::Utc::now().to_rfc3339();
@@ -626,7 +669,11 @@ impl<'a> TurnRepository<'a> {
                         to.to_string(),
                         error_kind,
                         error_message.as_deref(),
-                        if error_kind.is_some() { Some(&now) } else { None },
+                        if error_kind.is_some() {
+                            Some(&now)
+                        } else {
+                            None
+                        },
                         &now,
                     ],
                 )?;
@@ -641,60 +688,6 @@ impl<'a> TurnRepository<'a> {
 
         tx.commit()?;
         Ok(recovered)
-    }
-
-    fn require_state_locked(
-        tx: &rusqlite::Transaction<'_>,
-        turn_id: &str,
-        expected: TurnRunState,
-    ) -> Result<(), StorageError> {
-        let state = Self::read_state_locked(tx, turn_id)?;
-        if state != expected {
-            return Err(StorageError::Conflict(format!(
-                "turn state transition rejected: expected {expected} but was {state}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn read_row(
-        handle: &rusqlite::Connection,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> Result<Option<TurnRun>, StorageError> {
-        let row = handle
-            .query_row(sql, params, |row| {
-                let state_str: String = row.get(3)?;
-                let state: TurnRunState = state_str.parse().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                    )
-                })?;
-                Ok(TurnRun {
-                    turn_id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    request_key: row.get(2)?,
-                    state,
-                    current_iteration: row.get(4)?,
-                    input_message_id: row.get(5)?,
-                    final_message_id: row.get(6)?,
-                    config_revision: row.get(7)?,
-                    config_fingerprint: row.get(8)?,
-                    model_request_hash: row.get(9)?,
-                    model_attempt: row.get(10)?,
-                    output_published: row.get::<_, i64>(11)? != 0,
-                    error_kind: row.get(12)?,
-                    error_message: row.get(13)?,
-                    accepted_at: row.get(14)?,
-                    updated_at: row.get(15)?,
-                    finished_at: row.get(16)?,
-                    request_payload_hash: row.get(17)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
     }
 }
 
@@ -718,8 +711,7 @@ mod tests {
 
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
-            .turn_run_store()
-            .accept_or_get(1, request_key, 1, Some("abc123"), "payload-hash")
+            .accept_or_get_turn(1, request_key, 1, Some("abc123"), "payload-hash")
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -727,7 +719,7 @@ mod tests {
     }
 
     fn state(db: &Database, turn_id: &str) -> TurnRunState {
-        db.turn_run_store().get(turn_id).expect("get").state
+        db.get_turn_run(turn_id).expect("get").state
     }
 
     #[test]
@@ -792,8 +784,7 @@ mod tests {
 
         // Act: accepted -> tools_pending is not a permitted transition.
         let error = db
-            .turn_run_store()
-            .transition(&turn_id, TurnRunState::Accepted, TurnRunState::ToolsPending)
+            .transition_turn_state(&turn_id, TurnRunState::Accepted, TurnRunState::ToolsPending)
             .expect_err("invalid transition");
 
         // Assert
@@ -806,14 +797,12 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "k").turn_id;
-        db.turn_run_store()
-            .commit_input(&turn_id, "msg-1")
+        db.commit_turn_input(&turn_id, "msg-1")
             .expect("commit input");
 
         // Act: the row is now input_committed, not accepted.
         let error = db
-            .turn_run_store()
-            .transition(&turn_id, TurnRunState::Accepted, TurnRunState::ModelPending)
+            .transition_turn_state(&turn_id, TurnRunState::Accepted, TurnRunState::ModelPending)
             .expect_err("stale expected state");
 
         // Assert
@@ -827,12 +816,11 @@ mod tests {
         let turn_id = accept(&db, "k").turn_id;
 
         // Act
-        db.turn_run_store()
-            .commit_input(&turn_id, "user-msg-1")
+        db.commit_turn_input(&turn_id, "user-msg-1")
             .expect("commit input");
 
         // Assert
-        let run = db.turn_run_store().get(&turn_id).expect("get");
+        let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::InputCommitted);
         assert_eq!(run.input_message_id.as_deref(), Some("user-msg-1"));
     }
@@ -841,24 +829,24 @@ mod tests {
     fn full_lifecycle_progresses_through_all_states() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "life").turn_id;
 
         // Act: accepted -> input_committed -> model_pending -> model_completed
         //      -> tools_pending -> tools_completed -> model_pending -> completed
-        repo.commit_input(&turn_id, "in-1").expect("commit input");
-        repo.begin_model_iteration(&turn_id, 1, "hash-1")
+        db.commit_turn_input(&turn_id, "in-1")
+            .expect("commit input");
+        db.begin_turn_model_iteration(&turn_id, 1, "hash-1")
             .expect("begin iter 1");
-        repo.complete_model(&turn_id).expect("complete model");
-        repo.begin_tools(&turn_id).expect("begin tools");
-        repo.complete_tools(&turn_id).expect("complete tools");
-        repo.begin_model_iteration(&turn_id, 2, "hash-2")
+        db.complete_turn_model(&turn_id).expect("complete model");
+        db.begin_turn_tools(&turn_id).expect("begin tools");
+        db.complete_turn_tools(&turn_id).expect("complete tools");
+        db.begin_turn_model_iteration(&turn_id, 2, "hash-2")
             .expect("begin iter 2");
-        repo.complete_model(&turn_id).expect("complete model 2");
-        repo.complete(&turn_id, "final-1").expect("complete");
+        db.complete_turn_model(&turn_id).expect("complete model 2");
+        db.complete_turn(&turn_id, "final-1").expect("complete");
 
         // Assert
-        let run = repo.get(&turn_id).expect("get");
+        let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::Completed);
         assert_eq!(run.final_message_id.as_deref(), Some("final-1"));
         assert!(run.finished_at.is_some());
@@ -869,16 +857,15 @@ mod tests {
     fn begin_model_iteration_stamps_hash_and_resets_attempt() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "iter").turn_id;
-        repo.commit_input(&turn_id, "in").expect("commit input");
+        db.commit_turn_input(&turn_id, "in").expect("commit input");
 
         // Act
-        repo.begin_model_iteration(&turn_id, 1, "hash-A")
+        db.begin_turn_model_iteration(&turn_id, 1, "hash-A")
             .expect("begin");
 
         // Assert
-        let run = repo.get(&turn_id).expect("get");
+        let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::ModelPending);
         assert_eq!(run.current_iteration, 1);
         assert_eq!(run.model_request_hash.as_deref(), Some("hash-A"));
@@ -889,18 +876,19 @@ mod tests {
     fn increment_model_attempt_increments_without_changing_state() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "retry").turn_id;
-        repo.commit_input(&turn_id, "in").expect("commit input");
-        repo.begin_model_iteration(&turn_id, 1, "hash")
+        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        db.begin_turn_model_iteration(&turn_id, 1, "hash")
             .expect("begin iter");
 
         // Act
-        repo.increment_model_attempt(&turn_id).expect("increment");
-        repo.increment_model_attempt(&turn_id).expect("increment");
+        db.increment_turn_model_attempt(&turn_id)
+            .expect("increment");
+        db.increment_turn_model_attempt(&turn_id)
+            .expect("increment");
 
         // Assert
-        let run = repo.get(&turn_id).expect("get");
+        let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::ModelPending);
         assert_eq!(run.model_attempt, 3);
     }
@@ -909,12 +897,11 @@ mod tests {
     fn increment_model_attempt_rejected_outside_model_pending() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "no-retry").turn_id;
 
         // Act
-        let error = repo
-            .increment_model_attempt(&turn_id)
+        let error = db
+            .increment_turn_model_attempt(&turn_id)
             .expect_err("rejected");
 
         // Assert
@@ -925,31 +912,29 @@ mod tests {
     fn mark_output_published_is_idempotent() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "pub").turn_id;
 
         // Act
-        repo.mark_output_published(&turn_id).expect("first");
-        repo.mark_output_published(&turn_id).expect("second");
+        db.mark_turn_output_published(&turn_id).expect("first");
+        db.mark_turn_output_published(&turn_id).expect("second");
 
         // Assert
-        assert!(repo.get(&turn_id).expect("get").output_published);
+        assert!(db.get_turn_run(&turn_id).expect("get").output_published);
     }
 
     #[test]
     fn fail_records_error_classification_and_finished_at() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "fail").turn_id;
-        repo.commit_input(&turn_id, "in").expect("commit input");
+        db.commit_turn_input(&turn_id, "in").expect("commit input");
 
         // Act
-        repo.fail(&turn_id, TurnRunState::Failed, "llm_error", "boom")
+        db.fail_turn(&turn_id, TurnRunState::Failed, "llm_error", "boom")
             .expect("fail");
 
         // Assert
-        let run = repo.get(&turn_id).expect("get");
+        let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::Failed);
         assert_eq!(run.error_kind.as_deref(), Some("llm_error"));
         assert_eq!(run.error_message.as_deref(), Some("boom"));
@@ -960,14 +945,14 @@ mod tests {
     fn fail_uncertain_for_published_output() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "unc").turn_id;
-        repo.commit_input(&turn_id, "in").expect("commit input");
-        repo.begin_model_iteration(&turn_id, 1, "h").expect("begin");
-        repo.mark_output_published(&turn_id).expect("published");
+        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        db.begin_turn_model_iteration(&turn_id, 1, "h")
+            .expect("begin");
+        db.mark_turn_output_published(&turn_id).expect("published");
 
         // Act: output was published -> uncertain, not failed.
-        repo.fail(
+        db.fail_turn(
             &turn_id,
             TurnRunState::Uncertain,
             "partial_output",
@@ -983,14 +968,13 @@ mod tests {
     fn fail_rejected_from_terminal_state() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "term").turn_id;
-        repo.fail(&turn_id, TurnRunState::Failed, "x", "y")
+        db.fail_turn(&turn_id, TurnRunState::Failed, "x", "y")
             .expect("first fail");
 
         // Act
-        let error = repo
-            .fail(&turn_id, TurnRunState::Failed, "x", "y")
+        let error = db
+            .fail_turn(&turn_id, TurnRunState::Failed, "x", "y")
             .expect_err("terminal");
 
         // Assert
@@ -1001,12 +985,11 @@ mod tests {
     fn fail_rejects_non_failure_target() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "bad-target").turn_id;
 
         // Act
-        let error = repo
-            .fail(&turn_id, TurnRunState::Completed, "x", "y")
+        let error = db
+            .fail_turn(&turn_id, TurnRunState::Completed, "x", "y")
             .expect_err("non-failure target");
 
         // Assert
@@ -1018,52 +1001,64 @@ mod tests {
         // Arrange: accepted (no input), input_committed (safe to resume),
         // model_pending with output (unsafe to retry).
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let accepted_id = accept(&db, "acc").turn_id;
         let input_committed_id = accept(&db, "mid").turn_id;
         let model_pending_unsafe_id = accept(&db, "unsafe").turn_id;
         let model_pending_safe_id = accept(&db, "safe").turn_id;
 
-        repo.commit_input(&input_committed_id, "in").expect("commit");
+        db.commit_turn_input(&input_committed_id, "in")
+            .expect("commit");
 
-        repo.commit_input(&model_pending_unsafe_id, "in").expect("commit");
-        repo.begin_model_iteration(&model_pending_unsafe_id, 1, "h")
+        db.commit_turn_input(&model_pending_unsafe_id, "in")
+            .expect("commit");
+        db.begin_turn_model_iteration(&model_pending_unsafe_id, 1, "h")
             .expect("begin");
-        repo.mark_output_published(&model_pending_unsafe_id)
+        db.mark_turn_output_published(&model_pending_unsafe_id)
             .expect("mark published");
 
-        repo.commit_input(&model_pending_safe_id, "in").expect("commit");
-        repo.begin_model_iteration(&model_pending_safe_id, 1, "h")
+        db.commit_turn_input(&model_pending_safe_id, "in")
+            .expect("commit");
+        db.begin_turn_model_iteration(&model_pending_safe_id, 1, "h")
             .expect("begin");
 
         // Act
-        let recovered = repo.recover_interrupted(Some("abc123")).expect("recover");
+        let recovered = db
+            .recover_interrupted_turns(Some("abc123"))
+            .expect("recover");
 
         // Assert: accepted → failed; safe mid-flight states are preserved.
         assert_eq!(recovered.len(), 2);
         assert_eq!(state(&db, &accepted_id), TurnRunState::Failed);
-        assert_eq!(state(&db, &input_committed_id), TurnRunState::InputCommitted);
+        assert_eq!(
+            state(&db, &input_committed_id),
+            TurnRunState::InputCommitted
+        );
         assert_eq!(
             state(&db, &model_pending_unsafe_id),
             TurnRunState::Uncertain
         );
-        assert_eq!(state(&db, &model_pending_safe_id), TurnRunState::ModelPending);
+        assert_eq!(
+            state(&db, &model_pending_safe_id),
+            TurnRunState::ModelPending
+        );
     }
 
     #[test]
     fn recover_interrupted_leaves_terminal_states_untouched() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let completed_id = accept(&db, "done").turn_id;
-        repo.commit_input(&completed_id, "in").expect("commit");
-        repo.begin_model_iteration(&completed_id, 1, "h")
+        db.commit_turn_input(&completed_id, "in").expect("commit");
+        db.begin_turn_model_iteration(&completed_id, 1, "h")
             .expect("begin");
-        repo.complete_model(&completed_id).expect("complete model");
-        repo.complete(&completed_id, "final").expect("complete");
+        db.complete_turn_model(&completed_id)
+            .expect("complete model");
+        db.complete_turn(&completed_id, "final").expect("complete");
 
         // Act
-        let recovered = repo.recover_interrupted(Some("abc123")).expect("recover");
+        let recovered = db
+            .recover_interrupted_turns(Some("abc123"))
+            .expect("recover");
 
         // Assert
         assert!(recovered.is_empty(), "terminal turns are not recovered");
@@ -1074,13 +1069,14 @@ mod tests {
     fn recover_interrupted_is_idempotent() {
         // Arrange
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "once").turn_id;
-        repo.commit_input(&turn_id, "in").expect("commit");
+        db.commit_turn_input(&turn_id, "in").expect("commit");
 
         // Act: first recovery preserves input_committed; second sees no change.
-        repo.recover_interrupted(Some("abc123")).expect("first");
-        let second = repo.recover_interrupted(Some("abc123")).expect("second");
+        db.recover_interrupted_turns(Some("abc123")).expect("first");
+        let second = db
+            .recover_interrupted_turns(Some("abc123"))
+            .expect("second");
 
         // Assert
         assert!(second.is_empty());
@@ -1091,12 +1087,11 @@ mod tests {
     fn recover_interrupted_config_mismatch_always_uncertain() {
         // Arrange: accepted turn with a stored fingerprint.
         let (db, _dir) = test_db();
-        let repo = db.turn_run_store();
         let turn_id = accept(&db, "mismatch").turn_id;
 
         // Act: recovery with a different fingerprint.
-        let recovered = repo
-            .recover_interrupted(Some("different-fp"))
+        let recovered = db
+            .recover_interrupted_turns(Some("different-fp"))
             .expect("recover");
 
         // Assert: even though the state is accepted, fingerprint mismatch

@@ -1,6 +1,7 @@
+use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StorageError;
 
@@ -272,6 +273,267 @@ impl Database {
 }
 
 // ---------------------------------------------------------------------------
+// Conversation writes (messages + session snapshot)
+//
+// Every conversation mutation routes through these methods so that per-chat
+// ordering (`seq`) and optimistic concurrency (`chats.revision`) stay
+// consistent across the message row and the LLM session snapshot. Each write
+// that touches both a message and the session snapshot does so inside one
+// SQLite transaction; the integer `revision` on `chats` is the compare-and-swap
+// anchor: a caller that loaded `revision = N` can only commit while the row is
+// still at `N`, otherwise the whole transaction rolls back.
+// ---------------------------------------------------------------------------
+
+/// Result of a committed conversation change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitOutcome {
+    /// `chats.revision` after this commit.
+    revision: i64,
+    /// Per-chat `seq` assigned to the persisted message.
+    seq: i64,
+}
+
+/// Ensures a `chats` row exists for `chat_id` before any CAS (`revision`) or
+/// per-chat `seq` (`next_message_seq`) bookkeeping reads from it.
+///
+/// A bare `chat_id` — a test seed, or a session saved before the first
+/// message — must not fail the later `SELECT revision FROM chats` with
+/// `QueryReturnedNoRows`. The row is created with `revision = 0` and
+/// `next_message_seq = 0` so subsequent bumps start from a clean slate. In
+/// production `resolve_or_create_chat_id` already created the row, so this
+/// degrades to a no-op `INSERT OR IGNORE`.
+fn ensure_chat_row(tx: &rusqlite::Transaction<'_>, chat_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO chats (chat_id, last_message_time)
+         VALUES (?1, ?2)",
+        params![chat_id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Appends one message and, when `session_json` is provided, advances the LLM
+/// session snapshot in the same transaction.
+///
+/// Issues the next per-chat integer `seq`, writes the message row with that
+/// `seq` (plus `turn_id` / `parent_message_id` when supplied), upserts the
+/// session snapshot with `snapshot_through_seq = seq`, and bumps
+/// `chats.revision` and `chats.next_message_seq` by one.
+///
+/// `expected_revision` is the optimistic-concurrency token:
+/// * `Some(n)` — the commit only applies while `chats.revision == n`; any
+///   other value rolls the transaction back with
+///   [`StorageError::SessionSnapshotConflict`].
+/// * `None` — the session row must not yet exist (initial seed); if a session
+///   already exists the call conflicts.
+fn commit_message_locked(
+    tx: &rusqlite::Transaction<'_>,
+    message: &StoredMessage,
+    session_json: Option<&str>,
+    expected_revision: Option<i64>,
+) -> Result<CommitOutcome, StorageError> {
+    ensure_chat_row(tx, message.chat_id)?;
+    let (current_revision, next_seq): (i64, i64) = tx.query_row(
+        "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
+        params![message.chat_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+
+    if let Some(expected) = expected_revision {
+        if expected != current_revision {
+            return Err(StorageError::SessionSnapshotConflict);
+        }
+    } else if session_json.is_some() {
+        // Initial seed: refuse to clobber an existing session snapshot.
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM sessions WHERE chat_id = ?1 LIMIT 1",
+                params![message.chat_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if exists {
+            return Err(StorageError::SessionSnapshotConflict);
+        }
+    }
+
+    let seq = next_seq;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO messages
+             (id, chat_id, sender_id, content, sender_kind, timestamp,
+              message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            &message.id,
+            message.chat_id,
+            &message.sender_id,
+            &message.content,
+            message.sender_kind.to_string(),
+            &message.timestamp,
+            message.message_kind.to_string(),
+            message.recipient_agent_id.as_deref(),
+            seq,
+            message.turn_id.as_deref(),
+            message.parent_message_id.as_deref(),
+        ],
+    )?;
+
+    // Idempotent re-commit: the message row already exists (e.g. a Turn whose
+    // deterministic message id is re-persisted on recovery). Verify the stored
+    // row matches the incoming one — content, sender, and message kind must
+    // agree. A mismatch means the same id was reused for a different message
+    // and is rejected. Do not advance seq or revision — that would create a
+    // gap and a spurious CAS conflict for the next writer.
+    if inserted == 0 {
+        let (stored_content, stored_sender, stored_kind, stored_turn, stored_parent): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT content, sender_id, message_kind, turn_id, parent_message_id
+             FROM messages WHERE id = ?1 AND chat_id = ?2",
+            params![&message.id, message.chat_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        if stored_content != message.content
+            || stored_sender != message.sender_id
+            || stored_kind != message.message_kind.to_string()
+            || stored_turn.as_deref() != message.turn_id.as_deref()
+            || stored_parent.as_deref() != message.parent_message_id.as_deref()
+        {
+            return Err(StorageError::Conflict(format!(
+                "message id collision: {} already exists with different content",
+                message.id
+            )));
+        }
+        return Ok(CommitOutcome {
+            revision: current_revision,
+            seq,
+        });
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let Some(json) = session_json {
+        tx.execute(
+            "INSERT INTO sessions
+                 (chat_id, messages_json, updated_at, snapshot_through_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                messages_json = excluded.messages_json,
+                updated_at = excluded.updated_at,
+                snapshot_through_seq = excluded.snapshot_through_seq",
+            params![message.chat_id, json, &now, seq],
+        )?;
+    }
+
+    tx.execute(
+        "UPDATE chats
+         SET revision = revision + 1,
+             next_message_seq = next_message_seq + 1,
+             last_message_time = ?2
+         WHERE chat_id = ?1",
+        params![message.chat_id, &now],
+    )?;
+
+    Ok(CommitOutcome {
+        revision: current_revision + 1,
+        seq,
+    })
+}
+
+impl Database {
+    /// Commits one message and, when `session_json` is provided, advances the
+    /// LLM session snapshot in the same transaction. See
+    /// [`commit_message_locked`] for the concurrency contract.
+    fn commit_conversation_message(
+        &self,
+        message: &StoredMessage,
+        session_json: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<CommitOutcome, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome = commit_message_locked(&tx, message, session_json, expected_revision)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Advances the LLM session snapshot without appending a message.
+    ///
+    /// Used by compaction and by unconditional session seeds. Bumps
+    /// `chats.revision` so the change is observable under the same CAS
+    /// contract. `snapshot_through_seq` is left at the chat's current maximum
+    /// `seq` (no new message was added).
+    fn update_session_snapshot(
+        &self,
+        chat_id: i64,
+        session_json: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<CommitOutcome, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_chat_row(&tx, chat_id)?;
+
+        let (current_revision, max_seq): (i64, Option<i64>) = tx.query_row(
+            "SELECT c.revision,
+                    (SELECT MAX(m.seq) FROM messages m WHERE m.chat_id = c.chat_id)
+             FROM chats c WHERE c.chat_id = ?1",
+            params![chat_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        if let Some(expected) = expected_revision {
+            if expected != current_revision {
+                tx.rollback()?;
+                return Err(StorageError::SessionSnapshotConflict);
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let through = max_seq.unwrap_or(0);
+        tx.execute(
+            "INSERT INTO sessions
+                 (chat_id, messages_json, updated_at, snapshot_through_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                messages_json = excluded.messages_json,
+                updated_at = excluded.updated_at,
+                snapshot_through_seq = excluded.snapshot_through_seq",
+            params![chat_id, session_json, &now, through],
+        )?;
+        tx.execute(
+            "UPDATE chats SET revision = revision + 1, last_message_time = ?2 WHERE chat_id = ?1",
+            params![chat_id, &now],
+        )?;
+
+        tx.commit()?;
+        Ok(CommitOutcome {
+            revision: current_revision + 1,
+            seq: through,
+        })
+    }
+
+    /// Appends a message to a chat that has no session snapshot (multi-agent
+    /// Channel Log). Issues `seq` and advances `revision` but never touches
+    /// `sessions`.
+    fn store_channel_log_message(&self, message: &StoredMessage) -> Result<i64, StorageError> {
+        let outcome = self.commit_conversation_message(message, None, None)?;
+        Ok(outcome.seq)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -281,8 +543,7 @@ impl Database {
         chat_id: i64,
         messages_json: &str,
     ) -> Result<(), StorageError> {
-        self.conversation_store()
-            .update_session_snapshot(chat_id, messages_json, None)?;
+        self.update_session_snapshot(chat_id, messages_json, None)?;
         Ok(())
     }
 
@@ -299,8 +560,11 @@ impl Database {
         chat_id: i64,
         expected_revision: i64,
     ) -> Result<bool, StorageError> {
-        self.conversation_store()
-            .clear_session_snapshot(chat_id, expected_revision)
+        match self.update_session_snapshot(chat_id, "[]", Some(expected_revision)) {
+            Ok(_) => Ok(true),
+            Err(StorageError::SessionSnapshotConflict) => Ok(false),
+            Err(other) => Err(other),
+        }
     }
 
     /// Updates `sessions.messages_json` to `new_messages_json` and bumps
@@ -323,11 +587,11 @@ impl Database {
         expected_revision: i64,
         new_messages_json: &str,
     ) -> Result<bool, StorageError> {
-        self.conversation_store().truncate_session_snapshot(
-            chat_id,
-            expected_revision,
-            new_messages_json,
-        )
+        match self.update_session_snapshot(chat_id, new_messages_json, Some(expected_revision)) {
+            Ok(_) => Ok(true),
+            Err(StorageError::SessionSnapshotConflict) => Ok(false),
+            Err(other) => Err(other),
+        }
     }
 
     /// Persists one message and, when `messages_json` is provided, advances the
@@ -344,11 +608,8 @@ impl Database {
         messages_json: &str,
         expected_revision: Option<i64>,
     ) -> Result<i64, StorageError> {
-        let outcome = self.conversation_store().commit_message_struct(
-            message,
-            Some(messages_json),
-            expected_revision,
-        )?;
+        let outcome =
+            self.commit_conversation_message(message, Some(messages_json), expected_revision)?;
         Ok(outcome.revision)
     }
 
@@ -444,9 +705,7 @@ impl Database {
     /// Stores a message without touching the session snapshot.
     /// Used for Channel Log entries (agent_send, system events) that have no session.
     pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
-        self.conversation_store()
-            .store_channel_log_message(message)
-            .map(|_| ())
+        self.store_channel_log_message(message).map(|_| ())
     }
 
     /// Persists a system event message to a Channel Log chat.
@@ -457,11 +716,12 @@ impl Database {
     pub(crate) fn store_system_event(
         &self,
         channel_log_chat_id: i64,
-        reason: &impl std::fmt::Display,
+        reason: &impl fmt::Display,
     ) -> Result<(), StorageError> {
-        self.conversation_store()
-            .store_system_event(channel_log_chat_id, reason)
-            .map(|_| ())
+        let content = serde_json::json!({ "reason": reason.to_string() }).to_string();
+        let mut message = StoredMessage::system(channel_log_chat_id, content);
+        message.message_kind = MessageKind::SystemEvent;
+        self.store_channel_log_message(&message).map(|_| ())
     }
 
     /// Persists a bot response to the Channel Log.
@@ -473,15 +733,22 @@ impl Database {
         agent_id: &str,
         response: &str,
     ) -> Result<(), StorageError> {
-        self.conversation_store()
-            .store_channel_log_bot_response(channel_log_chat_id, agent_id, response)
-            .map(|_| ())
+        let message = StoredMessage {
+            id: format!("cl-bot-{}", uuid::Uuid::new_v4()),
+            chat_id: channel_log_chat_id,
+            sender_id: agent_id.to_string(),
+            content: response.to_string(),
+            sender_kind: SenderKind::Assistant,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message_kind: MessageKind::Message,
+            recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
+        };
+        self.store_channel_log_message(&message).map(|_| ())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool calls & LLM usage
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

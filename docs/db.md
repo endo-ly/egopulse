@@ -373,7 +373,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_turn_id
 **設計ポイント**:
 - `id` は OpenAI/Codex などのプロバイダが返す call id であり、永続化上のグローバルIDではない
 - 同じプロバイダ call id が別 assistant メッセージで再利用されても履歴を保持できるよう、主キーは `(id, chat_id, message_id)`
-- 新規台帳テーブルは作らず、本テーブルを Tool 実行台帳として拡張する（`ToolExecutionRepository` が claim・状態遷移・結果再利用を担う）
+- 新規台帳テーブルは作らず、本テーブルを Tool 実行台帳として拡張する（`Database`（tool.rs）が claim・状態遷移・結果再利用を担う）
 
 ---
 
@@ -888,7 +888,7 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
 | `uncertain` | 再開可否不明（crash 後の running Tool 等）。自動再開しない |
 
 **設計ポイント**:
-- 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`TurnRepository`）
+- 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`Database`（turn.rs））
 - `output_published` が真の Turn は partial output を外部公開済みのため自動 retry しない
 - `UNIQUE(chat_id, request_key)` により同一受付の重複を防止する。再受付時は既存 Turn を返し、`completed` なら保存済み結果を再利用する
 - crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)

@@ -83,7 +83,7 @@ MCP の詳細は以下を参照。
 
 ### Tool 実行台帳
 
-既存 `tool_calls` テーブルを Tool 実行台帳として拡張する（[db.md §tool_calls](./db.md#tool_calls)）。新規台帳テーブルは作らない。`ToolExecutionRepository` が claim・状態遷移・input 整合確認・結果再利用・uncertain 判定を担う。
+既存 `tool_calls` テーブルを Tool 実行台帳として拡張する（[db.md §tool_calls](./db.md#tool_calls)）。新規台帳テーブルは作らない。`Database`（tool.rs）が claim・状態遷移・input 整合確認・結果再利用・uncertain 判定を担う。
 
 #### 実行フロー
 
