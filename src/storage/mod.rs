@@ -700,7 +700,7 @@ impl Database {
             // any irreversible schema change touches the existing database.
             // Continuing without the safety net would risk unrecoverable data
             // loss on a bad migration.
-            if let Err(error) = backup::run_startup_backup(db_path, settings) {
+            if let Err(error) = backup::run_startup_backup(db_path, settings, "egopulse") {
                 return Err(StorageError::MigrationBackupFailed {
                     detail: format!(
                         "pre-migration backup for {} failed: {error}",
@@ -719,8 +719,34 @@ impl Database {
     /// Runs `run_secret_migrations` instead of `run_migrations`. The secret DB
     /// contains only `chats`, `messages`, `sessions`, `llm_usage_logs`, `db_meta`,
     /// and `schema_migrations` — no `tool_calls`, `sleep_runs`, etc.
+    #[cfg(test)]
     pub(crate) fn new_secret(db_path: &Path) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
+        initialize_database_file(db_path)?;
+        let pool = build_secret_pool_and_migrate(db_path)?;
+        Ok(Self { pool })
+    }
+
+    /// Constructs a `Database` for the secret DB with pre-migration backup.
+    ///
+    /// A failed pre-migration backup aborts startup before any schema change
+    /// touches the existing secret database. When backup is disabled or the
+    /// file does not yet exist, this behaves exactly like [`Database::new_secret`].
+    pub(crate) fn new_secret_with_backup(
+        db_path: &Path,
+        settings: &backup::BackupSettings,
+    ) -> Result<Self, StorageError> {
+        prepare_db_path(db_path)?;
+        if db_path.exists() && settings.enabled {
+            if let Err(error) = backup::run_startup_backup(db_path, settings, "secret") {
+                return Err(StorageError::MigrationBackupFailed {
+                    detail: format!(
+                        "pre-migration backup for secret db {} failed: {error}",
+                        db_path.display()
+                    ),
+                });
+            }
+        }
         initialize_database_file(db_path)?;
         let pool = build_secret_pool_and_migrate(db_path)?;
         Ok(Self { pool })
@@ -919,10 +945,6 @@ mod tests {
                 "missing table: {expected}"
             );
         }
-        assert!(
-            !table_names.iter().any(|t| t == "tool_calls"),
-            "tool_calls must not exist in secret.db"
-        );
         assert!(
             !table_names.iter().any(|t| t == "sleep_runs"),
             "sleep_runs must not exist in secret.db"

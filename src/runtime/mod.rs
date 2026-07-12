@@ -514,7 +514,10 @@ fn build_app_state_dependencies(
     )?);
 
     let secret_db = if config.needs_secret_db() {
-        Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
+        Some(Arc::new(Database::new_secret_with_backup(
+            &config.secret_db_path(),
+            &backup_settings,
+        )?))
     } else {
         None
     };

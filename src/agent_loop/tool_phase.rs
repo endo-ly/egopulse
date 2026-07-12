@@ -356,12 +356,10 @@ async fn execute_single_tool(
     let is_read_only = state.tools.is_read_only(&tool_call.name).await;
 
     // Claim the ledger slot before executing so a Tool call is never run
-    // before its durable row exists. Secret-scope conversations have no
-    // `tool_calls` table and skip the ledger entirely. Read-only Tools also
-    // skip the ledger because they have no side effects and may be safely
-    // retried after a crash; this avoids SQLite write contention during
-    // parallel execution.
-    let claim = if tool_context.scope == ConversationScope::Secret || is_read_only {
+    // before its durable row exists. Read-only Tools skip the ledger because
+    // they have no side effects and may be safely retried after a crash;
+    // this avoids SQLite write contention during parallel execution.
+    let claim = if is_read_only {
         ClaimOutcome::Acquired
     } else {
         claim_tool_slot(state, tool_context, assistant_message_id, &tool_call).await?
@@ -374,7 +372,7 @@ async fn execute_single_tool(
                 .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
                 .await;
             let payload = format_tool_result(&tool_call, &result);
-            if tool_context.scope != ConversationScope::Secret && !is_read_only {
+            if !is_read_only {
                 record_tool_outcome(state, tool_context, &tool_call, &result, &payload).await?;
             }
             (result, payload, true)

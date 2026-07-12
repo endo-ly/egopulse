@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 12;
+pub(super) const SCHEMA_VERSION: i64 = 13;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -799,6 +799,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 accepted_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 finished_at TEXT,
+                request_payload_hash TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -887,6 +888,20 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 12;
     }
 
+    if version < 13 {
+        let tx = conn.unchecked_transaction()?;
+
+        add_column_if_missing(&tx, "turn_runs", "request_payload_hash", "TEXT")?;
+
+        set_schema_version_in_tx(
+            &tx,
+            13,
+            "add turn_runs.request_payload_hash for ingress idempotency verification",
+        )?;
+        tx.commit()?;
+        version = 13;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -894,7 +909,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 3;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 4;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1056,6 +1071,7 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
                 accepted_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 finished_at TEXT,
+                request_payload_hash TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -1108,6 +1124,58 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 3;
+    }
+
+    if version < 4 {
+        let tx = conn.unchecked_transaction()?;
+
+        add_column_if_missing(&tx, "turn_runs", "request_payload_hash", "TEXT")?;
+
+        // Tool execution ledger. Secret conversations now own a private
+        // `tool_calls` table so claim-before-execute, result reuse, and
+        // non-idempotent Tool dedup apply uniformly to both scopes. Secret
+        // Tool input/output stays inside the secret DB and never reaches the
+        // normal DB.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tool_calls (
+                id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                tool_output TEXT,
+                timestamp TEXT NOT NULL,
+                turn_id TEXT,
+                state TEXT NOT NULL DEFAULT 'pending',
+                input_hash TEXT,
+                idempotency_class TEXT,
+                idempotency_key TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                error_kind TEXT,
+                error_message TEXT,
+                PRIMARY KEY (id, chat_id, message_id),
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
+                ON tool_calls(chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
+                ON tool_calls(chat_id, message_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_turn_id
+                ON tool_calls(turn_id, id)
+                WHERE turn_id IS NOT NULL",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            4,
+            "add turn_runs.request_payload_hash and tool_calls ledger",
+        )?;
+        tx.commit()?;
+        version = 4;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);

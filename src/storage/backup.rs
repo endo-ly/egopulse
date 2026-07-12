@@ -130,13 +130,13 @@ pub(crate) fn run_backup_with_integrity_checker(
 pub(crate) fn run_startup_backup(
     db_path: &Path,
     settings: &BackupSettings,
+    prefix: &str,
 ) -> Result<BackupOutcome, StorageError> {
     std::fs::create_dir_all(&settings.dest_dir)?;
-    let dest_path = settings.dest_dir.join(generate_backup_filename(
-        settings.now,
-        &settings.tz,
-        "egopulse",
-    ));
+    let dest_path =
+        settings
+            .dest_dir
+            .join(generate_backup_filename(settings.now, &settings.tz, prefix));
 
     {
         let conn = Connection::open(db_path)?;
