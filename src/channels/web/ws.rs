@@ -392,6 +392,7 @@ async fn handle_chat_send(
         SendRequest {
             session_key: Some(payload.session_key),
             message: payload.message,
+            request_id: None,
         },
         WEB_ACTOR,
     )

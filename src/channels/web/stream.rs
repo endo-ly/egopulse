@@ -70,6 +70,9 @@ struct ReplayMetaPayload {
 pub(super) struct SendRequest {
     pub session_key: Option<String>,
     pub message: String,
+    /// Client-generated request id for deduplication. The same id re-delivered
+    /// after a transient failure maps to the same Turn instead of a duplicate.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +238,7 @@ pub(super) async fn start_stream_run(
     let raw_session_key = request.session_key.as_deref().unwrap_or("main");
     let parsed_chat_id = parse_chat_id_from_session_key(raw_session_key);
 
-    let (session_key, context) = if let Some(chat_id) = parsed_chat_id {
+    let (session_key, mut context) = if let Some(chat_id) = parsed_chat_id {
         let db = Arc::clone(&state.app_state.db);
         let chat_info = call_blocking(db, move |db| db.get_chat_by_id(chat_id))
             .await
@@ -251,6 +254,14 @@ pub(super) async fn start_stream_run(
     } else {
         resolve_new_web_session(&state, raw_session_key, actor).await?
     };
+
+    if let Some(id) = request
+        .request_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        context.request_key = format!("web:{id}");
+    }
 
     let run_id = Uuid::new_v4().to_string();
     state.run_hub.create(&run_id, actor.to_string()).await;

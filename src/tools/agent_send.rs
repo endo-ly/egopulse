@@ -75,6 +75,19 @@ fn agent_label<'a>(
         .unwrap_or(id)
 }
 
+/// First 16 hex chars of SHA-256(text) — compact dedup-friendly fingerprint.
+fn short_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[async_trait]
 impl Tool for AgentSendTool {
     fn name(&self) -> &str {
@@ -197,7 +210,14 @@ impl Tool for AgentSendTool {
             trace_id: String::new(),
             scope: context.scope,
 
-            request_key: String::new(),
+            // Stable across crash retries: the same parent Turn sending the
+            // same message to the same target maps to one target Turn.
+            request_key: format!(
+                "agent_send:{}:{}:{}",
+                context.turn_id,
+                target_id,
+                short_hash(&params.message),
+            ),
         };
 
         let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
