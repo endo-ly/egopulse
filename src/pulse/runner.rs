@@ -101,6 +101,7 @@ pub(crate) async fn run_activation(
         turn_sender: state.turn_sender.clone(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        tool_call_id: String::new(),
     };
 
     let system_prompt = build_system_prompt(&state.turn_runtime(), &context);

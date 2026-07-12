@@ -7,6 +7,17 @@
 //!
 //! A Turn acquires `Arc<ConfigSnapshot>` at start time and holds it until
 //! completion, preventing generation-mixing when config changes mid-flight.
+//!
+//! The snapshot is taken **once** at Turn start (see `TurnExecutor::run`) and
+//! shared by both `accept_turn` and `prepare_turn`, so the fingerprint stored
+//! in `turn_runs` and the snapshot actually used for Prompt/Provider
+//! generation always belong to the same Config generation.
+//!
+//! `ConfigManager` holds a single immutable snapshot for the process lifetime,
+//! so `revision` is fixed at 1 and the fingerprint is constant. Both fields and
+//! their monotonic semantics are retained so atomic config swap can be
+//! introduced later without changing the `Turn` contract; config edits are
+//! picked up only when the process restarts.
 
 use std::path::Path;
 use std::sync::Arc;

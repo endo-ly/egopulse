@@ -913,8 +913,10 @@ pub(super) const SECRET_SCHEMA_VERSION: i64 = 4;
 
 /// Secret DB のマイグレーションを実行する。
 ///
-/// `egopulse.db` の6テーブル（chats, messages, sessions, llm_usage_logs, db_meta, schema_migrations）
-/// のみを作成する。`tool_calls`, `sleep_runs`, `pulse_runs` 等は含まない。
+/// `egopulse.db` と同等の分離スキーマを作成する（chats, messages, sessions,
+/// tool_calls, llm_usage_logs, db_meta, schema_migrations）。Secret スコープの
+/// Turn が発行する非読み取り専用 Tool の台帳も secret.db 側の `tool_calls` に
+/// 書かれるため、通常 DB へのデータ漏れを防ぐ。
 pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageError> {
     let mut version = schema_version(conn)?;
 

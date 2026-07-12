@@ -719,8 +719,9 @@ impl Database {
     /// Constructs a `Database` for the secret DB (`secret.db`).
     ///
     /// Runs `run_secret_migrations` instead of `run_migrations`. The secret DB
-    /// contains only `chats`, `messages`, `sessions`, `llm_usage_logs`, `db_meta`,
-    /// and `schema_migrations` — no `tool_calls`, `sleep_runs`, etc.
+    /// mirrors the primary schema but is isolated per secret group; it contains
+    /// `chats`, `messages`, `sessions`, `tool_calls`, `llm_usage_logs`,
+    /// `db_meta`, and `schema_migrations`.
     #[cfg(test)]
     pub(crate) fn new_secret(db_path: &Path) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;

@@ -546,21 +546,22 @@ impl Database {
 
     /// Recovers Turns interrupted by a process crash.
     ///
-    /// State-specific recovery rules (when `config_fingerprint` matches the
-    /// current config):
+    /// Crashed turns are moved to a terminal state so they are never silently
+    /// resumed by a re-delivered request. A re-sent request whose turn is
+    /// already `InProgress` (still owned by the original executor that crashed)
+    /// would otherwise be accepted as `TurnAcceptance::InProgress` by a fresh
+    /// executor and produce an empty response, leaving the turn stuck forever.
     ///
-    /// | State             | Recovery action                                    |
-    /// |-------------------|----------------------------------------------------|
-    /// | `accepted`        | `failed` — input was never committed.              |
-    /// | `input_committed` | preserved — a re-delivery can resume from model start. |
-    /// | `model_pending`   | preserved if `output_published == 0` — safe to retry. |
-    /// | `model_completed` | preserved — saved response / tool calls can continue. |
-    /// | `tools_pending`   | preserved — tool call state can be inspected.      |
-    /// | `tools_completed` | preserved — next iteration can proceed.            |
+    /// State-specific recovery rules:
     ///
-    /// When the persisted `config_fingerprint` differs from `current_fingerprint`,
-    /// the state is always moved to `uncertain` because the Config generation
-    /// cannot be verified.
+    /// | State             | Recovery action                                          |
+    /// |-------------------|----------------------------------------------------------|
+    /// | `accepted`        | `failed` — input was never committed, retry is safe.     |
+    /// | `input_committed` | `failed` — no model output yet, retry is safe.            |
+    /// | `model_pending`   | `uncertain` — output may have been published externally. |
+    /// | `model_completed` | `uncertain` — output may have been published externally. |
+    /// | `tools_pending`   | `uncertain` — tool side effects may have run.            |
+    /// | `tools_completed` | `uncertain` — tool side effects may have run.            |
     ///
     /// Returns the transitioned rows so the caller can log them. This does
     /// **not** touch `tool_calls`; [`Database::recover_running_tools`] handles
@@ -569,10 +570,7 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite writes fail.
-    pub(crate) fn recover_interrupted_turns(
-        &self,
-        current_fingerprint: Option<&str>,
-    ) -> Result<Vec<RecoveredTurnRun>, StorageError> {
+    pub(crate) fn recover_interrupted_turns(&self) -> Result<Vec<RecoveredTurnRun>, StorageError> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -580,16 +578,12 @@ impl Database {
             turn_id: String,
             chat_id: i64,
             state: String,
-            config_fingerprint: Option<String>,
-            output_published: bool,
             request_payload_hash: Option<String>,
-            model_request_hash: Option<String>,
         }
 
         let interrupted: Vec<InterruptedRow> = {
             let mut stmt = tx.prepare(
-                "SELECT turn_id, chat_id, state, config_fingerprint, output_published,
-                        request_payload_hash, model_request_hash
+                "SELECT turn_id, chat_id, state, request_payload_hash
                  FROM turn_runs
                  WHERE state IN (
                      'accepted', 'input_committed', 'model_pending',
@@ -601,10 +595,7 @@ impl Database {
                     turn_id: row.get(0)?,
                     chat_id: row.get(1)?,
                     state: row.get(2)?,
-                    config_fingerprint: row.get(3)?,
-                    output_published: row.get::<_, i64>(4)? != 0,
-                    request_payload_hash: row.get(5)?,
-                    model_request_hash: row.get(6)?,
+                    request_payload_hash: row.get(3)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -617,46 +608,40 @@ impl Database {
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
 
-            let fingerprint_mismatch = match (&row.config_fingerprint, current_fingerprint) {
-                (Some(stored), Some(current)) => stored != current,
-                _ => true,
-            };
-
+            // Fail-stop recovery: every non-terminal turn is terminated on
+            // startup. `accepted` / `input_committed` never published any
+            // model output, so failing them is safe and lets the user retry.
+            // The remaining states may have emitted output (or tool side
+            // effects) that the process failed to durably record before
+            // crashing, so they go to `uncertain` to avoid re-sending.
             let (to, error_kind, error_message): (TurnRunState, Option<&str>, Option<String>) =
-                if fingerprint_mismatch {
-                    (
-                        TurnRunState::Uncertain,
-                        Some("config_mismatch"),
+                match from {
+                    TurnRunState::Accepted => (
+                        TurnRunState::Failed,
+                        Some("interrupted"),
                         Some(format!(
-                            "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
-                            stored = row.config_fingerprint,
-                            current = current_fingerprint,
+                            "recovered on startup: accepted turn never started (payload_hash={})",
+                            row.request_payload_hash.as_deref().unwrap_or("none")
                         )),
-                    )
-                } else {
-                    match from {
-                        TurnRunState::Accepted => (
-                            TurnRunState::Failed,
-                            Some("interrupted"),
-                            Some(format!(
-                                "recovered on startup: accepted turn has no committed input (payload_hash={})",
-                                row.request_payload_hash.as_deref().unwrap_or("none")
-                            )),
+                    ),
+                    TurnRunState::InputCommitted => (
+                        TurnRunState::Failed,
+                        Some("interrupted"),
+                        Some(
+                            "recovered on startup: input committed but model never ran".to_string(),
                         ),
-                        TurnRunState::ModelPending
-                            if row.output_published || row.model_request_hash.is_none() =>
-                        {
-                            (
-                                TurnRunState::Uncertain,
-                                Some("interrupted"),
-                                Some(format!(
-                                    "recovered on startup: model_pending with output_published={} cannot prove safe retry",
-                                    row.output_published
-                                )),
-                            )
-                        }
-                        _ => (from, None, None),
-                    }
+                    ),
+                    TurnRunState::ModelPending
+                    | TurnRunState::ModelCompleted
+                    | TurnRunState::ToolsPending
+                    | TurnRunState::ToolsCompleted => (
+                        TurnRunState::Uncertain,
+                        Some("interrupted"),
+                        Some(format!(
+                            "recovered on startup: {from} may have published output externally; requires manual review"
+                        )),
+                    ),
+                    _ => (from, None, None),
                 };
 
             if to != from {
@@ -1030,14 +1015,16 @@ mod tests {
     }
 
     #[test]
-    fn recover_interrupted_marks_accepted_failed_and_preserves_safe_states() {
-        // Arrange: accepted (no input), input_committed (safe to resume),
-        // model_pending with output (unsafe to retry).
+    fn recover_interrupted_fail_stops_all_non_terminal_turns() {
+        // Arrange: every non-terminal state is represented.
         let (db, _dir) = test_db();
         let accepted_id = accept(&db, "acc").turn_id;
         let input_committed_id = accept(&db, "mid").turn_id;
         let model_pending_unsafe_id = accept(&db, "unsafe").turn_id;
         let model_pending_safe_id = accept(&db, "safe").turn_id;
+        let model_completed_id = accept(&db, "mcomp").turn_id;
+        let tools_pending_id = accept(&db, "tpend").turn_id;
+        let tools_completed_id = accept(&db, "tcomp").turn_id;
 
         db.commit_turn_input(&input_committed_id, "in")
             .expect("commit");
@@ -1054,26 +1041,48 @@ mod tests {
         db.begin_turn_model_iteration(&model_pending_safe_id, 1, "h")
             .expect("begin");
 
-        // Act
-        let recovered = db
-            .recover_interrupted_turns(Some("abc123"))
-            .expect("recover");
+        db.commit_turn_input(&model_completed_id, "in")
+            .expect("commit");
+        db.begin_turn_model_iteration(&model_completed_id, 1, "h")
+            .expect("begin");
+        db.complete_turn_model(&model_completed_id)
+            .expect("complete model");
 
-        // Assert: accepted → failed; safe mid-flight states are preserved.
-        assert_eq!(recovered.len(), 2);
+        db.commit_turn_input(&tools_pending_id, "in")
+            .expect("commit");
+        db.begin_turn_model_iteration(&tools_pending_id, 1, "h")
+            .expect("begin");
+        db.complete_turn_model(&tools_pending_id)
+            .expect("complete model");
+        db.begin_turn_tools(&tools_pending_id).expect("begin tools");
+
+        db.commit_turn_input(&tools_completed_id, "in")
+            .expect("commit");
+        db.begin_turn_model_iteration(&tools_completed_id, 1, "h")
+            .expect("begin");
+        db.complete_turn_model(&tools_completed_id)
+            .expect("complete model");
+        db.begin_turn_tools(&tools_completed_id)
+            .expect("begin tools");
+        db.complete_turn_tools(&tools_completed_id)
+            .expect("complete tools");
+
+        // Act
+        let recovered = db.recover_interrupted_turns().expect("recover");
+
+        // Assert: accepted / input_committed fail (safe to retry); every
+        // state that may have published output goes to uncertain (fail-stop).
+        assert_eq!(recovered.len(), 7);
         assert_eq!(state(&db, &accepted_id), TurnRunState::Failed);
-        assert_eq!(
-            state(&db, &input_committed_id),
-            TurnRunState::InputCommitted
-        );
+        assert_eq!(state(&db, &input_committed_id), TurnRunState::Failed);
         assert_eq!(
             state(&db, &model_pending_unsafe_id),
             TurnRunState::Uncertain
         );
-        assert_eq!(
-            state(&db, &model_pending_safe_id),
-            TurnRunState::ModelPending
-        );
+        assert_eq!(state(&db, &model_pending_safe_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &model_completed_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &tools_pending_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &tools_completed_id), TurnRunState::Uncertain);
     }
 
     #[test]
@@ -1089,9 +1098,7 @@ mod tests {
         db.complete_turn(&completed_id, "final").expect("complete");
 
         // Act
-        let recovered = db
-            .recover_interrupted_turns(Some("abc123"))
-            .expect("recover");
+        let recovered = db.recover_interrupted_turns().expect("recover");
 
         // Assert
         assert!(recovered.is_empty(), "terminal turns are not recovered");
@@ -1105,31 +1112,27 @@ mod tests {
         let turn_id = accept(&db, "once").turn_id;
         db.commit_turn_input(&turn_id, "in").expect("commit");
 
-        // Act: first recovery preserves input_committed; second sees no change.
-        db.recover_interrupted_turns(Some("abc123")).expect("first");
-        let second = db
-            .recover_interrupted_turns(Some("abc123"))
-            .expect("second");
+        // Act: first recovery fail-stops input_committed; second sees no change.
+        db.recover_interrupted_turns().expect("first");
+        let second = db.recover_interrupted_turns().expect("second");
 
         // Assert
         assert!(second.is_empty());
-        assert_eq!(state(&db, &turn_id), TurnRunState::InputCommitted);
+        assert_eq!(state(&db, &turn_id), TurnRunState::Failed);
     }
 
     #[test]
-    fn recover_interrupted_config_mismatch_always_uncertain() {
+    fn recover_interrupted_fails_accepted_regardless_of_fingerprint() {
         // Arrange: accepted turn with a stored fingerprint.
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "mismatch").turn_id;
 
         // Act: recovery with a different fingerprint.
-        let recovered = db
-            .recover_interrupted_turns(Some("different-fp"))
-            .expect("recover");
+        let recovered = db.recover_interrupted_turns().expect("recover");
 
-        // Assert: even though the state is accepted, fingerprint mismatch
-        // forces uncertain
+        // Assert: fail-stop ignores the fingerprint; an accepted turn that
+        // never started is always failed so the user can safely retry.
         assert_eq!(recovered.len(), 1);
-        assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &turn_id), TurnRunState::Failed);
     }
 }

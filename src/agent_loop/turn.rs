@@ -293,10 +293,19 @@ impl TurnExecutor<'_> {
             // 段階0: 同一受付の重複を防ぐため、まず chat_id を解決し
             // `turn_runs` を idempotent に受付する。completed の再受付は
             // 保存済みの最終結果をそのまま返し、LLM を呼ばない。
+            //
+            // The Config snapshot is taken exactly once here, at Turn start,
+            // and shared by both `accept_turn` and `prepare_turn` so the
+            // fingerprint stored in `turn_runs` and the snapshot actually used
+            // for the Provider/Prompt generation belong to the same Config
+            // generation.
+            let snapshot = self.state.config_manager.current_blocking();
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = self.resolve_request_key();
             let payload_hash = payload_hash(user_input);
-            let acceptance = self.accept_turn(chat_id, &request_key, &payload_hash).await?;
+            let acceptance = self
+                .accept_turn(chat_id, &request_key, &payload_hash, &snapshot)
+                .await?;
             let turn = match acceptance {
                 TurnAcceptance::Completed(saved) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
@@ -322,7 +331,9 @@ impl TurnExecutor<'_> {
 
             let result = async {
                 // 段階1: セッションを変更する前に、このターンで使う依存を解決する。
-                let prepared = self.prepare_turn(user_input, &turn.turn_id).await?;
+                let prepared = self
+                    .prepare_turn(user_input, &turn.turn_id, &snapshot)
+                    .await?;
                 let prompt_ctx = PromptContext {
                     system_prompt: &prepared.system_prompt,
                     tools_json: prepared.tools_json.as_deref(),
@@ -377,11 +388,11 @@ impl TurnExecutor<'_> {
         chat_id: i64,
         request_key: &str,
         payload_hash: &str,
+        snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
     ) -> Result<TurnAcceptance, EgoPulseError> {
         let scope = self.context.scope;
         let request_key = request_key.to_string();
         let payload_hash = payload_hash.to_string();
-        let snapshot = self.state.config_manager.current_blocking();
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
         let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
@@ -489,6 +500,7 @@ impl TurnExecutor<'_> {
         &self,
         user_input: &str,
         turn_id: &str,
+        snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
     ) -> Result<PreparedTurn, EgoPulseError> {
         let chat_id = resolve_chat_id(self.state, self.context)
             .await
@@ -514,8 +526,9 @@ impl TurnExecutor<'_> {
             turn_sender: self.state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             scope: self.context.scope,
+            tool_call_id: String::new(),
         };
-        let config_snapshot = self.state.config_manager.current_blocking();
+        let config_snapshot = Arc::clone(snapshot);
         let system_prompt = crate::agent_loop::prompt_builder::build_system_prompt_with_config(
             self.state,
             self.context,
@@ -3014,6 +3027,70 @@ mod tests {
                 "secret.db.{table} should have at least one row after a secret turn"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_turn_writes_tool_ledger_to_secret_db_only() {
+        // Regression: a non-read-only Tool executed in a Secret-scoped turn
+        // must persist its ledger row to secret.db, never to egopulse.db.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({"command": "echo secret-side-effect"}),
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+
+        let mut context = cli_context("secret-tool-ledger");
+        context.scope = ConversationScope::Secret;
+
+        let reply = process_turn(&state.turn_runtime(), &context, "run a command")
+            .await
+            .expect("process turn");
+        assert_eq!(reply, "done");
+
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        assert_eq!(
+            count_rows(&ego_conn, "tool_calls"),
+            0,
+            "secret tool ledger must NOT leak into egopulse.db"
+        );
+
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        assert_eq!(
+            count_rows(&secret_conn, "tool_calls"),
+            1,
+            "secret tool ledger must be written to secret.db"
+        );
     }
 
     // -----------------------------------------------------------------------

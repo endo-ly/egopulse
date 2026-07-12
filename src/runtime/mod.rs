@@ -409,18 +409,13 @@ pub async fn build_app_state_with_path(
 /// Failures are logged but never abort startup so the runtime can still serve
 /// new turns.
 async fn recover_durable_state(state: &AppState) {
-    let fp = state.config_manager.current_blocking().fingerprint.clone();
-    recover_durable_state_for_db(&state.db, ConversationScope::Normal, Some(&fp));
+    recover_durable_state_for_db(&state.db, ConversationScope::Normal);
     if let Some(secret_db) = &state.secret_db {
-        recover_durable_state_for_db(secret_db, ConversationScope::Secret, Some(&fp));
+        recover_durable_state_for_db(secret_db, ConversationScope::Secret);
     }
 }
 
-fn recover_durable_state_for_db(
-    db: &Arc<Database>,
-    scope: ConversationScope,
-    current_fingerprint: Option<&str>,
-) {
+fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
     match db.as_ref().recover_running_tools() {
         Ok(recovered) if !recovered.is_empty() => {
             for tool in &recovered {
@@ -438,7 +433,7 @@ fn recover_durable_state_for_db(
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
     }
-    match db.as_ref().recover_interrupted_turns(current_fingerprint) {
+    match db.as_ref().recover_interrupted_turns() {
         Ok(recovered) if !recovered.is_empty() => {
             for turn in &recovered {
                 tracing::info!(

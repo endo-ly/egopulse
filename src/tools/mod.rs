@@ -66,6 +66,12 @@ pub(crate) struct ToolExecutionContext {
     /// ledger rows (`tool_calls.turn_id`) so a crash recovery can attribute a
     /// Tool call to the Turn that claimed it.
     pub turn_id: String,
+    /// Tool Call ID assigned by the LLM for the single Tool call currently
+    /// being executed. Empty until the per-call executor sets it. Used as part
+    /// of idempotency keys (e.g. `agent_send`) so that one parent Turn sending
+    /// the same message to the same target via two distinct Tool calls maps to
+    /// two distinct child Turns.
+    pub tool_call_id: String,
     /// Sender half of the pending-agent-turn channel.
     /// Tools like `agent_send` use this to enqueue turns for target agents.
     pub turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,

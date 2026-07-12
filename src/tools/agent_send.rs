@@ -211,10 +211,14 @@ impl Tool for AgentSendTool {
             scope: context.scope,
 
             // Stable across crash retries: the same parent Turn sending the
-            // same message to the same target maps to one target Turn.
+            // same message to the same target via the same Tool call maps to
+            // one target Turn. The Tool Call ID disambiguates two separate
+            // `agent_send` calls within a single parent Turn that target the
+            // same agent with the same message.
             request_key: format!(
-                "agent_send:{}:{}:{}",
+                "agent_send:{}:{}:{}:{}",
                 context.turn_id,
+                context.tool_call_id,
                 target_id,
                 short_hash(&params.message),
             ),
@@ -302,6 +306,7 @@ mod tests {
             turn_id: String::new(),
             turn_sender,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         }
     }
@@ -428,6 +433,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_send_request_key_distinguishes_tool_calls() {
+        // Regression: two `agent_send` calls within the same parent Turn that
+        // target the same agent with the same message (distinct Tool Call IDs)
+        // must map to two distinct child Turns. The Tool Call ID is part of the
+        // request key so the Channel Log shows both while the target Turn is
+        // deduplicated per call.
+        let tool = tool_with_agents(test_agents());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let mut ctx_a = test_context_with_agent("lyre", tx.clone());
+        ctx_a.turn_id = "parent-turn".to_string();
+        ctx_a.tool_call_id = "call-1".to_string();
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "same message"}), &ctx_a)
+            .await;
+
+        let mut ctx_b = test_context_with_agent("lyre", tx);
+        ctx_b.turn_id = "parent-turn".to_string();
+        ctx_b.tool_call_id = "call-2".to_string();
+        let _ = tool
+            .execute(json!({"to": "vega", "message": "same message"}), &ctx_b)
+            .await;
+
+        let turn_a = rx.try_recv().expect("turn a");
+        let turn_b = rx.try_recv().expect("turn b");
+
+        assert_ne!(
+            turn_a.context.request_key, turn_b.context.request_key,
+            "distinct tool call IDs must yield distinct request keys"
+        );
+        assert!(turn_a.context.request_key.contains("call-1"));
+        assert!(turn_b.context.request_key.contains("call-2"));
+    }
+
+    #[tokio::test]
     async fn agent_send_target_input_format() {
         let tool = tool_with_agents(test_agents());
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -526,6 +566,7 @@ mod tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -576,6 +617,7 @@ mod tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -661,6 +703,7 @@ mod integration_tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -693,6 +736,7 @@ mod integration_tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -734,6 +778,7 @@ mod integration_tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -775,6 +820,7 @@ mod integration_tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
@@ -822,6 +868,7 @@ mod integration_tests {
             turn_id: String::new(),
             turn_sender: tx,
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
