@@ -11,8 +11,9 @@
 5. [Safety Compaction](#5-safety-compaction)
 6. [Fallback](#6-fallback)
 7. [Archive](#7-archive)
-8. [Conflict Retry](#8-conflict-retry)
-9. [Durable Turn State](#9-durable-turn-state)
+8. [Conversation Scope による DB Routing](#8-conversation-scope-による-db-routing)
+9. [Conflict Retry](#9-conflict-retry)
+10. [Durable Turn State](#10-durable-turn-state)
 
 ---
 
@@ -351,7 +352,7 @@ stale snapshot に単純 append だけを再試行すると、compaction 前の 
 | 最初の user-phase retry | compaction-aware |
 | 以降の assistant / tool phase retry | compaction はすでに終わっている前提で通常 persist |
 
-## 9. Durable Turn State
+## 10. Durable Turn State
 
 Turn の受付・入力保存・model iteration・Tool 実行・完了を `turn_runs` テーブルへ永続化し、重複受付防止・安全な再試行・crash 後の復旧判断を DB から行う。
 

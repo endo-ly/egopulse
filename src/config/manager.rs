@@ -48,7 +48,14 @@ impl ConfigSnapshot {
         let fingerprint = match config_path {
             Some(path) => match std::fs::read_to_string(path) {
                 Ok(content) => sha256_hex(content.as_bytes()),
-                Err(_) => fallback_fingerprint(&config),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "failed to read config file for fingerprinting; using fallback fingerprint"
+                    );
+                    fallback_fingerprint(&config)
+                }
             },
             None => fallback_fingerprint(&config),
         };
@@ -96,10 +103,10 @@ fn fallback_fingerprint(config: &Config) -> String {
     sha256_hex(&hasher.finish().to_le_bytes())
 }
 
-/// Owns the current `ConfigSnapshot` and supports atomic swap.
+/// Owns the current `ConfigSnapshot`.
 ///
-/// `current()` / `current_blocking()` return a cheap `Arc` clone; callers
-/// must not hold the read lock across await points.
+/// `current_blocking()` returns a cheap `Arc` clone; callers must not hold
+/// the read lock across await points.
 pub(crate) struct ConfigManager {
     inner: RwLock<Arc<ConfigSnapshot>>,
 }

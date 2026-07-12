@@ -819,7 +819,7 @@ CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
 
 ### turn_runs
 
-Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実行・完了・失敗・uncertain のライフサイクルを永続化し、重複受付防止と安全な再試行・復旧判断を可能にする。詳細は [session-lifecycle.md §9](./session-lifecycle.md#9-durable-turn-state) を参照。
+Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実行・完了・失敗・uncertain のライフサイクルを永続化し、重複受付防止と安全な再試行・復旧判断を可能にする。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
 
 ```sql
 CREATE TABLE IF NOT EXISTS turn_runs (
@@ -891,7 +891,7 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
 - 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`TurnRepository`）
 - `output_published` が真の Turn は partial output を外部公開済みのため自動 retry しない
 - `UNIQUE(chat_id, request_key)` により同一受付の重複を防止する。再受付時は既存 Turn を返し、`completed` なら保存済み結果を再利用する
-- crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §9](./session-lifecycle.md#9-durable-turn-state)
+- crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)
 
 ---
 
@@ -1133,7 +1133,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 ### 外部キー制約が最小限
 
-明示的な FK は `tool_calls.chat_id` のみ。`messages.chat_id` や `sessions.chat_id` には FK がない。整合性はアプリケーション層で担保。
+明示的な FK は `tool_calls.chat_id`、`sleep_run_steps.sleep_run_id`、`memory_snapshots.run_id` の 3 つ。`messages.chat_id` や `sessions.chat_id` には FK がない。整合性はアプリケーション層で担保。
 
 ### CASCADE なし
 
@@ -1151,7 +1151,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 |------|----|
 | ファイルパス | `{data_dir}/secret.db` |
 | 初期化条件 | `channels.discord.channels.*` または `channels.telegram.telegram_channels.*` に `secret: true` エントリが1件以上ある場合 |
-| テーブル数 | 8（`chats`, `messages`, `sessions`, `llm_usage_logs`, `turn_runs`, `db_meta`, `schema_migrations`。`tool_calls` は不在） |
+| テーブル数 | 7（`chats`, `messages`, `sessions`, `llm_usage_logs`, `turn_runs`, `db_meta`, `schema_migrations`。`tool_calls` は不在） |
 | スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数（現行 v3）。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
 | DBライブラリ | `egopulse.db` と同一（rusqlite 0.37 bundled） |
 | PRAGMA | `journal_mode=WAL`, `busy_timeout=5s` |

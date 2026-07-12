@@ -211,7 +211,7 @@ TurnRuntime
 └── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
 ```
 
-Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnRuntime` へ到達する。詳細は [session-lifecycle.md §9](./session-lifecycle.md#9-durable-turn-state) を参照。
+Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnRuntime` へ到達する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
 
 ### SurfaceContext
 

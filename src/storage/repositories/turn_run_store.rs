@@ -197,13 +197,14 @@ impl<'a> TurnRepository<'a> {
         Ok(())
     }
 
-    fn transition_locked(
+    /// Loads and parses the current state of a Turn inside a transaction.
+    /// Returns [`StorageError::NotFound`] when the row is missing, or
+    /// [`StorageError::Conflict`] when the persisted state string is invalid.
+    fn read_state_locked(
         tx: &rusqlite::Transaction<'_>,
         turn_id: &str,
-        from: TurnRunState,
-        to: TurnRunState,
-    ) -> Result<(), StorageError> {
-        let current_str: String = tx
+    ) -> Result<TurnRunState, StorageError> {
+        let state_str: String = tx
             .query_row(
                 "SELECT state FROM turn_runs WHERE turn_id = ?1",
                 params![turn_id],
@@ -211,9 +212,18 @@ impl<'a> TurnRepository<'a> {
             )
             .optional()?
             .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
-        let current: TurnRunState = current_str
+        state_str
             .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))
+    }
+
+    fn transition_locked(
+        tx: &rusqlite::Transaction<'_>,
+        turn_id: &str,
+        from: TurnRunState,
+        to: TurnRunState,
+    ) -> Result<(), StorageError> {
+        let current = Self::read_state_locked(tx, turn_id)?;
         if current != from {
             return Err(StorageError::Conflict(format!(
                 "turn state transition rejected: expected {from} but was {current}"
@@ -301,17 +311,7 @@ impl<'a> TurnRepository<'a> {
     ) -> Result<(), StorageError> {
         let mut conn = self.db.get_conn()?;
         let tx = conn.transaction()?;
-        let current_str: String = tx
-            .query_row(
-                "SELECT state FROM turn_runs WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
-        let current: TurnRunState = current_str
-            .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+        let current = Self::read_state_locked(&tx, turn_id)?;
         if !matches!(
             current,
             TurnRunState::InputCommitted
@@ -416,17 +416,7 @@ impl<'a> TurnRepository<'a> {
     ) -> Result<(), StorageError> {
         let mut conn = self.db.get_conn()?;
         let tx = conn.transaction()?;
-        let current_str: String = tx
-            .query_row(
-                "SELECT state FROM turn_runs WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
-        let current: TurnRunState = current_str
-            .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+        let current = Self::read_state_locked(&tx, turn_id)?;
         if !matches!(
             current,
             TurnRunState::ModelCompleted | TurnRunState::ToolsCompleted
@@ -478,17 +468,7 @@ impl<'a> TurnRepository<'a> {
         }
         let mut conn = self.db.get_conn()?;
         let tx = conn.transaction()?;
-        let current_str: String = tx
-            .query_row(
-                "SELECT state FROM turn_runs WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))?;
-        let current: TurnRunState = current_str
-            .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+        let current = Self::read_state_locked(&tx, turn_id)?;
         if current.is_terminal() {
             return Err(StorageError::Conflict(format!(
                 "fail rejected from terminal state {current}"
@@ -622,19 +602,7 @@ impl<'a> TurnRepository<'a> {
         turn_id: &str,
         expected: TurnRunState,
     ) -> Result<(), StorageError> {
-        let state_str: Option<String> = tx
-            .query_row(
-                "SELECT state FROM turn_runs WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(state_str) = state_str else {
-            return Err(StorageError::NotFound(format!("turn_run:{turn_id}")));
-        };
-        let state: TurnRunState = state_str
-            .parse()
-            .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+        let state = Self::read_state_locked(tx, turn_id)?;
         if state != expected {
             return Err(StorageError::Conflict(format!(
                 "turn state transition rejected: expected {expected} but was {state}"

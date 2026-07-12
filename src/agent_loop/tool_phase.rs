@@ -438,6 +438,7 @@ async fn claim_tool_slot(
 ) -> Result<ClaimOutcome, EgoPulseError> {
     let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
     let hash = input_hash(&canonical);
+    let tool_input = tool_call.arguments.to_string();
     let class = state.tools.idempotency_class(&tool_call.name).await;
     let key = state
         .tools
@@ -448,8 +449,8 @@ async fn claim_tool_slot(
     let message_id = assistant_message_id.to_string();
     let tool_call_id = tool_call.id.clone();
     let tool_name = tool_call.name.clone();
-    let canonical_for_closure = canonical.clone();
-    let hash_for_closure = hash.clone();
+    let hash_for_closure = hash;
+    let tool_input_for_closure = tool_input;
     let key_for_closure = key;
     Ok(call_blocking(Arc::clone(&state.db), move |db| {
         db.tool_execution_store().claim(ClaimParams {
@@ -458,7 +459,7 @@ async fn claim_tool_slot(
             message_id: &message_id,
             tool_call_id: &tool_call_id,
             tool_name: &tool_name,
-            canonical_input: &canonical_for_closure,
+            tool_input: &tool_input_for_closure,
             input_hash: &hash_for_closure,
             idempotency_class: class,
             idempotency_key: key_for_closure.as_deref(),

@@ -111,8 +111,8 @@ impl<'a> ConversationStore<'a> {
         }
 
         let seq = next_seq;
-        tx.execute(
-            "INSERT OR REPLACE INTO messages
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO messages
                  (id, chat_id, sender_id, content, sender_kind, timestamp,
                   message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -130,6 +130,18 @@ impl<'a> ConversationStore<'a> {
                 message.parent_message_id.as_deref(),
             ],
         )?;
+
+        // Idempotent re-commit: the message row already exists (e.g. a Turn
+        // whose deterministic message id is re-persisted on recovery). Do not
+        // advance seq or revision — that would create a gap and a spurious
+        // CAS conflict for the next writer.
+        if inserted == 0 {
+            return Ok(CommitOutcome {
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                revision: current_revision,
+                seq,
+            });
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
 

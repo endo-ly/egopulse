@@ -24,9 +24,10 @@ use crate::storage::{Database, IdempotencyClass, ToolState};
 
 /// Parameters for claiming a Tool execution slot.
 ///
-/// `canonical_input` is the deterministic serialization of the Tool name and
-/// arguments (see [`canonical_tool_input`]); `input_hash` is its SHA-256 hex
-/// digest (see [`input_hash`]). The caller computes both so the hash is fixed
+/// `tool_input` is the original JSON arguments serialized as-is — this is
+/// what history / display APIs read back. `input_hash` is the SHA-256 hex
+/// digest of the canonical Tool name + arguments (see
+/// [`canonical_tool_input`]); the caller computes it so the hash is fixed
 /// before any DB write.
 pub(crate) struct ClaimParams<'a> {
     pub turn_id: &'a str,
@@ -34,7 +35,8 @@ pub(crate) struct ClaimParams<'a> {
     pub message_id: &'a str,
     pub tool_call_id: &'a str,
     pub tool_name: &'a str,
-    pub canonical_input: &'a str,
+    /// Original JSON arguments, preserved verbatim for history display.
+    pub tool_input: &'a str,
     pub input_hash: &'a str,
     pub idempotency_class: IdempotencyClass,
     pub idempotency_key: Option<&'a str>,
@@ -74,6 +76,27 @@ pub(crate) struct ToolExecutionRepository<'a> {
     db: &'a Database,
 }
 
+/// Persisted columns read back during a claim re-evaluation.
+struct ExistingToolRow {
+    state: String,
+    input_hash: Option<String>,
+    tool_output: Option<String>,
+    idempotency_class: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+impl ExistingToolRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            state: row.get(0)?,
+            input_hash: row.get(1)?,
+            tool_output: row.get(2)?,
+            idempotency_class: row.get(3)?,
+            idempotency_key: row.get(4)?,
+        })
+    }
+}
+
 impl<'a> ToolExecutionRepository<'a> {
     pub(crate) fn new(db: &'a Database) -> Self {
         Self { db }
@@ -98,7 +121,7 @@ impl<'a> ToolExecutionRepository<'a> {
     /// `(turn_id, tool_call_id)` is claimed with a different input hash.
     pub(crate) fn claim(&self, params: ClaimParams<'_>) -> Result<ClaimOutcome, StorageError> {
         let mut conn = self.db.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let outcome = Self::claim_locked(&tx, params)?;
         tx.commit()?;
         Ok(outcome)
@@ -109,17 +132,21 @@ impl<'a> ToolExecutionRepository<'a> {
         params: ClaimParams<'_>,
     ) -> Result<ClaimOutcome, StorageError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let existing: Option<(String, Option<String>, Option<String>)> = tx
+        // Load the persisted classification alongside the execution state so
+        // the retry decision trusts the ledger, not the incoming params. A
+        // caller must not relax a stored `non_idempotent` Tool into
+        // `read_only` to force a retry.
+        let existing = tx
             .query_row(
-                "SELECT state, input_hash, tool_output
+                "SELECT state, input_hash, tool_output, idempotency_class, idempotency_key
                  FROM tool_calls
                  WHERE turn_id = ?1 AND id = ?2",
                 params![params.turn_id, params.tool_call_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ExistingToolRow::from_row,
             )
             .optional()?;
 
-        let Some((state_str, stored_hash, stored_output)) = existing else {
+        let Some(row) = existing else {
             // Fresh claim: create pending, then advance to running.
             tx.execute(
                 "INSERT INTO tool_calls
@@ -131,7 +158,7 @@ impl<'a> ToolExecutionRepository<'a> {
                     params.chat_id,
                     params.message_id,
                     params.tool_name,
-                    params.canonical_input,
+                    params.tool_input,
                     &now,
                     params.turn_id,
                     params.input_hash,
@@ -143,7 +170,7 @@ impl<'a> ToolExecutionRepository<'a> {
             return Ok(ClaimOutcome::Acquired);
         };
 
-        let stored_hash = stored_hash.unwrap_or_default();
+        let stored_hash = row.input_hash.unwrap_or_default();
         if stored_hash != params.input_hash {
             return Err(StorageError::ToolInputConflict {
                 tool_call_id: params.tool_call_id.to_string(),
@@ -152,20 +179,37 @@ impl<'a> ToolExecutionRepository<'a> {
             });
         }
 
-        let state: ToolState = state_str
+        // Trust the persisted idempotency classification for retry decisions.
+        // A mismatch between stored and incoming classification is a conflict:
+        // the Tool's retry contract cannot change across claims for the same
+        // execution slot.
+        let stored_class: IdempotencyClass = row
+            .idempotency_class
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(IdempotencyClass::NonIdempotent);
+        if stored_class != params.idempotency_class {
+            return Err(StorageError::Conflict(format!(
+                "tool_calls idempotency_class changed: stored {stored_class} but requested {}",
+                params.idempotency_class
+            )));
+        }
+
+        let state: ToolState = row
+            .state
             .parse()
             .map_err(|e| StorageError::Conflict(format!("invalid tool_calls.state: {e}")))?;
 
         let outcome = match state {
             ToolState::Succeeded => ClaimOutcome::Reused {
-                tool_output: stored_output.unwrap_or_default(),
+                tool_output: row.tool_output.unwrap_or_default(),
             },
             ToolState::Pending => {
                 Self::advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
                 ClaimOutcome::Acquired
             }
             ToolState::Uncertain
-                if Self::retry_eligible(params.idempotency_class, params.idempotency_key) =>
+                if Self::retry_eligible(stored_class, row.idempotency_key.as_deref()) =>
             {
                 Self::advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
                 ClaimOutcome::Acquired
@@ -412,7 +456,7 @@ mod tests {
             message_id: "m-1",
             tool_call_id,
             tool_name: "shell",
-            canonical_input: "shell:{}",
+            tool_input: "{}",
             input_hash,
             idempotency_class: class,
             idempotency_key: key,
@@ -845,6 +889,40 @@ mod tests {
             ClaimOutcome::Blocked {
                 state: ToolState::Uncertain
             }
+        );
+    }
+
+    #[test]
+    fn claim_rejects_idempotency_class_change_on_existing_row() {
+        // Arrange: a non-idempotent Tool claimed and then left uncertain by
+        // recovery.
+        let (db, _dir) = test_db();
+        let repo = db.tool_execution_store();
+        repo.claim(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("initial claim");
+        repo.recover_running().expect("recover to uncertain");
+
+        // Act: re-claim relaxing the classification to read_only. The ledger
+        // must reject this — a caller must not upgrade a non-idempotent Tool
+        // into a retryable class to force a second execution.
+        let result = repo.claim(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::ReadOnly,
+            None,
+        ));
+
+        // Assert
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "class change must be rejected, got: {result:?}"
         );
     }
 
