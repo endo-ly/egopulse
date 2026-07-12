@@ -148,7 +148,7 @@ pub(crate) fn run_startup_backup(
         &settings.dest_dir,
         dest_path,
         settings.max_generations,
-        "egopulse",
+        prefix,
         run_pragma_integrity_check,
     )
 }

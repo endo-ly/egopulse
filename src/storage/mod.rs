@@ -687,9 +687,11 @@ impl Database {
 
     /// Initializes the database with a pre-migration backup when `settings.enabled`
     /// is `true` and the DB file already exists. The backup runs against a raw
-    /// connection before the pool is constructed, so any failure is logged and
-    /// swallowed to keep the startup path best-effort. After the backup (or
-    /// skip), this function behaves exactly like [`Database::new`].
+    /// connection before the pool is constructed. A failed pre-migration backup
+    /// aborts startup before any irreversible schema change touches the existing
+    /// database: it returns [`StorageError::MigrationBackupFailed`] rather than
+    /// being logged and swallowed. When backup is disabled or the file does not
+    /// yet exist, this function behaves exactly like [`Database::new`].
     pub(crate) fn new_with_backup(
         db_path: &Path,
         settings: &backup::BackupSettings,

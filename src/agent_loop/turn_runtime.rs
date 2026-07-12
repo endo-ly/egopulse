@@ -93,6 +93,12 @@ impl TurnRuntime {
     ///
     /// Callers inside a Turn should use this so the entire Turn runs against a
     /// single fixed Config generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgoPulseError`] when resolving the agent/channel provider for
+    /// `context` fails, or when constructing the cached provider for the
+    /// resolved configuration fails.
     pub(crate) fn llm_for_context_with_snapshot(
         &self,
         context: &crate::agent_loop::SurfaceContext,

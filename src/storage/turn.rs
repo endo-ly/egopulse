@@ -238,12 +238,17 @@ impl Database {
         // A re-delivery under the same request_key must carry the same input
         // payload. A hash mismatch means the same key was reused for different
         // content — reject rather than silently returning the unrelated Turn.
+        // A NULL `request_payload_hash` is legacy data (captured before payload
+        // hashing existed); accept it as `Existing` so older rows stay usable.
         let outcome = if run.turn_id == proposed_turn_id {
             AcceptOutcome::Created(run)
-        } else if run.request_payload_hash.as_deref() != Some(request_payload_hash) {
-            return Err(StorageError::Conflict(format!(
-                "turn_runs request_payload_hash mismatch for chat_id={chat_id} request_key={request_key}"
-            )));
+        } else if let Some(existing_hash) = run.request_payload_hash.as_deref() {
+            if existing_hash != request_payload_hash {
+                return Err(StorageError::Conflict(format!(
+                    "turn_runs request_payload_hash mismatch for chat_id={chat_id} request_key={request_key}"
+                )));
+            }
+            AcceptOutcome::Existing(run)
         } else {
             AcceptOutcome::Existing(run)
         };
@@ -774,6 +779,34 @@ mod tests {
 
         // Assert
         assert_ne!(a.turn_id, b.turn_id);
+    }
+
+    #[test]
+    fn accept_treats_null_request_payload_hash_as_legacy_existing() {
+        // Arrange: a pre-existing turn_runs row with a NULL request_payload_hash
+        // (legacy data captured before payload hashing existed).
+        let (db, _dir) = test_db();
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "INSERT INTO turn_runs
+                     (turn_id, chat_id, request_key, state, config_revision, accepted_at, updated_at)
+                 VALUES (?1, 1, 'legacy:key', 'completed', 1, 't', 't')",
+                params![&"legacy-turn"],
+            )
+            .expect("seed legacy row");
+
+        // Act: re-accept the same request_key with any payload hash.
+        let outcome = db
+            .accept_or_get_turn(1, "legacy:key", 1, Some("abc123"), "new-hash")
+            .expect("accept");
+
+        // Assert: a NULL stored hash is legacy data, so it is accepted as
+        // Existing rather than rejected as a payload mismatch.
+        assert!(
+            matches!(outcome, AcceptOutcome::Existing(_)),
+            "legacy NULL request_payload_hash must be AcceptedOutcome::Existing"
+        );
     }
 
     #[test]
