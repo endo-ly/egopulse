@@ -1028,6 +1028,7 @@ async fn handle_message(
     let mut context = handler.make_context(&sender_name, &thread, &agent_id);
     context.channel_log_chat_id = channel_log_chat_id;
     context.origin_id = uuid::Uuid::new_v4().to_string();
+    context.request_key = format!("telegram:{raw_chat_id}:{}", msg.id.0);
 
     info!(
         chat_id = raw_chat_id,

@@ -8,30 +8,29 @@ use std::sync::Arc;
 use crate::agent_loop::session_snapshot::{
     SnapshotMessage, messages_from_snapshot, messages_to_snapshot,
 };
-use crate::agent_loop::{ConversationScope, SurfaceContext};
+use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
 use crate::assets::AssetStore;
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent};
-use crate::runtime::AppState;
 use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
 
 #[derive(Debug, Clone)]
 /// Holds the messages loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
     pub(crate) messages: Arc<Vec<Message>>,
-    pub(crate) session_updated_at: Option<String>,
+    pub(crate) session_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 /// Represents the updated snapshot returned after persisting one phase.
 pub(crate) struct PersistedTurn {
-    pub(crate) updated_at: String,
+    pub(crate) revision: i64,
     pub(crate) messages: Vec<Message>,
 }
 
 /// Resolves or creates the internal chat ID for a conversation surface.
 pub(crate) async fn resolve_chat_id(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
 ) -> Result<i64, EgoPulseError> {
     call_blocking(Arc::clone(state.db_for(context.scope)), {
@@ -55,7 +54,9 @@ pub(crate) async fn resolve_chat_id(
 }
 
 /// Lists all persisted sessions available in the local database.
-pub(crate) async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary>, EgoPulseError> {
+pub(crate) async fn list_sessions(
+    state: &TurnRuntime,
+) -> Result<Vec<SessionSummary>, EgoPulseError> {
     call_blocking(Arc::clone(&state.db), move |db| db.list_sessions())
         .await
         .map_err(EgoPulseError::from)
@@ -63,7 +64,7 @@ pub(crate) async fn list_sessions(state: &AppState) -> Result<Vec<SessionSummary
 
 /// Loads a session history and converts it into plain LLM messages.
 pub(crate) async fn load_session_messages(
-    state: &AppState,
+    state: &TurnRuntime,
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let chat_id = resolve_chat_id(state, context).await?;
@@ -86,11 +87,27 @@ pub(crate) async fn load_session_messages(
 
 /// Loads the trimmed session snapshot used as input for the next agent turn.
 pub(crate) async fn load_messages_for_turn(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
-    let max_history_messages = state.config.max_history_messages;
+    let max_history_messages = state.current_config().max_history_messages;
+    let snapshot = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.load_session_snapshot(chat_id, max_history_messages)
+    })
+    .await?;
+
+    snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
+}
+
+/// Like [`load_messages_for_turn`], but uses an explicit `max_history_messages`
+/// so the Turn can stick to the Config generation it started with.
+pub(crate) async fn load_messages_for_turn_with_limit(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    chat_id: i64,
+    max_history_messages: usize,
+) -> Result<LoadedSession, EgoPulseError> {
     let snapshot = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         db.load_session_snapshot(chat_id, max_history_messages)
     })
@@ -100,25 +117,57 @@ pub(crate) async fn load_messages_for_turn(
 }
 
 pub(crate) async fn persist_phase_once(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     message: StoredMessage,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    store_phase_snapshot(state, scope, message, messages.to_vec(), session_updated_at)
+    store_phase_snapshot(state, scope, message, messages.to_vec(), session_revision)
         .await
         .map_err(EgoPulseError::Storage)
 }
 
+/// Commits the user-input message, the session snapshot, and the
+/// `accepted → input_committed` Turn transition in a single database
+/// transaction.
+///
+/// This is the Turn-ingress counterpart to [`persist_phase_once`]: the
+/// conversation write and the Turn state advance share one SQLite
+/// transaction so a crash between them cannot leave a saved user message
+/// behind a Turn that recovery still considers unstarted.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Storage`] when the combined commit fails.
+pub(crate) async fn commit_user_turn_input(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    message: StoredMessage,
+    messages: &[Message],
+    session_revision: Option<i64>,
+    turn_id: &str,
+) -> Result<PersistedTurn, EgoPulseError> {
+    store_phase_snapshot_with_turn_input(
+        state,
+        scope,
+        message,
+        messages.to_vec(),
+        session_revision,
+        turn_id,
+    )
+    .await
+    .map_err(EgoPulseError::Storage)
+}
+
 /// Persists one turn phase with optimistic concurrency and a single conflict retry.
 pub(crate) async fn persist_phase(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     message: StoredMessage,
     phase_message: Message,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     persist_phase_messages(
         state,
@@ -126,25 +175,25 @@ pub(crate) async fn persist_phase(
         message,
         vec![phase_message],
         messages,
-        session_updated_at,
+        session_revision,
     )
     .await
 }
 
 pub(crate) async fn persist_phase_messages(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     message: StoredMessage,
     phase_messages: Vec<Message>,
     messages: &[Message],
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     let persisted = store_phase_snapshot(
         state,
         scope,
         message.clone(),
         messages.to_vec(),
-        session_updated_at.clone(),
+        session_revision,
     )
     .await;
     if let Some(turn) = persisted_turn_or_retry(persisted)? {
@@ -155,12 +204,12 @@ pub(crate) async fn persist_phase_messages(
     // 今回の phase 群だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
     let LoadedSession {
         messages: refreshed_messages,
-        session_updated_at: refreshed_updated_at,
+        session_revision: refreshed_revision,
     } = load_messages_for_turn(state, scope, message.chat_id).await?;
     let mut all_messages = Arc::try_unwrap(refreshed_messages).unwrap_or_else(|arc| (*arc).clone());
     all_messages.extend(phase_messages);
 
-    store_phase_snapshot(state, scope, message, all_messages, refreshed_updated_at)
+    store_phase_snapshot(state, scope, message, all_messages, refreshed_revision)
         .await
         .map_err(EgoPulseError::Storage)
 }
@@ -197,7 +246,7 @@ async fn snapshot_to_loaded(
 
     Ok(LoadedSession {
         messages: Arc::new(repair_orphan_tool_outputs(messages)),
-        session_updated_at: snapshot.updated_at,
+        session_revision: snapshot.session_revision,
     })
 }
 
@@ -278,7 +327,7 @@ fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
                 })
                 .collect(),
         ),
-        session_updated_at: snapshot.updated_at.clone(),
+        session_revision: snapshot.session_revision,
     }
 }
 
@@ -307,11 +356,11 @@ fn restore_snapshot_messages(
 }
 
 async fn store_phase_snapshot(
-    state: &AppState,
+    state: &TurnRuntime,
     scope: ConversationScope,
     message: StoredMessage,
     snapshot_messages: Vec<Message>,
-    session_updated_at: Option<String>,
+    session_revision: Option<i64>,
 ) -> Result<PersistedTurn, StorageError> {
     let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
         .await
@@ -319,12 +368,42 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
-    let updated_at = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
-        db.store_message_with_session(&message, &session_json, session_updated_at.as_deref())
+    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.store_message_with_session(&message, &session_json, session_revision)
     })
     .await?;
     Ok(PersistedTurn {
-        updated_at,
+        revision,
+        messages: snapshot_messages,
+    })
+}
+
+async fn store_phase_snapshot_with_turn_input(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    message: StoredMessage,
+    snapshot_messages: Vec<Message>,
+    session_revision: Option<i64>,
+    turn_id: &str,
+) -> Result<PersistedTurn, StorageError> {
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
+        .await
+        .map_err(|error| match error {
+            EgoPulseError::Storage(storage) => storage,
+            other => StorageError::TaskJoin(other.to_string()),
+        })?;
+    let turn_id_owned = turn_id.to_string();
+    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.commit_turn_input_with_conversation(
+            &message,
+            &session_json,
+            session_revision,
+            &turn_id_owned,
+        )
+    })
+    .await?;
+    Ok(PersistedTurn {
+        revision,
         messages: snapshot_messages,
     })
 }
@@ -441,6 +520,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = seed_message.clone();
@@ -456,12 +538,12 @@ mod tests {
         .await
         .expect("seed session");
 
-        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
+        let stale_session_revision = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 1)
-                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
+                .map(|snapshot| snapshot.session_revision.expect("session revision"))
         })
         .await
-        .expect("stale updated_at");
+        .expect("stale revision");
 
         let concurrent_message = StoredMessage {
             id: "seed-assistant".to_string(),
@@ -472,15 +554,18 @@ mod tests {
             timestamp: "2024-01-01T00:00:01Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
-            let expected_updated_at = stale_session_updated_at.clone();
+            let expected_revision = stale_session_revision;
             move |db| {
                 db.store_message_with_session(
                     &message,
                     r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
-                    Some(&expected_updated_at),
+                    Some(expected_revision),
                 )
                 .map(|_| ())
             }
@@ -489,7 +574,7 @@ mod tests {
         .expect("advance session");
 
         let persisted = persist_phase(
-            &state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: "new-user".to_string(),
@@ -500,10 +585,13 @@ mod tests {
                 timestamp: "2024-01-01T00:00:02Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "next"),
             &[Message::text("user", "hello")],
-            Some(stale_session_updated_at),
+            Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
@@ -523,7 +611,7 @@ mod tests {
             }),
         );
         let context = cli_context("images");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
         let data_url = "data:image/png;base64,AAAA";
@@ -545,7 +633,7 @@ mod tests {
         }];
 
         persist_phase(
-            &state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: "tool-msg".to_string(),
@@ -556,6 +644,9 @@ mod tests {
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             messages[0].clone(),
             &messages,
@@ -568,7 +659,7 @@ mod tests {
             db.load_session_snapshot(chat_id, 10).map(|snapshot| {
                 (
                     snapshot.messages_json.expect("session json"),
-                    snapshot.updated_at.expect("session updated_at"),
+                    snapshot.session_revision.expect("session revision"),
                 )
             })
         })
@@ -577,9 +668,10 @@ mod tests {
         assert!(!session_json.contains("data:image/png;base64"));
         assert!(session_json.contains("\"type\":\"input_image_ref\""));
 
-        let loaded = load_messages_for_turn(&state, ConversationScope::Normal, chat_id)
-            .await
-            .expect("load messages");
+        let loaded =
+            load_messages_for_turn(&state.turn_runtime(), ConversationScope::Normal, chat_id)
+                .await
+                .expect("load messages");
         match &loaded.messages[0].content {
             MessageContent::Parts(parts) => {
                 assert!(matches!(
@@ -601,7 +693,7 @@ mod tests {
             }),
         );
         let context = cli_context("missing-image");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
 
@@ -614,9 +706,10 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, ConversationScope::Normal, chat_id)
-            .await
-            .expect("load messages");
+        let loaded =
+            load_messages_for_turn(&state.turn_runtime(), ConversationScope::Normal, chat_id)
+                .await
+                .expect("load messages");
         match &loaded.messages[0].content {
             MessageContent::Parts(parts) => {
                 assert!(matches!(
@@ -639,7 +732,7 @@ mod tests {
             }),
         );
         let context = cli_context("orphan-tool-output");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
         let snapshot = vec![
@@ -665,9 +758,10 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, ConversationScope::Normal, chat_id)
-            .await
-            .expect("load messages");
+        let loaded =
+            load_messages_for_turn(&state.turn_runtime(), ConversationScope::Normal, chat_id)
+                .await
+                .expect("load messages");
 
         assert_eq!(loaded.messages.len(), 4);
         assert_eq!(loaded.messages[2].role, "tool");
@@ -694,7 +788,7 @@ mod tests {
             }),
         );
         let context = cli_context("full-snapshot");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
         let snapshot = (0..55)
@@ -713,9 +807,10 @@ mod tests {
         .await
         .expect("save snapshot");
 
-        let loaded = load_messages_for_turn(&state, ConversationScope::Normal, chat_id)
-            .await
-            .expect("load messages");
+        let loaded =
+            load_messages_for_turn(&state.turn_runtime(), ConversationScope::Normal, chat_id)
+                .await
+                .expect("load messages");
         assert_eq!(loaded.messages.len(), 55);
         assert_eq!(loaded.messages[0].content.as_text_lossy(), "message-0");
         assert_eq!(loaded.messages[54].content.as_text_lossy(), "message-54");
@@ -731,7 +826,7 @@ mod tests {
             }),
         );
         let context = cli_context("conflict-full");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
         let seed_messages = (0..51)
@@ -751,12 +846,12 @@ mod tests {
         .await
         .expect("save seed snapshot");
 
-        let stale_session_updated_at = call_blocking(Arc::clone(&state.db), move |db| {
+        let stale_session_revision = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 1)
-                .map(|snapshot| snapshot.updated_at.expect("session updated_at"))
+                .map(|snapshot| snapshot.session_revision.expect("session revision"))
         })
         .await
-        .expect("stale updated_at");
+        .expect("stale revision");
 
         let concurrent_message = StoredMessage {
             id: "concurrent-assistant".to_string(),
@@ -767,6 +862,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:52Z".to_string(),
             message_kind: MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         let mut latest_messages = seed_messages.clone();
         latest_messages.push(Message::text("assistant", "concurrent"));
@@ -775,9 +873,9 @@ mod tests {
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
             let latest_json = latest_json.clone();
-            let expected_updated_at = stale_session_updated_at.clone();
+            let expected_revision = stale_session_revision;
             move |db| {
-                db.store_message_with_session(&message, &latest_json, Some(&expected_updated_at))
+                db.store_message_with_session(&message, &latest_json, Some(expected_revision))
                     .map(|_| ())
             }
         })
@@ -787,7 +885,7 @@ mod tests {
         let mut stale_messages = seed_messages.clone();
         stale_messages.push(Message::text("user", "next"));
         let persisted = persist_phase(
-            &state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: "new-user-full".to_string(),
@@ -798,10 +896,13 @@ mod tests {
                 timestamp: "2024-01-01T00:00:53Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "next"),
             &stale_messages,
-            Some(stale_session_updated_at),
+            Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
@@ -828,6 +929,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         assert_eq!(context.agent_id, "default");
@@ -854,6 +957,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
         let ctx_b = SurfaceContext {
             channel: "discord".to_string(),
@@ -866,12 +971,14 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
-        let chat_a = super::resolve_chat_id(&state, &ctx_a)
+        let chat_a = super::resolve_chat_id(&state.turn_runtime(), &ctx_a)
             .await
             .expect("chat_a");
-        let chat_b = super::resolve_chat_id(&state, &ctx_b)
+        let chat_b = super::resolve_chat_id(&state.turn_runtime(), &ctx_b)
             .await
             .expect("chat_b");
 
@@ -902,10 +1009,16 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
-        let chat_first = super::resolve_chat_id(&state, &ctx).await.expect("first");
-        let chat_second = super::resolve_chat_id(&state, &ctx).await.expect("second");
+        let chat_first = super::resolve_chat_id(&state.turn_runtime(), &ctx)
+            .await
+            .expect("first");
+        let chat_second = super::resolve_chat_id(&state.turn_runtime(), &ctx)
+            .await
+            .expect("second");
 
         assert_eq!(chat_first, chat_second, "same agent must reuse chat id");
     }
@@ -923,6 +1036,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
         let telegram_ctx = SurfaceContext {
             channel: "telegram".to_string(),
@@ -935,6 +1050,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         assert_eq!(web_ctx.session_key(), "web:s1:agent:default");
@@ -986,10 +1103,16 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
-        let first = super::resolve_chat_id(&state, &ctx).await.expect("first");
-        let second = super::resolve_chat_id(&state, &ctx).await.expect("second");
+        let first = super::resolve_chat_id(&state.turn_runtime(), &ctx)
+            .await
+            .expect("first");
+        let second = super::resolve_chat_id(&state.turn_runtime(), &ctx)
+            .await
+            .expect("second");
 
         assert_eq!(first, second, "reentry must preserve existing chat id");
     }
@@ -1059,7 +1182,7 @@ mod tests {
             }),
         );
         let context = cli_context("sender-kind");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
 
@@ -1074,6 +1197,9 @@ mod tests {
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     message_kind: MessageKind::Message,
                     recipient_agent_id: None,
+                    seq: None,
+                    turn_id: None,
+                    parent_message_id: None,
                 })
             }
         })
@@ -1091,15 +1217,19 @@ mod tests {
                     timestamp: "2024-01-01T00:00:01Z".to_string(),
                     message_kind: MessageKind::Message,
                     recipient_agent_id: None,
+                    seq: None,
+                    turn_id: None,
+                    parent_message_id: None,
                 })
             }
         })
         .await
         .expect("store assistant message");
 
-        let loaded = load_messages_for_turn(&state, ConversationScope::Normal, chat_id)
-            .await
-            .expect("load messages");
+        let loaded =
+            load_messages_for_turn(&state.turn_runtime(), ConversationScope::Normal, chat_id)
+                .await
+                .expect("load messages");
 
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, "user");
@@ -1120,7 +1250,7 @@ mod tests {
             }),
         );
         let context = cli_context("borrow-test");
-        let chat_id = super::resolve_chat_id(&state, &context)
+        let chat_id = super::resolve_chat_id(&state.turn_runtime(), &context)
             .await
             .expect("chat id");
 
@@ -1130,7 +1260,7 @@ mod tests {
         ]);
 
         let _persisted = persist_phase(
-            &state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: "borrow-msg".to_string(),
@@ -1141,6 +1271,9 @@ mod tests {
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
                 message_kind: MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             Message::text("user", "test"),
             &messages,

@@ -96,7 +96,10 @@ pub(crate) async fn receive_webhook(
     let input = super::formatter::format_webhook_payload(&receiver_id.to_string(), &payload);
 
     let context = match build_webhook_context(&state.app_state.config, &receiver_id, receiver) {
-        Ok(context) => context,
+        Ok(mut context) => {
+            context.request_key = webhook_request_key(&receiver_id, &payload, &context.origin_id);
+            context
+        }
         Err(code) => {
             return super::error::webhook_error(
                 StatusCode::BAD_REQUEST,
@@ -189,6 +192,43 @@ fn build_webhook_context(
     context.origin_id = uuid::Uuid::new_v4().to_string();
     context.scope = resolve_target_scope(config, target_channel, &receiver.target.thread)?;
     Ok(context)
+}
+
+/// Derives a stable request key for a webhook delivery.
+///
+/// Prefers an explicit event id inside the payload (so a sender retrying the
+/// same event deduplicates). Falls back to a SHA-256 of the raw payload bytes
+/// so identical bodies still dedup. When neither is available, the per-call
+/// origin id is used (no dedup possible — documented limitation).
+fn webhook_request_key(
+    receiver_id: &WebhookReceiverId,
+    payload: &serde_json::Value,
+    origin_id: &str,
+) -> String {
+    let event_id = payload
+        .get("event_id")
+        .or_else(|| payload.get("id"))
+        .or_else(|| payload.get("message_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    match event_id {
+        Some(id) => format!("webhook:{receiver_id}:{id}"),
+        None => {
+            // No explicit event id: fall back to a content hash so identical
+            // bodies still dedup.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(payload.to_string().as_bytes());
+            let digest = hasher.finalize();
+            let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            if hex.chars().all(|c| c == '0') {
+                // Empty/invalid JSON that hashed to zeros — no dedup possible.
+                format!("webhook:{receiver_id}:{origin_id}")
+            } else {
+                format!("webhook:{receiver_id}:{hex}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

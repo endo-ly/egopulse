@@ -62,12 +62,16 @@ macro_rules! parse_row_enum {
 pub(crate) mod backup;
 mod chat;
 mod episode;
+mod llm_usage;
 mod migration;
 mod pulse;
 mod sleep;
 mod tool;
+mod turn;
 
 pub(crate) use backup::BackupSettings;
+pub(crate) use tool::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
+pub(crate) use turn::{AcceptOutcome, TurnRun};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -145,6 +149,14 @@ pub(crate) struct StoredMessage {
     pub timestamp: String,
     pub message_kind: MessageKind,
     pub recipient_agent_id: Option<String>,
+    /// Per-chat causal ordering index issued by the conversation commit path
+    /// (`commit_message_locked`).
+    pub seq: Option<i64>,
+    /// Owning Turn identifier, set when persisted through a Turn path.
+    pub turn_id: Option<String>,
+    /// Parent message referenced by this row (e.g. a Tool Result to its
+    /// issuing assistant message).
+    pub parent_message_id: Option<String>,
 }
 
 impl StoredMessage {
@@ -164,6 +176,9 @@ impl StoredMessage {
             timestamp: chrono::Utc::now().to_rfc3339(),
             message_kind: MessageKind::Message,
             recipient_agent_id,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }
     }
 
@@ -227,7 +242,10 @@ pub(crate) struct ChatInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSnapshot {
     pub messages_json: Option<String>,
-    pub updated_at: Option<String>,
+    /// CAS token for the next mutation: `Some(chats.revision)` when a session
+    /// row exists, `None` when the chat has no session snapshot yet (so the
+    /// next write performs an initial seed rather than an optimistic update).
+    pub session_revision: Option<i64>,
     pub recent_messages: Vec<StoredMessage>,
 }
 
@@ -244,7 +262,6 @@ pub(crate) struct AgentSessionInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCall {
     pub id: String,
-    pub chat_id: i64,
     pub message_id: String,
     pub tool_name: String,
     pub tool_input: String,
@@ -269,6 +286,102 @@ define_enum! {
         Assistant => "assistant",
         System => "system",
         Tool => "tool",
+    }
+}
+
+// Tool実行台帳 (`tool_calls.state`) の状態。
+//
+// `tool.rs` の `Database` メソッドがこの enum と中央遷移ルールを経由してのみ
+// 状態を更新する。自由文字列での更新は禁止。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ToolState {
+        Pending => "pending",
+        Running => "running",
+        Succeeded => "succeeded",
+        Failed => "failed",
+        Uncertain => "uncertain",
+    }
+}
+
+// Turn実行の永続状態 (`turn_runs.state`)。
+//
+// `turn.rs` の `Database` メソッドが中央遷移ルール (`TurnRunState::can_transition`) を
+// 経由してのみ状態を更新する。自由文字列での更新は禁止し、許可されて
+// いない遷移はDB更新前に拒否する。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TurnRunState {
+        Accepted => "accepted",
+        InputCommitted => "input_committed",
+        ModelPending => "model_pending",
+        ModelCompleted => "model_completed",
+        ToolsPending => "tools_pending",
+        ToolsCompleted => "tools_completed",
+        Completed => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        Uncertain => "uncertain",
+    }
+}
+
+impl TurnRunState {
+    /// 永続状態としてこれ以上遷移しない終端状態か。
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Uncertain
+        )
+    }
+
+    /// 許可された状態遷移のみ true を返す中央遷移ルール。
+    ///
+    /// 任意のmoduleから自由文字列で状態を更新することを防ぐため、
+    /// `Database` はこの関数で遷移を検証してからDB更新する。
+    pub(crate) fn can_transition(from: Self, to: Self) -> bool {
+        use TurnRunState::*;
+        if from == to {
+            return false;
+        }
+        if from.is_terminal() {
+            return false;
+        }
+        match from {
+            Accepted => matches!(to, InputCommitted | Failed | Uncertain | Cancelled),
+            InputCommitted => matches!(to, ModelPending | Failed | Uncertain | Cancelled),
+            ModelPending => {
+                matches!(to, ModelCompleted | Failed | Uncertain | Cancelled)
+            }
+            ModelCompleted => matches!(
+                to,
+                ToolsPending | Completed | ModelPending | Failed | Uncertain | Cancelled
+            ),
+            ToolsPending => {
+                matches!(to, ToolsCompleted | Failed | Uncertain | Cancelled)
+            }
+            ToolsCompleted => {
+                matches!(
+                    to,
+                    ModelPending | Completed | Failed | Uncertain | Cancelled
+                )
+            }
+            // 終端状態は上で弾いているのでここには来ない。
+            Completed | Failed | Cancelled | Uncertain => false,
+        }
+    }
+}
+
+// Tool再実行可能性の分類 (`tool_calls.idempotency_class`)。
+//
+// `read_only` は外部状態を変更しない。`idempotent` は同じ idempotency key
+// で重複排除できる。`non_idempotent` は再実行で副作用が重複し得る。
+// 未指定Toolは `non_idempotent` として扱い、名称から推測しない。
+define_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum IdempotencyClass {
+        ReadOnly => "read_only",
+        Idempotent => "idempotent",
+        NonIdempotent => "non_idempotent",
     }
 }
 
@@ -574,17 +687,28 @@ impl Database {
 
     /// Initializes the database with a pre-migration backup when `settings.enabled`
     /// is `true` and the DB file already exists. The backup runs against a raw
-    /// connection before the pool is constructed, so any failure is logged and
-    /// swallowed to keep the startup path best-effort. After the backup (or
-    /// skip), this function behaves exactly like [`Database::new`].
+    /// connection before the pool is constructed. A failed pre-migration backup
+    /// aborts startup before any irreversible schema change touches the existing
+    /// database: it returns [`StorageError::MigrationBackupFailed`] rather than
+    /// being logged and swallowed. When backup is disabled or the file does not
+    /// yet exist, this function behaves exactly like [`Database::new`].
     pub(crate) fn new_with_backup(
         db_path: &Path,
         settings: &backup::BackupSettings,
     ) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
         if db_path.exists() && settings.enabled {
-            if let Err(error) = backup::run_startup_backup(db_path, settings) {
-                tracing::warn!(%error, "startup backup failed; continuing");
+            // A failed pre-migration backup must abort startup before
+            // any irreversible schema change touches the existing database.
+            // Continuing without the safety net would risk unrecoverable data
+            // loss on a bad migration.
+            if let Err(error) = backup::run_startup_backup(db_path, settings, "egopulse") {
+                return Err(StorageError::MigrationBackupFailed {
+                    detail: format!(
+                        "pre-migration backup for {} failed: {error}",
+                        db_path.display()
+                    ),
+                });
             }
         }
         initialize_database_file(db_path)?;
@@ -595,10 +719,37 @@ impl Database {
     /// Constructs a `Database` for the secret DB (`secret.db`).
     ///
     /// Runs `run_secret_migrations` instead of `run_migrations`. The secret DB
-    /// contains only `chats`, `messages`, `sessions`, `llm_usage_logs`, `db_meta`,
-    /// and `schema_migrations` — no `tool_calls`, `sleep_runs`, etc.
+    /// mirrors the primary schema but is isolated per secret group; it contains
+    /// `chats`, `messages`, `sessions`, `tool_calls`, `llm_usage_logs`,
+    /// `db_meta`, and `schema_migrations`.
+    #[cfg(test)]
     pub(crate) fn new_secret(db_path: &Path) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
+        initialize_database_file(db_path)?;
+        let pool = build_secret_pool_and_migrate(db_path)?;
+        Ok(Self { pool })
+    }
+
+    /// Constructs a `Database` for the secret DB with pre-migration backup.
+    ///
+    /// A failed pre-migration backup aborts startup before any schema change
+    /// touches the existing secret database. When backup is disabled or the
+    /// file does not yet exist, this behaves exactly like [`Database::new_secret`].
+    pub(crate) fn new_secret_with_backup(
+        db_path: &Path,
+        settings: &backup::BackupSettings,
+    ) -> Result<Self, StorageError> {
+        prepare_db_path(db_path)?;
+        if db_path.exists() && settings.enabled {
+            if let Err(error) = backup::run_startup_backup(db_path, settings, "secret") {
+                return Err(StorageError::MigrationBackupFailed {
+                    detail: format!(
+                        "pre-migration backup for secret db {} failed: {error}",
+                        db_path.display()
+                    ),
+                });
+            }
+        }
         initialize_database_file(db_path)?;
         let pool = build_secret_pool_and_migrate(db_path)?;
         Ok(Self { pool })
@@ -773,10 +924,6 @@ mod tests {
                 "missing table: {expected}"
             );
         }
-        assert!(
-            !table_names.iter().any(|t| t == "tool_calls"),
-            "tool_calls must not exist in secret.db"
-        );
         assert!(
             !table_names.iter().any(|t| t == "sleep_runs"),
             "sleep_runs must not exist in secret.db"

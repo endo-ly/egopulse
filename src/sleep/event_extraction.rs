@@ -421,6 +421,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             message_kind: crate::storage::MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }];
         let text = messages_to_extract_text(&messages);
         assert!(text.contains("2025-01-01T00:00:00Z [user]: hello world"));
@@ -437,6 +440,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:01Z".to_string(),
             message_kind: crate::storage::MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }];
         let text = messages_to_extract_text(&messages);
         assert!(text.contains("[assistant]: hi there"));
@@ -454,6 +460,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:02Z".to_string(),
             message_kind: crate::storage::MessageKind::Message,
             recipient_agent_id: Some("lyre".to_string()),
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }];
         let text = messages_to_extract_text(&messages);
         assert!(text.contains("[tool]:"));
@@ -472,6 +481,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:03Z".to_string(),
             message_kind: crate::storage::MessageKind::Message,
             recipient_agent_id: Some("lyre".to_string()),
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }];
         let text = messages_to_extract_text(&messages);
         assert!(text.contains("[tool]: short"));
@@ -489,6 +501,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:04Z".to_string(),
             message_kind: crate::storage::MessageKind::Message,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         }];
         let text = messages_to_extract_text(&messages);
         assert!(text.contains("visible"));
@@ -508,6 +523,9 @@ mod tests {
                 timestamp: "2025-01-01T00:00:00Z".to_string(),
                 message_kind: crate::storage::MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
             StoredMessage {
                 id: "b".to_string(),
@@ -518,6 +536,9 @@ mod tests {
                 timestamp: "2025-01-01T00:00:01Z".to_string(),
                 message_kind: crate::storage::MessageKind::Message,
                 recipient_agent_id: None,
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
             },
         ];
         let text = messages_to_extract_text(&messages);
@@ -550,8 +571,8 @@ mod tests {
     fn store_msg(db: &crate::storage::Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.get_conn().expect("pool");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
             rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
         )
         .expect("store message");

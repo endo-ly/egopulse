@@ -58,7 +58,7 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         write_line(&mut stdout, format_args!("you: {trimmed}"))?;
         let started_at = chrono::Utc::now().to_rfc3339();
         let started = std::time::Instant::now();
-        match process_turn(state, &context, trimmed).await {
+        match process_turn(&state.turn_runtime(), &context, trimmed).await {
             Ok(response) => {
                 let duration = started.elapsed().as_secs_f64();
                 state.runtime_status.push_turn(

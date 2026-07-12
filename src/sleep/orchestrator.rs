@@ -242,8 +242,9 @@ pub async fn run_events_extract(
             if let Some(override_provider) = state.llm_override.clone() {
                 override_provider
             } else {
+                let revision = state.config_manager.current_blocking().revision;
                 state
-                    .cached_provider(&resolved)
+                    .cached_provider(&resolved, revision)
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
@@ -555,8 +556,9 @@ async fn prepare_batch_context(
     {
         override_provider
     } else {
+        let revision = state.config_manager.current_blocking().revision;
         state
-            .cached_provider(&resolved)
+            .cached_provider(&resolved, revision)
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 
@@ -1768,11 +1770,11 @@ fn archive_and_clear_session(
         }
     }
 
-    if let Some(updated_at) = &snapshot.updated_at {
+    if let Some(revision) = snapshot.session_revision {
         let truncated_json =
             truncate_messages_json(snapshot.messages_json.as_deref(), SESSION_CLEAR_KEEP_RECENT);
         let truncated = db
-            .truncate_session_messages(session.chat_id, updated_at, &truncated_json)
+            .truncate_session_messages(session.chat_id, revision, &truncated_json)
             .map_err(SleepBatchError::Storage)?;
         if !truncated {
             warn!(
@@ -1904,8 +1906,8 @@ mod tests {
     fn store_msg(db: &Database, id: &str, chat_id: i64, content: &str, ts: &str) {
         let conn = db.get_conn().expect("pool");
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
             rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
         )
         .expect("store message");

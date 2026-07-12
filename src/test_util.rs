@@ -132,6 +132,7 @@ pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
         origin_id: String::new(),
         trace_id: String::new(),
         scope: ConversationScope::Normal,
+        request_key: String::new(),
     }
 }
 
@@ -146,8 +147,10 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         channel_log_chat_id: None,
         chain_depth: 0,
         origin_id: String::new(),
+        turn_id: String::new(),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        tool_call_id: String::new(),
     }
 }

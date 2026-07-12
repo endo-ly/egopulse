@@ -1,92 +1,12 @@
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
+
+use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
-use crate::llm::calibration::CalibrationObservation;
 
-use super::{Database, LlmUsageLogEntry, ToolCall};
+use super::{Database, IdempotencyClass, ToolCall, ToolState};
 
 impl Database {
-    /// Persists a [`ToolCall`] record.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] on database connection or execution failures.
-    pub(crate) fn store_tool_call(&self, tool_call: &ToolCall) -> Result<(), StorageError> {
-        let conn = self.get_conn()?;
-        conn.execute(
-            "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                tool_call.id,
-                tool_call.chat_id,
-                tool_call.message_id,
-                tool_call.tool_name,
-                tool_call.tool_input,
-                tool_call.tool_output,
-                tool_call.timestamp,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Updates the output field of a tool call identified by `(chat_id, message_id, id)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::NotFound`] when no matching row exists.
-    /// Returns other [`StorageError`] variants on database connection or execution failures.
-    pub(crate) fn update_tool_call_output_for_message(
-        &self,
-        chat_id: i64,
-        message_id: &str,
-        id: &str,
-        output: &str,
-    ) -> Result<(), StorageError> {
-        let conn = self.get_conn()?;
-        let rows_updated = conn.execute(
-            "UPDATE tool_calls
-             SET tool_output = ?1
-             WHERE chat_id = ?2 AND message_id = ?3 AND id = ?4",
-            params![output, chat_id, message_id, id],
-        )?;
-        if rows_updated == 0 {
-            return Err(StorageError::NotFound(format!(
-                "tool_call:{chat_id}:{message_id}:{id}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Logs an LLM usage entry and returns the inserted row's rowid.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] on database connection or execution failures.
-    pub(crate) fn log_llm_usage(&self, entry: &LlmUsageLogEntry<'_>) -> Result<i64, StorageError> {
-        let conn = self.get_conn()?;
-        let total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
-        let created_at = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO llm_usage_logs
-                (chat_id, caller_channel, provider, model, input_tokens, output_tokens, total_tokens, request_kind, estimated_tokens, has_tools, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                entry.chat_id,
-                entry.caller_channel,
-                entry.provider,
-                entry.model,
-                entry.input_tokens,
-                entry.output_tokens,
-                total_tokens,
-                entry.request_kind,
-                entry.estimated_tokens,
-                entry.has_tools,
-                created_at,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
     /// Loads persisted tool calls for a chat, ordered by execution time.
     ///
     /// # Errors
@@ -98,106 +18,448 @@ impl Database {
     ) -> Result<Vec<ToolCall>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp
+            "SELECT id, message_id, tool_name, tool_input, tool_output, timestamp
              FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
         )?;
         let calls = stmt
             .query_map(params![chat_id], |row| {
                 Ok(ToolCall {
                     id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    message_id: row.get(2)?,
-                    tool_name: row.get(3)?,
-                    tool_input: row.get(4)?,
-                    tool_output: row.get(5)?,
-                    timestamp: row.get(6)?,
+                    message_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    tool_input: row.get(3)?,
+                    tool_output: row.get(4)?,
+                    timestamp: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(calls)
     }
+}
 
-    /// Loads recent observations for calibration factor rebuild.
+// ---------------------------------------------------------------------------
+// Tool execution ledger (`tool_calls`)
+//
+// Every Tool execution routes through these `Database` methods so that:
+//
+// * a Tool call is **claimed** (created or re-evaluated) before execution,
+// * the **input hash** guards against input drift on re-claim,
+// * a **succeeded** Tool returns its stored output instead of re-executing,
+// * a **running** Tool left by a crash becomes **uncertain** on recovery,
+// * an **uncertain** Tool is never retried (the owning Turn is not resumed),
+// * result and state are written in one transaction (no partial commit).
+//
+// Reads (e.g. `get_tool_calls_for_chat`) stay on `Database`; only state-mutating
+// writes live here.
+// ---------------------------------------------------------------------------
+
+/// Parameters for claiming a Tool execution slot.
+///
+/// `tool_input` is the original JSON arguments serialized as-is — this is
+/// what history / display APIs read back. `input_hash` is the SHA-256 hex
+/// digest of the canonical Tool name + arguments (see
+/// [`canonical_tool_input`]); the caller computes it so the hash is fixed
+/// before any DB write.
+pub(crate) struct ClaimParams<'a> {
+    pub turn_id: &'a str,
+    pub chat_id: i64,
+    pub message_id: &'a str,
+    pub tool_call_id: &'a str,
+    pub tool_name: &'a str,
+    /// Original JSON arguments, preserved verbatim for history display.
+    pub tool_input: &'a str,
+    pub input_hash: &'a str,
+    pub idempotency_class: IdempotencyClass,
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// Outcome of [`Database::claim_tool_execution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimOutcome {
+    /// The slot is freshly acquired and the Tool may execute. The ledger row
+    /// advanced to `running` with `started_at` set.
+    Acquired,
+    /// A prior execution already succeeded. The caller returns the stored
+    /// `tool_output` without re-executing the Tool.
+    Reused { tool_output: String },
+    /// The Tool is in a non-executable state (`failed`, `uncertain`, or
+    /// already `running`). The caller must not execute and surfaces the state.
+    Blocked { state: ToolState },
+}
+
+/// One row transitioned by [`Database::recover_running_tools`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredToolCall {
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// The state the row was moved to. Always [`ToolState::Uncertain`]: a
+    /// `running` Tool whose result is unverifiable is never reset to `pending`,
+    /// since the owning Turn is not resumed.
+    pub recovered_to: ToolState,
+}
+
+/// Persisted columns read back during a claim re-evaluation.
+struct ExistingToolRow {
+    state: String,
+    input_hash: Option<String>,
+    tool_output: Option<String>,
+    idempotency_class: Option<String>,
+}
+
+impl ExistingToolRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            state: row.get(0)?,
+            input_hash: row.get(1)?,
+            tool_output: row.get(2)?,
+            idempotency_class: row.get(3)?,
+        })
+    }
+}
+
+impl Database {
+    /// Atomically claims a Tool execution slot.
     ///
-    /// Returns [`CalibrationObservation`]s ordered oldest-first within each
-    /// key, limited to the most recent `limit_per_key` rows per key. Rows with
-    /// non-positive `estimated_tokens` or `input_tokens` are excluded so the
-    /// caller can replay a clean history through the calibrator.
+    /// Lookup is by `(turn_id, tool_call_id)` — the durable ledger identity.
+    /// * No row → create `pending` with the input hash, then advance to
+    ///   `running` and set `started_at`. Returns [`ClaimOutcome::Acquired`].
+    /// * Existing row with a **different** input hash →
+    ///   [`StorageError::ToolInputConflict`] (never execute, never guess).
+    /// * `succeeded` → [`ClaimOutcome::Reused`] with the stored output.
+    /// * `pending` with matching hash → advance to `running`. `Acquired`.
+    /// * `running`, `failed`, or `uncertain` → [`ClaimOutcome::Blocked`].
+    ///   An interrupted Turn is not resumed, so an `uncertain` Tool is never
+    ///   retried here.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] on database connection or query failures.
-    pub(crate) fn load_calibration_observations(
+    /// Returns [`StorageError::ToolInputConflict`] when the same
+    /// `(turn_id, tool_call_id)` is claimed with a different input hash.
+    pub(crate) fn claim_tool_execution(
         &self,
-        limit_per_key: usize,
-    ) -> Result<Vec<CalibrationObservation>, StorageError> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "WITH ranked AS (
-                 SELECT provider, model, request_kind, has_tools,
-                        estimated_tokens, input_tokens, created_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY provider, model, request_kind, has_tools
-                            ORDER BY created_at DESC
-                        ) AS rn
-                 FROM llm_usage_logs
-                 WHERE estimated_tokens > 0 AND input_tokens > 0
-             )
-             SELECT provider, model, request_kind, has_tools,
-                    estimated_tokens, input_tokens, created_at
-             FROM ranked
-             WHERE rn <= ?1
-             ORDER BY created_at DESC",
-        )?;
-        let mut observations: Vec<CalibrationObservation> = stmt
-            .query_map(params![limit_per_key as i64], |row| {
-                Ok(CalibrationObservation {
-                    provider: row.get(0)?,
-                    model: row.get(1)?,
-                    request_kind: row.get(2)?,
-                    has_tools: row.get::<_, i64>(3)? != 0,
-                    estimated_tokens: row.get::<_, i64>(4)? as usize,
-                    input_tokens: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        // SQL returns newest-first; reverse to oldest-first so the calibrator
-        // can replay each key's history chronologically. `created_at` is kept
-        // so callers can merge observations from multiple databases in true
-        // chronological order.
-        observations.reverse();
-        Ok(observations)
+        params: ClaimParams<'_>,
+    ) -> Result<ClaimOutcome, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let outcome = claim_locked(&tx, params)?;
+        tx.commit()?;
+        Ok(outcome)
     }
+
+    /// Records a successful Tool execution in one transaction.
+    ///
+    /// Sets `state = succeeded`, stores the sanitized `tool_output`, stamps
+    /// `finished_at`, and clears any prior error fields. The current state
+    /// must be `running`; any other state is rejected so a stale or already
+    /// completed row is never partially overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotFound`] when no row exists for
+    /// `(turn_id, tool_call_id)`, or [`StorageError::Conflict`] when the row
+    /// is not in the `running` state.
+    pub(crate) fn record_tool_success(
+        &self,
+        turn_id: &str,
+        tool_call_id: &str,
+        tool_output: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        require_state(&tx, turn_id, tool_call_id, ToolState::Running)?;
+        tx.execute(
+            "UPDATE tool_calls
+             SET state = 'succeeded',
+                 tool_output = ?3,
+                 finished_at = ?4,
+                 error_kind = NULL,
+                 error_message = NULL
+             WHERE turn_id = ?1 AND id = ?2",
+            params![turn_id, tool_call_id, tool_output, &now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a failed Tool execution in one transaction.
+    ///
+    /// Sets `state = failed`, stores the sanitized `error_kind` /
+    /// `error_message`, and stamps `finished_at`. The current state must be
+    /// `running`. Output is left untouched (a partial result is never
+    /// promoted to a success).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotFound`] when no row exists for
+    /// `(turn_id, tool_call_id)`, or [`StorageError::Conflict`] when the row
+    /// is not in the `running` state.
+    pub(crate) fn record_tool_failure(
+        &self,
+        turn_id: &str,
+        tool_call_id: &str,
+        error_kind: &str,
+        error_message: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        require_state(&tx, turn_id, tool_call_id, ToolState::Running)?;
+        tx.execute(
+            "UPDATE tool_calls
+             SET state = 'failed',
+                 error_kind = ?3,
+                 error_message = ?4,
+                 finished_at = ?5
+             WHERE turn_id = ?1 AND id = ?2",
+            params![turn_id, tool_call_id, error_kind, error_message, &now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transitions every `running` Tool to `uncertain`.
+    ///
+    /// An interrupted Turn is never resumed, so a `running` Tool whose result
+    /// is unverifiable can never be re-claimed by that Turn. Resetting it to
+    /// `pending` would leave an executable-looking row orphaned behind a
+    /// stopped Turn. Every `running` Tool is moved to `uncertain` so the
+    /// ledger state agrees with the owning Turn's terminal state.
+    ///
+    /// Returns the transitioned rows so the caller can log them. `pending`
+    /// rows (never started) are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite writes fail.
+    pub(crate) fn recover_running_tools(&self) -> Result<Vec<RecoveredToolCall>, StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+
+        let running: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT turn_id, id, tool_name
+                 FROM tool_calls
+                 WHERE state = 'running'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut recovered = Vec::with_capacity(running.len());
+        for (turn_id, tool_call_id, tool_name) in running {
+            tx.execute(
+                "UPDATE tool_calls
+                 SET state = 'uncertain'
+                 WHERE turn_id = ?1 AND id = ?2",
+                params![&turn_id, &tool_call_id],
+            )?;
+            recovered.push(RecoveredToolCall {
+                turn_id,
+                tool_call_id,
+                tool_name,
+                recovered_to: ToolState::Uncertain,
+            });
+        }
+
+        tx.commit()?;
+        Ok(recovered)
+    }
+}
+
+fn claim_locked(
+    tx: &rusqlite::Transaction<'_>,
+    params: ClaimParams<'_>,
+) -> Result<ClaimOutcome, StorageError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Load the persisted classification alongside the execution state so the
+    // stored idempotency class is trusted over the incoming params. A caller
+    // must not relax a stored `non_idempotent` Tool into `read_only`.
+    let existing = tx
+        .query_row(
+            "SELECT state, input_hash, tool_output, idempotency_class
+             FROM tool_calls
+             WHERE turn_id = ?1 AND id = ?2",
+            params![params.turn_id, params.tool_call_id],
+            ExistingToolRow::from_row,
+        )
+        .optional()?;
+
+    let Some(row) = existing else {
+        // Fresh claim: create pending, then advance to running.
+        tx.execute(
+            "INSERT INTO tool_calls
+                 (id, chat_id, message_id, tool_name, tool_input, timestamp,
+                  turn_id, state, input_hash, idempotency_class, idempotency_key)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10)",
+            params![
+                params.tool_call_id,
+                params.chat_id,
+                params.message_id,
+                params.tool_name,
+                params.tool_input,
+                &now,
+                params.turn_id,
+                params.input_hash,
+                params.idempotency_class.to_string(),
+                params.idempotency_key,
+            ],
+        )?;
+        advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
+        return Ok(ClaimOutcome::Acquired);
+    };
+
+    let stored_hash = row.input_hash.unwrap_or_default();
+    if stored_hash != params.input_hash {
+        return Err(StorageError::ToolInputConflict {
+            tool_call_id: params.tool_call_id.to_string(),
+            stored_hash,
+            requested_hash: params.input_hash.to_string(),
+        });
+    }
+
+    // The idempotency classification is immutable for a given execution slot.
+    // A mismatch between stored and incoming classification is a conflict:
+    // the contract recorded at first claim must stay stable across re-claims.
+    let stored_class: IdempotencyClass = row
+        .idempotency_class
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(IdempotencyClass::NonIdempotent);
+    if stored_class != params.idempotency_class {
+        return Err(StorageError::Conflict(format!(
+            "tool_calls idempotency_class changed: stored {stored_class} but requested {}",
+            params.idempotency_class
+        )));
+    }
+
+    let state: ToolState = row
+        .state
+        .parse()
+        .map_err(|e| StorageError::Conflict(format!("invalid tool_calls.state: {e}")))?;
+
+    let outcome = match state {
+        ToolState::Succeeded => ClaimOutcome::Reused {
+            tool_output: row.tool_output.unwrap_or_default(),
+        },
+        ToolState::Pending => {
+            advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
+            ClaimOutcome::Acquired
+        }
+        other => ClaimOutcome::Blocked { state: other },
+    };
+    Ok(outcome)
+}
+
+fn advance_to_running(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    tool_call_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE tool_calls
+         SET state = 'running', started_at = ?3
+         WHERE turn_id = ?1 AND id = ?2",
+        params![turn_id, tool_call_id, now],
+    )?;
+    Ok(())
+}
+
+fn require_state(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    tool_call_id: &str,
+    expected: ToolState,
+) -> Result<(), StorageError> {
+    let state_str: Option<String> = tx
+        .query_row(
+            "SELECT state FROM tool_calls WHERE turn_id = ?1 AND id = ?2",
+            params![turn_id, tool_call_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(state_str) = state_str else {
+        return Err(StorageError::NotFound(format!(
+            "tool_call:{turn_id}:{tool_call_id}"
+        )));
+    };
+    let state: ToolState = state_str
+        .parse()
+        .map_err(|e| StorageError::Conflict(format!("invalid tool_calls.state: {e}")))?;
+    if state != expected {
+        return Err(StorageError::Conflict(format!(
+            "tool state transition rejected: expected {expected} but was {state}"
+        )));
+    }
+    Ok(())
+}
+
+/// Deterministic serialization of a Tool call's identity and arguments.
+///
+/// The Tool name prefixes the arguments so the same arguments dispatched to
+/// different Tools produce distinct hashes. `serde_json` serializes object
+/// keys in sorted order by default (no `preserve_order` feature), so the
+/// result is stable regardless of insertion order.
+pub(crate) fn canonical_tool_input(tool_name: &str, arguments: &serde_json::Value) -> String {
+    format!("{tool_name}:{arguments}")
+}
+
+/// SHA-256 hex digest of the canonical input, used as the retry-identity token.
+pub(crate) fn input_hash(canonical: &str) -> String {
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("{digest:x}")
 }
 
 #[cfg(test)]
 impl Database {
-    pub(crate) fn get_llm_usage_summary(
+    /// Inserts a `tool_calls` row with the legacy composite identity
+    /// `(id, chat_id, message_id)`. Used by tests that need to seed ledger
+    /// rows for read-path assertions without exercising the full claim flow.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_tool_call_for_test(
         &self,
-        chat_id: Option<i64>,
-    ) -> Result<(i64, i64, i64, i64), StorageError> {
+        id: &str,
+        chat_id: i64,
+        message_id: &str,
+        tool_name: &str,
+        tool_input: &str,
+        tool_output: Option<&str>,
+        timestamp: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
-        let mut sql = String::from(
-            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0)
-             FROM llm_usage_logs WHERE 1=1",
-        );
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
-        if let Some(ref cid) = chat_id {
-            sql.push_str(" AND chat_id = ?");
-            params.push(cid as &dyn rusqlite::types::ToSql);
-        }
-        let result = conn.query_row(&sql, params.as_slice(), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
-        Ok(result)
+        conn.execute(
+            "INSERT INTO tool_calls
+                 (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp, state)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'succeeded')",
+            params![
+                id,
+                chat_id,
+                message_id,
+                tool_name,
+                tool_input,
+                tool_output,
+                timestamp
+            ],
+        )?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Database;
 
+    /// Test DB without any seeded chat (suitable for read-path tests that
+    /// resolve their own chat id).
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
@@ -205,271 +467,612 @@ mod tests {
         (db, dir)
     }
 
-    #[test]
-    fn update_tool_call_output_fails_when_tool_call_is_missing() {
-        let (db, _dir) = test_db();
+    /// Test DB with a seeded chat (`cli:tool-ledger` -> chat_id 1) so claim
+    /// inserts satisfy the `tool_calls.chat_id` FK to `chats.chat_id`.
+    fn ledger_test_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = Database::new(&db_path).expect("db");
         let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
+            .resolve_or_create_chat_id("cli", "cli:tool-ledger", None, "private", "default")
             .expect("create chat");
-
-        let error = db
-            .update_tool_call_output_for_message(
-                chat_id,
-                "message-1",
-                "missing-tool-call",
-                "output",
-            )
-            .expect_err("missing tool call should fail");
-
-        assert!(matches!(error, StorageError::NotFound(_)));
+        assert_eq!(chat_id, 1, "expected the seeded chat to be chat_id 1");
+        (db, dir)
     }
 
-    #[test]
-    fn update_tool_call_output_updates_existing_record() {
-        let (db, _dir) = test_db();
-        let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
-            .expect("create chat");
-        let tool_call = ToolCall {
-            id: "tool-1".to_string(),
-            chat_id,
-            message_id: "message-1".to_string(),
-            tool_name: "fetch".to_string(),
-            tool_input: "{}".to_string(),
-            tool_output: None,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
+    fn claim_params<'a>(
+        turn_id: &'a str,
+        tool_call_id: &'a str,
+        input_hash: &'a str,
+        class: IdempotencyClass,
+        key: Option<&'a str>,
+    ) -> ClaimParams<'a> {
+        ClaimParams {
+            turn_id,
+            chat_id: 1,
+            message_id: "m-1",
+            tool_call_id,
+            tool_name: "shell",
+            tool_input: "{}",
+            input_hash,
+            idempotency_class: class,
+            idempotency_key: key,
+        }
+    }
 
-        db.store_tool_call(&tool_call).expect("store tool call");
-        db.update_tool_call_output_for_message(chat_id, "message-1", "tool-1", "done")
-            .expect("update tool call");
-
-        let conn = db.get_conn().expect("pool");
-        let output: String = conn
+    fn row_state(db: &Database, turn_id: &str, tool_call_id: &str) -> ToolState {
+        let conn = db.get_conn().expect("conn");
+        let state: String = conn
             .query_row(
-                "SELECT tool_output FROM tool_calls WHERE chat_id = ?1 AND message_id = ?2 AND id = ?3",
-                rusqlite::params![chat_id, "message-1", "tool-1"],
+                "SELECT state FROM tool_calls WHERE turn_id = ?1 AND id = ?2",
+                params![turn_id, tool_call_id],
                 |row| row.get(0),
             )
-            .expect("query");
-        assert_eq!(output, "done");
+            .expect("row");
+        state.parse().expect("valid state")
+    }
+
+    fn row_output(db: &Database, turn_id: &str, tool_call_id: &str) -> Option<String> {
+        let conn = db.get_conn().expect("conn");
+        conn.query_row(
+            "SELECT tool_output FROM tool_calls WHERE turn_id = ?1 AND id = ?2",
+            params![turn_id, tool_call_id],
+            |row| row.get(0),
+        )
+        .ok()
     }
 
     #[test]
-    fn tool_call_ids_are_scoped_by_message() {
+    fn get_tool_calls_for_chat_returns_persisted_calls_in_timestamp_order() {
         let (db, _dir) = test_db();
         let chat_id = db
             .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
             .expect("create chat");
-        let first = ToolCall {
-            id: "tool-1".to_string(),
+
+        // Two tool calls on different assistant messages; the same provider
+        // call id is reused across messages (scoped by the composite PK).
+        db.insert_tool_call_for_test(
+            "tool-1",
             chat_id,
-            message_id: "message-1".to_string(),
-            tool_name: "fetch".to_string(),
-            tool_input: "{}".to_string(),
-            tool_output: None,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-        let second = ToolCall {
-            message_id: "message-2".to_string(),
-            timestamp: "2024-01-01T00:00:01Z".to_string(),
-            ..first.clone()
-        };
+            "message-1",
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"ok"}"#),
+            "2024-01-01T00:00:00Z",
+        )
+        .expect("insert first");
+        db.insert_tool_call_for_test(
+            "tool-1",
+            chat_id,
+            "message-2",
+            "read",
+            r#"{"path":"b.txt"}"#,
+            None,
+            "2024-01-01T00:00:01Z",
+        )
+        .expect("insert second");
 
-        db.store_tool_call(&first).expect("store first tool call");
-        db.store_tool_call(&second)
-            .expect("store second tool call with duplicate provider id");
-        db.update_tool_call_output_for_message(chat_id, "message-2", "tool-1", "done")
-            .expect("update scoped output");
+        let calls = db.get_tool_calls_for_chat(chat_id).expect("tool calls");
+        assert_eq!(calls.len(), 2, "composite PK scopes by message");
+        assert_eq!(calls[0].message_id, "message-1");
+        assert_eq!(calls[1].message_id, "message-2");
+        assert_eq!(calls[0].tool_output.as_deref(), Some(r#"{"result":"ok"}"#));
+        assert!(calls[1].tool_output.is_none());
+    }
 
-        let conn = db.get_conn().expect("pool");
+    #[test]
+    fn claim_creates_running_row_for_new_tool_call() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+
+        // Act
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("claim");
+
+        // Assert
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Running);
+    }
+
+    #[test]
+    fn claim_does_not_duplicate_same_turn_and_call_id() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("first claim");
+
+        // Act: re-claim the same slot (e.g. retry within the turn).
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("second claim");
+
+        // Assert: no second row, and the running slot is blocked (already in flight).
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Blocked {
+                state: ToolState::Running
+            }
+        );
+        let conn = db.get_conn().expect("conn");
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM tool_calls WHERE chat_id = ?1",
-                rusqlite::params![chat_id],
+                "SELECT COUNT(*) FROM tool_calls WHERE turn_id = ?1 AND id = ?2",
+                params!["turn-1", "call-1"],
                 |row| row.get(0),
             )
             .expect("count");
-        assert_eq!(count, 2);
+        assert_eq!(count, 1, "no duplicate ledger row");
     }
 
     #[test]
-    fn log_llm_usage_inserts_record() {
-        let (db, _dir) = test_db();
+    fn claim_rejects_different_input_hash_for_same_call_id() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("first claim");
 
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 100,
-            caller_channel: "tui",
-            provider: "openai",
-            model: "gpt-4",
-            input_tokens: 100,
-            output_tokens: 50,
-            request_kind: "agent_loop",
-            estimated_tokens: 0,
-            has_tools: false,
-        })
-        .expect("log usage");
+        // Act: same slot, different input.
+        let error = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-2",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect_err("conflict expected");
 
-        let conn = db.get_conn().expect("pool");
-        let (total_tokens, created_at): (i64, String) = conn
+        // Assert
+        assert!(matches!(
+            error,
+            StorageError::ToolInputConflict {
+                tool_call_id,
+                stored_hash,
+                requested_hash,
+            } if tool_call_id == "call-1" && stored_hash == "hash-1" && requested_hash == "hash-2"
+        ));
+    }
+
+    #[test]
+    fn claim_reuses_succeeded_tool_output_without_reexecuting() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        db.record_tool_success("turn-1", "call-1", "result-payload")
+            .expect("record success");
+
+        // Act: re-claim the completed slot.
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("re-claim");
+
+        // Assert
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Reused {
+                tool_output: "result-payload".to_string()
+            }
+        );
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Succeeded);
+    }
+
+    #[test]
+    fn claim_blocks_failed_tool_call() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        db.record_tool_failure("turn-1", "call-1", "tool_error", "boom")
+            .expect("record failure");
+
+        // Act
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("re-claim");
+
+        // Assert: failed Tools are never auto-retried.
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Blocked {
+                state: ToolState::Failed
+            }
+        );
+    }
+
+    #[test]
+    fn record_success_rejects_non_running_state() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        db.record_tool_success("turn-1", "call-1", "first")
+            .expect("first success");
+
+        // Act: a second success on an already-succeeded row is rejected.
+        let error = db
+            .record_tool_success("turn-1", "call-1", "second")
+            .expect_err("transition rejected");
+
+        // Assert: no partial commit — the stored output stays as the first.
+        assert!(matches!(error, StorageError::Conflict(_)));
+        assert_eq!(
+            row_output(&db, "turn-1", "call-1").as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn record_failure_clears_error_fields_on_subsequent_success_path() {
+        // Asserts that `record_tool_success` clears any stale `error_kind` /
+        // `error_message`. A claimed `running` row has stale error fields
+        // forced in, then a success is recorded.
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::ReadOnly,
+            None,
+        ))
+        .expect("claim");
+        // Force stale error fields while the row is still `running`.
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "UPDATE tool_calls SET error_kind = 'stale', error_message = 'stale-msg' WHERE turn_id = ?1 AND id = ?2",
+                params!["turn-1", "call-1"],
+            )
+            .expect("force error fields");
+        }
+
+        // Act: record success from the running state.
+        db.record_tool_success("turn-1", "call-1", "ok")
+            .expect("success");
+
+        // Assert: error fields cleared.
+        let conn = db.get_conn().expect("conn");
+        let (error_kind, error_message): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT total_tokens, created_at FROM llm_usage_logs WHERE chat_id = 100",
-                [],
+                "SELECT error_kind, error_message FROM tool_calls WHERE turn_id = ?1 AND id = ?2",
+                params!["turn-1", "call-1"],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("row");
-
-        assert_eq!(total_tokens, 150);
-        assert!(created_at.contains('T'));
+        assert!(error_kind.is_none());
+        assert!(error_message.is_none());
     }
 
     #[test]
-    fn log_llm_usage_stores_request_kind() {
-        let (db, _dir) = test_db();
+    fn recover_running_marks_non_idempotent_tool_uncertain() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        // Row is now running (crash mid-execution).
 
-        for kind in &["agent_loop", "compaction", "sleep_batch", "pulse"] {
-            db.log_llm_usage(&LlmUsageLogEntry {
-                chat_id: 0,
-                caller_channel: "test",
-                provider: "test",
-                model: "test",
-                input_tokens: 1,
-                output_tokens: 1,
-                request_kind: kind,
-                estimated_tokens: 0,
-                has_tools: false,
-            })
-            .expect("log usage");
+        // Act
+        let recovered = db.recover_running_tools().expect("recover");
+
+        // Assert
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Uncertain);
+    }
+
+    #[test]
+    fn recover_running_marks_read_only_tool_uncertain() {
+        // Arrange: a read-only Tool crashed mid-execution.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::ReadOnly,
+            None,
+        ))
+        .expect("claim");
+
+        // Act
+        let recovered = db.recover_running_tools().expect("recover");
+
+        // Assert: a read-only Tool is uncertain because its owning Turn is not
+        // resumed.
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Uncertain);
+    }
+
+    #[test]
+    fn recover_running_marks_idempotent_tool_with_key_uncertain() {
+        // Arrange: an idempotent Tool with a dedup key crashed mid-execution.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::Idempotent,
+            Some("key-1"),
+        ))
+        .expect("claim");
+
+        // Act
+        let recovered = db.recover_running_tools().expect("recover");
+
+        // Assert: idempotent classification does not reset to pending because the
+        // owning Turn is not resumed.
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
+    }
+
+    #[test]
+    fn recover_running_marks_idempotent_tool_without_key_uncertain() {
+        // Arrange: idempotent class but no key — cannot deduplicate, so stop.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::Idempotent,
+            None,
+        ))
+        .expect("claim");
+
+        // Act
+        let recovered = db.recover_running_tools().expect("recover");
+
+        // Assert
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
+    }
+
+    #[test]
+    fn claim_blocks_uncertain_read_only_tool() {
+        // Arrange: crash left the read-only Tool uncertain.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::ReadOnly,
+            None,
+        ))
+        .expect("claim");
+        db.recover_running_tools().expect("recover to uncertain");
+
+        // Act: re-claim with the same input.
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::ReadOnly,
+                None,
+            ))
+            .expect("re-claim");
+
+        // Assert: blocked — an uncertain Tool is never retried since the owning
+        // Turn is not resumed.
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Blocked {
+                state: ToolState::Uncertain
+            }
+        );
+    }
+
+    #[test]
+    fn claim_does_not_retry_uncertain_non_idempotent_tool() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        db.recover_running_tools().expect("recover to uncertain");
+
+        // Act
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("re-claim");
+
+        // Assert: blocked — non-idempotent Tools are never auto-retried.
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Blocked {
+                state: ToolState::Uncertain
+            }
+        );
+    }
+
+    #[test]
+    fn claim_rejects_idempotency_class_change_on_existing_row() {
+        // Arrange: a non-idempotent Tool claimed and then left uncertain by
+        // recovery.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("initial claim");
+        db.recover_running_tools().expect("recover to uncertain");
+
+        // Act: re-claim relaxing the classification to read_only. The ledger
+        // must reject this — a caller must not upgrade a non-idempotent Tool
+        // into a retryable class to force a second execution.
+        let result = db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::ReadOnly,
+            None,
+        ));
+
+        // Assert
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "class change must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn claim_advances_pending_row_to_running() {
+        // Arrange: a pending row left by a crash before execution started.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "UPDATE tool_calls SET state = 'pending', started_at = NULL WHERE turn_id = ?1 AND id = ?2",
+                params!["turn-1", "call-1"],
+            )
+            .expect("reset to pending");
         }
 
-        let conn = db.get_conn().expect("pool");
-        let kinds: Vec<String> = conn
-            .prepare("SELECT request_kind FROM llm_usage_logs ORDER BY rowid")
-            .expect("prepare")
-            .query_map([], |row| row.get(0))
-            .expect("query")
-            .map(|r| r.expect("row"))
-            .collect();
+        // Act
+        let outcome = db
+            .claim_tool_execution(claim_params(
+                "turn-1",
+                "call-1",
+                "hash-1",
+                IdempotencyClass::NonIdempotent,
+                None,
+            ))
+            .expect("re-claim");
 
-        assert_eq!(
-            kinds,
-            &["agent_loop", "compaction", "sleep_batch", "pulse"].map(|s| s.to_string())
+        // Assert
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Running);
+    }
+
+    #[test]
+    fn canonical_tool_input_includes_tool_name_and_sorted_arguments() {
+        // Arrange: arguments with keys in non-sorted insertion order.
+        let args = serde_json::json!({"b": 2, "a": 1});
+
+        // Act
+        let canonical = canonical_tool_input("shell", &args);
+
+        // Assert: tool name prefixes; object keys are sorted by serde_json.
+        assert_eq!(canonical, r#"shell:{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn input_hash_is_stable_for_equal_canonical_input() {
+        // Arrange
+        let left = canonical_tool_input("shell", &serde_json::json!({"a": 1, "b": 2}));
+        let right = canonical_tool_input("shell", &serde_json::json!({"b": 2, "a": 1}));
+
+        // Act & Assert: different insertion order, same hash.
+        assert_eq!(input_hash(&left), input_hash(&right));
+        assert_ne!(input_hash(&left), input_hash("shell:{}"));
+    }
+
+    #[test]
+    fn unique_index_prevents_duplicate_turn_and_call_id_on_raw_insert() {
+        // Arrange: the partial UNIQUE(turn_id, id) index is the DB-level guard
+        // behind claim's deduplication. Verify it rejects a manual duplicate.
+        let (db, _dir) = ledger_test_db();
+        db.claim_tool_execution(claim_params(
+            "turn-1",
+            "call-1",
+            "hash-1",
+            IdempotencyClass::NonIdempotent,
+            None,
+        ))
+        .expect("claim");
+
+        // Act: bypass the ledger and insert a second row with the same key.
+        let conn = db.get_conn().expect("conn");
+        let result = conn.execute(
+            "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, timestamp, turn_id, state)
+             VALUES ('call-1', 1, 'm-1', 'shell', '{}', '2024-01-01T00:00:00Z', 'turn-1', 'pending')",
+            [],
         );
-    }
 
-    fn log_observation(db: &Database, input_tokens: i64, estimated: i64, has_tools: bool) {
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 1,
-            caller_channel: "test",
-            provider: "p",
-            model: "m",
-            input_tokens,
-            output_tokens: 0,
-            request_kind: "agent_loop",
-            estimated_tokens: estimated,
-            has_tools,
-        })
-        .expect("log usage");
-        // created_at has sub-ms resolution, but a small sleep guarantees a
-        // strictly increasing ordering for the deterministic assertions below.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-
-    #[test]
-    fn load_calibration_observations_returns_persisted_observations_oldest_first() {
-        // Arrange: two observations for the same key, written in order
-        let (db, _dir) = test_db();
-        log_observation(&db, 200, 100, true);
-        log_observation(&db, 300, 100, true);
-
-        // Act
-        let observations = db.load_calibration_observations(30).expect("load");
-
-        // Assert: oldest-first so the calibrator can replay chronologically
-        assert_eq!(observations.len(), 2);
-        assert_eq!(observations[0].input_tokens, 200);
-        assert_eq!(observations[1].input_tokens, 300);
-        assert_eq!(observations[0].estimated_tokens, 100);
-        assert!(observations[0].has_tools);
-        assert_eq!(observations[0].provider, "p");
-        assert_eq!(observations[0].request_kind, "agent_loop");
-    }
-
-    #[test]
-    fn load_calibration_observations_limits_to_most_recent_per_key() {
-        // Arrange: three observations for one key
-        let (db, _dir) = test_db();
-        log_observation(&db, 100, 50, false);
-        log_observation(&db, 200, 50, false);
-        log_observation(&db, 300, 50, false);
-
-        // Act: cap at the two most recent
-        let observations = db.load_calibration_observations(2).expect("load");
-
-        // Assert: only the two newest (200, 300), oldest-first
-        assert_eq!(observations.len(), 2);
-        assert_eq!(observations[0].input_tokens, 200);
-        assert_eq!(observations[1].input_tokens, 300);
-    }
-
-    #[test]
-    fn load_calibration_observations_excludes_rows_with_zero_estimate() {
-        // Arrange: one valid observation and one with a zero estimate
-        let (db, _dir) = test_db();
-        log_observation(&db, 200, 100, true);
-        log_observation(&db, 999, 0, false);
-
-        // Act
-        let observations = db.load_calibration_observations(30).expect("load");
-
-        // Assert: only the row with a positive estimate is returned
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].input_tokens, 200);
-    }
-
-    #[test]
-    fn load_calibration_observations_keeps_keys_separate() {
-        // Arrange: observations for two distinct keys
-        let (db, _dir) = test_db();
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 1,
-            caller_channel: "test",
-            provider: "p",
-            model: "m",
-            input_tokens: 200,
-            output_tokens: 0,
-            request_kind: "agent_loop",
-            estimated_tokens: 100,
-            has_tools: true,
-        })
-        .expect("log agent_loop");
-        db.log_llm_usage(&LlmUsageLogEntry {
-            chat_id: 1,
-            caller_channel: "test",
-            provider: "p",
-            model: "m",
-            input_tokens: 150,
-            output_tokens: 0,
-            request_kind: "compaction",
-            estimated_tokens: 100,
-            has_tools: false,
-        })
-        .expect("log compaction");
-
-        // Act
-        let observations = db.load_calibration_observations(30).expect("load");
-
-        // Assert: both keys appear, each with its own shape
-        assert_eq!(observations.len(), 2);
+        // Assert
         assert!(
-            observations.iter().any(|o| {
-                o.request_kind == "agent_loop" && o.has_tools && o.input_tokens == 200
-            })
-        );
-        assert!(
-            observations.iter().any(|o| {
-                o.request_kind == "compaction" && !o.has_tools && o.input_tokens == 150
-            })
+            result.is_err(),
+            "UNIQUE(turn_id, id) must reject the duplicate"
         );
     }
 }

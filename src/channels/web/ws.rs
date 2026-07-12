@@ -102,6 +102,10 @@ struct ChatSendParams {
     #[serde(alias = "session_key", alias = "key")]
     session_key: String,
     message: String,
+    /// Client-generated request id for deduplication. Mirrors `SendRequest::request_id`
+    /// on the REST path; `start_stream_run` converts it into `context.request_key`
+    /// so a re-delivered `chat.send` maps to the same Turn instead of a duplicate.
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -392,6 +396,7 @@ async fn handle_chat_send(
         SendRequest {
             session_key: Some(payload.session_key),
             message: payload.message,
+            request_id: payload.request_id,
         },
         WEB_ACTOR,
     )

@@ -265,6 +265,26 @@ pub enum LlmError {
     RequestConstructionFailed(String),
 }
 
+impl LlmError {
+    /// Returns `true` when the error represents a transient failure that is
+    /// safe to retry without side effects: a network/timeout failure before
+    /// the provider returned any body, or a 429 / 5xx response.
+    ///
+    /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
+    /// `RequestConstructionFailed`, and 4xx other than 429) either indicate a
+    /// deterministic problem or imply the provider already produced a response
+    /// that must not be silently discarded.
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::RequestFailed(_) => true,
+            Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
+            Self::InitFailed(_) | Self::InvalidResponse(_) | Self::RequestConstructionFailed(_) => {
+                false
+            }
+        }
+    }
+}
+
 /// Logging subsystem initialization errors.
 #[derive(Debug, Error)]
 pub enum LoggingError {
@@ -293,6 +313,16 @@ pub enum StorageError {
     NotFound(String),
     #[error("storage_conflict: {0}")]
     Conflict(String),
+    /// 同一 `turn_id + tool_call_id` で異なる input hash で claim された。
+    /// 実行前に拒否し、結果を推測しない。
+    #[error(
+        "storage_tool_input_conflict: tool_call_id={tool_call_id} stored_hash={stored_hash} requested_hash={requested_hash}"
+    )]
+    ToolInputConflict {
+        tool_call_id: String,
+        stored_hash: String,
+        requested_hash: String,
+    },
     #[error(
         "storage_unsupported_schema_version: database={database} found={found} supported={supported}"
     )]
@@ -301,6 +331,9 @@ pub enum StorageError {
         found: i64,
         supported: i64,
     },
+    /// migration 前の DB backup に失敗した。schema 変更は開始しない。
+    #[error("storage_migration_backup_failed: {detail}")]
+    MigrationBackupFailed { detail: String },
 }
 
 /// Channel (Web / Discord / Telegram) operational errors.
