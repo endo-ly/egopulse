@@ -48,6 +48,7 @@ pub(crate) struct TurnRun {
     pub accepted_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,
+    pub request_payload_hash: Option<String>,
 }
 
 /// Outcome of [`TurnRepository::accept_or_get`].
@@ -105,6 +106,7 @@ impl<'a> TurnRepository<'a> {
         request_key: &str,
         config_revision: i64,
         config_fingerprint: Option<&str>,
+        request_payload_hash: &str,
     ) -> Result<AcceptOutcome, StorageError> {
         let mut conn = self.db.get_conn()?;
         let tx = conn.transaction()?;
@@ -113,8 +115,8 @@ impl<'a> TurnRepository<'a> {
         tx.execute(
             "INSERT INTO turn_runs
                  (turn_id, chat_id, request_key, state, config_revision,
-                  config_fingerprint, accepted_at, updated_at)
-             VALUES (?1, ?2, ?3, 'accepted', ?4, ?5, ?6, ?6)
+                  config_fingerprint, request_payload_hash, accepted_at, updated_at)
+             VALUES (?1, ?2, ?3, 'accepted', ?4, ?5, ?6, ?7, ?7)
              ON CONFLICT(chat_id, request_key) DO NOTHING",
             params![
                 &proposed_turn_id,
@@ -122,6 +124,7 @@ impl<'a> TurnRepository<'a> {
                 request_key,
                 config_revision,
                 config_fingerprint,
+                request_payload_hash,
                 &now,
             ],
         )?;
@@ -132,7 +135,7 @@ impl<'a> TurnRepository<'a> {
                     input_message_id, final_message_id, config_revision,
                     config_fingerprint, model_request_hash, model_attempt,
                     output_published, error_kind, error_message, accepted_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, request_payload_hash
              FROM turn_runs
              WHERE chat_id = ?1 AND request_key = ?2",
             params![chat_id, request_key],
@@ -145,8 +148,15 @@ impl<'a> TurnRepository<'a> {
 
         tx.commit()?;
 
+        // A re-delivery under the same request_key must carry the same input
+        // payload. A hash mismatch means the same key was reused for different
+        // content — reject rather than silently returning the unrelated Turn.
         let outcome = if run.turn_id == proposed_turn_id {
             AcceptOutcome::Created(run)
+        } else if run.request_payload_hash.as_deref() != Some(request_payload_hash) {
+            return Err(StorageError::Conflict(format!(
+                "turn_runs request_payload_hash mismatch for chat_id={chat_id} request_key={request_key}"
+            )));
         } else {
             AcceptOutcome::Existing(run)
         };
@@ -166,7 +176,7 @@ impl<'a> TurnRepository<'a> {
                     input_message_id, final_message_id, config_revision,
                     config_fingerprint, model_request_hash, model_attempt,
                     output_published, error_kind, error_message, accepted_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, request_payload_hash
              FROM turn_runs
              WHERE turn_id = ?1",
             params![turn_id],
@@ -491,17 +501,21 @@ impl<'a> TurnRepository<'a> {
 
     /// Recovers Turns interrupted by a process crash.
     ///
-    /// * `accepted` (input never committed) -> `failed`: the original input is
-    ///   gone with the dead process, so the Turn cannot be retried in place.
-    /// * `input_committed` / `model_pending` / `model_completed` /
-    ///   `tools_pending` / `tools_completed` -> `uncertain`: a mid-flight Turn
-    ///   cannot prove no output was published, and the Config generation
-    ///   cannot be verified either. Safe stop takes priority over speculative
-    ///   resume.
-    /// * If `current_fingerprint` is provided and differs from the persisted
-    ///   `config_fingerprint`, the Turn is always recovered to `uncertain`
-    ///   regardless of state.
-    /// * Terminal states are left untouched.
+    /// State-specific recovery rules (when `config_fingerprint` matches the
+    /// current config):
+    ///
+    /// | State             | Recovery action                                    |
+    /// |-------------------|----------------------------------------------------|
+    /// | `accepted`        | `failed` — input was never committed.              |
+    /// | `input_committed` | preserved — a re-delivery can resume from model start. |
+    /// | `model_pending`   | preserved if `output_published == 0` — safe to retry. |
+    /// | `model_completed` | preserved — saved response / tool calls can continue. |
+    /// | `tools_pending`   | preserved — tool call state can be inspected.      |
+    /// | `tools_completed` | preserved — next iteration can proceed.            |
+    ///
+    /// When the persisted `config_fingerprint` differs from `current_fingerprint`,
+    /// the state is always moved to `uncertain` because the Config generation
+    /// cannot be verified.
     ///
     /// Returns the transitioned rows so the caller can log them. This does
     /// **not** touch `tool_calls`; [`crate::storage::ToolExecutionRepository::recover_running`]
@@ -515,11 +529,22 @@ impl<'a> TurnRepository<'a> {
         current_fingerprint: Option<&str>,
     ) -> Result<Vec<RecoveredTurnRun>, StorageError> {
         let mut conn = self.db.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let interrupted: Vec<(String, i64, String, Option<String>)> = {
+        struct InterruptedRow {
+            turn_id: String,
+            chat_id: i64,
+            state: String,
+            config_fingerprint: Option<String>,
+            output_published: bool,
+            request_payload_hash: Option<String>,
+            model_request_hash: Option<String>,
+        }
+
+        let interrupted: Vec<InterruptedRow> = {
             let mut stmt = tx.prepare(
-                "SELECT turn_id, chat_id, state, config_fingerprint
+                "SELECT turn_id, chat_id, state, config_fingerprint, output_published,
+                        request_payload_hash, model_request_hash
                  FROM turn_runs
                  WHERE state IN (
                      'accepted', 'input_committed', 'model_pending',
@@ -527,70 +552,91 @@ impl<'a> TurnRepository<'a> {
                  )",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
+                Ok(InterruptedRow {
+                    turn_id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    state: row.get(2)?,
+                    config_fingerprint: row.get(3)?,
+                    output_published: row.get::<_, i64>(4)? != 0,
+                    request_payload_hash: row.get(5)?,
+                    model_request_hash: row.get(6)?,
+                })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
         let mut recovered = Vec::with_capacity(interrupted.len());
-        for (turn_id, chat_id, state_str, stored_fingerprint) in interrupted {
-            let from: TurnRunState = state_str
+        for row in interrupted {
+            let from: TurnRunState = row
+                .state
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
 
-            // Config fingerprint mismatch → always uncertain
-            let fingerprint_mismatch = match (&stored_fingerprint, current_fingerprint) {
+            let fingerprint_mismatch = match (&row.config_fingerprint, current_fingerprint) {
                 (Some(stored), Some(current)) => stored != current,
                 _ => true,
             };
 
-            let to = if fingerprint_mismatch {
-                TurnRunState::Uncertain
+            let (to, error_kind, error_message): (TurnRunState, Option<&str>, Option<String>) = if fingerprint_mismatch {
+                (
+                    TurnRunState::Uncertain,
+                    Some("config_mismatch"),
+                    Some(format!(
+                        "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
+                        stored = row.config_fingerprint,
+                        current = current_fingerprint,
+                    )),
+                )
             } else {
                 match from {
-                    TurnRunState::Accepted => TurnRunState::Failed,
-                    _ => TurnRunState::Uncertain,
+                    TurnRunState::Accepted => (
+                        TurnRunState::Failed,
+                        Some("interrupted"),
+                        Some(format!(
+                            "recovered on startup: accepted turn has no committed input (payload_hash={})",
+                            row.request_payload_hash.as_deref().unwrap_or("none")
+                        )),
+                    ),
+                    TurnRunState::ModelPending
+                        if row.output_published || row.model_request_hash.is_none() =>
+                    (
+                        TurnRunState::Uncertain,
+                        Some("interrupted"),
+                        Some(format!(
+                            "recovered on startup: model_pending with output_published={} cannot prove safe retry",
+                            row.output_published
+                        )),
+                    ),
+                    _ => (from, None, None),
                 }
             };
 
-            let now = chrono::Utc::now().to_rfc3339();
-            let (error_kind, error_message) = if fingerprint_mismatch {
-                (
-                    "config_mismatch",
-                    format!(
-                        "recovered on startup: config fingerprint mismatch (stored={stored:?}, current={current:?})",
-                        stored = stored_fingerprint,
-                        current = current_fingerprint,
-                    ),
-                )
-            } else {
-                (
-                    "interrupted",
-                    "recovered on startup: process restart left the turn non-terminal".to_string(),
-                )
-            };
-
-            tx.execute(
-                "UPDATE turn_runs
-                 SET state = ?2,
-                     error_kind = ?3,
-                     error_message = ?4,
-                     finished_at = ?5,
-                     updated_at = ?5
-                 WHERE turn_id = ?1",
-                params![&turn_id, to.to_string(), error_kind, error_message, &now,],
-            )?;
-            recovered.push(RecoveredTurnRun {
-                turn_id,
-                chat_id,
-                from,
-                recovered_to: to,
-            });
+            if to != from {
+                let now = chrono::Utc::now().to_rfc3339();
+                tx.execute(
+                    "UPDATE turn_runs
+                     SET state = ?2,
+                         error_kind = ?3,
+                         error_message = ?4,
+                         finished_at = ?5,
+                         updated_at = ?6
+                     WHERE turn_id = ?1",
+                    params![
+                        &row.turn_id,
+                        to.to_string(),
+                        error_kind,
+                        error_message.as_deref(),
+                        if error_kind.is_some() { Some(&now) } else { None },
+                        &now,
+                    ],
+                )?;
+                recovered.push(RecoveredTurnRun {
+                    turn_id: row.turn_id,
+                    chat_id: row.chat_id,
+                    from,
+                    recovered_to: to,
+                });
+            }
         }
 
         tx.commit()?;
@@ -644,6 +690,7 @@ impl<'a> TurnRepository<'a> {
                     accepted_at: row.get(14)?,
                     updated_at: row.get(15)?,
                     finished_at: row.get(16)?,
+                    request_payload_hash: row.get(17)?,
                 })
             })
             .optional()?;
@@ -672,7 +719,7 @@ mod tests {
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
             .turn_run_store()
-            .accept_or_get(1, request_key, 1, Some("abc123"))
+            .accept_or_get(1, request_key, 1, Some("abc123"), "payload-hash")
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -967,23 +1014,40 @@ mod tests {
     }
 
     #[test]
-    fn recover_interrupted_marks_accepted_failed_and_mid_flight_uncertain() {
-        // Arrange: one accepted (input not committed), one mid-flight.
+    fn recover_interrupted_marks_accepted_failed_and_preserves_safe_states() {
+        // Arrange: accepted (no input), input_committed (safe to resume),
+        // model_pending with output (unsafe to retry).
         let (db, _dir) = test_db();
         let repo = db.turn_run_store();
         let accepted_id = accept(&db, "acc").turn_id;
-        let mid_flight_id = accept(&db, "mid").turn_id;
-        repo.commit_input(&mid_flight_id, "in").expect("commit");
-        repo.begin_model_iteration(&mid_flight_id, 1, "h")
+        let input_committed_id = accept(&db, "mid").turn_id;
+        let model_pending_unsafe_id = accept(&db, "unsafe").turn_id;
+        let model_pending_safe_id = accept(&db, "safe").turn_id;
+
+        repo.commit_input(&input_committed_id, "in").expect("commit");
+
+        repo.commit_input(&model_pending_unsafe_id, "in").expect("commit");
+        repo.begin_model_iteration(&model_pending_unsafe_id, 1, "h")
+            .expect("begin");
+        repo.mark_output_published(&model_pending_unsafe_id)
+            .expect("mark published");
+
+        repo.commit_input(&model_pending_safe_id, "in").expect("commit");
+        repo.begin_model_iteration(&model_pending_safe_id, 1, "h")
             .expect("begin");
 
         // Act
         let recovered = repo.recover_interrupted(Some("abc123")).expect("recover");
 
-        // Assert
+        // Assert: accepted → failed; safe mid-flight states are preserved.
         assert_eq!(recovered.len(), 2);
         assert_eq!(state(&db, &accepted_id), TurnRunState::Failed);
-        assert_eq!(state(&db, &mid_flight_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &input_committed_id), TurnRunState::InputCommitted);
+        assert_eq!(
+            state(&db, &model_pending_unsafe_id),
+            TurnRunState::Uncertain
+        );
+        assert_eq!(state(&db, &model_pending_safe_id), TurnRunState::ModelPending);
     }
 
     #[test]
@@ -1014,13 +1078,13 @@ mod tests {
         let turn_id = accept(&db, "once").turn_id;
         repo.commit_input(&turn_id, "in").expect("commit");
 
-        // Act
+        // Act: first recovery preserves input_committed; second sees no change.
         repo.recover_interrupted(Some("abc123")).expect("first");
         let second = repo.recover_interrupted(Some("abc123")).expect("second");
 
-        // Assert: the now-uncertain turn is terminal and not recovered again.
+        // Assert
         assert!(second.is_empty());
-        assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
+        assert_eq!(state(&db, &turn_id), TurnRunState::InputCommitted);
     }
 
     #[test]
