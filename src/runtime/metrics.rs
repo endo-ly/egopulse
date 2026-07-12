@@ -41,6 +41,18 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_turn_queue_rejections_total",
             "Turns rejected at intake (scheduler queue full, origin tracker full, or chain terminated)"
         );
+        describe_gauge!(
+            "egopulse_runtime_owned_tasks",
+            "Long-lived tasks currently owned by the runtime supervisor"
+        );
+        describe_counter!(
+            "egopulse_runtime_task_failures_total",
+            "Long-lived tasks that exited with an error or panic"
+        );
+        describe_counter!(
+            "egopulse_runtime_shutdown_aborts_total",
+            "Tasks aborted by the runtime supervisor after the shutdown deadline elapsed"
+        );
 
         handle
     })
@@ -89,6 +101,18 @@ pub(crate) fn inc_tool_calls_total(tool: &str, status: &str) {
         .increment(1);
 }
 
+pub(crate) fn set_runtime_owned_tasks(count: usize) {
+    gauge!("egopulse_runtime_owned_tasks").set(count as f64);
+}
+
+pub(crate) fn inc_runtime_task_failures(kind: &str) {
+    counter!("egopulse_runtime_task_failures_total", "kind" => kind.to_owned()).increment(1);
+}
+
+pub(crate) fn inc_runtime_shutdown_aborts(count: usize) {
+    counter!("egopulse_runtime_shutdown_aborts_total").increment(count as u64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +130,9 @@ mod tests {
         set_active_turns_gauge(3);
         set_turn_queue_depth(5);
         inc_turn_queue_rejections("session_full");
+        set_runtime_owned_tasks(2);
+        inc_runtime_task_failures("channel");
+        inc_runtime_shutdown_aborts(1);
 
         let output = metrics_output();
 
@@ -141,6 +168,18 @@ mod tests {
             output.contains("egopulse_turn_queue_rejections_total"),
             "should contain turn_queue_rejections_total: {output}"
         );
+        assert!(
+            output.contains("egopulse_runtime_owned_tasks"),
+            "should contain runtime_owned_tasks: {output}"
+        );
+        assert!(
+            output.contains("egopulse_runtime_task_failures_total"),
+            "should contain runtime_task_failures_total: {output}"
+        );
+        assert!(
+            output.contains("egopulse_runtime_shutdown_aborts_total"),
+            "should contain runtime_shutdown_aborts_total: {output}"
+        );
     }
 
     #[test]
@@ -154,6 +193,9 @@ mod tests {
         set_active_turns_gauge(0);
         set_turn_queue_depth(0);
         inc_turn_queue_rejections("global_full");
+        set_runtime_owned_tasks(0);
+        inc_runtime_task_failures("scheduler");
+        inc_runtime_shutdown_aborts(0);
 
         let output = metrics_output();
         for line in output.lines() {

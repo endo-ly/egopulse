@@ -22,6 +22,11 @@ pub(crate) struct HealthResponse {
     uptime_secs: u64,
     pid: u32,
     db: DbHealth,
+    accepting_inputs: bool,
+    shutdown_started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    critical_task_failure: Option<String>,
+    owned_task_count: usize,
     channels: std::collections::HashMap<String, ChannelHealth>,
     mcp: McpStatus,
     active_turns: usize,
@@ -82,7 +87,14 @@ pub(super) async fn health(state: State<WebState>) -> Json<HealthResponse> {
         .channels
         .values()
         .any(|ch| matches!(ch.state, ChannelState::Running));
-    let ok = snapshot.db_healthy && has_running_channel;
+    // `ok` requires a healthy DB, at least one running channel, and that the
+    // runtime is still accepting input (not shutting down and no critical task
+    // failure).
+    let ok = snapshot.db_healthy
+        && has_running_channel
+        && snapshot.accepting_inputs
+        && !snapshot.shutdown_started
+        && snapshot.critical_task_failure.is_none();
 
     Json(HealthResponse {
         ok,
@@ -92,6 +104,10 @@ pub(super) async fn health(state: State<WebState>) -> Json<HealthResponse> {
         db: DbHealth {
             ok: snapshot.db_healthy,
         },
+        accepting_inputs: snapshot.accepting_inputs,
+        shutdown_started: snapshot.shutdown_started,
+        critical_task_failure: snapshot.critical_task_failure,
+        owned_task_count: snapshot.owned_task_count,
         channels: snapshot.channels,
         mcp: build_mcp_status(&state).await,
         active_turns,
@@ -358,6 +374,40 @@ mod tests {
         let Json(resp) = health(State(state)).await;
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("mcp").is_some());
+    }
+
+    #[tokio::test]
+    async fn health_reports_shutdown_and_critical_failure_fields() {
+        let state = test_state();
+        state
+            .app_state
+            .runtime_status
+            .update_channel("web", ChannelState::Running);
+
+        // Healthy default: accepting input, not shutting down, no critical failure.
+        let Json(resp) = health(State(state.clone())).await;
+        assert!(resp.accepting_inputs);
+        assert!(!resp.shutdown_started);
+        assert!(resp.critical_task_failure.is_none());
+        assert_eq!(resp.owned_task_count, 0);
+        assert!(resp.ok);
+
+        // Simulate shutdown: accepting_inputs flipped off.
+        state.app_state.runtime_status.set_accepting_inputs(false);
+        state.app_state.runtime_status.set_shutdown_started(true);
+        let Json(resp) = health(State(state.clone())).await;
+        assert!(!resp.accepting_inputs);
+        assert!(resp.shutdown_started);
+        assert!(!resp.ok, "shutdown must make health not ok");
+
+        // A critical task failure also flips ok to false even before shutdown.
+        state
+            .app_state
+            .runtime_status
+            .record_critical_task_failure("web died");
+        let Json(resp) = health(State(state)).await;
+        assert_eq!(resp.critical_task_failure.as_deref(), Some("web died"));
+        assert!(!resp.ok);
     }
 
     // -----------------------------------------------------------------------

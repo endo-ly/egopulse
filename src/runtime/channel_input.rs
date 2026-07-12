@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::runtime::AppState;
 use crate::runtime::metrics;
-use crate::runtime::turn_scheduler::{ScheduleResult, SubmitOutcome};
+use crate::runtime::turn_scheduler::{RejectReason, ScheduleResult, SubmitOutcome};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
 /// Platform-specific key used to resolve a multi-agent Channel Log chat.
@@ -127,6 +127,14 @@ pub(crate) fn submit_agent_turn(
 }
 
 pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+    // Refuse new input the moment shutdown begins so an accepted turn is never
+    // left unstarted after `202 Accepted`-equivalent intake paths return.
+    if !state.supervisor.accepting_inputs() {
+        tracing::info!("turn rejected: runtime not accepting inputs (shutdown)");
+        metrics::inc_turn_queue_rejections("shutdown");
+        return SubmitOutcome::Rejected(RejectReason::Shutdown);
+    }
+
     // Reserve tracker capacity at acceptance so an origin at the tracker limit
     // (or an already-terminated chain) is refused here, before any `202
     // Accepted` is returned. Execution no longer performs this check.
@@ -149,7 +157,8 @@ pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) 
         ScheduleResult::Started(turn) => {
             let turn = *turn;
             let state = state.clone();
-            tokio::spawn(async move {
+            let supervisor = Arc::clone(&state.supervisor);
+            supervisor.spawn_turn(async move {
                 crate::runtime::execute_scheduled_turn(&state, turn).await;
             });
             SubmitOutcome::Started

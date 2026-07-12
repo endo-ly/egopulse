@@ -38,8 +38,13 @@ impl Clock for RealClock {
 }
 
 /// Runs the periodic backup scheduler using the real system clock.
-pub(crate) async fn run_backup_scheduler_loop(state: AppState) -> Result<(), EgoPulseError> {
-    run_backup_scheduler_loop_with_clock(state, Arc::new(RealClock)).await
+///
+/// Returns when `shutdown` is cancelled or the scheduler is disabled.
+pub(crate) async fn run_backup_scheduler_loop(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), EgoPulseError> {
+    run_backup_scheduler_loop_with_clock(state, Arc::new(RealClock), shutdown).await
 }
 
 /// Clock-injectable scheduler entry point used by tests.
@@ -51,6 +56,7 @@ pub(crate) async fn run_backup_scheduler_loop(state: AppState) -> Result<(), Ego
 pub(crate) async fn run_backup_scheduler_loop_with_clock(
     state: AppState,
     clock: Arc<dyn Clock>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), EgoPulseError> {
     if !state.config.db.backup.scheduler_enabled() {
         info!("backup scheduler: disabled, exiting loop");
@@ -79,7 +85,13 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
             delay_secs = delay.as_secs(),
             "backup scheduler: waiting"
         );
-        sleep(delay).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("backup scheduler: shutdown requested, exiting loop");
+                return Ok(());
+            }
+            _ = sleep(delay) => {}
+        }
 
         match run_periodic_backup_once(&state, clock.now()).await {
             Ok(outcome) if outcome.integrity_ok => {
@@ -221,7 +233,12 @@ mod tests {
         let task_state = state.clone();
         let task_clock = Arc::clone(&clock);
         let handle = tokio::spawn(async move {
-            run_backup_scheduler_loop_with_clock(task_state, task_clock).await
+            run_backup_scheduler_loop_with_clock(
+                task_state,
+                task_clock,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
         });
 
         let db_for_poll = Arc::clone(&state.db);
@@ -258,7 +275,9 @@ mod tests {
         let backup_dir = state.config.backup_dir();
 
         // Act
-        let result = run_backup_scheduler_loop(state.clone()).await;
+        let result =
+            run_backup_scheduler_loop(state.clone(), tokio_util::sync::CancellationToken::new())
+                .await;
 
         // Assert
         assert!(result.is_ok(), "disabled scheduler should exit cleanly");

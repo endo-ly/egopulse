@@ -416,14 +416,23 @@ async fn load_last_success_started_at(
 
 /// Run the pulse scheduler tick loop.
 ///
-/// Sleeps for the configured tick interval between scans.
-/// Runs indefinitely until the task is cancelled (via tokio cancellation).
-pub(crate) async fn run_pulse_scheduler(state: AppState) {
+/// Sleeps for the configured tick interval between scans. Runs until
+/// `shutdown` is cancelled, at which point it returns promptly.
+pub(crate) async fn run_pulse_scheduler(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let tick_interval = state.config.pulse().tick_interval_secs;
     info!("pulse scheduler starting with {tick_interval}s tick interval");
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(tick_interval)).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("pulse scheduler: shutdown requested, exiting loop");
+                return;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(tick_interval)) => {}
+        }
         run_pulse_scan(&state).await;
     }
 }

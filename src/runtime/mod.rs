@@ -8,7 +8,8 @@ pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
 pub(crate) mod runtime_status;
-pub mod status;
+pub(crate) mod status;
+pub(crate) mod supervisor;
 pub(crate) mod tool_progress;
 pub(crate) mod turn_scheduler;
 
@@ -18,6 +19,10 @@ pub(crate) use channel_input::{
 };
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
+pub(crate) use supervisor::Criticality;
+pub(crate) use supervisor::RuntimeSupervisor;
+pub(crate) use supervisor::TaskKind;
+pub(crate) use supervisor::TaskSpec;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
 
 use std::collections::HashMap;
@@ -25,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::task::{JoinError, JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::agent_loop::ConversationScope;
@@ -72,6 +77,8 @@ pub struct AppState {
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
+    /// Owns long-lived tasks and in-flight turns; orchestrates shutdown.
+    pub(crate) supervisor: Arc<RuntimeSupervisor>,
     /// Learns prompt-token estimate correction factors from observed LLM usage.
     pub(crate) usage_calibrator: Arc<UsageCalibrator>,
     _sealed: (),
@@ -138,7 +145,8 @@ impl AppState {
             turn_sender: parts.turn_sender,
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
-            runtime_status: parts.runtime_status,
+            runtime_status: parts.runtime_status.clone(),
+            supervisor: Arc::new(RuntimeSupervisor::new(parts.runtime_status)),
             usage_calibrator: Arc::new(UsageCalibrator::new()),
             _sealed: (),
         }
@@ -350,7 +358,6 @@ pub async fn build_app_state_with_path(
     let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
     tools.set_mcp_manager(Arc::clone(&mcp_arc));
-    spawn_mcp_reconnect_loop(Arc::clone(&mcp_arc), workspace_dir.clone());
 
     tools.register_tool(Box::new(crate::tools::SendMessageTool::new(
         workspace_dir.clone(),
@@ -395,7 +402,31 @@ pub async fn build_app_state_with_path(
     // Running Tools become uncertain, and interrupted turn_runs stop safely.
     recover_durable_state(&state).await;
 
-    spawn_agent_turn_worker(state.clone(), turn_receiver);
+    // Own long-lived background tasks through the supervisor so their lifetime
+    // and shutdown are centrally managed.
+    let mcp_arc = state
+        .mcp_manager
+        .as_ref()
+        .expect("mcp manager initialized")
+        .clone();
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::McpReconnect,
+            "mcp-reconnect",
+            Criticality::NonCritical,
+        ),
+        spawn_mcp_reconnect_loop(
+            mcp_arc,
+            workspace_dir.clone(),
+            state.supervisor.shutdown_token(),
+        ),
+    );
+
+    spawn_agent_turn_worker(
+        state.clone(),
+        turn_receiver,
+        state.supervisor.shutdown_token(),
+    );
 
     Ok(state)
 }
@@ -545,34 +576,52 @@ fn build_app_state_dependencies(
 fn spawn_agent_turn_worker(
     state: AppState,
     mut receiver: tokio::sync::mpsc::Receiver<crate::agent_loop::PendingAgentTurn>,
+    shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
-        while let Some(pending) = receiver.recv().await {
-            let channel_log_chat_id = pending.context.channel_log_chat_id;
-            let scope = pending.context.scope;
-            let scheduled = crate::agent_loop::ScheduledTurn {
-                context: pending.context,
-                input: pending.input,
-                origin_id: pending.origin_id,
-            };
+    let supervisor = Arc::clone(&state.supervisor);
+    supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::AgentTurnWorker,
+            "agent-turn-worker",
+            Criticality::Critical,
+        ),
+        async move {
+            loop {
+                let pending = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = receiver.recv() => match msg {
+                        Some(p) => p,
+                        None => break,
+                    },
+                };
+                let channel_log_chat_id = pending.context.channel_log_chat_id;
+                let scope = pending.context.scope;
+                let scheduled = crate::agent_loop::ScheduledTurn {
+                    context: pending.context,
+                    input: pending.input,
+                    origin_id: pending.origin_id,
+                };
 
-            if let turn_scheduler::SubmitOutcome::Rejected(reason) =
-                channel_input::submit_scheduled_turn(&state, scheduled)
-            {
-                // Log + metric are already recorded centrally in the submit
-                // path; store a system event so the async rejection surfaces in
-                // the channel log instead of being silently dropped.
-                if let Some(chat_id) = channel_log_chat_id {
-                    if let Err(error) = state.db_for(scope).store_system_event(chat_id, &reason) {
-                        tracing::warn!(
-                            error = %error,
-                            "failed to store system event for agent_send queue rejection"
-                        );
+                if let turn_scheduler::SubmitOutcome::Rejected(reason) =
+                    channel_input::submit_scheduled_turn(&state, scheduled)
+                {
+                    // Log + metric are already recorded centrally in the submit
+                    // path; store a system event so the async rejection surfaces in
+                    // the channel log instead of being silently dropped.
+                    if let Some(chat_id) = channel_log_chat_id {
+                        if let Err(error) = state.db_for(scope).store_system_event(chat_id, &reason)
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to store system event for agent_send queue rejection"
+                            );
+                        }
                     }
                 }
             }
-        }
-    });
+            Ok(())
+        },
+    );
 }
 
 pub(crate) fn execute_scheduled_turn(
@@ -595,6 +644,20 @@ pub(crate) fn execute_scheduled_turn(
             .runtime_status
             .touch_channel_activity(&turn.context.channel);
 
+        // Shutdown may have begun between acceptance and execution start. Once
+        // shutdown is in progress, no new turn is started: release the
+        // reservation and let the in-flight task complete so the supervisor can
+        // drain it. This closes the race between the intake gate and execution.
+        if state.supervisor.is_shutting_down() {
+            tracing::info!(
+                agent_id = %turn.context.agent_id,
+                origin_id = %origin_id,
+                "shutdown in progress: not starting submitted turn"
+            );
+            state.turn_tracker.release(&origin_id);
+            return;
+        }
+
         // The origin was already reserved at acceptance (submit_scheduled_turn).
         // Re-check here for queued turns whose chain terminated while waiting in
         // the scheduler; release the reservation so capacity is not leaked.
@@ -606,9 +669,7 @@ pub(crate) fn execute_scheduled_turn(
                 "dropping turn: origin already has terminal stop reason"
             );
             state.turn_tracker.release(&origin_id);
-            if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                execute_scheduled_turn(state, next).await;
-            }
+            drain_next_queued_turn(state, &session_key).await;
             return;
         }
 
@@ -652,9 +713,7 @@ pub(crate) fn execute_scheduled_turn(
                         tracing::warn!(error = %error, "failed to store system event for stop condition");
                     }
                 }
-                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                    execute_scheduled_turn(state, next).await;
-                }
+                drain_next_queued_turn(state, &session_key).await;
                 return;
             }
         }
@@ -768,17 +827,34 @@ pub(crate) fn execute_scheduled_turn(
                     }
                 }
                 send_turn_failure_to_channel(adapter, &external_chat_id, &error).await;
-                if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-                    execute_scheduled_turn(state, next).await;
-                }
+                drain_next_queued_turn(state, &session_key).await;
                 return;
             }
         }
 
-        if let Some(next) = state.turn_scheduler.on_turn_completed(&session_key) {
-            execute_scheduled_turn(state, next).await;
-        }
+        drain_next_queued_turn(state, &session_key).await;
     })
+}
+
+/// Drains the next queued turn for a session after the current turn completes.
+///
+/// During shutdown (`accepting_inputs == false`) the next queued turn is **not**
+/// started: its origin reservation is released and the chain stops, so the
+/// in-flight turn task can complete and be reaped by the supervisor drain.
+/// This is the single point that enforces "no new turn starts after shutdown
+/// begins" for turns already buffered in the in-memory scheduler.
+async fn drain_next_queued_turn(state: &AppState, session_key: &str) {
+    if let Some(next) = state.turn_scheduler.on_turn_completed(session_key) {
+        if state.supervisor.is_shutting_down() {
+            state.turn_tracker.release(&next.origin_id);
+            tracing::info!(
+                origin_id = %next.origin_id,
+                "shutdown in progress: not starting next queued turn"
+            );
+            return;
+        }
+        execute_scheduled_turn(state, next).await;
+    }
 }
 
 /// Executes one agent turn while recording runtime activity and telemetry.
@@ -931,8 +1007,9 @@ async fn send_turn_failure_to_channel(
 fn spawn_mcp_reconnect_loop(
     mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
     workspace_dir: PathBuf,
-) {
-    tokio::spawn(async move {
+    shutdown: CancellationToken,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EgoPulseError>> + Send>> {
+    Box::pin(async move {
         const INITIAL_RETRY_SECS: u64 = 5;
         const MAX_RETRY_SECS: u64 = 300;
 
@@ -943,13 +1020,21 @@ fn spawn_mcp_reconnect_loop(
                 guard.has_failed_servers()
             };
 
+            let sleep_secs = if has_failed_servers {
+                retry_secs
+            } else {
+                MAX_RETRY_SECS
+            };
+
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+            }
+
             if !has_failed_servers {
-                tokio::time::sleep(Duration::from_secs(MAX_RETRY_SECS)).await;
                 retry_secs = INITIAL_RETRY_SECS;
                 continue;
             }
-
-            tokio::time::sleep(Duration::from_secs(retry_secs)).await;
 
             let reconnected = {
                 let mut guard = mcp_manager.write().await;
@@ -962,7 +1047,7 @@ fn spawn_mcp_reconnect_loop(
                 retry_secs = (retry_secs * 2).min(MAX_RETRY_SECS);
             }
         }
-    });
+    })
 }
 
 /// Sends a single prompt to the configured LLM without session state.
@@ -982,16 +1067,15 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
     channels::tui::run(state).await
 }
 
-/// 全有効チャネルを一括起動
-///
-/// `egopulse run` から呼び出される。
-/// 設定ベースでチャネルを構築 → spawn → ctrl_c 待機。
-///
-/// spawn したタスクの JoinHandle を監視し、即時終了 (起動失敗) を検知する。
 /// Starts all enabled channels and supervises them until shutdown or failure.
+///
+/// Every long-lived task (channel listeners, schedulers) is owned by the
+/// runtime supervisor. The run loop watches for critical task failures and
+/// Ctrl-C; on either trigger it runs [`RuntimeSupervisor::shutdown`], which
+/// stops accepting input, drains in-flight turns, then drains long-lived tasks
+/// within bounded deadlines.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     let mut has_active_channels = false;
-    let mut handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)> = Vec::new();
 
     // Web サーバー起動
     if state.config.web_enabled() {
@@ -1001,12 +1085,12 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         let web_state = state.clone();
         let host = state.config.web_host().to_owned();
         let port = state.config.web_port();
+        let token = state.supervisor.shutdown_token();
         info!("Starting Web UI server on {host}:{port}");
-        let handle =
-            tokio::spawn(
-                async move { crate::channels::web::run_server(web_state, &host, port).await },
-            );
-        handles.push(("web".to_string(), handle));
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(TaskKind::Channel, "web", Criticality::Critical),
+            async move { crate::channels::web::run_server(web_state, &host, port, token).await },
+        );
     }
 
     // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
@@ -1028,28 +1112,30 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
             for (bot_id, token, default_agent) in bot_configs {
                 let discord_state = Arc::new(state.clone());
-                let handle_name = format!("discord[{bot_id}]");
                 info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
                 let channels = shared_channels.clone();
-                let handle = tokio::spawn(async move {
-                    crate::channels::discord::start_discord_bot_for_bot(
-                        discord_state,
-                        &token,
-                        &bid,
-                        &default_agent,
-                        &channels,
-                        chain_state,
-                    )
-                    .await
-                    .map_err(|error| {
-                        EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                            "discord bot ({bid}) failed: {error}",
-                        )))
-                    })
-                });
-                handles.push((handle_name, handle));
+                let handle_name = format!("discord[{bot_id}]");
+                state.supervisor.spawn_long_lived(
+                    TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
+                    async move {
+                        crate::channels::discord::start_discord_bot_for_bot(
+                            discord_state,
+                            &token,
+                            &bid,
+                            &default_agent,
+                            &channels,
+                            chain_state,
+                        )
+                        .await
+                        .map_err(|error| {
+                            EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                                "discord bot ({bid}) failed: {error}",
+                            )))
+                        })
+                    },
+                );
             }
         } else {
             tracing::warn!(
@@ -1078,28 +1164,30 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
             for (bot_id, token, default_agent) in bot_configs {
                 let telegram_state = Arc::new(state.clone());
-                let handle_name = format!("telegram[{bot_id}]");
                 info!("Starting Telegram bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
                 let channels = shared_channels.clone();
-                let handle = tokio::spawn(async move {
-                    crate::channels::telegram::start_telegram_bot_for_bot(
-                        telegram_state,
-                        &token,
-                        &bid,
-                        &default_agent,
-                        &channels,
-                        chain_state,
-                    )
-                    .await
-                    .map_err(|error| {
-                        EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                            "telegram bot ({bid}) failed: {error}",
-                        )))
-                    })
-                });
-                handles.push((handle_name, handle));
+                let handle_name = format!("telegram[{bot_id}]");
+                state.supervisor.spawn_long_lived(
+                    TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
+                    async move {
+                        crate::channels::telegram::start_telegram_bot_for_bot(
+                            telegram_state,
+                            &token,
+                            &bid,
+                            &default_agent,
+                            &channels,
+                            chain_state,
+                        )
+                        .await
+                        .map_err(|error| {
+                            EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                                "telegram bot ({bid}) failed: {error}",
+                            )))
+                        })
+                    },
+                );
             }
         } else if state.config.channel_enabled("telegram") {
             tracing::warn!(
@@ -1117,11 +1205,18 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
 
     if state.config.sleep_batch.scheduler_enabled() {
         let scheduler_state = state.clone();
+        let token = state.supervisor.shutdown_token();
         info!("Starting sleep batch scheduler");
-        let handle = tokio::spawn(async move {
-            crate::sleep::scheduler::run_scheduler_loop(scheduler_state).await
-        });
-        handles.push(("sleep-scheduler".to_string(), handle));
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(
+                TaskKind::SleepScheduler,
+                "sleep-scheduler",
+                Criticality::NonCritical,
+            ),
+            async move {
+                crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await
+            },
+        );
     }
 
     if state.config.pulse().scheduler_enabled() {
@@ -1136,81 +1231,77 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
         }
 
         let pulse_state = state.clone();
+        let token = state.supervisor.shutdown_token();
         info!("Starting pulse scheduler");
-        let handle = tokio::spawn(async move {
-            crate::pulse::scheduler::run_pulse_scheduler(pulse_state).await;
-            Ok(())
-        });
-        handles.push(("pulse-scheduler".to_string(), handle));
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(
+                TaskKind::PulseScheduler,
+                "pulse-scheduler",
+                Criticality::NonCritical,
+            ),
+            async move {
+                crate::pulse::scheduler::run_pulse_scheduler(pulse_state, token).await;
+                Ok(())
+            },
+        );
     }
 
     if state.config.db.backup.scheduler_enabled() {
         let backup_state = state.clone();
+        let token = state.supervisor.shutdown_token();
         info!("Starting backup scheduler");
-        let handle =
-            tokio::spawn(
-                async move { backup_scheduler::run_backup_scheduler_loop(backup_state).await },
-            );
-        handles.push(("backup-scheduler".to_string(), handle));
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(
+                TaskKind::BackupScheduler,
+                "backup-scheduler",
+                Criticality::NonCritical,
+            ),
+            async move { backup_scheduler::run_backup_scheduler_loop(backup_state, token).await },
+        );
     }
+
+    // Recovery is complete and channels are starting; the runtime may now serve
+    // external input. Flipped back to false by `shutdown`.
+    state.supervisor.start_accepting();
+    state.runtime_status.set_accepting_inputs(true);
 
     info!("Runtime active; waiting for Ctrl-C or channel failure");
 
-    // spawn したタスクの即時終了 (起動失敗) を検知
     loop {
-        if let Some(finished_index) = handles.iter().position(|(_, handle)| handle.is_finished()) {
-            let (name, handle) = handles.swap_remove(finished_index);
-            let result = handle.await;
-            shutdown_channel_tasks(handles).await;
-            return match result {
-                Ok(Ok(())) => Err(EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                    "channel '{name}' exited unexpectedly"
-                )))),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(channel_join_error(&name, error)),
+        // Detect critical long-lived task failures (channel exit, worker panic).
+        if let Some(outcome) = state.supervisor.poll_long_lived() {
+            let summary = match outcome.result() {
+                supervisor::TaskResult::Ok => {
+                    format!("critical task '{}' exited unexpectedly", outcome.name())
+                }
+                supervisor::TaskResult::Err(msg) => {
+                    format!("critical task '{}' failed: {}", outcome.name(), msg)
+                }
+                supervisor::TaskResult::Panic => {
+                    format!("critical task '{}' panicked", outcome.name())
+                }
             };
+            state.runtime_status.record_critical_task_failure(&summary);
+            tracing::warn!(
+                task = %outcome.name(),
+                result = ?outcome.result(),
+                "critical task exited; initiating shutdown"
+            );
+            state.supervisor.shutdown().await;
+            return Err(EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                "critical task '{}' exited unexpectedly",
+                outcome.name()
+            ))));
         }
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                shutdown_channel_tasks(handles).await;
+                state.supervisor.shutdown().await;
                 return Ok(());
             },
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
     }
-}
-
-async fn shutdown_channel_tasks(handles: Vec<(String, JoinHandle<Result<(), EgoPulseError>>)>) {
-    for (name, mut handle) in handles {
-        let shutdown_result = tokio::time::timeout(Duration::from_secs(10), &mut handle).await;
-        match shutdown_result {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                tracing::warn!("Channel '{name}' exited during shutdown: {error}");
-            }
-            Ok(Err(error)) => {
-                tracing::warn!("Channel '{name}' join failed during shutdown: {error}");
-            }
-            Err(_) => {
-                tracing::warn!("Channel '{name}' did not stop in time; aborting task");
-                handle.abort();
-                if let Err(error) = handle.await {
-                    if !error.is_cancelled() {
-                        tracing::warn!(
-                            "Channel '{name}' join failed after abort during shutdown: {error}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn channel_join_error(name: &str, error: JoinError) -> EgoPulseError {
-    EgoPulseError::Channel(ChannelError::SendFailed(format!(
-        "channel '{name}' task join failed: {error}"
-    )))
 }
 
 #[cfg(test)]

@@ -84,6 +84,9 @@ src/
 │   ├── mod.rs           # AppState, build_app_state(), start_channels()
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
+│   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
+│   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
+│   ├── tool_progress.rs # ツール進捗表示コーディネータ
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
 │   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
@@ -302,29 +305,41 @@ pub(crate) struct SurfaceContext {
       │
 4. start_channels()
        │
-       ├─ Web server 起動 (tokio::spawn)
-       ├─ Discord bot 起動 (tokio::spawn × bot 数)
-       ├─ Telegram bot 起動 (tokio::spawn)
-      │
-      └─ 監視ループ (2 秒間隔でタスク状態をチェック)
-         └─ いずれかのチャネルが異常終了 → 全チャネルを停止
+       ├─ Web server 起動 (supervisor 経由)
+       ├─ Discord bot 起動 (supervisor 経由 × bot 数)
+       ├─ Telegram bot 起動 (supervisor 経由)
+       ├─ Sleep / Pulse / Backup scheduler 起動 (supervisor 経由)
+       │
+       └─ 監視ループ (500ms 間隔で critical task 終了をチェック)
+          ├─ critical task 終了 → shutdown 開始
+          └─ Ctrl-C → shutdown 開始
 ```
 
 ### 停止
 
+`RuntimeSupervisor` が長寿命 task と実行中 Turn task を所有し、順序立てて
+deadline 付きで停止する。
+
 ```text
-1. Ctrl-C シグナル受信 / チャネル異常終了
+1. shutdown 開始 (Ctrl-C / critical task 終了)
       │
-2. 全チャネルタスクに中止シグナル送信
+2. accepting_inputs = false / shutdown_started = true
+   ├─ 新規 Turn 受付拒否 (submit gate)
+   └─ queue 済み Turn は次ターンを開始しない
       │
-3. 各チャネルの graceful shutdown (最大 10 秒)
-   ├─ Discord:  shard_manager.shutdown_all()
-   ├─ Telegram: dispatcher 停止
-   └─ Web:      axum graceful shutdown
+3. 実行中 Turn を deadline (default 30s) まで待って drain
+   ├─ Turn は安全地点で自然完了
+   └─ deadline 超過分は abort (次回起動時に recovery で failed/uncertain へ)
       │
-4. タイムアウト時はタスクを abort
+4. root CancellationToken を cancel
+   ├─ MCP reconnect / agent turn worker / schedulers / Web が graceful 停止
+   └─ Discord / Telegram は自身の Ctrl-C handler または deadline 後 abort
       │
-5. プロセス終了
+5. 長寿命 task を deadline (default 15s) まで待って drain
+      │
+6. deadline 超過 task を abort
+      │
+7. プロセス終了
 ```
 
 ---
@@ -339,7 +354,7 @@ pub(crate) struct SurfaceContext {
 | **Optimistic Concurrency** | `storage/` sessions | セッション書き込みの競合を `updated_at` で解決 |
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |
 | **Feature Flag** | `Cargo.toml` | Discord / Telegram をオプショナルに |
-| **Graceful Shutdown** | `runtime/` | 10 秒タイムアウト付きで全チャネルを安全停止 |
+| **Graceful Shutdown** | `runtime/supervisor.rs` | 長寿命 task と Turn を所有し、deadline 付きで順序停止 |
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |

@@ -116,6 +116,10 @@ pub(crate) enum RejectReason {
     /// terminated earlier). Refused at acceptance rather than accepted and
     /// dropped later.
     ChainTerminated,
+    /// The runtime supervisor has stopped accepting new input (shutdown in
+    /// progress). Refused at acceptance so external callers learn the runtime
+    /// is draining instead of accepting work it cannot start.
+    Shutdown,
 }
 
 impl RejectReason {
@@ -127,6 +131,7 @@ impl RejectReason {
             Self::GlobalQueueFull => "global_queue_full",
             Self::OriginTrackerFull => "tracker_full",
             Self::ChainTerminated => "chain_terminated",
+            Self::Shutdown => "shutdown",
         }
     }
 
@@ -141,6 +146,7 @@ impl RejectReason {
             Self::GlobalQueueFull => "global turn queue is at capacity",
             Self::OriginTrackerFull => "origin turn tracker is at capacity",
             Self::ChainTerminated => "turn chain already terminated",
+            Self::Shutdown => "runtime is shutting down",
         }
     }
 }

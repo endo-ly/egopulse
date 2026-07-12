@@ -65,6 +65,10 @@ GET /health
   "uptime_secs": 86400,
   "pid": 12345,
   "db": { "ok": true },
+  "accepting_inputs": true,
+  "shutdown_started": false,
+  "critical_task_failure": null,
+  "owned_task_count": 4,
   "channels": {
     "web": { "state": "running", "last_error": null, "last_activity": "2026-05-23T10:00:00Z" },
     "discord": { "state": "starting", "last_error": null, "last_activity": null },
@@ -82,11 +86,15 @@ GET /health
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `ok` | `boolean` | DB 正常かつ少なくとも 1 チャネル Running のとき `true` |
+| `ok` | `boolean` | DB 正常かつ少なくとも 1 チャネル Running かつ受付中（shutdown / critical task failure なし）のとき `true` |
 | `version` | `string` | EgoPulse バージョン |
 | `uptime_secs` | `number` | 起動からの経過秒数 |
 | `pid` | `number` | プロセス ID |
 | `db` | `object` | DB 接続状態（`{ "ok": boolean }`） |
+| `accepting_inputs` | `boolean` | Runtime が新規入力を受付中か。shutdown 開始で `false` |
+| `shutdown_started` | `boolean` | graceful shutdown が開始したか |
+| `critical_task_failure` | `string \| null` | critical 長寿命 task の異常終了要約（なければ `null`） |
+| `owned_task_count` | `number` | supervisor が所有する長寿命 task 数 |
 | `channels` | `object` | 各チャネルの状態。値は `{ state, last_error, last_activity }` |
 | `channels.*.state` | `string` | チャネル状態（`starting` / `running` / `failed` / `stopped`） |
 | `channels.*.last_error` | `string \| null` | 直近のエラーメッセージ |
@@ -662,6 +670,7 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `global_queue_full` | 429 | Runtime 全体のキューが上限（512）に達し、受付を拒否した |
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
+| `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
 
 ---
 

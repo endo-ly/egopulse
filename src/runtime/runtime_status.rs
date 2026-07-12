@@ -37,6 +37,10 @@ pub(crate) struct StatusSnapshot {
     pub pid: u32,
     pub started_at: String,
     pub db_healthy: bool,
+    pub accepting_inputs: bool,
+    pub shutdown_started: bool,
+    pub critical_task_failure: Option<String>,
+    pub owned_task_count: usize,
     pub channels: HashMap<String, ChannelHealth>,
     pub recent_errors: Vec<AuditError>,
     pub recent_turns: Vec<TurnRecord>,
@@ -102,6 +106,10 @@ struct RuntimeStatusInner {
     pid: u32,
     version: String,
     db_healthy: bool,
+    accepting_inputs: bool,
+    shutdown_started: bool,
+    critical_task_failure: Option<String>,
+    owned_task_count: usize,
     channels: HashMap<String, ChannelHealth>,
     recent_errors: VecDeque<AuditError>,
     error_capacity: usize,
@@ -126,6 +134,10 @@ impl RuntimeStatus {
                 pid: std::process::id(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 db_healthy: true,
+                accepting_inputs: true,
+                shutdown_started: false,
+                critical_task_failure: None,
+                owned_task_count: 0,
                 channels: HashMap::new(),
                 recent_errors: VecDeque::new(),
                 error_capacity: DEFAULT_ERROR_CAPACITY,
@@ -133,6 +145,37 @@ impl RuntimeStatus {
                 turn_capacity: DEFAULT_TURN_CAPACITY,
             }),
         }
+    }
+
+    /// Sets whether the runtime is accepting new external input.
+    ///
+    /// Flipped to `false` the moment shutdown begins so the intake path can
+    /// refuse new turns before the supervisor drains in-flight work.
+    pub(crate) fn set_accepting_inputs(&self, accepting: bool) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        guard.accepting_inputs = accepting;
+    }
+
+    /// Marks shutdown as started.
+    pub(crate) fn set_shutdown_started(&self, started: bool) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        guard.shutdown_started = started;
+    }
+
+    /// Records that a critical long-lived task failed, surfacing the failure in
+    /// the status snapshot. The first critical failure is retained; subsequent
+    /// ones are appended to the recent-errors ring buffer via `push_error`.
+    pub(crate) fn record_critical_task_failure(&self, summary: &str) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        if guard.critical_task_failure.is_none() {
+            guard.critical_task_failure = Some(summary.to_string());
+        }
+    }
+
+    /// Sets the number of long-lived tasks currently owned by the supervisor.
+    pub(crate) fn set_owned_task_count(&self, count: usize) {
+        let mut guard = self.inner.write().expect("runtime_status lock");
+        guard.owned_task_count = count;
     }
 
     /// Sets the operational state of the named channel.
@@ -207,6 +250,10 @@ impl RuntimeStatus {
             pid: guard.pid,
             started_at: guard.started_at.to_rfc3339(),
             db_healthy: guard.db_healthy,
+            accepting_inputs: guard.accepting_inputs,
+            shutdown_started: guard.shutdown_started,
+            critical_task_failure: guard.critical_task_failure.clone(),
+            owned_task_count: guard.owned_task_count,
             channels: guard.channels.clone(),
             recent_errors: guard.recent_errors.iter().cloned().collect(),
             recent_turns: guard.recent_turns.iter().cloned().collect(),
@@ -292,6 +339,22 @@ mod tests {
         assert!(snapshot.pid > 0, "pid should be non-zero");
         assert!(!snapshot.version.is_empty(), "version should be set");
         assert!(snapshot.db_healthy, "db_healthy should default to true");
+        assert!(
+            snapshot.accepting_inputs,
+            "accepting_inputs should default to true"
+        );
+        assert!(
+            !snapshot.shutdown_started,
+            "shutdown_started should default to false"
+        );
+        assert!(
+            snapshot.critical_task_failure.is_none(),
+            "critical_task_failure should default to None"
+        );
+        assert_eq!(
+            snapshot.owned_task_count, 0,
+            "owned_task_count defaults to 0"
+        );
         assert!(snapshot.channels.is_empty(), "channels should start empty");
         assert!(
             snapshot.recent_errors.is_empty(),

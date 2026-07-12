@@ -126,8 +126,12 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
 ///
 /// Each iteration calculates the next scheduled run, sleeps until then,
 /// and executes [`run_scheduled_cycle`]. Returns `Ok(())` on normal exit
-/// (e.g. if the scheduler becomes disabled at runtime).
-pub(crate) async fn run_scheduler_loop(state: AppState) -> Result<(), crate::error::EgoPulseError> {
+/// (e.g. if the scheduler becomes disabled at runtime, or when `shutdown` is
+/// cancelled).
+pub(crate) async fn run_scheduler_loop(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), crate::error::EgoPulseError> {
     loop {
         let now = Utc::now();
         let next = match next_scheduled_run(&state.config.sleep_batch, &state.config.timezone, now)
@@ -146,7 +150,13 @@ pub(crate) async fn run_scheduler_loop(state: AppState) -> Result<(), crate::err
             "sleep scheduler: waiting for next scheduled run"
         );
 
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("sleep scheduler: shutdown requested, exiting loop");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
 
         run_scheduled_cycle(&state).await;
     }
@@ -655,7 +665,7 @@ mod tests {
             Box::new(MockLlm::new()),
         );
 
-        let result = run_scheduler_loop(state).await;
+        let result = run_scheduler_loop(state, tokio_util::sync::CancellationToken::new()).await;
         assert!(result.is_ok());
     }
 }

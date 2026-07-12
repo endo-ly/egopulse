@@ -278,6 +278,7 @@ pub(crate) async fn run_server(
     state: AppState,
     host: &str,
     port: u16,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), EgoPulseError> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
@@ -308,7 +309,7 @@ pub(crate) async fn run_server(
     };
     let app = build_router(web_state);
 
-    let shutdown_signal = async {
+    let shutdown_signal = async move {
         let ctrl_c = tokio::signal::ctrl_c();
 
         #[cfg(unix)]
@@ -325,6 +326,7 @@ pub(crate) async fn run_server(
         tokio::select! {
             _ = ctrl_c => {},
             _ = terminate => {},
+            _ = shutdown.cancelled() => {},
         }
     };
 
