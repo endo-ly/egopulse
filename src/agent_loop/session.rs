@@ -128,6 +128,38 @@ pub(crate) async fn persist_phase_once(
         .map_err(EgoPulseError::Storage)
 }
 
+/// Commits the user-input message, the session snapshot, and the
+/// `accepted → input_committed` Turn transition in a single database
+/// transaction.
+///
+/// This is the Turn-ingress counterpart to [`persist_phase_once`]: the
+/// conversation write and the Turn state advance share one SQLite
+/// transaction so a crash between them cannot leave a saved user message
+/// behind a Turn that recovery still considers unstarted.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Storage`] when the combined commit fails.
+pub(crate) async fn commit_user_turn_input(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    message: StoredMessage,
+    messages: &[Message],
+    session_revision: Option<i64>,
+    turn_id: &str,
+) -> Result<PersistedTurn, EgoPulseError> {
+    store_phase_snapshot_with_turn_input(
+        state,
+        scope,
+        message,
+        messages.to_vec(),
+        session_revision,
+        turn_id,
+    )
+    .await
+    .map_err(EgoPulseError::Storage)
+}
+
 /// Persists one turn phase with optimistic concurrency and a single conflict retry.
 pub(crate) async fn persist_phase(
     state: &TurnRuntime,
@@ -338,6 +370,36 @@ async fn store_phase_snapshot(
         })?;
     let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         db.store_message_with_session(&message, &session_json, session_revision)
+    })
+    .await?;
+    Ok(PersistedTurn {
+        revision,
+        messages: snapshot_messages,
+    })
+}
+
+async fn store_phase_snapshot_with_turn_input(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    message: StoredMessage,
+    snapshot_messages: Vec<Message>,
+    session_revision: Option<i64>,
+    turn_id: &str,
+) -> Result<PersistedTurn, StorageError> {
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
+        .await
+        .map_err(|error| match error {
+            EgoPulseError::Storage(storage) => storage,
+            other => StorageError::TaskJoin(other.to_string()),
+        })?;
+    let turn_id_owned = turn_id.to_string();
+    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.commit_turn_input_with_conversation(
+            &message,
+            &session_json,
+            session_revision,
+            &turn_id_owned,
+        )
     })
     .await?;
     Ok(PersistedTurn {

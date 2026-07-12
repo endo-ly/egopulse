@@ -37,7 +37,7 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 | テーブル数 | 15（データテーブル 13 + マイグレーション基盤テーブル 2） |
 | インデックス数 | 24 |
 | 外部キー制約 | 3（tool_calls.chat_id → chats.chat_id, sleep_run_steps.sleep_run_id → sleep_runs.id, memory_snapshots.run_id → sleep_runs.id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v12） |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v13） |
 | DBライブラリ | rusqlite 0.37（bundled） |
 | DBファイル | `{data_dir}/egopulse.db` |
 | 接続ラッパー | `Mutex<Connection>` |
@@ -843,6 +843,7 @@ CREATE TABLE IF NOT EXISTS turn_runs (
     accepted_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finished_at TEXT,
+    request_payload_hash TEXT,
     UNIQUE(chat_id, request_key)
 );
 
@@ -869,6 +870,7 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
 | accepted_at | TEXT | NOT NULL | 受付時刻 |
 | updated_at | TEXT | NOT NULL | 最終更新時刻 |
 | finished_at | TEXT | nullable | 完了・停止時刻 |
+| request_payload_hash | TEXT | nullable | 受付時の user input 本文 hash。再受付で同一 `request_key` に異なる本文が渡された場合に拒否する |
 
 *UNIQUE 制約は `(chat_id, request_key)` の複合。同じ受付を再受付した場合は新規 Turn を作らず既存 Turn を返す。
 
@@ -945,7 +947,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 | 構造体 | テーブル | フィールド |
 |--------|----------|-----------|
-| `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id |
+| `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id, seq, turn_id, parent_message_id |
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
 | `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
@@ -1049,7 +1051,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 // }
 ```
 
-> **Note**: v8/v9 は旧系統のマイグレーション履歴（参照用）。現行のコードラインでは v1 から v10 までを順に適用する。
+> **Note**: v8/v9 は旧系統のマイグレーション履歴（参照用）。現行のコードラインでは v1 から v13 までを順に適用する。
 
 #### v8: remove bot_id from Discord session external_chat_id (旧系統)
 
@@ -1131,6 +1133,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 - `ALTER TABLE ADD COLUMN` は `pragma_table_info` 存在チェックで導出し、version rollback 再実行でも重複しない
 - migration 前 backup を必須化（`new_with_backup` が backup 失敗時に `MigrationBackupFailed` で起動を拒否）
 
+#### v13: turn_runs.request_payload_hash
+
+`turn_runs` へ `request_payload_hash` カラムを追加。受付時に user input 本文の SHA-256 を保存し、同一 `request_key` の再受付で本文が異なる場合に受付を拒否できるようにする。既存行は NULL を許容し、NULL は未計測の legacy データとして再受付を許す。
+
 ### 外部キー制約が最小限
 
 明示的な FK は `tool_calls.chat_id`、`sleep_run_steps.sleep_run_id`、`memory_snapshots.run_id` の 3 つ。`messages.chat_id` や `sessions.chat_id` には FK がない。整合性はアプリケーション層で担保。
@@ -1151,25 +1157,26 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 |------|----|
 | ファイルパス | `{data_dir}/secret.db` |
 | 初期化条件 | `channels.discord.channels.*` または `channels.telegram.telegram_channels.*` に `secret: true` エントリが1件以上ある場合 |
-| テーブル数 | 7（`chats`, `messages`, `sessions`, `llm_usage_logs`, `turn_runs`, `db_meta`, `schema_migrations`。`tool_calls` は不在） |
-| スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数（現行 v3）。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
+| テーブル数 | 8（`chats`, `messages`, `sessions`, `tool_calls`, `llm_usage_logs`, `turn_runs`, `db_meta`, `schema_migrations`） |
+| スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数（現行 v4）。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
 | DBライブラリ | `egopulse.db` と同一（rusqlite 0.37 bundled） |
 | PRAGMA | `journal_mode=WAL`, `busy_timeout=5s` |
 
 ### 5.2 テーブル構成
 
-`secret.db` は `egopulse.db` のサブセット。通常 DB に存在する `tool_calls`, `sleep_runs`, `sleep_run_steps`, `sleep_step_checkpoints`, `pulse_runs`, `episode_events`, `episode_rollups`, `memory_snapshots` は含まない。秘匿会話も同一の会話順序・競合制御・Turn lifecycle を持つため、`chats`/`messages`/`sessions` 拡張カラムと `turn_runs` を追加する（`tool_calls` は不在のまま）。
+`secret.db` は `egopulse.db` の会話・Turn・Tool 台帳を担うサブセット。通常 DB に存在する `sleep_runs`, `sleep_run_steps`, `sleep_step_checkpoints`, `pulse_runs`, `episode_events`, `episode_rollups`, `memory_snapshots` は含まない。秘匿会話も同一の会話順序・競合制御・Turn lifecycle・Tool 実行台帳を持つため、`chats`/`messages`/`sessions` 拡張カラム、`turn_runs`、`tool_calls` を配置する。Secret スコープの Tool claim・結果保存はすべてこの DB で行われ、通常 DB へは書き込まれない。
 
 | テーブル | schema | 備考 |
 |---|---|---|
 | `chats` | `egopulse.db.chats` と同 schema | `chat_type` に `secret` 等の特殊値は使わない。DB ファイル自体で隔離を表現 |
 | `messages` | `egopulse.db.messages` と同 schema | |
 | `sessions` | `egopulse.db.sessions` と同 schema | `messages_json` に tool call block も包含されるため LLM context 復元に影響なし |
+| `tool_calls` | `egopulse.db.tool_calls` と同 schema | Secret スコープの Tool 実行台帳。claim・input hash・状態遷移・結果保存を担い、Secret Tool の入出力が通常 DB へ漏れない |
 | `llm_usage_logs` | `egopulse.db.llm_usage_logs` と同 schema | この DB 内のレコードはすべて Secret スコープとして扱われる |
 | `db_meta` | `egopulse.db.db_meta` と同 schema | `SECRET_SCHEMA_VERSION` を管理 |
 | `schema_migrations` | `egopulse.db.schema_migrations` と同 schema | |
 
-**`tool_calls` テーブル不在の理由**: 秘密モードでは tool call 永続化をスキップする。tool call block は `sessions.messages_json` に包含されており、LLM context 復元には十分。保管データ量（漏洩面積）を減らすため。
+**`tool_calls` テーブルについて**: 秘密モードでも Tool 実行台帳を保持する。claim-before-execute・input hash 整合確認・成功結果の再利用・実行状態管理を通常 DB と同じく適用し、Secret Tool の入出力を通常 DB へ書き出さず Secret DB 内に閉じ込める。tool call block は `sessions.messages_json` にも包含されるため LLM context 復元には影響しない。
 
 **Sleep / Pulse 関連テーブル不在の理由**: Sleep Batch・PULSE は `secret.db` にアクセスしない（構造的保証）。秘匿内容が長期記憶（`episodic.md` 等）へ昇格したり、公開チャネルで発言されたりするのを防ぐ。
 
@@ -1178,7 +1185,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 `run_migrations()` とは別に `run_secret_migrations()` を使用。`Database::new_secret()` 経由で起動時に呼ばれる。
 
 ```rust
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 3;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 4;
 ```
 
 `egopulse.db` 側の `SCHEMA_VERSION` と衝突しないよう、別定数・別関数で管理する。

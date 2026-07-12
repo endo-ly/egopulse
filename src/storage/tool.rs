@@ -46,7 +46,7 @@ impl Database {
 // * the **input hash** guards against input drift on re-claim,
 // * a **succeeded** Tool returns its stored output instead of re-executing,
 // * a **running** Tool left by a crash becomes **uncertain** on recovery,
-// * **non-idempotent** Tools are never auto-retried from `uncertain`,
+// * an **uncertain** Tool is never retried (the owning Turn is not resumed),
 // * result and state are written in one transaction (no partial commit).
 //
 // Reads (e.g. `get_tool_calls_for_chat`) stay on `Database`; only state-mutating
@@ -93,11 +93,10 @@ pub(crate) struct RecoveredToolCall {
     pub turn_id: String,
     pub tool_call_id: String,
     pub tool_name: String,
-    /// The state the row was moved to. `Uncertain` for Tools that must not be
-    /// auto-retried; `Pending` for read-only / idempotent Tools whose stored
-    /// input hash and key make a safe retry possible on the next claim.
+    /// The state the row was moved to. Always [`ToolState::Uncertain`]: a
+    /// `running` Tool whose result is unverifiable is never reset to `pending`,
+    /// since the owning Turn is not resumed.
     pub recovered_to: ToolState,
-    pub idempotency_class: IdempotencyClass,
 }
 
 /// Persisted columns read back during a claim re-evaluation.
@@ -106,7 +105,6 @@ struct ExistingToolRow {
     input_hash: Option<String>,
     tool_output: Option<String>,
     idempotency_class: Option<String>,
-    idempotency_key: Option<String>,
 }
 
 impl ExistingToolRow {
@@ -116,7 +114,6 @@ impl ExistingToolRow {
             input_hash: row.get(1)?,
             tool_output: row.get(2)?,
             idempotency_class: row.get(3)?,
-            idempotency_key: row.get(4)?,
         })
     }
 }
@@ -131,9 +128,9 @@ impl Database {
     ///   [`StorageError::ToolInputConflict`] (never execute, never guess).
     /// * `succeeded` → [`ClaimOutcome::Reused`] with the stored output.
     /// * `pending` with matching hash → advance to `running`. `Acquired`.
-    /// * `uncertain` read-only / idempotent Tool with matching hash (and key
-    ///   for idempotent) → retry is safe, advance to `running`. `Acquired`.
-    /// * `running`, `failed`, or non-retryable `uncertain` → [`ClaimOutcome::Blocked`].
+    /// * `running`, `failed`, or `uncertain` → [`ClaimOutcome::Blocked`].
+    ///   An interrupted Turn is not resumed, so an `uncertain` Tool is never
+    ///   retried here.
     ///
     /// # Errors
     ///
@@ -222,23 +219,27 @@ impl Database {
         Ok(())
     }
 
-    /// Transitions every `running` Tool to a recovery state.
+    /// Transitions every `running` Tool to `uncertain`.
     ///
-    /// The default recovery outcome is `uncertain`: a Tool interrupted mid-execution
-    /// cannot have its result verified, so it must not be auto-retried. The
-    /// sole exception is a read-only or idempotent Tool whose stored input
-    /// hash and idempotency key make a safe retry possible — these reset to
-    /// `pending` so the next claim re-executes them with the same input.
+    /// An interrupted Turn is never resumed, so a `running` Tool whose result
+    /// is unverifiable can never be re-claimed by that Turn. Resetting it to
+    /// `pending` would leave an executable-looking row orphaned behind a
+    /// stopped Turn. Every `running` Tool is moved to `uncertain` so the
+    /// ledger state agrees with the owning Turn's terminal state.
     ///
-    /// Returns the transitioned rows so the caller can report or decide on
-    /// further action. `pending` rows (never started) are left untouched.
+    /// Returns the transitioned rows so the caller can log them. `pending`
+    /// rows (never started) are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite writes fail.
     pub(crate) fn recover_running_tools(&self) -> Result<Vec<RecoveredToolCall>, StorageError> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
 
-        let running: Vec<(String, String, String, String, Option<String>)> = {
+        let running: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT turn_id, id, tool_name, idempotency_class, idempotency_key
+                "SELECT turn_id, id, tool_name
                  FROM tool_calls
                  WHERE state = 'running'",
             )?;
@@ -247,35 +248,24 @@ impl Database {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
         let mut recovered = Vec::with_capacity(running.len());
-        for (turn_id, tool_call_id, tool_name, class_str, key) in running {
-            let class: IdempotencyClass = class_str
-                .parse()
-                .map_err(|e| StorageError::Conflict(format!("invalid idempotency_class: {e}")))?;
-            let recovered_to = if retry_eligible(class, key.as_deref()) {
-                ToolState::Pending
-            } else {
-                ToolState::Uncertain
-            };
+        for (turn_id, tool_call_id, tool_name) in running {
             tx.execute(
                 "UPDATE tool_calls
-                 SET state = ?3
+                 SET state = 'uncertain'
                  WHERE turn_id = ?1 AND id = ?2",
-                params![&turn_id, &tool_call_id, recovered_to.to_string()],
+                params![&turn_id, &tool_call_id],
             )?;
             recovered.push(RecoveredToolCall {
                 turn_id,
                 tool_call_id,
                 tool_name,
-                recovered_to,
-                idempotency_class: class,
+                recovered_to: ToolState::Uncertain,
             });
         }
 
@@ -289,13 +279,12 @@ fn claim_locked(
     params: ClaimParams<'_>,
 ) -> Result<ClaimOutcome, StorageError> {
     let now = chrono::Utc::now().to_rfc3339();
-    // Load the persisted classification alongside the execution state so
-    // the retry decision trusts the ledger, not the incoming params. A
-    // caller must not relax a stored `non_idempotent` Tool into
-    // `read_only` to force a retry.
+    // Load the persisted classification alongside the execution state so the
+    // stored idempotency class is trusted over the incoming params. A caller
+    // must not relax a stored `non_idempotent` Tool into `read_only`.
     let existing = tx
         .query_row(
-            "SELECT state, input_hash, tool_output, idempotency_class, idempotency_key
+            "SELECT state, input_hash, tool_output, idempotency_class
              FROM tool_calls
              WHERE turn_id = ?1 AND id = ?2",
             params![params.turn_id, params.tool_call_id],
@@ -336,10 +325,9 @@ fn claim_locked(
         });
     }
 
-    // Trust the persisted idempotency classification for retry decisions.
+    // The idempotency classification is immutable for a given execution slot.
     // A mismatch between stored and incoming classification is a conflict:
-    // the Tool's retry contract cannot change across claims for the same
-    // execution slot.
+    // the contract recorded at first claim must stay stable across re-claims.
     let stored_class: IdempotencyClass = row
         .idempotency_class
         .as_deref()
@@ -365,10 +353,6 @@ fn claim_locked(
             advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
             ClaimOutcome::Acquired
         }
-        ToolState::Uncertain if retry_eligible(stored_class, row.idempotency_key.as_deref()) => {
-            advance_to_running(tx, params.turn_id, params.tool_call_id, &now)?;
-            ClaimOutcome::Acquired
-        }
         other => ClaimOutcome::Blocked { state: other },
     };
     Ok(outcome)
@@ -387,17 +371,6 @@ fn advance_to_running(
         params![turn_id, tool_call_id, now],
     )?;
     Ok(())
-}
-
-/// A `running` Tool left by a crash may be retried only when its idempotency
-/// class guarantees a duplicate execution is observably safe: read-only Tools
-/// never mutate external state, and idempotent Tools deduplicate on a stable key.
-fn retry_eligible(class: IdempotencyClass, idempotency_key: Option<&str>) -> bool {
-    match class {
-        IdempotencyClass::ReadOnly => true,
-        IdempotencyClass::Idempotent => idempotency_key.is_some(),
-        IdempotencyClass::NonIdempotent => false,
-    }
 }
 
 fn require_state(
@@ -786,9 +759,9 @@ mod tests {
 
     #[test]
     fn record_failure_clears_error_fields_on_subsequent_success_path() {
-        // This is covered indirectly: a fresh running row has no error fields.
-        // The key invariant is that record_success nulls error_kind/message,
-        // tested by claiming a retry-eligible uncertain row then succeeding.
+        // Asserts that `record_tool_success` clears any stale `error_kind` /
+        // `error_message`. A claimed `running` row has stale error fields
+        // forced in, then a success is recorded.
         // Arrange
         let (db, _dir) = ledger_test_db();
         db.claim_tool_execution(claim_params(
@@ -799,25 +772,17 @@ mod tests {
             None,
         ))
         .expect("claim");
-        // Simulate a crash: force the row to uncertain with stale error fields.
+        // Force stale error fields while the row is still `running`.
         {
             let conn = db.get_conn().expect("conn");
             conn.execute(
-                "UPDATE tool_calls SET state = 'uncertain', error_kind = 'stale', error_message = 'stale-msg' WHERE turn_id = ?1 AND id = ?2",
+                "UPDATE tool_calls SET error_kind = 'stale', error_message = 'stale-msg' WHERE turn_id = ?1 AND id = ?2",
                 params!["turn-1", "call-1"],
             )
-            .expect("force uncertain");
+            .expect("force error fields");
         }
 
-        // Act: read-only retry re-acquires, then succeeds.
-        db.claim_tool_execution(claim_params(
-            "turn-1",
-            "call-1",
-            "hash-1",
-            IdempotencyClass::ReadOnly,
-            None,
-        ))
-        .expect("re-claim");
+        // Act: record success from the running state.
         db.record_tool_success("turn-1", "call-1", "ok")
             .expect("success");
 
@@ -858,8 +823,8 @@ mod tests {
     }
 
     #[test]
-    fn recover_running_resets_read_only_tool_to_pending() {
-        // Arrange
+    fn recover_running_marks_read_only_tool_uncertain() {
+        // Arrange: a read-only Tool crashed mid-execution.
         let (db, _dir) = ledger_test_db();
         db.claim_tool_execution(claim_params(
             "turn-1",
@@ -873,14 +838,15 @@ mod tests {
         // Act
         let recovered = db.recover_running_tools().expect("recover");
 
-        // Assert: safe to retry — reset to pending for the next claim.
-        assert_eq!(recovered[0].recovered_to, ToolState::Pending);
-        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Pending);
+        // Assert: a read-only Tool is uncertain because its owning Turn is not
+        // resumed.
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
+        assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Uncertain);
     }
 
     #[test]
-    fn recover_running_resets_idempotent_tool_with_key_to_pending() {
-        // Arrange
+    fn recover_running_marks_idempotent_tool_with_key_uncertain() {
+        // Arrange: an idempotent Tool with a dedup key crashed mid-execution.
         let (db, _dir) = ledger_test_db();
         db.claim_tool_execution(claim_params(
             "turn-1",
@@ -894,8 +860,9 @@ mod tests {
         // Act
         let recovered = db.recover_running_tools().expect("recover");
 
-        // Assert
-        assert_eq!(recovered[0].recovered_to, ToolState::Pending);
+        // Assert: idempotent classification does not reset to pending because the
+        // owning Turn is not resumed.
+        assert_eq!(recovered[0].recovered_to, ToolState::Uncertain);
     }
 
     #[test]
@@ -919,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_retries_uncertain_read_only_tool_with_matching_hash() {
+    fn claim_blocks_uncertain_read_only_tool() {
         // Arrange: crash left the read-only Tool uncertain.
         let (db, _dir) = ledger_test_db();
         db.claim_tool_execution(claim_params(
@@ -930,7 +897,7 @@ mod tests {
             None,
         ))
         .expect("claim");
-        db.recover_running_tools().expect("recover to pending");
+        db.recover_running_tools().expect("recover to uncertain");
 
         // Act: re-claim with the same input.
         let outcome = db
@@ -943,8 +910,14 @@ mod tests {
             ))
             .expect("re-claim");
 
-        // Assert: retried (re-acquired), not blocked.
-        assert_eq!(outcome, ClaimOutcome::Acquired);
+        // Assert: blocked — an uncertain Tool is never retried since the owning
+        // Turn is not resumed.
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Blocked {
+                state: ToolState::Uncertain
+            }
+        );
     }
 
     #[test]

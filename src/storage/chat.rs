@@ -286,11 +286,11 @@ impl Database {
 
 /// Result of a committed conversation change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommitOutcome {
+pub(super) struct CommitOutcome {
     /// `chats.revision` after this commit.
-    revision: i64,
+    pub(super) revision: i64,
     /// Per-chat `seq` assigned to the persisted message.
-    seq: i64,
+    pub(super) seq: i64,
 }
 
 /// Ensures a `chats` row exists for `chat_id` before any CAS (`revision`) or
@@ -325,7 +325,7 @@ fn ensure_chat_row(tx: &rusqlite::Transaction<'_>, chat_id: i64) -> Result<(), S
 ///   [`StorageError::SessionSnapshotConflict`].
 /// * `None` — the session row must not yet exist (initial seed); if a session
 ///   already exists the call conflicts.
-fn commit_message_locked(
+pub(super) fn commit_message_locked(
     tx: &rusqlite::Transaction<'_>,
     message: &StoredMessage,
     session_json: Option<&str>,

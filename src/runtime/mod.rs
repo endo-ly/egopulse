@@ -392,8 +392,7 @@ pub async fn build_app_state_with_path(
     state.warm_up_calibrator().await;
 
     // Recover durable Turn / Tool state left non-terminal by a prior crash.
-    // Running Tools become uncertain (or pending for read-only / idempotent),
-    // and interrupted turn_runs stop safely.
+    // Running Tools become uncertain, and interrupted turn_runs stop safely.
     recover_durable_state(&state).await;
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);

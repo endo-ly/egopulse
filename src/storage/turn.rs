@@ -19,10 +19,11 @@
 //! and conservatively stops.
 
 use rusqlite::OptionalExtension;
+use rusqlite::TransactionBehavior;
 use rusqlite::params;
 
 use crate::error::StorageError;
-use crate::storage::{Database, TurnRunState};
+use crate::storage::{Database, StoredMessage, TurnRunState};
 
 /// One row of `turn_runs`, read back for lifecycle decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,20 +298,43 @@ impl Database {
         Ok(())
     }
 
-    /// Records the committed user-input message id and advances
-    /// `accepted -> input_committed`.
+    /// Commits the user-input message, advances the session snapshot, and
+    /// transitions `turn_runs` from `accepted` to `input_committed` in a single
+    /// transaction.
+    ///
+    /// The user message insert, the `sessions.messages_json` update, the
+    /// `chats.revision` / `next_message_seq` bump, the `turn_runs.state`
+    /// transition, and the `turn_runs.input_message_id` stamp share one SQLite
+    /// transaction so a crash between saving the conversation and recording the
+    /// Turn state cannot leave the two out of sync. `message.id` is recorded as
+    /// `turn_runs.input_message_id`.
+    ///
+    /// `expected_revision` is the optimistic-concurrency token for the
+    /// conversation: `Some(n)` commits only while `chats.revision == n`, while
+    /// `None` requires the session row to not yet exist (initial seed). A
+    /// mismatch rolls the whole transaction back with
+    /// [`StorageError::SessionSnapshotConflict`].
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the row is missing or not in the `accepted`
-    /// state.
-    pub(crate) fn commit_turn_input(
+    /// Returns [`StorageError`] if the conversation commit fails, or
+    /// [`StorageError::Conflict`] when the Turn is missing or not in the
+    /// `accepted` state.
+    pub(crate) fn commit_turn_input_with_conversation(
         &self,
+        message: &StoredMessage,
+        session_json: &str,
+        expected_revision: Option<i64>,
         turn_id: &str,
-        input_message_id: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<i64, StorageError> {
         let mut conn = self.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome = super::chat::commit_message_locked(
+            &tx,
+            message,
+            Some(session_json),
+            expected_revision,
+        )?;
         transition_locked(
             &tx,
             turn_id,
@@ -320,10 +344,10 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
             "UPDATE turn_runs SET input_message_id = ?2, updated_at = ?3 WHERE turn_id = ?1",
-            params![turn_id, input_message_id, &now],
+            params![turn_id, &message.id, &now],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(outcome.revision)
     }
 
     /// Marks that any external output (delta, narration, Tool Call, assistant
@@ -684,7 +708,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Database;
+    use crate::storage::{Database, StoredMessage};
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -712,6 +736,19 @@ mod tests {
         db.get_turn_run(turn_id).expect("get").state
     }
 
+    /// Drives the production `commit_turn_input_with_conversation` path so the
+    /// state-machine exercises the same atomic commit the runtime uses, and
+    /// tracks the per-chat session revision across sequential commits.
+    fn commit_input(db: &Database, turn_id: &str, session_revision: &mut Option<i64>) -> String {
+        let mut msg = StoredMessage::user(1, "sender".to_string(), format!("input-{turn_id}"));
+        msg.turn_id = Some(turn_id.to_string());
+        let rev = db
+            .commit_turn_input_with_conversation(&msg, "[]", *session_revision, turn_id)
+            .expect("commit input");
+        *session_revision = Some(rev);
+        msg.id
+    }
+
     #[test]
     fn accept_creates_new_turn_in_accepted_state() {
         // Arrange
@@ -728,6 +765,50 @@ mod tests {
         assert_eq!(run.config_fingerprint.as_deref(), Some("abc123"));
         assert_eq!(run.model_attempt, 0);
         assert!(!run.output_published);
+    }
+
+    #[test]
+    fn commit_turn_input_with_conversation_is_atomic_on_conflict() {
+        // Arrange: a pre-existing session row at revision 0, plus an accepted
+        // Turn. A mismatched `expected_revision` must roll back both the
+        // message insert and the `accepted → input_committed` transition.
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "atomic").turn_id;
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO sessions (chat_id, messages_json, updated_at, snapshot_through_seq)
+                 VALUES (1, '[]', 't', 0)",
+                [],
+            )
+            .expect("seed session");
+            conn.execute("UPDATE chats SET revision = 5 WHERE chat_id = 1", [])
+                .expect("bump revision");
+        }
+        let mut msg = StoredMessage::user(1, "sender".to_string(), "hello".to_string());
+        msg.turn_id = Some(turn_id.clone());
+
+        // Act: expected_revision mismatches the real revision (5).
+        let error = db
+            .commit_turn_input_with_conversation(&msg, "[]", Some(0), &turn_id)
+            .expect_err("conflict expected");
+        assert!(matches!(error, StorageError::SessionSnapshotConflict));
+
+        // Assert: neither the conversation nor the Turn state changed.
+        assert_eq!(state(&db, &turn_id), TurnRunState::Accepted);
+        let message_count: i64 = db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            message_count, 0,
+            "message insert must roll back on conflict"
+        );
     }
 
     #[test]
@@ -815,8 +896,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "k").turn_id;
-        db.commit_turn_input(&turn_id, "msg-1")
-            .expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
 
         // Act: the row is now input_committed, not accepted.
         let error = db
@@ -834,13 +915,13 @@ mod tests {
         let turn_id = accept(&db, "k").turn_id;
 
         // Act
-        db.commit_turn_input(&turn_id, "user-msg-1")
-            .expect("commit input");
+        let mut rev = None;
+        let msg_id = commit_input(&db, &turn_id, &mut rev);
 
         // Assert
         let run = db.get_turn_run(&turn_id).expect("get");
         assert_eq!(run.state, TurnRunState::InputCommitted);
-        assert_eq!(run.input_message_id.as_deref(), Some("user-msg-1"));
+        assert_eq!(run.input_message_id.as_deref(), Some(msg_id.as_str()));
     }
 
     #[test]
@@ -851,8 +932,8 @@ mod tests {
 
         // Act: accepted -> input_committed -> model_pending -> model_completed
         //      -> tools_pending -> tools_completed -> model_pending -> completed
-        db.commit_turn_input(&turn_id, "in-1")
-            .expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
         db.begin_turn_model_iteration(&turn_id, 1, "hash-1")
             .expect("begin iter 1");
         db.complete_turn_model(&turn_id).expect("complete model");
@@ -876,7 +957,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "iter").turn_id;
-        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
 
         // Act
         db.begin_turn_model_iteration(&turn_id, 1, "hash-A")
@@ -895,7 +977,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "retry").turn_id;
-        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
         db.begin_turn_model_iteration(&turn_id, 1, "hash")
             .expect("begin iter");
 
@@ -945,7 +1028,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "fail").turn_id;
-        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
 
         // Act
         db.fail_turn(&turn_id, TurnRunState::Failed, "llm_error", "boom")
@@ -964,7 +1048,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "unc").turn_id;
-        db.commit_turn_input(&turn_id, "in").expect("commit input");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
         db.begin_turn_model_iteration(&turn_id, 1, "h")
             .expect("begin");
         db.mark_turn_output_published(&turn_id).expect("published");
@@ -1026,38 +1111,35 @@ mod tests {
         let tools_pending_id = accept(&db, "tpend").turn_id;
         let tools_completed_id = accept(&db, "tcomp").turn_id;
 
-        db.commit_turn_input(&input_committed_id, "in")
-            .expect("commit");
+        // All committed Turns share one chat, so the session revision is
+        // threaded through the sequential commits.
+        let mut rev = None;
+        commit_input(&db, &input_committed_id, &mut rev);
 
-        db.commit_turn_input(&model_pending_unsafe_id, "in")
-            .expect("commit");
+        commit_input(&db, &model_pending_unsafe_id, &mut rev);
         db.begin_turn_model_iteration(&model_pending_unsafe_id, 1, "h")
             .expect("begin");
         db.mark_turn_output_published(&model_pending_unsafe_id)
             .expect("mark published");
 
-        db.commit_turn_input(&model_pending_safe_id, "in")
-            .expect("commit");
+        commit_input(&db, &model_pending_safe_id, &mut rev);
         db.begin_turn_model_iteration(&model_pending_safe_id, 1, "h")
             .expect("begin");
 
-        db.commit_turn_input(&model_completed_id, "in")
-            .expect("commit");
+        commit_input(&db, &model_completed_id, &mut rev);
         db.begin_turn_model_iteration(&model_completed_id, 1, "h")
             .expect("begin");
         db.complete_turn_model(&model_completed_id)
             .expect("complete model");
 
-        db.commit_turn_input(&tools_pending_id, "in")
-            .expect("commit");
+        commit_input(&db, &tools_pending_id, &mut rev);
         db.begin_turn_model_iteration(&tools_pending_id, 1, "h")
             .expect("begin");
         db.complete_turn_model(&tools_pending_id)
             .expect("complete model");
         db.begin_turn_tools(&tools_pending_id).expect("begin tools");
 
-        db.commit_turn_input(&tools_completed_id, "in")
-            .expect("commit");
+        commit_input(&db, &tools_completed_id, &mut rev);
         db.begin_turn_model_iteration(&tools_completed_id, 1, "h")
             .expect("begin");
         db.complete_turn_model(&tools_completed_id)
@@ -1071,7 +1153,7 @@ mod tests {
         let recovered = db.recover_interrupted_turns().expect("recover");
 
         // Assert: accepted / input_committed fail (safe to retry); every
-        // state that may have published output goes to uncertain (fail-stop).
+        // state that may have published output goes to uncertain.
         assert_eq!(recovered.len(), 7);
         assert_eq!(state(&db, &accepted_id), TurnRunState::Failed);
         assert_eq!(state(&db, &input_committed_id), TurnRunState::Failed);
@@ -1090,7 +1172,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let completed_id = accept(&db, "done").turn_id;
-        db.commit_turn_input(&completed_id, "in").expect("commit");
+        let mut rev = None;
+        commit_input(&db, &completed_id, &mut rev);
         db.begin_turn_model_iteration(&completed_id, 1, "h")
             .expect("begin");
         db.complete_turn_model(&completed_id)
@@ -1110,7 +1193,8 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "once").turn_id;
-        db.commit_turn_input(&turn_id, "in").expect("commit");
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
 
         // Act: first recovery fail-stops input_committed; second sees no change.
         db.recover_interrupted_turns().expect("first");

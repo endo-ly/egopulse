@@ -9,7 +9,7 @@ use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 
 use crate::agent_loop::session::{
-    PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once, resolve_chat_id,
+    PersistedTurn, persist_phase, persist_phase_messages, resolve_chat_id,
 };
 use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
@@ -100,12 +100,15 @@ enum TurnAcceptance {
     Completed(String),
     /// The Turn already exists and is non-terminal — another executor (or a
     /// prior crash) owns it. The caller must **not** start a second executor;
-    /// it acknowledges the duplicate and returns without side effects.
-    InProgress,
+    /// the carried message is returned to the caller and emitted as a final
+    /// response so every ingress (Web `done`, channel reply) observes a
+    /// terminal outcome for this duplicate request.
+    InProgress(String),
     /// The Turn already terminated in a non-success state (`failed` /
-    /// `uncertain` / `cancelled`). The caller informs the user but does not
-    /// re-execute (re-running could duplicate side effects).
-    Terminated(TurnRunState),
+    /// `uncertain` / `cancelled`). The caller informs the user via the carried
+    /// message but does not re-execute (re-running could duplicate side
+    /// effects). The message is also emitted as a final response.
+    Terminated(String),
 }
 
 /// An LLM model-iteration failure paired with whether any external output
@@ -313,18 +316,20 @@ impl TurnExecutor<'_> {
                     });
                     return Ok(saved);
                 }
-                TurnAcceptance::Terminated(state) => {
+                TurnAcceptance::Terminated(message) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        text: format!(
-                            "このリクエストは以前に処理されましたが、状態が {state} になりました。再度お試しください。"
-                        ),
+                        text: message.clone(),
                     });
-                    return Ok(String::new());
+                    return Ok(message);
                 }
-                TurnAcceptance::InProgress => {
+                TurnAcceptance::InProgress(message) => {
                     // 同一 request_key の Turn は既に別 executor が所有している。
-                    // 二重実行を避けるため、ここで新規 executor を起動しない。
-                    return Ok(String::new());
+                    // 二重実行を避けるため新規 executor を起動しないが、この重複
+                    // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
+                    self.on_event.emit(AgentEvent::FinalResponse {
+                        text: message.clone(),
+                    });
+                    return Ok(message);
                 }
                 TurnAcceptance::Proceed(run) => *run,
             };
@@ -341,11 +346,10 @@ impl TurnExecutor<'_> {
                 };
 
                 // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
-                // 保存後 input_committed へ遷移する。
+                // user message の保存と input_committed 遷移は同一 transaction で行う。
                 let (messages, session_revision) = self
                     .persist_user_input(&prepared, user_input, &prompt_ctx)
                     .await?;
-                self.commit_input(&prepared).await?;
 
                 // 段階3: 一時的なチャネル背景情報を、保存済みセッションとは別に読み込む。
                 let channel_context_msg = load_channel_context(self.state, self.context).await;
@@ -426,21 +430,14 @@ impl TurnExecutor<'_> {
                     })?;
                     Ok(TurnAcceptance::Completed(content))
                 }
-                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(other)),
-                _ => Ok(TurnAcceptance::InProgress),
+                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(format!(
+                    "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
+                ))),
+                _ => Ok(TurnAcceptance::InProgress(
+                    "このリクエストはすでに処理中です。".to_string(),
+                )),
             },
         }
-    }
-
-    async fn commit_input(&self, prepared: &PreparedTurn) -> Result<(), EgoPulseError> {
-        let turn_id = prepared.turn_id.clone();
-        let message_id = prepared.input_message_id.clone();
-        call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.commit_turn_input(&turn_id, &message_id),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn fail_turn(&self, turn_id: &str, error: &EgoPulseError) {
@@ -584,6 +581,7 @@ impl TurnExecutor<'_> {
             self.state,
             self.context,
             prepared.chat_id,
+            &prepared.turn_id,
             &prepared.input_message_id,
             &prepared.user_message,
             user_input,
@@ -787,6 +785,7 @@ impl TurnExecutor<'_> {
             prepared.chat_id,
             &self.context.agent_id,
             &final_message_id,
+            &prepared.turn_id,
             &mut loop_state.messages,
             loop_state.session_revision,
             &self.on_event,
@@ -916,6 +915,7 @@ async fn persist_and_finalize(
     chat_id: i64,
     agent_id: &str,
     final_message_id: &str,
+    turn_id: &str,
     messages: &mut Arc<Vec<Message>>,
     session_revision: Option<i64>,
     on_event: &EventEmitter,
@@ -930,6 +930,7 @@ async fn persist_and_finalize(
 
     let mut stored = StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone());
     stored.id = final_message_id.to_string();
+    stored.turn_id = Some(turn_id.to_string());
     let _persisted = persist_phase(
         state,
         scope,
@@ -964,6 +965,7 @@ async fn execute_and_persist_tools(
         tool_context.chat_id,
         &tool_context.agent_id,
         &assistant_message_id,
+        &tool_context.turn_id,
         &assistant_phase,
         messages_vec,
         session_revision,
@@ -986,6 +988,8 @@ async fn execute_and_persist_tools(
         tool_context.scope,
         tool_context.chat_id,
         &tool_context.agent_id,
+        &assistant_message_id,
+        &tool_context.turn_id,
         messages,
         tool_result_phase,
         session_revision,
@@ -1004,6 +1008,7 @@ async fn persist_tool_call_assistant_message(
     chat_id: i64,
     agent_id: &str,
     assistant_message_id: &str,
+    turn_id: &str,
     assistant_phase: &AssistantToolPhase,
     mut messages: Vec<Message>,
     session_revision: Option<i64>,
@@ -1016,6 +1021,7 @@ async fn persist_tool_call_assistant_message(
         scope,
         StoredMessage {
             id: assistant_message_id.to_string(),
+            turn_id: Some(turn_id.to_string()),
             ..StoredMessage::assistant(
                 chat_id,
                 agent_id.to_string(),
@@ -1029,11 +1035,14 @@ async fn persist_tool_call_assistant_message(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_tool_result_messages(
     state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     agent_id: &str,
+    assistant_message_id: &str,
+    turn_id: &str,
     messages: Vec<Message>,
     tool_result_phase: ToolResultPhase,
     session_revision: Option<i64>,
@@ -1051,7 +1060,10 @@ async fn persist_tool_result_messages(
 
     let mut messages_with_tools = messages;
     messages_with_tools.extend(tool_messages.iter().cloned());
-    let tool_summary = StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
+    let mut tool_summary =
+        StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
+    tool_summary.turn_id = Some(turn_id.to_string());
+    tool_summary.parent_message_id = Some(assistant_message_id.to_string());
     persist_phase_messages(
         state,
         scope,
@@ -1112,6 +1124,7 @@ async fn persist_user_turn_with_compaction(
     state: &TurnRuntime,
     context: &SurfaceContext,
     chat_id: i64,
+    turn_id: &str,
     input_message_id: &str,
     user_message: &Message,
     user_input: &str,
@@ -1132,6 +1145,7 @@ async fn persist_user_turn_with_compaction(
         user_input.to_string(),
     );
     stored_message.id = input_message_id.to_string();
+    stored_message.turn_id = Some(turn_id.to_string());
 
     for attempt in 0..2 {
         let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
@@ -1149,12 +1163,13 @@ async fn persist_user_turn_with_compaction(
         )
         .await?;
 
-        let persist_result = persist_phase_once(
+        let persist_result = crate::agent_loop::session::commit_user_turn_input(
             state,
             context.scope,
             stored_message.clone(),
             &candidate_messages,
             loaded.session_revision,
+            turn_id,
         )
         .await;
         let persisted = match persist_result {
@@ -3314,6 +3329,123 @@ mod tests {
         .expect("count user messages")
     }
 
+    /// A persisted message row's Turn-linkage fields, in `seq` order.
+    struct MessageLink {
+        id: String,
+        turn_id: Option<String>,
+        parent_message_id: Option<String>,
+    }
+
+    fn message_turn_links(state: &AppState, chat_id: i64) -> Vec<MessageLink> {
+        let conn = state.db.get_conn().expect("conn");
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, id, turn_id, parent_message_id FROM messages
+                 WHERE chat_id = ?1 ORDER BY seq",
+            )
+            .expect("prepare");
+        stmt.query_map(rusqlite::params![chat_id], |row| {
+            Ok(MessageLink {
+                id: row.get(1)?,
+                turn_id: row.get(2)?,
+                parent_message_id: row.get(3)?,
+            })
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_stamps_turn_id_on_all_persisted_messages() {
+        // Arrange: a Turn that runs one tool call, then finalizes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/turnid.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "checking".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-turnid".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("dir");
+        std::fs::write(&note_path, "content").expect("file");
+        let context = context_with_request_key("turn-id-links", "cli:turnid:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "read the note")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "done");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:turn-id-links:agent:default",
+                Some("turn-id-links"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        // Assert: every persisted message carries the owning Turn id. The Tool
+        // Result message also references the issuing assistant message as its
+        // parent.
+        let turn_id: String = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT turn_id FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("turn_id");
+        let rows = message_turn_links(&state, chat_id);
+        assert!(!rows.is_empty(), "turn must persist messages");
+        for link in &rows {
+            assert_eq!(
+                link.turn_id.as_deref(),
+                Some(turn_id.as_str()),
+                "every message must carry the owning turn_id"
+            );
+        }
+        // The Tool Result message is the one with a parent_message_id, and it
+        // points at the Tool Call assistant message.
+        let parents: Vec<String> = rows
+            .iter()
+            .filter_map(|link| link.parent_message_id.clone())
+            .collect();
+        assert_eq!(parents.len(), 1, "exactly the Tool Result carries a parent");
+        assert!(
+            rows.iter().any(|link| link.id == parents[0]),
+            "parent_message_id must reference a persisted assistant message"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn same_request_key_accepts_one_turn_and_one_user_message() {
@@ -3402,6 +3534,154 @@ mod tests {
             1,
             "completed turn re-acceptance must not call the LLM"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_in_progress_request_returns_terminal_event_and_response() {
+        // Arrange: seed a non-terminal turn_runs row so the re-accept resolves
+        // to InProgress (another executor owns it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(vec![], vec![]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let session = "dup-inprogress";
+        let request_key = "cli:dup-ip:1";
+        let context = context_with_request_key(session, request_key);
+        let chat_id = call_blocking(Arc::clone(&state.db), {
+            let session = session.to_string();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    "cli",
+                    &format!("cli:{session}:agent:default"),
+                    Some(&session),
+                    "cli",
+                    "default",
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+        let payload_hash = super::payload_hash("hello");
+        {
+            let conn = state.db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO turn_runs
+                     (turn_id, chat_id, request_key, state, config_revision,
+                      config_fingerprint, request_payload_hash, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'model_pending', 1, 'fp', ?4, 't', 't')",
+                rusqlite::params![
+                    &format!("seed-{session}"),
+                    chat_id,
+                    request_key,
+                    &payload_hash
+                ],
+            )
+            .expect("seed turn_runs");
+        }
+
+        // Act: a duplicate request for the in-progress Turn must terminate.
+        let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&collected);
+        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
+            collector.lock().expect("collector").push(ev);
+        })
+        .await
+        .expect("turn");
+
+        // Assert: a non-empty terminal message is returned and a FinalResponse
+        // event is emitted (Web publishes its `done` event from this), and the
+        // owning executor's LLM is never invoked.
+        assert!(
+            !reply.is_empty(),
+            "in-progress duplicate must return a terminal message"
+        );
+        let events = collected.lock().expect("collector");
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                AgentEvent::FinalResponse { text } if text == &reply
+            )),
+            "in-progress duplicate must emit a matching FinalResponse event"
+        );
+        assert!(
+            provider.seen_messages().is_empty(),
+            "duplicate request must not invoke the LLM"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn terminated_turn_re_acceptance_returns_terminal_event_and_response() {
+        // Arrange: seed a terminal (uncertain) turn_runs row so the re-accept
+        // resolves to Terminated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(vec![], vec![]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let session = "dup-terminated";
+        let request_key = "cli:dup-term:1";
+        let context = context_with_request_key(session, request_key);
+        let chat_id = call_blocking(Arc::clone(&state.db), {
+            let session = session.to_string();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    "cli",
+                    &format!("cli:{session}:agent:default"),
+                    Some(&session),
+                    "cli",
+                    "default",
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+        let payload_hash = super::payload_hash("hello");
+        {
+            let conn = state.db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO turn_runs
+                     (turn_id, chat_id, request_key, state, config_revision,
+                      config_fingerprint, request_payload_hash, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'uncertain', 1, 'fp', ?4, 't', 't')",
+                rusqlite::params![
+                    &format!("seed-{session}"),
+                    chat_id,
+                    request_key,
+                    &payload_hash
+                ],
+            )
+            .expect("seed turn_runs");
+        }
+
+        // Act
+        let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&collected);
+        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
+            collector.lock().expect("collector").push(ev);
+        })
+        .await
+        .expect("turn");
+
+        // Assert: a non-empty terminal message is returned and a FinalResponse
+        // event is emitted, with no LLM call.
+        assert!(
+            !reply.is_empty(),
+            "terminated re-acceptance must return a terminal message"
+        );
+        let events = collected.lock().expect("collector");
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                AgentEvent::FinalResponse { text } if text == &reply
+            )),
+            "terminated re-acceptance must emit a matching FinalResponse event"
+        );
+        assert!(provider.seen_messages().is_empty());
     }
 
     #[tokio::test]
