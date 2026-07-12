@@ -14,6 +14,7 @@
 use std::fmt;
 
 use rusqlite::OptionalExtension;
+use rusqlite::TransactionBehavior;
 use rusqlite::params;
 
 use crate::error::StorageError;
@@ -136,6 +137,42 @@ impl<'a> ConversationStore<'a> {
         // advance seq or revision — that would create a gap and a spurious
         // CAS conflict for the next writer.
         if inserted == 0 {
+            // Idempotent re-commit: the message row already exists (e.g. a Turn
+            // whose deterministic message id is re-persisted on recovery).
+            // Verify the stored row matches the incoming one — content,
+            // sender, and message kind must agree. A mismatch means the same
+            // id was reused for a different message and is rejected.
+            let (stored_content, stored_sender, stored_kind, stored_turn, stored_parent): (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = tx.query_row(
+                "SELECT content, sender_id, message_kind, turn_id, parent_message_id
+                 FROM messages WHERE id = ?1 AND chat_id = ?2",
+                params![&message.id, message.chat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            if stored_content != message.content
+                || stored_sender != message.sender_id
+                || stored_kind != message.message_kind.to_string()
+                || stored_turn.as_deref() != message.turn_id.as_deref()
+                || stored_parent.as_deref() != message.parent_message_id.as_deref()
+            {
+                return Err(StorageError::Conflict(format!(
+                    "message id collision: {} already exists with different content",
+                    message.id
+                )));
+            }
             return Ok(CommitOutcome {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 revision: current_revision,
@@ -181,7 +218,7 @@ impl<'a> ConversationStore<'a> {
         expected_revision: Option<i64>,
     ) -> Result<CommitOutcome, StorageError> {
         let mut conn = self.db.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let outcome = Self::commit_message_locked(&tx, message, session_json, expected_revision)?;
         tx.commit()?;
         Ok(outcome)
@@ -213,7 +250,7 @@ impl<'a> ConversationStore<'a> {
         expected_revision: Option<i64>,
     ) -> Result<CommitOutcome, StorageError> {
         let mut conn = self.db.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::ensure_chat_row(&tx, chat_id)?;
 
         let (current_revision, max_seq): (i64, Option<i64>) = tx.query_row(
