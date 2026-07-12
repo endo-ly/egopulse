@@ -14,22 +14,27 @@ env:
   CARGO_TERM_COLOR: always
   HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
+# Release workflows must run sequentially because release tags are allocated
+# from the highest existing release serial.
 concurrency:
   group: release-main
-  # Do not cancel an in-flight release; a second push will wait or skip via the
-  # tag collision checks rather than racing the publish step.
   cancel-in-progress: false
+  queue: max
 
 jobs:
   compute-version:
     name: Compute Release Version
+
     # Only release commits whose CI run actually succeeded.
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+
     runs-on: ubuntu-latest
+
     outputs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
       release_version: ${{ steps.version.outputs.version }}
       head_sha: ${{ steps.sha.outputs.head_sha }}
+
     steps:
       - name: Resolve CI head SHA
         id: sha
@@ -49,20 +54,50 @@ jobs:
 
       - name: Compute candidate tag
         id: tag
+        shell: bash
         run: |
-          # Derive the date from the commit itself (not the wall clock) so the
-          # candidate is stable across reruns of this release run for the same
-          # SHA. The run number disambiguates same-day releases.
-          COMMIT_DATE=$(git show -s --format=%cd --date=format:'%Y%m%d' "${HEAD_SHA}")
-          RUN=${{ github.run_number }}
-          RELEASE_TAG="${COMMIT_DATE}.${RUN}"
+          set -euo pipefail
+
+          COMMIT_DATE=$(
+            git show -s \
+              --format=%cd \
+              --date=format:'%Y%m%d' \
+              "${HEAD_SHA}"
+          )
+
+          # Reuse an existing release tag for the same commit.
+          EXISTING_TAG=$(
+            git tag --points-at "${HEAD_SHA}" |
+              sed -nE '/^[0-9]{8}\.[0-9]+$/p' |
+              sort -V |
+              tail -n 1
+          )
+
+          if [ -n "${EXISTING_TAG}" ]; then
+            RELEASE_TAG="${EXISTING_TAG}"
+            echo "Reusing release tag ${RELEASE_TAG} for ${HEAD_SHA}"
+          else
+            # N in YYYYMMDD.N is a repository-wide release serial.
+            MAX_NUMBER=$(
+              git tag -l |
+                sed -nE 's/^[0-9]{8}\.([0-9]+)$/\1/p' |
+                sort -n |
+                tail -n 1
+            )
+
+            NEXT_NUMBER=$((10#${MAX_NUMBER:-0} + 1))
+            RELEASE_TAG="${COMMIT_DATE}.${NEXT_NUMBER}"
+
+            echo "Allocated release tag ${RELEASE_TAG} for ${HEAD_SHA}"
+          fi
+
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "Candidate release tag: ${RELEASE_TAG} (not created yet)"
 
   build-web:
     name: Build Web Assets
     needs: [compute-version]
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout CI SHA
         uses: actions/checkout@v4
@@ -73,7 +108,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -95,6 +130,7 @@ jobs:
     name: Build ${{ matrix.target.label }}
     runs-on: ${{ matrix.target.os }}
     needs: [compute-version, build-web]
+
     strategy:
       fail-fast: false
       matrix:
@@ -104,19 +140,18 @@ jobs:
             bin: egopulse
             target_triple: x86_64-unknown-linux-gnu
             asset_triple: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
+
           - label: linux-arm64
             os: ubuntu-24.04-arm
             bin: egopulse
             target_triple: aarch64-unknown-linux-gnu
             asset_triple: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
+
           - label: macos-arm64
             os: macos-14
             bin: egopulse
             target_triple: aarch64-apple-darwin
             asset_triple: aarch64-apple-darwin
-            archive_ext: tar.gz
 
     steps:
       - name: Checkout CI SHA
@@ -151,8 +186,10 @@ jobs:
           RELEASE_VERSION: ${{ needs.compute-version.outputs.release_version }}
         run: |
           ASSET_NAME="egopulse-${RELEASE_VERSION}-${{ matrix.target.asset_triple }}.tar.gz"
-          tar -czf "$ASSET_NAME" -C target/release "${{ matrix.target.bin }}"
-          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          tar -czf "${ASSET_NAME}" \
+            -C target/release \
+            "${{ matrix.target.bin }}"
+          echo "ASSET_NAME=${ASSET_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -165,8 +202,10 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [compute-version, build-assets]
+
     permissions:
       contents: write
+
     env:
       RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
       HEAD_SHA: ${{ needs.compute-version.outputs.head_sha }}
@@ -177,6 +216,7 @@ jobs:
         with:
           ref: ${{ env.HEAD_SHA }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -196,21 +236,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           git fetch --tags origin
 
-          # If the candidate tag already exists, it must point at the same SHA.
-          # We never move an existing tag to a different commit.
-          EXISTING_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null || echo "")
-          if [ -n "${EXISTING_SHA}" ]; then
+          if EXISTING_SHA=$(
+            git rev-parse \
+              --verify \
+              "refs/tags/${RELEASE_TAG}^{commit}" \
+              2>/dev/null
+          ); then
             if [ "${EXISTING_SHA}" = "${HEAD_SHA}" ]; then
-              echo "Tag ${RELEASE_TAG} already exists at ${HEAD_SHA}; reusing (rerun-safe)"
+              echo "Tag ${RELEASE_TAG} already exists at ${HEAD_SHA}; reusing"
             else
-              echo "Tag ${RELEASE_TAG} exists at ${EXISTING_SHA}; refusing to move it to ${HEAD_SHA}" >&2
+              echo "::error::Tag ${RELEASE_TAG} points at ${EXISTING_SHA}, expected ${HEAD_SHA}"
               exit 1
             fi
           else
-            git tag "${RELEASE_TAG}" "${HEAD_SHA}"
-            git push origin "${RELEASE_TAG}"
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${RELEASE_TAG}" \
+              -f "sha=${HEAD_SHA}" \
+              >/dev/null
+
             echo "Created tag ${RELEASE_TAG} at ${HEAD_SHA}"
           fi
 
@@ -219,18 +267,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Idempotent: if the release already exists (e.g. a previous run
-          # created the tag and release but failed uploading assets), upload
-          # the artifacts again instead of creating a duplicate release.
-          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+
+          if gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+
             echo "Release ${RELEASE_TAG} already exists; uploading assets"
-            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-              dist/*.tar.gz dist/SHA256SUMS.txt --clobber
+
+            gh release upload "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              dist/*.tar.gz \
+              dist/SHA256SUMS.txt \
+              --clobber
           else
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              -t "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
               --generate-notes \
               --target "${HEAD_SHA}" \
-              dist/*.tar.gz dist/SHA256SUMS.txt
+              dist/*.tar.gz \
+              dist/SHA256SUMS.txt
           fi
