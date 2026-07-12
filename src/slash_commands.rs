@@ -233,12 +233,14 @@ async fn handle_compact(
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
+    let config = state.current_config();
     match force_compact(
         &state.turn_runtime(),
         context,
         chat_id,
         &loaded.messages,
         &llm,
+        &config,
     )
     .await
     {

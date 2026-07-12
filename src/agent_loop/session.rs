@@ -100,6 +100,22 @@ pub(crate) async fn load_messages_for_turn(
     snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
 }
 
+/// Like [`load_messages_for_turn`], but uses an explicit `max_history_messages`
+/// so the Turn can stick to the Config generation it started with.
+pub(crate) async fn load_messages_for_turn_with_limit(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    chat_id: i64,
+    max_history_messages: usize,
+) -> Result<LoadedSession, EgoPulseError> {
+    let snapshot = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.load_session_snapshot(chat_id, max_history_messages)
+    })
+    .await?;
+
+    snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
+}
+
 pub(crate) async fn persist_phase_once(
     state: &TurnRuntime,
     scope: ConversationScope,

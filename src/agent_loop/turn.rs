@@ -7,10 +7,9 @@ use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::AgentEvent;
 use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
-pub(crate) use crate::agent_loop::prompt_builder::build_system_prompt;
+
 use crate::agent_loop::session::{
-    PersistedTurn, load_messages_for_turn, persist_phase, persist_phase_messages,
-    persist_phase_once, resolve_chat_id,
+    PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once, resolve_chat_id,
 };
 use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
@@ -94,11 +93,19 @@ enum TurnAction {
 
 /// Outcome of idempotent Turn acceptance.
 enum TurnAcceptance {
-    /// A fresh or re-accepted `accepted` Turn that may proceed with execution.
+    /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response
     /// without re-invoking the LLM.
     Completed(String),
+    /// The Turn already exists and is non-terminal — another executor (or a
+    /// prior crash) owns it. The caller must **not** start a second executor;
+    /// it acknowledges the duplicate and returns without side effects.
+    InProgress,
+    /// The Turn already terminated in a non-success state (`failed` /
+    /// `uncertain` / `cancelled`). The caller informs the user but does not
+    /// re-execute (re-running could duplicate side effects).
+    Terminated(TurnRunState),
 }
 
 /// An LLM model-iteration failure paired with whether any external output
@@ -125,6 +132,10 @@ struct PreparedTurn {
     tools_json: Option<String>,
     user_message: Message,
     input_message_id: String,
+    /// Immutable Config snapshot acquired at Turn start. All downstream
+    /// processing must use this snapshot rather than re-reading ConfigManager,
+    /// preventing generation-mixing when config changes mid-flight.
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 }
 
 struct TurnLoopState {
@@ -284,13 +295,27 @@ impl TurnExecutor<'_> {
             // 保存済みの最終結果をそのまま返し、LLM を呼ばない。
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = self.resolve_request_key();
-            let acceptance = self.accept_turn(chat_id, &request_key).await?;
+            let payload_hash = payload_hash(user_input);
+            let acceptance = self.accept_turn(chat_id, &request_key, &payload_hash).await?;
             let turn = match acceptance {
                 TurnAcceptance::Completed(saved) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         text: saved.clone(),
                     });
                     return Ok(saved);
+                }
+                TurnAcceptance::Terminated(state) => {
+                    self.on_event.emit(AgentEvent::FinalResponse {
+                        text: format!(
+                            "このリクエストは以前に処理されましたが、状態が {state} になりました。再度お試しください。"
+                        ),
+                    });
+                    return Ok(String::new());
+                }
+                TurnAcceptance::InProgress => {
+                    // 同一 request_key の Turn は既に別 executor が所有している。
+                    // 二重実行を避けるため、ここで新規 executor を起動しない。
+                    return Ok(String::new());
                 }
                 TurnAcceptance::Proceed(run) => *run,
             };
@@ -351,9 +376,11 @@ impl TurnExecutor<'_> {
         &self,
         chat_id: i64,
         request_key: &str,
+        payload_hash: &str,
     ) -> Result<TurnAcceptance, EgoPulseError> {
         let scope = self.context.scope;
         let request_key = request_key.to_string();
+        let payload_hash = payload_hash.to_string();
         let snapshot = self.state.config_manager.current_blocking();
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
@@ -363,6 +390,7 @@ impl TurnExecutor<'_> {
                 &request_key,
                 config_revision,
                 Some(&config_fingerprint),
+                &payload_hash,
             )
         })
         .await?;
@@ -387,13 +415,8 @@ impl TurnExecutor<'_> {
                     })?;
                     Ok(TurnAcceptance::Completed(content))
                 }
-                TurnRunState::Accepted => Ok(TurnAcceptance::Proceed(Box::new(run))),
-                other if other.is_terminal() => Err(EgoPulseError::Internal(format!(
-                    "turn already terminal: {other}"
-                ))),
-                other => Err(EgoPulseError::Internal(format!(
-                    "turn already in progress: {other}"
-                ))),
+                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(other)),
+                _ => Ok(TurnAcceptance::InProgress),
             },
         }
     }
@@ -493,19 +516,27 @@ impl TurnExecutor<'_> {
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             scope: self.context.scope,
         };
-        let system_prompt = build_system_prompt(self.state, self.context);
-        let channel_llm = self.state.llm_for_context(self.context).inspect_err(|e| {
-            warn!(
-                error_kind = e.error_kind(),
-                error = %e,
-                channel = self.context.channel,
-                "llm_for_context failed"
-            );
-        })?;
+        let config_snapshot = self.state.config_manager.current_blocking();
+        let system_prompt = crate::agent_loop::prompt_builder::build_system_prompt_with_config(
+            self.state,
+            self.context,
+            &config_snapshot.config,
+        );
+        let channel_llm = self
+            .state
+            .llm_for_context_with_snapshot(self.context, &config_snapshot)
+            .inspect_err(|e| {
+                warn!(
+                    error_kind = e.error_kind(),
+                    error = %e,
+                    channel = self.context.channel,
+                    "llm_for_context failed"
+                );
+            })?;
 
         let timestamp_line = format!(
             "[Current time: {}]\n",
-            format_current_time(&self.state.current_config().timezone)
+            format_current_time(&config_snapshot.config.timezone)
         );
         let user_message = Message::text("user", format!("{timestamp_line}{user_input}"));
 
@@ -513,7 +544,7 @@ impl TurnExecutor<'_> {
         let tools_json = serde_json::to_string(&tool_defs).ok();
 
         // Deterministic input message id so a re-acceptance of the same Turn
-        // never creates a duplicate user message (INSERT OR REPLACE is a no-op
+        // never creates a duplicate user message (INSERT OR IGNORE is a no-op
         // when the row already exists with identical content).
         let input_message_id = format!("turn:{turn_id}:input");
 
@@ -527,6 +558,7 @@ impl TurnExecutor<'_> {
             tools_json,
             user_message,
             input_message_id,
+            config_snapshot,
         })
     }
 
@@ -545,6 +577,7 @@ impl TurnExecutor<'_> {
             user_input,
             &prepared.channel_llm,
             prompt_ctx,
+            &prepared.config_snapshot.config,
         )
         .await
     }
@@ -604,6 +637,7 @@ impl TurnExecutor<'_> {
                 &loop_state.messages,
                 &prepared.channel_llm,
                 prompt_ctx,
+                &prepared.config_snapshot.config,
             )
             .await
             {
@@ -1071,8 +1105,15 @@ async fn persist_user_turn_with_compaction(
     user_input: &str,
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
+    config: &crate::config::Config,
 ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
-    let mut loaded = load_messages_for_turn(state, context.scope, chat_id).await?;
+    let mut loaded = crate::agent_loop::session::load_messages_for_turn_with_limit(
+        state,
+        context.scope,
+        chat_id,
+        config.max_history_messages,
+    )
+    .await?;
     let mut stored_message = StoredMessage::user(
         chat_id,
         context.surface_user.clone(),
@@ -1092,6 +1133,7 @@ async fn persist_user_turn_with_compaction(
             &candidate_messages,
             llm,
             prompt_ctx,
+            config,
         )
         .await?;
 
@@ -1106,9 +1148,15 @@ async fn persist_user_turn_with_compaction(
         let persisted = match persist_result {
             Ok(persisted) => persisted,
             Err(error) => {
-                loaded =
-                    handle_user_turn_persist_error(state, context.scope, chat_id, attempt, error)
-                        .await?;
+                loaded = handle_user_turn_persist_error(
+                    state,
+                    context.scope,
+                    chat_id,
+                    attempt,
+                    error,
+                    config.max_history_messages,
+                )
+                .await?;
                 continue;
             }
         };
@@ -1127,9 +1175,18 @@ async fn handle_user_turn_persist_error(
     chat_id: i64,
     attempt: usize,
     error: EgoPulseError,
+    max_history_messages: usize,
 ) -> Result<crate::agent_loop::session::LoadedSession, EgoPulseError> {
     match persist_phase_conflict_outcome(attempt, error) {
-        PersistConflictOutcome::Reload => load_messages_for_turn(state, scope, chat_id).await,
+        PersistConflictOutcome::Reload => {
+            crate::agent_loop::session::load_messages_for_turn_with_limit(
+                state,
+                scope,
+                chat_id,
+                max_history_messages,
+            )
+            .await
+        }
         PersistConflictOutcome::Return(error) => Err(error),
     }
 }
@@ -1281,6 +1338,16 @@ async fn send_model_request_with_retry(
 /// conversation messages, and tool definitions. Stored as
 /// `turn_runs.model_request_hash` so a retry or recovery can verify the same
 /// request is being re-sent.
+/// SHA-256 of the raw user input text. Anchors `turn_runs.request_payload_hash`
+/// so a re-delivery under the same `request_key` is rejected when the message
+/// content differs.
+fn payload_hash(user_input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(user_input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn model_request_hash(
     system_prompt: &str,
     messages: &[Message],

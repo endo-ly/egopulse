@@ -89,20 +89,23 @@ impl TurnRuntime {
         }
     }
 
-    /// Returns the LLM provider resolved for the agent and channel in the
-    /// given context, honouring `llm_override` if present.
-    pub(crate) fn llm_for_context(
+    /// Returns the LLM provider using the provided immutable Config snapshot.
+    ///
+    /// Callers inside a Turn should use this so the entire Turn runs against a
+    /// single fixed Config generation.
+    pub(crate) fn llm_for_context_with_snapshot(
         &self,
         context: &crate::agent_loop::SurfaceContext,
+        snapshot: &crate::config::manager::ConfigSnapshot,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
         if let Some(provider) = self.llm_override.clone() {
             return Ok(provider);
         }
 
-        let snapshot = self.config_manager.current_blocking();
-        let config = &snapshot.config;
         let agent_id = crate::config::AgentId::new(&context.agent_id);
-        let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
+        let resolved = snapshot
+            .config
+            .resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
         self.cached_provider(&resolved, snapshot.revision)
     }
 

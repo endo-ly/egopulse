@@ -5,6 +5,19 @@ use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
 const CORE_INSTRUCTIONS: &str = include_str!("prompts/core_instructions.md");
 
 pub(crate) fn build_system_prompt(state: &TurnRuntime, context: &SurfaceContext) -> String {
+    let config = state.current_config();
+    build_system_prompt_with_config(state, context, &config)
+}
+
+/// Builds the system prompt using the provided immutable Config snapshot.
+///
+/// Callers inside a Turn should use this so the entire Turn runs against a
+/// single fixed Config generation.
+pub(crate) fn build_system_prompt_with_config(
+    state: &TurnRuntime,
+    context: &SurfaceContext,
+    config: &crate::config::Config,
+) -> String {
     let channel = &context.channel;
     let thread = &context.surface_thread;
 
@@ -14,7 +27,7 @@ pub(crate) fn build_system_prompt(state: &TurnRuntime, context: &SurfaceContext)
         prompt.push_str("\n\n");
     }
 
-    if let Some(instr) = build_model_instructions_section(state, context) {
+    if let Some(instr) = build_model_instructions_section(state, context, config) {
         prompt.push_str(&instr);
         prompt.push_str("\n\n");
     }
@@ -63,8 +76,8 @@ fn build_soul_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> O
 fn build_model_instructions_section(
     state: &TurnRuntime,
     context: &SurfaceContext,
+    config: &crate::config::Config,
 ) -> Option<String> {
-    let config = state.current_config();
     let agent_id = crate::config::AgentId::new(&context.agent_id);
     let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
         Ok(r) => r,

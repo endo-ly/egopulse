@@ -52,9 +52,9 @@ pub(crate) async fn maybe_compact_messages(
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
+    config: &crate::config::Config,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let provider_id = crate::config::ProviderId::new(llm.provider_name());
-    let config = state.current_config();
     let context_window = config.resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
     let raw_estimate =
@@ -86,6 +86,7 @@ pub(crate) async fn maybe_compact_messages(
             usable,
             target_ratio: config.compaction_target_ratio,
             calibration_factor: factor,
+            config,
         },
     )
     .await
@@ -97,13 +98,13 @@ pub(crate) async fn force_compact(
     chat_id: i64,
     messages: &[Message],
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
+    config: &crate::config::Config,
 ) -> Result<Vec<Message>, EgoPulseError> {
     if messages.is_empty() {
         return Ok(Vec::new());
     }
 
     let provider_id = crate::config::ProviderId::new(llm.provider_name());
-    let config = state.current_config();
     let context_window = config.resolve_context_window_tokens(&provider_id, llm.model_name());
     let usable = usable_context_tokens(context_window);
 
@@ -122,6 +123,7 @@ pub(crate) async fn force_compact(
             usable,
             target_ratio: config.compaction_target_ratio,
             calibration_factor: factor,
+            config,
         },
     )
     .await
@@ -217,6 +219,7 @@ struct SafetyCompactInput<'a> {
     usable: usize,
     target_ratio: f64,
     calibration_factor: f64,
+    config: &'a crate::config::Config,
 }
 
 enum SummarizeOutcome {
@@ -228,9 +231,16 @@ async fn safety_compact(
     state: &TurnRuntime,
     input: SafetyCompactInput<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
-    archive_current_conversation(state, input.context, input.chat_id, input.messages).await;
+    archive_current_conversation(
+        state,
+        input.context,
+        input.chat_id,
+        input.messages,
+        input.config,
+    )
+    .await;
 
-    let config = state.current_config();
+    let config = input.config;
     let Some(slices) = select_compaction_slices(input.messages, config.compact_keep_recent) else {
         return Ok(input.messages.to_vec());
     };
@@ -243,6 +253,7 @@ async fn safety_compact(
         input.llm,
         input.usable,
         input.target_ratio,
+        input.config,
     )
     .await
     {
@@ -271,9 +282,9 @@ async fn archive_current_conversation(
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
+    config: &crate::config::Config,
 ) {
-    let config = state.current_config();
-    let secrets = crate::tools::collect_config_secrets(&config);
+    let secrets = crate::tools::collect_config_secrets(config);
     let storage = state.storage_for(context.scope);
     archive_conversation(
         &storage.archive_root,
@@ -301,6 +312,7 @@ fn select_compaction_slices(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn summarize_old_messages(
     state: &TurnRuntime,
     context: &SurfaceContext,
@@ -309,10 +321,10 @@ async fn summarize_old_messages(
     llm: &std::sync::Arc<dyn LlmProvider>,
     usable_context: usize,
     target_ratio: f64,
+    config: &crate::config::Config,
 ) -> SummarizeOutcome {
-    let config = state.current_config();
     let mut summary_input = build_summary_input(old_messages, usable_context, target_ratio);
-    summary_input = redact_summary_text(&summary_input, state);
+    summary_input = redact_summary_text(&summary_input, config);
     let timeout_secs = config.compaction_timeout_secs;
     let summary_messages = Arc::new(vec![Message::text("user", summary_input)]);
     let raw_estimate = estimate_prompt_tokens(SUMMARIZER_SYSTEM_PROMPT, &summary_messages, None);
@@ -352,7 +364,7 @@ async fn summarize_old_messages(
         return SummarizeOutcome::KeepOriginal;
     }
 
-    SummarizeOutcome::Summary(redact_summary_text(&summary, state))
+    SummarizeOutcome::Summary(redact_summary_text(&summary, config))
 }
 
 enum SummarizeError {
@@ -567,9 +579,8 @@ fn lighten_message(message: &Message) -> String {
     }
 }
 
-fn redact_summary_text(text: &str, state: &TurnRuntime) -> String {
-    let config = state.current_config();
-    let secrets = crate::tools::collect_config_secrets(&config);
+fn redact_summary_text(text: &str, config: &crate::config::Config) -> String {
+    let secrets = crate::tools::collect_config_secrets(config);
     crate::tools::sanitize_output_string(text, &secrets)
 }
 
@@ -1277,9 +1288,16 @@ mod tests {
             Message::text("user", "msg-2"),
         ];
 
-        let result = force_compact(&state.turn_runtime(), &context, 1, &messages, &llm)
-            .await
-            .expect("force_compact");
+        let result = force_compact(
+            &state.turn_runtime(),
+            &context,
+            1,
+            &messages,
+            &llm,
+            &state.config,
+        )
+        .await
+        .expect("force_compact");
 
         assert_eq!(provider.seen_systems().len(), 1);
         assert_eq!(provider.seen_systems()[0], SUMMARIZER_SYSTEM_PROMPT);
@@ -1318,9 +1336,16 @@ mod tests {
             Message::text("user", "kept-c"),
         ];
 
-        let result = force_compact(&state.turn_runtime(), &context, 1, &messages, &llm)
-            .await
-            .expect("force_compact");
+        let result = force_compact(
+            &state.turn_runtime(),
+            &context,
+            1,
+            &messages,
+            &llm,
+            &state.config,
+        )
+        .await
+        .expect("force_compact");
 
         let text: Vec<String> = result.iter().map(|m| m.content.as_text_lossy()).collect();
         assert!(text.iter().any(|t| t.contains("kept-b")));
@@ -1351,9 +1376,16 @@ mod tests {
             Message::text("assistant", "reply-1"),
         ];
 
-        force_compact(&state.turn_runtime(), &context, chat_id, &messages, &llm)
-            .await
-            .expect("force_compact");
+        force_compact(
+            &state.turn_runtime(),
+            &context,
+            chat_id,
+            &messages,
+            &llm,
+            &state.config,
+        )
+        .await
+        .expect("force_compact");
 
         let archive_dir = dir
             .path()
@@ -1400,9 +1432,16 @@ mod tests {
             Message::text("assistant", "secret-reply-1"),
         ];
 
-        force_compact(&state.turn_runtime(), &context, chat_id, &messages, &llm)
-            .await
-            .expect("force_compact");
+        force_compact(
+            &state.turn_runtime(),
+            &context,
+            chat_id,
+            &messages,
+            &llm,
+            &state.config,
+        )
+        .await
+        .expect("force_compact");
 
         let secret_archive_dir = dir
             .path()
@@ -1460,9 +1499,16 @@ mod tests {
             Message::text("assistant", "normal-reply-1"),
         ];
 
-        force_compact(&state.turn_runtime(), &context, chat_id, &messages, &llm)
-            .await
-            .expect("force_compact");
+        force_compact(
+            &state.turn_runtime(),
+            &context,
+            chat_id,
+            &messages,
+            &llm,
+            &state.config,
+        )
+        .await
+        .expect("force_compact");
 
         let normal_archive_dir = dir
             .path()
@@ -1616,6 +1662,7 @@ mod tests {
                 tools_json: None,
                 has_tools: false,
             },
+            &state.config,
         )
         .await
         .expect("compaction");
