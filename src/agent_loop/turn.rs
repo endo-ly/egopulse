@@ -37,7 +37,7 @@ const CHANNEL_CONTEXT_LIMIT: usize = 30;
 
 /// Maximum number of attempts for a single LLM model iteration before the
 /// error surfaces. Retries are confined to the same iteration and only fire
-/// while no output has been published (Plan §7.4).
+/// while no output has been published.
 pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// Base backoff (milliseconds) for exponential LLM retry. Doubled per attempt.
 const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
@@ -1183,7 +1183,7 @@ enum PersistConflictOutcome {
 /// Before the call, the Turn is advanced to `model_pending` and the fixed
 /// `model_request_hash` is stamped so a later retry or recovery can prove the
 /// same payload is being re-sent. Retry is permitted only when **all** of the
-/// following hold (Plan §7.4):
+/// following hold:
 ///
 /// * the error is transient ([`LlmError::is_retryable`]): 429 / 5xx / network,
 /// * no delta has been published for this iteration (the `on_delta` callback
@@ -3143,7 +3143,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Package 4: durable Turn state and safe retry
+    // Durable Turn state and safe retry
     // -----------------------------------------------------------------------
 
     fn context_with_request_key(session: &str, request_key: &str) -> SurfaceContext {

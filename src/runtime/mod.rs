@@ -391,9 +391,9 @@ pub async fn build_app_state_with_path(
     });
     state.warm_up_calibrator().await;
 
-    // Phase 2: recover durable Turn / Tool state left non-terminal by a prior
-    // crash. Running Tools become uncertain (or pending for read-only /
-    // idempotent), and interrupted turn_runs stop safely (Plan §7.6, §2.4).
+    // Recover durable Turn / Tool state left non-terminal by a prior crash.
+    // Running Tools become uncertain (or pending for read-only / idempotent),
+    // and interrupted turn_runs stop safely.
     recover_durable_state(&state).await;
 
     spawn_agent_turn_worker(state.clone(), turn_receiver);
@@ -512,29 +512,6 @@ fn build_app_state_dependencies(
         &config.db_path(),
         &backup_settings,
     )?);
-
-    // Phase 2 Package 3: recover Tool executions interrupted by a crash before
-    // any new Turn claims a slot. A `running` row means the process died
-    // mid-execution; its result cannot be verified, so it is moved to
-    // `uncertain` (or `pending` for read-only / idempotent Tools that are safe
-    // to retry on the next claim).
-    let recovered = db.tool_execution_store().recover_running()?;
-    if !recovered.is_empty() {
-        tracing::warn!(
-            recovered_count = recovered.len(),
-            "recovering interrupted tool executions"
-        );
-        for tool in &recovered {
-            tracing::warn!(
-                turn_id = %tool.turn_id,
-                tool_call_id = %tool.tool_call_id,
-                tool_name = %tool.tool_name,
-                recovered_to = %tool.recovered_to,
-                idempotency_class = %tool.idempotency_class,
-                "recovered interrupted tool call"
-            );
-        }
-    }
 
     let secret_db = if config.needs_secret_db() {
         Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
@@ -1499,7 +1476,7 @@ mod tests {
         // Act
         let result = execute_turn_with_progress(&state, &context, "hello").await;
 
-        // Assert: Package 4 retries the same model iteration up to
+        // Assert: the same model iteration is retried up to
         // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
         // single Turn with a single persisted input.
         assert!(result.is_err(), "retryable failure must reach the caller");

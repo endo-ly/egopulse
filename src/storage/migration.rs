@@ -824,9 +824,8 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                AND messages.seq IS NULL",
         )?;
 
-        // Causal order uniqueness for assigned seqs. NULL seqs (messages
-        // written by legacy paths until WP2 routes them through the store) are
-        // excluded so they never collide.
+        // Causal order uniqueness for assigned seqs. NULL seqs (unassigned
+        // legacy messages) are excluded so they never collide.
         tx.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_seq
                 ON messages(chat_id, seq)
@@ -1006,7 +1005,7 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
     if version < 3 {
         let tx = conn.unchecked_transaction()?;
 
-        // Mirror the Phase 2 conversation + turn extensions on the secret DB.
+        // Mirror the conversation + turn extensions on the secret DB.
         // tool_calls is absent from the secret DB (secret mode skips tool
         // persistence), so only the chat/message/session columns and turn_runs
         // are added here.

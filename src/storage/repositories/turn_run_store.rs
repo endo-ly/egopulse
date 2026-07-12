@@ -1,8 +1,7 @@
 //! `TurnRepository`: the single authoritative boundary for `turn_runs`
 //! persistence and the Turn state machine.
 //!
-//! Phase 2 Package 4 (Work Package 3 — Durable Turn State and Safe Retry)
-//! persists every Turn's lifecycle into the `turn_runs` table so that:
+//! Every Turn's lifecycle is persisted into the `turn_runs` table so that:
 //!
 //! * the same `chat_id + request_key` is accepted exactly once (idempotent
 //!   ingress),
@@ -15,10 +14,10 @@
 //! * interrupted Turns are recovered to a safe stop (`uncertain`/`failed`)
 //!   on startup rather than auto-resumed.
 //!
-//! Config revision / fingerprint are stored as given by the caller. Package 4
-//! stores `revision = 0` and `fingerprint = NULL` (the immutable ConfigManager
-//! snapshot is Package 5); recovery treats a `NULL` fingerprint as "cannot
-//! verify config integrity" and conservatively stops.
+//! Config revision / fingerprint are stored as given by the caller. A `NULL`
+//! `config_fingerprint` means the Config identity was not captured at
+//! acceptance time; recovery treats it as "cannot verify config integrity"
+//! and conservatively stops.
 //!
 //! The repository borrows the owning [`Database`] for its lifetime; construct
 //! one via [`Database::turn_run_store`].
@@ -93,8 +92,9 @@ impl<'a> TurnRepository<'a> {
     /// reuses / resumes / refuses based on the persisted state.
     ///
     /// `config_revision` / `config_fingerprint` are fixed at acceptance so a
-    /// later recovery can detect a Config generation mismatch. Package 4
-    /// supplies `0` / `None`; Package 5 populates the real snapshot identity.
+    /// later recovery can detect a Config generation mismatch. A `0` /
+    /// `None` pair is accepted when the Config identity is not yet known at
+    /// acceptance time.
     ///
     /// # Errors
     ///
@@ -184,7 +184,7 @@ impl<'a> TurnRepository<'a> {
     /// Returns [`StorageError::NotFound`] when no row exists, or
     /// [`StorageError::Conflict`] when the current state is not `from` or the
     /// transition is not permitted by [`TurnRunState::can_transition`].
-    pub(crate) fn transition(
+    fn transition(
         &self,
         turn_id: &str,
         from: TurnRunState,
@@ -515,12 +515,12 @@ impl<'a> TurnRepository<'a> {
     ///   gone with the dead process, so the Turn cannot be retried in place.
     /// * `input_committed` / `model_pending` / `model_completed` /
     ///   `tools_pending` / `tools_completed` -> `uncertain`: a mid-flight Turn
-    ///   cannot prove no output was published, and without an immutable Config
-    ///   snapshot (Package 5) the Config generation cannot be verified either.
-    ///   Safe stop takes priority over speculative resume (Plan §2.4).
+    ///   cannot prove no output was published, and the Config generation
+    ///   cannot be verified either. Safe stop takes priority over speculative
+    ///   resume.
     /// * If `current_fingerprint` is provided and differs from the persisted
     ///   `config_fingerprint`, the Turn is always recovered to `uncertain`
-    ///   regardless of state (Plan §9.5).
+    ///   regardless of state.
     /// * Terminal states are left untouched.
     ///
     /// Returns the transitioned rows so the caller can log them. This does
@@ -563,7 +563,7 @@ impl<'a> TurnRepository<'a> {
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
 
-            // Config fingerprint mismatch → always uncertain (Plan §9.5).
+            // Config fingerprint mismatch → always uncertain
             let fingerprint_mismatch = match (&stored_fingerprint, current_fingerprint) {
                 (Some(stored), Some(current)) => stored != current,
                 _ => true,
@@ -1068,7 +1068,7 @@ mod tests {
             .expect("recover");
 
         // Assert: even though the state is accepted, fingerprint mismatch
-        // forces uncertain (Plan §9.5).
+        // forces uncertain
         assert_eq!(recovered.len(), 1);
         assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
     }

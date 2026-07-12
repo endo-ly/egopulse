@@ -1,8 +1,7 @@
 //! ConfigManager: immutable configuration snapshots with revision/fingerprint.
 //!
-//! Package 5 (Work Package 5 — Versioned ConfigManager) introduces:
 //! * `ConfigSnapshot` — an immutable point-in-time view of validated config
-//! * `ConfigManager` — owns the current snapshot and supports atomic swap
+//! * `ConfigManager` — owns the current snapshot
 //! * Fingerprint computed from the config file content (SHA-256)
 //! * Monotonically increasing revision
 //!

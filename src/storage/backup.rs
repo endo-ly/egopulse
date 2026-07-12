@@ -765,7 +765,7 @@ mod tests {
         // Act
         let result = Database::new_with_backup(&db_path, &settings);
 
-        // Assert: Phase 2 requires startup to abort when the pre-migration backup
+        // Startup must abort when the pre-migration backup
         // fails, so an irreversible schema change never runs without a safety net.
         match result {
             Err(error) => assert!(

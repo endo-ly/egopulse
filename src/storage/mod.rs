@@ -291,8 +291,8 @@ define_enum! {
 
 // Tool実行台帳 (`tool_calls.state`) の状態。
 //
-// Phase 2 Package 3: `ToolExecutionRepository` がこの enum と中央遷移ルール
-// を経由してのみ状態を更新する。自由文字列での更新は禁止。
+// `ToolExecutionRepository` がこの enum と中央遷移ルールを経由してのみ
+// 状態を更新する。自由文字列での更新は禁止。
 define_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum ToolState {
@@ -306,9 +306,9 @@ define_enum! {
 
 // Turn実行の永続状態 (`turn_runs.state`)。
 //
-// Phase 2 Package 4: `TurnRepository` が中央遷移ルール
-// (`TurnRunState::can_transition`) を経由してのみ状態を更新する。
-// 自由文字列での更新は禁止し、許可されていない遷移はDB更新前に拒否する。
+// `TurnRepository` が中央遷移ルール (`TurnRunState::can_transition`) を
+// 経由してのみ状態を更新する。自由文字列での更新は禁止し、許可されて
+// いない遷移はDB更新前に拒否する。
 define_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum TurnRunState {
@@ -696,7 +696,7 @@ impl Database {
     ) -> Result<Self, StorageError> {
         prepare_db_path(db_path)?;
         if db_path.exists() && settings.enabled {
-            // Phase 2: a failed pre-migration backup must abort startup before
+            // A failed pre-migration backup must abort startup before
             // any irreversible schema change touches the existing database.
             // Continuing without the safety net would risk unrecoverable data
             // loss on a bad migration.

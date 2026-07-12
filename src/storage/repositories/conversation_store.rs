@@ -1,10 +1,9 @@
 //! `ConversationStore`: the single authoritative boundary for all
 //! `messages` and `sessions` persistence.
 //!
-//! Package 2 (Work Package 2 — ConversationStoreへの書込み集約) moves
-//! every conversation mutation into this store so that per-chat ordering
-//! (`seq`) and optimistic concurrency (`chats.revision`) stay consistent
-//! across the message row and the LLM session snapshot.
+//! Every conversation mutation routes through this store so that per-chat
+//! ordering (`seq`) and optimistic concurrency (`chats.revision`) stay
+//! consistent across the message row and the LLM session snapshot.
 //!
 //! Every method that touches both a message and a session snapshot does so
 //! inside one SQLite transaction. The integer `revision` on `chats` is the

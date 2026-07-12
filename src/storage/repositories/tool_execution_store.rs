@@ -1,10 +1,9 @@
 //! `ToolExecutionRepository`: the single authoritative boundary for Tool
 //! execution state in the `tool_calls` ledger.
 //!
-//! Phase 2 Package 3 (Work Package 4 — Existing Tool Calls as Execution
-//! Ledger) extends the existing `tool_calls` table into a durable execution
-//! ledger without introducing a new table. Every Tool execution must route
-//! through this repository so that:
+//! The existing `tool_calls` table doubles as a durable execution ledger —
+//! no new table is introduced. Every Tool execution must route through this
+//! repository so that:
 //!
 //! * a Tool call is **claimed** (created or re-evaluated) before execution,
 //! * the **input hash** guards against input drift on re-claim,
@@ -82,7 +81,7 @@ impl<'a> ToolExecutionRepository<'a> {
 
     /// Atomically claims a Tool execution slot.
     ///
-    /// Lookup is by `(turn_id, tool_call_id)` — the Phase 2 ledger identity.
+    /// Lookup is by `(turn_id, tool_call_id)` — the durable ledger identity.
     /// * No row → create `pending` with the input hash, then advance to
     ///   `running` and set `started_at`. Returns [`ClaimOutcome::Acquired`].
     /// * Existing row with a **different** input hash →
@@ -277,7 +276,7 @@ impl<'a> ToolExecutionRepository<'a> {
 
     /// Transitions every `running` Tool to a recovery state.
     ///
-    /// The Phase 2 default is `uncertain`: a Tool interrupted mid-execution
+    /// The default recovery outcome is `uncertain`: a Tool interrupted mid-execution
     /// cannot have its result verified, so it must not be auto-retried. The
     /// sole exception is a read-only or idempotent Tool whose stored input
     /// hash and idempotency key make a safe retry possible — these reset to

@@ -1,10 +1,10 @@
 //! Turn execution runtime: narrows [`AppState`] to the fields a [`TurnExecutor`]
 //! actually needs.
 //!
-//! Introduced by Work Package 6 (Plan §10).  All Turn execution paths
-//! (Agent loop, Prompt builder, Compaction, Tool phase, Session persistence)
-//! receive `&TurnRuntime` instead of `&AppState`, eliminating accidental
-//! dependency on scheduling / channel / observability state.
+//! All Turn execution paths (Agent loop, Prompt builder, Compaction, Tool
+//! phase, Session persistence) receive `&TurnRuntime` instead of `&AppState`,
+//! eliminating accidental dependency on scheduling / channel / observability
+//! state.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
