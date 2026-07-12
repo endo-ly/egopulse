@@ -130,9 +130,13 @@ impl ConfigManager {
 mod tests {
     use super::*;
 
+    fn test_config() -> Config {
+        crate::test_util::test_config("/tmp/egopulse-manager-test")
+    }
+
     #[test]
     fn snapshot_stores_revision_and_fingerprint() {
-        let config = Config::load_allow_missing_api_key(None).expect("load default config");
+        let config = test_config();
         let snap = ConfigSnapshot::new(1, config.clone(), None);
         assert_eq!(snap.revision, 1);
         assert!(!snap.fingerprint.is_empty());
@@ -141,7 +145,7 @@ mod tests {
 
     #[test]
     fn same_config_same_fallback_fingerprint() {
-        let config = Config::load_allow_missing_api_key(None).expect("load default config");
+        let config = test_config();
         let a = ConfigSnapshot::new(1, config.clone(), None);
         let b = ConfigSnapshot::new(2, config, None);
         assert_eq!(
@@ -152,7 +156,7 @@ mod tests {
 
     #[test]
     fn different_config_different_fallback_fingerprint() {
-        let mut config_a = Config::load_allow_missing_api_key(None).expect("load default config");
+        let mut config_a = test_config();
         let config_b = config_a.clone();
         config_a.timezone = String::from("UTC+different");
         let a = ConfigSnapshot::new(1, config_a, None);
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn manager_returns_current_snapshot() {
-        let config = Config::load_allow_missing_api_key(None).expect("load default config");
+        let config = test_config();
         let manager = ConfigManager::new(config, None);
         let snap = manager.current_blocking();
         assert_eq!(snap.revision, 1);
