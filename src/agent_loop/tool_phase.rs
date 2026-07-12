@@ -6,6 +6,7 @@ use futures_util::future::join_all;
 use tracing::warn;
 
 use crate::agent_loop::ConversationScope;
+use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
     format_tool_result, message_to_text, sanitize_assistant_response_text,
@@ -15,8 +16,8 @@ use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
-use crate::runtime::AppState;
 use crate::storage::call_blocking;
+use crate::storage::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
 use crate::tools::{ToolExecutionContext, ToolResult};
 
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -47,7 +48,6 @@ pub(crate) struct ExecutedToolCall {
     pub(crate) payload: String,
     pub(crate) message: Message,
     pub(crate) duration_ms: u128,
-    pub(crate) timestamp: String,
 }
 
 pub(crate) struct AssistantToolPhase {
@@ -70,7 +70,7 @@ pub(crate) enum ToolPhaseResponse {
 }
 
 pub(crate) struct ToolPhaseRequest<'a> {
-    pub(crate) state: &'a AppState,
+    pub(crate) state: &'a TurnRuntime,
     pub(crate) llm: &'a dyn LlmProvider,
     pub(crate) system_prompt: &'a str,
     pub(crate) messages: Arc<Vec<Message>>,
@@ -173,7 +173,8 @@ pub(crate) async fn send_tool_phase_request(
             raw_estimate,
             has_tools,
             request.usage_log_failure,
-        );
+        )
+        .await;
     }
 
     if response.tool_calls.is_empty() {
@@ -236,8 +237,8 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn log_llm_usage(
-    state: &AppState,
+pub(crate) async fn log_llm_usage(
+    state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
     caller_channel: &str,
@@ -259,28 +260,27 @@ pub(crate) fn log_llm_usage(
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
 
-    tokio::spawn(async move {
-        let _ = call_blocking(db, move |db| {
-            db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                chat_id,
-                caller_channel: &channel,
-                provider: &provider,
-                model: &model,
-                input_tokens,
-                output_tokens,
-                request_kind,
-                estimated_tokens,
-                has_tools,
-            })
+    let _ = call_blocking(db, move |db| {
+        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+            chat_id,
+            caller_channel: &channel,
+            provider: &provider,
+            model: &model,
+            input_tokens,
+            output_tokens,
+            request_kind,
+            estimated_tokens,
+            has_tools,
         })
-        .await
-        .inspect_err(|e| warn!(error = %e, failure_message, "llm usage logging failed"));
-    });
+    })
+    .await
+    .inspect_err(|e| warn!(error = %e, failure_message, "llm usage logging failed"));
 }
 
 pub(crate) async fn execute_tool_calls<'a>(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
     valid_tool_calls: Vec<ToolCall>,
     hooks: ToolExecutionHooks<'a>,
 ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
@@ -301,7 +301,15 @@ pub(crate) async fn execute_tool_calls<'a>(
             let block_futures = valid_tool_calls[block_start..cursor]
                 .iter()
                 .cloned()
-                .map(|tool_call| execute_single_tool(state, tool_context, tool_call, hooks.clone()))
+                .map(|tool_call| {
+                    execute_single_tool(
+                        state,
+                        tool_context,
+                        assistant_message_id,
+                        tool_call,
+                        hooks.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let block_results = join_all(block_futures).await;
             for result in block_results {
@@ -312,6 +320,7 @@ pub(crate) async fn execute_tool_calls<'a>(
                 execute_single_tool(
                     state,
                     tool_context,
+                    assistant_message_id,
                     valid_tool_calls[cursor].clone(),
                     hooks.clone(),
                 )
@@ -324,7 +333,7 @@ pub(crate) async fn execute_tool_calls<'a>(
     Ok(outcomes)
 }
 
-async fn read_only_flags(state: &AppState, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
+async fn read_only_flags(state: &TurnRuntime, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
     let mut flags = Vec::with_capacity(valid_tool_calls.len());
     for tool_call in valid_tool_calls {
         flags.push(state.tools.is_read_only(&tool_call.name).await);
@@ -333,8 +342,9 @@ async fn read_only_flags(state: &AppState, valid_tool_calls: &[ToolCall]) -> Vec
 }
 
 async fn execute_single_tool(
-    state: &AppState,
+    state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
     tool_call: ToolCall,
     hooks: ToolExecutionHooks<'_>,
 ) -> Result<ExecutedToolCall, EgoPulseError> {
@@ -343,18 +353,56 @@ async fn execute_single_tool(
     }
 
     let tool_start = std::time::Instant::now();
-    let result = state
-        .tools
-        .execute(&tool_call.name, tool_call.arguments.clone(), tool_context)
-        .await;
-    let duration_ms = tool_start.elapsed().as_millis();
-    let payload = format_tool_result(&tool_call, &result);
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let is_read_only = state.tools.is_read_only(&tool_call.name).await;
 
-    crate::runtime::metrics::inc_tool_calls_total(
-        &tool_call.name,
-        if result.is_error { "error" } else { "ok" },
-    );
+    // Claim the ledger slot before executing so a Tool call is never run
+    // before its durable row exists. Read-only Tools skip the ledger because
+    // they have no side effects and may be safely retried after a crash;
+    // this avoids SQLite write contention during parallel execution.
+    let claim = if is_read_only {
+        ClaimOutcome::Acquired
+    } else {
+        claim_tool_slot(state, tool_context, assistant_message_id, &tool_call).await?
+    };
+
+    let (result, payload, executed) = match claim {
+        ClaimOutcome::Acquired => {
+            // Bind this execution's Tool Call ID into the context so tools
+            // (e.g. `agent_send`) can build per-call idempotency keys.
+            let mut exec_context = tool_context.clone();
+            exec_context.tool_call_id = tool_call.id.clone();
+            let result = state
+                .tools
+                .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
+                .await;
+            let payload = format_tool_result(&tool_call, &result);
+            if !is_read_only {
+                record_tool_outcome(state, tool_context, &tool_call, &result, &payload).await?;
+            }
+            (result, payload, true)
+        }
+        ClaimOutcome::Reused { tool_output } => {
+            // A prior execution already succeeded; return the stored output
+            // without re-running the Tool.
+            let result = ToolResult::success(tool_output.clone());
+            (result, tool_output, false)
+        }
+        ClaimOutcome::Blocked { state: tool_state } => {
+            // The ledger forbids execution (failed / uncertain / in flight).
+            let result = ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
+            let payload = format_tool_result(&tool_call, &result);
+            (result, payload, false)
+        }
+    };
+
+    let duration_ms = tool_start.elapsed().as_millis();
+
+    if executed {
+        crate::runtime::metrics::inc_tool_calls_total(
+            &tool_call.name,
+            if result.is_error { "error" } else { "ok" },
+        );
+    }
 
     let message = Message {
         role: "tool".to_string(),
@@ -370,7 +418,6 @@ async fn execute_single_tool(
         payload,
         message,
         duration_ms,
-        timestamp,
     };
 
     if let Some(on_result) = &hooks.on_result {
@@ -378,6 +425,83 @@ async fn execute_single_tool(
     }
 
     Ok(outcome)
+}
+
+/// Claims a Tool execution slot in the `tool_calls` ledger.
+///
+/// The canonical input and its hash are computed before any DB write so the
+/// retry identity is fixed at claim time. Idempotency classification comes
+/// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
+async fn claim_tool_slot(
+    state: &TurnRuntime,
+    tool_context: &ToolExecutionContext,
+    assistant_message_id: &str,
+    tool_call: &ToolCall,
+) -> Result<ClaimOutcome, EgoPulseError> {
+    let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
+    let hash = input_hash(&canonical);
+    let tool_input = tool_call.arguments.to_string();
+    let class = state.tools.idempotency_class(&tool_call.name).await;
+    let key = state
+        .tools
+        .idempotency_key(&tool_call.name, &tool_call.arguments)
+        .await;
+    let turn_id = tool_context.turn_id.clone();
+    let chat_id = tool_context.chat_id;
+    let message_id = assistant_message_id.to_string();
+    let tool_call_id = tool_call.id.clone();
+    let tool_name = tool_call.name.clone();
+    let hash_for_closure = hash;
+    let tool_input_for_closure = tool_input;
+    let key_for_closure = key;
+    Ok(
+        call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
+            db.claim_tool_execution(ClaimParams {
+                turn_id: &turn_id,
+                chat_id,
+                message_id: &message_id,
+                tool_call_id: &tool_call_id,
+                tool_name: &tool_name,
+                tool_input: &tool_input_for_closure,
+                input_hash: &hash_for_closure,
+                idempotency_class: class,
+                idempotency_key: key_for_closure.as_deref(),
+            })
+        })
+        .await?,
+    )
+}
+
+/// Records the Tool execution outcome (success or failure) in the ledger.
+///
+/// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
+/// so no secret reaches the persisted `tool_output` / `error_message`.
+async fn record_tool_outcome(
+    state: &TurnRuntime,
+    tool_context: &ToolExecutionContext,
+    tool_call: &ToolCall,
+    result: &ToolResult,
+    payload: &str,
+) -> Result<(), EgoPulseError> {
+    let turn_id = tool_context.turn_id.clone();
+    let tool_call_id = tool_call.id.clone();
+    if result.is_error {
+        let error_message = result.content.clone();
+        Ok(
+            call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
+                db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
+            })
+            .await?,
+        )
+    } else {
+        let payload = payload.to_string();
+        Ok(
+            call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
+                db.record_tool_success(&turn_id, &tool_call_id, &payload)
+            })
+            .await?,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +608,6 @@ mod tests {
                 tool_call_id: Some("call-1".to_string()),
             },
             duration_ms: 1,
-            timestamp: "2026-05-31T00:00:00Z".to_string(),
         };
         let second = ExecutedToolCall {
             tool_call: tool_call("call-2", "grep", json!({"pattern": "beta"})),
@@ -500,7 +623,6 @@ mod tests {
                 tool_call_id: Some("call-2".to_string()),
             },
             duration_ms: 2,
-            timestamp: "2026-05-31T00:00:01Z".to_string(),
         };
 
         // Act
@@ -569,9 +691,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("parallel-read"), "read both")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("parallel-read"),
+            "read both",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -590,8 +716,7 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+        assert_eq!(tool_calls.len(), 0, "read-only tools skip the ledger");
     }
 
     #[tokio::test]
@@ -636,7 +761,7 @@ mod tests {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(&full, "hello").expect("write");
 
-        let reply = process_turn(&state, &cli_context("mixed-tools"), "mixed")
+        let reply = process_turn(&state.turn_runtime(), &cli_context("mixed-tools"), "mixed")
             .await
             .expect("turn");
         assert_eq!(reply, "Done.");
@@ -657,8 +782,9 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 2);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
+        assert_eq!(tool_calls.len(), 1, "only non-idempotent/bash is persisted");
+        assert_eq!(tool_calls[0].tool_name, "bash");
+        assert!(tool_calls[0].tool_output.is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -686,9 +812,13 @@ mod tests {
             Box::new(provider.clone()),
         );
 
-        let reply = process_turn(&state, &cli_context("usage-log-single"), "hi")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("usage-log-single"),
+            "hi",
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "hello world");
 
         // Verify LLM resolution: exactly one call with the right system prompt.
@@ -758,7 +888,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -813,7 +943,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -871,7 +1001,7 @@ mod tests {
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state,
+            state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -954,9 +1084,13 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
         std::fs::write(&file_path, "data").expect("file");
 
-        let reply = process_turn(&state, &cli_context("usage-log-multi"), "read the file")
-            .await
-            .expect("process turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("usage-log-multi"),
+            "read the file",
+        )
+        .await
+        .expect("process turn");
         assert_eq!(reply, "done");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1053,9 +1187,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("partial-parallel"), "mixed")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("partial-parallel"),
+            "mixed",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1074,12 +1212,13 @@ mod tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 4);
-        assert!(tool_calls.iter().all(|tc| tc.tool_output.is_some()));
-        assert_eq!(tool_calls[0].tool_name, "read");
-        assert_eq!(tool_calls[1].tool_name, "read");
-        assert_eq!(tool_calls[2].tool_name, "bash");
-        assert_eq!(tool_calls[3].tool_name, "read");
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "only bash is persisted; read-only tools skip the ledger"
+        );
+        assert_eq!(tool_calls[0].tool_name, "bash");
+        assert!(tool_calls[0].tool_output.is_some());
     }
 
     #[tokio::test]
@@ -1130,7 +1269,7 @@ mod tests {
         )
         .expect("dir");
 
-        let reply = process_turn(&state, &cli_context("seq-write"), "write it")
+        let reply = process_turn(&state.turn_runtime(), &cli_context("seq-write"), "write it")
             .await
             .expect("turn");
         assert_eq!(reply, "Done.");
@@ -1207,9 +1346,13 @@ mod tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
-        let reply = process_turn(&state, &cli_context("transcript-order"), "ordered")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("transcript-order"),
+            "ordered",
+        )
+        .await
+        .expect("turn");
         assert_eq!(reply, "Done.");
 
         let seen = provider.seen_messages();

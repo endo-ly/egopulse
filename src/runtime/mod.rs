@@ -35,7 +35,7 @@ use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
 use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
-use crate::config::Config;
+use crate::config::{Config, ConfigManager};
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalibrator};
 use crate::llm::{Message, create_provider};
@@ -51,6 +51,7 @@ pub struct AppState {
     /// Secret DB for isolated secret-mode storage. `None` when no secret channels are configured.
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
+    pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -118,7 +119,11 @@ impl AppState {
         Self {
             db: parts.db,
             secret_db: parts.secret_db,
-            config: parts.config,
+            config: parts.config.clone(),
+            config_manager: Arc::new(ConfigManager::new(
+                parts.config,
+                parts.config_path.as_deref(),
+            )),
             config_path: parts.config_path,
             llm_override: parts.llm_override,
             channels: parts.channels,
@@ -136,6 +141,31 @@ impl AppState {
             runtime_status: parts.runtime_status,
             usage_calibrator: Arc::new(UsageCalibrator::new()),
             _sealed: (),
+        }
+    }
+
+    /// Builds a [`crate::agent_loop::TurnRuntime`] from the subset of this
+    /// `AppState` that Turn execution actually needs.
+    ///
+    /// Scheduling, channel dispatch, and runtime observability fields are
+    /// intentionally omitted so that Turn logic cannot accidentally depend on
+    /// them.
+    pub(crate) fn turn_runtime(&self) -> crate::agent_loop::TurnRuntime {
+        crate::agent_loop::TurnRuntime {
+            db: Arc::clone(&self.db),
+            secret_db: self.secret_db.clone(),
+            config_manager: Arc::clone(&self.config_manager),
+            config_path: self.config_path.clone(),
+            llm_override: self.llm_override.clone(),
+            llm_cache: Arc::clone(&self.llm_cache),
+            tools: Arc::clone(&self.tools),
+            skills: Arc::clone(&self.skills),
+            soul_agents: Arc::clone(&self.soul_agents),
+            memory_loader: Arc::clone(&self.memory_loader),
+            assets: Arc::clone(&self.assets),
+            usage_calibrator: Arc::clone(&self.usage_calibrator),
+            turn_sender: self.turn_sender.clone(),
+            active_turns: Arc::clone(&self.active_turns),
         }
     }
 
@@ -221,31 +251,6 @@ impl AppState {
         observations.reverse();
     }
 
-    /// Resolves the database and archive root for the given conversation scope.
-    ///
-    /// Callers that need both the database handle and the archive directory
-    /// (e.g. compaction) should prefer this over [`Self::db_for`] to avoid
-    /// duplicating scope-specific path logic.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
-    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
-        match scope {
-            ConversationScope::Normal => ScopedStorage {
-                db: &self.db,
-                archive_root: self.config.groups_dir(),
-            },
-            ConversationScope::Secret => ScopedStorage {
-                db: self
-                    .secret_db
-                    .as_ref()
-                    .expect("secret db required but not initialized"),
-                archive_root: self.config.runtime_dir().join("secret_groups"),
-            },
-        }
-    }
-
     /// 現在の設定スナップショットを返す。
     pub fn current_config(&self) -> Arc<Config> {
         Arc::new(self.config.clone())
@@ -268,17 +273,19 @@ impl AppState {
             return Ok(provider);
         }
 
-        let config = self.try_current_config()?;
+        let snapshot = self.config_manager.current_blocking();
+        let config = &snapshot.config;
         let agent_id = crate::config::AgentId::new(&context.agent_id);
         let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        self.cached_provider(&resolved)
+        self.cached_provider(&resolved, snapshot.revision)
     }
 
     pub(crate) fn cached_provider(
         &self,
         resolved: &crate::config::ResolvedLlmConfig,
+        config_revision: u64,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        let key = resolved.cache_key();
+        let key = resolved.cache_key_with_revision(config_revision);
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
         if let Some(provider) = cache.get(&key) {
             return Ok(Arc::clone(provider));
@@ -384,9 +391,63 @@ pub async fn build_app_state_with_path(
     });
     state.warm_up_calibrator().await;
 
+    // Recover durable Turn / Tool state left non-terminal by a prior crash.
+    // Running Tools become uncertain, and interrupted turn_runs stop safely.
+    recover_durable_state(&state).await;
+
     spawn_agent_turn_worker(state.clone(), turn_receiver);
 
     Ok(state)
+}
+
+/// Recovers durable Turn / Tool state on startup.
+///
+/// Runs against both the primary and (when present) secret databases:
+/// `running` tool_calls are transitioned by [`Database::recover_running_tools`],
+/// and non-terminal `turn_runs` are stopped safely by [`Database::recover_interrupted_turns`].
+/// Failures are logged but never abort startup so the runtime can still serve
+/// new turns.
+async fn recover_durable_state(state: &AppState) {
+    recover_durable_state_for_db(&state.db, ConversationScope::Normal);
+    if let Some(secret_db) = &state.secret_db {
+        recover_durable_state_for_db(secret_db, ConversationScope::Secret);
+    }
+}
+
+fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
+    match db.as_ref().recover_running_tools() {
+        Ok(recovered) if !recovered.is_empty() => {
+            for tool in &recovered {
+                tracing::info!(
+                    scope = %scope,
+                    turn_id = %tool.turn_id,
+                    tool_call_id = %tool.tool_call_id,
+                    tool_name = %tool.tool_name,
+                    from = "running",
+                    to = %tool.recovered_to,
+                    "recovered tool_call on startup"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
+    }
+    match db.as_ref().recover_interrupted_turns() {
+        Ok(recovered) if !recovered.is_empty() => {
+            for turn in &recovered {
+                tracing::info!(
+                    scope = %scope,
+                    turn_id = %turn.turn_id,
+                    chat_id = turn.chat_id,
+                    from = %turn.from,
+                    to = %turn.recovered_to,
+                    "recovered turn_run on startup"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, scope = %scope, "turn_runs recovery failed"),
+    }
 }
 
 /// Builds the minimal application state needed for manual sleep batch execution.
@@ -441,8 +502,12 @@ fn build_app_state_dependencies(
         &config.db_path(),
         &backup_settings,
     )?);
+
     let secret_db = if config.needs_secret_db() {
-        Some(Arc::new(Database::new_secret(&config.secret_db_path())?))
+        Some(Arc::new(Database::new_secret_with_backup(
+            &config.secret_db_path(),
+            &backup_settings,
+        )?))
     } else {
         None
     };
@@ -738,7 +803,9 @@ pub(crate) async fn execute_observed_turn(
         .touch_channel_activity(&context.channel);
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
-    let result = execute_turn_with_progress(state, context, input).await;
+    let runtime = state.turn_runtime();
+    let result =
+        crate::agent_loop::process_turn_with_events(&runtime, context, input, |_| {}).await;
     let duration = started.elapsed().as_secs_f64();
     state.runtime_status.push_turn(
         &context.trace_id,
@@ -780,10 +847,12 @@ async fn execute_turn_with_progress(
     let coordinator_abort = coordinator_handle.abort_handle();
 
     let event_sender = evt_tx.clone();
-    let result = crate::agent_loop::process_turn_with_events(state, context, input, move |event| {
-        let _ = event_sender.send(event);
-    })
-    .await;
+    let runtime = state.turn_runtime();
+    let result =
+        crate::agent_loop::process_turn_with_events(&runtime, context, input, move |event| {
+            let _ = event_sender.send(event);
+        })
+        .await;
 
     if result
         .as_ref()
@@ -1400,9 +1469,15 @@ mod tests {
         // Act
         let result = execute_turn_with_progress(&state, &context, "hello").await;
 
-        // Assert
+        // Assert: the same model iteration is retried up to
+        // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
+        // single Turn with a single persisted input.
         assert!(result.is_err(), "retryable failure must reach the caller");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "LLM must be called once");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::agent_loop::turn::MAX_LLM_RETRIES,
+            "LLM must be retried up to MAX_LLM_RETRIES within the same iteration"
+        );
         let conn = state.db.get_conn().expect("connection");
         let user_messages: i64 = conn
             .query_row(
@@ -1471,21 +1546,21 @@ mod tests {
     fn cache_key_differs_when_provider_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_differs_when_model_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_differs_when_base_url_differs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1");
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
@@ -1495,14 +1570,14 @@ mod tests {
         b.api_key = Some(secrecy::SecretString::new(
             "sk-other".to_string().into_boxed_str(),
         ));
-        assert_ne!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[test]
     fn cache_key_same_for_identical_configs() {
         let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        assert_eq!(a.cache_key(), b.cache_key());
+        assert_eq!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
     }
 
     #[tokio::test]
@@ -1675,50 +1750,6 @@ mod tests {
         let _ = state.db_for(ConversationScope::Secret);
     }
 
-    #[test]
-    fn storage_for_returns_archive_root_for_conversation_scope() {
-        // Arrange: create AppState with both normal and secret DBs
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_sleep_state(&dir);
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
-        state.secret_db = Some(Arc::clone(&secret_db));
-
-        // Act
-        let normal = state.storage_for(ConversationScope::Normal);
-        let secret = state.storage_for(ConversationScope::Secret);
-
-        // Assert: db pointer equality
-        assert!(
-            Arc::ptr_eq(normal.db, &state.db),
-            "Normal scope must resolve to the primary database"
-        );
-        assert!(
-            Arc::ptr_eq(secret.db, &secret_db),
-            "Secret scope must resolve to the isolated secret database"
-        );
-        assert!(
-            !Arc::ptr_eq(normal.db, secret.db),
-            "Normal and Secret scopes must resolve to different databases"
-        );
-
-        // Assert: archive root paths
-        assert!(
-            normal.archive_root.ends_with("groups"),
-            "Normal archive root must end with 'groups', got: {:?}",
-            normal.archive_root
-        );
-        assert!(
-            secret.archive_root.ends_with("secret_groups"),
-            "Secret archive root must end with 'secret_groups', got: {:?}",
-            secret.archive_root
-        );
-        assert_ne!(
-            normal.archive_root, secret.archive_root,
-            "Normal and Secret archive roots must differ"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
@@ -1789,50 +1820,5 @@ mod tests {
             !normal_has_reply,
             "normal DB should not contain the secret bot response"
         );
-    }
-
-    #[test]
-    fn normal_scope_does_not_require_secret_db() {
-        // Arrange: AppState with secret_db = None (no secret channels configured)
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        assert!(
-            state.secret_db.is_none(),
-            "test precondition: secret_db is None"
-        );
-
-        // Act: call db_for and storage_for with Normal scope
-        let db = state.db_for(ConversationScope::Normal);
-        let storage = state.storage_for(ConversationScope::Normal);
-
-        // Assert: both succeed and resolve to the normal db and archive root
-        assert!(
-            Arc::ptr_eq(db, &state.db),
-            "db_for(Normal) must return the primary database"
-        );
-        assert!(
-            Arc::ptr_eq(storage.db, &state.db),
-            "storage_for(Normal) must return the primary database"
-        );
-        assert!(
-            storage.archive_root.ends_with("groups"),
-            "storage_for(Normal) archive root must end with 'groups', got: {:?}",
-            storage.archive_root
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "secret db required")]
-    fn secret_scope_requires_secret_database() {
-        // Arrange: AppState without secret_db
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        assert!(
-            state.secret_db.is_none(),
-            "test precondition: secret_db is None"
-        );
-
-        // Act + Assert: storage_for(Secret) must panic
-        let _ = state.storage_for(ConversationScope::Secret);
     }
 }

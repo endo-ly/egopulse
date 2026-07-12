@@ -253,7 +253,7 @@ async fn persist_notification_with_session(
     };
 
     let loaded = crate::agent_loop::session::load_messages_for_turn(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         chat_id,
     )
@@ -263,24 +263,24 @@ async fn persist_notification_with_session(
     session_messages.push(Message::text("user", &synthetic_input.content));
 
     let PersistedTurn {
-        mut updated_at,
+        mut revision,
         messages: mut session_messages,
     } = persist_phase_once(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         synthetic_input.clone(),
         &session_messages,
-        loaded.session_updated_at,
+        loaded.session_revision,
     )
     .await?;
 
     for phase in &activation_result.tool_phases {
         session_messages.push(phase.assistant_message.clone());
         let PersistedTurn {
-            updated_at: next_updated_at,
+            revision: next_revision,
             messages: persisted_messages,
         } = persist_phase(
-            state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             StoredMessage {
                 id: phase.assistant_message_id.clone(),
@@ -292,21 +292,19 @@ async fn persist_notification_with_session(
             },
             phase.assistant_message.clone(),
             &session_messages,
-            Some(updated_at),
+            Some(revision),
         )
         .await?;
-        updated_at = next_updated_at;
+        revision = next_revision;
         session_messages = persisted_messages;
-
-        persist_tool_call_records(state, phase.stored_tool_calls.clone()).await?;
 
         if !phase.tool_messages.is_empty() {
             session_messages.extend(phase.tool_messages.iter().cloned());
             let PersistedTurn {
-                updated_at: next_updated_at,
+                revision: next_revision,
                 messages: persisted_messages,
             } = persist_phase_messages(
-                state,
+                &state.turn_runtime(),
                 ConversationScope::Normal,
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
@@ -318,10 +316,10 @@ async fn persist_notification_with_session(
                 },
                 phase.tool_messages.clone(),
                 &session_messages,
-                Some(updated_at),
+                Some(revision),
             )
             .await?;
-            updated_at = next_updated_at;
+            revision = next_revision;
             session_messages = persisted_messages;
         }
     }
@@ -335,26 +333,15 @@ async fn persist_notification_with_session(
     session_messages.push(Message::text("assistant", output_text));
 
     persist_phase_once(
-        state,
+        &state.turn_runtime(),
         ConversationScope::Normal,
         assistant_msg,
         &session_messages,
-        Some(updated_at),
+        Some(revision),
     )
     .await?;
 
     Ok(assistant_id)
-}
-
-async fn persist_tool_call_records(
-    state: &AppState,
-    tool_calls: Vec<crate::storage::ToolCall>,
-) -> Result<(), EgoPulseError> {
-    for record in tool_calls {
-        crate::storage::call_blocking(Arc::clone(&state.db), move |db| db.store_tool_call(&record))
-            .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -682,15 +669,6 @@ mod tests {
                 assistant_preview: "I'll inspect it. [tool_call] read".to_string(),
                 tool_messages: vec![tool_message],
                 tool_result_preview: "ok".to_string(),
-                stored_tool_calls: vec![crate::storage::ToolCall {
-                    id: "call-read".to_string(),
-                    chat_id,
-                    message_id: "assistant-tool-1".to_string(),
-                    tool_name: "read".to_string(),
-                    tool_input: "{\"path\":\"notes.md\"}".to_string(),
-                    tool_output: Some("{\"status\":\"success\",\"result\":\"ok\"}".to_string()),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                }],
             }],
         };
 
@@ -733,14 +711,6 @@ mod tests {
         let session_json = snapshot.messages_json.expect("session json");
         assert!(session_json.contains("call-read"));
         assert!(session_json.contains(notification_text));
-
-        let tool_calls = state
-            .db
-            .get_tool_calls_for_chat(chat_id)
-            .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].message_id, "assistant-tool-1");
-        assert!(tool_calls[0].tool_output.is_some());
 
         let synthetic = messages
             .iter()
@@ -975,6 +945,9 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_kind: MessageKind::SystemEvent,
             recipient_agent_id: None,
+            seq: None,
+            turn_id: None,
+            parent_message_id: None,
         };
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.sender_id, "pulse");

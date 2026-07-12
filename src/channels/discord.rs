@@ -898,6 +898,7 @@ impl EventHandler for Handler {
         let mut context = self.make_context(&msg.author.name, &thread, &agent_id);
         context.channel_log_chat_id = channel_log_chat_id;
         context.origin_id = uuid::Uuid::new_v4().to_string();
+        context.request_key = format!("discord:{channel_id}:{}", msg.id.get());
 
         info!(
             channel_id = channel_id,

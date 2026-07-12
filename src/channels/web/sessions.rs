@@ -382,8 +382,6 @@ mod tests {
 
     #[tokio::test]
     async fn api_history_interleaves_tool_calls() {
-        use crate::storage::ToolCall;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
         let db = Arc::clone(&web_state.app_state.db);
@@ -408,15 +406,15 @@ mod tests {
         );
         db.store_message_only(&assistant_msg)
             .expect("store assistant message");
-        db.store_tool_call(&ToolCall {
-            id: "call-1".to_string(),
+        db.insert_tool_call_for_test(
+            "call-1",
             chat_id,
-            message_id: assistant_msg.id.clone(),
-            tool_name: "read".to_string(),
-            tool_input: r#"{"path":"a.txt"}"#.to_string(),
-            tool_output: Some(r#"{"result":"file contents","status":"success"}"#.to_string()),
-            timestamp: "2024-01-01T00:00:01Z".to_string(),
-        })
+            &assistant_msg.id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"file contents","status":"success"}"#),
+            "2024-01-01T00:00:01Z",
+        )
         .expect("store tool call");
 
         let query = Query(super::HistoryQuery {
@@ -513,7 +511,6 @@ mod tests {
 
     #[tokio::test]
     async fn api_history_anchors_tool_calls_to_parent_message() {
-        use crate::storage::ToolCall;
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
         let db = Arc::clone(&web_state.app_state.db);
@@ -533,16 +530,16 @@ mod tests {
 
         // Persist the tool call with a timestamp earlier than its parent to
         // model timestamp skew; the card must still land right after the parent.
-        let tool_call = ToolCall {
-            id: "call-1".to_string(),
+        db.insert_tool_call_for_test(
+            "call-1",
             chat_id,
-            message_id: assistant_msg.id.clone(),
-            tool_name: "read".to_string(),
-            tool_input: r#"{"path":"a.txt"}"#.to_string(),
-            tool_output: Some(r#"{"result":"ok","status":"success"}"#.to_string()),
-            timestamp: "2020-01-01T00:00:00Z".to_string(),
-        };
-        db.store_tool_call(&tool_call).expect("store tool call");
+            &assistant_msg.id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"ok","status":"success"}"#),
+            "2020-01-01T00:00:00Z",
+        )
+        .expect("store tool call");
 
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
@@ -561,7 +558,6 @@ mod tests {
 
     #[tokio::test]
     async fn api_history_drops_tool_calls_outside_message_window() {
-        use crate::storage::ToolCall;
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
         let db = Arc::clone(&web_state.app_state.db);
@@ -577,15 +573,15 @@ mod tests {
         );
         db.store_message_only(&old_assistant)
             .expect("store old assistant");
-        db.store_tool_call(&ToolCall {
-            id: "old-tool".to_string(),
+        db.insert_tool_call_for_test(
+            "old-tool",
             chat_id,
-            message_id: old_assistant.id.clone(),
-            tool_name: "read".to_string(),
-            tool_input: r#"{"path":"old.txt"}"#.to_string(),
-            tool_output: Some(r#"{"result":"old","status":"success"}"#.to_string()),
-            timestamp: "2020-01-01T00:00:00Z".to_string(),
-        })
+            &old_assistant.id,
+            "read",
+            r#"{"path":"old.txt"}"#,
+            Some(r#"{"result":"old","status":"success"}"#),
+            "2020-01-01T00:00:00Z",
+        )
         .expect("store old tool");
         for i in 0..3 {
             db.store_message_only(&StoredMessage::user(

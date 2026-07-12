@@ -122,7 +122,7 @@ mod tests {
             }),
         );
 
-        let error = process_turn(&state, &cli_context("empty-guard"), "hello")
+        let error = process_turn(&state.turn_runtime(), &cli_context("empty-guard"), "hello")
             .await
             .expect_err("should fail after retry");
         assert!(matches!(error, EgoPulseError::Llm(_)));
@@ -152,9 +152,13 @@ mod tests {
             }),
         );
 
-        let reply = process_turn(&state, &cli_context("declarative-guard"), "help me")
-            .await
-            .expect("should succeed after retry");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("declarative-guard"),
+            "help me",
+        )
+        .await
+        .expect("should succeed after retry");
         assert_eq!(reply, "Here is the answer you need.");
 
         let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
@@ -169,7 +173,7 @@ mod tests {
         .await
         .expect("chat id");
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state,
+            &state.turn_runtime(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -211,9 +215,13 @@ mod tests {
             }),
         );
 
-        let reply = process_turn(&state, &cli_context("malformed-declarative"), "test")
-            .await
-            .expect("should recover after retry");
+        let reply = process_turn(
+            &state.turn_runtime(),
+            &cli_context("malformed-declarative"),
+            "test",
+        )
+        .await
+        .expect("should recover after retry");
         assert_eq!(reply, "実行結果です。");
     }
 }

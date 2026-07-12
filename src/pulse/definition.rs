@@ -61,12 +61,22 @@ pub(crate) enum PulseParseError {
     },
     #[error("pulse_invalid_delivery: {agent_id}: {detail}")]
     InvalidDelivery { agent_id: String, detail: String },
+    #[error("pulse_unsupported_version: {agent_id}: {version}")]
+    UnsupportedVersion { agent_id: String, version: u32 },
 }
+
+/// Schema version that this runtime understands. Pulse definitions declaring a
+/// different version are rejected with [`PulseParseError::UnsupportedVersion`]
+/// rather than silently ignored.
+///
+/// This is distinct from the DB schema version (migration ledger) and from the
+/// Config revision (immutable snapshot generation); see
+/// `docs/pulse.md` and `docs/config.md`.
+const SUPPORTED_PULSE_VERSION: u32 = 1;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PulseFrontMatter {
-    #[allow(dead_code)]
     version: u32,
     #[serde(default)]
     intentions: Vec<IntentionRaw>,
@@ -184,6 +194,13 @@ fn parse_pulse_definition_inner(
             agent_id: agent_id.to_string(),
             detail: e.to_string(),
         })?;
+
+    if fm.version != SUPPORTED_PULSE_VERSION {
+        return Err(PulseParseError::UnsupportedVersion {
+            agent_id: agent_id.to_string(),
+            version: fm.version,
+        });
+    }
 
     let default_delivery = fm
         .default_delivery
@@ -899,6 +916,25 @@ body
         assert!(
             result.is_err(),
             "non-empty PULSE.md without front matter should be rejected"
+        );
+    }
+
+    #[test]
+    fn unsupported_pulse_version_is_rejected() {
+        // Arrange: a well-formed front matter whose version is not supported.
+        let yaml = format!(
+            "---\nversion: {version}\n---\n\nbody\n",
+            version = super::SUPPORTED_PULSE_VERSION + 1
+        );
+
+        // Act
+        let result = parse_pulse_definition(&yaml);
+
+        // Assert
+        let err = result.expect_err("unsupported version must be rejected");
+        assert!(
+            matches!(err, PulseParseError::UnsupportedVersion { version, .. } if version == super::SUPPORTED_PULSE_VERSION + 1),
+            "expected UnsupportedVersion, got: {err}"
         );
     }
 

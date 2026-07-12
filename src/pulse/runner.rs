@@ -14,7 +14,7 @@ use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
 use crate::pulse::capsule::PulseCapsule;
 use crate::runtime::AppState;
-use crate::storage::{PulseOutputKind, ToolCall as StoredToolCall};
+use crate::storage::PulseOutputKind;
 use crate::tools::ToolExecutionContext;
 use tracing::warn;
 
@@ -49,7 +49,6 @@ pub(crate) struct ToolPhase {
     pub assistant_preview: String,
     pub tool_messages: Vec<Message>,
     pub tool_result_preview: String,
-    pub stored_tool_calls: Vec<StoredToolCall>,
 }
 
 /// Execute a Pulse Activation.
@@ -98,19 +97,21 @@ pub(crate) async fn run_activation(
         channel_log_chat_id: None,
         chain_depth: 0,
         origin_id: String::new(),
+        turn_id: uuid::Uuid::new_v4().to_string(),
         turn_sender: state.turn_sender.clone(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        tool_call_id: String::new(),
     };
 
-    let system_prompt = build_system_prompt(state, &context);
+    let system_prompt = build_system_prompt(&state.turn_runtime(), &context);
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let phase_response = send_tool_phase_request(ToolPhaseRequest {
-            state,
+            state: &state.turn_runtime(),
             llm: channel_llm.as_ref(),
             system_prompt: &system_prompt,
             messages: Arc::clone(&messages),
@@ -151,24 +152,13 @@ pub(crate) async fn run_activation(
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
         let tool_outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
-            state,
+            &state.turn_runtime(),
             &tool_context,
+            &assistant_message_id,
             assistant_phase.tool_calls.clone(),
             ToolExecutionHooks::none(),
         )
         .await?;
-        let stored_tool_calls = tool_outcomes
-            .iter()
-            .map(|outcome| StoredToolCall {
-                id: outcome.tool_call.id.clone(),
-                chat_id,
-                message_id: assistant_message_id.clone(),
-                tool_name: outcome.tool_call.name.clone(),
-                tool_input: outcome.tool_call.arguments.to_string(),
-                tool_output: Some(outcome.payload.clone()),
-                timestamp: outcome.timestamp.clone(),
-            })
-            .collect::<Vec<_>>();
         let tool_result_phase = build_tool_result_phase(tool_outcomes);
 
         {
@@ -182,7 +172,6 @@ pub(crate) async fn run_activation(
             assistant_preview: assistant_phase.assistant_preview,
             tool_messages: tool_result_phase.tool_messages,
             tool_result_preview: tool_result_phase.tool_result_preview,
-            stored_tool_calls,
         });
     }
 

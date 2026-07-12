@@ -85,7 +85,7 @@ pub(crate) async fn process_slash_command(
         return SlashCommandOutcome::Respond(response);
     }
 
-    match resolve_chat_id(state, context).await {
+    match resolve_chat_id(&state.turn_runtime(), context).await {
         Ok(chat_id) => {
             let response = handle_slash_command(state, chat_id, context, text, sender_id)
                 .await
@@ -191,11 +191,11 @@ pub(crate) fn unknown_command_response() -> String {
 async fn handle_new(state: &AppState, scope: ConversationScope, chat_id: i64) -> Option<String> {
     match call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         let snapshot = db.load_session_snapshot(chat_id, 1)?;
-        let updated_at = match snapshot.updated_at {
-            Some(ts) => ts,
+        let session_revision = match snapshot.session_revision {
+            Some(rev) => rev,
             None => return Ok(true), // no session row — nothing to clear
         };
-        let cleared = db.clear_session_messages(chat_id, &updated_at)?;
+        let cleared = db.clear_session_messages(chat_id, session_revision)?;
         if !cleared {
             tracing::debug!(
                 chat_id,
@@ -219,7 +219,7 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(state, context.scope, chat_id).await {
+    let loaded = match load_messages_for_turn(&state.turn_runtime(), context.scope, chat_id).await {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
@@ -233,7 +233,17 @@ async fn handle_compact(
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
-    match force_compact(state, context, chat_id, &loaded.messages, &llm).await {
+    let config = state.current_config();
+    match force_compact(
+        &state.turn_runtime(),
+        context,
+        chat_id,
+        &loaded.messages,
+        &llm,
+        &config,
+    )
+    .await
+    {
         Ok(compacted) => {
             let json = match serde_json::to_string(&compacted) {
                 Ok(j) => j,
@@ -874,6 +884,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         }
     }
 
@@ -897,6 +909,9 @@ mod tests {
                         timestamp: "2024-01-01T00:00:00Z".to_string(),
                         message_kind: MessageKind::Message,
                         recipient_agent_id: None,
+                        seq: None,
+                        turn_id: None,
+                        parent_message_id: None,
                     },
                     r#"[{"role":"user","content":"hello"}]"#,
                     None,
@@ -1206,6 +1221,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/status", None).await;
@@ -1247,6 +1264,8 @@ mod tests {
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, chat_id, &context, "/compact", None).await;
@@ -1328,6 +1347,8 @@ agents:
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/provider local", None).await;
@@ -1375,6 +1396,8 @@ agents:
             origin_id: String::new(),
             trace_id: String::new(),
             scope: ConversationScope::Normal,
+
+            request_key: String::new(),
         };
 
         let result = handle_slash_command(&state, 1, &context, "/model agent-model", None).await;
