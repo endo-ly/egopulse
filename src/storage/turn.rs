@@ -327,6 +327,37 @@ impl Database {
         Ok(ids)
     }
 
+    /// Returns the IDs of Turns that reached `input_committed` (the user input
+    /// is durably persisted) but whose model loop never started, and which carry
+    /// a persisted request so they can be resumed.
+    ///
+    /// Unlike [`Database::scan_durable_accepted_turn_ids`], this covers turns
+    /// that crashed between `accepted -> input_committed` and the first model
+    /// call. The same 2s grace window keeps a live turn (which sits in
+    /// `input_committed` only for microseconds, until the model iteration
+    /// transaction commits) from being double-dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite read fails.
+    pub(crate) fn scan_durable_input_committed_turn_ids(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT turn_id
+             FROM turn_runs
+             WHERE state = 'input_committed'
+               AND scheduled_request_json IS NOT NULL
+               AND accepted_at < datetime('now', '-2 seconds')
+             ORDER BY accepted_at ASC",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Validates `from -> to` against the central transition rule and, if
     /// allowed, advances the row. The expected `from` makes the transition
     /// optimistic: a mismatch (concurrent writer or unexpected state) is
@@ -632,8 +663,10 @@ impl Database {
     ///
     /// | State             | Recovery action                                          |
     /// |-------------------|----------------------------------------------------------|
-    /// | `accepted`        | `failed` — input was never committed, retry is safe.     |
-    /// | `input_committed` | `failed` — no model output yet, retry is safe.            |
+    /// | `accepted`        | `failed` unless durably persisted (then left for the    |
+    /// |                   | dispatcher) — input never committed, retry is safe.      |
+    /// | `input_committed` | `failed` unless durably persisted (then left for the    |
+    /// |                   | dispatcher to resume) — no model output yet.             |
     /// | `model_pending`   | `uncertain` — output may have been published externally. |
     /// | `model_completed` | `uncertain` — output may have been published externally. |
     /// | `tools_pending`   | `uncertain` — tool side effects may have run.            |
@@ -687,13 +720,16 @@ impl Database {
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
 
-            // A durably accepted turn (its full request is persisted) is left
-            // for the turn dispatcher to resume after startup instead of being
-            // failed here: the request can be rebuilt and re-executed safely
-            //. Legacy `accepted` turns without a persisted request
-            // (direct-execution paths) still fall through to the fail-stop
-            // branch below.
-            if from == TurnRunState::Accepted && row.scheduled_request_json.is_some() {
+            // A durably accepted or input_committed turn (its full request is
+            // persisted) is left for the turn dispatcher to resume after startup
+            // instead of being failed here: the request can be rebuilt and the
+            // turn re-executed (accepted) or its model loop restarted
+            // (input_committed) safely. Legacy turns without
+            // a persisted request (direct-execution paths) still fall through to
+            // the fail-stop branch below.
+            if row.scheduled_request_json.is_some()
+                && matches!(from, TurnRunState::Accepted | TurnRunState::InputCommitted)
+            {
                 continue;
             }
 
@@ -1353,6 +1389,87 @@ mod tests {
         assert_eq!(
             db.get_turn_run(&durable.turn_id).expect("get").state,
             TurnRunState::Accepted
+        );
+    }
+
+    #[test]
+    fn scan_durable_input_committed_excludes_recent_and_legacy() {
+        // Arrange: a durable input_committed turn (request persisted, aged past
+        // the grace window), a legacy input_committed turn (no persisted
+        // request), and a recent durable input_committed turn (not aged).
+        let (db, _dir) = test_db();
+        let mut rev = None;
+        let aged = match db
+            .accept_or_get_turn(1, "aged:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
+            .expect("accept aged")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        commit_input(&db, &aged.turn_id, &mut rev);
+        let legacy = match db
+            .accept_or_get_turn(1, "legacy:k", 1, Some("fp"), "h", None, None)
+            .expect("accept legacy")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        commit_input(&db, &legacy.turn_id, &mut rev);
+        let recent = match db
+            .accept_or_get_turn(1, "recent:k", 1, Some("fp"), "h", None, Some(r#"{"y":2}"#))
+            .expect("accept recent")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        commit_input(&db, &recent.turn_id, &mut rev);
+
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE turn_runs SET accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+                params![&aged.turn_id],
+            )
+            .expect("age aged");
+
+        // Act
+        let ids = db.scan_durable_input_committed_turn_ids().expect("scan");
+
+        // Assert: only the aged durable input_committed turn is returned; the
+        // legacy (no request) and recent (inside grace) turns are excluded.
+        assert_eq!(ids, vec![aged.turn_id]);
+    }
+
+    #[test]
+    fn recover_leaves_durable_input_committed_for_dispatcher() {
+        // Arrange: a durably input_committed turn (request persisted) older than
+        // the grace window.
+        let (db, _dir) = test_db();
+        let mut rev = None;
+        let durable = match db
+            .accept_or_get_turn(1, "dur:k", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("accept durable")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        commit_input(&db, &durable.turn_id, &mut rev);
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE turn_runs SET accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+                params![&durable.turn_id],
+            )
+            .expect("age durable");
+
+        // Act
+        db.recover_interrupted_turns().expect("recover");
+
+        // Assert: the durable input_committed turn is left for the dispatcher to
+        // resume (model loop restart), not failed like a legacy one.
+        assert_eq!(
+            db.get_turn_run(&durable.turn_id).expect("get").state,
+            TurnRunState::InputCommitted
         );
     }
 }

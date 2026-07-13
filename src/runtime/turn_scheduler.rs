@@ -644,6 +644,7 @@ mod tests {
 
     fn test_turn(agent_id: &str, origin_id: &str) -> ScheduledTurn {
         ScheduledTurn {
+            turn_id: format!("turn-{agent_id}"),
             context: test_context(agent_id),
             input: "hello".to_string(),
             origin_id: origin_id.to_string(),

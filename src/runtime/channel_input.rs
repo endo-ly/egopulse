@@ -125,6 +125,7 @@ pub(crate) async fn submit_agent_turn(
     submit_scheduled_turn(
         state,
         ScheduledTurn {
+            turn_id: uuid::Uuid::new_v4().to_string(),
             origin_id: context.origin_id.clone(),
             context,
             input,

@@ -34,9 +34,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::agent_loop::ConversationScope;
-use crate::agent_loop::deserialize_scheduled_turn;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
+use crate::agent_loop::{
+    ConversationScope, deserialize_scheduled_turn, resume_input_committed_turn,
+};
 use crate::assets::AssetStore;
 use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
@@ -49,6 +50,7 @@ use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
 use crate::storage::Database;
+use crate::storage::TurnRunState;
 use crate::storage::call_blocking;
 use crate::tools::ToolRegistry;
 
@@ -619,6 +621,7 @@ fn spawn_agent_turn_worker(
                 let channel_log_chat_id = pending.context.channel_log_chat_id;
                 let scope = pending.context.scope;
                 let scheduled = crate::agent_loop::ScheduledTurn {
+                    turn_id: String::new(),
                     context: pending.context,
                     input: pending.input,
                     origin_id: pending.origin_id,
@@ -683,10 +686,17 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
     };
     for &scope in scopes {
         let db = Arc::clone(state.db_for(scope));
-        let ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_accepted_turn_ids())
+        let mut turn_ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_accepted_turn_ids())
             .await
             .map_err(EgoPulseError::from)?;
-        for turn_id in ids {
+        let input_committed = call_blocking(Arc::clone(&db), |db| {
+            db.scan_durable_input_committed_turn_ids()
+        })
+        .await
+        .map_err(EgoPulseError::from)?;
+        turn_ids.extend(input_committed);
+
+        for turn_id in turn_ids {
             let json = match call_blocking(Arc::clone(&db), {
                 let turn_id = turn_id.clone();
                 move |db| {
@@ -699,16 +709,19 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
                 Ok(Some(json)) => json,
                 _ => continue,
             };
-            let turn = match deserialize_scheduled_turn(&json) {
+            let mut turn = match deserialize_scheduled_turn(&json) {
                 Ok(turn) => turn,
                 Err(error) => {
                     tracing::warn!(error = %error, turn_id, "failed to deserialize durable turn");
                     continue;
                 }
             };
-            // Re-enqueue. Bypasses dedupe so the recovered `accepted` turn is
-            // actually scheduled; the executor finds the existing row and
-            // proceeds instead of creating a duplicate.
+            // The dispatcher knows the authoritative `turn_id`; the persisted
+            // payload does not carry it, so stamp it before re-enqueue.
+            turn.turn_id = turn_id.clone();
+            // Re-enqueue. Bypasses dedupe so the recovered turn is actually
+            // scheduled; the executor finds the existing row and proceeds
+            // (accepted) or resumes the model loop (input_committed).
             let _ = channel_input::enqueue_durable_turn(state, turn);
         }
     }
@@ -829,7 +842,24 @@ pub(crate) fn execute_scheduled_turn(
         let started_at = chrono::Utc::now().to_rfc3339();
         let started = std::time::Instant::now();
 
-        let turn_result = execute_turn_with_progress(state, &turn.context, &turn.input).await;
+        // A turn the dispatcher recovered in `input_committed` state must resume
+        // the already-committed model loop, not re-accept/re-persist the input
+        //. A turn still in `accepted` (or any other state) runs the
+        // normal intake+execute path, which finds the existing row and proceeds.
+        let current_state = call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
+            let turn_id = turn.turn_id.clone();
+            move |db| db.get_turn_run(&turn_id).map(|run| run.state)
+        })
+        .await
+        .ok();
+
+        let runtime = state.turn_runtime();
+        let turn_result = match current_state {
+            Some(TurnRunState::InputCommitted) => {
+                resume_input_committed_turn(&runtime, turn.context.scope, &turn.turn_id).await
+            }
+            _ => execute_turn_with_progress(state, &turn.context, &turn.input).await,
+        };
         let duration = started.elapsed().as_secs_f64();
 
         match turn_result {
@@ -1966,6 +1996,7 @@ mod tests {
         context.channel_log_chat_id = Some(log_chat_id);
 
         let turn = ScheduledTurn {
+            turn_id: "turn-1".to_string(),
             context,
             input: "scheduled secret input".to_string(),
             origin_id: uuid::Uuid::new_v4().to_string(),
@@ -2001,6 +2032,108 @@ mod tests {
         assert!(
             !normal_has_reply,
             "normal DB should not contain the secret bot response"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resume_input_committed_turn_restarts_model_loop() {
+        use crate::agent_loop::ScheduledTurn;
+        use crate::agent_loop::resume_input_committed_turn;
+        use crate::agent_loop::serialize_scheduled_turn;
+        use crate::agent_loop::turn::RecordingProvider;
+        use crate::llm::MessagesResponse;
+        use crate::storage::{AcceptOutcome, StoredMessage, TurnRunState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "resumed reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let runtime = state.turn_runtime();
+
+        let mut context = crate::test_util::cli_context("resume-input-committed");
+        context.scope = ConversationScope::Normal;
+        let chat_id = crate::agent_loop::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("resolve chat");
+
+        let input = "resume input".to_string();
+        let scheduled = ScheduledTurn {
+            turn_id: String::new(),
+            context: context.clone(),
+            input: input.clone(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
+
+        let accepted = call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+            let scheduled_json = scheduled_json.clone();
+            move |db| {
+                db.accept_or_get_turn(
+                    chat_id,
+                    "resume-k",
+                    1,
+                    None,
+                    "h",
+                    None,
+                    Some(&scheduled_json),
+                )
+            }
+        })
+        .await
+        .expect("accept");
+        let turn_id = match accepted {
+            AcceptOutcome::Created(run) => run.turn_id,
+            _ => panic!("expected created"),
+        };
+
+        // Drive the turn to input_committed with the deterministic input message
+        // id the resume path validates (`turn:{id}:input`).
+        let mut msg = StoredMessage::user(chat_id, "sender".to_string(), input.clone());
+        msg.id = format!("turn:{turn_id}:input");
+        msg.turn_id = Some(turn_id.clone());
+        call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+            let msg = msg.clone();
+            let turn_id = turn_id.clone();
+            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id)
+        })
+        .await
+        .expect("commit input");
+
+        assert_eq!(
+            call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+                let turn_id = turn_id.clone();
+                move |db| db.get_turn_run(&turn_id).map(|r| r.state)
+            })
+            .await
+            .expect("get state"),
+            TurnRunState::InputCommitted
+        );
+
+        // Act: resume the input_committed turn.
+        let result =
+            resume_input_committed_turn(&runtime, ConversationScope::Normal, &turn_id).await;
+        assert!(result.is_ok(), "resume should succeed: {result:?}");
+
+        // Assert: the model loop ran to completion and the turn is terminal.
+        assert_eq!(
+            call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+                let turn_id = turn_id.clone();
+                move |db| db.get_turn_run(&turn_id).map(|r| r.state)
+            })
+            .await
+            .expect("get final state"),
+            TurnRunState::Completed
         );
     }
 }

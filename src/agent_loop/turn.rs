@@ -9,7 +9,8 @@ use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 
 use crate::agent_loop::session::{
-    PersistedTurn, persist_phase, persist_phase_messages, resolve_chat_id,
+    PersistedTurn, load_messages_for_turn_with_limit, persist_phase, persist_phase_messages,
+    resolve_chat_id,
 };
 use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
@@ -17,7 +18,9 @@ use crate::agent_loop::tool_phase::{
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
     send_tool_phase_request,
 };
-use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
+use crate::agent_loop::{
+    ConversationScope, SurfaceContext, TurnRuntime, deserialize_scheduled_turn,
+};
 use crate::channels::utils::text::truncate_by_chars;
 use crate::error::{EgoPulseError, LlmError, StorageError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
@@ -266,6 +269,158 @@ where
     process_turn_inner(state, context, user_input, EventEmitter::new(on_event)).await
 }
 
+/// Resumes a Turn that previously reached `input_committed` (the user input is
+/// durably persisted) but whose model loop never started — typically because the
+/// runtime crashed before the first model call.
+///
+/// Unlike [`process_turn`], this path does **not** re-accept, re-persist the
+/// user message, or re-run compaction. The input message and session snapshot are
+/// already durable; it reloads the session and restarts the model loop from the
+/// stored snapshot. The `accepted -> input_committed` transition and compaction
+/// are not replayed (§5.14).
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Internal`] when the turn is not resumable. A
+/// permanent validation failure (missing payload, already-published output,
+/// fingerprint drift, missing input message) marks the turn `failed` so the
+/// dispatcher stops retrying it.
+pub(crate) async fn resume_input_committed_turn(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    turn_id: &str,
+) -> Result<String, EgoPulseError> {
+    let turn_id_owned = turn_id.to_string();
+    let run = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.get_turn_run(&turn_id_owned)
+    })
+    .await
+    .map_err(EgoPulseError::from)?;
+
+    // §5.14 validations. A permanent failure marks the turn `failed` so the
+    // dispatcher does not loop forever on an unrecoverable turn.
+    if run.state != TurnRunState::InputCommitted {
+        fail_resume_permanently(
+            state,
+            scope,
+            turn_id,
+            "resume target is not input_committed",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(format!(
+            "resume target turn {turn_id} state is {}",
+            run.state
+        )));
+    }
+    let scheduled_json = match run.scheduled_request_json.clone() {
+        Some(json) => json,
+        None => {
+            fail_resume_permanently(
+                state,
+                scope,
+                turn_id,
+                "resume target has no scheduled request",
+            )
+            .await;
+            return Err(EgoPulseError::Internal(
+                "resume target turn has no scheduled request".to_string(),
+            ));
+        }
+    };
+    if run.output_published {
+        fail_resume_permanently(
+            state,
+            scope,
+            turn_id,
+            "resume target already published output",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(
+            "resume target turn already published output".to_string(),
+        ));
+    }
+
+    let persisted = match deserialize_scheduled_turn(&scheduled_json) {
+        Ok(p) => p,
+        Err(error) => {
+            fail_resume_permanently(state, scope, turn_id, "failed to decode scheduled request")
+                .await;
+            return Err(EgoPulseError::Internal(format!(
+                "failed to decode scheduled request for resume: {error}"
+            )));
+        }
+    };
+    let context = persisted.context;
+
+    // §5.12 / §5.14: the fingerprint fixed at the original acceptance must match
+    // the current Config generation; otherwise the model/prompt would diverge.
+    let snapshot = state.config_manager.current_blocking();
+    if let Some(fp) = &run.config_fingerprint {
+        if !fp.is_empty() && fp != &snapshot.fingerprint {
+            fail_resume_permanently(
+                state,
+                scope,
+                turn_id,
+                "config fingerprint mismatch on resume",
+            )
+            .await;
+            return Err(EgoPulseError::Internal(
+                "config fingerprint mismatch on resume".to_string(),
+            ));
+        }
+    }
+
+    // §5.14: the input message this Turn committed must still exist (and belong
+    // to the Turn via its deterministic id) so the session snapshot is trusted.
+    let input_message_id = format!("turn:{turn_id}:input");
+    let input_exists = call_blocking(Arc::clone(state.db_for(scope)), {
+        let id = input_message_id.clone();
+        move |db| db.get_message_content(&id)
+    })
+    .await
+    .map_err(EgoPulseError::from)?
+    .is_some();
+    if !input_exists {
+        fail_resume_permanently(state, scope, turn_id, "resume target input message missing").await;
+        return Err(EgoPulseError::Internal(
+            "resume target input message is missing".to_string(),
+        ));
+    }
+
+    let executor = TurnExecutor {
+        state,
+        context: &context,
+        on_event: EventEmitter::none(),
+    };
+    executor.resume_run(&persisted.input, &snapshot, &run).await
+}
+
+/// Marks an unrecoverable resume target `failed` so the turn dispatcher stops
+/// retrying a turn that can never be reconstructed.
+async fn fail_resume_permanently(
+    state: &TurnRuntime,
+    scope: ConversationScope,
+    turn_id: &str,
+    reason: &str,
+) {
+    let turn_id = turn_id.to_string();
+    let reason = reason.to_string();
+    let turn_id_for_db = turn_id.clone();
+    let reason_for_db = reason.clone();
+    if let Err(e) = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.fail_turn(
+            &turn_id_for_db,
+            TurnRunState::Failed,
+            "validation",
+            &reason_for_db,
+        )
+    })
+    .await
+    {
+        warn!(error = %e, %turn_id, "failed to mark unrecoverable resume turn as failed");
+    }
+}
+
 async fn process_turn_inner(
     state: &TurnRuntime,
     context: &SurfaceContext,
@@ -374,6 +529,58 @@ impl TurnExecutor<'_> {
                     Err(error)
                 }
             }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Runs the model loop for a Turn that already reached `input_committed`
+    /// before the runtime stopped. Reloads the persisted session snapshot but
+    /// does **not** re-accept, re-persist the user message, or re-run compaction
+    /// (those are already durable). See [`resume_input_committed_turn`].
+    async fn resume_run(
+        &self,
+        user_input: &str,
+        snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
+        turn_run: &TurnRun,
+    ) -> Result<String, EgoPulseError> {
+        self.state.active_turns.begin_turn(&self.context.agent_id);
+        crate::runtime::metrics::inc_turns_total(&self.context.agent_id, &self.context.channel);
+        let _guard = ActiveTurnGuard {
+            state: self.state,
+            agent_id: &self.context.agent_id,
+        };
+        let span = self.turn_span();
+
+        async move {
+            let chat_id = resolve_chat_id(self.state, self.context).await?;
+            let prepared = self
+                .prepare_turn(user_input, &turn_run.turn_id, snapshot)
+                .await?;
+            let prompt_ctx = PromptContext {
+                system_prompt: &prepared.system_prompt,
+                tools_json: prepared.tools_json.as_deref(),
+                has_tools: !prepared.tool_defs.is_empty(),
+            };
+            // Reload the already-committed session snapshot; do NOT re-persist the
+            // user message or re-run compaction (§5.14).
+            let loaded = load_messages_for_turn_with_limit(
+                self.state,
+                self.context.scope,
+                chat_id,
+                snapshot.config.max_history_messages,
+            )
+            .await?;
+            let channel_context_msg = load_channel_context(self.state, self.context).await;
+            self.run_model_loop(
+                turn_run,
+                &prepared,
+                &prompt_ctx,
+                channel_context_msg,
+                loaded.messages,
+                loaded.session_revision,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -2821,6 +3028,7 @@ mod tests {
         let _guard = install_capture_subscriber(&capture);
 
         let turn = crate::agent_loop::ScheduledTurn {
+            turn_id: "turn-1".to_string(),
             context: ctx,
             input: "scheduled turn".to_string(),
             origin_id: uuid::Uuid::new_v4().to_string(),

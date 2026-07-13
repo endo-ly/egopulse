@@ -17,7 +17,9 @@ pub(crate) mod turn_runtime;
 
 pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
-pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
+pub(crate) use turn::{
+    process_turn, process_turn_with_events, resume_input_committed_turn, send_turn,
+};
 pub(crate) use turn_runtime::TurnRuntime;
 
 use crate::error::EgoPulseError;
@@ -42,6 +44,8 @@ pub(crate) struct PendingAgentTurn {
 /// Extends [`PendingAgentTurn`] with origin tracking for runaway prevention.
 #[derive(Debug, Clone)]
 pub(crate) struct ScheduledTurn {
+    /// Stable Turn ID, also the primary key in `turn_runs`.
+    pub turn_id: String,
     /// Surface context identifying the agent session.
     pub context: SurfaceContext,
     /// The input text for this turn.
@@ -120,6 +124,7 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
     let payload: PersistedScheduledTurnV1 = serde_json::from_str(json)
         .map_err(|e| EgoPulseError::Internal(format!("deserialize scheduled turn: {e}")))?;
     Ok(ScheduledTurn {
+        turn_id: String::new(),
         context: payload.context.clone(),
         input: payload.input,
         origin_id: payload.context.origin_id.clone(),
@@ -230,6 +235,7 @@ mod tests {
         );
         context.origin_id = "origin-1".to_string();
         let turn = ScheduledTurn {
+            turn_id: "turn-1".to_string(),
             context,
             input: "hello world".to_string(),
             origin_id: "origin-1".to_string(),
