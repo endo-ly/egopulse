@@ -77,6 +77,16 @@ pub(crate) struct RecoveredTurnRun {
     pub recovered_to: TurnRunState,
 }
 
+/// Per-origin execution count rehydrated from `turn_runs` after a restart.
+/// The in-memory [`crate::runtime::turn_scheduler::TurnTracker`] is
+/// rebuilt from these so a chain that already consumed turns before a crash
+/// keeps its per-chain turn limit instead of resetting to zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredOrigin {
+    pub origin_id: String,
+    pub executed_turn_count: usize,
+}
+
 const TURN_RUN_COLUMNS: &str = "turn_id, chat_id, request_key, state, current_iteration,
     input_message_id, final_message_id, config_revision,
     config_fingerprint, model_request_hash, model_attempt,
@@ -461,6 +471,14 @@ impl Database {
     ///
     /// Allowed from: `input_committed`, `model_completed`, `tools_completed`.
     ///
+    /// This is a true optimistic CAS: the `UPDATE` is conditional on the exact
+    /// state read first, so two executors that both observe `input_committed`
+    /// cannot both move the turn to `model_pending`. This is the execution-right
+    /// boundary — the executor that commits `input_committed ->
+    /// model_pending` first owns the turn; a concurrent duplicate (e.g. a
+    /// recovered `input_committed` turn re-dispatched by the turn dispatcher)
+    /// observes `Ok(false)` and exits without producing output.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError::Conflict`] when the current state cannot start
@@ -470,7 +488,7 @@ impl Database {
         turn_id: &str,
         iteration: i64,
         model_request_hash: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
         let current = read_state_locked(&tx, turn_id)?;
@@ -485,18 +503,29 @@ impl Database {
             )));
         }
         let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
+        let affected = tx.execute(
             "UPDATE turn_runs
              SET state = 'model_pending',
                  current_iteration = ?2,
                  model_request_hash = ?3,
                  model_attempt = 1,
                  updated_at = ?4
-             WHERE turn_id = ?1",
-            params![turn_id, iteration, model_request_hash, &now],
+             WHERE turn_id = ?1 AND state = ?5",
+            params![
+                turn_id,
+                iteration,
+                model_request_hash,
+                &now,
+                current.to_string()
+            ],
         )?;
+        if affected == 0 {
+            // Another executor already transitioned this turn away from
+            // `current`. It owns the turn now; this duplicate must not run.
+            return Ok(false);
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Increments `model_attempt` for an in-place retry of the current
@@ -803,6 +832,43 @@ impl Database {
 
         tx.commit()?;
         Ok(recovered)
+    }
+
+    /// Aggregates per-origin execution counts from `turn_runs` so the in-memory
+    /// `TurnTracker` can be rehydrated after a restart.
+    ///
+    /// Only turns whose `accepted_at` is within `ttl_secs` of now are considered
+    /// (stale chains have been pruned from the live tracker and must not
+    /// resurface). Every turn that has left `accepted` / `input_committed`
+    /// counts toward its origin, because those are exactly the states the turn
+    /// dispatcher re-executes live after startup; counting them here would
+    /// double-count. Once a turn has begun execution it has consumed a slot via
+    /// [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`],
+    /// regardless of how it later terminated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite read fails.
+    pub(crate) fn recover_origin_tracker(
+        &self,
+        ttl_secs: i64,
+    ) -> Result<Vec<RecoveredOrigin>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT origin_id, COUNT(*)
+             FROM turn_runs
+             WHERE origin_id IS NOT NULL
+               AND state NOT IN ('accepted', 'input_committed')
+               AND accepted_at > datetime('now', ?1)
+             GROUP BY origin_id",
+        )?;
+        let rows = stmt.query_map(params![format!("-{ttl_secs} seconds")], |row| {
+            Ok(RecoveredOrigin {
+                origin_id: row.get(0)?,
+                executed_turn_count: row.get::<_, i64>(1)? as usize,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1471,5 +1537,139 @@ mod tests {
             db.get_turn_run(&durable.turn_id).expect("get").state,
             TurnRunState::InputCommitted
         );
+    }
+
+    #[test]
+    fn begin_turn_model_iteration_advances_from_input_committed() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "begin").turn_id;
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
+
+        // Act
+        let advanced = db
+            .begin_turn_model_iteration(&turn_id, 1, "hash-A")
+            .expect("begin");
+
+        // Assert: the model iteration started exactly once.
+        assert!(advanced);
+        assert_eq!(state(&db, &turn_id), TurnRunState::ModelPending);
+    }
+
+    #[test]
+    fn begin_turn_model_iteration_rejects_state_outside_allowed_set() {
+        // Arrange: an accepted turn has not yet committed input, so it is not in
+        // the set of states from which a model iteration may begin.
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "begin-rejected").turn_id;
+
+        // Act
+        let error = db
+            .begin_turn_model_iteration(&turn_id, 1, "hash-A")
+            .expect_err("must reject");
+
+        // Assert: only a terminal-conflict signals an unexpected precondition.
+        assert!(matches!(error, StorageError::Conflict(_)));
+    }
+
+    #[test]
+    fn begin_turn_model_iteration_from_model_completed_resets_and_advances() {
+        // Arrange: a turn that already completed a model phase.
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "begin-reset").turn_id;
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
+        db.begin_turn_model_iteration(&turn_id, 1, "hash-A")
+            .expect("begin");
+        db.complete_turn_model(&turn_id).expect("complete");
+
+        // Act: a second model iteration (e.g. after tool execution) is allowed.
+        let advanced = db
+            .begin_turn_model_iteration(&turn_id, 2, "hash-B")
+            .expect("begin again");
+
+        // Assert: the new attempt started and re-stamped its hash.
+        assert!(advanced);
+        let run = db.get_turn_run(&turn_id).expect("get");
+        assert_eq!(run.state, TurnRunState::ModelPending);
+        assert_eq!(run.model_attempt, 1);
+        assert_eq!(run.model_request_hash.as_deref(), Some("hash-B"));
+    }
+
+    #[test]
+    fn recover_origin_tracker_counts_executed_turns_within_ttl() {
+        // Arrange: ORIG1 has one accepted (excluded), one model_pending and one
+        // failed (both counted), plus a stale completed turn outside the TTL
+        // window (excluded). ORIG2 has a single completed turn (counted).
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        let o1a = accept(&db, "o1a").turn_id;
+        let o1b = accept(&db, "o1b").turn_id;
+        let o1c = accept(&db, "o1c").turn_id;
+        let o2a = accept(&db, "o2a").turn_id;
+        let stale = accept(&db, "stale").turn_id;
+        let conn = db.get_conn().expect("conn");
+        conn.execute(
+            "UPDATE turn_runs SET origin_id = 'ORIG1', state = 'accepted', accepted_at = ?1 WHERE turn_id = ?2",
+            params![now, &o1a],
+        )
+        .expect("set o1a");
+        conn.execute(
+            "UPDATE turn_runs SET origin_id = 'ORIG1', state = 'model_pending', accepted_at = ?1 WHERE turn_id = ?2",
+            params![now, &o1b],
+        )
+        .expect("set o1b");
+        conn.execute(
+            "UPDATE turn_runs SET origin_id = 'ORIG1', state = 'failed', accepted_at = ?1 WHERE turn_id = ?2",
+            params![now, &o1c],
+        )
+        .expect("set o1c");
+        conn.execute(
+            "UPDATE turn_runs SET origin_id = 'ORIG2', state = 'completed', accepted_at = ?1 WHERE turn_id = ?2",
+            params![now, &o2a],
+        )
+        .expect("set o2a");
+        conn.execute(
+            "UPDATE turn_runs SET origin_id = 'ORIG1', state = 'completed', accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+            params![&stale],
+        )
+        .expect("set stale");
+
+        // Act
+        let recovered = db.recover_origin_tracker(3600).expect("recover origins");
+
+        // Assert: accepted and stale turns are excluded; per-origin counts hold.
+        assert_eq!(recovered.len(), 2);
+        let o1 = recovered
+            .iter()
+            .find(|r| r.origin_id == "ORIG1")
+            .expect("ORIG1");
+        assert_eq!(o1.executed_turn_count, 2);
+        let o2 = recovered
+            .iter()
+            .find(|r| r.origin_id == "ORIG2")
+            .expect("ORIG2");
+        assert_eq!(o2.executed_turn_count, 1);
+    }
+
+    #[test]
+    fn recover_origin_tracker_excludes_turns_outside_ttl() {
+        // Arrange: a single completed turn dated far in the past.
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "old").turn_id;
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE turn_runs SET origin_id = 'ORIG1', state = 'completed', accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+                params![&turn_id],
+            )
+            .expect("age");
+
+        // Act: a negative TTL narrows the window so the past turn is excluded.
+        let recovered = db.recover_origin_tracker(-1).expect("recover origins");
+
+        // Assert
+        assert!(recovered.is_empty());
     }
 }

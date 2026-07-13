@@ -418,6 +418,11 @@ pub async fn build_app_state_with_path(
     // Running Tools become uncertain, and interrupted turn_runs stop safely.
     recover_durable_state(&state).await;
 
+    // Rehydrate the per-origin turn tracker from `turn_runs` so a chain that had
+    // already consumed turns before the crash keeps its per-chain limit.
+    // Must run before the turn dispatcher starts.
+    rehydrate_origin_tracker(&state);
+
     // Own long-lived background tasks through the supervisor so their lifetime
     // and shutdown are centrally managed.
     let mcp_arc = state
@@ -496,6 +501,37 @@ fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, scope = %scope, "turn_runs recovery failed"),
+    }
+}
+
+/// Rehydrates the in-memory `TurnTracker` from `turn_runs` after a restart,
+/// so per-chain turn limits and chain-depth guards survive crashes.
+/// Runs against both the primary and (when present) secret databases.
+fn rehydrate_origin_tracker(state: &AppState) {
+    let ttl_secs = turn_scheduler::ORIGIN_TTL.as_secs() as i64;
+    rehydrate_origin_tracker_for_db(state, &state.db, ConversationScope::Normal, ttl_secs);
+    if let Some(secret_db) = &state.secret_db {
+        rehydrate_origin_tracker_for_db(state, secret_db, ConversationScope::Secret, ttl_secs);
+    }
+}
+
+fn rehydrate_origin_tracker_for_db(
+    state: &AppState,
+    db: &Arc<Database>,
+    scope: ConversationScope,
+    ttl_secs: i64,
+) {
+    match db.as_ref().recover_origin_tracker(ttl_secs) {
+        Ok(origins) if !origins.is_empty() => {
+            tracing::info!(
+                scope = %scope,
+                count = origins.len(),
+                "rehydrated origin tracker from turn_runs"
+            );
+            state.turn_tracker.rehydrate_executed(&origins);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, scope = %scope, "origin tracker rehydration failed"),
     }
 }
 
@@ -661,12 +697,20 @@ fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
             Criticality::Critical,
         ),
         async move {
+            // Turn ids already submitted by this process. The dispatcher scans
+            // every 5s and a turn stays `accepted` / `input_committed` for the
+            // whole duration of its (slow) model loop, so a naive scan would
+            // re-submit the same turn on every tick. The CAS guard in the
+            // executor makes a duplicate submission harmless, but tracking here
+            // avoids the wasted re-enqueue entirely.
+            let mut dispatched: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
-                if let Err(error) = dispatch_durable_turns(&state).await {
+                if let Err(error) = dispatch_durable_turns(&state, &mut dispatched).await {
                     tracing::warn!(error = %error, "turn dispatcher scan failed");
                 }
             }
@@ -678,7 +722,11 @@ fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
 /// Re-enqueues any durably accepted turns found in the databases. Each is
 /// rebuilt from its persisted request and re-submitted; the executor re-accepts
 /// the existing row idempotently, so a turn already running is a no-op.
-async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
+/// `dispatched` de-duplicates across scan ticks within this process lifetime.
+async fn dispatch_durable_turns(
+    state: &AppState,
+    dispatched: &mut std::collections::HashSet<String>,
+) -> Result<(), EgoPulseError> {
     let scopes: &[ConversationScope] = if state.secret_db.is_some() {
         &[ConversationScope::Normal, ConversationScope::Secret]
     } else {
@@ -697,6 +745,9 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
         turn_ids.extend(input_committed);
 
         for turn_id in turn_ids {
+            if !dispatched.insert(turn_id.clone()) {
+                continue;
+            }
             let json = match call_blocking(Arc::clone(&db), {
                 let turn_id = turn_id.clone();
                 move |db| {
@@ -912,6 +963,16 @@ pub(crate) fn execute_scheduled_turn(
                 }
             }
             Err(error) => {
+                // A duplicate executor (recovered `input_committed` turn
+                // re-dispatched by the dispatcher, or a duplicate delivery) lost
+                // the `input_committed -> model_pending` CAS. Another executor
+                // owns the turn; exit cleanly without a failure message, without
+                // terminating the origin chain, and without marking the turn
+                // terminal. Just release the session slot.
+                if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
+                    drain_next_queued_turn(state, &session_key).await;
+                    return;
+                }
                 state.runtime_status.push_turn(
                     &turn.context.trace_id,
                     &turn.context.agent_id,

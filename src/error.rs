@@ -38,6 +38,12 @@ pub enum EgoPulseError {
     RuntimeAlreadyRunning(String),
     #[error("internal_error: {0}")]
     Internal(String),
+    /// A turn was already being executed by another executor when this one
+    /// tried to begin. This is a benign, expected race (e.g. a recovered turn
+    /// re-dispatched by the turn dispatcher, or a duplicate delivery) and must
+    /// NOT be surfaced as a turn failure or mark the turn terminal.
+    #[error("turn already claimed by another executor")]
+    TurnConcurrencyConflict,
 }
 
 impl EgoPulseError {
@@ -55,6 +61,7 @@ impl EgoPulseError {
             Self::SetupWizard(_) => "setup",
             Self::ShutdownRequested => "shutdown",
             Self::RuntimeAlreadyRunning(_) => "instance_lock",
+            Self::TurnConcurrencyConflict => "concurrency",
             Self::Internal(_) => "internal",
         }
     }

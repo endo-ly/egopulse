@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent_loop::ScheduledTurn;
 use crate::runtime::metrics;
+use crate::storage::RecoveredOrigin;
 
 /// In-flight turn tracker used by the sleep scheduler to defer scheduled
 /// batches while an agent is actively processing a conversation turn.
@@ -424,6 +425,35 @@ impl TurnTracker {
         origins
             .get(origin_id)
             .and_then(|s| s.terminal_reason.clone())
+    }
+
+    /// Rehydrates per-origin execution counts from a prior process.
+    ///
+    /// Called once at startup before the turn dispatcher begins, so a chain
+    /// that had already consumed turns before a crash keeps its per-chain turn
+    /// limit enforced instead of resetting to zero. `accepted` / `input_committed`
+    /// turns are not included in the counts (see
+    /// [`crate::storage::Database::recover_origin_tracker`]); the dispatcher
+    /// re-executes them after startup and they increment the count live via
+    /// [`TurnTracker::try_begin_execution`].
+    pub(crate) fn rehydrate_executed(&self, origins: &[RecoveredOrigin]) {
+        if origins.is_empty() {
+            return;
+        }
+        let mut map = self.origins.lock().expect("turn_tracker lock");
+        let now = self.clock.now();
+        for recovered in origins {
+            let state = map
+                .entry(recovered.origin_id.clone())
+                .or_insert(OriginState {
+                    executed_turn_count: 0,
+                    pending_reservations: 0,
+                    terminal_reason: None,
+                    last_touched: now,
+                });
+            state.executed_turn_count = recovered.executed_turn_count;
+            state.last_touched = now;
+        }
     }
 
     /// Removes origins whose `last_touched` is older than [`ORIGIN_TTL`].
@@ -1122,5 +1152,29 @@ mod tests {
         assert!(!tracker.is_active("agent-b"), "other agent unaffected");
         tracker.end_turn("agent-a");
         assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn rehydrate_executed_restores_per_origin_count_after_restart() {
+        // Arrange: a fresh tracker has no memory of prior executions.
+        let tracker = TurnTracker::new();
+        assert_eq!(tracker.executed_count("ORIG1"), 0);
+
+        // Act: rehydrate counts recovered from durable state at startup.
+        let origins = vec![
+            RecoveredOrigin {
+                origin_id: "ORIG1".to_string(),
+                executed_turn_count: 3,
+            },
+            RecoveredOrigin {
+                origin_id: "ORIG2".to_string(),
+                executed_turn_count: 1,
+            },
+        ];
+        tracker.rehydrate_executed(&origins);
+
+        // Assert: per-origin limits resume from the recovered counts.
+        assert_eq!(tracker.executed_count("ORIG1"), 3);
+        assert_eq!(tracker.executed_count("ORIG2"), 1);
     }
 }

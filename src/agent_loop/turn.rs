@@ -277,7 +277,7 @@ where
 /// user message, or re-run compaction. The input message and session snapshot are
 /// already durable; it reloads the session and restarts the model loop from the
 /// stored snapshot. The `accepted -> input_committed` transition and compaction
-/// are not replayed (§5.14).
+/// are not replayed on resume.
 ///
 /// # Errors
 ///
@@ -297,20 +297,17 @@ pub(crate) async fn resume_input_committed_turn(
     .await
     .map_err(EgoPulseError::from)?;
 
-    // §5.14 validations. A permanent failure marks the turn `failed` so the
+    // Resume validations. A permanent failure marks the turn `failed` so the
     // dispatcher does not loop forever on an unrecoverable turn.
     if run.state != TurnRunState::InputCommitted {
-        fail_resume_permanently(
-            state,
-            scope,
-            turn_id,
-            "resume target is not input_committed",
-        )
-        .await;
-        return Err(EgoPulseError::Internal(format!(
-            "resume target turn {turn_id} state is {}",
-            run.state
-        )));
+        // The turn is no longer in `input_committed`. The only benign case is a
+        // concurrent executor (the duplicate resume the dispatcher re-dispatched,
+        // or a live turn that already advanced) — it owns the turn now, so this
+        // duplicate exits without producing output or marking the turn failed.
+        // Any state other than `input_committed` here is expected to be another
+        // executor's progress, not a corruption, because the dispatcher only
+        // routes `input_committed` turns to this path.
+        return Err(EgoPulseError::TurnConcurrencyConflict);
     }
     let scheduled_json = match run.scheduled_request_json.clone() {
         Some(json) => json,
@@ -352,8 +349,8 @@ pub(crate) async fn resume_input_committed_turn(
     };
     let context = persisted.context;
 
-    // §5.12 / §5.14: the fingerprint fixed at the original acceptance must match
-    // the current Config generation; otherwise the model/prompt would diverge.
+    // The fingerprint fixed at the original acceptance must match the current
+    // Config generation; otherwise the model/prompt would diverge.
     let snapshot = state.config_manager.current_blocking();
     if let Some(fp) = &run.config_fingerprint {
         if !fp.is_empty() && fp != &snapshot.fingerprint {
@@ -370,7 +367,7 @@ pub(crate) async fn resume_input_committed_turn(
         }
     }
 
-    // §5.14: the input message this Turn committed must still exist (and belong
+    // The input message this Turn committed must still exist (and belong
     // to the Turn via its deterministic id) so the session snapshot is trusted.
     let input_message_id = format!("turn:{turn_id}:input");
     let input_exists = call_blocking(Arc::clone(state.db_for(scope)), {
@@ -563,7 +560,7 @@ impl TurnExecutor<'_> {
                 has_tools: !prepared.tool_defs.is_empty(),
             };
             // Reload the already-committed session snapshot; do NOT re-persist the
-            // user message or re-run compaction (§5.14).
+            // user message or re-run compaction.
             let loaded = load_messages_for_turn_with_limit(
                 self.state,
                 self.context.scope,
@@ -1504,7 +1501,7 @@ async fn send_model_request_with_retry(
     );
     let turn_id = turn.turn_id.clone();
     let hash_for_init = hash.clone();
-    call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+    let advanced = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
         db.begin_turn_model_iteration(&turn_id, iteration as i64, &hash_for_init)
     })
     .await
@@ -1512,6 +1509,15 @@ async fn send_model_request_with_retry(
         error: EgoPulseError::from(e),
         output_published: false,
     })?;
+    if !advanced {
+        // Another executor already began this iteration (the `input_committed ->
+        // model_pending` CAS lost the race). This duplicate execution must exit
+        // without producing output or marking the turn failed.
+        return Err(ModelRequestError {
+            error: EgoPulseError::TurnConcurrencyConflict,
+            output_published: false,
+        });
+    }
 
     let output_published = Arc::new(AtomicBool::new(false));
     for attempt in 1..=MAX_LLM_RETRIES {
