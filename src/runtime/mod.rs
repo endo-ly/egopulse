@@ -17,10 +17,10 @@ pub(crate) use channel_input::{
     ChannelLogKey, HumanChannelLogMessage, build_channel_context, channel_scope_from_secret,
     store_human_channel_log_message, submit_agent_turn,
 };
-pub(crate) use supervisor::InstanceGuard;
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use supervisor::Criticality;
+pub(crate) use supervisor::InstanceGuard;
 pub(crate) use supervisor::RuntimeSupervisor;
 pub(crate) use supervisor::TaskKind;
 pub(crate) use supervisor::TaskSpec;
@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::agent_loop::ConversationScope;
+use crate::agent_loop::deserialize_scheduled_turn;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
@@ -48,6 +49,7 @@ use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
 use crate::storage::Database;
+use crate::storage::call_blocking;
 use crate::tools::ToolRegistry;
 
 /// Holds the shared runtime dependencies used across all channels.
@@ -440,6 +442,8 @@ pub async fn build_app_state_with_path(
         state.supervisor.shutdown_token(),
     );
 
+    spawn_turn_dispatcher(state.clone(), state.supervisor.shutdown_token());
+
     Ok(state)
 }
 
@@ -621,7 +625,7 @@ fn spawn_agent_turn_worker(
                 };
 
                 if let turn_scheduler::SubmitOutcome::Rejected(reason) =
-                    channel_input::submit_scheduled_turn(&state, scheduled)
+                    channel_input::submit_scheduled_turn(&state, scheduled).await
                 {
                     // Log + metric are already recorded centrally in the submit
                     // path; store a system event so the async rejection surfaces in
@@ -640,6 +644,75 @@ fn spawn_agent_turn_worker(
             Ok(())
         },
     );
+}
+
+/// Spawns the turn dispatcher: a long-lived supervisor task that periodically
+/// scans both databases for durably accepted turns (request persisted but never
+/// started) and re-submits them so a crash before execution is fully recovered
+fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
+    let supervisor = Arc::clone(&state.supervisor);
+    supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::TurnDispatcher,
+            "turn-dispatcher",
+            Criticality::Critical,
+        ),
+        async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                if let Err(error) = dispatch_durable_turns(&state).await {
+                    tracing::warn!(error = %error, "turn dispatcher scan failed");
+                }
+            }
+            Ok(())
+        },
+    );
+}
+
+/// Re-enqueues any durably accepted turns found in the databases. Each is
+/// rebuilt from its persisted request and re-submitted; the executor re-accepts
+/// the existing row idempotently, so a turn already running is a no-op.
+async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
+    let scopes: &[ConversationScope] = if state.secret_db.is_some() {
+        &[ConversationScope::Normal, ConversationScope::Secret]
+    } else {
+        &[ConversationScope::Normal]
+    };
+    for &scope in scopes {
+        let db = Arc::clone(state.db_for(scope));
+        let ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_accepted_turn_ids())
+            .await
+            .map_err(EgoPulseError::from)?;
+        for turn_id in ids {
+            let json = match call_blocking(Arc::clone(&db), {
+                let turn_id = turn_id.clone();
+                move |db| {
+                    db.get_turn_run(&turn_id)
+                        .map(|run| run.scheduled_request_json)
+                }
+            })
+            .await
+            {
+                Ok(Some(json)) => json,
+                _ => continue,
+            };
+            let turn = match deserialize_scheduled_turn(&json) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    tracing::warn!(error = %error, turn_id, "failed to deserialize durable turn");
+                    continue;
+                }
+            };
+            // Re-enqueue. Bypasses dedupe so the recovered `accepted` turn is
+            // actually scheduled; the executor finds the existing row and
+            // proceeds instead of creating a duplicate.
+            let _ = channel_input::enqueue_durable_turn(state, turn);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn execute_scheduled_turn(

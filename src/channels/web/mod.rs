@@ -1288,28 +1288,33 @@ mod tests {
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         });
 
-        let post = || {
+        // Each post carries a distinct `event_id` so it is a distinct message
+        // (not a duplicate delivery). The durable intake dedupes identical
+        // request keys, so the queue-full path must be exercised with distinct
+        // messages rather than repeated identical ones.
+        let post = |event_id: u64| {
             app.clone().oneshot(
                 Request::post("/api/webhooks/egograph")
                     .header(header::AUTHORIZATION, "Bearer egograph-secret")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(format!("{{\"event_id\":{event_id}}}")))
                     .expect("request"),
             )
         };
 
         // First request starts the turn; the blocking provider keeps it busy.
-        let started = post().await.expect("response");
+        let started = post(0).await.expect("response");
         assert_eq!(started.status(), StatusCode::ACCEPTED);
 
         // Fill the per-session queue up to the limit; each is accepted (202).
-        for _ in 0..crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {
-            let resp = post().await.expect("response");
+        for i in 1..=crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {
+            let resp = post(i as u64).await.expect("response");
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
         }
 
-        // The next request exceeds the per-session queue limit → 429, not 202.
-        let rejected = post().await.expect("response");
+        // The next distinct request exceeds the per-session queue limit → 429,
+        // not 202.
+        let rejected = post(9999).await.expect("response");
         assert_ne!(rejected.status(), StatusCode::ACCEPTED);
         assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
         let bytes = to_bytes(rejected.into_body(), 1024)

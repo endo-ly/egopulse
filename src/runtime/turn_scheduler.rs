@@ -120,6 +120,10 @@ pub(crate) enum RejectReason {
     /// progress). Refused at acceptance so external callers learn the runtime
     /// is draining instead of accepting work it cannot start.
     Shutdown,
+    /// The durable accept (persisting the request to `turn_runs`) failed, so
+    /// the turn cannot be made crash-safe. Refused at acceptance so the caller
+    /// can retry instead of accepting work that may be lost on crash.
+    Internal,
 }
 
 impl RejectReason {
@@ -132,6 +136,7 @@ impl RejectReason {
             Self::OriginTrackerFull => "tracker_full",
             Self::ChainTerminated => "chain_terminated",
             Self::Shutdown => "shutdown",
+            Self::Internal => "internal",
         }
     }
 
@@ -147,6 +152,7 @@ impl RejectReason {
             Self::OriginTrackerFull => "origin turn tracker is at capacity",
             Self::ChainTerminated => "turn chain already terminated",
             Self::Shutdown => "runtime is shutting down",
+            Self::Internal => "internal error during turn acceptance",
         }
     }
 }

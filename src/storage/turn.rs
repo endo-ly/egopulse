@@ -300,6 +300,33 @@ impl Database {
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
     }
 
+    /// Returns the IDs of Turns that were durably accepted (their full request
+    /// is persisted in `scheduled_request_json`) but never started execution.
+    ///
+    /// The turn dispatcher polls this after a crash to re-enqueue turns that the
+    /// previous process accepted but lost before execution. A
+    /// short grace window (`accepted_at` older than 2s) keeps the live intake
+    /// path from racing the dispatcher on a turn it is about to start itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite read fails.
+    pub(crate) fn scan_durable_accepted_turn_ids(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT turn_id
+             FROM turn_runs
+             WHERE state = 'accepted'
+               AND scheduled_request_json IS NOT NULL
+               AND accepted_at < datetime('now', '-2 seconds')
+             ORDER BY accepted_at ASC",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Validates `from -> to` against the central transition rule and, if
     /// allowed, advances the row. The expected `from` makes the transition
     /// optimistic: a mismatch (concurrent writer or unexpected state) is
@@ -628,11 +655,13 @@ impl Database {
             chat_id: i64,
             state: String,
             request_payload_hash: Option<String>,
+            scheduled_request_json: Option<String>,
         }
 
         let interrupted: Vec<InterruptedRow> = {
             let mut stmt = tx.prepare(
-                "SELECT turn_id, chat_id, state, request_payload_hash
+                "SELECT turn_id, chat_id, state, request_payload_hash,
+                        scheduled_request_json
                  FROM turn_runs
                  WHERE state IN (
                      'accepted', 'input_committed', 'model_pending',
@@ -645,6 +674,7 @@ impl Database {
                     chat_id: row.get(1)?,
                     state: row.get(2)?,
                     request_payload_hash: row.get(3)?,
+                    scheduled_request_json: row.get(4)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -656,6 +686,16 @@ impl Database {
                 .state
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
+
+            // A durably accepted turn (its full request is persisted) is left
+            // for the turn dispatcher to resume after startup instead of being
+            // failed here: the request can be rebuilt and re-executed safely
+            //. Legacy `accepted` turns without a persisted request
+            // (direct-execution paths) still fall through to the fail-stop
+            // branch below.
+            if from == TurnRunState::Accepted && row.scheduled_request_json.is_some() {
+                continue;
+            }
 
             // Fail-stop recovery: every non-terminal turn is terminated on
             // startup. `accepted` / `input_committed` never published any
@@ -750,7 +790,15 @@ mod tests {
 
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
-            .accept_or_get_turn(1, request_key, 1, Some("abc123"), "payload-hash", None, None)
+            .accept_or_get_turn(
+                1,
+                request_key,
+                1,
+                Some("abc123"),
+                "payload-hash",
+                None,
+                None,
+            )
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -1243,5 +1291,68 @@ mod tests {
         // never started is always failed so the user can safely retry.
         assert_eq!(recovered.len(), 1);
         assert_eq!(state(&db, &turn_id), TurnRunState::Failed);
+    }
+
+    #[test]
+    fn scan_durable_accepted_excludes_legacy_and_recent() {
+        // Arrange: one durable-accepted turn (request persisted) and one legacy
+        // accepted turn (no persisted request).
+        let (db, _dir) = test_db();
+        let durable = match db
+            .accept_or_get_turn(1, "durable:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
+            .expect("accept durable")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        db.accept_or_get_turn(1, "legacy:k", 1, Some("fp"), "h", None, None)
+            .expect("accept legacy");
+
+        // Age the durable row past the dispatcher's grace window so the scan
+        // would pick it up.
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE turn_runs SET accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+                params![&durable.turn_id],
+            )
+            .expect("age durable");
+
+        // Act
+        let ids = db.scan_durable_accepted_turn_ids().expect("scan");
+
+        // Assert: only the durable turn is returned; the legacy one is excluded.
+        assert_eq!(ids, vec![durable.turn_id]);
+    }
+
+    #[test]
+    fn recover_leaves_durable_accepted_for_dispatcher() {
+        // Arrange: a durably accepted turn (request persisted) older than the
+        // grace window.
+        let (db, _dir) = test_db();
+        let durable = match db
+            .accept_or_get_turn(1, "dur:k", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("accept durable")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE turn_runs SET accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
+                params![&durable.turn_id],
+            )
+            .expect("age durable");
+
+        // Act
+        db.recover_interrupted_turns().expect("recover");
+
+        // Assert: the durable accepted turn is left for the dispatcher to resume,
+        // not failed like a legacy accepted turn.
+        assert_eq!(
+            db.get_turn_run(&durable.turn_id).expect("get").state,
+            TurnRunState::Accepted
+        );
     }
 }

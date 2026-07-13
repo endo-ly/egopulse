@@ -40,8 +40,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use futures_util::future::FutureExt;
 use fs2::FileExt;
+use futures_util::future::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -61,6 +61,7 @@ const DEFAULT_TASK_DRAIN_SECS: u64 = 15;
 pub(crate) enum TaskKind {
     Channel,
     AgentTurnWorker,
+    TurnDispatcher,
     McpReconnect,
     SleepScheduler,
     PulseScheduler,
@@ -72,6 +73,7 @@ impl TaskKind {
         match self {
             Self::Channel => "channel",
             Self::AgentTurnWorker => "agent_turn_worker",
+            Self::TurnDispatcher => "turn_dispatcher",
             Self::McpReconnect => "mcp_reconnect",
             Self::SleepScheduler => "sleep_scheduler",
             Self::PulseScheduler => "pulse_scheduler",
@@ -702,7 +704,10 @@ impl InstanceGuard {
                 ))
             }
         })?;
-        Ok(Arc::new(Self { file, path: lock_path }))
+        Ok(Arc::new(Self {
+            file,
+            path: lock_path,
+        }))
     }
 
     /// Acquires the exclusive instance lock on the exact `lock_path` given.
@@ -791,7 +796,8 @@ mod instance_guard_tests {
     #[test]
     fn supervisor_reports_held_instance_lock() {
         let guard = InstanceGuard::acquire(TempDir::new().unwrap().path()).unwrap();
-        let supervisor = RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
+        let supervisor =
+            RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
         assert!(supervisor.instance_lock_held());
         assert!(supervisor.instance_lock_path().is_some());
 

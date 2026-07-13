@@ -20,6 +20,8 @@ pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 pub(crate) use turn_runtime::TurnRuntime;
 
+use crate::error::EgoPulseError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -81,12 +83,55 @@ pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> S
     format!("{:x}", hasher.finalize())
 }
 
+/// Durable serialization of a [`ScheduledTurn`] for crash-safe persistence.
+///
+/// Stored as `turn_runs.scheduled_request_json`. On restart the turn dispatcher
+/// rebuilds the `ScheduledTurn` from this payload so an `accepted` turn can
+/// resume even if the process crashed before execution began.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PersistedScheduledTurnV1 {
+    /// Surface context identifying the agent session.
+    pub context: SurfaceContext,
+    /// The input text for this turn.
+    pub input: String,
+}
+
+/// Serializes a [`ScheduledTurn`] for durable persistence.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Internal`] when JSON serialization fails.
+pub(crate) fn serialize_scheduled_turn(turn: &ScheduledTurn) -> Result<String, EgoPulseError> {
+    let payload = PersistedScheduledTurnV1 {
+        context: turn.context.clone(),
+        input: turn.input.clone(),
+    };
+    serde_json::to_string(&payload)
+        .map_err(|e| EgoPulseError::Internal(format!("serialize scheduled turn: {e}")))
+}
+
+/// Rebuilds a [`ScheduledTurn`] from its durable persisted payload.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Internal`] when JSON deserialization fails or the
+/// payload is malformed.
+pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, EgoPulseError> {
+    let payload: PersistedScheduledTurnV1 = serde_json::from_str(json)
+        .map_err(|e| EgoPulseError::Internal(format!("deserialize scheduled turn: {e}")))?;
+    Ok(ScheduledTurn {
+        context: payload.context.clone(),
+        input: payload.input,
+        origin_id: payload.context.origin_id.clone(),
+    })
+}
+
 /// The storage boundary a conversation belongs to.
 ///
 /// Determines which database and archive root are used for persistence.
 /// `Normal` routes to the primary `egopulse.db`; `Secret` routes to the
 /// isolated `secret.db` and `secret_groups` archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ConversationScope {
     /// Default scope — persists to `egopulse.db` and `runtime/groups`.
     Normal,
@@ -103,7 +148,7 @@ impl std::fmt::Display for ConversationScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Identifies the external conversation surface mapped to a persisted session.
 pub(crate) struct SurfaceContext {
     pub channel: String,
@@ -172,6 +217,34 @@ impl SurfaceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_turn_serializes_and_deserializes() {
+        // Arrange
+        let mut context = SurfaceContext::new(
+            "discord".to_string(),
+            "alice".to_string(),
+            "123".to_string(),
+            "discord".to_string(),
+            "dev".to_string(),
+        );
+        context.origin_id = "origin-1".to_string();
+        let turn = ScheduledTurn {
+            context,
+            input: "hello world".to_string(),
+            origin_id: "origin-1".to_string(),
+        };
+
+        // Act
+        let json = serialize_scheduled_turn(&turn).expect("serialize");
+        let back = deserialize_scheduled_turn(&json).expect("deserialize");
+
+        // Assert: round-trip preserves input, origin, and surface context.
+        assert_eq!(back.input, "hello world");
+        assert_eq!(back.origin_id, "origin-1");
+        assert_eq!(back.context.channel, "discord");
+        assert_eq!(back.context.agent_id, "dev");
+    }
 
     #[test]
     fn new_assigns_all_fields() {

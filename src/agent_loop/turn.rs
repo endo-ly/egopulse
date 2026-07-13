@@ -416,6 +416,7 @@ impl TurnExecutor<'_> {
         match run {
             AcceptOutcome::Created(run) => Ok(TurnAcceptance::Proceed(Box::new(run))),
             AcceptOutcome::Existing(run) => match run.state {
+                TurnRunState::Accepted => Ok(TurnAcceptance::Proceed(Box::new(run))),
                 TurnRunState::Completed => {
                     let final_message_id = run.final_message_id.clone().ok_or_else(|| {
                         EgoPulseError::Internal(
