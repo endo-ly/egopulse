@@ -46,6 +46,16 @@ pub(crate) struct TurnRun {
     pub updated_at: String,
     pub finished_at: Option<String>,
     pub request_payload_hash: Option<String>,
+    /// Serialized accepted request ([`crate::agent_loop::PersistedScheduledTurnV1`]),
+    /// present once the turn has been durably accepted. Lets a restarted runtime
+    /// rebuild the `SurfaceContext` without re-delivering the platform event.
+    pub scheduled_request_json: Option<String>,
+    /// Origin chain id tracking every turn caused by one human input
+    /// (`agent_send` cascade). Equals `turn_id` for a root turn.
+    pub origin_id: Option<String>,
+    /// Terminal reason recorded when the origin chain stopped early (e.g. chain
+    /// depth or turn-count limit). `None` while the chain is active.
+    pub origin_stop_reason: Option<String>,
 }
 
 /// Outcome of [`Database::accept_or_get_turn`].
@@ -71,7 +81,8 @@ const TURN_RUN_COLUMNS: &str = "turn_id, chat_id, request_key, state, current_it
     input_message_id, final_message_id, config_revision,
     config_fingerprint, model_request_hash, model_attempt,
     output_published, error_kind, error_message, accepted_at,
-    updated_at, finished_at, request_payload_hash";
+    updated_at, finished_at, request_payload_hash,
+    scheduled_request_json, origin_id, origin_stop_reason";
 
 /// Loads and parses the current state of a Turn inside a transaction.
 /// Returns [`StorageError::NotFound`] when the row is missing, or
@@ -166,6 +177,9 @@ fn read_turn_run(
                 updated_at: row.get(15)?,
                 finished_at: row.get(16)?,
                 request_payload_hash: row.get(17)?,
+                scheduled_request_json: row.get(18)?,
+                origin_id: row.get(19)?,
+                origin_stop_reason: row.get(20)?,
             })
         })
         .optional()?;
@@ -190,6 +204,7 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite write fails.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_or_get_turn(
         &self,
         chat_id: i64,
@@ -197,17 +212,25 @@ impl Database {
         config_revision: i64,
         config_fingerprint: Option<&str>,
         request_payload_hash: &str,
+        origin_id: Option<&str>,
+        scheduled_request_json: Option<&str>,
     ) -> Result<AcceptOutcome, StorageError> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
         let proposed_turn_id = uuid::Uuid::new_v4().to_string();
+        // A root turn (no incoming origin) uses its own turn_id as the origin so
+        // every turn in the chain shares one identity.
+        let persisted_origin_id = origin_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&proposed_turn_id);
         tx.execute(
             "INSERT INTO turn_runs
                  (turn_id, chat_id, request_key, state, config_revision,
-                  config_fingerprint, request_payload_hash, accepted_at, updated_at)
-             VALUES (?1, ?2, ?3, 'accepted', ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(chat_id, request_key) DO NOTHING",
+                  config_fingerprint, request_payload_hash, accepted_at, updated_at,
+                  scheduled_request_json, origin_id)
+              VALUES (?1, ?2, ?3, 'accepted', ?4, ?5, ?6, ?7, ?7, ?8, ?9)
+              ON CONFLICT(chat_id, request_key) DO NOTHING",
             params![
                 &proposed_turn_id,
                 chat_id,
@@ -216,6 +239,8 @@ impl Database {
                 config_fingerprint,
                 request_payload_hash,
                 &now,
+                scheduled_request_json,
+                persisted_origin_id,
             ],
         )?;
 
@@ -725,7 +750,7 @@ mod tests {
 
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
-            .accept_or_get_turn(1, request_key, 1, Some("abc123"), "payload-hash")
+            .accept_or_get_turn(1, request_key, 1, Some("abc123"), "payload-hash", None, None)
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -864,7 +889,7 @@ mod tests {
 
         // Act: re-accept the same request_key with any payload hash.
         let outcome = db
-            .accept_or_get_turn(1, "legacy:key", 1, Some("abc123"), "new-hash")
+            .accept_or_get_turn(1, "legacy:key", 1, Some("abc123"), "new-hash", None, None)
             .expect("accept");
 
         // Assert: a NULL stored hash is legacy data, so it is accepted as

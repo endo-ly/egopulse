@@ -305,7 +305,7 @@ impl TurnExecutor<'_> {
             let snapshot = self.state.config_manager.current_blocking();
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = self.resolve_request_key();
-            let payload_hash = payload_hash(user_input);
+            let payload_hash = crate::agent_loop::canonical_request_hash(self.context, user_input);
             let acceptance = self
                 .accept_turn(chat_id, &request_key, &payload_hash, &snapshot)
                 .await?;
@@ -399,6 +399,7 @@ impl TurnExecutor<'_> {
         let payload_hash = payload_hash.to_string();
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
+        let origin_id = self.context.origin_id.clone();
         let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
             db.accept_or_get_turn(
                 chat_id,
@@ -406,6 +407,8 @@ impl TurnExecutor<'_> {
                 config_revision,
                 Some(&config_fingerprint),
                 &payload_hash,
+                Some(&origin_id),
+                None,
             )
         })
         .await?;
@@ -1364,16 +1367,6 @@ async fn send_model_request_with_retry(
 /// conversation messages, and tool definitions. Stored as
 /// `turn_runs.model_request_hash` so a retry or recovery can verify the same
 /// request is being re-sent.
-/// SHA-256 of the raw user input text. Anchors `turn_runs.request_payload_hash`
-/// so a re-delivery under the same `request_key` is rejected when the message
-/// content differs.
-fn payload_hash(user_input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(user_input.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 fn model_request_hash(
     system_prompt: &str,
     messages: &[Message],
@@ -3564,7 +3557,7 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash = super::payload_hash("hello");
+        let payload_hash = crate::agent_loop::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(
@@ -3640,7 +3633,7 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash = super::payload_hash("hello");
+        let payload_hash = crate::agent_loop::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(

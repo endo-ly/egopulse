@@ -20,6 +20,9 @@ pub use turn::ask_in_session;
 pub(crate) use turn::{process_turn, process_turn_with_events, send_turn};
 pub(crate) use turn_runtime::TurnRuntime;
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
 /// A pending turn to be executed for a target agent, enqueued by `agent_send`.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingAgentTurn {
@@ -50,6 +53,32 @@ impl ScheduledTurn {
     pub(crate) fn session_key(&self) -> String {
         self.context.session_key()
     }
+}
+
+/// Computes the canonical request hash from the full surface context and input
+///. The hash is independent of JSON field order or whitespace, so
+/// the same logical request always produces the same digest. `origin_id`,
+/// `request_key`, and `trace_id` are excluded: they are identity/routing values,
+/// not part of the request content.
+pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> String {
+    let mut map: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    map.insert("version", serde_json::json!(1u32));
+    map.insert("channel", serde_json::json!(context.channel));
+    map.insert("surface_user", serde_json::json!(context.surface_user));
+    map.insert("surface_thread", serde_json::json!(context.surface_thread));
+    map.insert("chat_type", serde_json::json!(context.chat_type));
+    map.insert("agent_id", serde_json::json!(context.agent_id));
+    map.insert(
+        "channel_log_chat_id",
+        serde_json::json!(context.channel_log_chat_id),
+    );
+    map.insert("chain_depth", serde_json::json!(context.chain_depth));
+    map.insert("input", serde_json::json!(input));
+    // BTreeMap serializes with sorted keys, giving an order-independent digest.
+    let bytes = serde_json::to_vec(&map).expect("canonical request serialization");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// The storage boundary a conversation belongs to.
