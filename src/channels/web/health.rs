@@ -31,6 +31,7 @@ pub(crate) struct HealthResponse {
     mcp: McpStatus,
     active_turns: usize,
     recent_errors_count: usize,
+    instance_lock: InstanceLockStatus,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +65,12 @@ pub(crate) struct TelemetryResponse {
 pub(crate) struct MetricEntry {
     labels: BTreeMap<String, String>,
     value: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct InstanceLockStatus {
+    held: bool,
+    lock_file: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,6 +119,15 @@ pub(super) async fn health(state: State<WebState>) -> Json<HealthResponse> {
         mcp: build_mcp_status(&state).await,
         active_turns,
         recent_errors_count: snapshot.recent_errors.len(),
+        instance_lock: InstanceLockStatus {
+            held: state.app_state.supervisor.instance_lock_held(),
+            lock_file: state
+                .app_state
+                .supervisor
+                .instance_lock_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        },
     })
 }
 

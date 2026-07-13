@@ -17,6 +17,7 @@ pub(crate) use channel_input::{
     ChannelLogKey, HumanChannelLogMessage, build_channel_context, channel_scope_from_secret,
     store_human_channel_log_message, submit_agent_turn,
 };
+pub(crate) use supervisor::InstanceGuard;
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use supervisor::Criticality;
@@ -99,6 +100,7 @@ pub(crate) struct AppStateParts {
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
     pub(crate) runtime_status: Arc<RuntimeStatus>,
+    pub(crate) instance_guard: Arc<InstanceGuard>,
 }
 
 struct AppStateDependencies {
@@ -146,7 +148,10 @@ impl AppState {
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
             runtime_status: parts.runtime_status.clone(),
-            supervisor: Arc::new(RuntimeSupervisor::new(parts.runtime_status)),
+            supervisor: Arc::new(RuntimeSupervisor::with_instance_guard(
+                parts.runtime_status,
+                Arc::clone(&parts.instance_guard),
+            )),
             usage_calibrator: Arc::new(UsageCalibrator::new()),
             _sealed: (),
         }
@@ -316,6 +321,12 @@ pub async fn build_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     crate::runtime::metrics::init_metrics();
 
+    // Acquire the exclusive instance lock before the database is opened, so a
+    // concurrent runtime or manual `sleep` command against this state root is
+    // rejected up front.
+    let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
+    metrics::set_instance_lock_held(true);
+
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
 
     let mut channels = ChannelRegistry::new();
@@ -395,6 +406,7 @@ pub async fn build_app_state_with_path(
         memory_loader: deps.memory_loader,
         turn_sender,
         runtime_status: Arc::clone(&runtime_status),
+        instance_guard: Arc::clone(&instance_guard),
     });
     state.warm_up_calibrator().await;
 
@@ -489,6 +501,11 @@ pub fn build_sleep_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
+    // Acquire the exclusive instance lock before the database is opened, so a
+    // concurrent runtime against this state root is rejected.
+    let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
+    metrics::set_instance_lock_held(true);
+
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
     let channels = Arc::new(ChannelRegistry::new());
     let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&deps.skills)));
@@ -510,6 +527,7 @@ pub fn build_sleep_app_state_with_path(
         memory_loader: deps.memory_loader,
         turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status,
+        instance_guard,
     }))
 }
 

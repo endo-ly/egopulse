@@ -71,6 +71,8 @@ pub(crate) fn test_config(state_root: &str) -> Config {
     }
 }
 
+use std::path::Path;
+
 /// テスト用 AppState を構築する。LLM プロバイダを注入可能。
 pub(crate) fn build_state_with_provider(
     state_root: &str,
@@ -116,7 +118,28 @@ pub(crate) fn build_state_with_config(
         )),
         turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status: Arc::new(RuntimeStatus::new()),
+        instance_guard: acquire_test_instance_guard(Path::new(&config.state_root)),
     })
+}
+
+/// Acquires the runtime instance lock for a test `AppState`.
+///
+/// The canonical lock enforces true single-process mutual exclusion, which is
+/// covered by the `instance_guard` unit tests. Some tests build more than one
+/// `AppState` on the same state root at once (e.g. to simulate a reopen after
+/// restart); for those the canonical lock would reject the second state. To
+/// keep `test_util` usable we fall back to a uniquely-named lock file so each
+/// test state still holds a guard without deadlocking the test.
+fn acquire_test_instance_guard(state_root: &Path) -> Arc<crate::runtime::InstanceGuard> {
+    match crate::runtime::InstanceGuard::acquire(state_root) {
+        Ok(guard) => guard,
+        Err(crate::error::EgoPulseError::RuntimeAlreadyRunning(_)) => {
+            let unique = state_root.join(format!("runtime-instance.{}.lock", uuid::Uuid::new_v4()));
+            crate::runtime::InstanceGuard::acquire_at(&unique)
+                .expect("acquire unique test instance lock")
+        }
+        Err(e) => panic!("acquire runtime instance lock in test state: {e}"),
+    }
 }
 
 /// テスト用 CLI SurfaceContext。

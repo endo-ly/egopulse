@@ -32,6 +32,10 @@ pub enum EgoPulseError {
     SetupWizard(#[from] crate::setup::SetupWizardError),
     #[error("shutdown_requested")]
     ShutdownRequested,
+    #[error(
+        "another EgoPulse process already holds the runtime instance lock for this state root: {0}"
+    )]
+    RuntimeAlreadyRunning(String),
     #[error("internal_error: {0}")]
     Internal(String),
 }
@@ -50,6 +54,7 @@ impl EgoPulseError {
             Self::Pulse(_) => "pulse",
             Self::SetupWizard(_) => "setup",
             Self::ShutdownRequested => "shutdown",
+            Self::RuntimeAlreadyRunning(_) => "instance_lock",
             Self::Internal(_) => "internal",
         }
     }

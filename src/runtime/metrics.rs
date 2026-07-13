@@ -53,6 +53,10 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_runtime_shutdown_aborts_total",
             "Tasks aborted by the runtime supervisor after the shutdown deadline elapsed"
         );
+        describe_gauge!(
+            "egopulse_runtime_instance_lock",
+            "1 if this process holds the exclusive runtime instance lock for its state root"
+        );
 
         handle
     })
@@ -111,6 +115,10 @@ pub(crate) fn inc_runtime_task_failures(kind: &str) {
 
 pub(crate) fn inc_runtime_shutdown_aborts(count: usize) {
     counter!("egopulse_runtime_shutdown_aborts_total").increment(count as u64);
+}
+
+pub(crate) fn set_instance_lock_held(held: bool) {
+    gauge!("egopulse_runtime_instance_lock").set(if held { 1.0 } else { 0.0 });
 }
 
 #[cfg(test)]

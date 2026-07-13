@@ -65,7 +65,7 @@ pub(crate) const MAX_QUEUED_TURNS_PER_SESSION: usize = 32;
 /// Maximum turns queued across the whole runtime before new turns are rejected.
 ///
 /// Bounds total scheduler memory across all sessions during sustained
-/// overload. Phase 3 will replace the in-memory queue with a durable one; until
+/// overload. Until a durable queue replaces the in-memory one,
 /// then this is an explicit finite capacity, not unbounded delay.
 pub(crate) const MAX_GLOBAL_QUEUED_TURNS: usize = 512;
 
