@@ -57,6 +57,18 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_runtime_instance_lock",
             "1 if this process holds the exclusive runtime instance lock for its state root"
         );
+        describe_counter!(
+            "egopulse_memory_publication_total",
+            "Memory bundle publications by outcome (started/success/conflict/recovery)"
+        );
+        describe_counter!(
+            "egopulse_memory_snapshot_incomplete_total",
+            "Sleep runs whose memory snapshot set was incomplete at recovery"
+        );
+        describe_counter!(
+            "egopulse_memory_recovery_validation_error_total",
+            "Memory publication recovery validations that could not classify on-disk content"
+        );
 
         handle
     })
@@ -119,6 +131,19 @@ pub(crate) fn inc_runtime_shutdown_aborts(count: usize) {
 
 pub(crate) fn set_instance_lock_held(held: bool) {
     gauge!("egopulse_runtime_instance_lock").set(if held { 1.0 } else { 0.0 });
+}
+
+/// `outcome` should be `started`, `success`, `conflict`, or `recovery`.
+pub(crate) fn inc_memory_publication(outcome: &str) {
+    counter!("egopulse_memory_publication_total", "outcome" => outcome.to_owned()).increment(1);
+}
+
+pub(crate) fn inc_memory_snapshot_incomplete() {
+    counter!("egopulse_memory_snapshot_incomplete_total").increment(1);
+}
+
+pub(crate) fn inc_memory_recovery_validation_error() {
+    counter!("egopulse_memory_recovery_validation_error_total").increment(1);
 }
 
 #[cfg(test)]

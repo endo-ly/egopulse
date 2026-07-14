@@ -423,6 +423,11 @@ pub async fn build_app_state_with_path(
     // Must run before the turn dispatcher starts.
     rehydrate_origin_tracker(&state);
 
+    // Re-drive memory publication for sleep runs interrupted mid-publication.
+    // Must complete before the TurnDispatcher and Channels start so Turns never
+    // read a half-published memory bundle.
+    crate::sleep::recover_memory_publication(&state)?;
+
     // Own long-lived background tasks through the supervisor so their lifetime
     // and shutdown are centrally managed.
     let mcp_arc = state
@@ -554,7 +559,7 @@ pub fn build_sleep_app_state_with_path(
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
-    Ok(AppState::from_parts(AppStateParts {
+    let state = AppState::from_parts(AppStateParts {
         db: deps.db,
         secret_db: deps.secret_db,
         config,
@@ -570,7 +575,12 @@ pub fn build_sleep_app_state_with_path(
         turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status,
         instance_guard,
-    }))
+    });
+    // Re-drive memory publication for sleep runs interrupted mid-publication
+    // before any new batch starts. The instance lock guarantees this process
+    // is the sole writer.
+    crate::sleep::recover_memory_publication(&state)?;
+    Ok(state)
 }
 
 enum ProvisionDefaultSoul {

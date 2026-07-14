@@ -2,7 +2,7 @@
 //! event_extraction, episodic_update, semantic_update, prospective_update.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Datelike;
@@ -11,13 +11,14 @@ use chrono_tz::OffsetComponents;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
+use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message};
-use crate::memory::MemoryContent;
+use crate::memory::{MemoryBundle, MemoryError};
 use crate::runtime::AppState;
 use crate::storage::{
-    AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, RollupGranularity,
-    SleepRunTrigger, SleepStepCheckpoint, SleepStepName, SleepStepResult, SleepStepStatus,
-    call_blocking,
+    AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, MemorySnapshot,
+    RollupGranularity, SleepRun, SleepRunTrigger, SleepStepCheckpoint, SleepStepName,
+    SleepStepResult, SleepStepStatus, call_blocking,
 };
 
 use super::SleepBatchError;
@@ -230,9 +231,6 @@ pub async fn run_events_extract(
     };
 
     let result = async {
-        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
-        recover_memory_write(&agents_dir, &resolved_agent)?;
-
         let resolved = state
             .config
             .resolve_sleep_batch_llm()
@@ -411,10 +409,14 @@ Output the raw JSON object and nothing else.";
 /// Batch execution context — holds shared state for step execution.
 struct BatchContext {
     run_id: String,
-    agents_dir: PathBuf,
     provider: Arc<dyn LlmProvider>,
     sessions: Vec<AgentSessionInfo>,
-    current_memory: MemoryContent,
+    /// Memory bundle captured at run start. Snapshot `content_before` values
+    /// and the publication precondition are derived from this.
+    base_memory: MemoryBundle,
+    /// In-memory candidate updated by each step. Published atomically at
+    /// finalize; never written to disk mid-run.
+    candidate_memory: MemoryBundle,
     context_tokens: usize,
 }
 
@@ -544,9 +546,6 @@ async fn prepare_batch_context(
     sessions: &[AgentSessionInfo],
     run_id: &str,
 ) -> Result<BatchContext, SleepBatchError> {
-    let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
-    recover_memory_write(&agents_dir, agent_id)?;
-
     let resolved = state
         .config
         .resolve_sleep_batch_llm()
@@ -566,14 +565,17 @@ async fn prepare_batch_context(
         &crate::config::ProviderId::new(&resolved.provider),
         &resolved.model,
     );
-    let memory_before = state.memory_loader.load(agent_id);
+    let memory_before = state
+        .memory_loader
+        .load_bundle(agent_id)
+        .map_err(|e| SleepBatchError::Io(e.to_string()))?;
 
     Ok(BatchContext {
         run_id: run_id.to_string(),
-        agents_dir,
         provider,
         sessions: sessions.to_vec(),
-        current_memory: memory_before.unwrap_or_default(),
+        base_memory: (*memory_before).clone(),
+        candidate_memory: (*memory_before).clone(),
         context_tokens,
     })
 }
@@ -803,37 +805,10 @@ async fn run_episodic_update_step(
         return Ok(None);
     };
 
-    let before = ctx.current_memory.clone();
-    let mut after = before.clone();
-    after.episodic = Some(rendered.clone());
-    if let Err(error) = write_memory_files(
-        &ctx.agents_dir,
-        agent_id,
-        &[
-            ("episodic.md", rendered.as_str()),
-            (
-                "semantic.md",
-                before.semantic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "prospective.md",
-                before.prospective.clone().unwrap_or_default().as_str(),
-            ),
-        ],
-    ) {
-        finish_step_failed(
-            db,
-            &ctx.run_id,
-            SleepStepName::EpisodicUpdate,
-            error.to_string(),
-        )
-        .await;
-        return Ok(None);
-    }
+    let content_before = ctx.base_memory.episodic.clone();
+    let content_after = rendered.clone();
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
-    let content_before = before.episodic.clone().unwrap_or_default();
-    let content_after = rendered.clone();
     if let Err(error) = call_blocking(Arc::clone(db), move |db| {
         db.commit_episodic_update_success(
             &run_id,
@@ -851,24 +826,6 @@ async fn run_episodic_update_step(
     })
     .await
     {
-        let _ = write_memory_files(
-            &ctx.agents_dir,
-            agent_id,
-            &[
-                (
-                    "episodic.md",
-                    before.episodic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "semantic.md",
-                    before.semantic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "prospective.md",
-                    before.prospective.clone().unwrap_or_default().as_str(),
-                ),
-            ],
-        );
         warn!(error = %error, "failed to commit episodic update");
         finish_step_failed(
             db,
@@ -880,7 +837,7 @@ async fn run_episodic_update_step(
         return Ok(None);
     }
 
-    ctx.current_memory = after;
+    ctx.candidate_memory.episodic = rendered.clone();
     Ok(Some(rendered))
 }
 
@@ -1288,7 +1245,7 @@ async fn run_memory_update_step(
     }
 
     let total_chunks = chunks.len();
-    let mut working_memory = ctx.current_memory.clone();
+    let mut working_memory = ctx.candidate_memory.clone();
     let mut total_input: i64 = 0;
     let mut total_output: i64 = 0;
     let mut step_failed = false;
@@ -1324,8 +1281,8 @@ async fn run_memory_update_step(
             Ok((output, inp, out)) => {
                 total_input = total_input.saturating_add(inp);
                 total_output = total_output.saturating_add(out);
-                working_memory.semantic = Some(output.semantic.clone());
-                working_memory.prospective = Some(output.prospective.clone());
+                working_memory.semantic = output.semantic.clone();
+                working_memory.prospective = output.prospective.clone();
             }
             Err(e) => {
                 warn!(error = %e, "memory update failed");
@@ -1354,84 +1311,22 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    let before = ctx.current_memory.clone();
+    // Always commit a snapshot for both memory files (even when unchanged) so
+    // the publication bundle has a complete snapshot set. content_before uses
+    // the run-start base; content_after uses the candidate produced here.
     let snapshots = [
         (
             MemoryFile::Semantic,
-            before.semantic.clone().unwrap_or_default(),
-            working_memory.semantic.clone().unwrap_or_default(),
+            ctx.base_memory.semantic.clone(),
+            working_memory.semantic.clone(),
         ),
         (
             MemoryFile::Prospective,
-            before.prospective.clone().unwrap_or_default(),
-            working_memory.prospective.clone().unwrap_or_default(),
+            ctx.base_memory.prospective.clone(),
+            working_memory.prospective.clone(),
         ),
-    ]
-    .into_iter()
-    .filter(|(_, content_before, content_after)| content_before != content_after)
-    .collect::<Vec<_>>();
+    ];
 
-    if snapshots.is_empty() {
-        let run_id = ctx.run_id.clone();
-        let agent_id = agent_id.to_string();
-        call_blocking(Arc::clone(db), move |db| {
-            db.commit_memory_update_success(
-                &run_id,
-                &agent_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Success,
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    error_message: None,
-                    metadata_json: None,
-                },
-                &checkpoints,
-                &[],
-            )
-        })
-        .await?;
-        return Ok(());
-    }
-
-    if let Err(error) = write_memory_files(
-        &ctx.agents_dir,
-        agent_id,
-        &[
-            (
-                "episodic.md",
-                working_memory.episodic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "semantic.md",
-                working_memory.semantic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "prospective.md",
-                working_memory
-                    .prospective
-                    .clone()
-                    .unwrap_or_default()
-                    .as_str(),
-            ),
-        ],
-    ) {
-        let run_id = ctx.run_id.clone();
-        let error_message = error.to_string();
-        call_blocking(Arc::clone(db), move |db| {
-            db.finish_memory_update_steps(
-                &run_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Failed,
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    error_message: Some(&error_message),
-                    metadata_json: None,
-                },
-            )
-        })
-        .await?;
-        return Ok(());
-    }
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
     if let Err(error) = call_blocking(Arc::clone(db), move |db| {
@@ -1451,24 +1346,6 @@ async fn run_memory_update_step(
     })
     .await
     {
-        let _ = write_memory_files(
-            &ctx.agents_dir,
-            agent_id,
-            &[
-                (
-                    "episodic.md",
-                    before.episodic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "semantic.md",
-                    before.semantic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "prospective.md",
-                    before.prospective.clone().unwrap_or_default().as_str(),
-                ),
-            ],
-        );
         let run_id = ctx.run_id.clone();
         let error_message = error.to_string();
         call_blocking(Arc::clone(db), move |db| {
@@ -1487,7 +1364,7 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    ctx.current_memory = working_memory;
+    ctx.candidate_memory = working_memory;
     Ok(())
 }
 
@@ -1551,6 +1428,8 @@ async fn finalize_batch(
     })
     .await?;
 
+    publish_memory_bundle(state, db, ctx, agent_id).await?;
+
     let run_id_for_finalize = ctx.run_id.clone();
     let derived_status = call_blocking(Arc::clone(db), move |db| {
         db.finalize_sleep_run(&run_id_for_finalize)
@@ -1591,155 +1470,184 @@ async fn finalize_batch(
     Ok(())
 }
 
-fn safe_agent_id_for_write(id: &str) -> bool {
-    let id = id.trim();
-    !id.is_empty()
-        && !id.contains("..")
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains(':')
-}
-
-pub(crate) fn recover_memory_write(
-    agents_dir: &Path,
+/// Ensures the run has a complete 3-file snapshot set, reads it back, and
+/// publishes the candidate bundle atomically.
+///
+/// A precondition conflict (on-disk file changed since run start) propagates
+/// as an error so [`execute_batch`] marks the run failed without overwriting
+/// the current files.
+async fn publish_memory_bundle(
+    state: &AppState,
+    db: &Arc<Database>,
+    ctx: &BatchContext,
     agent_id: &str,
 ) -> Result<(), SleepBatchError> {
-    if !safe_agent_id_for_write(agent_id) {
-        return Err(SleepBatchError::UnsafeAgentId(agent_id.to_string()));
-    }
+    let run_id = ctx.run_id.clone();
+    let agent_id_owned = agent_id.to_string();
+    let base = ctx.base_memory.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.ensure_memory_snapshots_complete(
+            &run_id,
+            &agent_id_owned,
+            &[
+                (MemoryFile::Episodic, base.episodic.as_str()),
+                (MemoryFile::Semantic, base.semantic.as_str()),
+                (MemoryFile::Prospective, base.prospective.as_str()),
+            ],
+        )
+    })
+    .await?;
 
-    let agent_dir = agents_dir.join(agent_id);
-    if !agent_dir.exists() {
-        return Ok(());
-    }
+    let run_id = ctx.run_id.clone();
+    let snapshots =
+        call_blocking(Arc::clone(db), move |db| db.get_snapshots_for_run(&run_id)).await?;
 
-    let memory_dir = agent_dir.join("memory");
+    let Some((before, after)) = build_bundles_from_snapshots(&snapshots) else {
+        crate::runtime::metrics::inc_memory_snapshot_incomplete();
+        return Err(SleepBatchError::Internal(format!(
+            "incomplete memory snapshot set for run {}",
+            ctx.run_id
+        )));
+    };
 
-    if !memory_dir.exists() {
-        let entries = std::fs::read_dir(&agent_dir)
-            .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
+    state
+        .memory_loader
+        .publish_bundle(agent_id, &ctx.run_id, &before, &after)
+        .map_err(|e| match e {
+            MemoryError::Conflict { agent_id, file } => SleepBatchError::Io(format!(
+                "memory publication conflict: agent={agent_id} file={file}"
+            )),
+            MemoryError::UnsafeAgentId(a) => SleepBatchError::UnsafeAgentId(a),
+            MemoryError::Io(m) => SleepBatchError::Io(m),
+            MemoryError::RecoveryValidation { .. } => SleepBatchError::Internal(e.to_string()),
+        })?;
+    Ok(())
+}
 
-        let mut backups: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("memory.backup-")
-            })
-            .collect();
-
-        backups.sort_by(|a, b| {
-            let mtime_a = a.metadata().and_then(|m| m.modified()).ok();
-            let mtime_b = b.metadata().and_then(|m| m.modified()).ok();
-            mtime_b.cmp(&mtime_a)
-        });
-
-        if let Some(newest) = backups.into_iter().next() {
-            let backup_path = newest.path();
-            info!(
-                agent_id = %agent_id,
-                path = %backup_path.display(),
-                "restoring memory from backup"
-            );
-            std::fs::rename(&backup_path, &memory_dir)
-                .map_err(|e| SleepBatchError::Io(format!("failed to restore backup: {e}")))?;
-        }
-    }
-
-    let entries = std::fs::read_dir(&agent_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| SleepBatchError::Io(format!("failed to read dir entry: {e}")))?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str.starts_with("memory.tmp-") || name_str.starts_with("memory.backup-") {
-            let path = entry.path();
-            info!(
-                agent_id = %agent_id,
-                path = %path.display(),
-                "cleaning up stale memory directory"
-            );
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                info!(
-                    agent_id = %agent_id,
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove stale directory (continuing)"
-                );
+/// Builds `(before, after)` bundles from a run's snapshots.
+///
+/// Returns `None` unless exactly one snapshot exists for each of the three
+/// memory files.
+fn build_bundles_from_snapshots(
+    snapshots: &[MemorySnapshot],
+) -> Option<(MemoryBundle, MemoryBundle)> {
+    let mut before = MemoryBundle::default();
+    let mut after = MemoryBundle::default();
+    let mut seen_episodic = false;
+    let mut seen_semantic = false;
+    let mut seen_prospective = false;
+    for snapshot in snapshots {
+        match snapshot.file {
+            MemoryFile::Episodic => {
+                before.episodic = snapshot.content_before.clone();
+                after.episodic = snapshot.content_after.clone();
+                seen_episodic = true;
+            }
+            MemoryFile::Semantic => {
+                before.semantic = snapshot.content_before.clone();
+                after.semantic = snapshot.content_after.clone();
+                seen_semantic = true;
+            }
+            MemoryFile::Prospective => {
+                before.prospective = snapshot.content_before.clone();
+                after.prospective = snapshot.content_after.clone();
+                seen_prospective = true;
             }
         }
     }
+    // All three files must have a snapshot row; otherwise the bundle is
+    // incomplete and publication must not proceed.
+    (seen_episodic && seen_semantic && seen_prospective).then_some((before, after))
+}
 
+/// Recovers memory publication for sleep runs left `running` by a crash.
+///
+/// For each running run: if its 3-file snapshot set is complete, re-drive the
+/// publication from the persisted `after` bundle and transition the run to its
+/// derived terminal status. If the snapshot set is incomplete, the run is
+/// marked failed. If the on-disk content matches neither `before` nor `after`,
+/// startup halts so the operator can intervene.
+///
+/// Must run before the TurnDispatcher and Channels start so Turns never read a
+/// half-published bundle.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError`] only when on-disk content is unclassifiable
+/// (startup must halt). Incomplete snapshots and failed publications are
+/// logged and marked failed without aborting startup.
+pub(crate) fn recover_memory_publication(state: &AppState) -> Result<(), EgoPulseError> {
+    let runs = state
+        .db
+        .list_running_sleep_runs()
+        .map_err(EgoPulseError::from)?;
+    if runs.is_empty() {
+        return Ok(());
+    }
+    for run in runs {
+        recover_run_publication(state, &run)?;
+    }
     Ok(())
 }
 
-pub(crate) fn write_memory_files(
-    agents_dir: &Path,
-    agent_id: &str,
-    files: &[(&str, &str)],
-) -> Result<(), SleepBatchError> {
-    if !safe_agent_id_for_write(agent_id) {
-        return Err(SleepBatchError::UnsafeAgentId(agent_id.to_string()));
-    }
+fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPulseError> {
+    let snapshots = state
+        .db
+        .get_snapshots_for_run(&run.id)
+        .map_err(EgoPulseError::from)?;
 
-    recover_memory_write(agents_dir, agent_id)?;
-
-    let agent_dir = agents_dir.join(agent_id);
-    std::fs::create_dir_all(&agent_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to create agent dir: {e}")))?;
-
-    let uuid = uuid::Uuid::new_v4();
-    let tmp_dir = agent_dir.join(format!("memory.tmp-{uuid}"));
-    let memory_dir = agent_dir.join("memory");
-    let backup_dir = agent_dir.join(format!("memory.backup-{uuid}"));
-
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to create tmp dir: {e}")))?;
-
-    let write_result = (|| -> Result<(), SleepBatchError> {
-        for (name, content) in files {
-            std::fs::write(tmp_dir.join(name), content)
-                .map_err(|e| SleepBatchError::Io(format!("failed to write {name}: {e}")))?;
+    match build_bundles_from_snapshots(&snapshots) {
+        Some((before, after)) => {
+            state
+                .memory_loader
+                .recover_publication(&run.agent_id, &run.id, &before, &after)
+                .map_err(|e| recovery_error(run, e))?;
+            let run_id = run.id.clone();
+            state
+                .db
+                .finalize_sleep_run(&run_id)
+                .map_err(EgoPulseError::from)?;
+            tracing::info!(
+                run_id = %run.id,
+                agent_id = %run.agent_id,
+                "recovered memory publication on startup"
+            );
         }
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-
-    if memory_dir.exists() {
-        std::fs::rename(&memory_dir, &backup_dir).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            SleepBatchError::Io(format!("failed to rename memory to backup: {e}"))
-        })?;
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_dir, &memory_dir) {
-        if backup_dir.exists() {
-            let _ = std::fs::rename(&backup_dir, &memory_dir);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(SleepBatchError::Io(format!(
-            "failed to rename tmp to memory: {e}"
-        )));
-    }
-
-    if backup_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&backup_dir) {
-            info!(
-                agent_id = %agent_id,
-                error = %e,
-                "failed to remove backup dir (non-fatal)"
+        None => {
+            crate::runtime::metrics::inc_memory_snapshot_incomplete();
+            let run_id = run.id.clone();
+            let _ = state.db.update_sleep_run_failed(
+                &run_id,
+                "memory snapshot set incomplete at startup recovery",
+            );
+            tracing::warn!(
+                run_id = %run.id,
+                agent_id = %run.agent_id,
+                "memory snapshot set incomplete; run marked failed"
             );
         }
     }
-
     Ok(())
+}
+
+/// Maps a [`MemoryError`] from recovery into the startup-halting error.
+///
+/// [`MemoryError::RecoveryValidation`] halts startup; other variants are
+/// unexpected during recovery and also halt to avoid silent loss.
+fn recovery_error(run: &SleepRun, e: MemoryError) -> EgoPulseError {
+    match e {
+        MemoryError::RecoveryValidation {
+            agent_id,
+            run_id,
+            file,
+        } => EgoPulseError::Internal(format!(
+            "memory recovery validation failed: agent={agent_id} run={run_id} file={file}"
+        )),
+        other => EgoPulseError::Internal(format!(
+            "memory recovery failed for run {}: {other}",
+            run.id
+        )),
+    }
 }
 
 fn archive_and_clear_session(
@@ -2158,24 +2066,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sleep_batch_recovers_backup_before_building_input() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-
-        let agent_dir = dir.path().join("agents").join("test-agent");
-        let backup_dir = agent_dir.join("memory.backup-test");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        std::fs::write(backup_dir.join("semantic.md"), "old memory").expect("write backup");
-
-        let llm = Arc::new(MockLlmProvider::new());
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
-            .await
-            .expect("batch");
-    }
-
-    #[tokio::test]
     async fn run_sleep_batch_marks_success_on_completion() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
@@ -2214,6 +2104,395 @@ mod tests {
             memory_dir.join("prospective.md").exists(),
             "prospective.md missing"
         );
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_creates_complete_snapshot_set_for_every_file() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        // all_success_responses yields no rollups and empty semantic/prospective,
+        // so no file actually changes — yet each must still have a snapshot.
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let snapshots = state
+            .db
+            .get_snapshots_for_run(&runs[0].id)
+            .expect("snapshots");
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "all three memory files must have a snapshot, even unchanged ones"
+        );
+        // semantic and prospective are unchanged (LLM returned empty strings),
+        // so their snapshots must still exist with before == after.
+        for snapshot in &snapshots {
+            if matches!(
+                snapshot.file,
+                MemoryFile::Semantic | MemoryFile::Prospective
+            ) {
+                assert_eq!(
+                    snapshot.content_before, snapshot.content_after,
+                    "unchanged file snapshot must have before == after"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_detects_manual_edit_conflict() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        // Seed base memory so the run starts from a non-empty bundle.
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("episodic.md"), "base ep").expect("write base");
+
+        let llm = Arc::new(SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            serde_json::json!({"semantic":"new sem","prospective":"new pro"}).to_string(),
+        ]));
+        // Simulate a manual edit to episodic.md after the run captured base but
+        // before publication. The run loads base at start, so the edit happens
+        // after that snapshot but before finalize.
+        let provider = Arc::new(ConflictEditProvider {
+            inner: llm,
+            edited: std::sync::Mutex::new(false),
+            memory_dir: memory_dir.clone(),
+        });
+        let state = build_test_state_with_llm(db, dir.path(), provider);
+
+        // A manual-edit conflict aborts publication; the batch returns an error
+        // but the run is marked failed.
+        let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(
+            runs[0].status,
+            SleepRunStatus::Failed,
+            "manual edit conflict must fail the run"
+        );
+        // The manual edit is preserved (publication did not overwrite it).
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
+            "manually edited"
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_partial_rename() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        // Create a running sleep run with a complete snapshot set.
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        // Crash point 1: only episodic renamed to `after`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+        recover_memory_publication(&state).expect("recover 1");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_all_renamed_but_not_finalized() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // All files already at `after`, but the run is still `running`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_two_files_renamed() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // Crash point 2: episodic and semantic renamed to `after`, prospective still `before`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_halts_on_unclassifiable_content() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // A third-party edit that matches neither before nor after.
+        std::fs::write(memory_dir.join("episodic.md"), "mystery").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+
+        let err = recover_memory_publication(&state).expect_err("should halt");
+        assert!(
+            err.to_string()
+                .contains("memory recovery validation failed")
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_marks_failed_when_snapshots_incomplete() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        // Only one snapshot exists → incomplete.
+        seed_one_snapshot(
+            &state.db,
+            &run_id,
+            "test-agent",
+            MemoryFile::Episodic,
+            "a",
+            "b",
+        );
+
+        recover_memory_publication(&state).expect("does not halt");
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Failed
+        );
+    }
+
+    fn mark_all_steps_success(db: &Database, run_id: &str) {
+        let conn = db.get_conn().expect("pool");
+        let now = chrono::Utc::now().to_rfc3339();
+        for step in [
+            "event_extraction",
+            "episodic_update",
+            "semantic_update",
+            "prospective_update",
+        ] {
+            conn.execute(
+                "UPDATE sleep_run_steps
+                 SET status = 'success', started_at = ?1, finished_at = ?1
+                 WHERE sleep_run_id = ?2 AND step_name = ?3",
+                rusqlite::params![now, run_id, step],
+            )
+            .expect("mark step success");
+        }
+    }
+
+    fn seed_complete_snapshots(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        before: &MemoryBundle,
+        after: &MemoryBundle,
+    ) {
+        for (file, b, a) in [
+            (MemoryFile::Episodic, &before.episodic, &after.episodic),
+            (MemoryFile::Semantic, &before.semantic, &after.semantic),
+            (
+                MemoryFile::Prospective,
+                &before.prospective,
+                &after.prospective,
+            ),
+        ] {
+            seed_one_snapshot(db, run_id, agent_id, file, b, a);
+        }
+    }
+
+    fn seed_one_snapshot(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        file: MemoryFile,
+        before: &str,
+        after: &str,
+    ) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                run_id,
+                agent_id,
+                file.to_string(),
+                before,
+                after,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert snapshot");
+    }
+
+    fn assert_bundle(memory_dir: &std::path::Path, expected: &MemoryBundle) {
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
+            expected.episodic
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
+            expected.semantic
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
+            expected.prospective
+        );
+    }
+
+    /// Provider that edits `episodic.md` on-disk right before the memory update
+    /// step runs, simulating a concurrent manual edit between base capture and
+    /// publication.
+    struct ConflictEditProvider {
+        inner: Arc<dyn LlmProvider>,
+        edited: std::sync::Mutex<bool>,
+        memory_dir: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConflictEditProvider {
+        fn provider_name(&self) -> &str {
+            self.inner.provider_name()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        async fn send_message(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let is_memory_step = system.contains("更新を担う");
+            if is_memory_step {
+                let mut edited = self.edited.lock().unwrap();
+                if !*edited {
+                    *edited = true;
+                    std::fs::write(self.memory_dir.join("episodic.md"), "manually edited")
+                        .expect("manual edit");
+                }
+            }
+            self.inner.send_message(system, messages, tools).await
+        }
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     #[tokio::test]
@@ -2283,127 +2562,6 @@ mod tests {
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
-    }
-    // --- write_memory_files tests ---
-
-    #[test]
-    fn write_memory_files_writes_all_given_files() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(
-            dir.path(),
-            "agent",
-            &[("semantic.md", "sem"), ("prospective.md", "pro")],
-        )
-        .expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
-            "sem"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            "pro"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_writes_single_file() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("episodic.md", "ep")]).expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
-            "ep"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_writes_three_files() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(
-            dir.path(),
-            "agent",
-            &[
-                ("episodic.md", "ep"),
-                ("semantic.md", "sem"),
-                ("prospective.md", "pro"),
-            ],
-        )
-        .expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
-            "ep"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
-            "sem"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            "pro"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_creates_memory_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert!(memory_dir.exists());
-    }
-
-    #[test]
-    fn write_memory_files_rejects_unsafe_agent_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = write_memory_files(dir.path(), "../etc", &[("semantic.md", "s")])
-            .expect_err("should reject");
-        assert!(matches!(err, SleepBatchError::UnsafeAgentId(_)));
-    }
-
-    #[test]
-    fn write_memory_files_preserves_existing_on_write_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent").join("memory");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("semantic.md"), "old").unwrap();
-
-        // This should succeed — we're writing valid content
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
-    }
-
-    #[test]
-    fn write_memory_files_recovers_backup_on_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent");
-        let backup_dir = agent_dir.join("memory.backup-test");
-        std::fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(backup_dir.join("semantic.md"), "recovered").unwrap();
-
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
-    }
-
-    #[test]
-    fn write_memory_files_cleans_tmp_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent");
-        let tmp_dir = agent_dir.join("memory.tmp-stale");
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
-        assert!(!tmp_dir.exists());
-    }
-
-    #[test]
-    fn write_memory_files_documents_rename_limit() {
-        // Verify the function handles concurrent writes gracefully
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("first write");
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("second write");
     }
 
     // --- retry integration ---

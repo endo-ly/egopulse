@@ -31,4 +31,5 @@ pub enum SleepBatchError {
     Llm(String),
 }
 
+pub(crate) use orchestrator::recover_memory_publication;
 pub use orchestrator::{run_events_extract, run_sleep_batch};
