@@ -70,7 +70,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 - 自己送信 (`from == to`) は禁止
 - Discord チャネルが設定されている場合のみ利用可能
 
-### 1.5 TurnScheduler による同時実行制御 (Phase 4)
+### 1.5 TurnScheduler による同時実行制御
 
 Multi-Agent Room の Discord チャネルでは、`TurnScheduler` がセッション単位のターン実行を管理する。
 
@@ -101,13 +101,13 @@ execute_scheduled_turn():
     └─ キューが空 → slot を削除
 ```
 
-**バックプレッシャー (Phase 1)**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
+**バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
 
 - Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返り、即時開始・キュー投入を問わず再起動後に実行される（durable acceptance）。同一 `request_key` + 異なる本文は `409 Conflict`、受付閾値超えは `429`、shutdown 中は `503` となる。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
 - Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
 
-**TurnTracker の有界化 (Phase 1)**: origin ごとの turn count / terminal reason を 1 つの state に統合し、24 時間の TTL で完了済み origin を破棄する。origin 追跡上限は 4096。TTL prunes 後も上限なら新規 origin を明示的に拒否する（既存 origin の更新は上限中も可能）。Phase 3 の Supervisor で正確な origin lifecycle を所有するまでは暫定的な有界化。
+**TurnTracker の有界化**: origin ごとの turn count / terminal reason を 1 つの state に統合し、24 時間の TTL で完了済み origin を破棄する。origin 追跡上限は 4096。TTL prunes 後も上限なら新規 origin を明示的に拒否する（既存 origin の更新は上限中も可能）。
 
 **SystemEvent**: 停止条件によりターンが拒否された場合、Channel Log に `MessageKind::SystemEvent` で JSON 形式の理由が記録される（`{"reason": "chain_depth_exceeded"}` 等）。
 
