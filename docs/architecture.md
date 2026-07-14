@@ -306,7 +306,7 @@ pub(crate) struct SurfaceContext {
       ├─ Durable state recovery (running tool_calls → uncertain, interrupt された turn_runs を安全停止)
       ├─ Origin tracker rehydrate (turn_runs から per-chain limit を復元)
       ├─ **Memory publication recovery** (running Sleep Run の bundle を再公開・整合)
-      └─ MCP reconnect loop / Agent turn worker / Turn dispatcher 起動 (supervisor 経由)
+      └─ Turn dispatcher / Agent turn worker / MCP reconnect loop 起動 (supervisor 経由)
       │
 4. start_channels()
        │

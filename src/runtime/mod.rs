@@ -429,7 +429,17 @@ pub async fn build_app_state_with_path(
     crate::sleep::recover_memory_publication(&state)?;
 
     // Own long-lived background tasks through the supervisor so their lifetime
-    // and shutdown are centrally managed.
+    // and shutdown are centrally managed. Spawn order follows the startup
+    // contract: dispatcher first so recovered turns are picked up, then the
+    // agent_send receiver, then the MCP reconnect loop.
+    spawn_turn_dispatcher(state.clone(), state.supervisor.shutdown_token());
+
+    spawn_agent_turn_worker(
+        state.clone(),
+        turn_receiver,
+        state.supervisor.shutdown_token(),
+    );
+
     let mcp_arc = state
         .mcp_manager
         .as_ref()
@@ -447,14 +457,6 @@ pub async fn build_app_state_with_path(
             state.supervisor.shutdown_token(),
         ),
     );
-
-    spawn_agent_turn_worker(
-        state.clone(),
-        turn_receiver,
-        state.supervisor.shutdown_token(),
-    );
-
-    spawn_turn_dispatcher(state.clone(), state.supervisor.shutdown_token());
 
     Ok(state)
 }
