@@ -1323,7 +1323,11 @@ mod tests {
         // Wait until the first turn actually reaches the blocking provider
         // (it is now the active turn holding the session slot, not a queued
         // one) before filling the queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while provider_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("blocking provider was not entered within 5 seconds");
+            }
             tokio::task::yield_now().await;
         }
 

@@ -726,12 +726,15 @@ fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
         ),
         async move {
             loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                if shutdown.is_cancelled() {
+                    break;
                 }
                 if let Err(error) = dispatch_durable_turns(&state).await {
                     tracing::warn!(error = %error, "turn dispatcher scan failed");
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
             }
             Ok(())

@@ -306,28 +306,16 @@ impl Database {
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
     }
 
-    /// Returns the IDs of Turns that were durably accepted (their full request
-    /// is persisted in `scheduled_request_json`) but never started execution.
+    /// Returns the IDs of durably pending Turns whose full request is
+    /// persisted in `scheduled_request_json` but never started execution.
     ///
-    /// The turn dispatcher polls this after a crash to re-enqueue turns that the
-    /// previous process accepted but lost before execution. A
-    /// short grace window (`accepted_at` older than 2s) keeps the live intake
-    /// path from racing the dispatcher on a turn it is about to start itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the underlying SQLite read fails.
-    /// Returns the IDs of durably-accepted Turns that still need execution or
-    /// resumption, oldest first.
-    ///
-    /// Covers both `accepted` (never started) and `input_committed` (model loop
-    /// not yet started) turns whose full request is persisted. A single query
-    /// ordered by `accepted_at` (then `turn_id`) preserves the original
-    /// acceptance order across both states, so a restart cannot reverse the
-    /// turn order of a session (an `input_committed` turn accepted before an
-    /// `accepted` turn is still dispatched first). The dispatcher re-submits
-    /// freely; the scheduler deduplicates by `turn_id`, so no grace window is
-    /// needed.
+    /// Covers both `accepted` (never started) and `input_committed`
+    /// (model loop not yet started) turns. A single query ordered by
+    /// `accepted_at` (then `turn_id`) preserves the original acceptance order
+    /// across both states, so a restart cannot reverse the turn order of a
+    /// session (an `input_committed` turn accepted before an `accepted` turn
+    /// is still dispatched first). The dispatcher re-submits freely; the
+    /// scheduler deduplicates by `turn_id`, so no grace window is needed.
     ///
     /// # Errors
     ///

@@ -557,14 +557,18 @@ impl TurnScheduler {
         let session_key = turn.session_key();
         let turn_id = turn.turn_id.clone();
 
-        // Idempotent dedup: if this turn is already running or queued, treat a
-        // repeat submission as a no-op so the dispatcher can re-scan the DB
-        // without a separate dedup set and without enqueueing duplicates.
-        if let Some(slot) = inner.slots.get(&session_key) {
-            if slot.current_turn_id.as_deref() == Some(turn_id.as_str())
-                || slot.queue.iter().any(|t| t.turn_id == turn_id)
-            {
-                return ScheduleResult::Queued;
+        // Idempotent dedup for non-empty turn IDs: if this turn is already
+        // running or queued, treat a repeat submission as a no-op so the
+        // dispatcher can re-scan the DB without a separate dedup set and
+        // without enqueueing duplicates. Empty turn IDs (e.g. agent_send) are
+        // never deduplicated — each is independent.
+        if !turn_id.is_empty() {
+            if let Some(slot) = inner.slots.get(&session_key) {
+                if slot.current_turn_id.as_deref() == Some(turn_id.as_str())
+                    || slot.queue.iter().any(|t| t.turn_id == turn_id)
+                {
+                    return ScheduleResult::Queued;
+                }
             }
         }
 
