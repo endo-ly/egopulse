@@ -328,7 +328,7 @@ impl Database {
              FROM turn_runs
              WHERE state = 'accepted'
                AND scheduled_request_json IS NOT NULL
-               AND accepted_at < datetime('now', '-2 seconds')
+               AND datetime(accepted_at) < datetime('now', '-2 seconds')
              ORDER BY accepted_at ASC",
         )?;
         let ids = stmt
@@ -359,7 +359,7 @@ impl Database {
              FROM turn_runs
              WHERE state = 'input_committed'
                AND scheduled_request_json IS NOT NULL
-               AND accepted_at < datetime('now', '-2 seconds')
+               AND datetime(accepted_at) < datetime('now', '-2 seconds')
              ORDER BY accepted_at ASC",
         )?;
         let ids = stmt
@@ -859,10 +859,10 @@ impl Database {
              FROM turn_runs
              WHERE origin_id IS NOT NULL
                AND state NOT IN ('accepted', 'input_committed')
-               AND accepted_at > datetime('now', ?1)
+               AND datetime(accepted_at) > datetime('now', ?1)
              GROUP BY origin_id",
         )?;
-        let rows = stmt.query_map(params![format!("-{ttl_secs} seconds")], |row| {
+        let rows = stmt.query_map(params![format!("{} seconds", -ttl_secs)], |row| {
             Ok(RecoveredOrigin {
                 origin_id: row.get(0)?,
                 executed_turn_count: row.get::<_, i64>(1)? as usize,

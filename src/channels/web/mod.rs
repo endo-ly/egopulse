@@ -1214,7 +1214,9 @@ mod tests {
 
     /// LLM provider that blocks forever on each call, keeping the started turn
     /// busy so the per-session queue can be filled deterministically.
-    struct BlockingProvider;
+    struct BlockingProvider {
+        entered: Arc<AtomicUsize>,
+    }
 
     #[async_trait::async_trait]
     impl crate::llm::LlmProvider for BlockingProvider {
@@ -1224,6 +1226,10 @@ mod tests {
             _messages: Arc<Vec<crate::llm::Message>>,
             _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            // Signal that a turn has reached the provider (i.e. it is actively
+            // executing and holding the session slot, not queued).
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::pending::<()>().await;
             unreachable!()
         }
@@ -1249,6 +1255,7 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_route_returns_429_when_session_queue_full() {
+        let provider_entered = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(dir.path().to_str().expect("state root"));
         config
@@ -1276,7 +1283,9 @@ mod tests {
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let app_state = Arc::new(build_state_with_config(
             config,
-            Some(Arc::new(BlockingProvider)),
+            Some(Arc::new(BlockingProvider {
+                entered: Arc::clone(&provider_entered),
+            })),
             None,
             None,
             Some(Arc::new(registry)),
@@ -1305,6 +1314,14 @@ mod tests {
         // First request starts the turn; the blocking provider keeps it busy.
         let started = post(0).await.expect("response");
         assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        // Wait until the first turn actually reaches the blocking provider
+        // (it is now the active turn holding the session slot, not a queued
+        // one) before filling the queue. Without this, the active turn could
+        // still be in the queue and the limit would trip one request early.
+        while provider_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
 
         // Fill the per-session queue up to the limit; each is accepted (202).
         for i in 1..=crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {

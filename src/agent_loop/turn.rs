@@ -522,7 +522,8 @@ impl TurnExecutor<'_> {
             match result {
                 Ok(response) => Ok(response),
                 Err(error) => {
-                    self.fail_turn(&turn.turn_id, &error).await;
+                    self.record_failure_excluding_conflict(&turn.turn_id, &error)
+                        .await;
                     Err(error)
                 }
             }
@@ -549,7 +550,7 @@ impl TurnExecutor<'_> {
         };
         let span = self.turn_span();
 
-        async move {
+        let result = async move {
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let prepared = self
                 .prepare_turn(user_input, &turn_run.turn_id, snapshot)
@@ -580,7 +581,20 @@ impl TurnExecutor<'_> {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+
+        // A resumed turn that fails for a non-conflict reason must be recorded
+        // (e.g. transitioned to `uncertain`) so the dispatcher does not
+        // re-resume it forever. A concurrency conflict means another executor
+        // owns the turn now and must not be terminated.
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.record_failure_excluding_conflict(&turn_run.turn_id, &error)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     fn resolve_request_key(&self) -> String {
@@ -680,6 +694,16 @@ impl TurnExecutor<'_> {
         {
             warn!(error = %e, turn_id, "failed to record turn_run failure");
         }
+    }
+
+    /// Records a turn failure unless the error is a benign concurrency
+    /// conflict (this executor lost the execution-right CAS to another owner).
+    /// A conflict must never terminate the winner's active turn.
+    async fn record_failure_excluding_conflict(&self, turn_id: &str, error: &EgoPulseError) {
+        if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
+            return;
+        }
+        self.fail_turn(turn_id, error).await;
     }
 
     fn turn_span(&self) -> tracing::Span {

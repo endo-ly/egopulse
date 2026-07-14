@@ -67,6 +67,9 @@ pub(crate) struct MetricEntry {
     value: f64,
 }
 
+/// Runtime instance lock state exposed by the health endpoint. `held` is true
+/// when this process owns the exclusive advisory lock for its state root;
+/// `lock_file` is the path of the lock file backing that ownership.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct InstanceLockStatus {
     held: bool,

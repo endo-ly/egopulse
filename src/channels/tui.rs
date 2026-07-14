@@ -262,6 +262,11 @@ pub(crate) async fn run(state: AppState) -> Result<(), EgoPulseError> {
     // blind after a critical task (e.g. the agent turn worker) panics or exits
     // unexpectedly — the same guarantee `start_channels` provides for the
     // daemon path.
+    // Initialize the terminal before spawning the monitor task so a failed
+    // `TuiSession::new` cannot leave the monitor holding the AppState and the
+    // instance lock after early return.
+    let mut session = TuiSession::new()?;
+
     let monitor_state = state.clone();
     let monitor = tokio::spawn(async move {
         let token = monitor_state.supervisor.shutdown_token();
@@ -278,7 +283,6 @@ pub(crate) async fn run(state: AppState) -> Result<(), EgoPulseError> {
         }
     });
 
-    let mut session = TuiSession::new()?;
     let result = run_loop(&mut session.terminal, &mut app).await;
 
     // Graceful shutdown on exit (quit key or monitor-triggered), draining

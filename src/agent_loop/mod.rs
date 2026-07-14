@@ -91,14 +91,21 @@ pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> S
 ///
 /// Stored as `turn_runs.scheduled_request_json`. On restart the turn dispatcher
 /// rebuilds the `ScheduledTurn` from this payload so an `accepted` turn can
-/// resume even if the process crashed before execution began.
+/// resume even if the process crashed before execution began. The `version`
+/// field lets a future schema change distinguish and migrate older payloads
+/// instead of silently misreading them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedScheduledTurnV1 {
+    /// Envelope version, always [`SCHEDULED_TURN_VERSION`].
+    pub version: u32,
     /// Surface context identifying the agent session.
     pub context: SurfaceContext,
     /// The input text for this turn.
     pub input: String,
 }
+
+/// Current durable scheduled-turn payload version.
+pub(crate) const SCHEDULED_TURN_VERSION: u32 = 1;
 
 /// Serializes a [`ScheduledTurn`] for durable persistence.
 ///
@@ -107,6 +114,7 @@ pub(crate) struct PersistedScheduledTurnV1 {
 /// Returns [`EgoPulseError::Internal`] when JSON serialization fails.
 pub(crate) fn serialize_scheduled_turn(turn: &ScheduledTurn) -> Result<String, EgoPulseError> {
     let payload = PersistedScheduledTurnV1 {
+        version: SCHEDULED_TURN_VERSION,
         context: turn.context.clone(),
         input: turn.input.clone(),
     };
@@ -118,10 +126,23 @@ pub(crate) fn serialize_scheduled_turn(turn: &ScheduledTurn) -> Result<String, E
 ///
 /// # Errors
 ///
-/// Returns [`EgoPulseError::Internal`] when JSON deserialization fails or the
-/// payload is malformed.
+/// Returns [`EgoPulseError::Internal`] when JSON deserialization fails, the
+/// payload is malformed, or its version is not [`SCHEDULED_TURN_VERSION`].
 pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, EgoPulseError> {
-    let payload: PersistedScheduledTurnV1 = serde_json::from_str(json)
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| EgoPulseError::Internal(format!("deserialize scheduled turn: {e}")))?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            EgoPulseError::Internal("scheduled turn payload missing version field".to_string())
+        })? as u32;
+    if version != SCHEDULED_TURN_VERSION {
+        return Err(EgoPulseError::Internal(format!(
+            "unsupported scheduled turn version {version} (supported {SCHEDULED_TURN_VERSION})"
+        )));
+    }
+    let payload: PersistedScheduledTurnV1 = serde_json::from_value(value)
         .map_err(|e| EgoPulseError::Internal(format!("deserialize scheduled turn: {e}")))?;
     Ok(ScheduledTurn {
         turn_id: String::new(),
@@ -250,6 +271,55 @@ mod tests {
         assert_eq!(back.origin_id, "origin-1");
         assert_eq!(back.context.channel, "discord");
         assert_eq!(back.context.agent_id, "dev");
+    }
+
+    #[test]
+    fn deserialize_scheduled_turn_rejects_unknown_version() {
+        // A future-version payload must be rejected, not silently misread.
+        let future = serde_json::json!({
+            "version": 999,
+            "context": {
+                "channel": "discord",
+                "surface_user": "u",
+                "surface_thread": "t",
+                "chat_type": "discord",
+                "agent_id": "a",
+                "channel_log_chat_id": null,
+                "chain_depth": 0,
+                "origin_id": "",
+                "trace_id": "",
+                "scope": "normal",
+                "request_key": ""
+            },
+            "input": "x"
+        })
+        .to_string();
+        let err = deserialize_scheduled_turn(&future).expect_err("should reject");
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn deserialize_scheduled_turn_rejects_missing_version() {
+        // A payload without a version field is malformed.
+        let no_version = serde_json::json!({
+            "context": {
+                "channel": "discord",
+                "surface_user": "u",
+                "surface_thread": "t",
+                "chat_type": "discord",
+                "agent_id": "a",
+                "channel_log_chat_id": null,
+                "chain_depth": 0,
+                "origin_id": "",
+                "trace_id": "",
+                "scope": "normal",
+                "request_key": ""
+            },
+            "input": "x"
+        })
+        .to_string();
+        let err = deserialize_scheduled_turn(&no_version).expect_err("should reject");
+        assert!(err.to_string().contains("version"));
     }
 
     #[test]

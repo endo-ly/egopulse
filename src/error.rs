@@ -32,6 +32,10 @@ pub enum EgoPulseError {
     SetupWizard(#[from] crate::setup::SetupWizardError),
     #[error("shutdown_requested")]
     ShutdownRequested,
+    /// Another EgoPulse process already holds the exclusive runtime instance
+    /// lock for this state root. The `String` payload is the lock file path,
+    /// surfaced to the operator so they can locate the conflicting process.
+    /// Startup is refused before the database is opened.
     #[error(
         "another EgoPulse process already holds the runtime instance lock for this state root: {0}"
     )]

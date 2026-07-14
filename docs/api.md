@@ -613,7 +613,7 @@ Content-Type: application/json
 
 `receiver_id` は設定済み receiver 名。未設定の場合は `404 webhook_receiver_not_found`。
 
-成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返り、即時開始・キュー投入を問わずプロセス再起動後にも `TurnDispatcher` が再実行する（durable acceptance）。受付拒否時は理由コード違いで一律 `429` を返す（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、同一 `request_key` へ異なる本文が再受付された場合は `internal`）。
+成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop から resume）の2状態のみで、モデル反復開始後（`model_pending` 以降）は再実行対象外となる。受付拒否時は理由コード違いで一律 `429` を返す（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、同一 `request_key` へ異なる本文が再受付された場合は `internal`）。
 
 ```json
 {
@@ -671,6 +671,7 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 | `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
+| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
 
 ---
 

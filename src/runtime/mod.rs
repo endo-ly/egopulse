@@ -420,8 +420,10 @@ pub async fn build_app_state_with_path(
 
     // Rehydrate the per-origin turn tracker from `turn_runs` so a chain that had
     // already consumed turns before the crash keeps its per-chain limit.
-    // Must run before the turn dispatcher starts.
-    rehydrate_origin_tracker(&state);
+    // Must run before the turn dispatcher starts. Failure is fail-closed: if
+    // the counts cannot be rebuilt, startup aborts rather than silently
+    // resetting every chain's turn budget to zero.
+    rehydrate_origin_tracker(&state)?;
 
     // Re-drive memory publication for sleep runs interrupted mid-publication.
     // Must complete before the TurnDispatcher and Channels start so Turns never
@@ -514,12 +516,13 @@ fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
 /// Rehydrates the in-memory `TurnTracker` from `turn_runs` after a restart,
 /// so per-chain turn limits and chain-depth guards survive crashes.
 /// Runs against both the primary and (when present) secret databases.
-fn rehydrate_origin_tracker(state: &AppState) {
+fn rehydrate_origin_tracker(state: &AppState) -> Result<(), EgoPulseError> {
     let ttl_secs = turn_scheduler::ORIGIN_TTL.as_secs() as i64;
-    rehydrate_origin_tracker_for_db(state, &state.db, ConversationScope::Normal, ttl_secs);
+    rehydrate_origin_tracker_for_db(state, &state.db, ConversationScope::Normal, ttl_secs)?;
     if let Some(secret_db) = &state.secret_db {
-        rehydrate_origin_tracker_for_db(state, secret_db, ConversationScope::Secret, ttl_secs);
+        rehydrate_origin_tracker_for_db(state, secret_db, ConversationScope::Secret, ttl_secs)?;
     }
+    Ok(())
 }
 
 fn rehydrate_origin_tracker_for_db(
@@ -527,19 +530,17 @@ fn rehydrate_origin_tracker_for_db(
     db: &Arc<Database>,
     scope: ConversationScope,
     ttl_secs: i64,
-) {
-    match db.as_ref().recover_origin_tracker(ttl_secs) {
-        Ok(origins) if !origins.is_empty() => {
-            tracing::info!(
-                scope = %scope,
-                count = origins.len(),
-                "rehydrated origin tracker from turn_runs"
-            );
-            state.turn_tracker.rehydrate_executed(&origins);
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, scope = %scope, "origin tracker rehydration failed"),
+) -> Result<(), EgoPulseError> {
+    let origins = db.as_ref().recover_origin_tracker(ttl_secs)?;
+    if !origins.is_empty() {
+        tracing::info!(
+            scope = %scope,
+            count = origins.len(),
+            "rehydrated origin tracker from turn_runs"
+        );
+        state.turn_tracker.rehydrate_executed(&origins);
     }
+    Ok(())
 }
 
 /// Builds the minimal application state needed for manual sleep batch execution.
@@ -909,12 +910,28 @@ pub(crate) fn execute_scheduled_turn(
         // the already-committed model loop, not re-accept/re-persist the input
         //. A turn still in `accepted` (or any other state) runs the
         // normal intake+execute path, which finds the existing row and proceeds.
-        let current_state = call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
+        let current_state = match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
             let turn_id = turn.turn_id.clone();
             move |db| db.get_turn_run(&turn_id).map(|run| run.state)
         })
         .await
-        .ok();
+        {
+            Ok(state) => Some(state),
+            // Genuinely missing record: run the normal intake path, which will
+            // re-accept the turn idempotently.
+            Err(crate::error::StorageError::NotFound(_)) => None,
+            // A transient DB error must not be collapsed to "not found" and
+            // silently re-accepted; defer to the next dispatcher scan.
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    turn_id = %turn.turn_id,
+                    "dispatcher: turn state lookup failed; deferring"
+                );
+                drain_next_queued_turn(state, &session_key).await;
+                return;
+            }
+        };
 
         let runtime = state.turn_runtime();
         let turn_result = match current_state {

@@ -142,8 +142,16 @@ pub(crate) async fn submit_agent_turn(
 /// it from the database on the next startup.
 pub(super) async fn submit_scheduled_turn(
     state: &AppState,
-    scheduled: ScheduledTurn,
+    mut scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
+    // An empty request_key would collide on UNIQUE(chat_id, request_key) and
+    // make every keyless turn on the same chat look like a duplicate. Assign a
+    // stable key before the request is persisted so recovery reuses the same
+    // one.
+    if scheduled.context.request_key.is_empty() {
+        scheduled.context.request_key = uuid::Uuid::new_v4().to_string();
+    }
+
     // Refuse new input the moment shutdown begins so an accepted turn is never
     // left unstarted after `202 Accepted`-equivalent intake paths return.
     if !state.supervisor.accepting_inputs() {

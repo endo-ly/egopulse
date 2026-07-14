@@ -1616,10 +1616,13 @@ fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPu
         None => {
             crate::runtime::metrics::inc_memory_snapshot_incomplete();
             let run_id = run.id.clone();
-            let _ = state.db.update_sleep_run_failed(
-                &run_id,
-                "memory snapshot set incomplete at startup recovery",
-            );
+            state
+                .db
+                .update_sleep_run_failed(
+                    &run_id,
+                    "memory snapshot set incomplete at startup recovery",
+                )
+                .map_err(EgoPulseError::from)?;
             tracing::warn!(
                 run_id = %run.id,
                 agent_id = %run.agent_id,

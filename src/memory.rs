@@ -2,15 +2,17 @@
 //!
 //! The three memory files (`episodic.md`, `semantic.md`, `prospective.md`) are
 //! treated as a single [`MemoryBundle`]. Reads ([`MemoryLoader::load_bundle`])
-//! take a per-agent **read lock** so they never observe a half-published
-//! bundle. Sleep publication ([`MemoryLoader::publish_bundle`]) takes the
-//! per-agent **write lock**, verifies the on-disk files still match the
-//! run-start baseline, then replaces all three files via temp-file + rename +
-//! fsync so a crash leaves either the old or the new bundle — never a mix.
+//! take a per-agent **read lock** and Sleep publication
+//! ([`MemoryLoader::publish_bundle`]) takes the per-agent **write lock**, so a
+//! reader and a publisher can never run concurrently: readers observe either
+//! the fully old or the fully new bundle, never an in-flight mix.
 //!
-//! Crash recovery ([`MemoryLoader::recover_publication`]) re-drives the
-//! rename sequence from the persisted `memory_snapshots` so a run interrupted
-//! mid-publication converges to the same bundle on the next startup.
+//! Publication replaces all three files via per-file temp-file + fsync +
+//! rename. Because the renames are sequential, a crash between them can leave a
+//! **mixed bundle on disk**; that on-disk state is never exposed to live
+//! readers (the write lock), and [`MemoryLoader::recover_publication`] re-drives
+//! the rename sequence from the persisted `memory_snapshots` on the next
+//! startup so the run converges to the intended post-publication bundle.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -165,7 +167,7 @@ impl MemoryLoader {
             }
         }
 
-        let bundle = Arc::new(read_bundle(&memory_dir));
+        let bundle = Arc::new(read_bundle(&memory_dir)?);
         let mut cache = self.cache.lock().expect("memory cache lock");
         cache.insert(
             agent_id.to_string(),
@@ -205,7 +207,7 @@ impl MemoryLoader {
         metrics::inc_memory_publication("started");
 
         let memory_dir = self.memory_dir(agent_id);
-        let current = read_bundle(&memory_dir);
+        let current = read_bundle(&memory_dir)?;
 
         for file in MemoryFile::ALL {
             if current.file(file) != base.file(file) {
@@ -217,7 +219,7 @@ impl MemoryLoader {
             }
         }
 
-        write_bundle_atomically(&memory_dir, run_id, candidate)?;
+        write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, candidate)?;
         self.refresh_cache(agent_id, candidate);
 
         metrics::inc_memory_publication("success");
@@ -250,7 +252,7 @@ impl MemoryLoader {
         let _guard = lock.write().expect("memory write lock");
 
         let memory_dir = self.memory_dir(agent_id);
-        let current = read_bundle(&memory_dir);
+        let current = read_bundle(&memory_dir)?;
 
         for file in MemoryFile::ALL {
             let cur = current.file(file);
@@ -264,7 +266,7 @@ impl MemoryLoader {
             }
         }
 
-        write_bundle_atomically(&memory_dir, run_id, after)?;
+        write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, after)?;
         self.refresh_cache(agent_id, after);
 
         metrics::inc_memory_publication("recovery");
@@ -294,12 +296,21 @@ impl MemoryLoader {
 /// Writes `bundle` to the memory dir via per-file temp files, fsync, and
 /// rename, then fsyncs the directory. Temp files are named
 /// `<file>.md.<run_id>.tmp` so concurrent runs do not collide.
+///
+/// `agents_dir` is the loader root; when `memory_dir` (or any ancestor below
+/// it) is newly created, those directory entries are fsynced too so a crash
+/// immediately after a successful publication cannot lose the whole bundle.
 fn write_bundle_atomically(
     memory_dir: &Path,
+    agents_dir: &Path,
     run_id: &str,
     bundle: &MemoryBundle,
 ) -> Result<(), MemoryError> {
+    let newly_created = !memory_dir.exists();
     std::fs::create_dir_all(memory_dir)?;
+    if newly_created {
+        sync_created_ancestors(memory_dir, agents_dir)?;
+    }
 
     // Best-effort sweep of stale temp files left by a crashed publication.
     // Same-run retries reuse the same temp names (File::create truncates), so
@@ -338,6 +349,21 @@ fn sync_directory(dir: &Path) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// fsyncs `memory_dir` and each ancestor up to and including `agents_dir` so
+/// newly created directory entries survive a crash. Called only when
+/// `memory_dir` did not exist before [`std::fs::create_dir_all`].
+fn sync_created_ancestors(memory_dir: &Path, agents_dir: &Path) -> Result<(), MemoryError> {
+    let mut current = Some(memory_dir);
+    while let Some(dir) = current {
+        sync_directory(dir)?;
+        if dir == agents_dir {
+            break;
+        }
+        current = dir.parent();
+    }
+    Ok(())
+}
+
 /// Removes orphaned `*.tmp` files from the memory dir. Best-effort: errors are
 /// logged and never fail a publication, since a leftover temp file does not
 /// affect correctness (only the three canonical files are ever read).
@@ -359,27 +385,28 @@ fn cleanup_stale_temp_files(memory_dir: &Path) {
     }
 }
 
-fn read_bundle(memory_dir: &Path) -> MemoryBundle {
-    MemoryBundle {
-        episodic: read_file_or_empty(&memory_dir.join(MemoryFile::Episodic.file_name())),
-        semantic: read_file_or_empty(&memory_dir.join(MemoryFile::Semantic.file_name())),
-        prospective: read_file_or_empty(&memory_dir.join(MemoryFile::Prospective.file_name())),
-    }
+fn read_bundle(memory_dir: &Path) -> Result<MemoryBundle, MemoryError> {
+    Ok(MemoryBundle {
+        episodic: read_file_or_empty(&memory_dir.join(MemoryFile::Episodic.file_name()))?,
+        semantic: read_file_or_empty(&memory_dir.join(MemoryFile::Semantic.file_name()))?,
+        prospective: read_file_or_empty(&memory_dir.join(MemoryFile::Prospective.file_name()))?,
+    })
 }
 
-fn read_file_or_empty(path: &Path) -> String {
-    // Read raw content so it round-trips exactly through publish -> read,
-    // which the publication precondition and recovery validation rely on.
-    // Whitespace-only files collapse to empty so the prompt builder treats
-    // them as "no memory" (preserving the old Option-based semantics).
+/// Reads a memory file. `NotFound` (and whitespace-only content) collapse to
+/// an empty string so a missing memory directory reads as "no memory". Any
+/// other read failure (permissions, transient I/O) is propagated as
+/// [`MemoryError::Io`] — swallowing it would let the publication precondition
+/// compare against an empty bundle and overwrite unreadable existing content.
+fn read_file_or_empty(path: &Path) -> Result<String, MemoryError> {
     match std::fs::read_to_string(path) {
-        Ok(content) if content.trim().is_empty() => String::new(),
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            warn!(error = %error, path = %path.display(), "memory file read failed; treating as empty");
-            String::new()
-        }
+        Ok(content) if content.trim().is_empty() => Ok(String::new()),
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(MemoryError::Io(format!(
+            "failed to read {}: {error}",
+            path.display()
+        ))),
     }
 }
 
