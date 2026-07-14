@@ -802,7 +802,6 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 request_payload_hash TEXT,
                 scheduled_request_json TEXT,
                 origin_id TEXT,
-                origin_stop_reason TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -909,11 +908,10 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         let tx = conn.unchecked_transaction()?;
 
         // Durable scheduled turn columns: the serialized accepted
-        // request (so a crashed runtime can rebuild the SurfaceContext), the
-        // origin chain id, and a terminal chain-stop reason.
+        // request (so a crashed runtime can rebuild the SurfaceContext) and the
+        // origin chain id.
         add_column_if_missing(&tx, "turn_runs", "scheduled_request_json", "TEXT")?;
         add_column_if_missing(&tx, "turn_runs", "origin_id", "TEXT")?;
-        add_column_if_missing(&tx, "turn_runs", "origin_stop_reason", "TEXT")?;
 
         // Dispatch scan index (accepted rows with a durable request) and the
         // origin-recovery index used at startup.
@@ -929,7 +927,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(
             &tx,
             14,
-            "add turn_runs durable scheduled turn columns (scheduled_request_json, origin_id, origin_stop_reason)",
+            "add turn_runs durable scheduled turn columns (scheduled_request_json, origin_id)",
         )?;
         tx.commit()?;
         version = 14;
@@ -1109,7 +1107,6 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
                 request_payload_hash TEXT,
                 scheduled_request_json TEXT,
                 origin_id TEXT,
-                origin_stop_reason TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -1222,7 +1219,6 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         // Durable scheduled turn columns, mirrored from the primary DB.
         add_column_if_missing(&tx, "turn_runs", "scheduled_request_json", "TEXT")?;
         add_column_if_missing(&tx, "turn_runs", "origin_id", "TEXT")?;
-        add_column_if_missing(&tx, "turn_runs", "origin_stop_reason", "TEXT")?;
 
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_turn_runs_dispatch

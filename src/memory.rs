@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::SystemTime;
 
 use tracing::warn;
 
@@ -100,12 +99,6 @@ impl From<std::io::Error> for MemoryError {
     }
 }
 
-struct CachedBundle {
-    bundle: Arc<MemoryBundle>,
-    /// mtime per file, indexed parallel to [`MemoryFile::ALL`].
-    mtimes: [Option<SystemTime>; 3],
-}
-
 /// Loads agent long-term memory bundles from `{agents_dir}/{agent_id}/memory/`
 /// and publishes new bundles atomically.
 ///
@@ -116,7 +109,6 @@ struct CachedBundle {
 pub(crate) struct MemoryLoader {
     agents_dir: PathBuf,
     locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
-    cache: Mutex<HashMap<String, CachedBundle>>,
 }
 
 impl MemoryLoader {
@@ -124,7 +116,6 @@ impl MemoryLoader {
         Self {
             agents_dir,
             locks: Mutex::new(HashMap::new()),
-            cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -138,10 +129,11 @@ impl MemoryLoader {
 
     /// Loads the current published memory bundle for `agent_id`.
     ///
-    /// Takes the per-agent read lock, re-reads files only when their mtimes
-    /// changed since the last load, and returns the cached bundle otherwise.
-    /// Missing files contribute empty strings. Returns an empty bundle when no
-    /// memory directory exists.
+    /// Takes the per-agent read lock and reads the three files from disk on
+    /// every call. Memory is only three small files and read at Turn-prompt
+    /// frequency, so an mtime cache is not worth the staleness/complexity it
+    /// would introduce (a stale cache could mask a manual edit or swallow a
+    /// metadata error). Missing files contribute empty strings.
     ///
     /// # Errors
     ///
@@ -154,28 +146,7 @@ impl MemoryLoader {
         }
         let lock = self.lock_for(agent_id);
         let _guard = lock.read().expect("memory read lock");
-
-        let memory_dir = self.memory_dir(agent_id);
-        let mtimes = file_mtimes(&memory_dir);
-
-        {
-            let cache = self.cache.lock().expect("memory cache lock");
-            if let Some(cached) = cache.get(agent_id) {
-                if cached.mtimes == mtimes {
-                    return Ok(Arc::clone(&cached.bundle));
-                }
-            }
-        }
-
-        let bundle = Arc::new(read_bundle(&memory_dir)?);
-        let mut cache = self.cache.lock().expect("memory cache lock");
-        cache.insert(
-            agent_id.to_string(),
-            CachedBundle {
-                bundle: Arc::clone(&bundle),
-                mtimes,
-            },
-        );
+        let bundle = Arc::new(read_bundle(&self.memory_dir(agent_id))?);
         Ok(bundle)
     }
 
@@ -220,7 +191,6 @@ impl MemoryLoader {
         }
 
         write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, candidate)?;
-        self.refresh_cache(agent_id, candidate);
 
         metrics::inc_memory_publication("success");
         Ok(())
@@ -267,25 +237,9 @@ impl MemoryLoader {
         }
 
         write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, after)?;
-        self.refresh_cache(agent_id, after);
 
         metrics::inc_memory_publication("recovery");
         Ok(())
-    }
-
-    /// Updates the in-memory cache to the just-published bundle, recording the
-    /// new mtimes so subsequent reads skip re-reading.
-    fn refresh_cache(&self, agent_id: &str, bundle: &MemoryBundle) {
-        let memory_dir = self.memory_dir(agent_id);
-        let mtimes = file_mtimes(&memory_dir);
-        let mut cache = self.cache.lock().expect("memory cache lock");
-        cache.insert(
-            agent_id.to_string(),
-            CachedBundle {
-                bundle: Arc::new(bundle.clone()),
-                mtimes,
-            },
-        );
     }
 
     fn memory_dir(&self, agent_id: &str) -> PathBuf {
@@ -410,18 +364,6 @@ fn read_file_or_empty(path: &Path) -> Result<String, MemoryError> {
     }
 }
 
-/// Returns the mtime of each memory file, indexed parallel to
-/// [`MemoryFile::ALL`]. `None` when the file is absent.
-fn file_mtimes(memory_dir: &Path) -> [Option<SystemTime>; 3] {
-    let mut mtimes = [None; 3];
-    for (idx, file) in MemoryFile::ALL.iter().enumerate() {
-        mtimes[idx] = std::fs::metadata(memory_dir.join(file.file_name()))
-            .and_then(|m| m.modified())
-            .ok();
-    }
-    mtimes
-}
-
 fn safe_agent_id(id: &str) -> bool {
     let id = id.trim();
     !id.is_empty()
@@ -504,49 +446,10 @@ mod tests {
         assert!(matches!(err, MemoryError::UnsafeAgentId(_)));
     }
 
-    #[test]
-    fn load_bundle_caches_unchanged_files() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_file(dir.path(), "a", "episodic.md", "cached");
-
-        let loader = make_loader(dir.path());
-        let first = loader.load_bundle("a").expect("first");
-        let second = loader.load_bundle("a").expect("second");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "cached bundle should be shared"
-        );
-    }
-
-    #[test]
-    fn load_bundle_invalidates_on_mtime_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("agents")
-            .join("a")
-            .join("memory")
-            .join("episodic.md");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "original").unwrap();
-
-        let loader = make_loader(dir.path());
-        let first = loader.load_bundle("a").expect("first");
-        assert_eq!(first.episodic, "original");
-
-        // Filesystems have ~1s mtime resolution; wait so the change is visible.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        fs::write(&path, "updated").unwrap();
-
-        let second = loader.load_bundle("a").expect("second");
-        assert_eq!(second.episodic, "updated");
-        assert!(!Arc::ptr_eq(&first, &second));
-    }
-
     // --- publish_bundle ---
 
     #[test]
-    fn publish_bundle_writes_all_three_files_and_updates_cache() {
+    fn publish_bundle_writes_all_three_files() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 

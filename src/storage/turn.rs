@@ -53,9 +53,6 @@ pub(crate) struct TurnRun {
     /// Origin chain id tracking every turn caused by one human input
     /// (`agent_send` cascade). Equals `turn_id` for a root turn.
     pub origin_id: Option<String>,
-    /// Terminal reason recorded when the origin chain stopped early (e.g. chain
-    /// depth or turn-count limit). `None` while the chain is active.
-    pub origin_stop_reason: Option<String>,
 }
 
 /// Outcome of [`Database::accept_or_get_turn`].
@@ -92,7 +89,7 @@ const TURN_RUN_COLUMNS: &str = "turn_id, chat_id, request_key, state, current_it
     config_fingerprint, model_request_hash, model_attempt,
     output_published, error_kind, error_message, accepted_at,
     updated_at, finished_at, request_payload_hash,
-    scheduled_request_json, origin_id, origin_stop_reason";
+    scheduled_request_json, origin_id";
 
 /// Loads and parses the current state of a Turn inside a transaction.
 /// Returns [`StorageError::NotFound`] when the row is missing, or
@@ -189,7 +186,6 @@ fn read_turn_run(
                 request_payload_hash: row.get(17)?,
                 scheduled_request_json: row.get(18)?,
                 origin_id: row.get(19)?,
-                origin_stop_reason: row.get(20)?,
             })
         })
         .optional()?;
@@ -321,46 +317,29 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite read fails.
-    pub(crate) fn scan_durable_accepted_turn_ids(&self) -> Result<Vec<String>, StorageError> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT turn_id
-             FROM turn_runs
-             WHERE state = 'accepted'
-               AND scheduled_request_json IS NOT NULL
-               AND datetime(accepted_at) < datetime('now', '-2 seconds')
-             ORDER BY accepted_at ASC",
-        )?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ids)
-    }
-
-    /// Returns the IDs of Turns that reached `input_committed` (the user input
-    /// is durably persisted) but whose model loop never started, and which carry
-    /// a persisted request so they can be resumed.
+    /// Returns the IDs of durably-accepted Turns that still need execution or
+    /// resumption, oldest first.
     ///
-    /// Unlike [`Database::scan_durable_accepted_turn_ids`], this covers turns
-    /// that crashed between `accepted -> input_committed` and the first model
-    /// call. The same 2s grace window keeps a live turn (which sits in
-    /// `input_committed` only for microseconds, until the model iteration
-    /// transaction commits) from being double-dispatched.
+    /// Covers both `accepted` (never started) and `input_committed` (model loop
+    /// not yet started) turns whose full request is persisted. A single query
+    /// ordered by `accepted_at` (then `turn_id`) preserves the original
+    /// acceptance order across both states, so a restart cannot reverse the
+    /// turn order of a session (an `input_committed` turn accepted before an
+    /// `accepted` turn is still dispatched first). The dispatcher re-submits
+    /// freely; the scheduler deduplicates by `turn_id`, so no grace window is
+    /// needed.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite read fails.
-    pub(crate) fn scan_durable_input_committed_turn_ids(
-        &self,
-    ) -> Result<Vec<String>, StorageError> {
+    pub(crate) fn scan_durable_pending_turn_ids(&self) -> Result<Vec<String>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT turn_id
              FROM turn_runs
-             WHERE state = 'input_committed'
+             WHERE state IN ('accepted', 'input_committed')
                AND scheduled_request_json IS NOT NULL
-               AND datetime(accepted_at) < datetime('now', '-2 seconds')
-             ORDER BY accepted_at ASC",
+             ORDER BY accepted_at ASC, turn_id ASC",
         )?;
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1421,7 +1400,7 @@ mod tests {
             .expect("age durable");
 
         // Act
-        let ids = db.scan_durable_accepted_turn_ids().expect("scan");
+        let ids = db.scan_durable_pending_turn_ids().expect("scan");
 
         // Assert: only the durable turn is returned; the legacy one is excluded.
         assert_eq!(ids, vec![durable.turn_id]);
@@ -1459,20 +1438,26 @@ mod tests {
     }
 
     #[test]
-    fn scan_durable_input_committed_excludes_recent_and_legacy() {
-        // Arrange: a durable input_committed turn (request persisted, aged past
-        // the grace window), a legacy input_committed turn (no persisted
-        // request), and a recent durable input_committed turn (not aged).
+    fn scan_durable_pending_unifies_accepted_and_input_committed() {
+        // Arrange: a durable accepted turn, a durable input_committed turn,
+        // and a legacy input_committed turn with no persisted request.
         let (db, _dir) = test_db();
         let mut rev = None;
-        let aged = match db
-            .accept_or_get_turn(1, "aged:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
-            .expect("accept aged")
+        let accepted = match db
+            .accept_or_get_turn(1, "acc:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
+            .expect("accept acc")
         {
             AcceptOutcome::Created(run) => run,
             _ => panic!("expected created"),
         };
-        commit_input(&db, &aged.turn_id, &mut rev);
+        let committed = match db
+            .accept_or_get_turn(1, "com:k", 1, Some("fp"), "h", None, Some(r#"{"y":2}"#))
+            .expect("accept com")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        commit_input(&db, &committed.turn_id, &mut rev);
         let legacy = match db
             .accept_or_get_turn(1, "legacy:k", 1, Some("fp"), "h", None, None)
             .expect("accept legacy")
@@ -1481,29 +1466,53 @@ mod tests {
             _ => panic!("expected created"),
         };
         commit_input(&db, &legacy.turn_id, &mut rev);
-        let recent = match db
-            .accept_or_get_turn(1, "recent:k", 1, Some("fp"), "h", None, Some(r#"{"y":2}"#))
-            .expect("accept recent")
+
+        // Act
+        let ids = db.scan_durable_pending_turn_ids().expect("scan");
+
+        // Assert: both durable turns are returned;
+        // the legacy turn (no request) is excluded.
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&accepted.turn_id));
+        assert!(ids.contains(&committed.turn_id));
+    }
+
+    #[test]
+    fn scan_durable_pending_preserves_accepted_at_order_across_states() {
+        // Arrange: same session with A=input_committed (accepted first) and
+        // B=accepted (accepted later). A must dispatch before B so restart
+        // cannot reverse the turn order.
+        let (db, _dir) = test_db();
+        let mut rev = None;
+
+        let a = match db
+            .accept_or_get_turn(1, "a:k", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("accept a")
         {
             AcceptOutcome::Created(run) => run,
             _ => panic!("expected created"),
         };
-        commit_input(&db, &recent.turn_id, &mut rev);
+        commit_input(&db, &a.turn_id, &mut rev);
 
-        db.get_conn()
-            .expect("conn")
-            .execute(
-                "UPDATE turn_runs SET accepted_at = '2000-01-01T00:00:00Z' WHERE turn_id = ?1",
-                params![&aged.turn_id],
-            )
-            .expect("age aged");
+        let b = match db
+            .accept_or_get_turn(1, "b:k", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("accept b")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
 
         // Act
-        let ids = db.scan_durable_input_committed_turn_ids().expect("scan");
+        let ids = db.scan_durable_pending_turn_ids().expect("scan");
 
-        // Assert: only the aged durable input_committed turn is returned; the
-        // legacy (no request) and recent (inside grace) turns are excluded.
-        assert_eq!(ids, vec![aged.turn_id]);
+        // Assert: A appears before B regardless of state difference.
+        let pos_a = ids.iter().position(|id| id == &a.turn_id);
+        let pos_b = ids.iter().position(|id| id == &b.turn_id);
+        assert!(
+            pos_a < pos_b,
+            "input_committed turn A must dispatch before accepted turn B; got {:?}",
+            ids
+        );
     }
 
     #[test]

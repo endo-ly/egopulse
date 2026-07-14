@@ -327,8 +327,17 @@ pub async fn build_app_state_with_path(
 
     // Acquire the exclusive instance lock before the database is opened, so a
     // concurrent runtime or manual `sleep` command against this state root is
-    // rejected up front.
+    // rejected up front. Create the state root first so a nested, not-yet-
+    // existing path (first run) does not fail the lock file open.
+    std::fs::create_dir_all(Path::new(&config.state_root))
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
     let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
+    // The guard's open fd is what holds the OS advisory lock; the call
+    // references the field so it is not considered dead code.
+    assert!(
+        instance_guard.is_valid(),
+        "instance lock file should be accessible"
+    );
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
@@ -553,7 +562,13 @@ pub fn build_sleep_app_state_with_path(
 ) -> Result<AppState, EgoPulseError> {
     // Acquire the exclusive instance lock before the database is opened, so a
     // concurrent runtime against this state root is rejected.
+    std::fs::create_dir_all(Path::new(&config.state_root))
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
     let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
+    assert!(
+        instance_guard.is_valid(),
+        "instance lock file should be accessible"
+    );
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
@@ -710,20 +725,12 @@ fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
             Criticality::Critical,
         ),
         async move {
-            // Turn ids already submitted by this process. The dispatcher scans
-            // every 5s and a turn stays `accepted` / `input_committed` for the
-            // whole duration of its (slow) model loop, so a naive scan would
-            // re-submit the same turn on every tick. The CAS guard in the
-            // executor makes a duplicate submission harmless, but tracking here
-            // avoids the wasted re-enqueue entirely.
-            let mut dispatched: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
-                if let Err(error) = dispatch_durable_turns(&state, &mut dispatched).await {
+                if let Err(error) = dispatch_durable_turns(&state).await {
                     tracing::warn!(error = %error, "turn dispatcher scan failed");
                 }
             }
@@ -732,14 +739,15 @@ fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
     );
 }
 
-/// Re-enqueues any durably accepted turns found in the databases. Each is
-/// rebuilt from its persisted request and re-submitted; the executor re-accepts
-/// the existing row idempotently, so a turn already running is a no-op.
-/// `dispatched` de-duplicates across scan ticks within this process lifetime.
-async fn dispatch_durable_turns(
-    state: &AppState,
-    dispatched: &mut std::collections::HashSet<String>,
-) -> Result<(), EgoPulseError> {
+/// Re-enqueues durably accepted turns found in the databases. Each is rebuilt
+/// from its persisted request and re-submitted in acceptance order; the
+/// scheduler deduplicates by `turn_id`, so re-scanning a turn that is already
+/// running or queued is an idempotent no-op and no per-process dedup set is
+/// needed. A transient failure (DB read, deserialize) for one turn does not
+/// blacklist it — the next scan retries. Turns the scheduler cannot accept yet
+/// (capacity) stay `accepted`/`input_committed` in the DB and are retried as
+/// capacity frees.
+async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
     let scopes: &[ConversationScope] = if state.secret_db.is_some() {
         &[ConversationScope::Normal, ConversationScope::Secret]
     } else {
@@ -747,20 +755,11 @@ async fn dispatch_durable_turns(
     };
     for &scope in scopes {
         let db = Arc::clone(state.db_for(scope));
-        let mut turn_ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_accepted_turn_ids())
+        let turn_ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_pending_turn_ids())
             .await
             .map_err(EgoPulseError::from)?;
-        let input_committed = call_blocking(Arc::clone(&db), |db| {
-            db.scan_durable_input_committed_turn_ids()
-        })
-        .await
-        .map_err(EgoPulseError::from)?;
-        turn_ids.extend(input_committed);
 
         for turn_id in turn_ids {
-            if !dispatched.insert(turn_id.clone()) {
-                continue;
-            }
             let json = match call_blocking(Arc::clone(&db), {
                 let turn_id = turn_id.clone();
                 move |db| {
@@ -771,6 +770,8 @@ async fn dispatch_durable_turns(
             .await
             {
                 Ok(Some(json)) => json,
+                // A transient DB error or a missing row is retried on the next
+                // scan; it is not blacklisted.
                 _ => continue,
             };
             let mut turn = match deserialize_scheduled_turn(&json) {
@@ -783,9 +784,10 @@ async fn dispatch_durable_turns(
             // The dispatcher knows the authoritative `turn_id`; the persisted
             // payload does not carry it, so stamp it before re-enqueue.
             turn.turn_id = turn_id.clone();
-            // Re-enqueue. Bypasses dedupe so the recovered turn is actually
-            // scheduled; the executor finds the existing row and proceeds
-            // (accepted) or resumes the model loop (input_committed).
+            // Re-enqueue. The scheduler deduplicates by `turn_id`, so a turn
+            // already running or queued is an idempotent no-op; a turn the
+            // scheduler cannot accept yet (capacity) is left in the DB and
+            // retried on the next scan as capacity frees.
             let _ = channel_input::enqueue_durable_turn(state, turn);
         }
     }

@@ -1254,7 +1254,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_route_returns_429_when_session_queue_full() {
+    async fn webhook_route_accepts_past_scheduler_capacity_and_leaves_durable_row() {
+        // Acceptance contract: once the DB commit succeeds the turn *is*
+        // accepted. Scheduler capacity after the commit is a wait-time problem,
+        // not a rejection — the turn stays `accepted` in the DB and the
+        // dispatcher retries as capacity frees. Therefore a request that would
+        // previously have returned 429 now returns 202.
         let provider_entered = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(dir.path().to_str().expect("state root"));
@@ -1317,8 +1322,7 @@ mod tests {
 
         // Wait until the first turn actually reaches the blocking provider
         // (it is now the active turn holding the session slot, not a queued
-        // one) before filling the queue. Without this, the active turn could
-        // still be in the queue and the limit would trip one request early.
+        // one) before filling the queue.
         while provider_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
@@ -1329,16 +1333,11 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
         }
 
-        // The next distinct request exceeds the per-session queue limit → 429,
-        // not 202.
-        let rejected = post(9999).await.expect("response");
-        assert_ne!(rejected.status(), StatusCode::ACCEPTED);
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-        let bytes = to_bytes(rejected.into_body(), 1024)
-            .await
-            .expect("response body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-        assert_eq!(body["error"], "session_queue_full");
+        // The next distinct request exceeds the per-session scheduler queue
+        // limit, but the DB commit already succeeded so it is still accepted
+        // (202) and left in `turn_runs` for the dispatcher to retry.
+        let beyond = post(9999).await.expect("response");
+        assert_eq!(beyond.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

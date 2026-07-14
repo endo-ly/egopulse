@@ -1377,6 +1377,23 @@ async fn finalize_batch(
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
 ) -> Result<(), SleepBatchError> {
+    // Publish the candidate bundle BEFORE archiving source sessions. If
+    // publication fails (manual-edit conflict or I/O error), the candidate is
+    // still valuable: leave the run `running` and return without archiving or
+    // finalizing. The candidate survives in `memory_snapshots`, startup
+    // recovery re-drives publication, and the still-running run blocks new
+    // sleep runs until the operator resolves the conflict (e.g. restart). This
+    // avoids losing the generated memory just because the final write failed.
+    if let Err(error) = publish_memory_bundle(state, db, ctx, agent_id).await {
+        warn!(
+            agent_id = %agent_id,
+            run_id = %ctx.run_id,
+            error = %error,
+            "memory publication failed; run left running for startup recovery"
+        );
+        return Ok(());
+    }
+
     let groups_dir = state.config.groups_dir();
     let secrets = crate::tools::collect_config_secrets(&state.config);
     for session in sessions {
@@ -1428,8 +1445,6 @@ async fn finalize_batch(
     })
     .await?;
 
-    publish_memory_bundle(state, db, ctx, agent_id).await?;
-
     let run_id_for_finalize = ctx.run_id.clone();
     let derived_status = call_blocking(Arc::clone(db), move |db| {
         db.finalize_sleep_run(&run_id_for_finalize)
@@ -1473,9 +1488,10 @@ async fn finalize_batch(
 /// Ensures the run has a complete 3-file snapshot set, reads it back, and
 /// publishes the candidate bundle atomically.
 ///
-/// A precondition conflict (on-disk file changed since run start) propagates
-/// as an error so [`execute_batch`] marks the run failed without overwriting
-/// the current files.
+/// Returns an error when publication cannot complete (manual-edit conflict,
+/// I/O failure, or an incomplete snapshot set). The caller leaves the run
+/// `running` on error so startup recovery can retry and the candidate is not
+/// lost; the current on-disk files are never overwritten on a conflict.
 async fn publish_memory_bundle(
     state: &AppState,
     db: &Arc<Database>,
@@ -1510,17 +1526,24 @@ async fn publish_memory_bundle(
         )));
     };
 
-    state
-        .memory_loader
-        .publish_bundle(agent_id, &ctx.run_id, &before, &after)
-        .map_err(|e| match e {
-            MemoryError::Conflict { agent_id, file } => SleepBatchError::Io(format!(
-                "memory publication conflict: agent={agent_id} file={file}"
-            )),
-            MemoryError::UnsafeAgentId(a) => SleepBatchError::UnsafeAgentId(a),
-            MemoryError::Io(m) => SleepBatchError::Io(m),
-            MemoryError::RecoveryValidation { .. } => SleepBatchError::Internal(e.to_string()),
-        })?;
+    // Publication performs several fsyncs; run it on a blocking thread so the
+    // async sleep batch never stalls the runtime on disk latency.
+    let memory_loader = Arc::clone(&state.memory_loader);
+    let agent_id_owned = agent_id.to_string();
+    let run_id_owned = ctx.run_id.clone();
+    let publish_result = tokio::task::spawn_blocking(move || {
+        memory_loader.publish_bundle(&agent_id_owned, &run_id_owned, &before, &after)
+    })
+    .await
+    .map_err(|e| SleepBatchError::Internal(format!("publication task failed: {e}")))?;
+    publish_result.map_err(|e| match e {
+        MemoryError::Conflict { agent_id, file } => SleepBatchError::Io(format!(
+            "memory publication conflict: agent={agent_id} file={file}"
+        )),
+        MemoryError::UnsafeAgentId(a) => SleepBatchError::UnsafeAgentId(a),
+        MemoryError::Io(m) => SleepBatchError::Io(m),
+        MemoryError::RecoveryValidation { .. } => SleepBatchError::Internal(e.to_string()),
+    })?;
     Ok(())
 }
 
@@ -2174,15 +2197,16 @@ mod tests {
         });
         let state = build_test_state_with_llm(db, dir.path(), provider);
 
-        // A manual-edit conflict aborts publication; the batch returns an error
-        // but the run is marked failed.
+        // A manual-edit conflict cannot publish: the run stays `running` so
+        // startup recovery can retry and the candidate is not lost, while the
+        // manual edit is preserved on disk.
         let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
 
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(
             runs[0].status,
-            SleepRunStatus::Failed,
-            "manual edit conflict must fail the run"
+            SleepRunStatus::Running,
+            "manual edit conflict must leave the run running for recovery"
         );
         // The manual edit is preserved (publication did not overwrite it).
         assert_eq!(

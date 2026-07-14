@@ -504,6 +504,9 @@ impl Default for TurnTracker {
 /// Slot state for a single agent session within the scheduler.
 struct TurnSlot {
     busy: bool,
+    /// `turn_id` of the currently executing turn, so duplicate re-submissions
+    /// by the dispatcher are recognized as idempotent no-ops.
+    current_turn_id: Option<String>,
     queue: VecDeque<ScheduledTurn>,
 }
 
@@ -552,15 +555,29 @@ impl TurnScheduler {
     pub(crate) fn submit(&self, turn: ScheduledTurn) -> ScheduleResult {
         let mut inner = self.inner.lock().expect("turn_scheduler lock");
         let session_key = turn.session_key();
+        let turn_id = turn.turn_id.clone();
+
+        // Idempotent dedup: if this turn is already running or queued, treat a
+        // repeat submission as a no-op so the dispatcher can re-scan the DB
+        // without a separate dedup set and without enqueueing duplicates.
+        if let Some(slot) = inner.slots.get(&session_key) {
+            if slot.current_turn_id.as_deref() == Some(turn_id.as_str())
+                || slot.queue.iter().any(|t| t.turn_id == turn_id)
+            {
+                return ScheduleResult::Queued;
+            }
+        }
 
         // Idle (no slot or slot not busy): start immediately.
         let is_idle = inner.slots.get(&session_key).is_none_or(|s| !s.busy);
         if is_idle {
             let slot = inner.slots.entry(session_key).or_insert_with(|| TurnSlot {
                 busy: false,
+                current_turn_id: None,
                 queue: VecDeque::new(),
             });
             slot.busy = true;
+            slot.current_turn_id = Some(turn_id);
             // Started turns are not counted in global_queued (only queued are).
             return ScheduleResult::Started(Box::new(turn));
         }
@@ -596,14 +613,19 @@ impl TurnScheduler {
     /// Always decrements the global queue count when a queued turn is drained.
     pub(crate) fn on_turn_completed(&self, session_key: &str) -> Option<ScheduledTurn> {
         let mut inner = self.inner.lock().expect("turn_scheduler lock");
-        if let Some(slot) = inner.slots.get_mut(session_key) {
-            if let Some(next) = slot.queue.pop_front() {
-                inner.global_queued = inner.global_queued.saturating_sub(1);
-                metrics::set_turn_queue_depth(inner.global_queued);
-                return Some(next);
+        let next = inner
+            .slots
+            .get_mut(session_key)
+            .and_then(|slot| slot.queue.pop_front());
+        if let Some(next) = next {
+            inner.global_queued = inner.global_queued.saturating_sub(1);
+            metrics::set_turn_queue_depth(inner.global_queued);
+            if let Some(slot) = inner.slots.get_mut(session_key) {
+                slot.current_turn_id = Some(next.turn_id.clone());
             }
-            inner.slots.remove(session_key);
+            return Some(next);
         }
+        inner.slots.remove(session_key);
         None
     }
 
@@ -674,7 +696,7 @@ mod tests {
 
     fn test_turn(agent_id: &str, origin_id: &str) -> ScheduledTurn {
         ScheduledTurn {
-            turn_id: format!("turn-{agent_id}"),
+            turn_id: format!("turn-{agent_id}-{origin_id}"),
             context: test_context(agent_id),
             input: "hello".to_string(),
             origin_id: origin_id.to_string(),
@@ -878,6 +900,33 @@ mod tests {
         assert!(matches!(result_b, ScheduleResult::Started(_)));
         assert!(scheduler.is_busy(key_a));
         assert!(scheduler.is_busy(key_b));
+    }
+
+    #[test]
+    fn turn_scheduler_dedups_identical_turn_id_as_no_op() {
+        // The dispatcher re-scans the DB every 5s; without dedup the same
+        // turn would be enqueued repeatedly. The scheduler treats a repeat
+        // submission as an idempotent no-op.
+        let scheduler = TurnScheduler::new();
+        let turn = test_turn("agent_a", "orig-1");
+
+        let first = scheduler.submit(turn.clone());
+        assert!(matches!(first, ScheduleResult::Started(_)));
+
+        let second = scheduler.submit(turn.clone());
+        assert!(
+            matches!(second, ScheduleResult::Queued),
+            "duplicate turn_id must be a no-op, not Started again"
+        );
+
+        // After the turn completes and the queue drains, a re-submit is a
+        // fresh start attempt (the prior execution is finished).
+        scheduler.on_turn_completed("discord:ch1:agent:agent_a");
+        let third = scheduler.submit(turn);
+        assert!(
+            matches!(third, ScheduleResult::Started(_)),
+            "after completion a re-submit should be fresh Started"
+        );
     }
 
     // ---- Stop Condition tests ----

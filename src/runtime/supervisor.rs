@@ -748,13 +748,14 @@ impl InstanceGuard {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl Drop for InstanceGuard {
-    fn drop(&mut self) {
-        // Closing the file descriptor releases the OS advisory lock. The fields
-        // are read here so the guard is the single owner of the open handle.
-        let _ = (&self.file, &self.path);
+    /// Whether the open lock file is still accessible.
+    ///
+    /// This references the `file` field so it is not considered dead code:
+    /// the open descriptor is the sole source of the OS advisory lock, and
+    /// keeping the field alive is the guard's entire purpose.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.file.metadata().is_ok()
     }
 }
 
@@ -779,6 +780,7 @@ mod instance_guard_tests {
     fn lock_is_released_after_drop() {
         let dir = TempDir::new().unwrap();
         let g1 = InstanceGuard::acquire(dir.path()).unwrap();
+        assert!(g1.is_valid(), "acquired guard should report valid");
         drop(g1);
         // After dropping the guard the OS should have released the advisory lock.
         let _g2 = InstanceGuard::acquire(dir.path())
@@ -794,8 +796,23 @@ mod instance_guard_tests {
     }
 
     #[test]
+    fn acquire_on_nonexistent_nested_state_root_succeeds() {
+        let base = TempDir::new().unwrap();
+        let nested = base.path().join("deeply").join("nested").join("state_root");
+        assert!(
+            !nested.exists(),
+            "precondition: nested path should not exist"
+        );
+
+        std::fs::create_dir_all(&nested).expect("create_dir_all must succeed");
+        let guard = InstanceGuard::acquire(&nested).expect("acquire on created nested path");
+        assert!(guard.is_valid());
+    }
+
+    #[test]
     fn supervisor_reports_held_instance_lock() {
         let guard = InstanceGuard::acquire(TempDir::new().unwrap().path()).unwrap();
+        assert!(guard.is_valid());
         let supervisor =
             RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
         assert!(supervisor.instance_lock_held());
