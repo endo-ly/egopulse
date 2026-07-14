@@ -674,10 +674,13 @@ CREATE INDEX idx_memory_snapshots_agent_created
 - `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
 - `get_snapshots_for_agent(agent_id, limit)` — agent_id 絞り込み + created_at 降順
 - `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
+- `ensure_memory_snapshots_complete(run_id, agent_id, base)` — 欠落 file に `content_before == content_after == base` の snapshot を補完する
+- `list_running_sleep_runs()` — `status = 'running'` の Run を開始順に取得（スタートアップリカバリ用）
 
 **設計ポイント**:
-- **Aggregate snapshot 方針**: 1回 LLM 呼び出し前提のため、phase ごとではなく run 単位で1ファイルにつき1件の snapshot を保存する。Phase 4 骨格実装では content_before == content_after（no-op）の snapshot を記録し、Phase 5 以降で LLM による書き換え後に差分が発生する
-- `phase` カラムは Phase 4 で削除。1回 LLM 呼び出し設計では phase ごとの中間状態が不要なため
+- **Aggregate snapshot 方針**: 1回 LLM 呼び出し前提のため、phase ごとではなく run 単位で1ファイルにつき1件の snapshot を保存する
+- **完全な3ファイルセット**: finalize 前に3種類の snapshot が揃うことを publication bundle の整合性条件とする。各 Step は成功時に担当 file の snapshot を commit し、未実行・未変更の file は `ensure_memory_snapshots_complete()` が `before == after == base` で補完する。`content_before` は常に Run 開始時の bundle（base）を使用する
+- **Publication / Recovery**: `publish_bundle()` は `content_before` を precondition とし、`content_after` を原子的に公開する。スタートアップリカバリは `content_after` から再公開し、現状が `before` / `after` のいずれにも一致しない場合は startup を停止する
 
 ---
 

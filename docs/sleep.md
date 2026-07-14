@@ -582,19 +582,46 @@ config.agents = [a,b]  → 指定 agent のみ
 - `try_create_sleep_run()` で同一 agent の同時実行を防止
 - 既に running 状態の run がある場合は `None` を返す（呼び出し元で `AlreadyRunning` に変換）
 
-### メモリファイル書き込みの安全性
+### メモリファイル公開（Publication）
 
-`write_memory_files()` は以下の順序で原子的に書き込む：
+3つの記憶ファイル（`episodic.md` / `semantic.md` / `prospective.md`）は1つの **Memory bundle** として扱い、末尾の `publish_bundle()` でのみ公開する。各 Step は候補（candidate）をインメモリに更新するだけで、公開 Markdown を直接変更しない。
 
-1. `memory.tmp-{uuid}/` に全ファイルを書き込み
-2. 既存 `memory/` を `memory.backup-{uuid}/` にリネーム
-3. `memory.tmp-{uuid}/` を `memory/` にリネーム
-4. 成功したら `memory.backup-{uuid}/` を削除
-5. 失敗したら backup から復元
+#### Per-agent RwLock
 
-`recover_memory_write()` は起動時に以下を実行：
-- `memory/` が消えていたら最新の `memory.backup-*` から復元
-- 古い `memory.tmp-*` / `memory.backup-*` を削除
+`MemoryLoader` は agent 単位の `RwLock` を持つ。
+
+- Turn 側（`load_bundle`）は **read lock** を取得し、3ファイルを一覧する。公開中は reader が入らない。
+- Sleep 公開側（`publish_bundle`）は **write lock** を取得し、検証〜 rename まで保持する。
+- LLM 生成中は write lock を保持しない（候補構築中は Turn が現行 bundle を読める）。
+
+#### 公開プロトコル
+
+`publish_bundle(agent_id, run_id, base, candidate)` は write lock 保持下で次の順序で実行する。
+
+1. 現在の3ファイルを読み、各 `content_before`（`base`）と一致することを確認（precondition）
+   - 不一致は手動編集とみなし `MemoryError::Conflict` で中断。現行ファイルはそのまま
+2. 各ファイルを `<file>.md.<run_id>.tmp` に書き、`flush` / `sync_all`
+3. `episodic` → `semantic` → `prospective` の順で rename
+4. ディレクトリを `sync_all`
+5. `MemoryLoader` cache を candidate bundle に更新
+
+#### Snapshot 完全性
+
+finalize 前、同じ `run_id` について3種類（episodic / semantic / prospective）の `memory_snapshots` を揃える。更新が無かった file にも `content_before == content_after == base` の snapshot を `ensure_memory_snapshots_complete()` で補完する。これを publication bundle の整合性条件とする。
+
+#### 手動編集検出
+
+ precondition 不一致（実行開始後にファイルが書き換えられた）は `Conflict` となり、現行ファイルを維持したまま Sleep Run を `failed` に遷移する。
+
+### スタートアップリカバリ
+
+Runtime 起動時、`status = running` の Sleep Run を検査する（TurnDispatcher / Channel 起動前）。
+
+- 3種類の snapshot が揃っている場合、各ファイルの現状が `content_before` または `content_after` のいずれかに一致することを検証し、`content_after` から再公開（rename 再実行）して Run を成功へ遷移
+- snapshot が揃っていない Run は `failed` へ遷移
+- 現状が `before` / `after` のどちらにも一致しない場合、startup を error で停止
+
+これにより、1ファイル目・2ファイル目の rename 後、全 rename 後・run success 前のいずれの停止点からも同じ bundle へ収束する。
 
 ---
 

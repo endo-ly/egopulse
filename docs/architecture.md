@@ -144,7 +144,7 @@ src/
 │
 ├── setup/               # 初回セットアップウィザード
 │
-├── memory.rs            # 長期記憶ファイルの読み込み（episodic/semantic/prospective）
+├── memory.rs            # 長期記憶 bundle の読み込み・公開・クラッシュリカバリ
 ├── skills.rs            # スキル管理 (発見・読み込み・カタログ生成)
 ├── slash_commands.rs    # slash command dispatcher、LLM プロファイル管理
 ├── sleep/               # sleep batch 実行・scheduler
@@ -295,13 +295,18 @@ pub(crate) struct SurfaceContext {
       │
 3. build_app_state()
        │
+       ├─ InstanceGuard 取得 (state root の排他ロック)
        ├─ Database 初期化 (SQLite WAL, マイグレーション)
        ├─ secret_db 初期化 (Config::needs_secret_db() が true の場合のみ)
        ├─ SkillManager 構築
       ├─ McpManager 初期化 (MCP server 接続)
       ├─ ToolRegistry 構築 (built-in + MCP adapters)
       ├─ ChannelAdapter 登録
-      └─ SOUL.md プロビジョニング
+      ├─ SOUL.md プロビジョニング
+      ├─ Durable state recovery (running tool_calls → uncertain, interrupt された turn_runs を安全停止)
+      ├─ Origin tracker rehydrate (turn_runs から per-chain limit を復元)
+      ├─ **Memory publication recovery** (running Sleep Run の bundle を再公開・整合)
+      └─ MCP reconnect loop / Agent turn worker / Turn dispatcher 起動 (supervisor 経由)
       │
 4. start_channels()
        │
