@@ -1265,7 +1265,7 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
 ///
 /// Every long-lived task (channel listeners, schedulers) is owned by the
 /// runtime supervisor. The run loop watches for critical task failures and
-/// Ctrl-C; on either trigger it runs [`RuntimeSupervisor::shutdown`], which
+/// Ctrl-C; on either trigger it runs `RuntimeSupervisor::shutdown`, which
 /// stops accepting input, drains in-flight turns, then drains long-lived tasks
 /// within bounded deadlines.
 pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
