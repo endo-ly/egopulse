@@ -847,11 +847,20 @@ CREATE TABLE IF NOT EXISTS turn_runs (
     updated_at TEXT NOT NULL,
     finished_at TEXT,
     request_payload_hash TEXT,
+    scheduled_request_json TEXT,
+    origin_id TEXT,
+    origin_stop_reason TEXT,
     UNIQUE(chat_id, request_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_turn_runs_chat ON turn_runs(chat_id);
 CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
+CREATE INDEX IF NOT EXISTS idx_turn_runs_dispatch
+    ON turn_runs(state, accepted_at, turn_id)
+    WHERE scheduled_request_json IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
+    ON turn_runs(origin_id, accepted_at)
+    WHERE origin_id IS NOT NULL;
 ```
 
 | カラム | 型 | 制約 | 説明 |
@@ -874,6 +883,9 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
 | updated_at | TEXT | NOT NULL | 最終更新時刻 |
 | finished_at | TEXT | nullable | 完了・停止時刻 |
 | request_payload_hash | TEXT | nullable | 受付時の user input 本文 hash。再受付で同一 `request_key` に異なる本文が渡された場合に拒否する |
+| scheduled_request_json | TEXT | nullable | accepted Turn の実行要求（`PersistedScheduledTurn` の versioned JSON）。再起動後に Dispatcher がこれから再実行する |
+| origin_id | TEXT | nullable | Agent Send chain の identity。root Turn は自身の `turn_id`、子 Turn は親の `origin_id` を継承する |
+| origin_stop_reason | TEXT | nullable | chain を停止させた理由（LLM 失敗・深さ超過など）。terminal した chain の再開抑止に用いる |
 
 *UNIQUE 制約は `(chat_id, request_key)` の複合。同じ受付を再受付した場合は新規 Turn を作らず既存 Turn を返す。
 
@@ -1139,6 +1151,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 #### v13: turn_runs.request_payload_hash
 
 `turn_runs` へ `request_payload_hash` カラムを追加。受付時に user input 本文の SHA-256 を保存し、同一 `request_key` の再受付で本文が異なる場合に受付を拒否できるようにする。既存行は NULL を許容し、NULL は未計測の legacy データとして再受付を許す。
+
+#### v14: durable scheduled turn columns
+
+`turn_runs` へ `scheduled_request_json` / `origin_id` / `origin_stop_reason` を追加し、部分索引 `idx_turn_runs_dispatch`（`scheduled_request_json IS NOT NULL`）と `idx_turn_runs_origin`（`origin_id IS NOT NULL`）を追加する。accepted Turn の実行要求を永続化し、再起動後に `TurnDispatcher` が再実行できるようにする。`origin_id` / `origin_stop_reason` は Agent Send chain の identity と停止理由を永続化する。Normal / Secret 両 DB に適用する。
 
 ### 外部キー制約が最小限
 

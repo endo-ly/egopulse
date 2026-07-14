@@ -613,7 +613,7 @@ Content-Type: application/json
 
 `receiver_id` は設定済み receiver 名。未設定の場合は `404 webhook_receiver_not_found`。
 
-成功時は turn 完了を待たず `202 Accepted` を返す。`202` は「in-memory scheduler への受付成功（即時開始 or キュー投入）」のみを意味し、Webhook job の永続化は行わない。したがって受付後のプロセス再起動でキューは失われる。スケジューラの in-memory queue が満杯の場合は `429` を返す（後述）。
+成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返り、即時開始・キュー投入を問わずプロセス再起動後にも `TurnDispatcher` が再実行する（durable acceptance）。受付拒否時は理由コード違いで一律 `429` を返す（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、同一 `request_key` へ異なる本文が再受付された場合は `internal`）。
 
 ```json
 {

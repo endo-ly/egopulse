@@ -103,7 +103,7 @@ execute_scheduled_turn():
 
 **バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
 
-- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返り、即時開始・キュー投入を問わず再起動後に実行される（durable acceptance）。同一 `request_key` + 異なる本文は `409 Conflict`、受付閾値超えは `429`、shutdown 中は `503` となる。
+- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返り、即時開始・キュー投入を問わず再起動後に実行される（durable acceptance）。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown` / 同一 `request_key` への異なる本文は `internal`）。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
 - Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
 
