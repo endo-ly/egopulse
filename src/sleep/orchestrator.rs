@@ -1431,13 +1431,27 @@ async fn finalize_batch(
         .ok_or_else(|| SleepBatchError::Internal(format!("sleep run vanished: {}", ctx.run_id)))?;
     let groups_dir = state.config.groups_dir();
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    finalize_published_run_blocking(
-        db.as_ref(),
-        &groups_dir,
-        &secrets,
-        &run,
-        Some(ctx.provider.provider_name()),
-    )?;
+    let provider_name = ctx.provider.provider_name().to_string();
+    let db_for_finalize = Arc::clone(db);
+    // The post-publication finalization (archive writes, truncation, run
+    // transition) is DB + filesystem I/O; run it on a blocking thread so the
+    // async sleep batch never stalls the runtime on disk latency. This mirrors
+    // how memory publication is offloaded above and keeps the normal path
+    // symmetric with startup recovery, which runs this synchronously in a
+    // blocking startup context.
+    tokio::task::spawn_blocking(move || {
+        finalize_published_run_blocking(
+            db_for_finalize.as_ref(),
+            &groups_dir,
+            &secrets,
+            &run,
+            Some(&provider_name),
+        )
+    })
+    .await
+    .map_err(|join_error| {
+        SleepBatchError::Internal(format!("finalization task panicked: {join_error}"))
+    })??;
     Ok(())
 }
 
@@ -1445,7 +1459,7 @@ async fn finalize_batch(
 /// truncate the source sessions, then transition the run `Running → Success`.
 ///
 /// This is the single, idempotent convergence point shared by the normal path
-/// ([`finalize_batch`], via `call_blocking`) and startup recovery
+/// ([`finalize_batch`], via `spawn_blocking`) and startup recovery
 /// ([`recover_run_publication`], called directly). The archive-target sessions
 /// are reconstructed from the run's `source_chats_json`, which is persisted
 /// **before** publication so a crash between publication and this call still
@@ -1633,7 +1647,9 @@ async fn publish_memory_bundle(
             "memory publication conflict: agent={agent_id} file={file}"
         )),
         MemoryError::UnsafeAgentId(a) => SleepBatchError::UnsafeAgentId(a),
-        MemoryError::Io(m) => SleepBatchError::Io(m),
+        MemoryError::Io { path, source } => {
+            SleepBatchError::Io(format!("memory io failed at {}: {source}", path.display()))
+        }
         MemoryError::RecoveryValidation { .. } => SleepBatchError::Internal(e.to_string()),
     })?;
     Ok(())

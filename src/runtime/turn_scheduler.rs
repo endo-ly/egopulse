@@ -180,18 +180,26 @@ impl std::fmt::Display for RejectReason {
 
 /// Internal result of [`TurnScheduler::submit`].
 ///
-/// `Started` hands the turn back so the caller can begin execution; `Queued`
-/// means the turn was buffered behind an in-progress turn; `Rejected` means
-/// the in-memory scheduler is at capacity. The durable intake converts a
-/// `Rejected` here into `SubmitOutcome::Queued` (deferred to the dispatcher),
-/// because the turn is already durably accepted — capacity is the dispatcher's
-/// wait-time problem, never a caller-visible rejection. Acceptance-level
-/// capacity rejection (`session_queue_full` / `global_queue_full`) is decided
-/// earlier, in the same transaction as the durable commit.
+/// Each variant names exactly one outcome so the caller does not have to read
+/// comments to distinguish them:
+/// - `Started` hands the turn back so the caller can begin execution.
+/// - `Enqueued` buffered the turn behind an in-progress turn for this session.
+/// - `AlreadyOwned` is an idempotent no-op: the same `turn_id` is already
+///   running or queued, so a dispatcher re-scan does not enqueue a duplicate.
+/// - `DeferredCapacity` hit the per-session or global in-memory capacity. The
+///   turn is already durably accepted, so this is a wait-time problem for the
+///   dispatcher, never a caller-visible rejection; the durable intake maps it
+///   to [`SubmitOutcome::Queued`]. Acceptance-level capacity rejection
+///   (`session_queue_full` / `global_queue_full`) is decided earlier, in the
+///   same transaction as the durable commit.
 pub(crate) enum ScheduleResult {
     Started(Box<ScheduledTurn>),
-    Queued,
-    Rejected(RejectReason),
+    /// Buffered behind an in-progress turn for this session.
+    Enqueued,
+    /// Same `turn_id` already running or queued (idempotent re-dispatch no-op).
+    AlreadyOwned,
+    /// Per-session or global in-memory capacity full; defer to the dispatcher.
+    DeferredCapacity,
 }
 
 /// Caller-facing outcome of submitting a turn.
@@ -574,10 +582,13 @@ impl TurnScheduler {
     ///
     /// - [`ScheduleResult::Started`] when the slot was idle — the caller should
     ///   begin executing the returned turn immediately.
-    /// - [`ScheduleResult::Queued`] when the slot is busy and capacity allowed
+    /// - [`ScheduleResult::Enqueued`] when the slot is busy and capacity allowed
     ///   buffering the turn for later execution.
-    /// - [`ScheduleResult::Rejected`] when per-session or global capacity is
-    ///   full — the turn is refused and must not be executed.
+    /// - [`ScheduleResult::AlreadyOwned`] when the same `turn_id` is already
+    ///   running or queued (idempotent re-dispatch no-op).
+    /// - [`ScheduleResult::DeferredCapacity`] when per-session or global
+    ///   in-memory capacity is full — the turn is already durably accepted, so
+    ///   it defers to the dispatcher rather than being refused.
     ///
     /// Per-session and global limits are checked under a single lock and no
     /// async work runs while the lock is held. Rejection metrics are recorded
@@ -598,7 +609,7 @@ impl TurnScheduler {
                 if slot.current_turn_id.as_deref() == Some(turn_id.as_str())
                     || slot.queue.iter().any(|t| t.turn_id == turn_id)
                 {
-                    return ScheduleResult::Queued;
+                    return ScheduleResult::AlreadyOwned;
                 }
             }
         }
@@ -625,10 +636,10 @@ impl TurnScheduler {
             .get(&session_key)
             .is_some_and(|s| s.queue.len() >= MAX_QUEUED_TURNS_PER_SESSION);
         if session_full {
-            return ScheduleResult::Rejected(RejectReason::SessionQueueFull);
+            return ScheduleResult::DeferredCapacity;
         }
         if inner.global_queued >= MAX_GLOBAL_QUEUED_TURNS {
-            return ScheduleResult::Rejected(RejectReason::GlobalQueueFull);
+            return ScheduleResult::DeferredCapacity;
         }
 
         inner
@@ -639,7 +650,7 @@ impl TurnScheduler {
             .push_back(turn);
         inner.global_queued += 1;
         metrics::set_turn_queue_depth(inner.global_queued);
-        ScheduleResult::Queued
+        ScheduleResult::Enqueued
     }
 
     /// Called after a turn completes. Returns the next queued turn for this
@@ -827,10 +838,7 @@ mod tests {
 
         let result = scheduler.submit(test_turn("agent_a", "overflow"));
 
-        assert!(matches!(
-            result,
-            ScheduleResult::Rejected(RejectReason::SessionQueueFull)
-        ));
+        assert!(matches!(result, ScheduleResult::DeferredCapacity));
         // Rejected turn is not enqueued.
         assert_eq!(
             scheduler.queue_len("discord:ch1:agent:agent_a"),
@@ -858,10 +866,7 @@ mod tests {
         // A new session's second turn must be rejected on the global limit.
         scheduler.submit(test_turn("overflow_agent", "started"));
         let result = scheduler.submit(test_turn("overflow_agent", "queued"));
-        assert!(matches!(
-            result,
-            ScheduleResult::Rejected(RejectReason::GlobalQueueFull)
-        ));
+        assert!(matches!(result, ScheduleResult::DeferredCapacity));
         assert_eq!(scheduler.global_queued(), MAX_GLOBAL_QUEUED_TURNS);
     }
 
@@ -950,7 +955,7 @@ mod tests {
 
         let second = scheduler.submit(turn.clone());
         assert!(
-            matches!(second, ScheduleResult::Queued),
+            matches!(second, ScheduleResult::AlreadyOwned),
             "duplicate turn_id must be a no-op, not Started again"
         );
 

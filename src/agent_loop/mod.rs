@@ -25,7 +25,6 @@ pub(crate) use turn_runtime::TurnRuntime;
 use crate::error::EgoPulseError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 /// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
 ///
@@ -49,27 +48,44 @@ impl ScheduledTurn {
     }
 }
 
+/// Canonical (order-independent) serialization of a turn request. Fields are
+/// declared in the sorted-key order a `BTreeMap` would produce, so the digest
+/// matches the original map-based implementation byte-for-byte (locked by a
+/// unit test) while avoiding the per-call `BTreeMap` + `serde_json::Value`
+/// allocations on the acceptance hot path.
+#[derive(serde::Serialize)]
+struct CanonicalRequest<'a> {
+    agent_id: &'a str,
+    chain_depth: usize,
+    channel: &'a str,
+    channel_log_chat_id: Option<i64>,
+    chat_type: &'a str,
+    input: &'a str,
+    surface_thread: &'a str,
+    surface_user: &'a str,
+    version: u32,
+}
+
 /// Computes the canonical request hash from the full surface context and input
 ///. The hash is independent of JSON field order or whitespace, so
 /// the same logical request always produces the same digest. `origin_id`,
 /// `request_key`, and `trace_id` are excluded: they are identity/routing values,
 /// not part of the request content.
 pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> String {
-    let mut map: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-    map.insert("version", serde_json::json!(1u32));
-    map.insert("channel", serde_json::json!(context.channel));
-    map.insert("surface_user", serde_json::json!(context.surface_user));
-    map.insert("surface_thread", serde_json::json!(context.surface_thread));
-    map.insert("chat_type", serde_json::json!(context.chat_type));
-    map.insert("agent_id", serde_json::json!(context.agent_id));
-    map.insert(
-        "channel_log_chat_id",
-        serde_json::json!(context.channel_log_chat_id),
-    );
-    map.insert("chain_depth", serde_json::json!(context.chain_depth));
-    map.insert("input", serde_json::json!(input));
-    // BTreeMap serializes with sorted keys, giving an order-independent digest.
-    let bytes = serde_json::to_vec(&map).expect("canonical request serialization");
+    let canonical = CanonicalRequest {
+        agent_id: &context.agent_id,
+        chain_depth: context.chain_depth,
+        channel: &context.channel,
+        channel_log_chat_id: context.channel_log_chat_id,
+        chat_type: &context.chat_type,
+        input,
+        surface_thread: &context.surface_thread,
+        surface_user: &context.surface_user,
+        version: 1u32,
+    };
+    // Fields are declared in sorted-key order, giving an order-independent
+    // digest without a per-call BTreeMap allocation.
+    let bytes = serde_json::to_vec(&canonical).expect("canonical request serialization");
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     format!("{:x}", hasher.finalize())
@@ -231,6 +247,84 @@ impl SurfaceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_request_hash_matches_sorted_key_reference() {
+        // Lock the canonical serialization: the borrowed-struct implementation
+        // must produce the exact same digest as the original sorted-key
+        // `BTreeMap` approach for every shape of input (with/without
+        // channel_log_chat_id, unicode input, empty fields). This keeps durable
+        // request hashes stable across the refactor.
+        use std::collections::BTreeMap;
+
+        fn reference(context: &SurfaceContext, input: &str) -> String {
+            let mut map: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+            map.insert("version", serde_json::json!(1u32));
+            map.insert("channel", serde_json::json!(context.channel));
+            map.insert("surface_user", serde_json::json!(context.surface_user));
+            map.insert("surface_thread", serde_json::json!(context.surface_thread));
+            map.insert("chat_type", serde_json::json!(context.chat_type));
+            map.insert("agent_id", serde_json::json!(context.agent_id));
+            map.insert(
+                "channel_log_chat_id",
+                serde_json::json!(context.channel_log_chat_id),
+            );
+            map.insert("chain_depth", serde_json::json!(context.chain_depth));
+            map.insert("input", serde_json::json!(input));
+            let bytes = serde_json::to_vec(&map).expect("reference serialization");
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            format!("{:x}", hasher.finalize())
+        }
+
+        let cases = [
+            (None, "", "", "", "", "", ""),
+            (
+                Some(7_i64),
+                "discord",
+                "123",
+                "discord",
+                "dev",
+                "alice",
+                "hello",
+            ),
+            (
+                None,
+                "telegram",
+                "t-1",
+                "telegram",
+                "lyre",
+                "bob",
+                "あいうえお",
+            ),
+            (
+                Some(-3_i64),
+                "web",
+                "w-9",
+                "web",
+                "vega",
+                "carol",
+                "{\"k\":1}",
+            ),
+        ];
+        for (log_id, channel, thread, chat_type, agent, user, input) in cases {
+            let mut context = SurfaceContext::new(
+                channel.to_string(),
+                user.to_string(),
+                thread.to_string(),
+                chat_type.to_string(),
+                agent.to_string(),
+            );
+            context.channel_log_chat_id = log_id;
+            context.chain_depth = 2;
+            assert_eq!(
+                canonical_request_hash(&context, input),
+                reference(&context, input),
+                "digest diverged for case {channel}/{agent}/{input:?}"
+            );
+        }
+    }
 
     #[test]
     fn scheduled_turn_serializes_and_deserializes() {

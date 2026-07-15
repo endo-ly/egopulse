@@ -138,7 +138,17 @@ fn build_skills_prompt_section(state: &TurnRuntime) -> Option<String> {
 }
 
 fn build_memory_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
-    let memory = state.memory_loader.load_bundle(&context.agent_id).ok()?;
+    let memory = match state.memory_loader.load_bundle(&context.agent_id) {
+        Ok(memory) => memory,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %context.agent_id,
+                error = %error,
+                "failed to load long-term memory bundle; omitting memory section"
+            );
+            return None;
+        }
+    };
     if memory.all_empty() {
         return None;
     }

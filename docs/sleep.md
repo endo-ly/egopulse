@@ -590,7 +590,7 @@ config.agents = [a,b]  → 指定 agent のみ
 
 `MemoryLoader` は agent 単位の `RwLock` を持つ。
 
-- Turn 側（`load_bundle`）は **read lock** を取得し、3ファイルを一覧する。公開中は reader が入らない。
+- Turn 側（`load_bundle`）は **read lock** を取得し、in-memory cache から bundle を返す。cache は初回 load 時にのみ disk から構築され、以降の Turn hot path は `Arc` clone のみで disk I/O を伴わない。公開中は reader が入らず、常に完全公開済みの一貫した bundle が見える。
 - Sleep 公開側（`publish_bundle`）は **write lock** を取得し、検証〜 rename まで保持する。
 - LLM 生成中は write lock を保持しない（候補構築中は Turn が現行 bundle を読める）。
 

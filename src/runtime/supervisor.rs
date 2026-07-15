@@ -667,7 +667,10 @@ const INSTANCE_LOCK_FILE_NAME: &str = "runtime-instance.lock";
 /// process mutates a given state root at a time.
 #[derive(Debug)]
 pub(crate) struct InstanceGuard {
-    file: std::fs::File,
+    /// Open descriptor that holds the OS advisory lock for the process' lifetime.
+    /// Underscore-prefixed because it is never read — its mere existence (and
+    /// Drop) is what holds and releases the lock.
+    _file: std::fs::File,
     path: PathBuf,
 }
 
@@ -703,7 +706,7 @@ impl InstanceGuard {
             }
         })?;
         Ok(Arc::new(Self {
-            file,
+            _file: file,
             path: lock_path,
         }))
     }
@@ -737,7 +740,7 @@ impl InstanceGuard {
             }
         })?;
         Ok(Arc::new(Self {
-            file,
+            _file: file,
             path: lock_path.to_path_buf(),
         }))
     }
@@ -745,15 +748,6 @@ impl InstanceGuard {
     /// Path of the lock file backing this guard.
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Whether the open lock file is still accessible.
-    ///
-    /// This references the `file` field so it is not considered dead code:
-    /// the open descriptor is the sole source of the OS advisory lock, and
-    /// keeping the field alive is the guard's entire purpose.
-    pub(crate) fn is_valid(&self) -> bool {
-        self.file.metadata().is_ok()
     }
 }
 
@@ -778,7 +772,6 @@ mod instance_guard_tests {
     fn lock_is_released_after_drop() {
         let dir = TempDir::new().unwrap();
         let g1 = InstanceGuard::acquire(dir.path()).unwrap();
-        assert!(g1.is_valid(), "acquired guard should report valid");
         drop(g1);
         // After dropping the guard the OS should have released the advisory lock.
         let _g2 = InstanceGuard::acquire(dir.path())
@@ -803,14 +796,12 @@ mod instance_guard_tests {
         );
 
         std::fs::create_dir_all(&nested).expect("create_dir_all must succeed");
-        let guard = InstanceGuard::acquire(&nested).expect("acquire on created nested path");
-        assert!(guard.is_valid());
+        let _guard = InstanceGuard::acquire(&nested).expect("acquire on created nested path");
     }
 
     #[test]
     fn supervisor_reports_held_instance_lock() {
         let guard = InstanceGuard::acquire(TempDir::new().unwrap().path()).unwrap();
-        assert!(guard.is_valid());
         let supervisor =
             RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
         assert!(supervisor.instance_lock_held());

@@ -68,6 +68,22 @@ pub(crate) enum AcceptOutcome {
     Existing(TurnRun),
 }
 
+/// Borrowed parameters for [`Database::accept_or_get_turn`].
+///
+/// Bundles the durable acceptance inputs into a single record so the call
+/// site reads clearly and the method signature does not keep growing as more
+/// durable metadata is added.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AcceptTurnParams<'a> {
+    pub(crate) chat_id: i64,
+    pub(crate) request_key: &'a str,
+    pub(crate) config_revision: i64,
+    pub(crate) config_fingerprint: Option<&'a str>,
+    pub(crate) request_payload_hash: &'a str,
+    pub(crate) origin_id: Option<&'a str>,
+    pub(crate) scheduled_request_json: Option<&'a str>,
+}
+
 /// One Turn recovered by [`Database::recover_interrupted_turns`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredTurnRun {
@@ -219,17 +235,19 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite write fails.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_or_get_turn(
         &self,
-        chat_id: i64,
-        request_key: &str,
-        config_revision: i64,
-        config_fingerprint: Option<&str>,
-        request_payload_hash: &str,
-        origin_id: Option<&str>,
-        scheduled_request_json: Option<&str>,
+        params: AcceptTurnParams<'_>,
     ) -> Result<AcceptOutcome, StorageError> {
+        let AcceptTurnParams {
+            chat_id,
+            request_key,
+            config_revision,
+            config_fingerprint,
+            request_payload_hash,
+            origin_id,
+            scheduled_request_json,
+        } = params;
         let mut conn = self.get_conn()?;
         // BEGIN IMMEDIATE acquires the write lock up front so the capacity
         // count and the INSERT are observed atomically by other acceptors:
@@ -1088,15 +1106,15 @@ mod tests {
 
     fn accept(db: &Database, request_key: &str) -> TurnRun {
         match db
-            .accept_or_get_turn(
-                1,
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
                 request_key,
-                1,
-                Some("abc123"),
-                "payload-hash",
-                None,
-                None,
-            )
+                config_revision: 1,
+                config_fingerprint: Some("abc123"),
+                request_payload_hash: "payload-hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -1235,7 +1253,15 @@ mod tests {
 
         // Act: re-accept the same request_key with any payload hash.
         let outcome = db
-            .accept_or_get_turn(1, "legacy:key", 1, Some("abc123"), "new-hash", None, None)
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "legacy:key",
+                config_revision: 1,
+                config_fingerprint: Some("abc123"),
+                request_payload_hash: "new-hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
             .expect("accept");
 
         // Assert: a NULL stored hash is legacy data, so it is accepted as
@@ -1443,15 +1469,15 @@ mod tests {
         let (db, _dir) = test_db();
         // Accept with an explicit origin_id so the origin can be tracked.
         let run = match db
-            .accept_or_get_turn(
-                1,
-                "k-atomic",
-                1,
-                Some("fp"),
-                "h",
-                Some("origin-atomic"),
-                None,
-            )
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "k-atomic",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: Some("origin-atomic"),
+                scheduled_request_json: None,
+            })
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -1484,7 +1510,15 @@ mod tests {
     fn fail_turn_and_terminate_origin_idempotent_on_retry() {
         let (db, _dir) = test_db();
         let run = match db
-            .accept_or_get_turn(1, "k-idem", 1, Some("fp"), "h", Some("origin-idem"), None)
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "k-idem",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: Some("origin-idem"),
+                scheduled_request_json: None,
+            })
             .expect("accept")
         {
             AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
@@ -1732,14 +1766,30 @@ mod tests {
         // accepted turn (no persisted request).
         let (db, _dir) = test_db();
         let durable = match db
-            .accept_or_get_turn(1, "durable:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "durable:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some(r#"{"x":1}"#),
+            })
             .expect("accept durable")
         {
             AcceptOutcome::Created(run) => run,
             _ => panic!("expected created"),
         };
-        db.accept_or_get_turn(1, "legacy:k", 1, Some("fp"), "h", None, None)
-            .expect("accept legacy");
+        db.accept_or_get_turn(AcceptTurnParams {
+            chat_id: 1,
+            request_key: "legacy:k",
+            config_revision: 1,
+            config_fingerprint: Some("fp"),
+            request_payload_hash: "h",
+            origin_id: None,
+            scheduled_request_json: None,
+        })
+        .expect("accept legacy");
 
         // Age the durable row past the dispatcher's grace window so the scan
         // would pick it up.
@@ -1769,7 +1819,15 @@ mod tests {
         // grace window.
         let (db, _dir) = test_db();
         let durable = match db
-            .accept_or_get_turn(1, "dur:k", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "dur:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept durable")
         {
             AcceptOutcome::Created(run) => run,
@@ -1801,14 +1859,30 @@ mod tests {
         let (db, _dir) = test_db();
         let mut rev = None;
         let accepted = match db
-            .accept_or_get_turn(1, "acc:k", 1, Some("fp"), "h", None, Some(r#"{"x":1}"#))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "acc:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some(r#"{"x":1}"#),
+            })
             .expect("accept acc")
         {
             AcceptOutcome::Created(run) => run,
             _ => panic!("expected created"),
         };
         let committed = match db
-            .accept_or_get_turn(1, "com:k", 1, Some("fp"), "h", None, Some(r#"{"y":2}"#))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "com:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some(r#"{"y":2}"#),
+            })
             .expect("accept com")
         {
             AcceptOutcome::Created(run) => run,
@@ -1816,7 +1890,15 @@ mod tests {
         };
         commit_input(&db, &committed.turn_id, &mut rev);
         let legacy = match db
-            .accept_or_get_turn(1, "legacy:k", 1, Some("fp"), "h", None, None)
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "legacy:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
             .expect("accept legacy")
         {
             AcceptOutcome::Created(run) => run,
@@ -1848,7 +1930,15 @@ mod tests {
         let mut rev = None;
 
         let a = match db
-            .accept_or_get_turn(1, "a:k", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "a:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept a")
         {
             AcceptOutcome::Created(run) => run,
@@ -1857,7 +1947,15 @@ mod tests {
         commit_input(&db, &a.turn_id, &mut rev);
 
         let b = match db
-            .accept_or_get_turn(1, "b:k", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "b:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept b")
         {
             AcceptOutcome::Created(run) => run,
@@ -1887,25 +1985,41 @@ mod tests {
         let (db, _dir) = test_db();
         // Fill the session up to the per-session durable limit.
         for i in 0..MAX_DURABLE_PENDING_PER_SESSION {
-            db.accept_or_get_turn(
-                1,
-                &format!("sess:k{i}"),
-                1,
-                Some("fp"),
-                "h",
-                None,
-                Some("{}"),
-            )
+            db.accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: &format!("sess:k{i}"),
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept within limit");
         }
         // The next distinct request for the same session is rejected.
         let err = db
-            .accept_or_get_turn(1, "sess:overflow", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "sess:overflow",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect_err("expected session queue full");
         assert!(matches!(err, StorageError::TurnSessionQueueFull));
         // A different session is still accepted (the cap is per-session).
-        db.accept_or_get_turn(2, "other:k", 1, Some("fp"), "h", None, Some("{}"))
-            .expect("accept on a different session");
+        db.accept_or_get_turn(AcceptTurnParams {
+            chat_id: 2,
+            request_key: "other:k",
+            config_revision: 1,
+            config_fingerprint: Some("fp"),
+            request_payload_hash: "h",
+            origin_id: None,
+            scheduled_request_json: Some("{}"),
+        })
+        .expect("accept on a different session");
     }
 
     #[test]
@@ -1915,20 +2029,28 @@ mod tests {
         // retrying a turn in a full session would 429 instead of dedup).
         let (db, _dir) = test_db();
         for i in 0..MAX_DURABLE_PENDING_PER_SESSION {
-            db.accept_or_get_turn(
-                1,
-                &format!("sess:k{i}"),
-                1,
-                Some("fp"),
-                "h",
-                None,
-                Some("{}"),
-            )
+            db.accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: &format!("sess:k{i}"),
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept within limit");
         }
         // Re-deliver the first request_key: should return Existing, not 429.
         let outcome = db
-            .accept_or_get_turn(1, "sess:k0", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "sess:k0",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("redelivery bypasses cap");
         assert!(matches!(outcome, AcceptOutcome::Existing(_)));
     }
@@ -1938,30 +2060,30 @@ mod tests {
         let (db, _dir) = test_db();
         // Fill the runtime-wide limit by spreading one turn per session.
         for i in 0..MAX_DURABLE_PENDING_PER_SCOPE {
-            db.accept_or_get_turn(
+            db.accept_or_get_turn(AcceptTurnParams {
                 // chat_id must be unique per row; offset by 1 to avoid the
                 // seeded chat_id=1 collisions.
-                i + 100,
-                &format!("g:k{i}"),
-                1,
-                Some("fp"),
-                "h",
-                None,
-                Some("{}"),
-            )
+                chat_id: i + 100,
+                request_key: &format!("g:k{i}"),
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept within global limit");
         }
         // A brand-new session's first turn is rejected globally.
         let err = db
-            .accept_or_get_turn(
-                MAX_DURABLE_PENDING_PER_SCOPE + 1000,
-                "g:overflow",
-                1,
-                Some("fp"),
-                "h",
-                None,
-                Some("{}"),
-            )
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: MAX_DURABLE_PENDING_PER_SCOPE + 1000,
+                request_key: "g:overflow",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect_err("expected global queue full");
         assert!(matches!(err, StorageError::TurnGlobalQueueFull));
     }
@@ -1973,15 +2095,15 @@ mod tests {
         let (db, _dir) = test_db();
         // Insert 300 durable-pending turns (well above the 256-batch limit).
         for i in 0..300i64 {
-            db.accept_or_get_turn(
-                i + 10_000,
-                &format!("p:k{i}"),
-                1,
-                Some("fp"),
-                "h",
-                None,
-                Some("{}"),
-            )
+            db.accept_or_get_turn(AcceptTurnParams {
+                chat_id: i + 10_000,
+                request_key: &format!("p:k{i}"),
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept");
         }
 
@@ -2025,7 +2147,15 @@ mod tests {
         let (db, _dir) = test_db();
         let mut rev = None;
         let durable = match db
-            .accept_or_get_turn(1, "dur:k", 1, Some("fp"), "h", None, Some("{}"))
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "dur:k",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: None,
+                scheduled_request_json: Some("{}"),
+            })
             .expect("accept durable")
         {
             AcceptOutcome::Created(run) => run,
