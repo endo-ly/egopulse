@@ -219,6 +219,15 @@ impl MemoryLoader {
 
         for file in MemoryFile::ALL {
             if current.file(file) != base.file(file) {
+                // The on-disk content drifted from `base` (an external/manual
+                // edit between run start and publication). Realign the cache to
+                // the current disk content under the same write lock so the
+                // next run uses it as its base. Without this the stale cached
+                // bundle would keep being returned as the base and every
+                // subsequent publication would Conflict-loop until a restart —
+                // a liveness regression versus the pre-cache read-on-every-call
+                // behaviour.
+                *lock.cache.write().expect("memory cache write lock") = Some(Arc::new(current));
                 metrics::inc_memory_publication("conflict");
                 return Err(MemoryError::Conflict {
                     agent_id: agent_id.to_string(),
@@ -554,6 +563,63 @@ mod tests {
             fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
             "manually edited"
         );
+    }
+
+    #[test]
+    fn conflict_realigns_cache_to_current_disk_so_next_run_succeeds() {
+        // Regression: after an external edit, the in-memory cache used to stay
+        // pinned to the pre-edit bundle, so every subsequent publication
+        // Conflict-looped against the edited disk content until a restart. The
+        // Conflict path must realign the cache to the current disk content so
+        // the next run uses it as its base.
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        // Seed generation A and warm the cache.
+        loader
+            .publish_bundle(
+                "a",
+                "seed",
+                &MemoryBundle::default(),
+                &bundle_of("ep-a", "sem-a", "pro-a"),
+            )
+            .expect("seed publish");
+        let loaded = loader.load_bundle("a").expect("load warms cache");
+        assert_eq!(*loaded, bundle_of("ep-a", "sem-a", "pro-a"));
+
+        // External manual edit to B on disk, bypassing the loader.
+        write_memory_file(dir.path(), "a", "episodic.md", "ep-b");
+        write_memory_file(dir.path(), "a", "semantic.md", "sem-b");
+        write_memory_file(dir.path(), "a", "prospective.md", "pro-b");
+
+        // A run that started from the now-stale cached base A conflicts against
+        // the edited disk B.
+        let err = loader
+            .publish_bundle(
+                "a",
+                "run-1",
+                &bundle_of("ep-a", "sem-a", "pro-a"),
+                &bundle_of("new", "new", "new"),
+            )
+            .expect_err("should conflict");
+        assert!(matches!(err, MemoryError::Conflict { .. }));
+
+        // The conflict realigned the cache to B, so the next load returns B
+        // (not the stale A).
+        let loaded = loader.load_bundle("a").expect("load after conflict");
+        assert_eq!(*loaded, bundle_of("ep-b", "sem-b", "pro-b"));
+
+        // A run based on the realigned base B now succeeds.
+        loader
+            .publish_bundle(
+                "a",
+                "run-2",
+                &bundle_of("ep-b", "sem-b", "pro-b"),
+                &bundle_of("final", "final", "final"),
+            )
+            .expect("next run succeeds against realigned base");
+        let loaded = loader.load_bundle("a").expect("load after success");
+        assert_eq!(*loaded, bundle_of("final", "final", "final"));
     }
 
     #[test]

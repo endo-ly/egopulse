@@ -47,9 +47,13 @@ impl TurnIntake {
     }
 
     /// Binds the intake to the live runtime. Called exactly once, after
-    /// [`AppState`] is constructed.
+    /// [`AppState`] is constructed. Panics if called more than once, since a
+    /// second bind would be a construction-order invariant violation rather
+    /// than a recoverable condition.
     pub(crate) fn bind(&self, state: &Arc<AppState>) {
-        let _ = self.runtime.set(Arc::downgrade(state));
+        self.runtime
+            .set(Arc::downgrade(state))
+            .expect("TurnIntake must be bound exactly once");
     }
 
     /// Durably accepts and schedules `turn` through the shared intake. Returns
