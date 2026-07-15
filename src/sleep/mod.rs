@@ -39,6 +39,17 @@ pub enum SleepBatchError {
         run_id: String,
         reason: String,
     },
+    /// Archiving/truncating a source session failed, so the run must NOT be
+    /// finalized as `Success`. The run is intentionally left `running` so a
+    /// retry converges to the same end state (already-archived sessions are
+    /// skipped via a per-session `archive` checkpoint). The caller observes
+    /// this as an error, never as success.
+    #[error("session archive pending for run '{run_id}' (agent '{agent_id}'): {reason}")]
+    ArchivePending {
+        agent_id: String,
+        run_id: String,
+        reason: String,
+    },
 }
 
 pub(crate) use orchestrator::recover_memory_publication;

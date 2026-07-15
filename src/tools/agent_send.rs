@@ -380,7 +380,7 @@ mod tests {
     fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
         state
             .db
-            .scan_durable_pending_turns(100)
+            .scan_durable_pending_turns_after("", "", 100)
             .expect("scan durable turns")
             .into_iter()
             .map(|p| {
@@ -817,7 +817,7 @@ mod integration_tests {
     async fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
         state
             .db
-            .scan_durable_pending_turns(100)
+            .scan_durable_pending_turns_after("", "", 100)
             .expect("scan durable turns")
             .into_iter()
             .map(|p| {

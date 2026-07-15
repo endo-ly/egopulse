@@ -24,7 +24,7 @@ use rusqlite::params;
 
 use crate::error::StorageError;
 use crate::storage::{
-    Database, DurablePendingTurn, MAX_DURABLE_PENDING_GLOBAL, MAX_DURABLE_PENDING_PER_SESSION,
+    Database, DurablePendingTurn, MAX_DURABLE_PENDING_PER_SCOPE, MAX_DURABLE_PENDING_PER_SESSION,
     StoredMessage, TurnRunState,
 };
 
@@ -80,11 +80,17 @@ pub(crate) struct RecoveredTurnRun {
 /// Per-origin execution count rehydrated from `turn_runs` after a restart.
 /// The in-memory [`crate::runtime::turn_scheduler::TurnTracker`] is
 /// rebuilt from these so a chain that already consumed turns before a crash
-/// keeps its per-chain turn limit instead of resetting to zero.
+/// keeps its per-chain turn limit instead of resetting to zero. `terminal_reason`
+/// (when present) is the durable terminal stop reason restored from
+/// `turn_origins`, so a terminated chain is not silently resumed after a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredOrigin {
     pub origin_id: String,
     pub executed_turn_count: usize,
+    /// Durable terminal stop reason restored from `turn_origins`, if the chain
+    /// terminated before the crash. Stored as the canonical `Display` string and
+    /// parsed back by the tracker on rehydration.
+    pub terminal_reason: Option<String>,
 }
 
 const TURN_RUN_COLUMNS: &str = "turn_id, chat_id, request_key, state, current_iteration,
@@ -264,7 +270,7 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            if global_pending >= MAX_DURABLE_PENDING_GLOBAL {
+            if global_pending >= MAX_DURABLE_PENDING_PER_SCOPE {
                 return Err(StorageError::TurnGlobalQueueFull);
             }
         }
@@ -356,27 +362,42 @@ impl Database {
     /// is still dispatched first). The dispatcher re-submits freely; the
     /// scheduler deduplicates by `turn_id`, so no grace window is needed.
     ///
+    /// Only returns rows whose `(accepted_at, turn_id)` is strictly greater than
+    /// the supplied cursor. This lets the dispatcher advance past turns it has
+    /// already considered (including busy turns still owned by the in-memory
+    /// scheduler) instead of re-reading the same fixed prefix on every 5s tick.
+    /// Without it, the head of a large pending set can starve later sessions'
+    /// turns (the scheduler dedups already-known turns, but the scan keeps
+    /// re-reading them). Rows are ordered by `(accepted_at, turn_id)` so the
+    /// cursor preserves acceptance order and never skips a turn permanently: a
+    /// turn the scheduler already knows about was processed on a prior tick, and
+    /// a genuinely new turn has a later `accepted_at` (after the cursor).
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite read fails.
-    pub(crate) fn scan_durable_pending_turns(
+    pub(crate) fn scan_durable_pending_turns_after(
         &self,
+        after_accepted_at: &str,
+        after_turn_id: &str,
         limit: i64,
     ) -> Result<Vec<DurablePendingTurn>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT turn_id, scheduled_request_json
-             FROM turn_runs
-             WHERE state IN ('accepted', 'input_committed')
-               AND scheduled_request_json IS NOT NULL
-             ORDER BY accepted_at ASC, turn_id ASC
-             LIMIT ?1",
+            "SELECT turn_id, accepted_at, scheduled_request_json
+              FROM turn_runs
+              WHERE (accepted_at, turn_id) > (?1, ?2)
+                AND state IN ('accepted', 'input_committed')
+                AND scheduled_request_json IS NOT NULL
+              ORDER BY accepted_at ASC, turn_id ASC
+              LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![limit], |row| {
+            .query_map(params![after_accepted_at, after_turn_id, limit], |row| {
                 Ok(DurablePendingTurn {
                     turn_id: row.get(0)?,
-                    scheduled_request_json: row.get(1)?,
+                    accepted_at: row.get(1)?,
+                    scheduled_request_json: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -385,7 +406,7 @@ impl Database {
 
     /// Total durable-pending turn count (`accepted`/`input_committed`), for
     /// backlog observability. Uses `idx_turn_runs_state`, so it stays cheap
-    /// regardless of table size. Unlike [`Self::scan_durable_pending_turns`]
+    /// regardless of table size. Unlike [`Self::scan_durable_pending_turns_after`]
     /// this is not batch-limited, so it reflects the true backlog even when it
     /// exceeds the dispatcher batch.
     pub(crate) fn count_durable_pending(&self) -> Result<i64, StorageError> {
@@ -934,20 +955,51 @@ impl Database {
     ) -> Result<Vec<RecoveredOrigin>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT origin_id, COUNT(*)
-             FROM turn_runs
-             WHERE origin_id IS NOT NULL
-               AND state NOT IN ('accepted', 'input_committed')
-               AND datetime(accepted_at) > datetime('now', ?1)
-             GROUP BY origin_id",
+            "SELECT t.origin_id, COUNT(*),
+                    (SELECT o.terminal_reason FROM turn_origins o
+                     WHERE o.origin_id = t.origin_id)
+              FROM turn_runs t
+              WHERE t.origin_id IS NOT NULL
+                AND t.state NOT IN ('accepted', 'input_committed')
+                AND datetime(t.accepted_at) > datetime('now', ?1)
+              GROUP BY t.origin_id",
         )?;
         let rows = stmt.query_map(params![format!("{} seconds", -ttl_secs)], |row| {
             Ok(RecoveredOrigin {
                 origin_id: row.get(0)?,
                 executed_turn_count: row.get::<_, i64>(1)? as usize,
+                terminal_reason: row.get::<_, Option<String>>(2)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Persists (insert-or-update) the durable terminal stop reason for an
+    /// origin. The `executed_turn_count` column is left unchanged (it is derived
+    /// from `turn_runs` at startup); only `terminal_reason` is written. A `None`
+    /// reason clears it. Called whenever the in-memory
+    /// [`crate::runtime::turn_scheduler::TurnTracker`] records a terminal reason,
+    /// so a terminated chain is durably remembered across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying SQLite write fails.
+    pub(crate) fn upsert_turn_origin(
+        &self,
+        origin_id: &str,
+        terminal_reason: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO turn_origins (origin_id, executed_turn_count, terminal_reason, updated_at)
+             VALUES (?1, 0, ?2, ?3)
+             ON CONFLICT(origin_id) DO UPDATE SET
+                terminal_reason = excluded.terminal_reason,
+                updated_at = excluded.updated_at",
+            params![origin_id, terminal_reason, &now],
+        )?;
+        Ok(())
     }
 }
 
@@ -1558,7 +1610,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns(100)
+            .scan_durable_pending_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -1631,7 +1683,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns(100)
+            .scan_durable_pending_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -1671,7 +1723,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns(100)
+            .scan_durable_pending_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -1742,7 +1794,7 @@ mod tests {
     fn accept_rejects_when_global_durable_pending_full() {
         let (db, _dir) = test_db();
         // Fill the runtime-wide limit by spreading one turn per session.
-        for i in 0..MAX_DURABLE_PENDING_GLOBAL {
+        for i in 0..MAX_DURABLE_PENDING_PER_SCOPE {
             db.accept_or_get_turn(
                 // chat_id must be unique per row; offset by 1 to avoid the
                 // seeded chat_id=1 collisions.
@@ -1759,7 +1811,7 @@ mod tests {
         // A brand-new session's first turn is rejected globally.
         let err = db
             .accept_or_get_turn(
-                MAX_DURABLE_PENDING_GLOBAL + 1000,
+                MAX_DURABLE_PENDING_PER_SCOPE + 1000,
                 "g:overflow",
                 1,
                 Some("fp"),
@@ -1769,6 +1821,58 @@ mod tests {
             )
             .expect_err("expected global queue full");
         assert!(matches!(err, StorageError::TurnGlobalQueueFull));
+    }
+
+    // --- Fix 4: the dispatcher scan must reach turns beyond the batch prefix ---
+
+    #[test]
+    fn scan_durable_pending_turns_after_reaches_past_batch_prefix() {
+        let (db, _dir) = test_db();
+        // Insert 300 durable-pending turns (well above the 256-batch limit).
+        for i in 0..300i64 {
+            db.accept_or_get_turn(
+                i + 10_000,
+                &format!("p:k{i}"),
+                1,
+                Some("fp"),
+                "h",
+                None,
+                Some("{}"),
+            )
+            .expect("accept");
+        }
+
+        // A single uncursored scan is capped at the batch limit and cannot see
+        // the 257th+ turn — the starvation the cursor pagination fixes.
+        let single = db
+            .scan_durable_pending_turns_after("", "", 256)
+            .expect("single scan");
+        assert_eq!(single.len(), 256, "uncursored scan sees only the prefix");
+
+        // Cursor pagination: first batch, then continue from its last row.
+        let first = db
+            .scan_durable_pending_turns_after("", "", 256)
+            .expect("first page");
+        assert_eq!(first.len(), 256);
+        let last = first.last().expect("last of first page");
+        let second = db
+            .scan_durable_pending_turns_after(&last.accepted_at, &last.turn_id, 256)
+            .expect("second page");
+        assert_eq!(second.len(), 44, "second page reaches the 257th+ turns");
+
+        // No turn is revisited: the union of both pages covers all 300 exactly.
+        let mut ids: Vec<&str> = first
+            .iter()
+            .chain(second.iter())
+            .map(|t| t.turn_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            300,
+            "cursor pagination covers every pending turn"
+        );
     }
 
     #[test]

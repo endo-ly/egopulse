@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 14;
+pub(super) const SCHEMA_VERSION: i64 = 15;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -933,6 +933,29 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 14;
     }
 
+    if version < 15 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable origin terminal stop reason. Each human-input chain (origin)
+        // records its per-chain turn count and, once it terminates (LLM failure,
+        // chain depth, turn count, invalid agent), the terminal reason. The
+        // count is rehydrated on startup so the per-chain limit survives a crash;
+        // the terminal reason is rehydrated so a terminated chain is not silently
+        // resumed after a restart.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_origins (
+                origin_id          TEXT PRIMARY KEY,
+                executed_turn_count INTEGER NOT NULL DEFAULT 0,
+                terminal_reason    TEXT,
+                updated_at         TEXT NOT NULL
+            );",
+        )?;
+
+        set_schema_version_in_tx(&tx, 15, "add turn_origins for durable terminal stop reason")?;
+        tx.commit()?;
+        version = 15;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -940,7 +963,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 5;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 6;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1236,6 +1259,28 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 5;
+    }
+
+    if version < 6 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable origin terminal stop reason (mirrored from the primary DB).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_origins (
+                origin_id          TEXT PRIMARY KEY,
+                executed_turn_count INTEGER NOT NULL DEFAULT 0,
+                terminal_reason    TEXT,
+                updated_at         TEXT NOT NULL
+            );",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            6,
+            "add turn_origins for durable terminal stop reason (secret db)",
+        )?;
+        tx.commit()?;
+        version = 6;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);

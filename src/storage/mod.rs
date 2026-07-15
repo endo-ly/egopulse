@@ -12,8 +12,10 @@ use crate::error::StorageError;
 /// allowed per session. Enforced atomically with the accept INSERT so a
 /// capacity rejection never leaves a runnable row.
 pub(crate) const MAX_DURABLE_PENDING_PER_SESSION: i64 = 32;
-/// Maximum durable-pending turns runtime-wide.
-pub(crate) const MAX_DURABLE_PENDING_GLOBAL: i64 = 512;
+/// Maximum durable-pending turns per scope (i.e. per database: normal or
+/// secret). The check is enforced inside a single `Database` transaction, so it
+/// bounds each scope independently rather than pooling both scopes together.
+pub(crate) const MAX_DURABLE_PENDING_PER_SCOPE: i64 = 512;
 /// Upper bound on how many durable-pending turns the dispatcher re-enqueues per
 /// scan, so a large backlog cannot turn each 5s tick into a full-table walk.
 pub(crate) const DISPATCHER_BATCH_LIMIT: i64 = 256;
@@ -148,6 +150,18 @@ fn initialize_database_file(db_path: &Path) -> Result<(), StorageError> {
 /// `busy_timeout = 5 s`.
 pub struct Database {
     pool: Pool,
+    /// Test-only transient fault injection. Stays at its default (no faults) in
+    /// production; tests force a flaky DB via [`Database::fault_inject_next_get_conn`]
+    /// to exercise abnormal recovery paths.
+    fault: std::sync::Mutex<FaultConfig>,
+}
+
+/// Test-only transient fault configuration for [`Database`].
+#[derive(Debug, Default)]
+pub(crate) struct FaultConfig {
+    /// Number of the next `get_conn` calls that must fail with a transient
+    /// `StorageError` before succeeding again. Lets a test simulate a flaky DB.
+    pub(crate) fail_next_get_conn: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +558,10 @@ pub(crate) struct SleepStepCheckpoint {
 #[derive(Debug, Clone)]
 pub(crate) struct DurablePendingTurn {
     pub turn_id: String,
+    /// `accepted_at` of the row, used as the pagination cursor so the scan can
+    /// advance past already-seen turns (including busy ones still owned by the
+    /// scheduler) to reach later pending turns without re-reading from the head.
+    pub accepted_at: String,
     pub scheduled_request_json: String,
 }
 
@@ -696,7 +714,10 @@ impl Database {
         prepare_db_path(db_path)?;
         initialize_database_file(db_path)?;
         let pool = build_pool_and_migrate(db_path)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fault: std::sync::Mutex::new(FaultConfig::default()),
+        })
     }
 
     /// Initializes the database with a pre-migration backup when `settings.enabled`
@@ -727,7 +748,10 @@ impl Database {
         }
         initialize_database_file(db_path)?;
         let pool = build_pool_and_migrate(db_path)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fault: std::sync::Mutex::new(FaultConfig::default()),
+        })
     }
 
     /// Constructs a `Database` for the secret DB (`secret.db`).
@@ -741,7 +765,10 @@ impl Database {
         prepare_db_path(db_path)?;
         initialize_database_file(db_path)?;
         let pool = build_secret_pool_and_migrate(db_path)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fault: std::sync::Mutex::new(FaultConfig::default()),
+        })
     }
 
     /// Constructs a `Database` for the secret DB with pre-migration backup.
@@ -766,13 +793,37 @@ impl Database {
         }
         initialize_database_file(db_path)?;
         let pool = build_secret_pool_and_migrate(db_path)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fault: std::sync::Mutex::new(FaultConfig::default()),
+        })
     }
 
     pub(crate) fn get_conn(&self) -> Result<PooledConn, StorageError> {
+        // Test-only fault injection: fail the next `fail_next_get_conn`
+        // connection acquisitions with a transient error so abnormal-path
+        // recovery (retry / fail-closed) can be exercised deterministically.
+        {
+            let mut fault = self.fault.lock().expect("fault lock");
+            if fault.fail_next_get_conn > 0 {
+                fault.fail_next_get_conn -= 1;
+                return Err(StorageError::InitFailed(
+                    "injected storage fault (test)".to_string(),
+                ));
+            }
+        }
         self.pool
             .get()
             .map_err(|e| StorageError::InitFailed(e.to_string()))
+    }
+
+    /// Test-only: forces the next `n` [`Database::get_conn`] calls to fail with a
+    /// transient [`StorageError::InitFailed`] before succeeding again. No-op in
+    /// production paths that do not call this method.
+    #[cfg(test)]
+    pub(crate) fn fault_inject_next_get_conn(&self, n: u32) {
+        let mut fault = self.fault.lock().expect("fault lock");
+        fault.fail_next_get_conn = n;
     }
 
     /// Creates a pool-backed Database without running migrations.
@@ -789,7 +840,10 @@ impl Database {
             .max_size(4)
             .build(manager)
             .map_err(|e| StorageError::InitFailed(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fault: std::sync::Mutex::new(FaultConfig::default()),
+        })
     }
 }
 

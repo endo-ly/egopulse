@@ -520,10 +520,14 @@ async fn execute_batch(
     .await;
 
     if let Err(error) = result {
-        // PublicationPending intentionally leaves the run `running` so the
-        // candidate snapshot set survives for retry (scheduler cycle or startup
-        // recovery); only real failures mark the run failed.
-        if !matches!(error, SleepBatchError::PublicationPending { .. }) {
+        // PublicationPending and ArchivePending intentionally leave the run
+        // `running` so the candidate snapshot set, or the un-archived source
+        // sessions, survive for retry (scheduler cycle or startup recovery);
+        // only real failures mark the run failed.
+        if !matches!(
+            error,
+            SleepBatchError::PublicationPending { .. } | SleepBatchError::ArchivePending { .. }
+        ) {
             let run_id_owned = run_id.clone();
             let error_message = error.to_string();
             call_blocking(db, move |db| {
@@ -1447,9 +1451,14 @@ async fn finalize_batch(
 /// **before** publication so a crash between publication and this call still
 /// leaves enough to converge.
 ///
-/// Idempotency: if the run is no longer `Running` the function is a no-op, so a
-/// duplicate invocation (recovery after the normal path already finalized)
-/// does not re-archive. `finalize_sleep_run` itself is a conditional
+/// Archive/truncate is a *required* condition for success: if any archivable
+/// session fails to archive, the run is left `Running` (returning
+/// [`SleepBatchError::ArchivePending`]) instead of being finalized as
+/// `Success`. Idempotency: if the run is no longer `Running` the function is a
+/// no-op, so a duplicate invocation (recovery after the normal path already
+/// finalized) does not re-archive. Already-archived sessions are skipped on
+/// retry because truncation removes their messages, so the archive cursor
+/// check leaves them untouched. `finalize_sleep_run` itself is a conditional
 /// `Running → Success` transition, providing the atomic gate.
 ///
 /// `provider_name` controls the optional batch-level token metric bump; it is
@@ -1472,6 +1481,7 @@ fn finalize_published_run_blocking(
             SleepBatchError::Internal(format!("decode source_chats_json for run {}: {e}", run.id))
         })?;
 
+    let mut archive_failures: Vec<String> = Vec::new();
     for session in &sessions {
         let source_id = session.chat_id.to_string();
         let event_checkpoint = db.get_sleep_checkpoint(
@@ -1498,20 +1508,40 @@ fn finalize_published_run_blocking(
                 prospective_checkpoint.cursor_id,
             ),
         );
+        // If the session still has messages past the boundary, it is not yet
+        // safe to archive (new activity arrived after this run's snapshot), so
+        // it is intentionally left untouched — not a failure.
         let Some(latest) = db.get_latest_message_cursor(session.chat_id)? else {
             continue;
         };
         if latest > boundary {
             continue;
         }
+        // Archivable now: the source can be durably moved and truncated. A
+        // failure here MUST prevent the run from being finalized as `Success`.
+        // Already-archived sessions are naturally skipped on retry: truncation
+        // removes the messages, so `get_latest_message_cursor` returns `None`
+        // and the session is not re-archived.
         if let Err(e) = archive_and_clear_session(db, groups_dir, session, secrets) {
             warn!(
                 agent_id = %agent_id,
                 chat_id = session.chat_id,
                 error = %e,
-                "failed to archive/clear session (continuing)"
+                "failed to archive/clear session; run left running for retry"
             );
+            archive_failures.push(session.chat_id.to_string());
         }
+    }
+
+    // Archive/truncate is a *required* condition for run success. If any
+    // archivable session failed, do not finalize — leave the run `Running` so
+    // startup recovery or the next scheduler cycle retries and converges.
+    if !archive_failures.is_empty() {
+        return Err(SleepBatchError::ArchivePending {
+            agent_id: agent_id.to_string(),
+            run_id: run.id.clone(),
+            reason: format!("{} session(s) failed to archive", archive_failures.len()),
+        });
     }
 
     let derived_status = db.finalize_sleep_run(&run.id)?;
@@ -3592,7 +3622,7 @@ mod tests {
         ];
         let llm2 = Arc::new(SequentialMockProvider::new(all_success_second));
         let config = crate::test_util::test_config(&dir.path().to_string_lossy());
-        let state2 = crate::test_util::build_state_with_config(
+        let state2 = crate::test_util::build_state_for_restart_simulation(
             config,
             Some(llm2),
             None,
@@ -3633,6 +3663,52 @@ mod tests {
         assert_eq!(
             result, json,
             "should return input unchanged when at or under limit"
+        );
+    }
+
+    // --- Fix 5: archive/truncate failure must not finalize the run as Success ---
+
+    #[test]
+    fn archive_failure_leaves_run_running_not_success() {
+        use crate::storage::SleepRunTrigger;
+
+        let (db, dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create run")
+            .expect("run id");
+        let sessions = serde_json::json!([{
+            "chat_id": 1,
+            "channel": "cli",
+            "external_chat_id": "",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "message_count": 1,
+            "estimated_tokens": 1
+        }])
+        .to_string();
+        db.update_sleep_run_source_chats(&run_id, &sessions)
+            .expect("set source chats");
+        let run = db
+            .get_sleep_run(&run_id)
+            .expect("read run")
+            .expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Running);
+
+        // Force every DB read inside finalization to fail (simulating an
+        // archive/truncate I/O failure).
+        db.fault_inject_next_get_conn(u32::MAX);
+
+        let result =
+            finalize_published_run_blocking(&db, &dir.path().join("groups"), &[], &run, None);
+        assert!(
+            result.is_err(),
+            "archive/truncate failure must not finalize the run"
+        );
+        // The run was never transitioned away from Running.
+        assert_eq!(
+            run.status,
+            SleepRunStatus::Running,
+            "run must remain Running on archive/truncate failure"
         );
     }
 

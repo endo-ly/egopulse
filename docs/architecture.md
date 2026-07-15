@@ -366,7 +366,7 @@ deadline 付きで停止する。
 | **Sleep Batch** | `sleep/batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
-| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
+| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / scope（DB）単位 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
 | **Conversation Scope Routing** | `runtime/` / `agent_loop/turn_runtime.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnRuntime::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |

@@ -102,6 +102,20 @@ impl std::fmt::Display for StopReason {
     }
 }
 
+impl std::str::FromStr for StopReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "chain_depth_exceeded" => Ok(Self::ChainDepthExceeded),
+            "turn_count_exceeded" => Ok(Self::TurnCountExceeded),
+            "agent_not_found" => Ok(Self::AgentNotFound),
+            "llm_failure" => Ok(Self::LlmFailure),
+            other => Err(format!("unknown StopReason: {other}")),
+        }
+    }
+}
+
 /// Reason a turn was rejected by the scheduler queue capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
@@ -432,15 +446,17 @@ impl TurnTracker {
             .and_then(|s| s.terminal_reason.clone())
     }
 
-    /// Rehydrates per-origin execution counts from a prior process.
+    /// Rehydrates per-origin execution counts and terminal reasons from a prior
+    /// process.
     ///
     /// Called once at startup before the turn dispatcher begins, so a chain
     /// that had already consumed turns before a crash keeps its per-chain turn
-    /// limit enforced instead of resetting to zero. `accepted` / `input_committed`
-    /// turns are not included in the counts (see
-    /// [`crate::storage::Database::recover_origin_tracker`]); the dispatcher
-    /// re-executes them after startup and they increment the count live via
-    /// [`TurnTracker::try_begin_execution`].
+    /// limit enforced instead of resetting to zero, and a chain that already
+    /// terminated keeps its terminal stop reason so the dispatcher does not
+    /// silently resume it. `accepted` / `input_committed` turns are not included
+    /// in the counts (see [`crate::storage::Database::recover_origin_tracker`]);
+    /// the dispatcher re-executes them after startup and they increment the
+    /// count live via [`TurnTracker::try_begin_execution`].
     pub(crate) fn rehydrate_executed(&self, origins: &[RecoveredOrigin]) {
         if origins.is_empty() {
             return;
@@ -458,6 +474,16 @@ impl TurnTracker {
                 });
             state.executed_turn_count = recovered.executed_turn_count;
             state.last_touched = now;
+            if let Some(reason_str) = &recovered.terminal_reason {
+                match reason_str.parse::<StopReason>() {
+                    Ok(reason) => state.terminal_reason = Some(reason),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        origin_id = %recovered.origin_id,
+                        "failed to parse recovered terminal reason"
+                    ),
+                }
+            }
         }
     }
 
@@ -1223,10 +1249,12 @@ mod tests {
             RecoveredOrigin {
                 origin_id: "ORIG1".to_string(),
                 executed_turn_count: 3,
+                terminal_reason: None,
             },
             RecoveredOrigin {
                 origin_id: "ORIG2".to_string(),
                 executed_turn_count: 1,
+                terminal_reason: None,
             },
         ];
         tracker.rehydrate_executed(&origins);
@@ -1234,5 +1262,28 @@ mod tests {
         // Assert: per-origin limits resume from the recovered counts.
         assert_eq!(tracker.executed_count("ORIG1"), 3);
         assert_eq!(tracker.executed_count("ORIG2"), 1);
+    }
+
+    // --- Fix 2: a persisted terminal reason must survive rehydration ---
+
+    #[test]
+    fn rehydrate_executed_restores_terminal_reason_after_restart() {
+        let tracker = TurnTracker::new();
+
+        let origins = vec![RecoveredOrigin {
+            origin_id: "ORIG1".to_string(),
+            executed_turn_count: 2,
+            terminal_reason: Some("turn_count_exceeded".to_string()),
+        }];
+        tracker.rehydrate_executed(&origins);
+
+        // The persisted stop reason (durable across restart) is rehydrated so a
+        // later queued turn is rejected with the same reason instead of being
+        // re-dispatched.
+        assert_eq!(
+            tracker.terminal_reason("ORIG1"),
+            Some(StopReason::TurnCountExceeded),
+            "terminal reason must be rehydrated from durable state"
+        );
     }
 }

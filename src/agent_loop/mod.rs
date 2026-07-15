@@ -145,7 +145,7 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
 /// Determines which database and archive root are used for persistence.
 /// `Normal` routes to the primary `egopulse.db`; `Secret` routes to the
 /// isolated `secret.db` and `secret_groups` archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum ConversationScope {
     /// Default scope — persists to `egopulse.db` and `runtime/groups`.
     Normal,

@@ -79,6 +79,12 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
     pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
+    /// Dispatcher scan cursor per scope: the `(accepted_at, turn_id)` of the
+    /// last durable-pending turn considered on the previous tick. Lets the
+    /// 5s scan advance past turns already owned by the scheduler (busy/queued)
+    /// so later sessions' turns are not starved by a fixed query prefix.
+    pub(crate) durable_scan_cursor:
+        Arc<std::sync::Mutex<std::collections::HashMap<ConversationScope, (String, String)>>>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
     /// Owns long-lived tasks and in-flight turns; orchestrates shutdown.
@@ -148,6 +154,7 @@ impl AppState {
             active_turns: Arc::new(ActiveTurnTracker::new()),
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
+            durable_scan_cursor: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             runtime_status: parts.runtime_status.clone(),
             supervisor: Arc::new(RuntimeSupervisor::with_instance_guard(
                 parts.runtime_status,
@@ -444,7 +451,8 @@ pub async fn build_app_state_with_path(
 
     // Recover durable Turn / Tool state left non-terminal by a prior crash.
     // Running Tools become uncertain, and interrupted turn_runs stop safely.
-    recover_durable_state(&state).await;
+    // Fail-closed: a recovery failure aborts startup (see `recover_durable_state`).
+    recover_durable_state(&state).await?;
 
     // Rehydrate the per-origin turn tracker from `turn_runs` so a chain that had
     // already consumed turns before the crash keeps its per-chain limit.
@@ -489,17 +497,31 @@ pub async fn build_app_state_with_path(
 ///
 /// Runs against both the primary and (when present) secret databases:
 /// `running` tool_calls are transitioned by [`Database::recover_running_tools`],
-/// and non-terminal `turn_runs` are stopped safely by [`Database::recover_interrupted_turns`].
-/// Failures are logged but never abort startup so the runtime can still serve
-/// new turns.
-async fn recover_durable_state(state: &AppState) {
-    recover_durable_state_for_db(&state.db, ConversationScope::Normal);
+/// and non-terminal `turn_runs` are stopped safely by
+/// [`Database::recover_interrupted_turns`].
+///
+/// Failures are fail-closed: if either scope's recovery cannot complete, the
+/// error is propagated so the caller aborts startup rather than accepting new
+/// turns against an only-partially-recovered durable state. This preserves the
+/// startup contract (instance lock → DB open → tool recovery → turn recovery →
+/// origin recovery → memory recovery → dispatcher → channels → accept input).
+///
+/// # Errors
+///
+/// Returns the first [`EgoPulseError`] encountered while recovering the normal
+/// or secret database.
+async fn recover_durable_state(state: &AppState) -> Result<(), EgoPulseError> {
+    recover_durable_state_for_db(&state.db, ConversationScope::Normal)?;
     if let Some(secret_db) = &state.secret_db {
-        recover_durable_state_for_db(secret_db, ConversationScope::Secret);
+        recover_durable_state_for_db(secret_db, ConversationScope::Secret)?;
     }
+    Ok(())
 }
 
-fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
+fn recover_durable_state_for_db(
+    db: &Arc<Database>,
+    scope: ConversationScope,
+) -> Result<(), EgoPulseError> {
     match db.as_ref().recover_running_tools() {
         Ok(recovered) if !recovered.is_empty() => {
             for tool in &recovered {
@@ -515,7 +537,9 @@ fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
             }
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, scope = %scope, "tool_calls recovery failed"),
+        Err(e) => {
+            return Err(EgoPulseError::from(e));
+        }
     }
     match db.as_ref().recover_interrupted_turns() {
         Ok(recovered) if !recovered.is_empty() => {
@@ -531,8 +555,11 @@ fn recover_durable_state_for_db(db: &Arc<Database>, scope: ConversationScope) {
             }
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, scope = %scope, "turn_runs recovery failed"),
+        Err(e) => {
+            return Err(EgoPulseError::from(e));
+        }
     }
+    Ok(())
 }
 
 /// Rehydrates the in-memory `TurnTracker` from `turn_runs` after a restart,
@@ -720,52 +747,91 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
     let mut backlog_ok = true;
     for &scope in scopes {
         let db = Arc::clone(state.db_for(scope));
-        // Fetch a bounded batch (turn_id + persisted request) in a single
-        // query, so a large backlog cannot turn each 5s tick into a
-        // full-table scan followed by a per-row SELECT (N+1). Turns beyond the
-        // batch are reached on subsequent scans in acceptance order.
-        let pending = call_blocking(Arc::clone(&db), |db| {
-            db.scan_durable_pending_turns(DISPATCHER_BATCH_LIMIT)
-        })
-        .await
-        .map_err(EgoPulseError::from)?;
-        // Observe the true backlog (not batch-capped) so the availability risk
-        // (unbounded durable growth under a runaway sender) stays visible even
-        // when it exceeds the dispatcher batch. Aggregate across every scope
-        // (normal + secret): a per-scope `set` would overwrite the gauge with
-        // only the last scope's count.
-        match call_blocking(Arc::clone(&db), |db| db.count_durable_pending()).await {
-            Ok(count) => backlog_total += count as u64,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "durable backlog count failed; retaining previous gauge"
-                );
-                backlog_ok = false;
+        // Cursor pagination: resume the scan after the last turn considered on
+        // the previous tick, so a large prefix of busy/queued turns (already
+        // owned by the scheduler) does not block later sessions' turns from ever
+        // being reached. The cursor is maintained per scope across ticks.
+        let mut cursor = state
+            .durable_scan_cursor
+            .lock()
+            .expect("cursor lock")
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(|| ("".to_string(), "".to_string()));
+        // Bound per-tick work so a huge backlog of busy turns cannot monopolise
+        // a single tick; remaining turns are reached on subsequent ticks via
+        // the persisted cursor.
+        const MAX_PAGES_PER_TICK: u32 = 8;
+        let mut pages = 0u32;
+        loop {
+            let batch = call_blocking(Arc::clone(&db), {
+                let after_at = cursor.0.clone();
+                let after_id = cursor.1.clone();
+                move |db| {
+                    db.scan_durable_pending_turns_after(
+                        &after_at,
+                        &after_id,
+                        DISPATCHER_BATCH_LIMIT,
+                    )
+                }
+            })
+            .await
+            .map_err(EgoPulseError::from)?;
+
+            // Observe the true backlog (not batch-capped) so the availability
+            // risk (unbounded durable growth under a runaway sender) stays
+            // visible even when it exceeds the dispatcher batch.
+            match call_blocking(Arc::clone(&db), |db| db.count_durable_pending()).await {
+                Ok(count) => backlog_total += count as u64,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "durable backlog count failed; retaining previous gauge"
+                    );
+                    backlog_ok = false;
+                }
+            }
+
+            let batch_len = batch.len();
+            for crate::storage::DurablePendingTurn {
+                turn_id,
+                accepted_at,
+                scheduled_request_json: json,
+            } in batch
+            {
+                let mut turn = match deserialize_scheduled_turn(&json) {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        tracing::warn!(error = %error, turn_id, "failed to deserialize durable turn");
+                        continue;
+                    }
+                };
+                // The dispatcher knows the authoritative `turn_id`; the persisted
+                // payload does not carry it, so stamp it before re-enqueue.
+                turn.turn_id = turn_id.clone();
+                // Re-enqueue. The scheduler deduplicates by `turn_id`, so a turn
+                // already running or queued is an idempotent no-op; a turn the
+                // scheduler cannot accept yet (capacity) is left in the DB and
+                // retried on the next scan as capacity frees.
+                let _ = channel_input::enqueue_durable_turn(state, turn);
+                // Advance the cursor past this turn so the next page (and the
+                // next tick) starts after it, never re-reading the busy prefix.
+                cursor = (accepted_at, turn_id);
+            }
+
+            pages += 1;
+            // Stop once we reach the tail (a partial batch) or hit the per-tick
+            // page cap; remaining turns are covered by the persisted cursor on
+            // subsequent ticks.
+            if (batch_len as i64) < DISPATCHER_BATCH_LIMIT || pages >= MAX_PAGES_PER_TICK {
+                break;
             }
         }
-
-        for crate::storage::DurablePendingTurn {
-            turn_id,
-            scheduled_request_json: json,
-        } in pending
-        {
-            let mut turn = match deserialize_scheduled_turn(&json) {
-                Ok(turn) => turn,
-                Err(error) => {
-                    tracing::warn!(error = %error, turn_id, "failed to deserialize durable turn");
-                    continue;
-                }
-            };
-            // The dispatcher knows the authoritative `turn_id`; the persisted
-            // payload does not carry it, so stamp it before re-enqueue.
-            turn.turn_id = turn_id.clone();
-            // Re-enqueue. The scheduler deduplicates by `turn_id`, so a turn
-            // already running or queued is an idempotent no-op; a turn the
-            // scheduler cannot accept yet (capacity) is left in the DB and
-            // retried on the next scan as capacity frees.
-            let _ = channel_input::enqueue_durable_turn(state, turn);
-        }
+        state
+            .durable_scan_cursor
+            .lock()
+            .expect("cursor lock")
+            .insert(scope, cursor);
     }
     // Publish only when every scope's count succeeded, so a transient count
     // failure retains the previous gauge instead of silently zeroing it.
@@ -780,18 +846,35 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
 /// `accepted`/`input_committed`. A row left accepted would be re-delivered by
 /// the turn dispatcher after a restart, re-running a turn a stop condition had
 /// already rejected.
-fn persist_turn_cancellation(
+///
+/// The synchronous SQLite write is performed on a blocking thread via
+/// [`call_blocking`] so it never stalls the async executor. The call sites are
+/// fail-closed: a returned `Err` means the turn could not be durably cancelled,
+/// and the caller must NOT mark the turn complete or start the next queued turn
+/// for the same session (see [`execute_scheduled_turn`]).
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError`] if every retry of `cancel_turn` fails.
+async fn persist_turn_cancellation(
     state: &AppState,
     scope: crate::agent_loop::ConversationScope,
     turn_id: &str,
     reason: &str,
     note: &str,
-) {
+) -> Result<(), EgoPulseError> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match state.db_for(scope).cancel_turn(turn_id, reason, note) {
-            Ok(()) => return,
+        let result = call_blocking(Arc::clone(state.db_for(scope)), {
+            let turn_id = turn_id.to_string();
+            let reason = reason.to_string();
+            let note = note.to_string();
+            move |db| db.cancel_turn(&turn_id, &reason, &note)
+        })
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
                 if attempt < MAX_ATTEMPTS {
@@ -805,6 +888,34 @@ fn persist_turn_cancellation(
             error = %error,
             turn_id,
             "failed to persist turn cancellation after retries"
+        );
+        return Err(EgoPulseError::from(error));
+    }
+    Ok(())
+}
+
+/// Durably records an origin's terminal stop reason in `turn_origins` so a
+/// terminated chain survives a restart and is not silently resumed by the
+/// dispatcher. Best-effort: a failure is logged but does not abort the turn
+/// (the in-memory tracker already enforces the stop for this process; the
+/// durable write only protects the post-restart window).
+async fn persist_origin_terminal_reason(
+    state: &AppState,
+    scope: crate::agent_loop::ConversationScope,
+    origin_id: &str,
+    reason: turn_scheduler::StopReason,
+) {
+    if let Err(error) = call_blocking(Arc::clone(state.db_for(scope)), {
+        let origin_id = origin_id.to_string();
+        let reason = reason.to_string();
+        move |db| db.upsert_turn_origin(&origin_id, Some(&reason))
+    })
+    .await
+    {
+        tracing::warn!(
+            error = %error,
+            origin_id,
+            "failed to durably persist origin terminal reason"
         );
     }
 }
@@ -855,17 +966,32 @@ pub(crate) fn execute_scheduled_turn(
             );
             // Fail-closed: persist the termination so the dispatcher never
             // re-dispatches this accepted turn on its next 5s scan (otherwise it
-            // loops forever). A DB failure is logged but the in-memory
-            // `terminal_reason` still protects this process from re-execution.
-            persist_turn_cancellation(
+            // loops forever). On a cancellation-persist failure we must NOT
+            // release the reservation or start the next queued turn: leaving the
+            // session blocked (the current turn stays the scheduler's current
+            // turn) is the safe state, and startup rehydration will cancel it
+            // once the DB recovers.
+            match persist_turn_cancellation(
                 state,
                 turn.context.scope,
                 &turn.turn_id,
                 &reason.to_string(),
                 "origin chain already terminated",
-            );
-            state.turn_tracker.release(&origin_id);
-            drain_next_queued_turn(state, &session_key).await;
+            )
+            .await
+            {
+                Ok(()) => {
+                    state.turn_tracker.release(&origin_id);
+                    drain_next_queued_turn(state, &session_key).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        turn_id = %turn.turn_id,
+                        "durable cancellation failed; leaving turn blocked until DB recovers"
+                    );
+                }
+            }
             return;
         }
 
@@ -874,28 +1000,46 @@ pub(crate) fn execute_scheduled_turn(
         //. A turn still in `accepted` (or any other state) runs the
         // normal intake+execute path, which finds the existing row and proceeds.
         // Looked up *before* `try_begin_execution`: a transient DB failure here
-        // defers to the next scan without having reserved an execution slot,
-        // which would otherwise leak capacity and never actually run the turn.
-        let current_state = match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
-            let turn_id = turn.turn_id.clone();
-            move |db| db.get_turn_run(&turn_id).map(|run| run.state)
-        })
-        .await
-        {
-            Ok(state) => Some(state),
-            // Genuinely missing record: run the normal intake path, which will
-            // re-accept the turn idempotently.
-            Err(crate::error::StorageError::NotFound(_)) => None,
-            // A transient DB error must not be collapsed to "not found" and
-            // silently re-accepted; defer to the next dispatcher scan.
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    turn_id = %turn.turn_id,
-                    "dispatcher: turn state lookup failed; deferring"
-                );
-                drain_next_queued_turn(state, &session_key).await;
-                return;
+        // must NOT start the next queued turn (B) before this one (A) — the
+        // session's causal order would be destroyed. We retry the lookup a
+        // bounded number of times; only after exhausting retries do we leave
+        // the turn blocked (the current turn stays the scheduler's current
+        // turn, so B cannot begin) — a restart re-drives it once the DB is
+        // healthy. We never drain the next queued turn from this branch.
+        let current_state = {
+            let mut retries = 0u32;
+            const MAX_TURN_DB_RETRIES: u32 = 5;
+            loop {
+                match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
+                    let turn_id = turn.turn_id.clone();
+                    move |db| db.get_turn_run(&turn_id).map(|run| run.state)
+                })
+                .await
+                {
+                    Ok(state) => break Some(state),
+                    // Genuinely missing record: run the normal intake path, which will
+                    // re-accept the turn idempotently.
+                    Err(crate::error::StorageError::NotFound(_)) => break None,
+                    Err(error) => {
+                        if retries < MAX_TURN_DB_RETRIES {
+                            retries += 1;
+                            tracing::warn!(
+                                error = %error,
+                                attempt = retries,
+                                turn_id = %turn.turn_id,
+                                "dispatcher: turn state lookup failed; retrying"
+                            );
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                        tracing::error!(
+                            error = %error,
+                            turn_id = %turn.turn_id,
+                            "dispatcher: turn state lookup failed after retries; leaving turn blocked"
+                        );
+                        return;
+                    }
+                }
             }
         };
 
@@ -926,14 +1070,33 @@ pub(crate) fn execute_scheduled_turn(
                 // Fail-closed: persist the stop so the dispatcher does not
                 // re-dispatch this accepted turn forever. The tracker already
                 // recorded the terminal reason for this process; the DB write
-                // makes the stop durable across restarts.
-                persist_turn_cancellation(
+                // makes the stop durable across restarts. On a cancellation
+                // failure we must NOT start the next queued turn: this turn
+                // stays blocked (its slot remains busy) until the DB recovers
+                // and startup rehydration re-drives cancellation.
+                persist_origin_terminal_reason(
+                    state,
+                    turn.context.scope,
+                    &origin_id,
+                    reason.clone(),
+                )
+                .await;
+                if let Err(error) = persist_turn_cancellation(
                     state,
                     turn.context.scope,
                     &turn.turn_id,
                     &reason.to_string(),
                     &format!("turn rejected by stop condition: {reason:?}"),
-                );
+                )
+                .await
+                {
+                    tracing::error!(
+                        error = %error,
+                        turn_id = %turn.turn_id,
+                        "durable stop cancellation failed; leaving turn blocked"
+                    );
+                    return;
+                }
                 state.runtime_status.push_error(
                     &turn.context.trace_id,
                     "stop_condition",
@@ -1071,6 +1234,16 @@ pub(crate) fn execute_scheduled_turn(
                 state
                     .turn_tracker
                     .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
+                // Durably remember the terminal stop reason so a restart does not
+                // silently resume this chain (and so its still-accepted child
+                // turns are rejected by the dispatcher after rehydration).
+                persist_origin_terminal_reason(
+                    state,
+                    turn.context.scope,
+                    &origin_id,
+                    turn_scheduler::StopReason::LlmFailure,
+                )
+                .await;
                 if let Some(log_chat_id) = turn.context.channel_log_chat_id {
                     if let Err(db_err) = state
                         .db_for(turn.context.scope)
@@ -2164,6 +2337,131 @@ mod tests {
         assert!(
             !normal_has_reply,
             "normal DB should not contain the secret bot response"
+        );
+    }
+
+    // --- Fix 6: startup recovery must be fail-closed (abort on storage error) ---
+
+    #[tokio::test]
+    async fn recover_durable_state_fails_closed_on_storage_error() {
+        use crate::agent_loop::ConversationScope;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(StubFinalProvider),
+        );
+        // Inject a permanent storage fault so every recovery read fails.
+        state
+            .db_for(ConversationScope::Normal)
+            .fault_inject_next_get_conn(u32::MAX);
+        let result = recover_durable_state(&state).await;
+        assert!(
+            result.is_err(),
+            "startup recovery must abort (fail-closed) on storage failure"
+        );
+    }
+
+    // --- Fix 3: durable cancellation persistence must be fail-closed ---
+
+    #[tokio::test]
+    async fn persist_turn_cancellation_fails_closed_on_storage_error() {
+        use crate::agent_loop::ConversationScope;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(StubFinalProvider),
+        );
+        state
+            .db_for(ConversationScope::Normal)
+            .fault_inject_next_get_conn(u32::MAX);
+        let result = persist_turn_cancellation(
+            &state,
+            ConversationScope::Normal,
+            "turn-fix3",
+            "turn_count_exceeded",
+            "test cancellation",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cancellation persistence must fail-closed on storage error"
+        );
+    }
+
+    // --- Fix 1: transient DB failure must not start the next queued turn ---
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn db_failure_during_dispatch_blocks_turn_and_keeps_next_queued() {
+        use crate::agent_loop::turn::RecordingProvider;
+        use crate::agent_loop::{ConversationScope, ScheduledTurn};
+        use crate::llm::MessagesResponse;
+        use crate::runtime::turn_scheduler::ScheduleResult;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "reply".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider.clone()),
+        );
+
+        // Two turns for the same session: A first, B queued behind it.
+        let mut ctx = crate::test_util::cli_context("fix1-session");
+        ctx.origin_id = uuid::Uuid::new_v4().to_string();
+        let turn_a = ScheduledTurn {
+            turn_id: "A".to_string(),
+            context: ctx.clone(),
+            input: "a".to_string(),
+            origin_id: ctx.origin_id.clone(),
+        };
+        let turn_b = ScheduledTurn {
+            turn_id: "B".to_string(),
+            context: ctx.clone(),
+            input: "b".to_string(),
+            origin_id: ctx.origin_id.clone(),
+        };
+        assert!(
+            matches!(
+                state.turn_scheduler.submit(turn_a.clone()),
+                ScheduleResult::Started(_)
+            ),
+            "A must start immediately"
+        );
+        assert!(
+            matches!(
+                state.turn_scheduler.submit(turn_b.clone()),
+                ScheduleResult::Queued
+            ),
+            "B must be queued behind A"
+        );
+
+        // Permanent DB failure during the dispatcher's current-state lookup.
+        state
+            .db_for(ConversationScope::Normal)
+            .fault_inject_next_get_conn(u32::MAX);
+
+        execute_scheduled_turn(&state, turn_a).await;
+
+        // A must NOT have executed, and B must NOT have been drained/started —
+        // the session's causal order is preserved even under DB failure.
+        assert!(
+            provider.seen_messages().is_empty(),
+            "turn A must not execute under DB failure"
+        );
+        assert_eq!(
+            state.turn_scheduler.global_queued(),
+            1,
+            "turn B must remain queued, not drained"
         );
     }
 
