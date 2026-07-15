@@ -687,11 +687,33 @@ impl TurnExecutor<'_> {
         let error_kind = error.error_kind();
         let error_message = sanitize_error_message(error);
         let turn_id_for_fail = turn_id.to_string();
-        if let Err(e) = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
-        })
-        .await
-        {
+        let origin_id = self.context.origin_id.clone();
+        // When the origin is known, fail the turn and terminate the origin
+        // atomically in one transaction so a crash between the two commits
+        // cannot leave a terminal turn with a non-terminal origin (which
+        // would let the dispatcher re-dispatch accepted child turns after a
+        // restart).
+        let result = if origin_id.is_empty() {
+            call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+                db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
+            })
+            .await
+        } else {
+            let terminal_reason =
+                crate::runtime::turn_scheduler::StopReason::LlmFailure.to_string();
+            call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+                db.fail_turn_and_terminate_origin(
+                    &turn_id_for_fail,
+                    target,
+                    error_kind,
+                    &error_message,
+                    &origin_id,
+                    &terminal_reason,
+                )
+            })
+            .await
+        };
+        if let Err(e) = result {
             warn!(error = %e, turn_id, "failed to record turn_run failure");
         }
     }

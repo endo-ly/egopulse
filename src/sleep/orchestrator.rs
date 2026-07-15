@@ -1724,14 +1724,27 @@ fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPu
             // run the normal path already finalized is a no-op.
             let groups_dir = state.config.groups_dir();
             let secrets = crate::tools::collect_config_secrets(&state.config);
-            finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None).map_err(
-                |e| {
-                    EgoPulseError::Internal(format!(
+            if let Err(e) =
+                finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None)
+            {
+                // ArchivePending is a transient condition (archive I/O
+                // temporarily unavailable), not a consistency violation. The
+                // run stays `Running` and the next scheduler cycle retries —
+                // startup must NOT abort over a retryable archive failure.
+                if matches!(e, SleepBatchError::ArchivePending { .. }) {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        agent_id = %run.agent_id,
+                        error = %e,
+                        "archive pending after memory recovery; run left Running for retry"
+                    );
+                } else {
+                    return Err(EgoPulseError::Internal(format!(
                         "finalize after memory recovery failed for run {}: {e}",
                         run.id
-                    ))
-                },
-            )?;
+                    )));
+                }
+            }
             tracing::info!(
                 run_id = %run.id,
                 agent_id = %run.agent_id,
@@ -3802,15 +3815,28 @@ mod tests {
             expected_path.display()
         );
 
-        // Idempotent re-archive (e.g. after a crash before truncate): same file,
-        // no duplicate. This is safe because the deterministic key overwrites.
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello-2"}]"#)
-            .expect("re-save session");
-        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
-            .expect("re-archive success");
+        // After archive + truncate, a retry must NOT overwrite the original
+        // archive with the now-truncated session. The existence guard skips
+        // the write, preserving the original full conversation.
+        let original_bytes = std::fs::read_to_string(&expected_path).expect("read original");
         assert!(
-            expected_path.exists(),
-            "deterministic archive file must still exist after re-archive"
+            original_bytes.contains("hello"),
+            "original archive must contain the conversation"
+        );
+
+        // Simulate post-truncation: session now has different (shorter) content.
+        db.save_session(chat_id, r#"[{"role":"user","content":"truncated-only"}]"#)
+            .expect("re-save truncated session");
+        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+            .expect("re-archive (skipped)");
+        let retry_bytes = std::fs::read_to_string(&expected_path).expect("read retry");
+        assert_eq!(
+            original_bytes, retry_bytes,
+            "archive must not be overwritten with truncated content on retry"
+        );
+        assert!(
+            !retry_bytes.contains("truncated-only"),
+            "truncated content must not have replaced the original archive"
         );
     }
 

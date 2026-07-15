@@ -706,13 +706,20 @@ pub(crate) async fn archive_conversation(
 /// truncate a session whose archive did not land).
 ///
 /// `idempotency_key` becomes the file name stem (`{key}.md`). A deterministic
-/// key (e.g. `{run_id}-{chat_id}`) makes retry safe: a crash after the archive
-/// write but before truncation produces the same file on re-finalization rather
-/// than a duplicate with a random suffix.
+/// key (e.g. `{run_id}-{chat_id}`) makes retry safe across crashes:
+///
+/// - If the archive file already exists it is **never overwritten**. After the
+///   first successful archive the session is truncated, so a retry would read
+///   the truncated snapshot and shrink the archive. Skipping protects the
+///   original full content.
+/// - The write goes to a temporary file first, then is atomically renamed to
+///   the final path. A crash mid-write leaves no partial archive — the temp
+///   file is simply overwritten on the next attempt.
 ///
 /// # Errors
 ///
-/// Returns [`std::io::Error`] if directory creation or the file write fails.
+/// Returns [`std::io::Error`] if directory creation, the file write, or the
+/// rename fails.
 pub(crate) fn archive_conversation_blocking(
     groups_dir: &std::path::Path,
     channel: &str,
@@ -734,6 +741,18 @@ pub(crate) fn archive_conversation_blocking(
     std::fs::create_dir_all(&dir)?;
 
     let path = dir.join(format!("{idempotency_key}.md"));
+
+    // Idempotent guard: never overwrite an existing archive. After the first
+    // successful archive the session is truncated; a retry would read the
+    // truncated snapshot and destroy the original full conversation.
+    if path.exists() {
+        info!(
+            path = %path.display(),
+            "archive already exists; skipping write to preserve original content"
+        );
+        return Ok(());
+    }
+
     let mut content = String::new();
     for message in messages {
         let role = &message.role;
@@ -742,20 +761,25 @@ pub(crate) fn archive_conversation_blocking(
         content.push_str(&format!("## {role}\n\n{redacted}\n\n---\n\n"));
     }
 
-    std::fs::write(&path, content)?;
+    // Atomic write: temp file → rename. A crash before the rename leaves no
+    // partial archive at the final path, so the next attempt re-archives
+    // cleanly.
+    let tmp = dir.join(format!("{idempotency_key}.tmp"));
+    std::fs::write(&tmp, &content)?;
 
-    // Set file permissions to owner-only (0600) for security.
+    // Set file permissions to owner-only (0600) for security before rename.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        {
+        if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
             warn!(
                 "failed to set archive file permissions {}: {error}",
-                path.display()
+                tmp.display()
             );
         }
     }
+
+    std::fs::rename(&tmp, &path)?;
     info!(
         "archived conversation ({} messages) to {}",
         messages.len(),

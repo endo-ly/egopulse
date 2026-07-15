@@ -729,7 +729,75 @@ impl Database {
         Ok(())
     }
 
-    /// Terminates a durably accepted turn that will never execute, recording why.
+    /// Atomically fails a turn **and** records the origin's terminal stop
+    /// reason in a single transaction.
+    ///
+    /// This closes the crash window between [`Self::fail_turn`] (which
+    /// transitions the turn to `failed`/`uncertain`) and
+    /// [`Self::upsert_turn_origin`] (which persists `terminal_reason`).
+    /// Without atomicity, a crash between the two commits would leave the
+    /// turn terminal but the origin non-terminal — and after a restart the
+    /// dispatcher would re-dispatch and execute the origin's accepted child
+    /// turns.
+    ///
+    /// The turn-failure portion is idempotent: a turn that is already terminal
+    /// is left untouched. The origin upsert uses `ON CONFLICT … DO UPDATE`, so
+    /// a repeat call with the same reason is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the transaction fails.
+    pub(crate) fn fail_turn_and_terminate_origin(
+        &self,
+        turn_id: &str,
+        to: TurnRunState,
+        error_kind: &str,
+        error_message: &str,
+        origin_id: &str,
+        terminal_reason: &str,
+    ) -> Result<(), StorageError> {
+        if !matches!(to, TurnRunState::Failed | TurnRunState::Uncertain) {
+            return Err(StorageError::Conflict(format!(
+                "fail target must be failed or uncertain, got {to}"
+            )));
+        }
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Turn failure (idempotent for already-terminal turns).
+        let current = read_state_locked(&tx, turn_id)?;
+        if !current.is_terminal() {
+            if !TurnRunState::can_transition(current, to) {
+                return Err(StorageError::Conflict(format!(
+                    "fail rejected from state {current} to {to}"
+                )));
+            }
+            tx.execute(
+                "UPDATE turn_runs
+                 SET state = ?2,
+                     error_kind = ?3,
+                     error_message = ?4,
+                     finished_at = ?5,
+                     updated_at = ?5
+                 WHERE turn_id = ?1",
+                params![turn_id, to.to_string(), error_kind, error_message, &now],
+            )?;
+        }
+
+        // Origin terminal reason (idempotent upsert).
+        tx.execute(
+            "INSERT INTO turn_origins (origin_id, executed_turn_count, terminal_reason, updated_at)
+             VALUES (?1, 0, ?2, ?3)
+             ON CONFLICT(origin_id) DO UPDATE SET
+                terminal_reason = excluded.terminal_reason,
+                updated_at = excluded.updated_at",
+            params![origin_id, terminal_reason, &now],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
     ///
     /// Used when the turn dispatcher drops a turn because its origin already has a
     /// terminal stop reason, or [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`]
@@ -1368,6 +1436,84 @@ mod tests {
 
         // Assert
         assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
+    }
+
+    #[test]
+    fn fail_turn_and_terminate_origin_is_atomic() {
+        let (db, _dir) = test_db();
+        // Accept with an explicit origin_id so the origin can be tracked.
+        let run = match db
+            .accept_or_get_turn(
+                1,
+                "k-atomic",
+                1,
+                Some("fp"),
+                "h",
+                Some("origin-atomic"),
+                None,
+            )
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
+        };
+
+        db.fail_turn_and_terminate_origin(
+            &run.turn_id,
+            TurnRunState::Failed,
+            "llm_error",
+            "boom",
+            "origin-atomic",
+            "llm_failure",
+        )
+        .expect("fail + terminate");
+
+        // Turn is failed.
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::Failed);
+
+        // Origin has the terminal reason — recoverable on restart.
+        let origins = db.recover_origin_tracker(3600).expect("recover");
+        let origin = origins
+            .iter()
+            .find(|o| o.origin_id == "origin-atomic")
+            .expect("origin found");
+        assert_eq!(origin.terminal_reason.as_deref(), Some("llm_failure"));
+        assert_eq!(origin.executed_turn_count, 1);
+    }
+
+    #[test]
+    fn fail_turn_and_terminate_origin_idempotent_on_retry() {
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(1, "k-idem", 1, Some("fp"), "h", Some("origin-idem"), None)
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
+        };
+
+        // First call: fails the turn and terminates the origin.
+        db.fail_turn_and_terminate_origin(
+            &run.turn_id,
+            TurnRunState::Failed,
+            "llm_error",
+            "boom",
+            "origin-idem",
+            "llm_failure",
+        )
+        .expect("first");
+
+        // Second call: the turn is already terminal (skipped), origin upsert
+        // is idempotent. Must not error.
+        db.fail_turn_and_terminate_origin(
+            &run.turn_id,
+            TurnRunState::Failed,
+            "llm_error",
+            "boom",
+            "origin-idem",
+            "llm_failure",
+        )
+        .expect("idempotent retry");
+
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::Failed);
     }
 
     #[test]
