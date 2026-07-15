@@ -71,6 +71,8 @@ pub(crate) fn test_config(state_root: &str) -> Config {
     }
 }
 
+use std::path::Path;
+
 /// テスト用 AppState を構築する。LLM プロバイダを注入可能。
 pub(crate) fn build_state_with_provider(
     state_root: &str,
@@ -114,8 +116,79 @@ pub(crate) fn build_state_with_config(
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status: Arc::new(RuntimeStatus::new()),
+        instance_guard: acquire_test_instance_guard(Path::new(&config.state_root)),
+    })
+}
+
+/// Acquires the runtime instance lock for a test `AppState`.
+///
+/// The canonical lock enforces true single-process mutual exclusion. A second
+/// `AppState` on the same state root must fail loudly (`RuntimeAlreadyRunning`)
+/// rather than silently degrading to a separate lock: that path is reserved for
+/// explicit restart-simulation tests via [`acquire_test_instance_guard_for_restart`],
+/// so a test that accidentally builds two states on one root is caught instead
+/// of hidden.
+fn acquire_test_instance_guard(state_root: &Path) -> Arc<crate::runtime::InstanceGuard> {
+    crate::runtime::InstanceGuard::acquire(state_root)
+        .unwrap_or_else(|e| panic!("acquire runtime instance lock in test state: {e}"))
+}
+
+/// Acquires a *separate* instance lock for restart-simulation tests that build
+/// a second `AppState` on the same state root (e.g. to simulate an instance
+/// reopening the same data dir after a crash). The second state deliberately
+/// bypasses the canonical lock by acquiring a uniquely-named lock file, so the
+/// two states can coexist without deadlocking the test.
+///
+/// Use only for restart simulation; never as a silent fallback.
+fn acquire_test_instance_guard_for_restart(
+    state_root: &Path,
+) -> Arc<crate::runtime::InstanceGuard> {
+    let unique = state_root.join(format!("runtime-instance.{}.lock", uuid::Uuid::new_v4()));
+    crate::runtime::InstanceGuard::acquire_at(&unique)
+        .unwrap_or_else(|e| panic!("acquire restart test instance lock: {e}"))
+}
+
+/// Builds a test `AppState` that simulates a *restart*: a separate instance lock
+/// is acquired so two states can share one state root within a single test. Use
+/// this (instead of [`build_state_with_config`]) only when modeling an instance
+/// reopening its data dir after a crash.
+pub(crate) fn build_state_for_restart_simulation(
+    config: Config,
+    llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
+    config_path: Option<std::path::PathBuf>,
+    db: Option<Arc<Database>>,
+    channels: Option<Arc<ChannelRegistry>>,
+) -> AppState {
+    let skills = Arc::new(SkillManager::from_dirs(
+        config.user_skills_dir().expect("user_skills_dir"),
+        config.skills_dir().expect("skills_dir"),
+    ));
+    AppState::from_parts(AppStateParts {
+        db: db.unwrap_or_else(|| Arc::new(Database::new(&config.db_path()).expect("db"))),
+        secret_db: if config.needs_secret_db() {
+            Some(Arc::new(
+                Database::new_secret(&config.secret_db_path()).expect("secret db"),
+            ))
+        } else {
+            None
+        },
+        config: config.clone(),
+        config_path,
+        llm_override,
+        channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
+        skills: Arc::clone(&skills),
+        tools: Arc::new(ToolRegistry::new(&config, skills)),
+        mcp_manager: None,
+        assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
+        soul_agents: Arc::new(crate::agent_loop::soul_agents::SoulAgentsLoader::new(
+            &config,
+        )),
+        memory_loader: Arc::new(MemoryLoader::new(
+            std::path::PathBuf::from(&config.state_root).join("agents"),
+        )),
+        runtime_status: Arc::new(RuntimeStatus::new()),
+        instance_guard: acquire_test_instance_guard_for_restart(Path::new(&config.state_root)),
     })
 }
 
@@ -148,7 +221,6 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         chain_depth: 0,
         origin_id: String::new(),
         turn_id: String::new(),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
         tool_call_id: String::new(),

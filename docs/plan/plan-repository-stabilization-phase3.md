@@ -2,970 +2,1070 @@
 
 ## 1. 目的
 
-本 Plan が解決するのは次の4点である。
+Phase 3では、EgoPulseを長時間常駐するAgent Runtimeとして安定運用できる状態へ仕上げる。
 
-1. `202 Accepted` を返した Webhook を、Turn 開始前のプロセス停止で失わない
-2. Runtime が起動した長寿命 task と Turn task を所有し、順序立てて停止できる
-3. Sleep Memory の DB 状態と Markdown ファイルを、クラッシュ後も同じ世代へ復旧できる
-4. LLM が実行する Bash Tool を、EgoPulse 本体の host 権限から分離する
+Phase 2でConversation TurnとTool Callの実行状態は永続化された。一方、Runtime taskの所有、非同期Turnの受付、Sleep Memoryの公開には、プロセス停止時の入力消失や不整合につながる境界が残っている。
 
-本 Phase は、現在存在する信頼性・整合性・権限分離上の問題を解消するためのものである。
+本Phaseでは、次の3つを完成させる。
 
-全面的な Event Sourcing、全 Channel の Durable Queue 化、Memory 専用の新しい正本モデル、汎用 Workflow Engine は導入しない。
+1. Runtimeが起動したtaskを所有し、異常終了とshutdownを一貫して管理する
+2. 非同期実行されるConversation Turnを、memory queueへ入れる前に永続化する
+3. Sleep Memoryの3ファイルを、一貫したbundleとして公開・復旧する
+
+以下は本PRのスコープ外とし、独立したSecurity Hardening PRへ延期する。
+
+- **Bash Toolの権限分離**: LLMが実行するBash Toolを、EgoPulse本体のhost権限から分離する sandbox は未実施である。現時点ではhost権限で実行される既知リスクが残る。
 
 ---
 
-## 2. 背景
-
-### 2.1 Webhook は永続化前に受付成功を返し得る
-
-現在の Webhook は、入力を in-memory Turn Scheduler へ投入できた時点で `202 Accepted` を返す。
-
-そのため、次の順序で入力が失われ得る。
+## 2. 完成後の構造
 
 ```text
-Webhook受信
-  ↓
-TurnSchedulerへ投入
-  ↓
-202 Accepted
-  ↓
-Turnがturn_runsへ永続化される前にプロセス停止
-  ↓
-外部送信元は成功済みと判断し、再送しない
+Discord / Telegram / Webhook / Agent Send
+                    │
+                    ▼
+              TurnIntake
+        turn_runs: accepted
+                    │
+                    ▼
+            TurnDispatcher
+                    │
+                    ▼
+             TurnScheduler
+                    │
+                    ▼
+       execute accepted Turn
+                    │
+                    ▼
+ input_committed → model → tools → completed
 ```
 
-Phase 2 により Turn 開始後の状態は永続化されたが、Turn になる前の受付状態はまだ永続化されていない。
+```text
+Sleep Steps
+    │
+    ▼
+candidate Memory
+    │
+    ▼
+memory_snapshots
+    │
+    ▼
+Memory Publication
+    │
+    ▼
+episodic / semantic / prospective
+```
 
-### 2.2 Runtime が background task を完全には所有していない
+```text
+RuntimeSupervisor
+├── Channel tasks
+├── TurnDispatcher
+├── Agent Send worker
+├── Conversation Turn tasks
+├── MCP reconnect task
+├── Sleep scheduler / tasks
+├── Pulse scheduler / tasks
+└── Backup scheduler
+```
 
-MCP reconnect loop、Agent Turn worker、Channel listener、Scheduler、個々の Turn などが複数箇所で起動されている。
-
-一部は `JoinHandle` を保持せず、Runtime 全体として次を保証できない。
-
-- task panic の検知
-- 長寿命 task の異常終了の可視化
-- shutdown 中の新規受付停止
-- 実行中 Turn の drain
-- shutdown deadline 超過時の abort
-- MCP や Scheduler の停止順序
-
-### 2.3 Sleep Memory の DB と Markdown は同一 transaction では更新できない
-
-Sleep Memory は DB と filesystem の両方へ状態を保存する。
-
-通常のエラーでは rollback 相当の処理を行えても、Markdown 更新直後にプロセスが停止すると、その補償処理は実行されない。
-
-Phase 3 では DB と filesystem を単一 transaction に入れるのではなく、DB 上に再公開可能な状態を先に残し、クラッシュ後に同じ世代を再公開できる protocol を作る。
-
-### 2.4 Bash Tool は host process と同じ権限で動作する
-
-現在の Bash Tool は EgoPulse process から host 上の `bash` を直接起動する。
-
-command guard、path guard、timeout、output truncation、secret redaction は存在するが、これらは OS sandbox ではない。
-
-LLM が Shell Tool を利用できる以上、Prompt Injection や誤操作により次が起こり得る。
-
-- workspace 外の host filesystem 参照
-- workspace 外への書込み
-- parent process の環境変数参照
-- network access
-- CPU / memory の過剰消費
-- child process の残留
-
-Phase 3 では Built-in Bash Tool を対象として、host 権限から分離する。
 
 ---
 
-## 3. 設計原則
+## 3. Runtime invariants
 
-### 3.1 Durable にする対象を限定する
+Phase 3完了後、Runtimeは次を常に満たす。
 
-Durable Queue の対象は Webhook に限定する。
+### 3.1 Task ownership
 
-Discord、Telegram、Web、CLI の全入力を DB Queue 経由へ変更しない。
+- 長寿命taskには所有者が存在する
+- Conversation Turn taskはSupervisorが追跡する
+- taskのpanic、error、unexpected completionを観測できる
+- shutdown開始後に新しいTurnを開始しない
+- shutdown deadlineを超えたtaskをabortできる
 
-Webhook は外部 API として `202 Accepted` を返すため、受付済み入力を失わない契約が必要である。
+### 3.2 Durable acceptance
 
-### 3.2 新規テーブルは1つに限定する
+- 非同期Turnは`turn_runs`へcommitされた後に受付成功となる
+- `accepted` Turnは再起動後に実行要求を復元できる
+- Scheduler capacity不足で受付済みTurnを失わない
+- 同一request keyは同一Turnへ収束する
+- Turn executionの重複競合は、片方のexecutorが安全に終了する
 
-新規テーブルは `ingress_jobs` のみ追加する。
+### 3.3 Memory consistency
 
-以下の新規テーブルは作らない。
+- 1つのSleep Runが生成した3ファイルは同じcandidate bundleから公開される
+- Turnはpublication途中の混在したMemoryを読まない
+- publication途中のprocess停止後に同じbundleへ収束する
+- Sleep中に発生した手動編集を検知する
 
-- `memory_generations`
-- `memory_generation_files`
-- `task_registry`
-- `task_runs`
-- `job_attempts`
-- `dead_letters`
-- `agent_locks`
-- `capability_grants`
-- `supervisor_state`
+### 3.4 Single-instance guarantee
 
-Memory publication は既存の `sleep_runs`、`sleep_run_steps`、`memory_snapshots` を利用する。
+- 同じ state root に対して同時に起動できる Runtime は 1 つだけである
+- Runtime 起動時に state root 内の専用ロックファイルに対して OS の排他 advisory lock を取得し、DB オープン前に獲得する
+- ロック獲得に失敗した場合（他プロセスが既に保持）、起動を `RuntimeAlreadyRunning` で拒否する
+- ロックはプロセス終了（正常・異常問わず）時に OS が自動解放するため、クラッシュ後の次回起動をブロックしない
+- 手動 Sleep 実行も同一 state root のロックを共有し、Runtime と同時実行されない
 
-Supervisor、lock、capability policy は process memory または Config で管理する。
 
-### 3.3 不明な状態を推測で再実行しない
+# 4. Package 1 — Runtime Supervisor
 
-既存の fail-stop 方針を維持する。
+## 4.1 目的
 
-shutdown deadline を超えた Turn や、完了を証明できない Tool を「たぶん安全」と判断して再開しない。
+Runtimeが起動するtaskを一つのlifecycleへ統合し、起動、異常検知、drain、停止を一貫して管理する。
 
-再起動時は既存の Turn / Tool recovery により `failed` または `uncertain` へ安全停止する。
+## 4.2 RuntimeSupervisor
 
-### 3.4 OS sandbox 不在時に host 実行へ fallback しない
+`RuntimeSupervisor`は次を保持する。
 
-`sandboxed` が指定されている環境で sandbox backend が利用できない場合、Bash Tool は無効化または明示的エラーとする。
+```rust
+struct RuntimeSupervisor {
+    cancellation: CancellationToken,
+    accepting_inputs: AtomicBool,
+    long_lived_tasks: TaskSet,
+    turn_tasks: TaskSet,
+    maintenance_tasks: TaskSet,
+    shutdown_state: ShutdownState,
+}
+```
 
-暗黙に host 上で直接実行しない。
+内部実装は`JoinSet`または所有された`JoinHandle`集合を使用する。
 
----
+各taskには次のmetadataを付与する。
 
-## 4. Scope
+```rust
+struct TaskMetadata {
+    name: &'static str,
+    kind: TaskKind,
+    criticality: TaskCriticality,
+}
+```
 
-### 4.1 対象
+```rust
+enum TaskKind {
+    Channel,
+    Dispatcher,
+    Turn,
+    AgentWorker,
+    Mcp,
+    Sleep,
+    Pulse,
+    Backup,
+}
+```
 
-- Runtime Supervisor
-- root cancellation
-- 長寿命 task ownership
-- Turn task ownership
-- graceful shutdown
-- shutdown deadline
-- Durable Webhook Ingress
-- `ingress_jobs`
-- Webhook Job worker
-- Job lease / retry / dead letter
-- Secret scope 対応
-- Recoverable Memory Publication
-- per-agent Memory read/write lock
-- 起動時 Memory recovery
-- Built-in Bash Tool の OS sandbox
-- sandbox availability validation
-- Runtime 起動順序の統一
+```rust
+enum TaskCriticality {
+    Critical,
+    Supporting,
+}
+```
 
-### 4.2 対象外
+## 4.3 Supervisor経由で起動するtask
 
-- 全 Channel の Durable Queue 化
-- `turn_runs` を汎用 Job Queue として利用すること
-- 汎用 Supervisor framework
-- task 状態の DB 永続化
-- task 自動 restart policy の一般化
-- Memory の Event Sourcing
-- DB を日常的な Memory 読込の正本へ変更すること
-- Markdown 外部編集の DB 同期
-- MCP Server 全体の sandbox 化
-- Browser sandbox
-- 全 OS で同一の sandbox backend を提供すること
-- Channel identity の全面的な型再設計
-- `AppState` の全面解体
-- Cargo / Web build 境界の整理
-- Built-in docs manifest
-
-最後の4項目は後続 Plan で扱う。
-
----
-
-# 5. Package 1 — Runtime Supervisor
-
-## 5.1 目的
-
-Runtime が起動した長寿命 task と実行中 Turn を所有し、異常終了・shutdown・deadline 超過を管理できるようにする。
-
-## 5.2 Supervisor が所有する対象
-
-- Channel listener
-- Agent Turn worker
-- Durable Ingress worker
+- Web server
+- Discord listener
+- Telegram listener
+- Voice listener
+- TurnDispatcher
+- Agent Send receiver
 - MCP reconnect loop
 - Sleep scheduler
 - Pulse scheduler
 - Backup scheduler
-- 実行中 Turn task
+- Schedulerから開始されるConversation Turn
+- Sleep batch
+- Pulse Activation
 
-単発の短い補助 Future まで汎用 registry へ登録する必要はない。
+親Futureが必ず完了をawaitする短時間の補助taskは、親taskのlifecycleに含める。
 
-Runtime の存続期間に関係する task と、shutdown 時に待つ必要がある task を所有対象とする。
+## 4.4 Critical task failure
 
-## 5.3 構成
+Critical taskがpanic、error、unexpected completionした場合、次を実行する。
 
-概念的には次の要素を持つ。
+1. RuntimeStatusへtask名と終了理由を記録
+2. `accepting_inputs`をfalseへ変更
+3. root cancellationを発火
+4. graceful shutdownへ遷移
 
-```text
-RuntimeSupervisor
-├── root CancellationToken
-├── long_lived_tasks: JoinSet
-├── turn_tasks: JoinSet または owned handle registry
-├── accepting_inputs: AtomicBool
-├── shutdown_started: AtomicBool
-└── RuntimeStatus
-```
+Critical task:
 
-既存の `AppState` は Composition Root として残してよい。
+- Web server
+- 有効化されたChannel listener
+- TurnDispatcher
+- Agent Send receiver
 
-Supervisor の導入を理由に、Phase 3 内で `AppState` を全面的に分解しない。
+## 4.5 Turn task ownership
 
-## 5.4 task 起動
+TurnSchedulerが実行開始を決定した後、Conversation TurnはSupervisor経由でspawnする。
 
-長寿命 task は、直接 `tokio::spawn` して handle を捨てない。
+Supervisorは次を追跡する。
 
-Supervisor を通じて起動し、少なくとも次を記録する。
+- turn_id
+- agent_id
+- channel
+- session key
+- started_at
+- completion
+- panic
+- forced abort
 
-- task kind
-- task name
-- critical / non-critical
-- 正常終了か
-- panic / error の有無
+Turn taskの正常終了時、Schedulerへsession完了を通知し、同じsessionの次Turnを開始する。
 
-DB へ task 状態は保存しない。
+Turn taskのpanic時もsession slotを解放し、該当Turnをrecovery対象として残す。
 
-## 5.5 task 異常終了
-
-### Critical task
-
-例:
-
-- Agent Turn worker
-- Durable Ingress worker
-- 必須 Channel listener
-
-予期せず終了した場合は RuntimeStatus へ記録し、新規受付を停止する。
-
-自動 restart は本 Phase の必須要件にしない。
-
-### Non-critical task
-
-例:
-
-- 補助的な定期処理
-- optional Channel
-- optional reconnect loop
-
-異常終了を RuntimeStatus と log へ記録する。
-
-Runtime 全体を停止するかは既存機能の重要度に応じて決定する。
-
-## 5.6 shutdown 順序
+## 4.6 Shutdown sequence
 
 ```text
 1. accepting_inputs = false
-2. Webhook / Channel の新規入力受付停止
-3. 新しい Job claim と Turn start を停止
-4. Scheduler の新規 dispatch を停止
-5. 実行中 Turn と Memory publication の完了を待つ
-6. Durable Ingress worker を停止
-7. MCP / Sleep / Pulse / Backup 等を停止
-8. deadline 超過 task を abort
-9. DB と Runtime を終了
+2. HTTP / Channelの新規入力受付を停止
+3. TurnIntakeの新規acceptを停止
+4. TurnDispatcherの新規dispatchを停止
+5. TurnSchedulerの新規Turn開始を停止
+6. 実行中Conversation Turnをdrain
+7. 実行中Sleep publicationをdrain
+8. 実行中Pulse Activationをdrain
+9. Sleep / Pulse / Backup schedulerを停止
+10. MCP reconnect loopを停止
+11. deadline超過taskをabort
+12. DB poolとRuntime resourceを解放
 ```
 
-shutdown 中、既に queue 済みの次の Turn を新たに開始しない。
+`accepted`状態で待機しているTurnはDBに保持する。
 
-## 5.7 Turn の扱い
+## 4.7 RuntimeStatus / Metrics
 
-Turn 実行中に cancellation が通知された場合、可能な安全地点で終了する。
+記録する項目:
 
-ただし、外部副作用の完了状態を証明できない場合は、再実行可能状態へ戻さない。
+- task count by kind
+- critical task failures
+- task panics
+- active Turn tasks
+- shutdown started
+- shutdown duration
+- forced abort count
+- accepting inputs
 
-deadline 超過により task が abort された場合、次回起動時に 既存の recovery を通じて `failed` または `uncertain` へ移行する。
+## 4.8 完了条件
 
-## 5.8 完了条件
+- 長寿命taskのhandleが破棄されていない
+- Scheduler起点のConversation TurnがSupervisorに所有される
+- critical task終了をRuntime全体が検知する
+- shutdown開始後に新しい入力をacceptしない
+- shutdown開始後に新しいTurnを開始しない
+- active Turnをdeadlineまでdrainする
+- deadline超過taskをabortする
+- task panic後もsession scheduler slotが解放される
 
-- Runtime が所有していない長寿命 task が残っていない
-- shutdown 開始後に新しい Turn が開始されない
-- 実行中 Turn を deadline まで待てる
-- deadline 超過 taskを abort できる
-- task panic が RuntimeStatus へ反映される
-- MCP reconnect loop を停止できる
-- shutdown が特定 Channel の終了待ちで無期限停止しない
+## 4.9 単一インスタンス保証（RuntimeSupervisor の所有）
+
+単一インスタンス保証（§3.4）は RuntimeSupervisor が所有する。
+
+- `InstanceGuard` を supervisor が保持し、プロセス生存期間中ロックを維持する
+- ロック取得は `build_app_state` において DB オープン前に行われ、取得失敗時は起動を拒否する
+- ロック状態は health エンドポイントと metrics ゲージ（`egopulse_runtime_instance_lock`）から観測できる
 
 ---
 
-# 6. Package 2 — Durable Webhook Ingress
+# 5. Package 2 — Durable Scheduled Turn
 
-## 6.1 目的
+## 5.1 目的
 
-`202 Accepted` を返した Webhook 入力を、Turn 開始前のプロセス停止で失わないようにする。
+`ScheduledTurn`として非同期実行される入力を、TurnSchedulerへ投入する前に`turn_runs`へ永続化する。
 
-## 6.2 `turn_runs` と分ける理由
+対象経路:
 
-`turn_runs` は、Turn として durable accept された後の実行状態を管理する。
+- Discord
+- Telegram
+- Webhook
+- Agent Send
+- `submit_scheduled_turn`を使用するChannel adapter
 
-`ingress_jobs` は、Turn になる前の外部入力を管理する。
+## 5.2 turn_runs schema
 
-```text
-Webhook delivery
-  ↓
-ingress_jobs
-  ↓
-Turn durable accept
-  ↓
-turn_runs
-```
-
-対象とライフサイクルが異なるため、`turn_runs` を Queue として流用しない。
-
-## 6.3 新規テーブル
+Normal DBとSecret DBの`turn_runs`へ次を追加する。
 
 ```sql
-CREATE TABLE ingress_jobs (
-    job_id          TEXT PRIMARY KEY,
-    receiver_id     TEXT NOT NULL,
-    request_key     TEXT NOT NULL,
-    target_channel  TEXT NOT NULL,
-    target_thread   TEXT NOT NULL,
-    agent_id        TEXT NOT NULL,
-    input_text      TEXT NOT NULL,
-    state           TEXT NOT NULL,
-    attempt_count   INTEGER NOT NULL DEFAULT 0,
-    available_at    TEXT NOT NULL,
-    lease_until     TEXT,
-    turn_id          TEXT,
-    last_error       TEXT,
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL,
-    CHECK (state IN ('queued', 'running', 'handed_off', 'dead_letter')),
-    UNIQUE (receiver_id, request_key)
-);
+ALTER TABLE turn_runs ADD COLUMN scheduled_request_json TEXT;
+ALTER TABLE turn_runs ADD COLUMN origin_id TEXT;
+ALTER TABLE turn_runs ADD COLUMN origin_stop_reason TEXT;
 ```
 
-必要な index を追加する。
+検索index:
 
 ```sql
-CREATE INDEX idx_ingress_jobs_claim
-    ON ingress_jobs(state, available_at, lease_until);
+CREATE INDEX idx_turn_runs_dispatch
+ON turn_runs(state, accepted_at, turn_id)
+WHERE scheduled_request_json IS NOT NULL;
 
-CREATE INDEX idx_ingress_jobs_receiver_created
-    ON ingress_jobs(receiver_id, created_at);
-
-CREATE INDEX idx_ingress_jobs_turn_id
-    ON ingress_jobs(turn_id);
+CREATE INDEX idx_turn_runs_origin
+ON turn_runs(origin_id, accepted_at)
+WHERE origin_id IS NOT NULL;
 ```
 
-## 6.4 Normal / Secret DB
+各fieldの責務:
 
-Job は解決済み target の Conversation Scope に対応する DB へ保存する。
+| field | 責務 |
+|---|---|
+| `scheduled_request_json` | accepted Turnの実行要求を復元する |
+| `origin_id` | Agent Send chainのidentityを永続化する |
+| `origin_stop_reason` | chainを停止させた理由を永続化する |
 
-- Normal target → Normal DB
-- Secret target → Secret DB
+既存の次のfieldをそのまま使用する。
 
-Secret Webhook の payload、input text、target metadata を Normal DB へ保存しない。
+- `turn_id`
+- `chat_id`
+- `request_key`
+- `request_payload_hash`
+- `state`
+- `config_revision`
+- `config_fingerprint`
+- `input_message_id`
+- `output_published`
+- `accepted_at`
+- `updated_at`
 
-Normal DB と Secret DB の双方へ同じ `ingress_jobs` schema を導入する。
+## 5.3 PersistedScheduledTurn
 
-## 6.5 受付フロー
+`scheduled_request_json`はversioned schemaとする。
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct PersistedScheduledTurnV1 {
+    version: u32,
+    context: PersistedSurfaceContextV1,
+    input: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSurfaceContextV1 {
+    channel: String,
+    surface_user: String,
+    surface_thread: String,
+    chat_type: String,
+    agent_id: String,
+    channel_log_chat_id: Option<i64>,
+    chain_depth: usize,
+}
+```
+
+次は独立columnまたは実行時生成値として扱う。
+
+- `request_key`: `turn_runs.request_key`
+- `origin_id`: `turn_runs.origin_id`
+- `scope`: 保存先DB
+- `trace_id`: execution開始時に生成
+- `turn_id`: `turn_runs.turn_id`
+
+serialization対象は専用型とし、`SurfaceContext`自体へ永続schemaの責務を持たせない。
+
+## 5.4 Canonical request hash
+
+`request_payload_hash`は次のcanonical inputから生成する。
 
 ```text
-Webhook受信
+version
+channel
+surface_user
+surface_thread
+chat_type
+agent_id
+channel_log_chat_id
+chain_depth
+input
+```
+
+JSON objectのfield順序やwhitespaceに依存しないcanonical serializationを使用する。
+
+同じ`chat_id + request_key`で既存Turnが存在する場合:
+
+- hash一致: 既存Turnを返す
+- hash不一致: conflictを返す
+
+`origin_id`と`trace_id`はhashへ含めない。
+
+## 5.5 Root originとAgent Send origin
+
+Root Turnでは、新規作成する`turn_id`を`origin_id`として使用する。
+
+```text
+root turn:
+  origin_id = turn_id
+  chain_depth = 0
+```
+
+Agent Sendが生成する子Turnでは、親Turnの`origin_id`を継承する。
+
+```text
+child turn:
+  origin_id = parent.origin_id
+  chain_depth = parent.chain_depth + 1
+```
+
+重複受付で既存Turnが返る場合は、既存rowの`origin_id`を使用する。
+
+## 5.6 TurnIntake
+
+新しい受付境界を`TurnIntake`へ集約する。
+
+```rust
+struct NewScheduledTurn {
+    context: SurfaceContext,
+    input: String,
+}
+```
+
+```rust
+enum TurnIntakeOutcome {
+    Created(AcceptedTurnRef),
+    Existing(AcceptedTurnRef, TurnRunState),
+    Rejected(TurnRejectReason),
+}
+```
+
+```rust
+struct AcceptedTurnRef {
+    turn_id: String,
+    scope: ConversationScope,
+    session_key: String,
+    origin_id: String,
+}
+```
+
+受付処理:
+
+```text
+1. Runtimeがinput受付中であることを確認
+2. request keyを確定
+3. chatをresolve / create
+4. canonical requestを生成
+5. request hashを生成
+6. duplicateを確認
+7. origin reservationを取得
+8. accepted backlog capacityを確認
+9. turn_runsへaccepted rowをinsert
+10. transaction commit
+11. TurnDispatcherをwake
+12. AcceptedTurnRefを返す
+```
+
+DB write失敗時はorigin reservationをreleaseする。
+
+duplicateで既存Turnを返す場合も、新規に取得したreservationをreleaseする。
+
+## 5.7 Backlog capacity
+
+次の既存上限をdurable accepted backlogへ適用する。
+
+- global accepted Turn: `MAX_GLOBAL_QUEUED_TURNS`
+- chat単位accepted Turn: `MAX_QUEUED_TURNS_PER_SESSION`
+- tracked origin: `MAX_TRACKED_ORIGINS`
+- origin単位execution Turn: `MAX_AGENT_TURNS_PER_INPUT`
+- chain depth: `MAX_AGENT_CHAIN_DEPTH`
+
+capacity判定は新規row insertと同じSQLite transaction内で行う。
+
+duplicate rowの取得はcapacityに関係なく成功させる。
+
+## 5.8 Webhook acceptance
+
+Webhook handlerは次の順序で処理する。
+
+```text
+receiver resolve
   ↓
-receiver解決
-  ↓
-token認証
+Bearer token validation
   ↓
 payload size / JSON validation
   ↓
-target channel / thread / agent / scope解決
+target channel / thread / agent / scope resolve
   ↓
-Agent入力へ正規化
+Agent input formatting
   ↓
-request_key決定
+TurnIntake::accept
   ↓
-対象DBのingress_jobsへINSERT
+DB commit
   ↓
-COMMIT成功
-  ↓
-202 Accepted + job_id
+202 Accepted
 ```
 
-DB commit に失敗した場合は `202 Accepted` を返さない。
-
-## 6.6 Request Key
-
-優先順位は次とする。
+request keyの優先順位:
 
 1. `Idempotency-Key` header
-2. payload の明示的な `event_id`
-3. payload の明示的な `message_id`
-4. receiver が対応する外部イベント固有 ID
-5. ランダム生成した Job ID
+2. payloadのstable event identifier
+3. requestごとのUUID
 
-明示的な ID がない場合、payload hash による deduplication は行わない。
+response:
 
-同じ内容のイベントが複数回実際に起こり得るため、同一 payload を同一イベントとみなさない。
-
-## 6.7 Worker claim
-
-単一 process 内で複数 worker が存在しても、同じ Job を同時実行しないよう transaction 内で claim する。
-
-```text
-queued
-  ↓ claim
-running + lease_until
+```json
+{
+  "ok": true,
+  "status": "accepted",
+  "turn_id": "..."
+}
 ```
 
-claim 対象は次を満たす Job とする。
+hash conflictはHTTP 409とする。
 
-- `state = queued`
-- `available_at <= now`
+capacity rejectionはHTTP 429とする。
 
-または、
+shutdown中の受付はHTTP 503とする。
 
-- `state = running`
-- `lease_until < now`
+## 5.9 TurnDispatcher
 
-後者は前回 worker の停止による lease 失効として扱う。
+TurnDispatcherはRuntimeSupervisorが所有する単一のlong-lived taskとする。
 
-## 6.8 Turn への handoff
+内部状態:
 
-Job は Scheduler へ投入しただけでは `handed_off` にしない。
-
-```text
-Job claim
-  ↓
-ScheduledTurn生成
-  ↓
-Turn durable accept
-  ↓
-turn_runs.turn_id確定
-  ↓
-ingress_jobs.turn_id保存
-  ↓
-state = handed_off
+```rust
+struct TurnDispatcher {
+    queued_turn_ids: HashSet<String>,
+    wake_rx: Receiver<()>,
+}
 ```
 
-TurnScheduler の in-memory queue に入っただけの状態は、handoff 完了ではない。
-
-## 6.9 重複 handoff
-
-worker 再実行時、同じ `receiver_id + request_key` に対応する Turn が既に存在する場合は、新しい Turn を作らない。
-
-既存 Turn の `turn_id` を Job へ関連付け、`handed_off` にする。
-
-既存の Turn request key deduplication と組み合わせ、Job worker の再実行でも重複 Turn を防止する。
-
-## 6.10 Retry
-
-一時的な内部エラーに限り retry する。
-
-retry 時は次を更新する。
-
-- `attempt_count += 1`
-- `state = queued`
-- `available_at = backoff後`
-- `lease_until = NULL`
-- `last_error`
-
-retry 回数を超えた Job は `dead_letter` とする。
-
-専用の attempt table と dead letter table は作らない。
-
-## 6.11 Queue capacity と retention
-
-Config で少なくとも次を設定可能にする。
-
-- 最大未処理 Job 件数
-- 最大 retry 回数
-- lease duration
-- retry backoff 上限
-- handed_off retention
-- dead_letter retention
-
-capacity 超過時は DB に保存せず、明示的な 429 または 503 を返す。
-
-既に `202 Accepted` を返した Job を capacity 理由で後から捨てない。
-
-## 6.12 Job Status API
+dispatch loop:
 
 ```text
-GET /api/webhooks/{receiver_id}/jobs/{job_id}
+1. wakeまたはperiodic intervalを待つ
+2. Normal DBからdispatchable Turnを取得
+3. Secret DBからdispatchable Turnを取得
+4. accepted_at, turn_id順でmerge
+5. queued_turn_idsに存在しないTurnを選ぶ
+6. TurnSchedulerへAcceptedTurnRefをsubmit
+7. Started / Queuedならqueued_turn_idsへ登録
+8. Scheduler capacity時はDB rowをacceptedのまま保持
 ```
 
-receiver token で認証する。
+periodic scanにより、wake notificationの消失後もDBへ収束する。
 
-`input_text`、payload、Secret 情報、内部 error detail をそのまま返さない。
+## 5.10 TurnScheduler
 
-## 6.13 完了条件
+TurnSchedulerが保持するqueue itemを、入力本文を持つ`ScheduledTurn`からaccepted済みTurn参照へ変更する。
 
-- DB commit 成功後にのみ 202 を返す
-- 202 後、worker 開始前に停止しても Job が残る
-- worker claim 後の停止で lease recovery できる
-- Turn durable accept 前の停止で再処理できる
-- Turn durable accept 後は重複 Turn を作らない
-- Secret Job が Normal DB に保存されない
-- queue capacity が有界
-- dead letter が確認可能
-- retention で完了済み Job を削除できる
+```rust
+struct RunnableTurn {
+    turn_id: String,
+    scope: ConversationScope,
+    session_key: String,
+    origin_id: String,
+    resume_point: TurnResumePoint,
+}
+```
+
+```rust
+enum TurnResumePoint {
+    Accepted,
+    InputCommitted,
+}
+```
+
+session orderingは`session_key`で維持する。
+
+Schedulerが実行開始を決めた後、RunnableTurnをRuntimeSupervisorへ渡す。
+
+## 5.11 Turn execution split
+
+現在のTurn処理を次の境界へ分離する。
+
+```text
+accept direct Turn
+execute accepted Turn
+resume input_committed Turn
+run model / tool loop
+```
+
+概念API:
+
+```rust
+process_direct_turn(...)
+execute_accepted_turn(turn_id, scope)
+resume_input_committed_turn(turn_id, scope)
+```
+
+`process_direct_turn`は、直接応答を返す既存経路のwrapperとして使用する。
+
+非同期Scheduled Turnは`execute_accepted_turn`を使用する。
+
+## 5.12 Config pinning
+
+Scheduled Turnの受付時点では`config_revision = 0`、`config_fingerprint = NULL`とする。
+
+実行開始時にConfig snapshotを1回取得し、`turn_runs`へ固定する。
+
+```text
+accepted
+  ↓
+current ConfigSnapshot取得
+  ↓
+config revision / fingerprintをCASで固定
+  ↓
+Provider / Prompt / Tool definition解決
+```
+
+既にfingerprintが固定されているTurnでは、current fingerprintとの一致を確認する。
+
+Config identityの固定後は、Turn完了まで同じsnapshotを使用する。
+
+## 5.13 accepted execution
+
+`execute_accepted_turn`は次を実行する。
+
+```text
+1. turn_runsを取得
+2. state = acceptedを確認
+3. scheduled_request_jsonをdeserialize
+4. SurfaceContextを再構築
+5. Config snapshotを固定
+6. Provider / Prompt / Toolを準備
+7. sessionをload
+8. compactionを実行
+9. user messageとsession snapshotをcommit
+10. accepted → input_committed
+11. model loopを開始
+```
+
+user message、session snapshot、chat revision、input message ID、Turn state transitionは同一transactionでcommitする。
+
+input message ID:
+
+```text
+turn:{turn_id}:input
+```
+
+## 5.14 input_committed resume
+
+`resume_input_committed_turn`は次を検証する。
+
+- scheduled requestを復元できる
+- input message IDが存在する
+- input messageが該当Turnに属する
+- session snapshotが該当inputを含む
+- Config fingerprintが一致する
+- `output_published = false`
+- Tool execution rowが存在しない
+- stateが`input_committed`
+
+検証後、保存済みsession snapshotからmodel loopを開始する。
+
+input messageのinsert、compaction、`accepted → input_committed`処理は再実行しない。
+
+## 5.15 Executor競合
+
+同じTurnを複数executorが開始した場合、state transitionのCASを実行権境界として扱う。
+
+- `accepted → input_committed`を先にcommitしたexecutorが継続する
+- `input_committed → model_pending`を先にcommitしたexecutorが継続する
+- CAS conflictとなったexecutorは最新stateを読み、通常終了する
+
+CAS conflictをTurn failureへ変換しない。
+
+## 5.16 Recovery
+
+Runtime起動時、Normal DBとSecret DBを対象にTurnを分類する。
+
+| persisted state | recovery |
+|---|---|
+| `accepted` + valid scheduled request | Dispatcherへ登録 |
+| `input_committed` + resume検証成功 | `InputCommitted`としてDispatcherへ登録 |
+| `accepted` + request復元error | `failed` |
+| `input_committed` + resume検証error | `failed` |
+| `model_pending` | `uncertain` |
+| `model_completed` | `uncertain` |
+| `tools_pending` | `uncertain` |
+| `tools_completed` | `uncertain` |
+
+`output_published = true`の非terminal Turnは`uncertain`とする。
+
+## 5.17 Origin tracker recovery
+
+Runtime起動時、`origin_id`が存在し、`accepted_at`がorigin TTL内のTurnを集計する。
+
+復元する値:
+
+- accepted rows: pending reservation
+- input_committed以降のrows: executed count
+- `origin_stop_reason`: terminal reason
+- latest updated_at: TTL基準
+
+復元後にTurnDispatcherを開始する。
+
+chain stopを発生させたTurnでは、該当reasonを`origin_stop_reason`へ保存する。
+
+## 5.18 Completion handling
+
+Turnが`input_committed`へ進んだ時点で、Dispatcherの`queued_turn_ids`から削除する。
+
+Turn taskが完了・失敗・panicした場合、Scheduler slotを解放する。
+
+同じsessionの次TurnはSupervisor経由で開始する。
+
+## 5.19 Metrics
+
+- accepted Turn count
+- oldest accepted age
+- intake created / existing / rejected
+- dispatcher scans
+- dispatcher started / queued / deferred
+- accepted recovery
+- input_committed recovery
+- request decode failure
+- request hash conflict
+- origin recovery count
+- executor CAS conflict
+
+## 5.20 完了条件
+
+- `submit_scheduled_turn`経路がSchedulerより先に`turn_runs`へcommitする
+- WebhookがDB commit後に202を返す
+- accepted Turnがrestart後に実行される
+- input_committed Turnがrestart後にmodel loopを開始する
+- same request key + same requestが同一Turnへ収束する
+- same request key + different requestがconflictになる
+- Scheduler capacity時にaccepted TurnがDBへ残る
+- Normal / Secret DBのroutingが維持される
+- Agent Sendのoriginとchain depthがrestart後も復元される
+- duplicate executorがTurnをfailedへ変更しない
+- Config snapshotがexecution開始時に固定される
 
 ---
 
-# 7. Package 3 — Recoverable Memory Publication
+# 6. Package 3 — Recoverable Memory Publication
 
-## 7.1 目的
+## 6.1 目的
 
-Sleep Memory の3つの Markdown ファイルを、1つの Sleep Run に対応する同じ世代として公開し、公開途中のクラッシュから復旧できるようにする。
+Sleep Runが生成する`episodic.md`、`semantic.md`、`prospective.md`を一つのMemory bundleとして公開し、process停止後も同じbundleへ復旧する。
 
-## 7.2 新規テーブルを作らない理由
+## 6.2 BatchContext
 
-既存の `memory_snapshots` は次を保持している。
+BatchContextはrun開始時のMemoryと生成中のcandidateを分けて保持する。
 
-- `run_id`
-- `agent_id`
-- `file`
-- `content_before`
-- `content_after`
-
-`sleep_run_id` を Memory generation ID として利用できる。
-
-そのため、同等の情報を持つ `memory_generations` や `memory_generation_files` は追加しない。
-
-## 7.3 正本の扱い
-
-Markdown ファイルは引き続き通常の Memory 読込元とする。
-
-DB は、Sleep が生成した Memory を安全に再公開するための durable publication record とする。
-
-Phase 3 では「DB を日常的な Memory 正本へ変更する」仕様変更は行わない。
-
-## 7.4 Step 内でファイルを更新しない
-
-各 Memory Step は、LLM 処理と DB commit までを行う。
-
-```text
-Step開始
-  ↓
-LLM処理
-  ↓
-候補Memory生成
-  ↓
-memory_snapshotsへcontent_before / content_after保存
-  ↓
-sleep_run_stepsをsuccessへ更新
+```rust
+struct BatchContext {
+    run_id: String,
+    agent_id: String,
+    base_memory: MemoryBundle,
+    candidate_memory: MemoryBundle,
+    ...
+}
 ```
 
-各 Step の途中では、公開中の Markdown を変更しない。
+```rust
+struct MemoryBundle {
+    episodic: String,
+    semantic: String,
+    prospective: String,
+}
+```
 
-## 7.5 3ファイルすべての snapshot
+Sleep Stepは`candidate_memory`を更新する。
 
-最終 publication 前に、1つの Sleep Run について次の3行が存在することを保証する。
+## 6.3 Step commit
+
+各Memory Stepは次の順序で完了する。
+
+```text
+1. LLM / rendererでcandidateを生成
+2. candidate_memoryを更新
+3. memory_snapshotsへcontent_before / content_afterを保存
+4. checkpointとStep resultをcommit
+5. Stepをsuccessまたはskippedへ遷移
+```
+
+Step処理中は公開中Markdownを変更しない。
+
+`content_before`は`base_memory`の値を使用する。
+
+`content_after`はStep完了時点のcandidateを使用する。
+
+## 6.4 Complete snapshot set
+
+finalize前に、同じrun_idについて3種類のsnapshotを揃える。
 
 - episodic
 - semantic
 - prospective
 
-変更されなかった Memory file についても、現在内容を `content_before` と `content_after` に保存する。
-
-これにより、1つの run_id だけで完全な Memory 状態を再構築できる。
-
-## 7.6 Publication protocol
+更新が発生しなかったfileでは次を保存する。
 
 ```text
-1. 全Memory Step完了
-2. 3ファイルの最終content_afterを確定
-3. DB transaction:
-   - 3つのmemory_snapshotsを確認
-   - sleep_runs.status = publishing
-4. per-agent Memory write lock取得
-5. agent専用staging directoryへ3ファイル生成
-6. fsync可能な範囲で内容を確定
-7. staging generationをcurrentへ切替
-8. 3ファイルの公開状態を確認
-9. DBでsleep_runs.status = success
-10. write lock解放
+content_before = base content
+content_after  = base content
 ```
 
-## 7.7 ファイル切替方式
+`memory_snapshots`の`UNIQUE(run_id, file)`をpublication bundleの整合性条件として使用する。
 
-単純に3つの既存ファイルへ順番に上書きすると、途中状態を Turn が読み得る。
+## 6.5 Per-agent Memory lock
 
-そのため、3ファイルを一つの generation directory として生成し、current generation の参照を atomic に切り替える方式を優先する。
+MemoryLoaderへagent単位の`RwLock` registryを追加する。
 
-```text
-agents/{agent_id}/memory/
-├── generations/
-│   ├── {run_id}/
-│   │   ├── episodic.md
-│   │   ├── semantic.md
-│   │   └── prospective.md
-│   └── ...
-└── current -> generations/{run_id}
+```rust
+struct AgentMemoryLockRegistry {
+    locks: DashMap<AgentId, Arc<RwLock<()>>>,
+}
 ```
 
-platform 上で directory symlink / rename の扱いが不適切な場合は、同等の atomic manifest 切替を使う。
-
-重要なのは、Turn が3ファイルを別世代から読む期間を作らないことである。
-
-## 7.8 per-agent Memory lock
-
-Agent ごとに read/write lock を持つ。
-
-Sleep の LLM 処理中ずっと Turn を停止しない。
-
-### Turn
+Turn側:
 
 ```text
 read lock取得
   ↓
-current generationから3ファイル読込
+3ファイルをMemoryBundleとしてload
   ↓
-Turn用Memory snapshot生成
+bundleをclone
   ↓
 read lock解放
 ```
 
-Turn は読み込んだ Memory snapshot を Turn 完了まで使用する。
-
-### Sleep publication
+Sleep publication側:
 
 ```text
 write lock取得
   ↓
-generation切替
+precondition検証
+  ↓
+3ファイルをpublish
+  ↓
+cache更新
   ↓
 write lock解放
 ```
 
-lock は process memory で管理し、DB table は追加しない。
+LLM生成中はwrite lockを保持しない。
 
-## 7.9 起動時 recovery
+## 6.6 MemoryLoader bundle load
 
-Channel と Scheduler の開始前に、`sleep_runs.status = publishing` を検索する。
+MemoryLoaderにbundle単位のAPIを追加する。
+
+```rust
+fn load_bundle(&self, agent_id: &str) -> Result<Arc<MemoryBundle>, MemoryError>
+```
+
+3ファイルを同じread lock内で読み込む。
+
+cacheもagent単位のMemoryBundleとして更新する。
+
+Turn prompt buildingはbundle APIを使用する。
+
+## 6.7 Publication precondition
+
+通常publicationでは、write lock取得後に現在の3ファイルを読み、各snapshotの`content_before`と一致することを確認する。
+
+一致後にpublicationを開始する。
+
+一致しない場合:
+
+- current filesを維持
+- Sleep Runをfailedへ遷移
+- conflict fileをerrorへ記録
+- publication conflict metricを増加
+
+## 6.8 Atomic file replacement
+
+各fileについて同じdirectoryにtemp fileを作成する。
 
 ```text
-memory_snapshotsを取得
-  ↓
-episodic / semantic / prospectiveの3行を確認
-  ↓
-同じrun_idのgenerationを再生成
-  ↓
-currentをそのgenerationへ切替
-  ↓
-sleep_runs.status = success
+episodic.md.<run_id>.tmp
+semantic.md.<run_id>.tmp
+prospective.md.<run_id>.tmp
 ```
 
-snapshot が不足している場合は、その run を成功扱いにしない。
-
-暗黙に不整合な Markdown を使用し続けない。
-
-## 7.10 手動編集
-
-Phase 3 では、公開済み Markdown の手動編集を DB へ逆同期する仕組みは導入しない。
-
-本 Phase の中心は Sleep publication のクラッシュ整合性であり、双方向同期ではない。
-
-## 7.11 完了条件
-
-- Step 成功前に公開中 Markdown を変更しない
-- 1 run_id で3ファイルを完全再構築できる
-- Turn が異なる generation の3ファイルを混在して読まない
-- Sleep LLM処理中はTurnを長時間blockしない
-- 1ファイル目更新後のクラッシュから復旧できる
-- 2ファイル目更新後のクラッシュから復旧できる
-- current切替後・DB success前のクラッシュから復旧できる
-- publishing run の自動 recovery が Channel 起動前に完了する
-- snapshot 不足を安全側へ倒す
-
----
-
-# 8. Package 4 — Bash OS Sandbox
-
-## 8.1 目的
-
-Built-in Bash Tool を EgoPulse 本体の host 権限から分離する。
-
-対象はまず Bash Tool に限定する。
-
-Tool Policy の全面的一般化や MCP process 全体の sandbox 化は後続 Plan で扱う。
-
-## 8.2 Policy
-
-権限を単一 enum にまとめず、直交する項目として扱う。
-
-```yaml
-tools:
-  bash:
-    process: sandboxed
-    filesystem: workspace_write
-    network: disabled
-    timeout_secs: 30
-    memory_mb: 512
-    cpu_seconds: 30
-    env:
-      allowed:
-        - SOME_SKILL_TOKEN
-```
-
-## 8.3 Default
-
-default は `sandboxed` とする。
-
-sandbox backend が利用できない場合、Bash Tool は fail-closed でエラーを返す。
-
-host 実行を許可するのは、明示的に `host_trusted` が設定された場合だけとする。
-
-## 8.4 Sandbox要件
-
-最低限、次を保証する。
-
-- workspace 外 filesystem を原則参照できない
-- filesystem policy に応じて read-only / read-write を切り替える
-- network は default disabled
-- parent process の環境変数を継承しない
-- allowlist された Skill env だけを注入する
-- process group 単位で timeout kill できる
-- child process が残留しない
-- CPU limit
-- memory limit
-- stdout / stderr の既存上限を維持する
-- Secret scope は Normal workspace を mount しない
-- temporary output も scope 外へ漏らさない
-
-## 8.5 Platform
-
-最初の backend は、現在 EgoPulse を実運用する主要 platform 向けに実装する。
-
-未対応 platform では `sandboxed` を host 実行へ fallback させない。
-
-## 8.6 Environment
-
-Bash process には `env_clear()` 相当を適用する。
-
-最低限必要な実行環境だけを明示的に構築する。
-
-- `PATH`
-- locale
-- sandbox 内 HOME
-- sandbox 内 TMPDIR
-- allowlist Skill env
-
-EgoPulse process が持つ provider token、Webhook token、DB path、Secret 設定値などを継承しない。
-
-## 8.7 Defense in Depth
-
-既存の次の防御は維持する。
-
-- command guard
-- path guard
-- timeout
-- process group kill
-- output truncation
-- secret redaction
-- Tool execution ledger
-
-ただし、これらを sandbox の代替とは扱わない。
-
-## 8.8 Host Trusted
-
-`host_trusted` は明示的な危険設定とする。
-
-- default ではない
-- configuration documentation で警告する
-- RuntimeStatus または startup log へ明示する
-- Secret Channel では原則拒否する
-- unrestricted parent env 継承は行わない
-
-## 8.9 完了条件
-
-- workspace 外 read を拒否する
-- workspace 外 write を拒否する
-- symlink escape を拒否する
-- network access を default で拒否する
-- parent env を継承しない
-- allowlist env のみ注入する
-- timeout 時に process tree を終了する
-- CPU / memory limit が機能する
-- backend 不在時に fail-closed になる
-- explicit `host_trusted` のみ host 実行する
-- Secret scope と Normal workspace を分離する
-
----
-
-# 9. Package 5 — Startup and Cutover
-
-## 9.1 起動順序
+publication:
 
 ```text
-Config読込
-  ↓
-DB open
-  ↓
-migration / backup
-  ↓
-Turn / Tool recovery
-  ↓
-Memory publication recovery
-  ↓
-Durable Ingress lease recovery
-  ↓
-Sandbox capability validation
-  ↓
-Runtime Supervisor開始
-  ↓
-Workers開始
-  ↓
-Schedulers開始
-  ↓
-Channels開始
-  ↓
-accepting_inputs = true
+1. 3つのtemp fileへcontent_afterを書込
+2. 各temp fileをflush / sync_all
+3. episodic tempをrename
+4. semantic tempをrename
+5. prospective tempをrename
+6. directoryをsync
+7. MemoryLoader cacheをcandidate bundleへ更新
+8. sleep_runsをsuccessへ遷移
 ```
 
-Memory や DB の recovery が完了する前に外部入力を受け付けない。
+rename中はagent write lockを保持する。
 
-## 9.2 Migration
+## 6.9 Startup recovery
 
-新規 DB migration は `ingress_jobs` のみとする。
+Runtime起動時、`status = running`のSleep Runを検査する。
 
-Normal / Secret schema version を更新する。
+3種類のsnapshotが揃い、Memory Stepがterminalであるrunをpublication recovery対象とする。
 
-Memory publication 用の新規 table は追加しない。
+各fileのcurrent contentを次で検証する。
 
----
+```text
+current == content_before
+または
+current == content_after
+```
 
-# 10. Observability
+3ファイルすべてが検証を通った場合:
 
-## 10.1 Metrics
+```text
+content_afterからtemp fileを再作成
+  ↓
+3ファイルをrename
+  ↓
+directory sync
+  ↓
+cache更新
+  ↓
+sleep_runsをsuccessへ遷移
+```
 
-少なくとも次を追加する。
+snapshotが揃っていないrunはfailedへ遷移する。
 
-- `ingress_jobs_queued`
-- `ingress_jobs_running`
-- `ingress_jobs_dead_letter`
-- `ingress_job_retries_total`
-- `ingress_job_handoff_total`
-- `runtime_owned_tasks`
-- `runtime_task_failures_total`
-- `runtime_shutdown_aborts_total`
-- `memory_publication_recoveries_total`
-- `memory_publication_failures_total`
-- `sandbox_executions_total`
-- `sandbox_failures_total`
-- `sandbox_host_trusted_executions_total`
+current contentがbefore / afterのどちらにも一致しない場合、startupをerrorで停止し、agent_id、run_id、fileを表示する。
 
-## 10.2 RuntimeStatus
+Memory recovery完了後にTurnDispatcherとChannelを開始する。
 
-次を確認可能にする。
+## 6.10 Shutdown
 
-- accepting inputs
-- shutdown started
-- critical task failure
-- Durable Ingress worker state
-- queued / dead-letter Job count
-- Memory recovery failure
-- sandbox availability
-- host_trusted有効化
+Memory publication taskはRuntimeSupervisorのmaintenance taskとして所有する。
 
-payload、secret、Tool env の実値は出さない。
+shutdown開始時:
 
----
+- 新しいSleep Runを開始しない
+- candidate生成中のtaskをdeadlineまでdrain
+- publication開始済みtaskを優先してdrain
+- deadline超過時はabortし、次回startup recoveryへ委ねる
 
-# 11. Test Plan
+## 6.11 Metrics
 
-## 11.1 Durable Ingress
+- publication started
+- publication success
+- publication conflict
+- publication recovery
+- snapshot incomplete
+- recovery validation error
+- Memory read lock wait
+- Memory write lock wait
 
-- DB commit失敗時に202を返さない
-- 202後、worker開始前に停止してもJobが残る
-- claim直後の停止でlease recoveryされる
-- Scheduler投入後、Turn accept前の停止で再処理される
-- Turn accept後はJobがhanded_offになる
-- Job再実行で重複Turnを作らない
-- 同一Idempotency-Keyが同一Jobに収束する
-- IDなしで同じpayloadを2回送ると別Jobになる
-- retry backoff
-- retry上限超過でdead_letter
-- queue capacity
-- handed_off retention
-- dead_letter retention
-- Secret JobがNormal DBへ保存されない
-- Status APIの認証と情報制限
+## 6.12 完了条件
 
-## 11.2 Runtime Supervisor
-
-- Channel受付停止後に新規Turnが開始されない
-- shutdown中に次のqueued Turnを開始しない
-- 実行中Turnがdeadline内でdrainされる
-- deadline超過Turnがabortされる
-- task panicがRuntimeStatusへ記録される
-- critical task終了で受付停止する
-- MCP reconnect loopが停止する
-- optional task失敗が無視されず観測される
-- shutdownが無期限にhangしない
-
-## 11.3 Memory Publication
-
-- Step中にMarkdownが変更されない
-- 3種類のsnapshotが1 run_idに揃う
-- 変更なしのfileもsnapshotされる
-- 1ファイル目生成後のクラッシュ復旧
-- 2ファイル目生成後のクラッシュ復旧
-- current切替後・DB success前のクラッシュ復旧
-- Turnが3ファイルの異なるgenerationを読まない
-- Sleep LLM処理中はTurnを不必要にblockしない
-- publishing runが起動時に再公開される
-- snapshot不足時に安全側へ停止する
-- 旧generationがrecovery失敗時も維持される
-
-## 11.4 Sandbox
-
-- workspace外read拒否
-- workspace外write拒否
-- absolute path escape拒否
-- `..` escape拒否
-- symlink escape拒否
-- network拒否
-- parent env非継承
-- allowlist envのみ注入
-- timeout時process tree終了
-- background child残留防止
-- memory limit
-- CPU limit
-- output truncation維持
-- backendなしでfail-closed
-- explicit host_trustedのみhost実行
-- Secret workspace分離
-
-## 11.5 Integration
-
-- Webhook受信からJob永続化、Turn durable accept、最終応答まで
-- Webhook受付後のプロセス再起動
-- shutdown中のWebhook拒否
-- Sleep publication中のshutdown
-- Memory recovery完了前にChannelが開始されない
-- sandboxed Bashを含むTurnの正常完了
-- sandboxed Bash中のshutdown
+- Sleep Stepが公開Markdownを直接変更しない
+- 1つのrun_idに3種類のsnapshotが存在する
+- 更新なしfileにもsnapshotが存在する
+- Turnが3ファイルをbundleとして読む
+- publication中にTurn readerが入らない
+- 手動編集conflictを検出する
+- 1ファイル目rename後のrestartで復旧する
+- 2ファイル目rename後のrestartで復旧する
+- 全rename後・run success前のrestartで復旧する
+- recovery完了前にChannelを開始しない
+- MemoryLoader cacheがpublication後のbundleと一致する
 
 ---
 
-# 12. Definition of Done
 
-1. `202 Accepted` を返した Webhook が Turn 開始前の停止で消失しない
-2. Webhook Job と Turn の二重実行を防止できる
-3. Secret Webhook Job が Normal DB に保存されない
-4. Runtime がすべての長寿命 task を所有する
-5. shutdown時に受付停止、drain、abortが順序立てて行われる
-6. shutdown開始後に新しいTurnが開始されない
-7. Sleep Memoryが3ファイルの混在状態で読まれない
-8. Memory公開途中のクラッシュから同じrun_idを再公開できる
-9. Bash Toolがdefaultでhost権限を使用しない
-10. sandboxが利用不能な環境で暗黙のhost fallbackをしない
-11. 新規テーブルは`ingress_jobs`の1つだけである
-12. Normal / Secret DB の migration と recovery が検証されている
-13. Runtime、Webhook、Sleep、Tool のdocumentationが実装と一致している
+# 7. Startup integration
+
+Runtime startupを次の順序へ統一する。
+
+```text
+1. Config load
+2. DB backup
+3. Normal DB migration
+4. Secret DB migration
+5. Tool Call recovery
+6. Turn recovery classification
+7. Origin tracker recovery
+8. Memory publication recovery
+9. AppState construction
+10. RuntimeSupervisor start
+11. TurnDispatcher start
+12. recovery TurnをDispatcherへwake
+13. Agent Send receiver start
+14. MCP reconnect loop start
+15. Sleep scheduler start
+16. Pulse scheduler start
+17. Backup scheduler start
+18. Channel / Web server start
+19. accepting_inputs = true
+```
+
+startup errorはRuntimeStatusとlogへ構造化して記録する。
 
 ---
 
-# 13. Phase 3 後に残す課題
+# 8. 実装順序
 
-以下はこのPRの完了を妨げない。
+## Package 1
 
-- Discord / Telegram / Web の Durable Queue 化
-- typed Ingress Envelope の全面導入
-- Channel入力経路の統一
-- `AppState` の追加分解
-- Tool Policy の他Toolへの展開
-- MCP process sandbox
-- Cargo build と Web build の分離
-- Built-in docs manifest
-- Memory手動編集の正式な同期仕様
+1. RuntimeSupervisor core
+2. long-lived task registration
+3. Turn task ownership
+4. critical task handling
+5. shutdown sequence
+6. metrics / tests
 
-これらは `plan-runtime-boundary-cleanup.md` で扱う。
+## Package 2
+
+1. Normal / Secret migration
+2. PersistedScheduledTurn型
+3. storage API
+4. TurnIntake
+5. request key / origin rule
+6. TurnDispatcher
+7. TurnScheduler item変更
+8. execute accepted Turn
+9. input_committed resume
+10. origin tracker recovery
+11. Webhook cutover
+12. Discord / Telegram / Agent Send cutover
+13. recovery / integration tests
+
+## Package 3
+
+1. MemoryBundle
+2. MemoryLoader bundle API
+3. agent Memory lock
+4. Sleep candidate generation
+5. full snapshot set
+6. publication protocol
+7. startup recovery
+8. crash-point tests
+
+
+## Integration
+
+1. startup order
+2. shutdown order
+3. RuntimeStatus
+4. metrics
+5. architecture documentation
+6. session lifecycle documentation
+7. DB documentation
+8. Memory documentation
+
+---
+
+# 9. End-to-end test scenarios
+
+## 9.1 Durable Turn
+
+1. Webhook受信
+2. accepted commit
+3. 202 response
+4. process停止
+5. Runtime再起動
+6. DispatcherがTurnを取得
+7. Turn完了
+8. target channelへresponse送信
+
+## 9.2 Accepted before execution
+
+1. session AでTurn実行中
+2. session Aへ2件目をaccept
+3. 2件目がDB accepted
+4. process停止
+5. Runtime再起動
+6. 2件目を1回だけ実行
+
+## 9.3 Input committed recovery
+
+1. user inputとsessionをcommit
+2. stateがinput_committed
+3. model_pending前にprocess停止
+4. Runtime再起動
+5. inputを再insertせずmodel loop開始
+6. Turn完了

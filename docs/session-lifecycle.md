@@ -70,7 +70,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 - 自己送信 (`from == to`) は禁止
 - Discord チャネルが設定されている場合のみ利用可能
 
-### 1.5 TurnScheduler による同時実行制御 (Phase 4)
+### 1.5 TurnScheduler による同時実行制御
 
 Multi-Agent Room の Discord チャネルでは、`TurnScheduler` がセッション単位のターン実行を管理する。
 
@@ -101,13 +101,13 @@ execute_scheduled_turn():
     └─ キューが空 → slot を削除
 ```
 
-**バックプレッシャー (Phase 1)**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
+**バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
 
-- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は「in-memory scheduler への受付成功（即時開始 or キュー投入）」のみを意味し、永続化は保証しない。
+- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop resume）のみで、モデル反復開始後は再実行対象外。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown` / 同一 `request_key` への異なる本文は `internal`）。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
 - Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
 
-**TurnTracker の有界化 (Phase 1)**: origin ごとの turn count / terminal reason を 1 つの state に統合し、24 時間の TTL で完了済み origin を破棄する。origin 追跡上限は 4096。TTL prunes 後も上限なら新規 origin を明示的に拒否する（既存 origin の更新は上限中も可能）。Phase 3 の Supervisor で正確な origin lifecycle を所有するまでは暫定的な有界化。
+**TurnTracker の有界化**: origin ごとの turn count / terminal reason を 1 つの state に統合し、24 時間の TTL で完了済み origin を破棄する。origin 追跡上限は 4096。TTL prunes 後も上限なら新規 origin を明示的に拒否する（既存 origin の更新は上限中も可能）。
 
 **SystemEvent**: 停止条件によりターンが拒否された場合、Channel Log に `MessageKind::SystemEvent` で JSON 形式の理由が記録される（`{"reason": "chain_depth_exceeded"}` 等）。
 
@@ -385,18 +385,25 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 ### 10.3 crash recovery
 
-起動時に `recover_interrupted_turns()` が未端末 Turn を次の規則で fail-stop させる。再開条件を証明できない Turn を推測で再開せず、すべて停止状態へ移す。
+起動時の recovery は2段階で構成される。まず `recover_interrupted_turns()` が未端末 Turn を分類し、続いて `TurnDispatcher` が実行可能な Turn を再実行する。再開条件を証明できない Turn を推測で再開せず、すべて停止状態へ移す。
+
+#### `recover_interrupted_turns()` の分類
 
 | 状態 | 処理 |
 |---|---|
-| `accepted` | `failed`（input 未 commit。再受付で安全に再開可能） |
-| `input_committed` | `failed`（model 未実行。再受付で安全に再開可能） |
+| `accepted` / `input_committed`（`scheduled_request_json` あり） | **そのまま残す**。要求が永続化されているため `TurnDispatcher` が再実行する（accepted は受付から、input_committed は model loop から resume） |
+| `accepted`（`scheduled_request_json` なし・旧式直接実行） | `failed`（input 未 commit。再受付で安全に再開可能） |
+| `input_committed`（`scheduled_request_json` なし・旧式直接実行） | `failed`（model 未実行。再受付で安全に再開可能） |
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed` | `uncertain`（外部出力や Tool 副作用が及んでいる可能性があり、再開の安全性を証明できない） |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
 起動時の fail-stop は `config_fingerprint` に関わらず適用する。fingerprint は Turn 受付時の Config 同一性記録として保持されるが、再開の可否判定には用いない。
 
 同時に `Database::recover_running_tools()` が `running` の Tool をすべて `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
+
+#### TurnDispatcher による再実行
+
+`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査し、`accepted` / `input_committed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed → model_pending`）が重複実行を安全に排除する。`input_committed` で resume 検証（input message や session snapshot の整合性）に失敗した Turn は `failed` へ移行する。
 
 ### 10.4 安全停止の原則
 
@@ -407,7 +414,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 - Tool 実行結果が不明（`running` のまま停止）
 - 同一 `request_key` へ異なる本文が再受付された
 
-これらは人手による確認を促す安全弁として機能する。`accepted` / `input_committed` は外部出力が一切発生していないため `failed` とし、再受付による安全な再実行を許す。それ以上の状態は出力または副作用が及んでいる可能性があるため `uncertain` とする。
+これらは人手による確認を促す安全弁として機能する。`accepted` / `input_committed` は外部出力が一切発生していないことが前提のため、要求が永続化されていれば再実行（§10.3）、そうでなければ `failed` として再受付による安全な再実行を許す。それ以上の状態は出力または副作用が及んでいる可能性があるため `uncertain` とする。
 
 ---
 

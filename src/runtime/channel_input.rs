@@ -6,10 +6,16 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
+use crate::agent_loop::session::resolve_chat_id;
+use crate::agent_loop::{
+    ConversationScope, ScheduledTurn, SurfaceContext, canonical_request_hash,
+    serialize_scheduled_turn,
+};
+use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
 use crate::runtime::turn_scheduler::{RejectReason, ScheduleResult, SubmitOutcome};
+use crate::storage::AcceptOutcome;
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
 /// Platform-specific key used to resolve a multi-agent Channel Log chat.
@@ -111,7 +117,7 @@ pub(crate) async fn store_human_channel_log_message(
 /// Returns [`SubmitOutcome`] so callers can distinguish an accepted turn
 /// (started or queued) from a queue-capacity rejection. Rejections are logged
 /// centrally here so no turn is silently dropped.
-pub(crate) fn submit_agent_turn(
+pub(crate) async fn submit_agent_turn(
     state: &AppState,
     context: SurfaceContext,
     input: String,
@@ -119,40 +125,147 @@ pub(crate) fn submit_agent_turn(
     submit_scheduled_turn(
         state,
         ScheduledTurn {
+            turn_id: uuid::Uuid::new_v4().to_string(),
             origin_id: context.origin_id.clone(),
             context,
             input,
         },
     )
+    .await
 }
 
-pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
-    // Refuse new input the moment shutdown begins so an accepted turn is never
-    // left unstarted after `202 Accepted`-equivalent intake paths return.
+/// Submits an agent turn and starts execution immediately when the session is idle.
+///
+/// The turn is durably accepted (its full request persisted to `turn_runs` as
+/// `accepted`) **before** it is handed to the in-memory scheduler, so a crash
+/// during shutdown can never lose an accepted turn: the turn dispatcher resumes
+/// it from the database on the next startup.
+///
+/// Acceptance contract: once the DB commit succeeds the turn *is* accepted and
+/// the caller observes success. Every rejection (shutdown, terminated chain,
+/// origin tracker capacity) is decided **before** the commit, so a rejected
+/// turn never leaves a runnable row that the dispatcher would later execute.
+/// In-memory scheduler capacity after the commit is a wait-time problem, not a
+/// rejection: the turn stays `accepted` and the dispatcher retries as capacity
+/// frees.
+pub(crate) async fn submit_scheduled_turn(
+    state: &AppState,
+    mut scheduled: ScheduledTurn,
+) -> SubmitOutcome {
+    // An empty request_key would collide on UNIQUE(chat_id, request_key) and
+    // make every keyless turn on the same chat look like a duplicate. Assign a
+    // stable key before the request is persisted so recovery reuses the same
+    // one.
+    if scheduled.context.request_key.is_empty() {
+        scheduled.context.request_key = uuid::Uuid::new_v4().to_string();
+    }
+    // Generate the origin id at the acceptance boundary so live execution and
+    // post-crash recovery share one identity (the DB row stores the same id).
+    if scheduled.origin_id.is_empty() {
+        scheduled.origin_id = uuid::Uuid::new_v4().to_string();
+        scheduled.context.origin_id = scheduled.origin_id.clone();
+    }
+    let origin_id = scheduled.origin_id.clone();
+
+    // Refuse new input the moment shutdown begins, before any commit.
     if !state.supervisor.accepting_inputs() {
         tracing::info!("turn rejected: runtime not accepting inputs (shutdown)");
         metrics::inc_turn_queue_rejections("shutdown");
         return SubmitOutcome::Rejected(RejectReason::Shutdown);
     }
 
-    // Reserve tracker capacity at acceptance so an origin at the tracker limit
-    // (or an already-terminated chain) is refused here, before any `202
-    // Accepted` is returned. Execution no longer performs this check.
-    let mut scheduled = scheduled;
-    if scheduled.origin_id.is_empty() {
-        scheduled.origin_id = uuid::Uuid::new_v4().to_string();
-    }
-    let origin_id = scheduled.origin_id.clone();
-
+    // Acceptance-time origin checks BEFORE the commit so a rejected turn leaves
+    // no runnable row: a terminated chain or a full origin tracker.
     if let Err(reason) = state.turn_tracker.reserve(&origin_id) {
-        tracing::warn!(
-            reason = %reason,
-            "turn rejected at acceptance: origin tracker"
-        );
+        tracing::warn!(reason = %reason, "turn rejected at acceptance: origin tracker");
         metrics::inc_turn_queue_rejections(reason.as_str());
         return SubmitOutcome::Rejected(reason);
     }
 
+    // Durably accept the turn. On failure release the reservation so tracker
+    // capacity is not leaked, and reject so the caller retries. Capacity
+    // rejections (per-session / global durable-pending limits) are surfaced as
+    // their own reason codes so callers can return the correct 429; they were
+    // decided inside the same transaction as the INSERT, so no runnable row is
+    // left behind.
+    let accepted = match durably_accept_turn(state, &scheduled).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.turn_tracker.release(&origin_id);
+            let reason = match &error {
+                crate::error::EgoPulseError::Storage(
+                    crate::error::StorageError::TurnSessionQueueFull,
+                ) => {
+                    tracing::info!(
+                        chat_id = ?scheduled.context,
+                        "turn rejected: per-session durable queue full"
+                    );
+                    metrics::inc_turn_queue_rejections("session_queue_full");
+                    RejectReason::SessionQueueFull
+                }
+                crate::error::EgoPulseError::Storage(
+                    crate::error::StorageError::TurnGlobalQueueFull,
+                ) => {
+                    tracing::info!("turn rejected: global durable queue full");
+                    metrics::inc_turn_queue_rejections("global_queue_full");
+                    RejectReason::GlobalQueueFull
+                }
+                _ => {
+                    tracing::warn!(error = %error, "durable accept failed; rejecting turn");
+                    metrics::inc_turn_queue_rejections(RejectReason::Internal.as_str());
+                    RejectReason::Internal
+                }
+            };
+            return SubmitOutcome::Rejected(reason);
+        }
+    };
+
+    let run = match accepted {
+        crate::storage::AcceptOutcome::Created(run) => run,
+        // Same request already accepted elsewhere: do not start a second
+        // execution. Release this reservation; the existing owner holds its own.
+        crate::storage::AcceptOutcome::Existing(_) => {
+            state.turn_tracker.release(&origin_id);
+            return SubmitOutcome::Queued;
+        }
+    };
+    // Stamp the authoritative ids from the DB row (#5: the DB is the source of
+    // truth, not the tentative ScheduledTurn id).
+    scheduled.turn_id = run.turn_id.clone();
+    if let Some(canonical_origin) = run.origin_id.as_deref() {
+        scheduled.origin_id = canonical_origin.to_string();
+        scheduled.context.origin_id = canonical_origin.to_string();
+    }
+
+    // Post-commit: the turn is durably accepted. In-memory scheduler capacity
+    // is a wait, not a rejection — defer to the dispatcher if it cannot run
+    // now. A reservation is held until execution converts it.
+    schedule_and_spawn(state, scheduled)
+}
+
+/// Re-enqueues an already-durably-accepted turn (used by the turn dispatcher
+/// to resume or retry turns). Performs no acceptance work and no origin
+/// reservation: live turns reserved at intake, and recovered origins are
+/// rehydrated. The scheduler deduplicates by `turn_id`, so repeat dispatch is
+/// an idempotent no-op; capacity overflow defers to the next scan.
+pub(super) fn enqueue_durable_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+    schedule_and_spawn(state, scheduled)
+}
+
+/// Hands the turn to the in-memory scheduler, spawning execution immediately
+/// when the session is idle. A scheduler rejection (capacity) is converted to
+/// `Queued` rather than surfaced: the turn is already durably accepted, so it
+/// must never be reported as rejected to the caller. The dispatcher retries as
+/// capacity frees.
+fn schedule_and_spawn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+    // Shutdown gate: never start a new turn task once shutdown has begun. The
+    // durable turn stays in `turn_runs` and is resumed on the next startup, so
+    // the supervisor only owns the in-flight turns it is draining (the
+    // dispatcher, an input producer, is still running at this point and would
+    // otherwise spawn into the fresh post-drain JoinSet).
+    if state.supervisor.is_shutting_down() {
+        return SubmitOutcome::Queued;
+    }
     match state.turn_scheduler.submit(scheduled) {
         ScheduleResult::Started(turn) => {
             let turn = *turn;
@@ -163,20 +276,55 @@ pub(super) fn submit_scheduled_turn(state: &AppState, scheduled: ScheduledTurn) 
             });
             SubmitOutcome::Started
         }
+        // Busy or at capacity: the turn waits in `turn_runs` for the dispatcher.
         ScheduleResult::Queued => SubmitOutcome::Queued,
         ScheduleResult::Rejected(reason) => {
-            // Scheduler refused after we reserved: roll the reservation back so
-            // the origin does not occupy tracker capacity for a turn that will
-            // never run.
-            state.turn_tracker.release(&origin_id);
-            tracing::warn!(
+            tracing::debug!(
                 reason = %reason,
-                "turn rejected: scheduler queue at capacity"
+                "turn deferred: in-memory scheduler at capacity; dispatcher retries"
             );
-            metrics::inc_turn_queue_rejections(reason.as_str());
-            SubmitOutcome::Rejected(reason)
+            SubmitOutcome::Queued
         }
     }
+}
+
+/// Persists the full request to `turn_runs` as `accepted` before scheduling.
+///
+/// Uses the same `(chat_id, request_key)` identity and canonical payload hash
+/// the executor will use, so the executor's later `accept_or_get_turn` call
+/// finds the same row (idempotent `Existing`) instead of creating a duplicate.
+/// The fully serialized [`ScheduledTurn`] is stored in `scheduled_request_json`
+/// so the turn dispatcher can rebuild and resume it after a crash.
+async fn durably_accept_turn(
+    state: &AppState,
+    scheduled: &ScheduledTurn,
+) -> Result<AcceptOutcome, EgoPulseError> {
+    let scope = scheduled.context.scope;
+    let chat_id = resolve_chat_id(&state.turn_runtime(), &scheduled.context).await?;
+    let request_hash = canonical_request_hash(&scheduled.context, &scheduled.input);
+    let scheduled_json = serialize_scheduled_turn(scheduled)?;
+    let snapshot = state.config_manager.current_blocking();
+    let request_key = scheduled.context.request_key.clone();
+    let origin_id = if scheduled.origin_id.is_empty() {
+        None
+    } else {
+        Some(scheduled.origin_id.clone())
+    };
+    let revision = snapshot.revision as i64;
+    let fingerprint = snapshot.fingerprint.clone();
+    call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+        db.accept_or_get_turn(
+            chat_id,
+            &request_key,
+            revision,
+            Some(&fingerprint),
+            &request_hash,
+            origin_id.as_deref(),
+            Some(&scheduled_json),
+        )
+    })
+    .await
+    .map_err(EgoPulseError::from)
 }
 
 #[cfg(test)]

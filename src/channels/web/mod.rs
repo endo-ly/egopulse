@@ -275,7 +275,7 @@ fn asset_or_index(uri: &Uri) -> Response {
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
 pub(crate) async fn run_server(
-    state: AppState,
+    state: Arc<AppState>,
     host: &str,
     port: u16,
     shutdown: tokio_util::sync::CancellationToken,
@@ -303,7 +303,7 @@ pub(crate) async fn run_server(
 
     let web_state = WebState {
         config_path: state.config_path.clone(),
-        app_state: Arc::new(state),
+        app_state: Arc::clone(&state),
         run_hub: RunHub::default(),
         active_ws_connections: Arc::new(AtomicUsize::new(0)),
     };
@@ -1214,7 +1214,9 @@ mod tests {
 
     /// LLM provider that blocks forever on each call, keeping the started turn
     /// busy so the per-session queue can be filled deterministically.
-    struct BlockingProvider;
+    struct BlockingProvider {
+        entered: Arc<AtomicUsize>,
+    }
 
     #[async_trait::async_trait]
     impl crate::llm::LlmProvider for BlockingProvider {
@@ -1224,6 +1226,10 @@ mod tests {
             _messages: Arc<Vec<crate::llm::Message>>,
             _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
         ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+            // Signal that a turn has reached the provider (i.e. it is actively
+            // executing and holding the session slot, not queued).
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::pending::<()>().await;
             unreachable!()
         }
@@ -1248,7 +1254,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_route_returns_429_when_session_queue_full() {
+    async fn webhook_route_rejects_past_durable_pending_capacity() {
+        // Acceptance contract: durable-pending capacity (turn_runs in
+        // accepted/input_committed) is enforced atomically with the accept
+        // INSERT, in the same transaction. A request that would exceed the
+        // per-session durable limit is rejected with 429 and leaves NO runnable
+        // row behind. In-memory scheduler pressure after a successful commit is
+        // a separate concern (a 202-deferred wait for the dispatcher); this test
+        // exercises the durable cap, not post-commit deferral.
+        let provider_entered = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(dir.path().to_str().expect("state root"));
         config
@@ -1276,7 +1290,9 @@ mod tests {
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let app_state = Arc::new(build_state_with_config(
             config,
-            Some(Arc::new(BlockingProvider)),
+            Some(Arc::new(BlockingProvider {
+                entered: Arc::clone(&provider_entered),
+            })),
             None,
             None,
             Some(Arc::new(registry)),
@@ -1288,35 +1304,53 @@ mod tests {
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         });
 
-        let post = || {
+        // Each post carries a distinct `event_id` so it is a distinct message
+        // (not a duplicate delivery).
+        let post = |event_id: u64| {
             app.clone().oneshot(
                 Request::post("/api/webhooks/egograph")
                     .header(header::AUTHORIZATION, "Bearer egograph-secret")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(format!("{{\"event_id\":{event_id}}}")))
                     .expect("request"),
             )
         };
 
-        // First request starts the turn; the blocking provider keeps it busy.
-        let started = post().await.expect("response");
+        // First request starts the turn; the blocking provider keeps it busy so
+        // it stays the active (non-pending) turn holding the session slot.
+        let started = post(0).await.expect("response");
         assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while provider_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("blocking provider was not entered within 5 seconds");
+            }
+            tokio::task::yield_now().await;
+        }
 
-        // Fill the per-session queue up to the limit; each is accepted (202).
-        for _ in 0..crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {
-            let resp = post().await.expect("response");
+        // Fill the per-session durable-pending queue up to the limit; each is
+        // accepted (202).
+        for i in 1..=crate::storage::MAX_DURABLE_PENDING_PER_SESSION {
+            let resp = post(i as u64).await.expect("response");
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
         }
 
-        // The next request exceeds the per-session queue limit → 429, not 202.
-        let rejected = post().await.expect("response");
-        assert_ne!(rejected.status(), StatusCode::ACCEPTED);
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-        let bytes = to_bytes(rejected.into_body(), 1024)
-            .await
-            .expect("response body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-        assert_eq!(body["error"], "session_queue_full");
+        // The next distinct request exceeds the per-session durable-pending
+        // limit and is rejected with 429 (no runnable row left behind).
+        let pending_before = app_state
+            .db
+            .count_durable_pending()
+            .expect("count durable pending before rejected request");
+        let beyond = post(9999).await.expect("response");
+        assert_eq!(beyond.status(), StatusCode::TOO_MANY_REQUESTS);
+        let pending_after = app_state
+            .db
+            .count_durable_pending()
+            .expect("count durable pending after rejected request");
+        assert_eq!(
+            pending_before, pending_after,
+            "rejected capacity request must not insert a durable-pending row"
+        );
     }
 
     #[tokio::test]

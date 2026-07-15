@@ -2,17 +2,18 @@
 //!
 //! Allows one agent to send a message to another agent in the same channel.
 //! The message is displayed as `[From → To] message` and the target agent's
-//! next turn is queued for background execution.
+//! next turn is durably accepted for background execution.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent_loop::{ConversationScope, PendingAgentTurn, SurfaceContext};
+use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::config::{AgentConfig, AgentId};
 use crate::llm::ToolDefinition;
 use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
+use crate::runtime::{AppState, channel_input, turn_scheduler::SubmitOutcome};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::send_message::lookup_chat_info;
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
@@ -34,7 +35,26 @@ pub(crate) struct AgentSendTool {
     db: Arc<crate::storage::Database>,
     secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
+    /// Shared durable-turn intake. When present (production runtime), the target
+    /// agent turn is durably accepted (`turn_runs` committed) **before**
+    /// `delivered: true` is returned, closing the crash window where an
+    /// in-memory hand-off could lose the turn. Tests run without an `AppState`
+    /// and report `delivered: false` (the turn is not durably accepted).
+    ///
+    /// Stored as a `Weak<AppState>` in a `OnceLock` so the runtime can backfill
+    /// it *after* the tool has been registered into the registry the `AppState`
+    /// owns, without requiring unique ownership of that `AppState` and without
+    /// forming an `AppState -> ToolRegistry -> AgentSendTool -> AppState`
+    /// strong-reference cycle that would leak the runtime for the process'
+    /// lifetime. The upgrade is best-effort: if the runtime has already been
+    /// dropped, the target turn cannot be durably accepted and `delivered` is
+    /// `false`.
+    app_state: std::sync::OnceLock<Weak<AppState>>,
 }
+
+/// Stable name of the `agent_send` tool, used by the registry to locate it
+/// when backfilling the runtime `AppState` after registration.
+pub(crate) const AGENT_SEND_NAME: &str = "agent_send";
 
 impl AgentSendTool {
     pub(crate) fn new(
@@ -48,6 +68,7 @@ impl AgentSendTool {
             db,
             secret_db,
             channels,
+            app_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -92,6 +113,10 @@ fn short_hash(text: &str) -> String {
 impl Tool for AgentSendTool {
     fn name(&self) -> &str {
         "agent_send"
+    }
+
+    fn init_app_state(&self, state: std::sync::Arc<crate::runtime::AppState>) {
+        let _ = self.app_state.set(std::sync::Arc::downgrade(&state));
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -164,6 +189,83 @@ impl Tool for AgentSendTool {
         let to_label = agent_label(&self.agents, &target_id).to_string();
         let display_text = format!("[{from_label} → {to_label}] {}", params.message);
 
+        // Durable intake context.
+        let target_context = SurfaceContext {
+            channel: context.channel.clone(),
+            surface_user: "agent_send".to_string(),
+            surface_thread: context.surface_thread.clone(),
+            chat_type: context.chat_type.clone(),
+            agent_id: target_id.clone(),
+            channel_log_chat_id: context.channel_log_chat_id,
+            chain_depth: target_chain_depth,
+            origin_id: context.origin_id.clone(),
+            trace_id: String::new(),
+            scope: context.scope,
+
+            // Stable across crash retries: the same parent Turn sending the
+            // same message to the same target via the same Tool call maps to
+            // one target Turn. The Tool Call ID disambiguates two separate
+            // `agent_send` calls within a single parent Turn that target the
+            // same agent with the same message.
+            request_key: format!(
+                "agent_send:{}:{}:{}:{}",
+                context.turn_id,
+                context.tool_call_id,
+                target_id,
+                short_hash(&params.message),
+            ),
+        };
+
+        let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
+
+        // Durable acceptance through the shared intake. The target turn is
+        // committed to `turn_runs` (`accepted`) *before* `delivered: true` is
+        // reported, so a crash between this point and any downstream processing
+        // can never lose the turn: the TurnDispatcher resumes it from the
+        // database on the next startup. This is the same reservation + durable
+        // commit + spawn used by every channel, eliminating the previous
+        // in-memory queue window where `delivered: true` could be returned for a
+        // turn that had not yet been persisted.
+        //
+        // Side effects (channel log + on-channel display) run ONLY after this
+        // succeeds, so a rejected or undeliverable turn never leaves a message
+        // that was not actually accepted.
+        let scheduled = ScheduledTurn {
+            turn_id: String::new(),
+            origin_id: context.origin_id.clone(),
+            context: target_context,
+            input: target_input,
+        };
+
+        let delivered = match self.app_state.get().and_then(|w| w.upgrade()) {
+            Some(app_state) => {
+                match channel_input::submit_scheduled_turn(&app_state, scheduled).await {
+                    SubmitOutcome::Rejected(reason) => {
+                        tracing::warn!(reason = %reason, "agent_send: target turn rejected");
+                        false
+                    }
+                    SubmitOutcome::Started | SubmitOutcome::Queued => true,
+                }
+            }
+            None => {
+                tracing::error!("agent_send: no AppState bound; cannot durably accept target turn");
+                false
+            }
+        };
+
+        if !delivered {
+            return sanitize_tool_result(
+                ToolResult::success(
+                    serde_json::to_string(&json!({
+                        "delivered": false,
+                        "to": target_id
+                    }))
+                    .expect("json"),
+                ),
+                &[],
+            );
+        }
+
         // 1. Save to Channel Log
         let message_id = uuid::Uuid::new_v4().to_string();
         let chat_id = context.chat_id;
@@ -197,52 +299,10 @@ impl Tool for AgentSendTool {
             }
         }
 
-        // 3. Queue target agent turn
-        let target_context = SurfaceContext {
-            channel: context.channel.clone(),
-            surface_user: "agent_send".to_string(),
-            surface_thread: context.surface_thread.clone(),
-            chat_type: context.chat_type.clone(),
-            agent_id: target_id.clone(),
-            channel_log_chat_id: context.channel_log_chat_id,
-            chain_depth: target_chain_depth,
-            origin_id: context.origin_id.clone(),
-            trace_id: String::new(),
-            scope: context.scope,
-
-            // Stable across crash retries: the same parent Turn sending the
-            // same message to the same target via the same Tool call maps to
-            // one target Turn. The Tool Call ID disambiguates two separate
-            // `agent_send` calls within a single parent Turn that target the
-            // same agent with the same message.
-            request_key: format!(
-                "agent_send:{}:{}:{}:{}",
-                context.turn_id,
-                context.tool_call_id,
-                target_id,
-                short_hash(&params.message),
-            ),
-        };
-
-        let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
-
-        let turn = PendingAgentTurn {
-            context: target_context,
-            input: target_input,
-            origin_id: context.origin_id.clone(),
-        };
-
-        if let Err(error) = context.turn_sender.send(turn).await {
-            tracing::warn!(error = %error, "agent_send: failed to queue target turn");
-            return ToolResult::error(format!(
-                "failed to queue turn for agent '{target_id}': {error}"
-            ));
-        }
-
         sanitize_tool_result(
             ToolResult::success(
                 serde_json::to_string(&json!({
-                    "delivered": true,
+                    "delivered": delivered,
                     "to": target_id
                 }))
                 .expect("json"),
@@ -255,9 +315,12 @@ impl Tool for AgentSendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::deserialize_scheduled_turn;
+    use crate::channels::adapter::ChannelRegistry;
     use crate::config::{AgentConfig, AgentId};
-    use crate::storage::{MessageKind, SenderKind};
+    use crate::runtime::{AppState, build_sleep_app_state_with_path};
     use crate::test_util::test_config;
+    use crate::tools::Tool;
     use crate::tools::ToolExecutionContext;
     use serde_json::json;
     use std::collections::HashMap;
@@ -286,14 +349,48 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
-        let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
+        let channels = Arc::new(ChannelRegistry::new());
         AgentSendTool::new(agents, db, None, channels)
     }
 
-    fn test_context_with_agent(
-        agent_id: &str,
-        turn_sender: tokio::sync::mpsc::Sender<PendingAgentTurn>,
-    ) -> ToolExecutionContext {
+    /// Builds a real `AppState` and an `AgentSendTool` bound to it via
+    /// `init_app_state`, so the tool durably accepts its target turns through
+    /// the shared intake (the same path production uses). The returned `TempDir`
+    /// must outlive `state`.
+    fn durable_tool() -> (AgentSendTool, Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.agents = test_agents();
+        let state =
+            build_sleep_app_state_with_path(config.clone(), None).expect("build sleep state");
+        // Mirrors `start_channels`, which flips intake on before serving input.
+        state.supervisor.start_accepting();
+        let state_arc = Arc::new(state);
+        let tool = AgentSendTool::new(
+            config.agents.clone(),
+            Arc::clone(&state_arc.db),
+            None,
+            Arc::new(ChannelRegistry::new()),
+        );
+        tool.init_app_state(Arc::clone(&state_arc));
+        (tool, state_arc, dir)
+    }
+
+    /// Returns the durably accepted target turns from `turn_runs` for `state`.
+    fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
+        state
+            .db
+            .scan_durable_pending_turns_after("", "", 100)
+            .expect("scan durable turns")
+            .into_iter()
+            .map(|p| {
+                deserialize_scheduled_turn(&p.scheduled_request_json)
+                    .expect("deserialize scheduled turn")
+            })
+            .collect()
+    }
+
+    fn test_context_with_agent(agent_id: &str) -> ToolExecutionContext {
         ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -304,8 +401,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_id: String::new(),
-            turn_sender,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         }
@@ -340,8 +436,7 @@ mod tests {
     #[tokio::test]
     async fn agent_send_rejects_unknown_agent() {
         let tool = tool_with_agents(test_agents());
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "unknown", "message": "hello"}), &ctx)
             .await;
@@ -352,8 +447,7 @@ mod tests {
     #[tokio::test]
     async fn agent_send_rejects_self_send() {
         let tool = tool_with_agents(test_agents());
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "lyre", "message": "hello myself"}), &ctx)
             .await;
@@ -363,23 +457,24 @@ mod tests {
 
     #[tokio::test]
     async fn agent_send_returns_delivered_true() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "vega", "message": "hello"}), &ctx)
             .await;
         assert!(!result.is_error, "unexpected error: {}", result.content);
         let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
         assert_eq!(parsed["delivered"], true);
-        assert_eq!(parsed["to"], "vega");
+        // The turn is durably accepted, not merely queued in memory.
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1, "exactly one target turn should be accepted");
+        assert_eq!(turns[0].context.agent_id, "vega");
     }
 
     #[tokio::test]
     async fn agent_send_returns_delivered_false_when_chain_depth_exceeded() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let mut ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let mut ctx = test_context_with_agent("lyre");
         // MAX_AGENT_CHAIN_DEPTH is 4, so chain_depth=4 means target would be 5 and rejected.
         ctx.chain_depth = 4;
         let result = tool
@@ -391,20 +486,18 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
         assert_eq!(parsed["delivered"], false);
-        assert_eq!(parsed["to"], "vega");
         assert_eq!(parsed["reason"], "ChainDepthExceeded");
-        // No turn should be queued
+        // No turn should be durably accepted.
         assert!(
-            rx.try_recv().is_err(),
-            "no turn should be queued when chain depth exceeded"
+            accepted_turns(&state).is_empty(),
+            "no turn should be accepted when chain depth exceeded"
         );
     }
 
     #[tokio::test]
     async fn agent_send_succeeds_at_max_chain_depth_boundary() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let mut ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let mut ctx = test_context_with_agent("lyre");
         // chain_depth=3 means target would be 4, which is allowed by the scheduler stop evaluator.
         ctx.chain_depth = 3;
         let result = tool
@@ -413,23 +506,22 @@ mod tests {
         assert!(!result.is_error, "unexpected error: {}", result.content);
         let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
         assert_eq!(parsed["delivered"], true);
-        // Turn should be queued with chain_depth = 4
-        let turn = rx.try_recv().expect("turn should be queued at boundary");
-        assert_eq!(turn.context.chain_depth, 4);
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context.chain_depth, 4);
     }
 
     #[tokio::test]
     async fn agent_send_sends_turn_to_target() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "vega", "message": "check this"}), &ctx)
             .await;
         assert!(!result.is_error, "unexpected error: {}", result.content);
-
-        let turn = rx.try_recv().expect("should have queued a turn");
-        assert_eq!(turn.context.agent_id, "vega");
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context.agent_id, "vega");
     }
 
     #[tokio::test]
@@ -439,106 +531,99 @@ mod tests {
         // must map to two distinct child Turns. The Tool Call ID is part of the
         // request key so the Channel Log shows both while the target Turn is
         // deduplicated per call.
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-
-        let mut ctx_a = test_context_with_agent("lyre", tx.clone());
+        let (tool, state, _dir) = durable_tool();
+        let mut ctx_a = test_context_with_agent("lyre");
         ctx_a.turn_id = "parent-turn".to_string();
         ctx_a.tool_call_id = "call-1".to_string();
         let _ = tool
             .execute(json!({"to": "vega", "message": "same message"}), &ctx_a)
             .await;
 
-        let mut ctx_b = test_context_with_agent("lyre", tx);
+        let mut ctx_b = test_context_with_agent("lyre");
         ctx_b.turn_id = "parent-turn".to_string();
         ctx_b.tool_call_id = "call-2".to_string();
         let _ = tool
             .execute(json!({"to": "vega", "message": "same message"}), &ctx_b)
             .await;
 
-        let turn_a = rx.try_recv().expect("turn a");
-        let turn_b = rx.try_recv().expect("turn b");
-
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 2, "two distinct tool calls -> two child turns");
         assert_ne!(
-            turn_a.context.request_key, turn_b.context.request_key,
+            turns[0].context.request_key, turns[1].context.request_key,
             "distinct tool call IDs must yield distinct request keys"
         );
-        assert!(turn_a.context.request_key.contains("call-1"));
-        assert!(turn_b.context.request_key.contains("call-2"));
+        assert!(turns[0].context.request_key.contains("call-1"));
+        assert!(turns[1].context.request_key.contains("call-2"));
     }
 
     #[tokio::test]
     async fn agent_send_target_input_format() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let _ = tool
             .execute(json!({"to": "vega", "message": "check this"}), &ctx)
             .await;
-
-        let turn = rx.try_recv().expect("turn");
-        assert!(turn.input.starts_with("[System:"));
-        assert!(turn.input.contains("[Lyre → Vega]"));
-        assert!(turn.input.contains("check this"));
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].input.starts_with("[System:"));
+        assert!(turns[0].input.contains("[Lyre → Vega]"));
+        assert!(turns[0].input.contains("check this"));
     }
 
     #[tokio::test]
     async fn agent_send_target_input_includes_system_instruction() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let _ = tool
             .execute(json!({"to": "vega", "message": "hello"}), &ctx)
             .await;
-
-        let turn = rx.try_recv().expect("turn");
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
         let expected_prefix = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n");
         assert!(
-            turn.input.starts_with(&expected_prefix),
+            turns[0].input.starts_with(&expected_prefix),
             "target input should start with system instruction followed by blank line"
         );
         assert!(
-            turn.input[expected_prefix.len()..].starts_with("[Lyre → Vega]"),
+            turns[0].input[expected_prefix.len()..].starts_with("[Lyre → Vega]"),
             "display text should follow system instruction"
         );
     }
 
     #[tokio::test]
     async fn agent_send_target_context_uses_source_channel() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let _ = tool
             .execute(json!({"to": "vega", "message": "hello"}), &ctx)
             .await;
-
-        let turn = rx.try_recv().expect("turn");
-        assert_eq!(turn.context.channel, "discord");
-        assert_eq!(turn.context.channel_log_chat_id, Some(99));
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context.channel, "discord");
+        assert_eq!(turns[0].context.channel_log_chat_id, Some(99));
     }
 
     #[tokio::test]
     async fn agent_send_target_context_replaces_source_agent_scope() {
-        let tool = tool_with_agents(test_agents());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = test_context_with_agent("lyre", tx);
+        let (tool, state, _dir) = durable_tool();
+        let ctx = test_context_with_agent("lyre");
         let _ = tool
             .execute(json!({"to": "vega", "message": "hello"}), &ctx)
             .await;
-
-        let turn = rx.try_recv().expect("turn");
-        assert_eq!(turn.context.surface_thread, "123");
-        assert_eq!(turn.context.session_key(), "discord:123:agent:vega");
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context.surface_thread, "123");
+        assert_eq!(turns[0].context.session_key(), "discord:123:agent:vega");
     }
 
     #[tokio::test]
-    async fn agent_send_saves_to_channel_log() {
+    async fn agent_send_no_channel_log_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
-        let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
+        let channels = Arc::new(ChannelRegistry::new());
 
-        // Create the channel_log_chat so messages can be stored
+        // Create the channel_log chat so messages could be stored
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
             db.resolve_or_create_chat_id(
                 "discord",
@@ -552,8 +637,9 @@ mod tests {
         .expect("create log chat");
 
         let agents = test_agents();
+        // No AppState bound: the turn is not durably accepted, so the
+        // channel-log side effect must NOT run.
         let tool = AgentSendTool::new(agents, Arc::clone(&db), None, channels);
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -564,15 +650,19 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
-        let _ = tool
+        let result = tool
             .execute(json!({"to": "vega", "message": "test msg"}), &ctx)
             .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(
+            parsed["delivered"], false,
+            "missing AppState: not delivered"
+        );
 
         let messages = call_blocking(Arc::clone(&db), move |db| {
             db.get_channel_log_messages(log_chat_id, 10)
@@ -580,16 +670,18 @@ mod tests {
         .await
         .expect("get messages");
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_kind, MessageKind::AgentSend);
+        assert!(
+            messages.is_empty(),
+            "no channel-log side effect without durable acceptance"
+        );
     }
 
     #[tokio::test]
-    async fn agent_send_sets_sender_recipient_ids() {
+    async fn agent_send_no_side_effects_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
-        let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
+        let channels = Arc::new(ChannelRegistry::new());
 
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
             db.resolve_or_create_chat_id(
@@ -604,7 +696,6 @@ mod tests {
         .expect("create log chat");
 
         let tool = AgentSendTool::new(test_agents(), Arc::clone(&db), None, channels);
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -615,8 +706,7 @@ mod tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
@@ -631,18 +721,23 @@ mod tests {
         .await
         .expect("messages");
 
-        assert_eq!(messages[0].sender_id, "lyre");
-        assert_eq!(messages[0].sender_kind, SenderKind::Tool);
-        assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
+        assert!(
+            messages.is_empty(),
+            "no sender/recipient side effect without durable acceptance"
+        );
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::agent_loop::deserialize_scheduled_turn;
+    use crate::channels::adapter::ChannelRegistry;
     use crate::config::{AgentConfig, AgentId};
+    use crate::runtime::{AppState, build_sleep_app_state_with_path};
     use crate::storage::{MessageKind, SenderKind, call_blocking};
     use crate::test_util::test_config;
+    use crate::tools::Tool;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -679,42 +774,74 @@ mod integration_tests {
         config: &crate::config::Config,
     ) -> (AgentSendTool, Arc<crate::storage::Database>) {
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
-        let channels = Arc::new(crate::channels::adapter::ChannelRegistry::new());
+        let channels = Arc::new(ChannelRegistry::new());
         let tool = AgentSendTool::new(config.agents.clone(), Arc::clone(&db), None, channels);
         (tool, db)
+    }
+
+    /// Builds a real `AppState` + tool bound to it for the multi-agent config,
+    /// so the target turn is durably accepted.
+    fn durable_multi_tool(dir: &tempfile::TempDir) -> (AgentSendTool, Arc<AppState>) {
+        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        let state =
+            build_sleep_app_state_with_path(config.clone(), None).expect("build sleep state");
+        state.supervisor.start_accepting();
+        let state_arc = Arc::new(state);
+        let tool = AgentSendTool::new(
+            config.agents.clone(),
+            Arc::clone(&state_arc.db),
+            None,
+            Arc::new(ChannelRegistry::new()),
+        );
+        tool.init_app_state(Arc::clone(&state_arc));
+        (tool, state_arc)
+    }
+
+    fn test_context_with_agent(agent_id: &str) -> ToolExecutionContext {
+        ToolExecutionContext {
+            chat_id: 1,
+            channel: "discord".to_string(),
+            surface_thread: "123".to_string(),
+            chat_type: "discord".to_string(),
+            agent_id: agent_id.to_string(),
+            channel_log_chat_id: None,
+            chain_depth: 0,
+            origin_id: String::new(),
+            turn_id: String::new(),
+            skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tool_call_id: String::new(),
+            scope: ConversationScope::Normal,
+        }
+    }
+
+    async fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
+        state
+            .db
+            .scan_durable_pending_turns_after("", "", 100)
+            .expect("scan durable turns")
+            .into_iter()
+            .map(|p| {
+                deserialize_scheduled_turn(&p.scheduled_request_json)
+                    .expect("deserialize scheduled turn")
+            })
+            .collect()
     }
 
     #[tokio::test]
     async fn agent_send_in_single_agent_channel() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
-        let (tool, _db) = multi_agent_tool(&config);
+        let (tool, state) = durable_multi_tool(&dir);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = ToolExecutionContext {
-            chat_id: 1,
-            channel: "discord".to_string(),
-            surface_thread: "123".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "lyre".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-            turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_call_id: String::new(),
-            scope: ConversationScope::Normal,
-        };
-
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "vega", "message": "hey vega"}), &ctx)
             .await;
         assert!(!result.is_error, "{}", result.content);
 
-        let turn = rx.try_recv().expect("turn queued");
-        assert_eq!(turn.context.agent_id, "vega");
-        assert_eq!(turn.context.channel, "discord");
+        let turns = accepted_turns(&state).await;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context.agent_id, "vega");
+        assert_eq!(turns[0].context.channel, "discord");
     }
 
     #[tokio::test]
@@ -723,23 +850,7 @@ mod integration_tests {
         let config = multi_agent_config(dir.path().to_str().expect("utf8"));
         let (tool, _db) = multi_agent_tool(&config);
 
-        let (tx, _) = tokio::sync::mpsc::channel(16);
-        let ctx = ToolExecutionContext {
-            chat_id: 1,
-            channel: "discord".to_string(),
-            surface_thread: "123".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "lyre".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-            turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_call_id: String::new(),
-            scope: ConversationScope::Normal,
-        };
-
+        let ctx = test_context_with_agent("lyre");
         let result = tool
             .execute(json!({"to": "unknown", "message": "hello?"}), &ctx)
             .await;
@@ -750,10 +861,11 @@ mod integration_tests {
     #[tokio::test]
     async fn agent_send_channel_log_saved() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
-        let (tool, db) = multi_agent_tool(&config);
+        // Bind a real runtime so the target turn is durably accepted and the
+        // channel-log side effect is allowed to run (only after delivery).
+        let (tool, state) = durable_multi_tool(&dir);
 
-        let log_chat_id = call_blocking(Arc::clone(&db), |db| {
+        let log_chat_id = call_blocking(Arc::clone(&state.db), |db| {
             db.resolve_or_create_chat_id(
                 "discord",
                 "discord:123:multi-room-log",
@@ -765,7 +877,6 @@ mod integration_tests {
         .await
         .expect("log chat");
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -776,17 +887,17 @@ mod integration_tests {
             chain_depth: 0,
             origin_id: String::new(),
             turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
         };
 
-        let _ = tool
+        let result = tool
             .execute(json!({"to": "vega", "message": "check this design"}), &ctx)
             .await;
+        assert!(!result.is_error, "{}", result.content);
 
-        let messages = call_blocking(Arc::clone(&db), move |db| {
+        let messages = call_blocking(Arc::clone(&state.db), move |db| {
             db.get_channel_log_messages(log_chat_id, 10)
         })
         .await
@@ -804,37 +915,21 @@ mod integration_tests {
     #[tokio::test]
     async fn agent_send_target_session_independent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
-        let (tool, _db) = multi_agent_tool(&config);
+        let (tool, state) = durable_multi_tool(&dir);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ctx = ToolExecutionContext {
-            chat_id: 1,
-            channel: "discord".to_string(),
-            surface_thread: "123".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "lyre".to_string(),
-            channel_log_chat_id: None,
-            chain_depth: 0,
-            origin_id: String::new(),
-            turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_call_id: String::new(),
-            scope: ConversationScope::Normal,
-        };
-
+        let ctx = test_context_with_agent("lyre");
         let _ = tool
             .execute(json!({"to": "vega", "message": "hello"}), &ctx)
             .await;
 
-        let turn = rx.try_recv().expect("turn");
+        let turns = accepted_turns(&state).await;
+        assert_eq!(turns.len(), 1);
         assert_ne!(
-            turn.context.agent_id, ctx.agent_id,
+            turns[0].context.agent_id, ctx.agent_id,
             "target session should be independent from sender"
         );
-        assert_eq!(turn.context.surface_thread, "123");
-        assert_eq!(turn.context.session_key(), "discord:123:agent:vega");
+        assert_eq!(turns[0].context.surface_thread, "123");
+        assert_eq!(turns[0].context.session_key(), "discord:123:agent:vega");
     }
 
     #[tokio::test]
@@ -855,23 +950,8 @@ mod integration_tests {
         .await
         .expect("log chat");
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let ctx = ToolExecutionContext {
-            chat_id: 1,
-            channel: "discord".to_string(),
-            surface_thread: "123".to_string(),
-            chat_type: "discord".to_string(),
-            agent_id: "lyre".to_string(),
-            channel_log_chat_id: Some(log_chat_id),
-            chain_depth: 4, // exceeds limit
-            origin_id: String::new(),
-            turn_id: String::new(),
-            turn_sender: tx,
-            skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            tool_call_id: String::new(),
-            scope: ConversationScope::Normal,
-        };
-
+        let mut ctx = test_context_with_agent("lyre");
+        ctx.chain_depth = 4; // exceeds limit
         let result = tool
             .execute(json!({"to": "vega", "message": "should not persist"}), &ctx)
             .await;

@@ -613,7 +613,9 @@ Content-Type: application/json
 
 `receiver_id` は設定済み receiver 名。未設定の場合は `404 webhook_receiver_not_found`。
 
-成功時は turn 完了を待たず `202 Accepted` を返す。`202` は「in-memory scheduler への受付成功（即時開始 or キュー投入）」のみを意味し、Webhook job の永続化は行わない。したがって受付後のプロセス再起動でキューは失われる。スケジューラの in-memory queue が満杯の場合は `429` を返す（後述）。
+成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返る。commit 後に in-memory scheduler の同時実行上限に達しても拒否とは扱わず、dispatcher への deferred（容量が空き次第の再投入）として同じ `202` を返す。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop から resume）の2状態のみで、モデル反復開始後（`model_pending` 以降）は再実行対象外となる。
+
+受付拒否時は理由コード違いで一律 `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、受付処理の内部エラーや同一 `request_key` へ異なる本文の再受付は `internal`）。
 
 ```json
 {
@@ -666,11 +668,12 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
 | `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
-| `session_queue_full` | 429 | 対象セッションのキューが上限（32）に達し、受付を拒否した |
-| `global_queue_full` | 429 | Runtime 全体のキューが上限（512）に達し、受付を拒否した |
+| `session_queue_full` | 429 | 対象セッションの durable pending（`accepted`/`input_committed`）が上限（32）に達し、INSERT と同一トランザクションで受付を拒否した |
+| `global_queue_full` | 429 | Runtime 全体の durable pending が上限（512）に達し、INSERT と同一トランザクションで受付を拒否した |
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 | `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
+| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
 
 ---
 

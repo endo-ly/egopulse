@@ -2,7 +2,7 @@
 //! event_extraction, episodic_update, semantic_update, prospective_update.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Datelike;
@@ -11,13 +11,14 @@ use chrono_tz::OffsetComponents;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
+use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message};
-use crate::memory::MemoryContent;
+use crate::memory::{MemoryBundle, MemoryError};
 use crate::runtime::AppState;
 use crate::storage::{
-    AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, RollupGranularity,
-    SleepRunTrigger, SleepStepCheckpoint, SleepStepName, SleepStepResult, SleepStepStatus,
-    call_blocking,
+    AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, MemorySnapshot,
+    RollupGranularity, SleepRun, SleepRunStatus, SleepRunTrigger, SleepStepCheckpoint,
+    SleepStepName, SleepStepResult, SleepStepStatus, call_blocking,
 };
 
 use super::SleepBatchError;
@@ -230,9 +231,6 @@ pub async fn run_events_extract(
     };
 
     let result = async {
-        let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
-        recover_memory_write(&agents_dir, &resolved_agent)?;
-
         let resolved = state
             .config
             .resolve_sleep_batch_llm()
@@ -411,10 +409,14 @@ Output the raw JSON object and nothing else.";
 /// Batch execution context — holds shared state for step execution.
 struct BatchContext {
     run_id: String,
-    agents_dir: PathBuf,
     provider: Arc<dyn LlmProvider>,
     sessions: Vec<AgentSessionInfo>,
-    current_memory: MemoryContent,
+    /// Memory bundle captured at run start. Snapshot `content_before` values
+    /// and the publication precondition are derived from this.
+    base_memory: MemoryBundle,
+    /// In-memory candidate updated by each step. Published atomically at
+    /// finalize; never written to disk mid-run.
+    candidate_memory: MemoryBundle,
     context_tokens: usize,
 }
 
@@ -494,25 +496,45 @@ async fn execute_batch(
 ) -> Result<(), SleepBatchError> {
     let run_id = create_sleep_run(&db, agent_id, trigger).await?;
 
+    // Persist the archive-target plan (the serialized source sessions) BEFORE
+    // any publication, so a crash between publication and finalization still
+    // leaves startup recovery enough to drive the same archive/truncate step
+    // and converge to the normal-path state.
+    let run_id_for_source = run_id.clone();
+    let source_chats = source_chats_json.to_string();
+    call_blocking(Arc::clone(&db), move |db| {
+        db.update_sleep_run_source_chats(&run_id_for_source, &source_chats)
+    })
+    .await?;
+
     let result = async {
         let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id).await?;
         run_event_extraction_step(&mut ctx, &db, agent_id).await?;
         run_episodic_update_step(&mut ctx, state, &db, agent_id).await?;
         run_memory_update_step(&mut ctx, &db, agent_id).await?;
 
-        finalize_batch(&ctx, state, &db, agent_id, sessions, source_chats_json).await?;
+        finalize_batch(&ctx, state, &db, agent_id).await?;
 
         Ok::<(), SleepBatchError>(())
     }
     .await;
 
     if let Err(error) = result {
-        let run_id_owned = run_id.clone();
-        let error_message = error.to_string();
-        call_blocking(db, move |db| {
-            db.update_sleep_run_failed(&run_id_owned, &error_message)
-        })
-        .await?;
+        // PublicationPending and ArchivePending intentionally leave the run
+        // `running` so the candidate snapshot set, or the un-archived source
+        // sessions, survive for retry (scheduler cycle or startup recovery);
+        // only real failures mark the run failed.
+        if !matches!(
+            error,
+            SleepBatchError::PublicationPending { .. } | SleepBatchError::ArchivePending { .. }
+        ) {
+            let run_id_owned = run_id.clone();
+            let error_message = error.to_string();
+            call_blocking(db, move |db| {
+                db.update_sleep_run_failed(&run_id_owned, &error_message)
+            })
+            .await?;
+        }
         return Err(error);
     }
 
@@ -544,9 +566,6 @@ async fn prepare_batch_context(
     sessions: &[AgentSessionInfo],
     run_id: &str,
 ) -> Result<BatchContext, SleepBatchError> {
-    let agents_dir = PathBuf::from(&state.config.state_root).join("agents");
-    recover_memory_write(&agents_dir, agent_id)?;
-
     let resolved = state
         .config
         .resolve_sleep_batch_llm()
@@ -566,14 +585,17 @@ async fn prepare_batch_context(
         &crate::config::ProviderId::new(&resolved.provider),
         &resolved.model,
     );
-    let memory_before = state.memory_loader.load(agent_id);
+    let memory_before = state
+        .memory_loader
+        .load_bundle(agent_id)
+        .map_err(|e| SleepBatchError::Io(e.to_string()))?;
 
     Ok(BatchContext {
         run_id: run_id.to_string(),
-        agents_dir,
         provider,
         sessions: sessions.to_vec(),
-        current_memory: memory_before.unwrap_or_default(),
+        base_memory: (*memory_before).clone(),
+        candidate_memory: (*memory_before).clone(),
         context_tokens,
     })
 }
@@ -803,37 +825,10 @@ async fn run_episodic_update_step(
         return Ok(None);
     };
 
-    let before = ctx.current_memory.clone();
-    let mut after = before.clone();
-    after.episodic = Some(rendered.clone());
-    if let Err(error) = write_memory_files(
-        &ctx.agents_dir,
-        agent_id,
-        &[
-            ("episodic.md", rendered.as_str()),
-            (
-                "semantic.md",
-                before.semantic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "prospective.md",
-                before.prospective.clone().unwrap_or_default().as_str(),
-            ),
-        ],
-    ) {
-        finish_step_failed(
-            db,
-            &ctx.run_id,
-            SleepStepName::EpisodicUpdate,
-            error.to_string(),
-        )
-        .await;
-        return Ok(None);
-    }
+    let content_before = ctx.base_memory.episodic.clone();
+    let content_after = rendered.clone();
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
-    let content_before = before.episodic.clone().unwrap_or_default();
-    let content_after = rendered.clone();
     if let Err(error) = call_blocking(Arc::clone(db), move |db| {
         db.commit_episodic_update_success(
             &run_id,
@@ -851,24 +846,6 @@ async fn run_episodic_update_step(
     })
     .await
     {
-        let _ = write_memory_files(
-            &ctx.agents_dir,
-            agent_id,
-            &[
-                (
-                    "episodic.md",
-                    before.episodic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "semantic.md",
-                    before.semantic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "prospective.md",
-                    before.prospective.clone().unwrap_or_default().as_str(),
-                ),
-            ],
-        );
         warn!(error = %error, "failed to commit episodic update");
         finish_step_failed(
             db,
@@ -880,7 +857,7 @@ async fn run_episodic_update_step(
         return Ok(None);
     }
 
-    ctx.current_memory = after;
+    ctx.candidate_memory.episodic = rendered.clone();
     Ok(Some(rendered))
 }
 
@@ -1288,7 +1265,7 @@ async fn run_memory_update_step(
     }
 
     let total_chunks = chunks.len();
-    let mut working_memory = ctx.current_memory.clone();
+    let mut working_memory = ctx.candidate_memory.clone();
     let mut total_input: i64 = 0;
     let mut total_output: i64 = 0;
     let mut step_failed = false;
@@ -1324,8 +1301,8 @@ async fn run_memory_update_step(
             Ok((output, inp, out)) => {
                 total_input = total_input.saturating_add(inp);
                 total_output = total_output.saturating_add(out);
-                working_memory.semantic = Some(output.semantic.clone());
-                working_memory.prospective = Some(output.prospective.clone());
+                working_memory.semantic = output.semantic.clone();
+                working_memory.prospective = output.prospective.clone();
             }
             Err(e) => {
                 warn!(error = %e, "memory update failed");
@@ -1354,84 +1331,22 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    let before = ctx.current_memory.clone();
+    // Always commit a snapshot for both memory files (even when unchanged) so
+    // the publication bundle has a complete snapshot set. content_before uses
+    // the run-start base; content_after uses the candidate produced here.
     let snapshots = [
         (
             MemoryFile::Semantic,
-            before.semantic.clone().unwrap_or_default(),
-            working_memory.semantic.clone().unwrap_or_default(),
+            ctx.base_memory.semantic.clone(),
+            working_memory.semantic.clone(),
         ),
         (
             MemoryFile::Prospective,
-            before.prospective.clone().unwrap_or_default(),
-            working_memory.prospective.clone().unwrap_or_default(),
+            ctx.base_memory.prospective.clone(),
+            working_memory.prospective.clone(),
         ),
-    ]
-    .into_iter()
-    .filter(|(_, content_before, content_after)| content_before != content_after)
-    .collect::<Vec<_>>();
+    ];
 
-    if snapshots.is_empty() {
-        let run_id = ctx.run_id.clone();
-        let agent_id = agent_id.to_string();
-        call_blocking(Arc::clone(db), move |db| {
-            db.commit_memory_update_success(
-                &run_id,
-                &agent_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Success,
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    error_message: None,
-                    metadata_json: None,
-                },
-                &checkpoints,
-                &[],
-            )
-        })
-        .await?;
-        return Ok(());
-    }
-
-    if let Err(error) = write_memory_files(
-        &ctx.agents_dir,
-        agent_id,
-        &[
-            (
-                "episodic.md",
-                working_memory.episodic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "semantic.md",
-                working_memory.semantic.clone().unwrap_or_default().as_str(),
-            ),
-            (
-                "prospective.md",
-                working_memory
-                    .prospective
-                    .clone()
-                    .unwrap_or_default()
-                    .as_str(),
-            ),
-        ],
-    ) {
-        let run_id = ctx.run_id.clone();
-        let error_message = error.to_string();
-        call_blocking(Arc::clone(db), move |db| {
-            db.finish_memory_update_steps(
-                &run_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Failed,
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    error_message: Some(&error_message),
-                    metadata_json: None,
-                },
-            )
-        })
-        .await?;
-        return Ok(());
-    }
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
     if let Err(error) = call_blocking(Arc::clone(db), move |db| {
@@ -1451,24 +1366,6 @@ async fn run_memory_update_step(
     })
     .await
     {
-        let _ = write_memory_files(
-            &ctx.agents_dir,
-            agent_id,
-            &[
-                (
-                    "episodic.md",
-                    before.episodic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "semantic.md",
-                    before.semantic.clone().unwrap_or_default().as_str(),
-                ),
-                (
-                    "prospective.md",
-                    before.prospective.clone().unwrap_or_default().as_str(),
-                ),
-            ],
-        );
         let run_id = ctx.run_id.clone();
         let error_message = error.to_string();
         call_blocking(Arc::clone(db), move |db| {
@@ -1487,7 +1384,7 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    ctx.current_memory = working_memory;
+    ctx.candidate_memory = working_memory;
     Ok(())
 }
 
@@ -1497,12 +1394,95 @@ async fn finalize_batch(
     state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
-    sessions: &[AgentSessionInfo],
-    source_chats_json: &str,
 ) -> Result<(), SleepBatchError> {
+    // Publish the candidate bundle BEFORE finalizing. A retryable publication
+    // failure (manual-edit conflict or transient I/O, surfaced as
+    // `SleepBatchError::Io`) is wrapped in `PublicationPending`: the run is
+    // intentionally left `running` (not failed) so the candidate snapshot set
+    // survives for retry by the next scheduler cycle or startup recovery. The
+    // caller must NOT treat this as success. Non-retryable failures (incomplete
+    // snapshot set, unsafe agent id, unclassifiable disk content) propagate
+    // unchanged so `execute_batch` hard-fails the run instead of looping.
+    if let Err(error) = publish_memory_bundle(state, db, ctx, agent_id).await {
+        if let SleepBatchError::Io(reason) = error {
+            warn!(
+                agent_id = %agent_id,
+                run_id = %ctx.run_id,
+                error = %reason,
+                "memory publication failed; run left running for retry"
+            );
+            return Err(SleepBatchError::PublicationPending {
+                agent_id: agent_id.to_string(),
+                run_id: ctx.run_id.clone(),
+                reason,
+            });
+        }
+        return Err(error);
+    }
+
+    // Publication succeeded: drive the shared post-publication finalization
+    // (archive / truncate / finalize). Reused by startup recovery so both
+    // paths converge to the same end state. The blocking helper does only
+    // quick DB + file writes; like the checkpoint/archive reads elsewhere in
+    // the batch it runs inline rather than via `call_blocking`.
+    let run_id_for_load = ctx.run_id.clone();
+    let run = call_blocking(Arc::clone(db), move |db| db.get_sleep_run(&run_id_for_load))
+        .await?
+        .ok_or_else(|| SleepBatchError::Internal(format!("sleep run vanished: {}", ctx.run_id)))?;
     let groups_dir = state.config.groups_dir();
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    for session in sessions {
+    finalize_published_run_blocking(
+        db.as_ref(),
+        &groups_dir,
+        &secrets,
+        &run,
+        Some(ctx.provider.provider_name()),
+    )?;
+    Ok(())
+}
+
+/// Synchronously drives the post-publication finalization for a run: archive +
+/// truncate the source sessions, then transition the run `Running → Success`.
+///
+/// This is the single, idempotent convergence point shared by the normal path
+/// ([`finalize_batch`], via `call_blocking`) and startup recovery
+/// ([`recover_run_publication`], called directly). The archive-target sessions
+/// are reconstructed from the run's `source_chats_json`, which is persisted
+/// **before** publication so a crash between publication and this call still
+/// leaves enough to converge.
+///
+/// Archive/truncate is a *required* condition for success: if any archivable
+/// session fails to archive, the run is left `Running` (returning
+/// [`SleepBatchError::ArchivePending`]) instead of being finalized as
+/// `Success`. Idempotency: if the run is no longer `Running` the function is a
+/// no-op, so a duplicate invocation (recovery after the normal path already
+/// finalized) does not re-archive. Already-archived sessions are skipped on
+/// retry because truncation removes their messages, so the archive cursor
+/// check leaves them untouched. `finalize_sleep_run` itself is a conditional
+/// `Running → Success` transition, providing the atomic gate.
+///
+/// `provider_name` controls the optional batch-level token metric bump; it is
+/// `Some` on the normal path and `None` during recovery (per-call usage was
+/// already logged by each step's LLM call).
+fn finalize_published_run_blocking(
+    db: &Database,
+    groups_dir: &Path,
+    secrets: &[(String, String)],
+    run: &SleepRun,
+    provider_name: Option<&str>,
+) -> Result<(), SleepBatchError> {
+    // Idempotency: nothing to do once the run left the Running state.
+    if run.status != SleepRunStatus::Running {
+        return Ok(());
+    }
+    let agent_id = run.agent_id.as_str();
+    let sessions: Vec<AgentSessionInfo> =
+        serde_json::from_str(&run.source_chats_json).map_err(|e| {
+            SleepBatchError::Internal(format!("decode source_chats_json for run {}: {e}", run.id))
+        })?;
+
+    let mut archive_failures: Vec<String> = Vec::new();
+    for session in &sessions {
         let source_id = session.chat_id.to_string();
         let event_checkpoint = db.get_sleep_checkpoint(
             agent_id,
@@ -1528,62 +1508,68 @@ async fn finalize_batch(
                 prospective_checkpoint.cursor_id,
             ),
         );
+        // If the session still has messages past the boundary, it is not yet
+        // safe to archive (new activity arrived after this run's snapshot), so
+        // it is intentionally left untouched — not a failure.
         let Some(latest) = db.get_latest_message_cursor(session.chat_id)? else {
             continue;
         };
         if latest > boundary {
             continue;
         }
-        if let Err(e) = archive_and_clear_session(db, &groups_dir, session, &secrets) {
+        // Archivable now: the source can be durably moved and truncated. A
+        // failure here MUST prevent the run from being finalized as `Success`.
+        // Already-archived sessions are naturally skipped on retry: truncation
+        // removes the messages, so `get_latest_message_cursor` returns `None`
+        // and the session is not re-archived.
+        if let Err(e) = archive_and_clear_session(db, groups_dir, &run.id, session, secrets) {
             warn!(
                 agent_id = %agent_id,
                 chat_id = session.chat_id,
                 error = %e,
-                "failed to archive/clear session (continuing)"
+                "failed to archive/clear session; run left running for retry"
             );
+            archive_failures.push(session.chat_id.to_string());
         }
     }
 
-    let run_id_for_source = ctx.run_id.clone();
-    let source_chats = source_chats_json.to_string();
-    call_blocking(Arc::clone(db), move |db| {
-        db.update_sleep_run_source_chats(&run_id_for_source, &source_chats)
-    })
-    .await?;
+    // Archive/truncate is a *required* condition for run success. If any
+    // archivable session failed, do not finalize — leave the run `Running` so
+    // startup recovery or the next scheduler cycle retries and converges.
+    if !archive_failures.is_empty() {
+        return Err(SleepBatchError::ArchivePending {
+            agent_id: agent_id.to_string(),
+            run_id: run.id.clone(),
+            reason: format!("{} session(s) failed to archive", archive_failures.len()),
+        });
+    }
 
-    let run_id_for_finalize = ctx.run_id.clone();
-    let derived_status = call_blocking(Arc::clone(db), move |db| {
-        db.finalize_sleep_run(&run_id_for_finalize)
-    })
-    .await?;
+    let derived_status = db.finalize_sleep_run(&run.id)?;
 
-    let run_id_for_tokens = ctx.run_id.clone();
-    if let Ok(Some(run)) = call_blocking(Arc::clone(db), move |db| {
-        db.get_sleep_run(&run_id_for_tokens)
-    })
-    .await
-    {
-        if run.input_tokens > 0 || run.output_tokens > 0 {
-            let provider_name = ctx.provider.provider_name().to_string();
-            crate::runtime::metrics::inc_llm_tokens_total(
-                "input",
-                &provider_name,
-                run.input_tokens,
-            );
-            crate::runtime::metrics::inc_llm_tokens_total(
-                "output",
-                &provider_name,
-                run.output_tokens,
-            );
-            // Per-call usage is logged by each sleep step's LLM call. The
-            // batch-level aggregate has no single prompt estimate to pair
-            // with, so it is not written to llm_usage_logs.
+    if let Some(provider) = provider_name {
+        if let Ok(Some(token_run)) = db.get_sleep_run(&run.id) {
+            if token_run.input_tokens > 0 || token_run.output_tokens > 0 {
+                let provider_name = provider.to_string();
+                crate::runtime::metrics::inc_llm_tokens_total(
+                    "input",
+                    &provider_name,
+                    token_run.input_tokens,
+                );
+                crate::runtime::metrics::inc_llm_tokens_total(
+                    "output",
+                    &provider_name,
+                    token_run.output_tokens,
+                );
+                // Per-call usage is logged by each sleep step's LLM call. The
+                // batch-level aggregate has no single prompt estimate to pair
+                // with, so it is not written to llm_usage_logs.
+            }
         }
     }
 
     info!(
         agent_id = %agent_id,
-        run_id = %ctx.run_id,
+        run_id = %run.id,
         status = %derived_status,
         "sleep batch finalized"
     );
@@ -1591,160 +1577,224 @@ async fn finalize_batch(
     Ok(())
 }
 
-fn safe_agent_id_for_write(id: &str) -> bool {
-    let id = id.trim();
-    !id.is_empty()
-        && !id.contains("..")
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains(':')
-}
-
-pub(crate) fn recover_memory_write(
-    agents_dir: &Path,
+/// Ensures the run has a complete 3-file snapshot set, reads it back, and
+/// publishes the candidate bundle atomically.
+///
+/// Returns an error when publication cannot complete (manual-edit conflict,
+/// I/O failure, or an incomplete snapshot set). The caller leaves the run
+/// `running` on error so startup recovery can retry and the candidate is not
+/// lost; the current on-disk files are never overwritten on a conflict.
+async fn publish_memory_bundle(
+    state: &AppState,
+    db: &Arc<Database>,
+    ctx: &BatchContext,
     agent_id: &str,
 ) -> Result<(), SleepBatchError> {
-    if !safe_agent_id_for_write(agent_id) {
-        return Err(SleepBatchError::UnsafeAgentId(agent_id.to_string()));
-    }
+    let run_id = ctx.run_id.clone();
+    let agent_id_owned = agent_id.to_string();
+    let base = ctx.base_memory.clone();
+    call_blocking(Arc::clone(db), move |db| {
+        db.ensure_memory_snapshots_complete(
+            &run_id,
+            &agent_id_owned,
+            &[
+                (MemoryFile::Episodic, base.episodic.as_str()),
+                (MemoryFile::Semantic, base.semantic.as_str()),
+                (MemoryFile::Prospective, base.prospective.as_str()),
+            ],
+        )
+    })
+    .await?;
 
-    let agent_dir = agents_dir.join(agent_id);
-    if !agent_dir.exists() {
-        return Ok(());
-    }
+    let run_id = ctx.run_id.clone();
+    let snapshots =
+        call_blocking(Arc::clone(db), move |db| db.get_snapshots_for_run(&run_id)).await?;
 
-    let memory_dir = agent_dir.join("memory");
+    let Some((before, after)) = build_bundles_from_snapshots(&snapshots) else {
+        crate::runtime::metrics::inc_memory_snapshot_incomplete();
+        return Err(SleepBatchError::Internal(format!(
+            "incomplete memory snapshot set for run {}",
+            ctx.run_id
+        )));
+    };
 
-    if !memory_dir.exists() {
-        let entries = std::fs::read_dir(&agent_dir)
-            .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
+    // Publication performs several fsyncs; run it on a blocking thread so the
+    // async sleep batch never stalls the runtime on disk latency.
+    let memory_loader = Arc::clone(&state.memory_loader);
+    let agent_id_owned = agent_id.to_string();
+    let run_id_owned = ctx.run_id.clone();
+    let publish_result = tokio::task::spawn_blocking(move || {
+        memory_loader.publish_bundle(&agent_id_owned, &run_id_owned, &before, &after)
+    })
+    .await
+    .map_err(|e| SleepBatchError::Io(format!("publication task failed: {e}")))?;
+    publish_result.map_err(|e| match e {
+        MemoryError::Conflict { agent_id, file } => SleepBatchError::Io(format!(
+            "memory publication conflict: agent={agent_id} file={file}"
+        )),
+        MemoryError::UnsafeAgentId(a) => SleepBatchError::UnsafeAgentId(a),
+        MemoryError::Io(m) => SleepBatchError::Io(m),
+        MemoryError::RecoveryValidation { .. } => SleepBatchError::Internal(e.to_string()),
+    })?;
+    Ok(())
+}
 
-        let mut backups: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("memory.backup-")
-            })
-            .collect();
-
-        backups.sort_by(|a, b| {
-            let mtime_a = a.metadata().and_then(|m| m.modified()).ok();
-            let mtime_b = b.metadata().and_then(|m| m.modified()).ok();
-            mtime_b.cmp(&mtime_a)
-        });
-
-        if let Some(newest) = backups.into_iter().next() {
-            let backup_path = newest.path();
-            info!(
-                agent_id = %agent_id,
-                path = %backup_path.display(),
-                "restoring memory from backup"
-            );
-            std::fs::rename(&backup_path, &memory_dir)
-                .map_err(|e| SleepBatchError::Io(format!("failed to restore backup: {e}")))?;
-        }
-    }
-
-    let entries = std::fs::read_dir(&agent_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to read agent dir: {e}")))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| SleepBatchError::Io(format!("failed to read dir entry: {e}")))?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str.starts_with("memory.tmp-") || name_str.starts_with("memory.backup-") {
-            let path = entry.path();
-            info!(
-                agent_id = %agent_id,
-                path = %path.display(),
-                "cleaning up stale memory directory"
-            );
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                info!(
-                    agent_id = %agent_id,
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove stale directory (continuing)"
-                );
+/// Builds `(before, after)` bundles from a run's snapshots.
+///
+/// Returns `None` unless exactly one snapshot exists for each of the three
+/// memory files.
+fn build_bundles_from_snapshots(
+    snapshots: &[MemorySnapshot],
+) -> Option<(MemoryBundle, MemoryBundle)> {
+    let mut before = MemoryBundle::default();
+    let mut after = MemoryBundle::default();
+    let mut seen_episodic = false;
+    let mut seen_semantic = false;
+    let mut seen_prospective = false;
+    for snapshot in snapshots {
+        match snapshot.file {
+            MemoryFile::Episodic => {
+                before.episodic = snapshot.content_before.clone();
+                after.episodic = snapshot.content_after.clone();
+                seen_episodic = true;
+            }
+            MemoryFile::Semantic => {
+                before.semantic = snapshot.content_before.clone();
+                after.semantic = snapshot.content_after.clone();
+                seen_semantic = true;
+            }
+            MemoryFile::Prospective => {
+                before.prospective = snapshot.content_before.clone();
+                after.prospective = snapshot.content_after.clone();
+                seen_prospective = true;
             }
         }
     }
+    // All three files must have a snapshot row; otherwise the bundle is
+    // incomplete and publication must not proceed.
+    (seen_episodic && seen_semantic && seen_prospective).then_some((before, after))
+}
 
+/// Recovers memory publication for sleep runs left `running` by a crash.
+///
+/// For each running run: if its 3-file snapshot set is complete, re-drive the
+/// publication from the persisted `after` bundle and transition the run to its
+/// derived terminal status. If the snapshot set is incomplete, the run is
+/// marked failed. If the on-disk content matches neither `before` nor `after`,
+/// startup halts so the operator can intervene.
+///
+/// Must run before the TurnDispatcher and Channels start so Turns never read a
+/// half-published bundle.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError`] only when on-disk content is unclassifiable
+/// (startup must halt). Incomplete snapshots and failed publications are
+/// logged and marked failed without aborting startup.
+pub(crate) fn recover_memory_publication(state: &AppState) -> Result<(), EgoPulseError> {
+    let runs = state
+        .db
+        .list_running_sleep_runs()
+        .map_err(EgoPulseError::from)?;
+    if runs.is_empty() {
+        return Ok(());
+    }
+    for run in runs {
+        recover_run_publication(state, &run)?;
+    }
     Ok(())
 }
 
-pub(crate) fn write_memory_files(
-    agents_dir: &Path,
-    agent_id: &str,
-    files: &[(&str, &str)],
-) -> Result<(), SleepBatchError> {
-    if !safe_agent_id_for_write(agent_id) {
-        return Err(SleepBatchError::UnsafeAgentId(agent_id.to_string()));
-    }
+fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPulseError> {
+    let snapshots = state
+        .db
+        .get_snapshots_for_run(&run.id)
+        .map_err(EgoPulseError::from)?;
 
-    recover_memory_write(agents_dir, agent_id)?;
-
-    let agent_dir = agents_dir.join(agent_id);
-    std::fs::create_dir_all(&agent_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to create agent dir: {e}")))?;
-
-    let uuid = uuid::Uuid::new_v4();
-    let tmp_dir = agent_dir.join(format!("memory.tmp-{uuid}"));
-    let memory_dir = agent_dir.join("memory");
-    let backup_dir = agent_dir.join(format!("memory.backup-{uuid}"));
-
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| SleepBatchError::Io(format!("failed to create tmp dir: {e}")))?;
-
-    let write_result = (|| -> Result<(), SleepBatchError> {
-        for (name, content) in files {
-            std::fs::write(tmp_dir.join(name), content)
-                .map_err(|e| SleepBatchError::Io(format!("failed to write {name}: {e}")))?;
+    match build_bundles_from_snapshots(&snapshots) {
+        Some((before, after)) => {
+            state
+                .memory_loader
+                .recover_publication(&run.agent_id, &run.id, &before, &after)
+                .map_err(|e| recovery_error(run, e))?;
+            // Re-drive the same post-publication finalization the normal path
+            // uses (archive / truncate / finalize), so a crash between
+            // publication and finalization still converges to the on-success
+            // state rather than leaving sessions un-archived. Idempotent: a
+            // run the normal path already finalized is a no-op.
+            let groups_dir = state.config.groups_dir();
+            let secrets = crate::tools::collect_config_secrets(&state.config);
+            if let Err(e) =
+                finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None)
+            {
+                // ArchivePending is a transient condition (archive I/O
+                // temporarily unavailable), not a consistency violation. The
+                // run stays `Running` and the next scheduler cycle retries —
+                // startup must NOT abort over a retryable archive failure.
+                if matches!(e, SleepBatchError::ArchivePending { .. }) {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        agent_id = %run.agent_id,
+                        error = %e,
+                        "archive pending after memory recovery; run left Running for retry"
+                    );
+                } else {
+                    return Err(EgoPulseError::Internal(format!(
+                        "finalize after memory recovery failed for run {}: {e}",
+                        run.id
+                    )));
+                }
+            }
+            tracing::info!(
+                run_id = %run.id,
+                agent_id = %run.agent_id,
+                "recovered memory publication on startup"
+            );
         }
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-
-    if memory_dir.exists() {
-        std::fs::rename(&memory_dir, &backup_dir).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            SleepBatchError::Io(format!("failed to rename memory to backup: {e}"))
-        })?;
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_dir, &memory_dir) {
-        if backup_dir.exists() {
-            let _ = std::fs::rename(&backup_dir, &memory_dir);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(SleepBatchError::Io(format!(
-            "failed to rename tmp to memory: {e}"
-        )));
-    }
-
-    if backup_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&backup_dir) {
-            info!(
-                agent_id = %agent_id,
-                error = %e,
-                "failed to remove backup dir (non-fatal)"
+        None => {
+            crate::runtime::metrics::inc_memory_snapshot_incomplete();
+            let run_id = run.id.clone();
+            state
+                .db
+                .update_sleep_run_failed(
+                    &run_id,
+                    "memory snapshot set incomplete at startup recovery",
+                )
+                .map_err(EgoPulseError::from)?;
+            tracing::warn!(
+                run_id = %run.id,
+                agent_id = %run.agent_id,
+                "memory snapshot set incomplete; run marked failed"
             );
         }
     }
-
     Ok(())
+}
+
+/// Maps a [`MemoryError`] from recovery into the startup-halting error.
+///
+/// [`MemoryError::RecoveryValidation`] halts startup; other variants are
+/// unexpected during recovery and also halt to avoid silent loss.
+fn recovery_error(run: &SleepRun, e: MemoryError) -> EgoPulseError {
+    match e {
+        MemoryError::RecoveryValidation {
+            agent_id,
+            run_id,
+            file,
+        } => EgoPulseError::Internal(format!(
+            "memory recovery validation failed: agent={agent_id} run={run_id} file={file}"
+        )),
+        other => EgoPulseError::Internal(format!(
+            "memory recovery failed for run {}: {other}",
+            run.id
+        )),
+    }
 }
 
 fn archive_and_clear_session(
     db: &Database,
     groups_dir: &Path,
+    run_id: &str,
     session: &AgentSessionInfo,
     secrets: &[(String, String)],
 ) -> Result<(), SleepBatchError> {
@@ -1755,13 +1805,25 @@ fn archive_and_clear_session(
     if let Some(json) = &snapshot.messages_json {
         let messages = parse_messages_json(json);
         if !messages.is_empty() {
+            // Deterministic idempotency key: a crash after the archive write but
+            // before truncation produces the same file on re-finalization rather
+            // than a duplicate. An I/O failure here MUST propagate so the caller
+            // leaves the run `Running` instead of truncating an un-archived
+            // session.
+            let idempotency_key = format!("{run_id}-{}", session.chat_id);
             archive_conversation_blocking(
                 groups_dir,
                 &session.channel,
                 session.chat_id,
                 &messages,
                 secrets,
-            );
+                &idempotency_key,
+            )
+            .map_err(|e| SleepBatchError::ArchivePending {
+                agent_id: String::new(),
+                run_id: run_id.to_string(),
+                reason: format!("archive I/O failed for chat {}: {e}", session.chat_id),
+            })?;
         } else {
             info!(
                 chat_id = session.chat_id,
@@ -1770,6 +1832,8 @@ fn archive_and_clear_session(
         }
     }
 
+    // Only truncate after the archive is confirmed on disk, so an archive
+    // failure never loses the conversation content.
     if let Some(revision) = snapshot.session_revision {
         let truncated_json =
             truncate_messages_json(snapshot.messages_json.as_deref(), SESSION_CLEAR_KEEP_RECENT);
@@ -2158,24 +2222,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sleep_batch_recovers_backup_before_building_input() {
-        let (db, dir) = test_db();
-        seed_messages_for_proceed(&db, "test-agent");
-
-        let agent_dir = dir.path().join("agents").join("test-agent");
-        let backup_dir = agent_dir.join("memory.backup-test");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        std::fs::write(backup_dir.join("semantic.md"), "old memory").expect("write backup");
-
-        let llm = Arc::new(MockLlmProvider::new());
-        let state = build_test_state_with_llm(db, dir.path(), llm);
-
-        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
-            .await
-            .expect("batch");
-    }
-
-    #[tokio::test]
     async fn run_sleep_batch_marks_success_on_completion() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
@@ -2214,6 +2260,517 @@ mod tests {
             memory_dir.join("prospective.md").exists(),
             "prospective.md missing"
         );
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_creates_complete_snapshot_set_for_every_file() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        // all_success_responses yields no rollups and empty semantic/prospective,
+        // so no file actually changes — yet each must still have a snapshot.
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        let snapshots = state
+            .db
+            .get_snapshots_for_run(&runs[0].id)
+            .expect("snapshots");
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "all three memory files must have a snapshot, even unchanged ones"
+        );
+        // semantic and prospective are unchanged (LLM returned empty strings),
+        // so their snapshots must still exist with before == after.
+        for snapshot in &snapshots {
+            if matches!(
+                snapshot.file,
+                MemoryFile::Semantic | MemoryFile::Prospective
+            ) {
+                assert_eq!(
+                    snapshot.content_before, snapshot.content_after,
+                    "unchanged file snapshot must have before == after"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sleep_batch_detects_manual_edit_conflict() {
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+
+        // Seed base memory so the run starts from a non-empty bundle.
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("episodic.md"), "base ep").expect("write base");
+
+        let llm = Arc::new(SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            serde_json::json!({"semantic":"new sem","prospective":"new pro"}).to_string(),
+        ]));
+        // Simulate a manual edit to episodic.md after the run captured base but
+        // before publication. The run loads base at start, so the edit happens
+        // after that snapshot but before finalize.
+        let provider = Arc::new(ConflictEditProvider {
+            inner: llm,
+            edited: std::sync::Mutex::new(false),
+            memory_dir: memory_dir.clone(),
+        });
+        let state = build_test_state_with_llm(db, dir.path(), provider);
+
+        // A manual-edit conflict cannot publish: the run stays `running` so
+        // startup recovery can retry and the candidate is not lost, while the
+        // manual edit is preserved on disk.
+        let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
+
+        let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
+        assert_eq!(
+            runs[0].status,
+            SleepRunStatus::Running,
+            "manual edit conflict must leave the run running for recovery"
+        );
+        // The manual edit is preserved (publication did not overwrite it).
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
+            "manually edited"
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_partial_rename() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        // Create a running sleep run with a complete snapshot set.
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        // Crash point 1: only episodic renamed to `after`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+        recover_memory_publication(&state).expect("recover 1");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_all_renamed_but_not_finalized() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // All files already at `after`, but the run is still `running`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_converges_after_two_files_renamed() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // Crash point 2: episodic and semantic renamed to `after`, prospective still `before`.
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+        assert_bundle(&memory_dir, &after);
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_halts_on_unclassifiable_content() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        seed_complete_snapshots(&state.db, &run_id, "test-agent", &before, &after);
+
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // A third-party edit that matches neither before nor after.
+        std::fs::write(memory_dir.join("episodic.md"), "mystery").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+
+        let err = recover_memory_publication(&state).expect_err("should halt");
+        assert!(
+            err.to_string()
+                .contains("memory recovery validation failed")
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_marks_failed_when_snapshots_incomplete() {
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+
+        let run_id = state
+            .db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        // Only one snapshot exists → incomplete.
+        seed_one_snapshot(
+            &state.db,
+            &run_id,
+            "test-agent",
+            MemoryFile::Episodic,
+            "a",
+            "b",
+        );
+
+        recover_memory_publication(&state).expect("does not halt");
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn recover_memory_publication_archives_source_sessions_like_normal_path() {
+        // Major 4: a crash between memory publication and session archiving
+        // must still converge to the normal-path state. Recovery drives the
+        // same archive/truncate/finalize, reconstructing targets from the
+        // source_chats_json persisted before publication.
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+        let agent = "test-agent";
+
+        // A source session with 8 messages, all settled past both checkpoints.
+        let chat_id = create_chat(&state.db, agent, "-arch");
+        for i in 1..=8 {
+            store_msg(
+                &state.db,
+                &format!("a-{i}"),
+                chat_id,
+                &format!("msg{i}"),
+                &format!("2025-06-01T00:00:{i:02}Z"),
+            );
+        }
+        let messages_json = (1..=8)
+            .map(|i| format!(r#"{{"role":"user","content":"msg{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        state
+            .db
+            .save_session(chat_id, &format!("[{messages_json}]"))
+            .expect("save session");
+
+        // Checkpoints at the last message so the session is archivable.
+        let conn = state.db.get_conn().expect("pool");
+        for step in ["event_extraction", "prospective_update"] {
+            conn.execute(
+                "INSERT INTO sleep_step_checkpoints
+                 (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES (?1, ?2, 'messages', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    agent,
+                    step,
+                    chat_id.to_string(),
+                    "2025-06-01T00:00:08Z",
+                    "a-8",
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("seed checkpoint");
+        }
+        drop(conn);
+
+        // Run with complete snapshots + the archive plan persisted pre-crash.
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+        let run_id = state
+            .db
+            .try_create_sleep_run(agent, SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, agent, &before, &after);
+        let plan = serde_json::to_string(&[AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-arch".to_string(),
+            updated_at: "2025-06-01T00:00:00Z".to_string(),
+            message_count: 8,
+            estimated_tokens: 0,
+        }])
+        .expect("serialize plan");
+        state
+            .db
+            .update_sleep_run_source_chats(&run_id, &plan)
+            .expect("persist plan");
+
+        // Memory files already at `after` (publication completed pre-crash).
+        let memory_dir = dir.path().join("agents").join(agent).join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+
+        // Run finalized...
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+        // ...and the session was archived + truncated (converges with the
+        // normal path), not left dangling as before.
+        let snap = state
+            .db
+            .load_session_snapshot(chat_id, 100)
+            .expect("snapshot");
+        let kept = parse_messages_json(snap.messages_json.as_deref().unwrap_or("[]"));
+        assert!(
+            kept.len() <= SESSION_CLEAR_KEEP_RECENT,
+            "session should be truncated to <= {} messages, got {}",
+            SESSION_CLEAR_KEEP_RECENT,
+            kept.len()
+        );
+        let archive_dir = state
+            .config
+            .groups_dir()
+            .join("test")
+            .join(chat_id.to_string())
+            .join("conversations");
+        let archived = std::fs::read_dir(&archive_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert!(archived >= 1, "archive file should exist");
+    }
+
+    fn mark_all_steps_success(db: &Database, run_id: &str) {
+        let conn = db.get_conn().expect("pool");
+        let now = chrono::Utc::now().to_rfc3339();
+        for step in [
+            "event_extraction",
+            "episodic_update",
+            "semantic_update",
+            "prospective_update",
+        ] {
+            conn.execute(
+                "UPDATE sleep_run_steps
+                 SET status = 'success', started_at = ?1, finished_at = ?1
+                 WHERE sleep_run_id = ?2 AND step_name = ?3",
+                rusqlite::params![now, run_id, step],
+            )
+            .expect("mark step success");
+        }
+    }
+
+    fn seed_complete_snapshots(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        before: &MemoryBundle,
+        after: &MemoryBundle,
+    ) {
+        for (file, b, a) in [
+            (MemoryFile::Episodic, &before.episodic, &after.episodic),
+            (MemoryFile::Semantic, &before.semantic, &after.semantic),
+            (
+                MemoryFile::Prospective,
+                &before.prospective,
+                &after.prospective,
+            ),
+        ] {
+            seed_one_snapshot(db, run_id, agent_id, file, b, a);
+        }
+    }
+
+    fn seed_one_snapshot(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        file: MemoryFile,
+        before: &str,
+        after: &str,
+    ) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO memory_snapshots (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                run_id,
+                agent_id,
+                file.to_string(),
+                before,
+                after,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert snapshot");
+    }
+
+    fn assert_bundle(memory_dir: &std::path::Path, expected: &MemoryBundle) {
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
+            expected.episodic
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
+            expected.semantic
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
+            expected.prospective
+        );
+    }
+
+    /// Provider that edits `episodic.md` on-disk right before the memory update
+    /// step runs, simulating a concurrent manual edit between base capture and
+    /// publication.
+    struct ConflictEditProvider {
+        inner: Arc<dyn LlmProvider>,
+        edited: std::sync::Mutex<bool>,
+        memory_dir: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConflictEditProvider {
+        fn provider_name(&self) -> &str {
+            self.inner.provider_name()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        async fn send_message(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let is_memory_step = system.contains("更新を担う");
+            if is_memory_step {
+                let mut edited = self.edited.lock().unwrap();
+                if !*edited {
+                    *edited = true;
+                    std::fs::write(self.memory_dir.join("episodic.md"), "manually edited")
+                        .expect("manual edit");
+                }
+            }
+            self.inner.send_message(system, messages, tools).await
+        }
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
     }
 
     #[tokio::test]
@@ -2283,127 +2840,6 @@ mod tests {
         let runs = state.db.list_sleep_runs("test-agent", 10).expect("list");
         assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
-    }
-    // --- write_memory_files tests ---
-
-    #[test]
-    fn write_memory_files_writes_all_given_files() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(
-            dir.path(),
-            "agent",
-            &[("semantic.md", "sem"), ("prospective.md", "pro")],
-        )
-        .expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
-            "sem"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            "pro"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_writes_single_file() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("episodic.md", "ep")]).expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
-            "ep"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_writes_three_files() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(
-            dir.path(),
-            "agent",
-            &[
-                ("episodic.md", "ep"),
-                ("semantic.md", "sem"),
-                ("prospective.md", "pro"),
-            ],
-        )
-        .expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("episodic.md")).unwrap(),
-            "ep"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
-            "sem"
-        );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            "pro"
-        );
-    }
-
-    #[test]
-    fn write_memory_files_creates_memory_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
-
-        let memory_dir = dir.path().join("agent").join("memory");
-        assert!(memory_dir.exists());
-    }
-
-    #[test]
-    fn write_memory_files_rejects_unsafe_agent_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = write_memory_files(dir.path(), "../etc", &[("semantic.md", "s")])
-            .expect_err("should reject");
-        assert!(matches!(err, SleepBatchError::UnsafeAgentId(_)));
-    }
-
-    #[test]
-    fn write_memory_files_preserves_existing_on_write_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent").join("memory");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("semantic.md"), "old").unwrap();
-
-        // This should succeed — we're writing valid content
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
-    }
-
-    #[test]
-    fn write_memory_files_recovers_backup_on_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent");
-        let backup_dir = agent_dir.join("memory.backup-test");
-        std::fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(backup_dir.join("semantic.md"), "recovered").unwrap();
-
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "new")]).expect("write");
-    }
-
-    #[test]
-    fn write_memory_files_cleans_tmp_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent");
-        let tmp_dir = agent_dir.join("memory.tmp-stale");
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("write");
-        assert!(!tmp_dir.exists());
-    }
-
-    #[test]
-    fn write_memory_files_documents_rename_limit() {
-        // Verify the function handles concurrent writes gracefully
-        let dir = tempfile::tempdir().unwrap();
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("first write");
-        write_memory_files(dir.path(), "agent", &[("semantic.md", "s")]).expect("second write");
     }
 
     // --- retry integration ---
@@ -3214,7 +3650,7 @@ mod tests {
         ];
         let llm2 = Arc::new(SequentialMockProvider::new(all_success_second));
         let config = crate::test_util::test_config(&dir.path().to_string_lossy());
-        let state2 = crate::test_util::build_state_with_config(
+        let state2 = crate::test_util::build_state_for_restart_simulation(
             config,
             Some(llm2),
             None,
@@ -3255,6 +3691,152 @@ mod tests {
         assert_eq!(
             result, json,
             "should return input unchanged when at or under limit"
+        );
+    }
+
+    // --- Fix 5: archive/truncate failure must not finalize the run as Success ---
+
+    #[test]
+    fn archive_failure_leaves_run_running_not_success() {
+        use crate::storage::SleepRunTrigger;
+
+        let (db, dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("test-agent", SleepRunTrigger::Manual)
+            .expect("create run")
+            .expect("run id");
+        let sessions = serde_json::json!([{
+            "chat_id": 1,
+            "channel": "cli",
+            "external_chat_id": "",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "message_count": 1,
+            "estimated_tokens": 1
+        }])
+        .to_string();
+        db.update_sleep_run_source_chats(&run_id, &sessions)
+            .expect("set source chats");
+        let run = db
+            .get_sleep_run(&run_id)
+            .expect("read run")
+            .expect("run exists");
+        assert_eq!(run.status, SleepRunStatus::Running);
+
+        // Force every DB read inside finalization to fail (simulating an
+        // archive/truncate I/O failure).
+        db.fault_inject_next_get_conn(u32::MAX);
+
+        let result =
+            finalize_published_run_blocking(&db, &dir.path().join("groups"), &[], &run, None);
+        assert!(
+            result.is_err(),
+            "archive/truncate failure must not finalize the run"
+        );
+        // The run was never transitioned away from Running.
+        assert_eq!(
+            run.status,
+            SleepRunStatus::Running,
+            "run must remain Running on archive/truncate failure"
+        );
+    }
+
+    // --- Blocker 3: archive file I/O failure must propagate and prevent truncate ---
+
+    #[test]
+    fn archive_io_failure_propagates_and_preserves_session() {
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "-archive-io");
+
+        // Save a session with messages so archive has content to write.
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let session = AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-archive-io".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            message_count: 1,
+            estimated_tokens: 1,
+        };
+
+        // Point groups_dir under a file (not a directory) so create_dir_all
+        // fails — simulating an archive I/O failure that must propagate.
+        let blocking_file = dir.path().join("blocking-file");
+        std::fs::write(&blocking_file, "not a directory").expect("write blocking file");
+        let bad_groups_dir = blocking_file.join("groups");
+
+        let result =
+            archive_and_clear_session(&db, &bad_groups_dir, "run-archive-io", &session, &[]);
+        assert!(
+            matches!(result, Err(SleepBatchError::ArchivePending { .. })),
+            "archive I/O failure must propagate as ArchivePending"
+        );
+
+        // The session must NOT have been truncated — messages_json preserved.
+        let snapshot = db.load_session_snapshot(chat_id, 100).expect("snapshot");
+        assert!(
+            snapshot.messages_json.as_deref().unwrap_or("[]") != "[]",
+            "session must retain its messages after archive failure"
+        );
+    }
+
+    #[test]
+    fn archive_uses_deterministic_idempotency_key() {
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "-archive-det");
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let session = AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-archive-det".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            message_count: 1,
+            estimated_tokens: 1,
+        };
+
+        let groups_dir = dir.path().join("groups");
+
+        // First call: archives successfully.
+        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+            .expect("archive success");
+
+        let expected_path = groups_dir
+            .join("test")
+            .join(chat_id.to_string())
+            .join("conversations")
+            .join(format!("run-det-{chat_id}.md"));
+        assert!(
+            expected_path.exists(),
+            "archive file must use deterministic name: {}",
+            expected_path.display()
+        );
+
+        // After archive + truncate, a retry must NOT overwrite the original
+        // archive with the now-truncated session. The existence guard skips
+        // the write, preserving the original full conversation.
+        let original_bytes = std::fs::read_to_string(&expected_path).expect("read original");
+        assert!(
+            original_bytes.contains("hello"),
+            "original archive must contain the conversation"
+        );
+
+        // Simulate post-truncation: session now has different (shorter) content.
+        db.save_session(chat_id, r#"[{"role":"user","content":"truncated-only"}]"#)
+            .expect("re-save truncated session");
+        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+            .expect("re-archive (skipped)");
+        let retry_bytes = std::fs::read_to_string(&expected_path).expect("read retry");
+        assert_eq!(
+            original_bytes, retry_bytes,
+            "archive must not be overwritten with truncated content on retry"
+        );
+        assert!(
+            !retry_bytes.contains("truncated-only"),
+            "truncated content must not have replaced the original archive"
         );
     }
 

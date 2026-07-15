@@ -110,7 +110,7 @@ pub(crate) async fn receive_webhook(
     };
 
     let outcome =
-        crate::runtime::channel_input::submit_agent_turn(&state.app_state, context, input);
+        crate::runtime::channel_input::submit_agent_turn(&state.app_state, context, input).await;
     if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
         return super::error::webhook_error(
             StatusCode::TOO_MANY_REQUESTS,

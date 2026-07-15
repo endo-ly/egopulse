@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent_loop::ScheduledTurn;
 use crate::runtime::metrics;
+use crate::storage::RecoveredOrigin;
 
 /// In-flight turn tracker used by the sleep scheduler to defer scheduled
 /// batches while an agent is actively processing a conversation turn.
@@ -65,7 +66,7 @@ pub(crate) const MAX_QUEUED_TURNS_PER_SESSION: usize = 32;
 /// Maximum turns queued across the whole runtime before new turns are rejected.
 ///
 /// Bounds total scheduler memory across all sessions during sustained
-/// overload. Phase 3 will replace the in-memory queue with a durable one; until
+/// overload. Until a durable queue replaces the in-memory one,
 /// then this is an explicit finite capacity, not unbounded delay.
 pub(crate) const MAX_GLOBAL_QUEUED_TURNS: usize = 512;
 
@@ -101,6 +102,20 @@ impl std::fmt::Display for StopReason {
     }
 }
 
+impl std::str::FromStr for StopReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "chain_depth_exceeded" => Ok(Self::ChainDepthExceeded),
+            "turn_count_exceeded" => Ok(Self::TurnCountExceeded),
+            "agent_not_found" => Ok(Self::AgentNotFound),
+            "llm_failure" => Ok(Self::LlmFailure),
+            other => Err(format!("unknown StopReason: {other}")),
+        }
+    }
+}
+
 /// Reason a turn was rejected by the scheduler queue capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
@@ -120,6 +135,10 @@ pub(crate) enum RejectReason {
     /// progress). Refused at acceptance so external callers learn the runtime
     /// is draining instead of accepting work it cannot start.
     Shutdown,
+    /// The durable accept (persisting the request to `turn_runs`) failed, so
+    /// the turn cannot be made crash-safe. Refused at acceptance so the caller
+    /// can retry instead of accepting work that may be lost on crash.
+    Internal,
 }
 
 impl RejectReason {
@@ -132,6 +151,7 @@ impl RejectReason {
             Self::OriginTrackerFull => "tracker_full",
             Self::ChainTerminated => "chain_terminated",
             Self::Shutdown => "shutdown",
+            Self::Internal => "internal",
         }
     }
 
@@ -147,6 +167,7 @@ impl RejectReason {
             Self::OriginTrackerFull => "origin turn tracker is at capacity",
             Self::ChainTerminated => "turn chain already terminated",
             Self::Shutdown => "runtime is shutting down",
+            Self::Internal => "internal error during turn acceptance",
         }
     }
 }
@@ -161,7 +182,12 @@ impl std::fmt::Display for RejectReason {
 ///
 /// `Started` hands the turn back so the caller can begin execution; `Queued`
 /// means the turn was buffered behind an in-progress turn; `Rejected` means
-/// the turn was refused and must not be executed.
+/// the in-memory scheduler is at capacity. The durable intake converts a
+/// `Rejected` here into `SubmitOutcome::Queued` (deferred to the dispatcher),
+/// because the turn is already durably accepted — capacity is the dispatcher's
+/// wait-time problem, never a caller-visible rejection. Acceptance-level
+/// capacity rejection (`session_queue_full` / `global_queue_full`) is decided
+/// earlier, in the same transaction as the durable commit.
 pub(crate) enum ScheduleResult {
     Started(Box<ScheduledTurn>),
     Queued,
@@ -420,6 +446,47 @@ impl TurnTracker {
             .and_then(|s| s.terminal_reason.clone())
     }
 
+    /// Rehydrates per-origin execution counts and terminal reasons from a prior
+    /// process.
+    ///
+    /// Called once at startup before the turn dispatcher begins, so a chain
+    /// that had already consumed turns before a crash keeps its per-chain turn
+    /// limit enforced instead of resetting to zero, and a chain that already
+    /// terminated keeps its terminal stop reason so the dispatcher does not
+    /// silently resume it. `accepted` / `input_committed` turns are not included
+    /// in the counts (see [`crate::storage::Database::recover_origin_tracker`]);
+    /// the dispatcher re-executes them after startup and they increment the
+    /// count live via [`TurnTracker::try_begin_execution`].
+    pub(crate) fn rehydrate_executed(&self, origins: &[RecoveredOrigin]) {
+        if origins.is_empty() {
+            return;
+        }
+        let mut map = self.origins.lock().expect("turn_tracker lock");
+        let now = self.clock.now();
+        for recovered in origins {
+            let state = map
+                .entry(recovered.origin_id.clone())
+                .or_insert(OriginState {
+                    executed_turn_count: 0,
+                    pending_reservations: 0,
+                    terminal_reason: None,
+                    last_touched: now,
+                });
+            state.executed_turn_count = recovered.executed_turn_count;
+            state.last_touched = now;
+            if let Some(reason_str) = &recovered.terminal_reason {
+                match reason_str.parse::<StopReason>() {
+                    Ok(reason) => state.terminal_reason = Some(reason),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        origin_id = %recovered.origin_id,
+                        "failed to parse recovered terminal reason"
+                    ),
+                }
+            }
+        }
+    }
+
     /// Removes origins whose `last_touched` is older than [`ORIGIN_TTL`].
     ///
     /// Active chains refresh `last_touched` on every operation and are never
@@ -468,6 +535,9 @@ impl Default for TurnTracker {
 /// Slot state for a single agent session within the scheduler.
 struct TurnSlot {
     busy: bool,
+    /// `turn_id` of the currently executing turn, so duplicate re-submissions
+    /// by the dispatcher are recognized as idempotent no-ops.
+    current_turn_id: Option<String>,
     queue: VecDeque<ScheduledTurn>,
 }
 
@@ -516,15 +586,33 @@ impl TurnScheduler {
     pub(crate) fn submit(&self, turn: ScheduledTurn) -> ScheduleResult {
         let mut inner = self.inner.lock().expect("turn_scheduler lock");
         let session_key = turn.session_key();
+        let turn_id = turn.turn_id.clone();
+
+        // Idempotent dedup for non-empty turn IDs: if this turn is already
+        // running or queued, treat a repeat submission as a no-op so the
+        // dispatcher can re-scan the DB without a separate dedup set and
+        // without enqueueing duplicates. Empty turn IDs (e.g. agent_send) are
+        // never deduplicated — each is independent.
+        if !turn_id.is_empty() {
+            if let Some(slot) = inner.slots.get(&session_key) {
+                if slot.current_turn_id.as_deref() == Some(turn_id.as_str())
+                    || slot.queue.iter().any(|t| t.turn_id == turn_id)
+                {
+                    return ScheduleResult::Queued;
+                }
+            }
+        }
 
         // Idle (no slot or slot not busy): start immediately.
         let is_idle = inner.slots.get(&session_key).is_none_or(|s| !s.busy);
         if is_idle {
             let slot = inner.slots.entry(session_key).or_insert_with(|| TurnSlot {
                 busy: false,
+                current_turn_id: None,
                 queue: VecDeque::new(),
             });
             slot.busy = true;
+            slot.current_turn_id = Some(turn_id);
             // Started turns are not counted in global_queued (only queued are).
             return ScheduleResult::Started(Box::new(turn));
         }
@@ -560,14 +648,19 @@ impl TurnScheduler {
     /// Always decrements the global queue count when a queued turn is drained.
     pub(crate) fn on_turn_completed(&self, session_key: &str) -> Option<ScheduledTurn> {
         let mut inner = self.inner.lock().expect("turn_scheduler lock");
-        if let Some(slot) = inner.slots.get_mut(session_key) {
-            if let Some(next) = slot.queue.pop_front() {
-                inner.global_queued = inner.global_queued.saturating_sub(1);
-                metrics::set_turn_queue_depth(inner.global_queued);
-                return Some(next);
+        let next = inner
+            .slots
+            .get_mut(session_key)
+            .and_then(|slot| slot.queue.pop_front());
+        if let Some(next) = next {
+            inner.global_queued = inner.global_queued.saturating_sub(1);
+            metrics::set_turn_queue_depth(inner.global_queued);
+            if let Some(slot) = inner.slots.get_mut(session_key) {
+                slot.current_turn_id = Some(next.turn_id.clone());
             }
-            inner.slots.remove(session_key);
+            return Some(next);
         }
+        inner.slots.remove(session_key);
         None
     }
 
@@ -638,6 +731,7 @@ mod tests {
 
     fn test_turn(agent_id: &str, origin_id: &str) -> ScheduledTurn {
         ScheduledTurn {
+            turn_id: format!("turn-{agent_id}-{origin_id}"),
             context: test_context(agent_id),
             input: "hello".to_string(),
             origin_id: origin_id.to_string(),
@@ -841,6 +935,33 @@ mod tests {
         assert!(matches!(result_b, ScheduleResult::Started(_)));
         assert!(scheduler.is_busy(key_a));
         assert!(scheduler.is_busy(key_b));
+    }
+
+    #[test]
+    fn turn_scheduler_dedups_identical_turn_id_as_no_op() {
+        // The dispatcher re-scans the DB every 5s; without dedup the same
+        // turn would be enqueued repeatedly. The scheduler treats a repeat
+        // submission as an idempotent no-op.
+        let scheduler = TurnScheduler::new();
+        let turn = test_turn("agent_a", "orig-1");
+
+        let first = scheduler.submit(turn.clone());
+        assert!(matches!(first, ScheduleResult::Started(_)));
+
+        let second = scheduler.submit(turn.clone());
+        assert!(
+            matches!(second, ScheduleResult::Queued),
+            "duplicate turn_id must be a no-op, not Started again"
+        );
+
+        // After the turn completes and the queue drains, a re-submit is a
+        // fresh start attempt (the prior execution is finished).
+        scheduler.on_turn_completed("discord:ch1:agent:agent_a");
+        let third = scheduler.submit(turn);
+        assert!(
+            matches!(third, ScheduleResult::Started(_)),
+            "after completion a re-submit should be fresh Started"
+        );
     }
 
     // ---- Stop Condition tests ----
@@ -1115,5 +1236,54 @@ mod tests {
         assert!(!tracker.is_active("agent-b"), "other agent unaffected");
         tracker.end_turn("agent-a");
         assert!(!tracker.is_active("agent-a"));
+    }
+
+    #[test]
+    fn rehydrate_executed_restores_per_origin_count_after_restart() {
+        // Arrange: a fresh tracker has no memory of prior executions.
+        let tracker = TurnTracker::new();
+        assert_eq!(tracker.executed_count("ORIG1"), 0);
+
+        // Act: rehydrate counts recovered from durable state at startup.
+        let origins = vec![
+            RecoveredOrigin {
+                origin_id: "ORIG1".to_string(),
+                executed_turn_count: 3,
+                terminal_reason: None,
+            },
+            RecoveredOrigin {
+                origin_id: "ORIG2".to_string(),
+                executed_turn_count: 1,
+                terminal_reason: None,
+            },
+        ];
+        tracker.rehydrate_executed(&origins);
+
+        // Assert: per-origin limits resume from the recovered counts.
+        assert_eq!(tracker.executed_count("ORIG1"), 3);
+        assert_eq!(tracker.executed_count("ORIG2"), 1);
+    }
+
+    // --- Fix 2: a persisted terminal reason must survive rehydration ---
+
+    #[test]
+    fn rehydrate_executed_restores_terminal_reason_after_restart() {
+        let tracker = TurnTracker::new();
+
+        let origins = vec![RecoveredOrigin {
+            origin_id: "ORIG1".to_string(),
+            executed_turn_count: 2,
+            terminal_reason: Some("turn_count_exceeded".to_string()),
+        }];
+        tracker.rehydrate_executed(&origins);
+
+        // The persisted stop reason (durable across restart) is rehydrated so a
+        // later queued turn is rejected with the same reason instead of being
+        // re-dispatched.
+        assert_eq!(
+            tracker.terminal_reason("ORIG1"),
+            Some(StopReason::TurnCountExceeded),
+            "terminal reason must be rehydrated from durable state"
+        );
     }
 }

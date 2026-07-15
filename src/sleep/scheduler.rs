@@ -1,6 +1,7 @@
 //! Sleep batch scheduler — schedule calculation and execution control.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, LocalResult, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -10,7 +11,7 @@ use crate::config::{AgentConfig, AgentId, SleepBatchConfig};
 use crate::runtime::AppState;
 use crate::storage::SleepRunTrigger;
 
-use super::{SleepBatchError, run_sleep_batch};
+use super::{SleepBatchError, recover_memory_publication, run_sleep_batch};
 
 /// Returns the next scheduled run as a UTC instant, or `None` if the scheduler
 /// is disabled or the configuration is incomplete.
@@ -57,10 +58,26 @@ pub(crate) fn resolve_target_agents(
     }
 }
 
-pub(crate) async fn run_scheduled_cycle(state: &AppState) {
+pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
     let config = &state.config.sleep_batch;
     if !config.scheduler_enabled() {
         return;
+    }
+
+    // Retry publication for any run left `running` by a prior transient
+    // publication failure, so a single manual-edit conflict or disk hiccup
+    // cannot permanently stall sleep until a restart. Idempotent: a run the
+    // normal path already finalized is untouched; errors are best-effort
+    // (logged) so one failing run does not abort the whole cycle.
+    //
+    // Recovery runs blocking file I/O + DB work; execute it off the async
+    // scheduler worker via `spawn_blocking` so it cannot stall other scheduled
+    // agents. The join result is awaited so a panicked task stays visible.
+    let recovery_state = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || recover_memory_publication(&recovery_state)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "scheduled cycle: pending-publication retry failed"),
+        Err(e) => warn!(error = %e, "scheduled cycle: pending-publication task panicked"),
     }
 
     let agents = resolve_target_agents(config, &state.config.agents, &state.config.default_agent);
@@ -75,7 +92,7 @@ pub(crate) async fn run_scheduled_cycle(state: &AppState) {
             continue;
         }
 
-        match run_agent_with_retry(state, agent_id).await {
+        match run_agent_with_retry(&state, agent_id).await {
             Ok(()) => {}
             Err(SleepBatchError::AlreadyRunning { .. }) => {
                 info!(agent_id = %agent_id, "scheduled cycle: already running, skipping");
@@ -129,7 +146,7 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
 /// (e.g. if the scheduler becomes disabled at runtime, or when `shutdown` is
 /// cancelled).
 pub(crate) async fn run_scheduler_loop(
-    state: AppState,
+    state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::error::EgoPulseError> {
     loop {
@@ -158,7 +175,7 @@ pub(crate) async fn run_scheduler_loop(
             _ = tokio::time::sleep(delay) => {}
         }
 
-        run_scheduled_cycle(&state).await;
+        run_scheduled_cycle(Arc::clone(&state)).await;
     }
 }
 
@@ -454,10 +471,10 @@ mod tests {
     #[tokio::test]
     async fn scheduler_skips_when_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
         let config = SleepBatchConfig {
             enabled: false,
@@ -513,12 +530,12 @@ mod tests {
     #[tokio::test]
     async fn scheduler_uses_scheduled_trigger() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
-        run_scheduled_cycle(&state).await;
+        run_scheduled_cycle(Arc::clone(&state)).await;
 
         let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
         let scheduled_runs: Vec<_> = runs
@@ -531,15 +548,15 @@ mod tests {
     #[tokio::test]
     async fn scheduler_defers_active_agent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
         state.active_turns.begin_turn("default");
         assert!(state.active_turns.is_active("default"));
 
-        run_scheduled_cycle(&state).await;
+        run_scheduled_cycle(Arc::clone(&state)).await;
 
         state.active_turns.end_turn("default");
 
@@ -550,12 +567,12 @@ mod tests {
     #[tokio::test]
     async fn scheduler_continues_after_skip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
-        run_scheduled_cycle(&state).await;
+        run_scheduled_cycle(Arc::clone(&state)).await;
 
         let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
         assert!(runs.is_empty());
@@ -564,10 +581,10 @@ mod tests {
     #[tokio::test]
     async fn scheduler_logs_already_running_as_skip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
         let run_id = state
             .db
@@ -575,7 +592,7 @@ mod tests {
             .expect("create run")
             .expect("run id");
 
-        run_scheduled_cycle(&state).await;
+        run_scheduled_cycle(Arc::clone(&state)).await;
 
         let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
         assert_eq!(runs.len(), 1);
@@ -590,10 +607,10 @@ mod tests {
     #[tokio::test]
     async fn scheduler_retries_failed_agent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
         let agents = resolve_target_agents(
             &state.config.sleep_batch,
@@ -660,10 +677,10 @@ mod tests {
     #[tokio::test]
     async fn scheduler_loop_exits_when_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_util::build_state_with_provider(
+        let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
-        );
+        ));
 
         let result = run_scheduler_loop(state, tokio_util::sync::CancellationToken::new()).await;
         assert!(result.is_ok());

@@ -988,6 +988,71 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    /// Inserts a `before == after == base` snapshot for every memory file that
+    /// does not yet have one for this run, so the publication bundle has a
+    /// complete snapshot set regardless of which steps ran or were skipped.
+    ///
+    /// `base` is `(MemoryFile, base_content)` for each of the three files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn ensure_memory_snapshots_complete(
+        &self,
+        sleep_run_id: &str,
+        agent_id: &str,
+        base: &[(MemoryFile, &str)],
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (file, base_content) in base {
+            tx.execute(
+                "INSERT INTO memory_snapshots
+                    (id, run_id, agent_id, file, content_before, content_after, created_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?5, ?6
+                 WHERE EXISTS (
+                    SELECT 1 FROM sleep_runs WHERE id = ?2 AND agent_id = ?3
+                 )
+                 AND NOT EXISTS (
+                    SELECT 1 FROM memory_snapshots WHERE run_id = ?2 AND file = ?4
+                 )",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    sleep_run_id,
+                    agent_id,
+                    file.to_string(),
+                    base_content,
+                    now,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lists sleep runs still in `running` status, oldest first.
+    ///
+    /// Used by startup recovery to find runs interrupted by a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn list_running_sleep_runs(&self) -> Result<Vec<SleepRun>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+                    source_chats_json, source_digest_md,
+                    input_tokens, output_tokens, total_tokens, error_message
+             FROM sleep_runs
+             WHERE status = 'running'
+             ORDER BY started_at ASC, rowid ASC",
+        )?;
+        stmt.query_map(params![], row_to_sleep_run)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]

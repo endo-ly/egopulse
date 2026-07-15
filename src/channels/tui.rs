@@ -7,6 +7,8 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::select;
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -92,7 +94,7 @@ struct PendingSend {
 
 /// Owns browser and chat state for the TUI application.
 struct TuiApp {
-    state: AppState,
+    state: Arc<AppState>,
     sessions: Vec<SessionSummary>,
     selected: usize,
     view: View,
@@ -100,7 +102,7 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(state: AppState, sessions: Vec<SessionSummary>) -> Self {
+    fn new(state: Arc<AppState>, sessions: Vec<SessionSummary>) -> Self {
         Self {
             state,
             sessions,
@@ -248,15 +250,49 @@ impl TuiApp {
 }
 
 /// Starts the Ratatui application for browsing and chatting with sessions.
-pub(crate) async fn run(state: AppState) -> Result<(), EgoPulseError> {
+pub(crate) async fn run(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     let sessions = agent_loop::list_sessions(&state.turn_runtime()).await?;
-    let mut app = TuiApp::new(state, sessions);
+    let mut app = TuiApp::new(state.clone(), sessions);
     if app.sessions.is_empty() {
         app.status = "No sessions yet. Press n to create one.".to_string();
     }
 
+    // Monitor the supervisor for critical task failures and
+    // trigger an orderly shutdown. Without this the TUI would keep running
+    // blind after a critical task (e.g. the agent turn worker) panics or exits
+    // unexpectedly — the same guarantee `start_channels` provides for the
+    // daemon path.
+    // Initialize the terminal before spawning the monitor task so a failed
+    // `TuiSession::new` cannot leave the monitor holding the AppState and the
+    // instance lock after early return.
     let mut session = TuiSession::new()?;
-    run_loop(&mut session.terminal, &mut app).await
+
+    let monitor_state = state.clone();
+    let monitor = tokio::spawn(async move {
+        let token = monitor_state.supervisor.shutdown_token();
+        loop {
+            select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    if monitor_state.supervisor.poll_long_lived().is_some() {
+                        monitor_state.supervisor.shutdown().await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let result = run_loop(&mut session.terminal, &mut app).await;
+
+    // Graceful shutdown on exit (quit key or monitor-triggered), draining
+    // in-flight turns before returning. `shutdown` is idempotent, so a
+    // monitor-triggered shutdown here is a no-op.
+    state.supervisor.shutdown().await;
+    // Let the monitor finish its own drain (if it triggered shutdown) before
+    // the process tears down.
+    let _ = monitor.await;
+    result
 }
 
 async fn run_loop(
@@ -264,6 +300,12 @@ async fn run_loop(
     app: &mut TuiApp,
 ) -> Result<(), EgoPulseError> {
     loop {
+        // Exit if a critical task failure triggered an orderly shutdown via the
+        // monitor task.
+        if app.state.supervisor.is_shutting_down() {
+            return Ok(());
+        }
+
         // 描画前に完了済みタスクを取り込み、UI を別スレッド同期なしで更新する。
         poll_pending_send(app).await;
         terminal

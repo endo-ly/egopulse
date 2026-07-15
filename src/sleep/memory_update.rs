@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::llm::{LlmProvider, Message};
-use crate::memory::MemoryContent;
+use crate::memory::MemoryBundle;
 use crate::storage::AgentSessionInfo;
 
 use super::SleepBatchError;
@@ -73,13 +73,13 @@ pub(crate) fn parse_sleep_response(response: &str) -> Result<SleepBatchOutput, S
 #[derive(Debug, Clone)]
 pub(crate) struct SleepPromptInput {
     pub agent_id: String,
-    pub memory: MemoryContent,
+    pub memory: MemoryBundle,
     pub sessions_text: String,
 }
 
 pub(crate) fn build_sleep_input_from_parts(
     agent_id: &str,
-    memory: MemoryContent,
+    memory: MemoryBundle,
     sessions_text: String,
     context_window_tokens: usize,
     minimum_session_tokens: usize,
@@ -198,10 +198,9 @@ pub(crate) fn sleep_chunk_session_tokens(context_window_tokens: usize) -> usize 
     )
 }
 
-fn estimate_memory_tokens(memory: &MemoryContent) -> usize {
-    [memory.semantic.as_deref(), memory.prospective.as_deref()]
+fn estimate_memory_tokens(memory: &MemoryBundle) -> usize {
+    [memory.semantic.as_str(), memory.prospective.as_str()]
         .into_iter()
-        .flatten()
         .map(estimate_text_tokens)
         .sum()
 }
@@ -216,16 +215,16 @@ pub(crate) fn build_sleep_system_prompt(input: &SleepPromptInput) -> String {
 
     let mut input_data = String::new();
 
-    if let Some(ref semantic) = input.memory.semantic {
+    if !input.memory.semantic.is_empty() {
         input_data.push_str(&format!(
             "<memory-semantic>\n{}\n</memory-semantic>\n\n",
-            escape_xml_content(semantic)
+            escape_xml_content(&input.memory.semantic)
         ));
     }
-    if let Some(ref prospective) = input.memory.prospective {
+    if !input.memory.prospective.is_empty() {
         input_data.push_str(&format!(
             "<memory-prospective>\n{}\n</memory-prospective>\n\n",
-            escape_xml_content(prospective)
+            escape_xml_content(&input.memory.prospective)
         ));
     }
     if !input.sessions_text.is_empty() {
@@ -401,7 +400,7 @@ mod tests {
     fn build_sleep_prompt_includes_hippocampus_role() {
         let input = SleepPromptInput {
             agent_id: "lyre".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -413,7 +412,7 @@ mod tests {
     fn build_sleep_prompt_includes_replay_rules() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -425,7 +424,7 @@ mod tests {
     fn build_sleep_prompt_includes_security_rules() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -439,7 +438,7 @@ mod tests {
     fn build_sleep_prompt_treats_memory_as_reference() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -451,10 +450,10 @@ mod tests {
     fn build_sleep_prompt_wraps_inputs_in_xml_like_tags() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent {
-                episodic: Some("ep data".to_string()),
-                semantic: Some("sem data".to_string()),
-                prospective: Some("pro data".to_string()),
+            memory: MemoryBundle {
+                episodic: "ep data".to_string(),
+                semantic: "sem data".to_string(),
+                prospective: "pro data".to_string(),
             },
             sessions_text: "session data".to_string(),
         };
@@ -471,10 +470,10 @@ mod tests {
     fn build_sleep_prompt_escapes_xml_special_chars_in_content() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent {
-                episodic: Some("unused".to_string()),
-                semantic: Some("has <angle> & amp".to_string()),
-                prospective: None,
+            memory: MemoryBundle {
+                episodic: "unused".to_string(),
+                semantic: "has <angle> & amp".to_string(),
+                prospective: String::new(),
             },
             sessions_text: "<script>alert(1)</script>".to_string(),
         };
@@ -488,7 +487,7 @@ mod tests {
     fn build_sleep_prompt_requires_json_output() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -499,7 +498,7 @@ mod tests {
     fn build_sleep_prompt_requires_two_memory_output_keys() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);
@@ -511,7 +510,7 @@ mod tests {
     fn build_sleep_prompt_does_not_request_summary_or_phases() {
         let input = SleepPromptInput {
             agent_id: "test".to_string(),
-            memory: MemoryContent::default(),
+            memory: MemoryBundle::default(),
             sessions_text: String::new(),
         };
         let prompt = build_sleep_system_prompt(&input);

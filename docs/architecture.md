@@ -144,7 +144,7 @@ src/
 │
 ├── setup/               # 初回セットアップウィザード
 │
-├── memory.rs            # 長期記憶ファイルの読み込み（episodic/semantic/prospective）
+├── memory.rs            # 長期記憶 bundle の読み込み・公開・クラッシュリカバリ
 ├── skills.rs            # スキル管理 (発見・読み込み・カタログ生成)
 ├── slash_commands.rs    # slash command dispatcher、LLM プロファイル管理
 ├── sleep/               # sleep batch 実行・scheduler
@@ -295,13 +295,18 @@ pub(crate) struct SurfaceContext {
       │
 3. build_app_state()
        │
+       ├─ InstanceGuard 取得 (state root の排他ロック)
        ├─ Database 初期化 (SQLite WAL, マイグレーション)
        ├─ secret_db 初期化 (Config::needs_secret_db() が true の場合のみ)
        ├─ SkillManager 構築
       ├─ McpManager 初期化 (MCP server 接続)
       ├─ ToolRegistry 構築 (built-in + MCP adapters)
       ├─ ChannelAdapter 登録
-      └─ SOUL.md プロビジョニング
+      ├─ SOUL.md プロビジョニング
+      ├─ Durable state recovery (running tool_calls → uncertain, interrupt された turn_runs を安全停止)
+      ├─ Origin tracker rehydrate (turn_runs から per-chain limit を復元)
+      ├─ **Memory publication recovery** (running Sleep Run の bundle を再公開・整合)
+      └─ Turn dispatcher / Agent turn worker / MCP reconnect loop 起動 (supervisor 経由)
       │
 4. start_channels()
        │
@@ -361,7 +366,7 @@ deadline 付きで停止する。
 | **Sleep Batch** | `sleep/batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
-| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
+| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / scope（DB）単位 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
 | **Conversation Scope Routing** | `runtime/` / `agent_loop/turn_runtime.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnRuntime::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |

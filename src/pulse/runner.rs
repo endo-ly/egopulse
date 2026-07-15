@@ -98,7 +98,6 @@ pub(crate) async fn run_activation(
         chain_depth: 0,
         origin_id: String::new(),
         turn_id: uuid::Uuid::new_v4().to_string(),
-        turn_sender: state.turn_sender.clone(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
         tool_call_id: String::new(),

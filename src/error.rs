@@ -32,8 +32,22 @@ pub enum EgoPulseError {
     SetupWizard(#[from] crate::setup::SetupWizardError),
     #[error("shutdown_requested")]
     ShutdownRequested,
+    /// Another EgoPulse process already holds the exclusive runtime instance
+    /// lock for this state root. The `String` payload is the lock file path,
+    /// surfaced to the operator so they can locate the conflicting process.
+    /// Startup is refused before the database is opened.
+    #[error(
+        "another EgoPulse process already holds the runtime instance lock for this state root: {0}"
+    )]
+    RuntimeAlreadyRunning(String),
     #[error("internal_error: {0}")]
     Internal(String),
+    /// A turn was already being executed by another executor when this one
+    /// tried to begin. This is a benign, expected race (e.g. a recovered turn
+    /// re-dispatched by the turn dispatcher, or a duplicate delivery) and must
+    /// NOT be surfaced as a turn failure or mark the turn terminal.
+    #[error("turn already claimed by another executor")]
+    TurnConcurrencyConflict,
 }
 
 impl EgoPulseError {
@@ -50,6 +64,8 @@ impl EgoPulseError {
             Self::Pulse(_) => "pulse",
             Self::SetupWizard(_) => "setup",
             Self::ShutdownRequested => "shutdown",
+            Self::RuntimeAlreadyRunning(_) => "instance_lock",
+            Self::TurnConcurrencyConflict => "concurrency",
             Self::Internal(_) => "internal",
         }
     }
@@ -313,6 +329,16 @@ pub enum StorageError {
     NotFound(String),
     #[error("storage_conflict: {0}")]
     Conflict(String),
+    /// The per-session durable-pending queue (`turn_runs` in
+    /// `accepted`/`input_committed`) reached its capacity. Decided inside the
+    /// same transaction as the accept INSERT, so a 429 response never leaves a
+    /// runnable row behind.
+    #[error("storage_turn_session_queue_full")]
+    TurnSessionQueueFull,
+    /// The runtime-wide durable-pending queue reached its capacity. Same
+    /// in-transaction guarantee as [`Self::TurnSessionQueueFull`].
+    #[error("storage_turn_global_queue_full")]
+    TurnGlobalQueueFull,
     /// 同一 `turn_id + tool_call_id` で異なる input hash で claim された。
     /// 実行前に拒否し、結果を推測しない。
     #[error(

@@ -29,6 +29,28 @@ pub enum SleepBatchError {
     UnsafeAgentId(String),
     #[error("LLM error: {0}")]
     Llm(String),
+    /// Memory publication failed but the candidate snapshot set is intact, so
+    /// the run is intentionally left `running` (not failed) for a retry — by
+    /// the scheduler on the next cycle, or by startup recovery. The caller
+    /// observes this as an error, never as success.
+    #[error("memory publication pending for run '{run_id}' (agent '{agent_id}'): {reason}")]
+    PublicationPending {
+        agent_id: String,
+        run_id: String,
+        reason: String,
+    },
+    /// Archiving/truncating a source session failed, so the run must NOT be
+    /// finalized as `Success`. The run is intentionally left `running` so a
+    /// retry converges to the same end state (already-archived sessions are
+    /// skipped via a per-session `archive` checkpoint). The caller observes
+    /// this as an error, never as success.
+    #[error("session archive pending for run '{run_id}' (agent '{agent_id}'): {reason}")]
+    ArchivePending {
+        agent_id: String,
+        run_id: String,
+        reason: String,
+    },
 }
 
+pub(crate) use orchestrator::recover_memory_publication;
 pub use orchestrator::{run_events_extract, run_sleep_batch};

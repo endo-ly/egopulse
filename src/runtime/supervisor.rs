@@ -22,15 +22,25 @@
 //!
 //! New turns are not started once shutdown has begun: the intake path refuses
 //! submissions and a completing turn does not start the next queued turn.
+//!
+//! ## Single-instance guarantee
+//!
+//! The supervisor also owns the [`InstanceGuard`]: the exclusive OS advisory
+//! lock that ensures no second EgoPulse process mutates the same state root at
+//! once. The lock is acquired before the database is opened
+//! and held for the whole process; the OS releases it automatically when the
+//! process exits, so a crashed runtime cannot block the next startup.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use fs2::FileExt;
 use futures_util::future::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -50,7 +60,7 @@ const DEFAULT_TASK_DRAIN_SECS: u64 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskKind {
     Channel,
-    AgentTurnWorker,
+    TurnDispatcher,
     McpReconnect,
     SleepScheduler,
     PulseScheduler,
@@ -61,7 +71,7 @@ impl TaskKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Channel => "channel",
-            Self::AgentTurnWorker => "agent_turn_worker",
+            Self::TurnDispatcher => "turn_dispatcher",
             Self::McpReconnect => "mcp_reconnect",
             Self::SleepScheduler => "sleep_scheduler",
             Self::PulseScheduler => "pulse_scheduler",
@@ -137,18 +147,37 @@ pub(crate) struct RuntimeSupervisor {
     accepting_inputs: AtomicBool,
     shutdown_started: AtomicBool,
     runtime_status: Arc<RuntimeStatus>,
+    /// Exclusive OS advisory lock for this state root; held for the process lifetime.
+    instance_guard: Option<Arc<InstanceGuard>>,
     turn_drain: Duration,
     task_drain: Duration,
 }
 
 impl RuntimeSupervisor {
     /// Creates a new supervisor bound to the given [`RuntimeStatus`].
-    pub(crate) fn new(runtime_status: Arc<RuntimeStatus>) -> Self {
-        Self::with_drain(
+    /// Builds a supervisor that also owns the exclusive instance lock for the
+    /// given state root, acquired before the database was opened.
+    pub(crate) fn with_instance_guard(
+        runtime_status: Arc<RuntimeStatus>,
+        instance_guard: Arc<InstanceGuard>,
+    ) -> Self {
+        let mut supervisor = Self::with_drain(
             runtime_status,
             Duration::from_secs(DEFAULT_TURN_DRAIN_SECS),
             Duration::from_secs(DEFAULT_TASK_DRAIN_SECS),
-        )
+        );
+        supervisor.instance_guard = Some(instance_guard);
+        supervisor
+    }
+
+    /// Returns the lock file path backing the held instance guard, if any.
+    pub(crate) fn instance_lock_path(&self) -> Option<PathBuf> {
+        self.instance_guard.as_ref().map(|g| g.path().to_path_buf())
+    }
+
+    /// Whether this process holds the exclusive instance lock for its state root.
+    pub(crate) fn instance_lock_held(&self) -> bool {
+        self.instance_guard.is_some()
     }
 
     fn with_drain(
@@ -163,6 +192,7 @@ impl RuntimeSupervisor {
             accepting_inputs: AtomicBool::new(true),
             shutdown_started: AtomicBool::new(false),
             runtime_status,
+            instance_guard: None,
             turn_drain,
             task_drain,
         }
@@ -282,7 +312,7 @@ impl RuntimeSupervisor {
 
     /// Begins graceful shutdown.
     ///
-    /// Order (per the Phase 3 shutdown protocol):
+    /// Order (per the shutdown protocol):
     /// 1. Stop accepting input (`accepting_inputs = false`, `shutdown_started`).
     /// 2. Drain in-flight turns within the turn deadline, then abort stragglers.
     ///    Workers and channels are still running at this point so turns can
@@ -419,7 +449,11 @@ mod tests {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     fn make_supervisor() -> Arc<RuntimeSupervisor> {
-        Arc::new(RuntimeSupervisor::new(Arc::new(RuntimeStatus::new())))
+        Arc::new(RuntimeSupervisor::with_drain(
+            Arc::new(RuntimeStatus::new()),
+            Duration::from_secs(DEFAULT_TURN_DRAIN_SECS),
+            Duration::from_secs(DEFAULT_TASK_DRAIN_SECS),
+        ))
     }
 
     #[tokio::test]
@@ -614,5 +648,180 @@ mod tests {
         supervisor.shutdown().await;
         assert!(!supervisor.accepting_inputs());
         assert!(supervisor.is_shutting_down());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instance lock
+// ---------------------------------------------------------------------------
+
+/// Name of the lock file created inside the state root.
+const INSTANCE_LOCK_FILE_NAME: &str = "runtime-instance.lock";
+
+/// Holds an exclusive advisory lock for a single state root.
+///
+/// The lock is bound to the underlying file descriptor, which stays open for
+/// as long as this guard is alive (the whole runtime process). Dropping the
+/// guard — or the process exiting, normally or abnormally — closes the file
+/// descriptor and releases the lock. This guarantees that only one EgoPulse
+/// process mutates a given state root at a time.
+#[derive(Debug)]
+pub(crate) struct InstanceGuard {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl InstanceGuard {
+    /// Acquires the exclusive instance lock for `state_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgoPulseError::RuntimeAlreadyRunning`] if another process
+    /// already holds the lock for this state root. Other I/O errors are
+    /// surfaced as [`EgoPulseError::Internal`].
+    pub(crate) fn acquire(state_root: &Path) -> Result<Arc<Self>, EgoPulseError> {
+        let lock_path = state_root.join(INSTANCE_LOCK_FILE_NAME);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                EgoPulseError::Internal(format!(
+                    "failed to open runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        file.try_lock_exclusive().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                EgoPulseError::RuntimeAlreadyRunning(lock_path.display().to_string())
+            } else {
+                EgoPulseError::Internal(format!(
+                    "failed to acquire runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            }
+        })?;
+        Ok(Arc::new(Self {
+            file,
+            path: lock_path,
+        }))
+    }
+
+    /// Acquires the exclusive instance lock on the exact `lock_path` given.
+    ///
+    /// Unlike [`InstanceGuard::acquire`], this does not append a fixed file
+    /// name, so callers may choose an alternate lock file (used by test
+    /// helpers that need a unique lock per `AppState`).
+    #[cfg(test)]
+    pub(crate) fn acquire_at(lock_path: &Path) -> Result<Arc<Self>, EgoPulseError> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| {
+                EgoPulseError::Internal(format!(
+                    "failed to open runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        file.try_lock_exclusive().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                EgoPulseError::RuntimeAlreadyRunning(lock_path.display().to_string())
+            } else {
+                EgoPulseError::Internal(format!(
+                    "failed to acquire runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            }
+        })?;
+        Ok(Arc::new(Self {
+            file,
+            path: lock_path.to_path_buf(),
+        }))
+    }
+
+    /// Path of the lock file backing this guard.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the open lock file is still accessible.
+    ///
+    /// This references the `file` field so it is not considered dead code:
+    /// the open descriptor is the sole source of the OS advisory lock, and
+    /// keeping the field alive is the guard's entire purpose.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.file.metadata().is_ok()
+    }
+}
+
+#[cfg(test)]
+mod instance_guard_tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    #[test]
+    fn second_acquisition_on_same_state_root_fails() {
+        let dir = TempDir::new().unwrap();
+        let _g1 = InstanceGuard::acquire(dir.path()).unwrap();
+        let err = InstanceGuard::acquire(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, EgoPulseError::RuntimeAlreadyRunning(_)),
+            "second runtime must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_is_released_after_drop() {
+        let dir = TempDir::new().unwrap();
+        let g1 = InstanceGuard::acquire(dir.path()).unwrap();
+        assert!(g1.is_valid(), "acquired guard should report valid");
+        drop(g1);
+        // After dropping the guard the OS should have released the advisory lock.
+        let _g2 = InstanceGuard::acquire(dir.path())
+            .expect("lock should be reacquirable after the first guard is dropped");
+    }
+
+    #[test]
+    fn distinct_state_roots_do_not_conflict() {
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        let _g1 = InstanceGuard::acquire(a.path()).unwrap();
+        let _g2 = InstanceGuard::acquire(b.path()).unwrap();
+    }
+
+    #[test]
+    fn acquire_on_nonexistent_nested_state_root_succeeds() {
+        let base = TempDir::new().unwrap();
+        let nested = base.path().join("deeply").join("nested").join("state_root");
+        assert!(
+            !nested.exists(),
+            "precondition: nested path should not exist"
+        );
+
+        std::fs::create_dir_all(&nested).expect("create_dir_all must succeed");
+        let guard = InstanceGuard::acquire(&nested).expect("acquire on created nested path");
+        assert!(guard.is_valid());
+    }
+
+    #[test]
+    fn supervisor_reports_held_instance_lock() {
+        let guard = InstanceGuard::acquire(TempDir::new().unwrap().path()).unwrap();
+        assert!(guard.is_valid());
+        let supervisor =
+            RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
+        assert!(supervisor.instance_lock_held());
+        assert!(supervisor.instance_lock_path().is_some());
+
+        let empty = RuntimeSupervisor::with_drain(
+            Arc::new(RuntimeStatus::new()),
+            Duration::from_secs(DEFAULT_TURN_DRAIN_SECS),
+            Duration::from_secs(DEFAULT_TASK_DRAIN_SECS),
+        );
+        assert!(!empty.instance_lock_held());
+        assert!(empty.instance_lock_path().is_none());
     }
 }

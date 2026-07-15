@@ -53,6 +53,26 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_runtime_shutdown_aborts_total",
             "Tasks aborted by the runtime supervisor after the shutdown deadline elapsed"
         );
+        describe_gauge!(
+            "egopulse_runtime_instance_lock",
+            "1 if this process holds the exclusive runtime instance lock for its state root"
+        );
+        describe_counter!(
+            "egopulse_memory_publication_total",
+            "Memory bundle publications by outcome (started/success/conflict/recovery)"
+        );
+        describe_counter!(
+            "egopulse_memory_snapshot_incomplete_total",
+            "Sleep runs whose memory snapshot set was incomplete at recovery"
+        );
+        describe_counter!(
+            "egopulse_memory_recovery_validation_error_total",
+            "Memory publication recovery validations that could not classify on-disk content"
+        );
+        describe_gauge!(
+            "egopulse_durable_pending_turns",
+            "Durably-accepted turns awaiting execution (turn_runs in accepted/input_committed)"
+        );
 
         handle
     })
@@ -92,6 +112,12 @@ pub(crate) fn set_turn_queue_depth(count: usize) {
     gauge!("egopulse_turn_queue_depth").set(count as f64);
 }
 
+/// Observes the durable-pending backlog so operators can alert on backlog
+/// growth (the availability risk flagged for the dispatcher scan path).
+pub(crate) fn set_durable_pending_turns(count: usize) {
+    gauge!("egopulse_durable_pending_turns").set(count as f64);
+}
+
 pub(crate) fn inc_turn_queue_rejections(reason: &str) {
     counter!("egopulse_turn_queue_rejections_total", "reason" => reason.to_owned()).increment(1);
 }
@@ -111,6 +137,23 @@ pub(crate) fn inc_runtime_task_failures(kind: &str) {
 
 pub(crate) fn inc_runtime_shutdown_aborts(count: usize) {
     counter!("egopulse_runtime_shutdown_aborts_total").increment(count as u64);
+}
+
+pub(crate) fn set_instance_lock_held(held: bool) {
+    gauge!("egopulse_runtime_instance_lock").set(if held { 1.0 } else { 0.0 });
+}
+
+/// `outcome` should be `started`, `success`, `conflict`, or `recovery`.
+pub(crate) fn inc_memory_publication(outcome: &str) {
+    counter!("egopulse_memory_publication_total", "outcome" => outcome.to_owned()).increment(1);
+}
+
+pub(crate) fn inc_memory_snapshot_incomplete() {
+    counter!("egopulse_memory_snapshot_incomplete_total").increment(1);
+}
+
+pub(crate) fn inc_memory_recovery_validation_error() {
+    counter!("egopulse_memory_recovery_validation_error_total").increment(1);
 }
 
 #[cfg(test)]

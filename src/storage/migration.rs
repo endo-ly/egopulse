@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 13;
+pub(super) const SCHEMA_VERSION: i64 = 15;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -800,6 +800,8 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
                 updated_at TEXT NOT NULL,
                 finished_at TEXT,
                 request_payload_hash TEXT,
+                scheduled_request_json TEXT,
+                origin_id TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -902,6 +904,58 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 13;
     }
 
+    if version < 14 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable scheduled turn columns: the serialized accepted
+        // request (so a crashed runtime can rebuild the SurfaceContext) and the
+        // origin chain id.
+        add_column_if_missing(&tx, "turn_runs", "scheduled_request_json", "TEXT")?;
+        add_column_if_missing(&tx, "turn_runs", "origin_id", "TEXT")?;
+
+        // Dispatch scan index (accepted rows with a durable request) and the
+        // origin-recovery index used at startup.
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_turn_runs_dispatch
+                 ON turn_runs(state, accepted_at, turn_id)
+                 WHERE scheduled_request_json IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
+                 ON turn_runs(origin_id, accepted_at)
+                 WHERE origin_id IS NOT NULL;",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            14,
+            "add turn_runs durable scheduled turn columns (scheduled_request_json, origin_id)",
+        )?;
+        tx.commit()?;
+        version = 14;
+    }
+
+    if version < 15 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable origin terminal stop reason. Each human-input chain (origin)
+        // records its per-chain turn count and, once it terminates (LLM failure,
+        // chain depth, turn count, invalid agent), the terminal reason. The
+        // count is rehydrated on startup so the per-chain limit survives a crash;
+        // the terminal reason is rehydrated so a terminated chain is not silently
+        // resumed after a restart.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_origins (
+                origin_id          TEXT PRIMARY KEY,
+                executed_turn_count INTEGER NOT NULL DEFAULT 0,
+                terminal_reason    TEXT,
+                updated_at         TEXT NOT NULL
+            );",
+        )?;
+
+        set_schema_version_in_tx(&tx, 15, "add turn_origins for durable terminal stop reason")?;
+        tx.commit()?;
+        version = 15;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -909,7 +963,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 4;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 6;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1074,6 +1128,8 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
                 updated_at TEXT NOT NULL,
                 finished_at TEXT,
                 request_payload_hash TEXT,
+                scheduled_request_json TEXT,
+                origin_id TEXT,
                 UNIQUE(chat_id, request_key)
             );
 
@@ -1178,6 +1234,53 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 4;
+    }
+
+    if version < 5 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable scheduled turn columns, mirrored from the primary DB.
+        add_column_if_missing(&tx, "turn_runs", "scheduled_request_json", "TEXT")?;
+        add_column_if_missing(&tx, "turn_runs", "origin_id", "TEXT")?;
+
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_turn_runs_dispatch
+                 ON turn_runs(state, accepted_at, turn_id)
+                 WHERE scheduled_request_json IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
+                 ON turn_runs(origin_id, accepted_at)
+                 WHERE origin_id IS NOT NULL;",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            5,
+            "add turn_runs durable scheduled turn columns (secret db)",
+        )?;
+        tx.commit()?;
+        version = 5;
+    }
+
+    if version < 6 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Durable origin terminal stop reason (mirrored from the primary DB).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_origins (
+                origin_id          TEXT PRIMARY KEY,
+                executed_turn_count INTEGER NOT NULL DEFAULT 0,
+                terminal_reason    TEXT,
+                updated_at         TEXT NOT NULL
+            );",
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            6,
+            "add turn_origins for durable terminal stop reason (secret db)",
+        )?;
+        tx.commit()?;
+        version = 6;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
