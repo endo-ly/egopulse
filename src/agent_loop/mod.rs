@@ -27,18 +27,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// A pending turn to be executed for a target agent, enqueued by `agent_send`.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingAgentTurn {
-    /// The surface context for the target agent (same channel, target agent_id).
-    pub context: SurfaceContext,
-    /// The input text in `[From → To] message` format.
-    pub input: String,
-    /// Origin ID: UUID tracking all turns caused by a single human input.
-    /// Propagated from the originating human message through agent_send chains.
-    pub origin_id: String,
-}
-
 /// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
 ///
 /// Extends [`PendingAgentTurn`] with origin tracking for runaway prevention.

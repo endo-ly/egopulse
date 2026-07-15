@@ -148,7 +148,7 @@ pub(crate) async fn submit_agent_turn(
 /// In-memory scheduler capacity after the commit is a wait-time problem, not a
 /// rejection: the turn stays `accepted` and the dispatcher retries as capacity
 /// frees.
-pub(super) async fn submit_scheduled_turn(
+pub(crate) async fn submit_scheduled_turn(
     state: &AppState,
     mut scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
@@ -183,14 +183,40 @@ pub(super) async fn submit_scheduled_turn(
     }
 
     // Durably accept the turn. On failure release the reservation so tracker
-    // capacity is not leaked, and reject so the caller retries.
+    // capacity is not leaked, and reject so the caller retries. Capacity
+    // rejections (per-session / global durable-pending limits) are surfaced as
+    // their own reason codes so callers can return the correct 429; they were
+    // decided inside the same transaction as the INSERT, so no runnable row is
+    // left behind.
     let accepted = match durably_accept_turn(state, &scheduled).await {
         Ok(outcome) => outcome,
         Err(error) => {
             state.turn_tracker.release(&origin_id);
-            tracing::warn!(error = %error, "durable accept failed; rejecting turn");
-            metrics::inc_turn_queue_rejections(RejectReason::Internal.as_str());
-            return SubmitOutcome::Rejected(RejectReason::Internal);
+            let reason = match &error {
+                crate::error::EgoPulseError::Storage(
+                    crate::error::StorageError::TurnSessionQueueFull,
+                ) => {
+                    tracing::info!(
+                        chat_id = ?scheduled.context,
+                        "turn rejected: per-session durable queue full"
+                    );
+                    metrics::inc_turn_queue_rejections("session_queue_full");
+                    RejectReason::SessionQueueFull
+                }
+                crate::error::EgoPulseError::Storage(
+                    crate::error::StorageError::TurnGlobalQueueFull,
+                ) => {
+                    tracing::info!("turn rejected: global durable queue full");
+                    metrics::inc_turn_queue_rejections("global_queue_full");
+                    RejectReason::GlobalQueueFull
+                }
+                _ => {
+                    tracing::warn!(error = %error, "durable accept failed; rejecting turn");
+                    metrics::inc_turn_queue_rejections(RejectReason::Internal.as_str());
+                    RejectReason::Internal
+                }
+            };
+            return SubmitOutcome::Rejected(reason);
         }
     };
 

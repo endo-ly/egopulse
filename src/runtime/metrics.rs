@@ -69,6 +69,10 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_memory_recovery_validation_error_total",
             "Memory publication recovery validations that could not classify on-disk content"
         );
+        describe_gauge!(
+            "egopulse_durable_pending_turns",
+            "Durably-accepted turns awaiting execution (turn_runs in accepted/input_committed)"
+        );
 
         handle
     })
@@ -106,6 +110,12 @@ pub(crate) fn set_active_turns_gauge(count: usize) {
 
 pub(crate) fn set_turn_queue_depth(count: usize) {
     gauge!("egopulse_turn_queue_depth").set(count as f64);
+}
+
+/// Observes the durable-pending backlog so operators can alert on backlog
+/// growth (the availability risk flagged for the dispatcher scan path).
+pub(crate) fn set_durable_pending_turns(count: usize) {
+    gauge!("egopulse_durable_pending_turns").set(count as f64);
 }
 
 pub(crate) fn inc_turn_queue_rejections(reason: &str) {

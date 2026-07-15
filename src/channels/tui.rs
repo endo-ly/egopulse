@@ -94,7 +94,7 @@ struct PendingSend {
 
 /// Owns browser and chat state for the TUI application.
 struct TuiApp {
-    state: AppState,
+    state: Arc<AppState>,
     sessions: Vec<SessionSummary>,
     selected: usize,
     view: View,
@@ -102,7 +102,7 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(state: AppState, sessions: Vec<SessionSummary>) -> Self {
+    fn new(state: Arc<AppState>, sessions: Vec<SessionSummary>) -> Self {
         Self {
             state,
             sessions,
@@ -250,7 +250,7 @@ impl TuiApp {
 }
 
 /// Starts the Ratatui application for browsing and chatting with sessions.
-pub(crate) async fn run(state: AppState) -> Result<(), EgoPulseError> {
+pub(crate) async fn run(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     let sessions = agent_loop::list_sessions(&state.turn_runtime()).await?;
     let mut app = TuiApp::new(state.clone(), sessions);
     if app.sessions.is_empty() {

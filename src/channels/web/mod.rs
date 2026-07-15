@@ -275,7 +275,7 @@ fn asset_or_index(uri: &Uri) -> Response {
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
 pub(crate) async fn run_server(
-    state: AppState,
+    state: Arc<AppState>,
     host: &str,
     port: u16,
     shutdown: tokio_util::sync::CancellationToken,
@@ -303,7 +303,7 @@ pub(crate) async fn run_server(
 
     let web_state = WebState {
         config_path: state.config_path.clone(),
-        app_state: Arc::new(state),
+        app_state: Arc::clone(&state),
         run_hub: RunHub::default(),
         active_ws_connections: Arc::new(AtomicUsize::new(0)),
     };
@@ -1254,12 +1254,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_route_accepts_past_scheduler_capacity_and_leaves_durable_row() {
-        // Acceptance contract: once the DB commit succeeds the turn *is*
-        // accepted. Scheduler capacity after the commit is a wait-time problem,
-        // not a rejection — the turn stays `accepted` in the DB and the
-        // dispatcher retries as capacity frees. Therefore a request that would
-        // previously have returned 429 now returns 202.
+    async fn webhook_route_rejects_past_durable_pending_capacity() {
+        // Acceptance contract: durable-pending capacity (turn_runs in
+        // accepted/input_committed) is enforced atomically with the accept
+        // INSERT, in the same transaction. A request that would exceed the
+        // per-session durable limit is rejected with 429 and leaves NO runnable
+        // row behind. In-memory scheduler pressure after a successful commit is
+        // a separate concern (a 202-deferred wait for the dispatcher); this test
+        // exercises the durable cap, not post-commit deferral.
         let provider_entered = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(dir.path().to_str().expect("state root"));
@@ -1303,9 +1305,7 @@ mod tests {
         });
 
         // Each post carries a distinct `event_id` so it is a distinct message
-        // (not a duplicate delivery). The durable intake dedupes identical
-        // request keys, so the queue-full path must be exercised with distinct
-        // messages rather than repeated identical ones.
+        // (not a duplicate delivery).
         let post = |event_id: u64| {
             app.clone().oneshot(
                 Request::post("/api/webhooks/egograph")
@@ -1316,13 +1316,10 @@ mod tests {
             )
         };
 
-        // First request starts the turn; the blocking provider keeps it busy.
+        // First request starts the turn; the blocking provider keeps it busy so
+        // it stays the active (non-pending) turn holding the session slot.
         let started = post(0).await.expect("response");
         assert_eq!(started.status(), StatusCode::ACCEPTED);
-
-        // Wait until the first turn actually reaches the blocking provider
-        // (it is now the active turn holding the session slot, not a queued
-        // one) before filling the queue.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while provider_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             if std::time::Instant::now() > deadline {
@@ -1331,17 +1328,17 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Fill the per-session queue up to the limit; each is accepted (202).
-        for i in 1..=crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION {
+        // Fill the per-session durable-pending queue up to the limit; each is
+        // accepted (202).
+        for i in 1..=crate::storage::MAX_DURABLE_PENDING_PER_SESSION {
             let resp = post(i as u64).await.expect("response");
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
         }
 
-        // The next distinct request exceeds the per-session scheduler queue
-        // limit, but the DB commit already succeeded so it is still accepted
-        // (202) and left in `turn_runs` for the dispatcher to retry.
+        // The next distinct request exceeds the per-session durable-pending
+        // limit and is rejected with 429 (no runnable row left behind).
         let beyond = post(9999).await.expect("response");
-        assert_eq!(beyond.status(), StatusCode::ACCEPTED);
+        assert_eq!(beyond.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

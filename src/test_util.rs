@@ -116,7 +116,6 @@ pub(crate) fn build_state_with_config(
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status: Arc::new(RuntimeStatus::new()),
         instance_guard: acquire_test_instance_guard(Path::new(&config.state_root)),
     })
@@ -171,7 +170,6 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         chain_depth: 0,
         origin_id: String::new(),
         turn_id: String::new(),
-        turn_sender: tokio::sync::mpsc::channel(16).0,
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
         tool_call_id: String::new(),

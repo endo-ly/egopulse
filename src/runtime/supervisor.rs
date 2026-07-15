@@ -60,7 +60,6 @@ const DEFAULT_TASK_DRAIN_SECS: u64 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskKind {
     Channel,
-    AgentTurnWorker,
     TurnDispatcher,
     McpReconnect,
     SleepScheduler,
@@ -72,7 +71,6 @@ impl TaskKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Channel => "channel",
-            Self::AgentTurnWorker => "agent_turn_worker",
             Self::TurnDispatcher => "turn_dispatcher",
             Self::McpReconnect => "mcp_reconnect",
             Self::SleepScheduler => "sleep_scheduler",

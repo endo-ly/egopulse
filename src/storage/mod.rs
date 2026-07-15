@@ -8,6 +8,16 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+/// Maximum durable-pending turns (`turn_runs` in `accepted`/`input_committed`)
+/// allowed per session. Enforced atomically with the accept INSERT so a
+/// capacity rejection never leaves a runnable row.
+pub(crate) const MAX_DURABLE_PENDING_PER_SESSION: i64 = 32;
+/// Maximum durable-pending turns runtime-wide.
+pub(crate) const MAX_DURABLE_PENDING_GLOBAL: i64 = 512;
+/// Upper bound on how many durable-pending turns the dispatcher re-enqueues per
+/// scan, so a large backlog cannot turn each 5s tick into a full-table walk.
+pub(crate) const DISPATCHER_BATCH_LIMIT: i64 = 256;
+
 macro_rules! define_enum {
     (
         $(#[$outer:meta])*
@@ -250,7 +260,7 @@ pub(crate) struct SessionSnapshot {
     pub recent_messages: Vec<StoredMessage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AgentSessionInfo {
     pub chat_id: i64,
     pub channel: String,
@@ -348,24 +358,19 @@ impl TurnRunState {
             return false;
         }
         match from {
+            // A turn can only be discarded (cancelled) while it is still queued,
+            // before the executor has started a model iteration. Once execution
+            // has begun the turn is owned by its executor and must be finalized
+            // by it (Failed/Completed/Uncertain), never discarded at the DB level.
             Accepted => matches!(to, InputCommitted | Failed | Uncertain | Cancelled),
             InputCommitted => matches!(to, ModelPending | Failed | Uncertain | Cancelled),
-            ModelPending => {
-                matches!(to, ModelCompleted | Failed | Uncertain | Cancelled)
-            }
+            ModelPending => matches!(to, ModelCompleted | Failed | Uncertain),
             ModelCompleted => matches!(
                 to,
-                ToolsPending | Completed | ModelPending | Failed | Uncertain | Cancelled
+                ToolsPending | Completed | ModelPending | Failed | Uncertain
             ),
-            ToolsPending => {
-                matches!(to, ToolsCompleted | Failed | Uncertain | Cancelled)
-            }
-            ToolsCompleted => {
-                matches!(
-                    to,
-                    ModelPending | Completed | Failed | Uncertain | Cancelled
-                )
-            }
+            ToolsPending => matches!(to, ToolsCompleted | Failed | Uncertain),
+            ToolsCompleted => matches!(to, ModelPending | Completed | Failed | Uncertain),
             // 終端状態は上で弾いているのでここには来ない。
             Completed | Failed | Cancelled | Uncertain => false,
         }
@@ -532,6 +537,14 @@ pub(crate) struct SleepStepCheckpoint {
     pub cursor_at: String,
     pub cursor_id: String,
     pub updated_at: String,
+}
+
+/// A durable-pending turn surfaced by the dispatcher scan: enough to rebuild
+/// and re-enqueue the turn without a follow-up per-row SELECT (no N+1).
+#[derive(Debug, Clone)]
+pub(crate) struct DurablePendingTurn {
+    pub turn_id: String,
+    pub scheduled_request_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

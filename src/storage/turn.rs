@@ -23,7 +23,10 @@ use rusqlite::TransactionBehavior;
 use rusqlite::params;
 
 use crate::error::StorageError;
-use crate::storage::{Database, StoredMessage, TurnRunState};
+use crate::storage::{
+    Database, DurablePendingTurn, MAX_DURABLE_PENDING_GLOBAL, MAX_DURABLE_PENDING_PER_SESSION,
+    StoredMessage, TurnRunState,
+};
 
 /// One row of `turn_runs`, read back for lifecycle decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +225,10 @@ impl Database {
         scheduled_request_json: Option<&str>,
     ) -> Result<AcceptOutcome, StorageError> {
         let mut conn = self.get_conn()?;
-        let tx = conn.transaction()?;
+        // BEGIN IMMEDIATE acquires the write lock up front so the capacity
+        // count and the INSERT are observed atomically by other acceptors:
+        // no concurrent accept can pass the same limit and overshoot.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = chrono::Utc::now().to_rfc3339();
         let proposed_turn_id = uuid::Uuid::new_v4().to_string();
         // A root turn (no incoming origin) uses its own turn_id as the origin so
@@ -230,6 +236,39 @@ impl Database {
         let persisted_origin_id = origin_id
             .filter(|s| !s.is_empty())
             .unwrap_or(&proposed_turn_id);
+
+        // Durable-pending capacity gate (per-session then runtime-wide),
+        // evaluated inside the same transaction that will perform the INSERT.
+        // A rejection here surfaces as a 429 to the caller and leaves no row
+        // behind. Existing re-deliveries (the ON CONFLICT DO NOTHING path below)
+        // are not "new" pending load, so they must bypass the cap: only count
+        // when the request_key is not already present for this chat.
+        let already_present: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM turn_runs WHERE chat_id = ?1 AND request_key = ?2",
+            params![chat_id, request_key],
+            |row| row.get(0),
+        )?;
+        if already_present == 0 {
+            let session_pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM turn_runs
+                 WHERE chat_id = ?1 AND state IN ('accepted', 'input_committed')",
+                params![chat_id],
+                |row| row.get(0),
+            )?;
+            if session_pending >= MAX_DURABLE_PENDING_PER_SESSION {
+                return Err(StorageError::TurnSessionQueueFull);
+            }
+            let global_pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM turn_runs
+                 WHERE state IN ('accepted', 'input_committed')",
+                [],
+                |row| row.get(0),
+            )?;
+            if global_pending >= MAX_DURABLE_PENDING_GLOBAL {
+                return Err(StorageError::TurnGlobalQueueFull);
+            }
+        }
+
         tx.execute(
             "INSERT INTO turn_runs
                  (turn_id, chat_id, request_key, state, config_revision,
@@ -320,19 +359,44 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite read fails.
-    pub(crate) fn scan_durable_pending_turn_ids(&self) -> Result<Vec<String>, StorageError> {
+    pub(crate) fn scan_durable_pending_turns(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<DurablePendingTurn>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT turn_id
+            "SELECT turn_id, scheduled_request_json
              FROM turn_runs
              WHERE state IN ('accepted', 'input_committed')
                AND scheduled_request_json IS NOT NULL
-             ORDER BY accepted_at ASC, turn_id ASC",
+             ORDER BY accepted_at ASC, turn_id ASC
+             LIMIT ?1",
         )?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(DurablePendingTurn {
+                    turn_id: row.get(0)?,
+                    scheduled_request_json: row.get(1)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ids)
+        Ok(rows)
+    }
+
+    /// Total durable-pending turn count (`accepted`/`input_committed`), for
+    /// backlog observability. Uses `idx_turn_runs_state`, so it stays cheap
+    /// regardless of table size. Unlike [`Self::scan_durable_pending_turns`]
+    /// this is not batch-limited, so it reflects the true backlog even when it
+    /// exceeds the dispatcher batch.
+    pub(crate) fn count_durable_pending(&self) -> Result<i64, StorageError> {
+        let conn = self.get_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turn_runs
+             WHERE state IN ('accepted', 'input_committed')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Validates `from -> to` against the central transition rule and, if
@@ -642,6 +706,54 @@ impl Database {
                  updated_at = ?5
              WHERE turn_id = ?1",
             params![turn_id, to.to_string(), error_kind, error_message, &now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Terminates a durably accepted turn that will never execute, recording why.
+    ///
+    /// Used when the turn dispatcher drops a turn because its origin already has a
+    /// terminal stop reason, or [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`]
+    /// refuses it (chain depth, turn count, missing agent). Moving the turn to
+    /// `cancelled` (with `error_kind` / `error_message`) prevents the dispatcher
+    /// from re-scanning and re-dispatching it on every 5s loop — otherwise a
+    /// discarded turn stays `accepted` forever and is retried indefinitely.
+    ///
+    /// Idempotent: a turn that is already terminal is left untouched (the
+    /// cancellation is treated as already applied).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] when the current state cannot be
+    /// cancelled (e.g. the turn is already mid-model-loop).
+    pub(crate) fn cancel_turn(
+        &self,
+        turn_id: &str,
+        error_kind: &str,
+        error_message: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let current = read_state_locked(&tx, turn_id)?;
+        if current.is_terminal() {
+            return Ok(());
+        }
+        if !TurnRunState::can_transition(current, TurnRunState::Cancelled) {
+            return Err(StorageError::Conflict(format!(
+                "cancel rejected from state {current}"
+            )));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE turn_runs
+             SET state = 'cancelled',
+                 error_kind = ?2,
+                 error_message = ?3,
+                 finished_at = ?4,
+                 updated_at = ?4
+             WHERE turn_id = ?1",
+            params![turn_id, error_kind, error_message, &now],
         )?;
         tx.commit()?;
         Ok(())
@@ -1310,6 +1422,63 @@ mod tests {
     }
 
     #[test]
+    fn cancel_turn_moves_accepted_to_cancelled_with_reason() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "cancel-me").turn_id;
+
+        // Act
+        db.cancel_turn(&turn_id, "chain_depth_exceeded", "origin chain terminated")
+            .expect("cancel");
+
+        // Assert
+        let run = db.get_turn_run(&turn_id).expect("get");
+        assert_eq!(run.state, TurnRunState::Cancelled);
+        assert_eq!(run.error_kind.as_deref(), Some("chain_depth_exceeded"));
+        assert_eq!(
+            run.error_message.as_deref(),
+            Some("origin chain terminated")
+        );
+        assert!(run.finished_at.is_some());
+    }
+
+    #[test]
+    fn cancel_turn_is_idempotent_on_terminal_state() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "cancel-idem").turn_id;
+        db.cancel_turn(&turn_id, "turn_count_exceeded", "stop")
+            .expect("first cancel");
+
+        // Act: a second cancel must not error.
+        db.cancel_turn(&turn_id, "turn_count_exceeded", "stop")
+            .expect("second cancel");
+
+        // Assert
+        assert_eq!(state(&db, &turn_id), TurnRunState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_turn_rejected_from_non_cancellable_state() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "no-cancel").turn_id;
+        let mut rev = None;
+        commit_input(&db, &turn_id, &mut rev);
+        db.begin_turn_model_iteration(&turn_id, 1, "h")
+            .expect("begin");
+
+        // Act
+        let error = db
+            .cancel_turn(&turn_id, "x", "y")
+            .expect_err("cannot cancel mid-loop");
+
+        // Assert
+        assert!(matches!(error, StorageError::Conflict(_)));
+        assert_eq!(state(&db, &turn_id), TurnRunState::ModelPending);
+    }
+
+    #[test]
     fn recover_interrupted_leaves_terminal_states_untouched() {
         // Arrange
         let (db, _dir) = test_db();
@@ -1388,7 +1557,12 @@ mod tests {
             .expect("age durable");
 
         // Act
-        let ids = db.scan_durable_pending_turn_ids().expect("scan");
+        let ids = db
+            .scan_durable_pending_turns(100)
+            .expect("scan")
+            .into_iter()
+            .map(|p| p.turn_id)
+            .collect::<Vec<_>>();
 
         // Assert: only the durable turn is returned; the legacy one is excluded.
         assert_eq!(ids, vec![durable.turn_id]);
@@ -1456,7 +1630,12 @@ mod tests {
         commit_input(&db, &legacy.turn_id, &mut rev);
 
         // Act
-        let ids = db.scan_durable_pending_turn_ids().expect("scan");
+        let ids = db
+            .scan_durable_pending_turns(100)
+            .expect("scan")
+            .into_iter()
+            .map(|p| p.turn_id)
+            .collect::<Vec<_>>();
 
         // Assert: both durable turns are returned;
         // the legacy turn (no request) is excluded.
@@ -1491,7 +1670,12 @@ mod tests {
         };
 
         // Act
-        let ids = db.scan_durable_pending_turn_ids().expect("scan");
+        let ids = db
+            .scan_durable_pending_turns(100)
+            .expect("scan")
+            .into_iter()
+            .map(|p| p.turn_id)
+            .collect::<Vec<_>>();
 
         // Assert: A appears before B regardless of state difference.
         let pos_a = ids.iter().position(|id| id == &a.turn_id);
@@ -1501,6 +1685,90 @@ mod tests {
             "input_committed turn A must dispatch before accepted turn B; got {:?}",
             ids
         );
+    }
+
+    #[test]
+    fn accept_rejects_when_per_session_durable_pending_full() {
+        let (db, _dir) = test_db();
+        // Fill the session up to the per-session durable limit.
+        for i in 0..MAX_DURABLE_PENDING_PER_SESSION {
+            db.accept_or_get_turn(
+                1,
+                &format!("sess:k{i}"),
+                1,
+                Some("fp"),
+                "h",
+                None,
+                Some("{}"),
+            )
+            .expect("accept within limit");
+        }
+        // The next distinct request for the same session is rejected.
+        let err = db
+            .accept_or_get_turn(1, "sess:overflow", 1, Some("fp"), "h", None, Some("{}"))
+            .expect_err("expected session queue full");
+        assert!(matches!(err, StorageError::TurnSessionQueueFull));
+        // A different session is still accepted (the cap is per-session).
+        db.accept_or_get_turn(2, "other:k", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("accept on a different session");
+    }
+
+    #[test]
+    fn accept_capacity_check_skips_existing_request_key() {
+        // A re-delivery of an already-accepted request_key must NOT be counted
+        // as new pending load, so it must bypass the capacity gate (otherwise
+        // retrying a turn in a full session would 429 instead of dedup).
+        let (db, _dir) = test_db();
+        for i in 0..MAX_DURABLE_PENDING_PER_SESSION {
+            db.accept_or_get_turn(
+                1,
+                &format!("sess:k{i}"),
+                1,
+                Some("fp"),
+                "h",
+                None,
+                Some("{}"),
+            )
+            .expect("accept within limit");
+        }
+        // Re-deliver the first request_key: should return Existing, not 429.
+        let outcome = db
+            .accept_or_get_turn(1, "sess:k0", 1, Some("fp"), "h", None, Some("{}"))
+            .expect("redelivery bypasses cap");
+        assert!(matches!(outcome, AcceptOutcome::Existing(_)));
+    }
+
+    #[test]
+    fn accept_rejects_when_global_durable_pending_full() {
+        let (db, _dir) = test_db();
+        // Fill the runtime-wide limit by spreading one turn per session.
+        for i in 0..MAX_DURABLE_PENDING_GLOBAL {
+            db.accept_or_get_turn(
+                // chat_id must be unique per row; offset by 1 to avoid the
+                // seeded chat_id=1 collisions.
+                i + 100,
+                &format!("g:k{i}"),
+                1,
+                Some("fp"),
+                "h",
+                None,
+                Some("{}"),
+            )
+            .expect("accept within global limit");
+        }
+        // A brand-new session's first turn is rejected globally.
+        let err = db
+            .accept_or_get_turn(
+                MAX_DURABLE_PENDING_GLOBAL + 1000,
+                "g:overflow",
+                1,
+                Some("fp"),
+                "h",
+                None,
+                Some("{}"),
+            )
+            .expect_err("expected global queue full");
+        assert!(matches!(err, StorageError::TurnGlobalQueueFull));
     }
 
     #[test]

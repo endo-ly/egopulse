@@ -752,7 +752,6 @@ impl TurnExecutor<'_> {
             chain_depth: self.context.chain_depth,
             origin_id: self.context.origin_id.clone(),
             turn_id: turn_id.to_string(),
-            turn_sender: self.state.turn_sender.clone(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             scope: self.context.scope,
             tool_call_id: String::new(),

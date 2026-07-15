@@ -168,7 +168,12 @@ impl std::fmt::Display for RejectReason {
 ///
 /// `Started` hands the turn back so the caller can begin execution; `Queued`
 /// means the turn was buffered behind an in-progress turn; `Rejected` means
-/// the turn was refused and must not be executed.
+/// the in-memory scheduler is at capacity. The durable intake converts a
+/// `Rejected` here into `SubmitOutcome::Queued` (deferred to the dispatcher),
+/// because the turn is already durably accepted — capacity is the dispatcher's
+/// wait-time problem, never a caller-visible rejection. Acceptance-level
+/// capacity rejection (`session_queue_full` / `global_queue_full`) is decided
+/// earlier, in the same transaction as the durable commit.
 pub(crate) enum ScheduleResult {
     Started(Box<ScheduledTurn>),
     Queued,

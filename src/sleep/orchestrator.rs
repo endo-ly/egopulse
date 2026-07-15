@@ -17,8 +17,8 @@ use crate::memory::{MemoryBundle, MemoryError};
 use crate::runtime::AppState;
 use crate::storage::{
     AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, MemorySnapshot,
-    RollupGranularity, SleepRun, SleepRunTrigger, SleepStepCheckpoint, SleepStepName,
-    SleepStepResult, SleepStepStatus, call_blocking,
+    RollupGranularity, SleepRun, SleepRunStatus, SleepRunTrigger, SleepStepCheckpoint,
+    SleepStepName, SleepStepResult, SleepStepStatus, call_blocking,
 };
 
 use super::SleepBatchError;
@@ -496,25 +496,41 @@ async fn execute_batch(
 ) -> Result<(), SleepBatchError> {
     let run_id = create_sleep_run(&db, agent_id, trigger).await?;
 
+    // Persist the archive-target plan (the serialized source sessions) BEFORE
+    // any publication, so a crash between publication and finalization still
+    // leaves startup recovery enough to drive the same archive/truncate step
+    // and converge to the normal-path state.
+    let run_id_for_source = run_id.clone();
+    let source_chats = source_chats_json.to_string();
+    call_blocking(Arc::clone(&db), move |db| {
+        db.update_sleep_run_source_chats(&run_id_for_source, &source_chats)
+    })
+    .await?;
+
     let result = async {
         let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id).await?;
         run_event_extraction_step(&mut ctx, &db, agent_id).await?;
         run_episodic_update_step(&mut ctx, state, &db, agent_id).await?;
         run_memory_update_step(&mut ctx, &db, agent_id).await?;
 
-        finalize_batch(&ctx, state, &db, agent_id, sessions, source_chats_json).await?;
+        finalize_batch(&ctx, state, &db, agent_id).await?;
 
         Ok::<(), SleepBatchError>(())
     }
     .await;
 
     if let Err(error) = result {
-        let run_id_owned = run_id.clone();
-        let error_message = error.to_string();
-        call_blocking(db, move |db| {
-            db.update_sleep_run_failed(&run_id_owned, &error_message)
-        })
-        .await?;
+        // PublicationPending intentionally leaves the run `running` so the
+        // candidate snapshot set survives for retry (scheduler cycle or startup
+        // recovery); only real failures mark the run failed.
+        if !matches!(error, SleepBatchError::PublicationPending { .. }) {
+            let run_id_owned = run_id.clone();
+            let error_message = error.to_string();
+            call_blocking(db, move |db| {
+                db.update_sleep_run_failed(&run_id_owned, &error_message)
+            })
+            .await?;
+        }
         return Err(error);
     }
 
@@ -1374,29 +1390,89 @@ async fn finalize_batch(
     state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
-    sessions: &[AgentSessionInfo],
-    source_chats_json: &str,
 ) -> Result<(), SleepBatchError> {
-    // Publish the candidate bundle BEFORE archiving source sessions. If
-    // publication fails (manual-edit conflict or I/O error), the candidate is
-    // still valuable: leave the run `running` and return without archiving or
-    // finalizing. The candidate survives in `memory_snapshots`, startup
-    // recovery re-drives publication, and the still-running run blocks new
-    // sleep runs until the operator resolves the conflict (e.g. restart). This
-    // avoids losing the generated memory just because the final write failed.
+    // Publish the candidate bundle BEFORE finalizing. A retryable publication
+    // failure (manual-edit conflict or transient I/O, surfaced as
+    // `SleepBatchError::Io`) is wrapped in `PublicationPending`: the run is
+    // intentionally left `running` (not failed) so the candidate snapshot set
+    // survives for retry by the next scheduler cycle or startup recovery. The
+    // caller must NOT treat this as success. Non-retryable failures (incomplete
+    // snapshot set, unsafe agent id, unclassifiable disk content) propagate
+    // unchanged so `execute_batch` hard-fails the run instead of looping.
     if let Err(error) = publish_memory_bundle(state, db, ctx, agent_id).await {
-        warn!(
-            agent_id = %agent_id,
-            run_id = %ctx.run_id,
-            error = %error,
-            "memory publication failed; run left running for startup recovery"
-        );
-        return Ok(());
+        if let SleepBatchError::Io(reason) = error {
+            warn!(
+                agent_id = %agent_id,
+                run_id = %ctx.run_id,
+                error = %reason,
+                "memory publication failed; run left running for retry"
+            );
+            return Err(SleepBatchError::PublicationPending {
+                agent_id: agent_id.to_string(),
+                run_id: ctx.run_id.clone(),
+                reason,
+            });
+        }
+        return Err(error);
     }
 
+    // Publication succeeded: drive the shared post-publication finalization
+    // (archive / truncate / finalize). Reused by startup recovery so both
+    // paths converge to the same end state. The blocking helper does only
+    // quick DB + file writes; like the checkpoint/archive reads elsewhere in
+    // the batch it runs inline rather than via `call_blocking`.
+    let run_id_for_load = ctx.run_id.clone();
+    let run = call_blocking(Arc::clone(db), move |db| db.get_sleep_run(&run_id_for_load))
+        .await?
+        .ok_or_else(|| SleepBatchError::Internal(format!("sleep run vanished: {}", ctx.run_id)))?;
     let groups_dir = state.config.groups_dir();
     let secrets = crate::tools::collect_config_secrets(&state.config);
-    for session in sessions {
+    finalize_published_run_blocking(
+        db.as_ref(),
+        &groups_dir,
+        &secrets,
+        &run,
+        Some(ctx.provider.provider_name()),
+    )?;
+    Ok(())
+}
+
+/// Synchronously drives the post-publication finalization for a run: archive +
+/// truncate the source sessions, then transition the run `Running → Success`.
+///
+/// This is the single, idempotent convergence point shared by the normal path
+/// ([`finalize_batch`], via `call_blocking`) and startup recovery
+/// ([`recover_run_publication`], called directly). The archive-target sessions
+/// are reconstructed from the run's `source_chats_json`, which is persisted
+/// **before** publication so a crash between publication and this call still
+/// leaves enough to converge.
+///
+/// Idempotency: if the run is no longer `Running` the function is a no-op, so a
+/// duplicate invocation (recovery after the normal path already finalized)
+/// does not re-archive. `finalize_sleep_run` itself is a conditional
+/// `Running → Success` transition, providing the atomic gate.
+///
+/// `provider_name` controls the optional batch-level token metric bump; it is
+/// `Some` on the normal path and `None` during recovery (per-call usage was
+/// already logged by each step's LLM call).
+fn finalize_published_run_blocking(
+    db: &Database,
+    groups_dir: &Path,
+    secrets: &[(String, String)],
+    run: &SleepRun,
+    provider_name: Option<&str>,
+) -> Result<(), SleepBatchError> {
+    // Idempotency: nothing to do once the run left the Running state.
+    if run.status != SleepRunStatus::Running {
+        return Ok(());
+    }
+    let agent_id = run.agent_id.as_str();
+    let sessions: Vec<AgentSessionInfo> =
+        serde_json::from_str(&run.source_chats_json).map_err(|e| {
+            SleepBatchError::Internal(format!("decode source_chats_json for run {}: {e}", run.id))
+        })?;
+
+    for session in &sessions {
         let source_id = session.chat_id.to_string();
         let event_checkpoint = db.get_sleep_checkpoint(
             agent_id,
@@ -1428,7 +1504,7 @@ async fn finalize_batch(
         if latest > boundary {
             continue;
         }
-        if let Err(e) = archive_and_clear_session(db, &groups_dir, session, &secrets) {
+        if let Err(e) = archive_and_clear_session(db, groups_dir, session, secrets) {
             warn!(
                 agent_id = %agent_id,
                 chat_id = session.chat_id,
@@ -1438,46 +1514,32 @@ async fn finalize_batch(
         }
     }
 
-    let run_id_for_source = ctx.run_id.clone();
-    let source_chats = source_chats_json.to_string();
-    call_blocking(Arc::clone(db), move |db| {
-        db.update_sleep_run_source_chats(&run_id_for_source, &source_chats)
-    })
-    .await?;
+    let derived_status = db.finalize_sleep_run(&run.id)?;
 
-    let run_id_for_finalize = ctx.run_id.clone();
-    let derived_status = call_blocking(Arc::clone(db), move |db| {
-        db.finalize_sleep_run(&run_id_for_finalize)
-    })
-    .await?;
-
-    let run_id_for_tokens = ctx.run_id.clone();
-    if let Ok(Some(run)) = call_blocking(Arc::clone(db), move |db| {
-        db.get_sleep_run(&run_id_for_tokens)
-    })
-    .await
-    {
-        if run.input_tokens > 0 || run.output_tokens > 0 {
-            let provider_name = ctx.provider.provider_name().to_string();
-            crate::runtime::metrics::inc_llm_tokens_total(
-                "input",
-                &provider_name,
-                run.input_tokens,
-            );
-            crate::runtime::metrics::inc_llm_tokens_total(
-                "output",
-                &provider_name,
-                run.output_tokens,
-            );
-            // Per-call usage is logged by each sleep step's LLM call. The
-            // batch-level aggregate has no single prompt estimate to pair
-            // with, so it is not written to llm_usage_logs.
+    if let Some(provider) = provider_name {
+        if let Ok(Some(token_run)) = db.get_sleep_run(&run.id) {
+            if token_run.input_tokens > 0 || token_run.output_tokens > 0 {
+                let provider_name = provider.to_string();
+                crate::runtime::metrics::inc_llm_tokens_total(
+                    "input",
+                    &provider_name,
+                    token_run.input_tokens,
+                );
+                crate::runtime::metrics::inc_llm_tokens_total(
+                    "output",
+                    &provider_name,
+                    token_run.output_tokens,
+                );
+                // Per-call usage is logged by each sleep step's LLM call. The
+                // batch-level aggregate has no single prompt estimate to pair
+                // with, so it is not written to llm_usage_logs.
+            }
         }
     }
 
     info!(
         agent_id = %agent_id,
-        run_id = %ctx.run_id,
+        run_id = %run.id,
         status = %derived_status,
         "sleep batch finalized"
     );
@@ -1535,7 +1597,7 @@ async fn publish_memory_bundle(
         memory_loader.publish_bundle(&agent_id_owned, &run_id_owned, &before, &after)
     })
     .await
-    .map_err(|e| SleepBatchError::Internal(format!("publication task failed: {e}")))?;
+    .map_err(|e| SleepBatchError::Io(format!("publication task failed: {e}")))?;
     publish_result.map_err(|e| match e {
         MemoryError::Conflict { agent_id, file } => SleepBatchError::Io(format!(
             "memory publication conflict: agent={agent_id} file={file}"
@@ -1625,11 +1687,21 @@ fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPu
                 .memory_loader
                 .recover_publication(&run.agent_id, &run.id, &before, &after)
                 .map_err(|e| recovery_error(run, e))?;
-            let run_id = run.id.clone();
-            state
-                .db
-                .finalize_sleep_run(&run_id)
-                .map_err(EgoPulseError::from)?;
+            // Re-drive the same post-publication finalization the normal path
+            // uses (archive / truncate / finalize), so a crash between
+            // publication and finalization still converges to the on-success
+            // state rather than leaving sessions un-archived. Idempotent: a
+            // run the normal path already finalized is a no-op.
+            let groups_dir = state.config.groups_dir();
+            let secrets = crate::tools::collect_config_secrets(&state.config);
+            finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None).map_err(
+                |e| {
+                    EgoPulseError::Internal(format!(
+                        "finalize after memory recovery failed for run {}: {e}",
+                        run.id
+                    ))
+                },
+            )?;
             tracing::info!(
                 run_id = %run.id,
                 agent_id = %run.agent_id,
@@ -2395,6 +2467,127 @@ mod tests {
             state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
             SleepRunStatus::Failed
         );
+    }
+
+    #[test]
+    fn recover_memory_publication_archives_source_sessions_like_normal_path() {
+        // Major 4: a crash between memory publication and session archiving
+        // must still converge to the normal-path state. Recovery drives the
+        // same archive/truncate/finalize, reconstructing targets from the
+        // source_chats_json persisted before publication.
+        let (db, dir) = test_db();
+        let state = build_test_state(db, dir.path());
+        let agent = "test-agent";
+
+        // A source session with 8 messages, all settled past both checkpoints.
+        let chat_id = create_chat(&state.db, agent, "-arch");
+        for i in 1..=8 {
+            store_msg(
+                &state.db,
+                &format!("a-{i}"),
+                chat_id,
+                &format!("msg{i}"),
+                &format!("2025-06-01T00:00:{i:02}Z"),
+            );
+        }
+        let messages_json = (1..=8)
+            .map(|i| format!(r#"{{"role":"user","content":"msg{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        state
+            .db
+            .save_session(chat_id, &format!("[{messages_json}]"))
+            .expect("save session");
+
+        // Checkpoints at the last message so the session is archivable.
+        let conn = state.db.get_conn().expect("pool");
+        for step in ["event_extraction", "prospective_update"] {
+            conn.execute(
+                "INSERT INTO sleep_step_checkpoints
+                 (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES (?1, ?2, 'messages', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    agent,
+                    step,
+                    chat_id.to_string(),
+                    "2025-06-01T00:00:08Z",
+                    "a-8",
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("seed checkpoint");
+        }
+        drop(conn);
+
+        // Run with complete snapshots + the archive plan persisted pre-crash.
+        let before = MemoryBundle {
+            episodic: "old ep".to_string(),
+            semantic: "old sem".to_string(),
+            prospective: "old pro".to_string(),
+        };
+        let after = MemoryBundle {
+            episodic: "new ep".to_string(),
+            semantic: "new sem".to_string(),
+            prospective: "new pro".to_string(),
+        };
+        let run_id = state
+            .db
+            .try_create_sleep_run(agent, SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        mark_all_steps_success(&state.db, &run_id);
+        seed_complete_snapshots(&state.db, &run_id, agent, &before, &after);
+        let plan = serde_json::to_string(&[AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-arch".to_string(),
+            updated_at: "2025-06-01T00:00:00Z".to_string(),
+            message_count: 8,
+            estimated_tokens: 0,
+        }])
+        .expect("serialize plan");
+        state
+            .db
+            .update_sleep_run_source_chats(&run_id, &plan)
+            .expect("persist plan");
+
+        // Memory files already at `after` (publication completed pre-crash).
+        let memory_dir = dir.path().join("agents").join(agent).join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
+        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
+
+        recover_memory_publication(&state).expect("recover");
+
+        // Run finalized...
+        assert_eq!(
+            state.db.get_sleep_run(&run_id).unwrap().unwrap().status,
+            SleepRunStatus::Success
+        );
+        // ...and the session was archived + truncated (converges with the
+        // normal path), not left dangling as before.
+        let snap = state
+            .db
+            .load_session_snapshot(chat_id, 100)
+            .expect("snapshot");
+        let kept = parse_messages_json(snap.messages_json.as_deref().unwrap_or("[]"));
+        assert!(
+            kept.len() <= SESSION_CLEAR_KEEP_RECENT,
+            "session should be truncated to <= {} messages, got {}",
+            SESSION_CLEAR_KEEP_RECENT,
+            kept.len()
+        );
+        let archive_dir = state
+            .config
+            .groups_dir()
+            .join("test")
+            .join(chat_id.to_string())
+            .join("conversations");
+        let archived = std::fs::read_dir(&archive_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert!(archived >= 1, "archive file should exist");
     }
 
     fn mark_all_steps_success(db: &Database, run_id: &str) {

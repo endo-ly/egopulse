@@ -41,7 +41,6 @@ pub(crate) struct TurnRuntime {
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) assets: Arc<crate::assets::AssetStore>,
     pub(crate) usage_calibrator: Arc<crate::llm::calibration::UsageCalibrator>,
-    pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
 }
 

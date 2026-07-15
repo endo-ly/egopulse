@@ -1,6 +1,7 @@
 //! Sleep batch scheduler — schedule calculation and execution control.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, LocalResult, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -10,7 +11,7 @@ use crate::config::{AgentConfig, AgentId, SleepBatchConfig};
 use crate::runtime::AppState;
 use crate::storage::SleepRunTrigger;
 
-use super::{SleepBatchError, run_sleep_batch};
+use super::{SleepBatchError, recover_memory_publication, run_sleep_batch};
 
 /// Returns the next scheduled run as a UTC instant, or `None` if the scheduler
 /// is disabled or the configuration is incomplete.
@@ -61,6 +62,15 @@ pub(crate) async fn run_scheduled_cycle(state: &AppState) {
     let config = &state.config.sleep_batch;
     if !config.scheduler_enabled() {
         return;
+    }
+
+    // Retry publication for any run left `running` by a prior transient
+    // publication failure, so a single manual-edit conflict or disk hiccup
+    // cannot permanently stall sleep until a restart. Idempotent: a run the
+    // normal path already finalized is untouched; errors are best-effort
+    // (logged) so one failing run does not abort the whole cycle.
+    if let Err(e) = recover_memory_publication(state) {
+        warn!(error = %e, "scheduled cycle: pending-publication retry failed");
     }
 
     let agents = resolve_target_agents(config, &state.config.agents, &state.config.default_agent);
@@ -129,7 +139,7 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
 /// (e.g. if the scheduler becomes disabled at runtime, or when `shutdown` is
 /// cancelled).
 pub(crate) async fn run_scheduler_loop(
-    state: AppState,
+    state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::error::EgoPulseError> {
     loop {
@@ -665,7 +675,11 @@ mod tests {
             Box::new(MockLlm::new()),
         );
 
-        let result = run_scheduler_loop(state, tokio_util::sync::CancellationToken::new()).await;
+        let result = run_scheduler_loop(
+            std::sync::Arc::new(state),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 }

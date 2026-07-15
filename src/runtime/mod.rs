@@ -49,6 +49,7 @@ use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalib
 use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
+use crate::storage::DISPATCHER_BATCH_LIMIT;
 use crate::storage::Database;
 use crate::storage::TurnRunState;
 use crate::storage::call_blocking;
@@ -74,8 +75,6 @@ pub struct AppState {
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
-    /// Sender half of the pending-agent-turn channel for `agent_send` turn queuing.
-    pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
     /// Per-session turn scheduler for concurrency control and ordered execution.
     pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
@@ -102,7 +101,6 @@ pub(crate) struct AppStateParts {
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
-    pub(crate) turn_sender: tokio::sync::mpsc::Sender<crate::agent_loop::PendingAgentTurn>,
     pub(crate) runtime_status: Arc<RuntimeStatus>,
     pub(crate) instance_guard: Arc<InstanceGuard>,
 }
@@ -148,7 +146,6 @@ impl AppState {
             memory_loader: parts.memory_loader,
             llm_cache: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(ActiveTurnTracker::new()),
-            turn_sender: parts.turn_sender,
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
             runtime_status: parts.runtime_status.clone(),
@@ -181,7 +178,6 @@ impl AppState {
             memory_loader: Arc::clone(&self.memory_loader),
             assets: Arc::clone(&self.assets),
             usage_calibrator: Arc::clone(&self.usage_calibrator),
-            turn_sender: self.turn_sender.clone(),
             active_turns: Arc::clone(&self.active_turns),
         }
     }
@@ -314,7 +310,7 @@ impl AppState {
 }
 
 /// Builds the application state without recording a config file path.
-pub async fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> {
+pub async fn build_app_state(config: Config) -> Result<Arc<AppState>, EgoPulseError> {
     build_app_state_with_path(config, None).await
 }
 
@@ -322,7 +318,7 @@ pub async fn build_app_state(config: Config) -> Result<AppState, EgoPulseError> 
 pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
-) -> Result<AppState, EgoPulseError> {
+) -> Result<Arc<AppState>, EgoPulseError> {
     crate::runtime::metrics::init_metrics();
 
     // Acquire the exclusive instance lock before the database is opened, so a
@@ -390,21 +386,11 @@ pub async fn build_app_state_with_path(
         deps.secret_db.clone(),
     )));
 
-    let (turn_sender, turn_receiver) =
-        tokio::sync::mpsc::channel::<crate::agent_loop::PendingAgentTurn>(16);
-
-    tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
-        config.agents.clone(),
-        Arc::clone(&deps.db),
-        deps.secret_db.clone(),
-        Arc::clone(&channels),
-    )));
-
     let tools = Arc::new(tools);
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
-    let state = AppState::from_parts(AppStateParts {
+    let mut state = Arc::new(AppState::from_parts(AppStateParts {
         db: deps.db,
         secret_db: deps.secret_db,
         config,
@@ -417,10 +403,29 @@ pub async fn build_app_state_with_path(
         assets: deps.assets,
         soul_agents: deps.soul_agents,
         memory_loader: deps.memory_loader,
-        turn_sender,
         runtime_status: Arc::clone(&runtime_status),
         instance_guard: Arc::clone(&instance_guard),
-    });
+    }));
+
+    // `AgentSendTool` needs the fully-built `AppState` so it can durably accept
+    // its target turns through the shared intake. Register it after `from_parts`
+    // (its `app_state` is backfilled once below); the backfill uses `&self`
+    // interior mutability so we never need unique ownership of `state` — which
+    // would otherwise create a chicken-and-egg over the `tools` Arc that the
+    // `AppState` owns and that holds this very tool.
+    {
+        let agents = state.config.agents.clone();
+        let db = Arc::clone(state.db_for(crate::agent_loop::ConversationScope::Normal));
+        let secret_db = state.secret_db.as_ref().map(Arc::clone);
+        let channels = Arc::clone(&state.channels);
+        let agent_send = crate::tools::AgentSendTool::new(agents, db, secret_db, channels);
+        let state_mut = Arc::get_mut(&mut state).expect("unique app state at build time");
+        Arc::get_mut(&mut state_mut.tools)
+            .expect("unique tool registry at build time")
+            .register_tool(Box::new(agent_send));
+    }
+    state.tools.init_agent_send_app_state(Arc::clone(&state));
+
     state.warm_up_calibrator().await;
 
     // Recover durable Turn / Tool state left non-terminal by a prior crash.
@@ -442,14 +447,8 @@ pub async fn build_app_state_with_path(
     // Own long-lived background tasks through the supervisor so their lifetime
     // and shutdown are centrally managed. Spawn order follows the startup
     // contract: dispatcher first so recovered turns are picked up, then the
-    // agent_send receiver, then the MCP reconnect loop.
-    spawn_turn_dispatcher(state.clone(), state.supervisor.shutdown_token());
-
-    spawn_agent_turn_worker(
-        state.clone(),
-        turn_receiver,
-        state.supervisor.shutdown_token(),
-    );
+    // MCP reconnect loop.
+    spawn_turn_dispatcher(Arc::clone(&state), state.supervisor.shutdown_token());
 
     let mcp_arc = state
         .mcp_manager
@@ -590,7 +589,6 @@ pub fn build_sleep_app_state_with_path(
         assets: deps.assets,
         soul_agents: deps.soul_agents,
         memory_loader: deps.memory_loader,
-        turn_sender: tokio::sync::mpsc::channel(16).0,
         runtime_status,
         instance_guard,
     });
@@ -661,62 +659,10 @@ fn build_app_state_dependencies(
     })
 }
 
-fn spawn_agent_turn_worker(
-    state: AppState,
-    mut receiver: tokio::sync::mpsc::Receiver<crate::agent_loop::PendingAgentTurn>,
-    shutdown: CancellationToken,
-) {
-    let supervisor = Arc::clone(&state.supervisor);
-    supervisor.spawn_long_lived(
-        TaskSpec::new(
-            TaskKind::AgentTurnWorker,
-            "agent-turn-worker",
-            Criticality::Critical,
-        ),
-        async move {
-            loop {
-                let pending = tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    msg = receiver.recv() => match msg {
-                        Some(p) => p,
-                        None => break,
-                    },
-                };
-                let channel_log_chat_id = pending.context.channel_log_chat_id;
-                let scope = pending.context.scope;
-                let scheduled = crate::agent_loop::ScheduledTurn {
-                    turn_id: String::new(),
-                    context: pending.context,
-                    input: pending.input,
-                    origin_id: pending.origin_id,
-                };
-
-                if let turn_scheduler::SubmitOutcome::Rejected(reason) =
-                    channel_input::submit_scheduled_turn(&state, scheduled).await
-                {
-                    // Log + metric are already recorded centrally in the submit
-                    // path; store a system event so the async rejection surfaces in
-                    // the channel log instead of being silently dropped.
-                    if let Some(chat_id) = channel_log_chat_id {
-                        if let Err(error) = state.db_for(scope).store_system_event(chat_id, &reason)
-                        {
-                            tracing::warn!(
-                                error = %error,
-                                "failed to store system event for agent_send queue rejection"
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(())
-        },
-    );
-}
-
 /// Spawns the turn dispatcher: a long-lived supervisor task that periodically
 /// scans both databases for durably accepted turns (request persisted but never
 /// started) and re-submits them so a crash before execution is fully recovered
-fn spawn_turn_dispatcher(state: AppState, shutdown: CancellationToken) {
+fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: CancellationToken) {
     let supervisor = Arc::clone(&state.supervisor);
     supervisor.spawn_long_lived(
         TaskSpec::new(
@@ -758,25 +704,28 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
     };
     for &scope in scopes {
         let db = Arc::clone(state.db_for(scope));
-        let turn_ids = call_blocking(Arc::clone(&db), |db| db.scan_durable_pending_turn_ids())
+        // Fetch a bounded batch (turn_id + persisted request) in a single
+        // query, so a large backlog cannot turn each 5s tick into a
+        // full-table scan followed by a per-row SELECT (N+1). Turns beyond the
+        // batch are reached on subsequent scans in acceptance order.
+        let pending = call_blocking(Arc::clone(&db), |db| {
+            db.scan_durable_pending_turns(DISPATCHER_BATCH_LIMIT)
+        })
+        .await
+        .map_err(EgoPulseError::from)?;
+        // Observe the true backlog (not batch-capped) so the availability risk
+        // (unbounded durable growth under a runaway sender) stays visible even
+        // when it exceeds the dispatcher batch.
+        let backlog = call_blocking(Arc::clone(&db), |db| db.count_durable_pending())
             .await
-            .map_err(EgoPulseError::from)?;
+            .unwrap_or(0);
+        metrics::set_durable_pending_turns(backlog as usize);
 
-        for turn_id in turn_ids {
-            let json = match call_blocking(Arc::clone(&db), {
-                let turn_id = turn_id.clone();
-                move |db| {
-                    db.get_turn_run(&turn_id)
-                        .map(|run| run.scheduled_request_json)
-                }
-            })
-            .await
-            {
-                Ok(Some(json)) => json,
-                // A transient DB error or a missing row is retried on the next
-                // scan; it is not blacklisted.
-                _ => continue,
-            };
+        for crate::storage::DurablePendingTurn {
+            turn_id,
+            scheduled_request_json: json,
+        } in pending
+        {
             let mut turn = match deserialize_scheduled_turn(&json) {
                 Ok(turn) => turn,
                 Err(error) => {
@@ -841,6 +790,21 @@ pub(crate) fn execute_scheduled_turn(
                 reason = ?reason,
                 "dropping turn: origin already has terminal stop reason"
             );
+            // Fail-closed: persist the termination so the dispatcher never
+            // re-dispatches this accepted turn on its next 5s scan (otherwise it
+            // loops forever). A DB failure is logged but the in-memory
+            // `terminal_reason` still protects this process from re-execution.
+            if let Err(error) = state.db_for(turn.context.scope).cancel_turn(
+                &turn.turn_id,
+                &reason.to_string(),
+                "origin chain already terminated",
+            ) {
+                tracing::error!(
+                    error = %error,
+                    turn_id = %turn.turn_id,
+                    "failed to persist cancellation for terminated-origin turn"
+                );
+            }
             state.turn_tracker.release(&origin_id);
             drain_next_queued_turn(state, &session_key).await;
             return;
@@ -870,6 +834,21 @@ pub(crate) fn execute_scheduled_turn(
                     reason = ?reason,
                     "scheduled turn rejected by stop condition evaluator"
                 );
+                // Fail-closed: persist the stop so the dispatcher does not
+                // re-dispatch this accepted turn forever. The tracker already
+                // recorded the terminal reason for this process; the DB write
+                // makes the stop durable across restarts.
+                if let Err(error) = state.db_for(turn.context.scope).cancel_turn(
+                    &turn.turn_id,
+                    &reason.to_string(),
+                    &format!("turn rejected by stop condition: {reason:?}"),
+                ) {
+                    tracing::error!(
+                        error = %error,
+                        turn_id = %turn.turn_id,
+                        "failed to persist cancellation for stopped turn"
+                    );
+                }
                 state.runtime_status.push_error(
                     &turn.context.trace_id,
                     "stop_condition",
@@ -1290,7 +1269,7 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
 /// Ctrl-C; on either trigger it runs `RuntimeSupervisor::shutdown`, which
 /// stops accepting input, drains in-flight turns, then drains long-lived tasks
 /// within bounded deadlines.
-pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
+pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     let mut has_active_channels = false;
 
     // Web サーバー起動
@@ -1327,7 +1306,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             rs.update_channel("discord", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
             for (bot_id, token, default_agent) in bot_configs {
-                let discord_state = Arc::new(state.clone());
+                let discord_state = Arc::clone(&state);
                 info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
@@ -1379,7 +1358,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             rs.update_channel("telegram", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
             for (bot_id, token, default_agent) in bot_configs {
-                let telegram_state = Arc::new(state.clone());
+                let telegram_state = Arc::clone(&state);
                 info!("Starting Telegram bot '{bot_id}' (agent {default_agent})...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
@@ -1446,7 +1425,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
             Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
         }
 
-        let pulse_state = state.clone();
+        let pulse_state = (*state).clone();
         let token = state.supervisor.shutdown_token();
         info!("Starting pulse scheduler");
         state.supervisor.spawn_long_lived(
@@ -1463,7 +1442,7 @@ pub async fn start_channels(state: AppState) -> Result<(), EgoPulseError> {
     }
 
     if state.config.db.backup.scheduler_enabled() {
-        let backup_state = state.clone();
+        let backup_state = (*state).clone();
         let token = state.supervisor.shutdown_token();
         info!("Starting backup scheduler");
         state.supervisor.spawn_long_lived(
