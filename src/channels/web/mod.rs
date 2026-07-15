@@ -1337,8 +1337,20 @@ mod tests {
 
         // The next distinct request exceeds the per-session durable-pending
         // limit and is rejected with 429 (no runnable row left behind).
+        let pending_before = app_state
+            .db
+            .count_durable_pending()
+            .expect("count durable pending before rejected request");
         let beyond = post(9999).await.expect("response");
         assert_eq!(beyond.status(), StatusCode::TOO_MANY_REQUESTS);
+        let pending_after = app_state
+            .db
+            .count_durable_pending()
+            .expect("count durable pending after rejected request");
+        assert_eq!(
+            pending_before, pending_after,
+            "rejected capacity request must not insert a durable-pending row"
+        );
     }
 
     #[tokio::test]

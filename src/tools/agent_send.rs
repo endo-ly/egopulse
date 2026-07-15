@@ -4,7 +4,7 @@
 //! The message is displayed as `[From → To] message` and the target agent's
 //! next turn is durably accepted for background execution.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -41,13 +41,15 @@ pub(crate) struct AgentSendTool {
     /// in-memory hand-off could lose the turn. Tests run without an `AppState`
     /// and report `delivered: false` (the turn is not durably accepted).
     ///
-    /// Stored in a `OnceLock` so the runtime can backfill it *after* the tool
-    /// has been registered into the registry the `AppState` owns, without
-    /// requiring unique ownership of that `AppState`. The `Arc` shares every
-    /// runtime service (`turn_tracker`, `turn_scheduler`, `supervisor`, `db`,
-    /// `config_manager`) through its `Arc` handles, so reservations and durable
-    /// commits made here are visible to the live runtime.
-    app_state: std::sync::OnceLock<std::sync::Arc<AppState>>,
+    /// Stored as a `Weak<AppState>` in a `OnceLock` so the runtime can backfill
+    /// it *after* the tool has been registered into the registry the `AppState`
+    /// owns, without requiring unique ownership of that `AppState` and without
+    /// forming an `AppState -> ToolRegistry -> AgentSendTool -> AppState`
+    /// strong-reference cycle that would leak the runtime for the process'
+    /// lifetime. The upgrade is best-effort: if the runtime has already been
+    /// dropped, the target turn cannot be durably accepted and `delivered` is
+    /// `false`.
+    app_state: std::sync::OnceLock<Weak<AppState>>,
 }
 
 /// Stable name of the `agent_send` tool, used by the registry to locate it
@@ -114,7 +116,7 @@ impl Tool for AgentSendTool {
     }
 
     fn init_app_state(&self, state: std::sync::Arc<crate::runtime::AppState>) {
-        let _ = self.app_state.set(state);
+        let _ = self.app_state.set(std::sync::Arc::downgrade(&state));
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -187,40 +189,7 @@ impl Tool for AgentSendTool {
         let to_label = agent_label(&self.agents, &target_id).to_string();
         let display_text = format!("[{from_label} → {to_label}] {}", params.message);
 
-        // 1. Save to Channel Log
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let chat_id = context.chat_id;
-        let mut stored = StoredMessage::tool(
-            context.channel_log_chat_id.unwrap_or(chat_id),
-            context.agent_id.clone(),
-            target_id.clone(),
-            display_text.clone(),
-        );
-        stored.id = message_id;
-        stored.message_kind = MessageKind::AgentSend;
-
-        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
-            db.store_message_only(&stored)
-        })
-        .await
-        {
-            tracing::warn!(error = %error, "agent_send: failed to save channel log");
-        }
-
-        // 2. Display in channel
-        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.scope)), chat_id).await;
-        if let Ok(Some(info)) = chat_info {
-            if let Some(adapter) = self.channels.get(&info.channel) {
-                if let Err(error) = adapter
-                    .send_text(&info.external_chat_id, &display_text)
-                    .await
-                {
-                    tracing::warn!(error = %error, "agent_send: failed to display in channel");
-                }
-            }
-        }
-
-        // 3. Durable acceptance through the shared intake.
+        // Durable intake context.
         let target_context = SurfaceContext {
             channel: context.channel.clone(),
             surface_user: "agent_send".to_string(),
@@ -257,6 +226,10 @@ impl Tool for AgentSendTool {
         // commit + spawn used by every channel, eliminating the previous
         // in-memory queue window where `delivered: true` could be returned for a
         // turn that had not yet been persisted.
+        //
+        // Side effects (channel log + on-channel display) run ONLY after this
+        // succeeds, so a rejected or undeliverable turn never leaves a message
+        // that was not actually accepted.
         let scheduled = ScheduledTurn {
             turn_id: String::new(),
             origin_id: context.origin_id.clone(),
@@ -264,9 +237,9 @@ impl Tool for AgentSendTool {
             input: target_input,
         };
 
-        let delivered = match self.app_state.get() {
+        let delivered = match self.app_state.get().and_then(|w| w.upgrade()) {
             Some(app_state) => {
-                match channel_input::submit_scheduled_turn(app_state, scheduled).await {
+                match channel_input::submit_scheduled_turn(&app_state, scheduled).await {
                     SubmitOutcome::Rejected(reason) => {
                         tracing::warn!(reason = %reason, "agent_send: target turn rejected");
                         false
@@ -279,6 +252,52 @@ impl Tool for AgentSendTool {
                 false
             }
         };
+
+        if !delivered {
+            return sanitize_tool_result(
+                ToolResult::success(
+                    serde_json::to_string(&json!({
+                        "delivered": false,
+                        "to": target_id
+                    }))
+                    .expect("json"),
+                ),
+                &[],
+            );
+        }
+
+        // 1. Save to Channel Log
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let chat_id = context.chat_id;
+        let mut stored = StoredMessage::tool(
+            context.channel_log_chat_id.unwrap_or(chat_id),
+            context.agent_id.clone(),
+            target_id.clone(),
+            display_text.clone(),
+        );
+        stored.id = message_id;
+        stored.message_kind = MessageKind::AgentSend;
+
+        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
+            db.store_message_only(&stored)
+        })
+        .await
+        {
+            tracing::warn!(error = %error, "agent_send: failed to save channel log");
+        }
+
+        // 2. Display in channel
+        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.scope)), chat_id).await;
+        if let Ok(Some(info)) = chat_info {
+            if let Some(adapter) = self.channels.get(&info.channel) {
+                if let Err(error) = adapter
+                    .send_text(&info.external_chat_id, &display_text)
+                    .await
+                {
+                    tracing::warn!(error = %error, "agent_send: failed to display in channel");
+                }
+            }
+        }
 
         sanitize_tool_result(
             ToolResult::success(
@@ -300,7 +319,6 @@ mod tests {
     use crate::channels::adapter::ChannelRegistry;
     use crate::config::{AgentConfig, AgentId};
     use crate::runtime::{AppState, build_sleep_app_state_with_path};
-    use crate::storage::{MessageKind, SenderKind};
     use crate::test_util::test_config;
     use crate::tools::Tool;
     use crate::tools::ToolExecutionContext;
@@ -599,13 +617,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_send_saves_to_channel_log() {
+    async fn agent_send_no_channel_log_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
 
-        // Create the channel_log chat so messages can be stored
+        // Create the channel_log chat so messages could be stored
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
             db.resolve_or_create_chat_id(
                 "discord",
@@ -619,6 +637,8 @@ mod tests {
         .expect("create log chat");
 
         let agents = test_agents();
+        // No AppState bound: the turn is not durably accepted, so the
+        // channel-log side effect must NOT run.
         let tool = AgentSendTool::new(agents, Arc::clone(&db), None, channels);
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -635,9 +655,14 @@ mod tests {
             scope: ConversationScope::Normal,
         };
 
-        let _ = tool
+        let result = tool
             .execute(json!({"to": "vega", "message": "test msg"}), &ctx)
             .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(
+            parsed["delivered"], false,
+            "missing AppState: not delivered"
+        );
 
         let messages = call_blocking(Arc::clone(&db), move |db| {
             db.get_channel_log_messages(log_chat_id, 10)
@@ -645,12 +670,14 @@ mod tests {
         .await
         .expect("get messages");
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_kind, MessageKind::AgentSend);
+        assert!(
+            messages.is_empty(),
+            "no channel-log side effect without durable acceptance"
+        );
     }
 
     #[tokio::test]
-    async fn agent_send_sets_sender_recipient_ids() {
+    async fn agent_send_no_side_effects_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
@@ -694,9 +721,10 @@ mod tests {
         .await
         .expect("messages");
 
-        assert_eq!(messages[0].sender_id, "lyre");
-        assert_eq!(messages[0].sender_kind, SenderKind::Tool);
-        assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("vega"));
+        assert!(
+            messages.is_empty(),
+            "no sender/recipient side effect without durable acceptance"
+        );
     }
 }
 
@@ -833,10 +861,11 @@ mod integration_tests {
     #[tokio::test]
     async fn agent_send_channel_log_saved() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = multi_agent_config(dir.path().to_str().expect("utf8"));
-        let (tool, db) = multi_agent_tool(&config);
+        // Bind a real runtime so the target turn is durably accepted and the
+        // channel-log side effect is allowed to run (only after delivery).
+        let (tool, state) = durable_multi_tool(&dir);
 
-        let log_chat_id = call_blocking(Arc::clone(&db), |db| {
+        let log_chat_id = call_blocking(Arc::clone(&state.db), |db| {
             db.resolve_or_create_chat_id(
                 "discord",
                 "discord:123:multi-room-log",
@@ -863,11 +892,12 @@ mod integration_tests {
             scope: ConversationScope::Normal,
         };
 
-        let _ = tool
+        let result = tool
             .execute(json!({"to": "vega", "message": "check this design"}), &ctx)
             .await;
+        assert!(!result.is_error, "{}", result.content);
 
-        let messages = call_blocking(Arc::clone(&db), move |db| {
+        let messages = call_blocking(Arc::clone(&state.db), move |db| {
             db.get_channel_log_messages(log_chat_id, 10)
         })
         .await
