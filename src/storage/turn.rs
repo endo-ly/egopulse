@@ -363,15 +363,12 @@ impl Database {
     /// scheduler deduplicates by `turn_id`, so no grace window is needed.
     ///
     /// Only returns rows whose `(accepted_at, turn_id)` is strictly greater than
-    /// the supplied cursor. This lets the dispatcher advance past turns it has
-    /// already considered (including busy turns still owned by the in-memory
-    /// scheduler) instead of re-reading the same fixed prefix on every 5s tick.
-    /// Without it, the head of a large pending set can starve later sessions'
-    /// turns (the scheduler dedups already-known turns, but the scan keeps
-    /// re-reading them). Rows are ordered by `(accepted_at, turn_id)` so the
-    /// cursor preserves acceptance order and never skips a turn permanently: a
-    /// turn the scheduler already knows about was processed on a prior tick, and
-    /// a genuinely new turn has a later `accepted_at` (after the cursor).
+    /// the supplied cursor. The dispatcher uses this for in-tick pagination:
+    /// each tick scans from the head (`("", "")`) and pages through the full
+    /// backlog, so every durable-pending turn is reached every tick. Turns
+    /// already owned by the in-memory scheduler are deduplicated cheaply on
+    /// re-submit, and capacity-rejected turns are retried from the head on the
+    /// next tick — no turn is ever permanently skipped.
     ///
     /// # Errors
     ///

@@ -1154,7 +1154,11 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 #### v14: durable scheduled turn columns
 
-`turn_runs` へ `scheduled_request_json` / `origin_id` / `origin_stop_reason` を追加し、部分索引 `idx_turn_runs_dispatch`（`scheduled_request_json IS NOT NULL`）と `idx_turn_runs_origin`（`origin_id IS NOT NULL`）を追加する。accepted Turn の実行要求を永続化し、再起動後に `TurnDispatcher` が再実行できるようにする。`origin_id` / `origin_stop_reason` は Agent Send chain の identity と停止理由を永続化する。Normal / Secret 両 DB に適用する。
+`turn_runs` へ `scheduled_request_json` / `origin_id` を追加し、部分索引 `idx_turn_runs_dispatch`（`scheduled_request_json IS NOT NULL`）と `idx_turn_runs_origin`（`origin_id IS NOT NULL`）を追加する。accepted Turn の実行要求を永続化し、再起動後に `TurnDispatcher` が再実行できるようにする。`origin_id` は Agent Send chain の identity を永続化する。Normal / Secret 両 DB に適用する。
+
+#### v15: turn_origins table
+
+`turn_origins` 表を新設し、origin（人間入力の chain）ごとの実行 turn 数・terminal stop reason・更新日時を永続化する。chain が停止条件（LLM failure / chain depth / turn count / invalid agent）に到達した際、その理由を durably 記録し、再起動後に `TurnTracker` が rehydrate することで終了した chain の再実行を防ぐ。Normal / Secret 両 DB に適用する。
 
 ### 外部キー制約が最小限
 

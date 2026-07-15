@@ -1522,7 +1522,7 @@ fn finalize_published_run_blocking(
         // Already-archived sessions are naturally skipped on retry: truncation
         // removes the messages, so `get_latest_message_cursor` returns `None`
         // and the session is not re-archived.
-        if let Err(e) = archive_and_clear_session(db, groups_dir, session, secrets) {
+        if let Err(e) = archive_and_clear_session(db, groups_dir, &run.id, session, secrets) {
             warn!(
                 agent_id = %agent_id,
                 chat_id = session.chat_id,
@@ -1781,6 +1781,7 @@ fn recovery_error(run: &SleepRun, e: MemoryError) -> EgoPulseError {
 fn archive_and_clear_session(
     db: &Database,
     groups_dir: &Path,
+    run_id: &str,
     session: &AgentSessionInfo,
     secrets: &[(String, String)],
 ) -> Result<(), SleepBatchError> {
@@ -1791,13 +1792,25 @@ fn archive_and_clear_session(
     if let Some(json) = &snapshot.messages_json {
         let messages = parse_messages_json(json);
         if !messages.is_empty() {
+            // Deterministic idempotency key: a crash after the archive write but
+            // before truncation produces the same file on re-finalization rather
+            // than a duplicate. An I/O failure here MUST propagate so the caller
+            // leaves the run `Running` instead of truncating an un-archived
+            // session.
+            let idempotency_key = format!("{run_id}-{}", session.chat_id);
             archive_conversation_blocking(
                 groups_dir,
                 &session.channel,
                 session.chat_id,
                 &messages,
                 secrets,
-            );
+                &idempotency_key,
+            )
+            .map_err(|e| SleepBatchError::ArchivePending {
+                agent_id: String::new(),
+                run_id: run_id.to_string(),
+                reason: format!("archive I/O failed for chat {}: {e}", session.chat_id),
+            })?;
         } else {
             info!(
                 chat_id = session.chat_id,
@@ -1806,6 +1819,8 @@ fn archive_and_clear_session(
         }
     }
 
+    // Only truncate after the archive is confirmed on disk, so an archive
+    // failure never loses the conversation content.
     if let Some(revision) = snapshot.session_revision {
         let truncated_json =
             truncate_messages_json(snapshot.messages_json.as_deref(), SESSION_CLEAR_KEEP_RECENT);
@@ -3709,6 +3724,93 @@ mod tests {
             run.status,
             SleepRunStatus::Running,
             "run must remain Running on archive/truncate failure"
+        );
+    }
+
+    // --- Blocker 3: archive file I/O failure must propagate and prevent truncate ---
+
+    #[test]
+    fn archive_io_failure_propagates_and_preserves_session() {
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "-archive-io");
+
+        // Save a session with messages so archive has content to write.
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let session = AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-archive-io".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            message_count: 1,
+            estimated_tokens: 1,
+        };
+
+        // Point groups_dir under a file (not a directory) so create_dir_all
+        // fails — simulating an archive I/O failure that must propagate.
+        let blocking_file = dir.path().join("blocking-file");
+        std::fs::write(&blocking_file, "not a directory").expect("write blocking file");
+        let bad_groups_dir = blocking_file.join("groups");
+
+        let result =
+            archive_and_clear_session(&db, &bad_groups_dir, "run-archive-io", &session, &[]);
+        assert!(
+            matches!(result, Err(SleepBatchError::ArchivePending { .. })),
+            "archive I/O failure must propagate as ArchivePending"
+        );
+
+        // The session must NOT have been truncated — messages_json preserved.
+        let snapshot = db.load_session_snapshot(chat_id, 100).expect("snapshot");
+        assert!(
+            snapshot.messages_json.as_deref().unwrap_or("[]") != "[]",
+            "session must retain its messages after archive failure"
+        );
+    }
+
+    #[test]
+    fn archive_uses_deterministic_idempotency_key() {
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "-archive-det");
+
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
+            .expect("save session");
+
+        let session = AgentSessionInfo {
+            chat_id,
+            channel: "test".to_string(),
+            external_chat_id: "test:chat-archive-det".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            message_count: 1,
+            estimated_tokens: 1,
+        };
+
+        let groups_dir = dir.path().join("groups");
+
+        // First call: archives successfully.
+        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+            .expect("archive success");
+
+        let expected_path = groups_dir
+            .join("test")
+            .join(chat_id.to_string())
+            .join("conversations")
+            .join(format!("run-det-{chat_id}.md"));
+        assert!(
+            expected_path.exists(),
+            "archive file must use deterministic name: {}",
+            expected_path.display()
+        );
+
+        // Idempotent re-archive (e.g. after a crash before truncate): same file,
+        // no duplicate. This is safe because the deterministic key overwrites.
+        db.save_session(chat_id, r#"[{"role":"user","content":"hello-2"}]"#)
+            .expect("re-save session");
+        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+            .expect("re-archive success");
+        assert!(
+            expected_path.exists(),
+            "deterministic archive file must still exist after re-archive"
         );
     }
 

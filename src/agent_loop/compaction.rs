@@ -286,14 +286,25 @@ async fn archive_current_conversation(
 ) {
     let secrets = crate::tools::collect_config_secrets(config);
     let storage = state.storage_for(context.scope);
-    archive_conversation(
+    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let unique_suffix = uuid::Uuid::new_v4().simple();
+    if let Err(error) = archive_conversation(
         &storage.archive_root,
         &context.channel,
         chat_id,
         messages,
         &secrets,
+        &format!("{now}-{unique_suffix}"),
     )
-    .await;
+    .await
+    {
+        warn!(
+            channel = %context.channel,
+            chat_id,
+            error = %error,
+            "safety-compaction archive failed (best-effort)"
+        );
+    }
 }
 
 fn select_compaction_slices(
@@ -661,35 +672,55 @@ pub(crate) async fn archive_conversation(
     chat_id: i64,
     messages: &[Message],
     secrets: &[(String, String)],
-) {
+    idempotency_key: &str,
+) -> std::io::Result<()> {
     let groups_dir = groups_dir.to_path_buf();
     let channel = channel.to_string();
     let messages: std::sync::Arc<[Message]> =
         std::sync::Arc::from(messages.to_vec().into_boxed_slice());
     let secrets: Vec<(String, String)> = secrets.to_vec();
+    let idempotency_key = idempotency_key.to_string();
     let join_channel = channel.clone();
-    let join_result = tokio::task::spawn_blocking(move || {
-        archive_conversation_blocking(&groups_dir, &channel, chat_id, &messages, &secrets);
+    let join_chat_id = chat_id;
+    tokio::task::spawn_blocking(move || {
+        archive_conversation_blocking(
+            &groups_dir,
+            &channel,
+            chat_id,
+            &messages,
+            &secrets,
+            &idempotency_key,
+        )
     })
-    .await;
-
-    if let Err(error) = join_result {
-        warn!(
-            "failed to join archive task for {}:{}: {error}",
-            join_channel, chat_id
-        );
-    }
+    .await
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "archive task join failed for {join_channel}:{join_chat_id}: {e}"
+        ))
+    })
+    .and_then(|inner| inner)
 }
 
+/// Archives a conversation to disk as a Markdown file, returning an error if
+/// any I/O step fails so the caller can prevent data loss (e.g. refusing to
+/// truncate a session whose archive did not land).
+///
+/// `idempotency_key` becomes the file name stem (`{key}.md`). A deterministic
+/// key (e.g. `{run_id}-{chat_id}`) makes retry safe: a crash after the archive
+/// write but before truncation produces the same file on re-finalization rather
+/// than a duplicate with a random suffix.
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] if directory creation or the file write fails.
 pub(crate) fn archive_conversation_blocking(
     groups_dir: &std::path::Path,
     channel: &str,
     chat_id: i64,
     messages: &[Message],
     secrets: &[(String, String)],
-) {
-    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let unique_suffix = uuid::Uuid::new_v4().simple();
+    idempotency_key: &str,
+) -> std::io::Result<()> {
     let channel_dir = if channel.trim().is_empty() {
         "unknown"
     } else {
@@ -700,12 +731,9 @@ pub(crate) fn archive_conversation_blocking(
         .join(chat_id.to_string())
         .join("conversations");
 
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        warn!("failed to create archive dir {}: {error}", dir.display());
-        return;
-    }
+    std::fs::create_dir_all(&dir)?;
 
-    let path = dir.join(format!("{now}-{unique_suffix}.md"));
+    let path = dir.join(format!("{idempotency_key}.md"));
     let mut content = String::new();
     for message in messages {
         let role = &message.role;
@@ -714,31 +742,26 @@ pub(crate) fn archive_conversation_blocking(
         content.push_str(&format!("## {role}\n\n{redacted}\n\n---\n\n"));
     }
 
-    if let Err(error) = std::fs::write(&path, content) {
-        warn!(
-            "failed to archive conversation to {}: {error}",
-            path.display()
-        );
-    } else {
-        // Set file permissions to owner-only (0600) for security.
-        #[cfg(unix)]
+    std::fs::write(&path, content)?;
+
+    // Set file permissions to owner-only (0600) for security.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            {
-                warn!(
-                    "failed to set archive file permissions {}: {error}",
-                    path.display()
-                );
-            }
+            warn!(
+                "failed to set archive file permissions {}: {error}",
+                path.display()
+            );
         }
-        info!(
-            "archived conversation ({} messages) to {}",
-            messages.len(),
-            path.display()
-        );
     }
+    info!(
+        "archived conversation ({} messages) to {}",
+        messages.len(),
+        path.display()
+    );
+    Ok(())
 }
 
 pub(crate) fn tool_safe_split_at(messages: &[Message], preferred_split_at: usize) -> usize {
