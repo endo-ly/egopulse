@@ -14,8 +14,8 @@ pub(crate) mod tool_progress;
 pub(crate) mod turn_scheduler;
 
 pub(crate) use channel_input::{
-    ChannelLogKey, HumanChannelLogMessage, build_channel_context, channel_scope_from_secret,
-    store_human_channel_log_message, submit_agent_turn,
+    ChannelLogKey, HumanChannelLogMessage, TurnIntake, build_channel_context,
+    channel_scope_from_secret, store_human_channel_log_message, submit_agent_turn,
 };
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
@@ -342,12 +342,6 @@ pub async fn build_app_state_with_path(
     std::fs::create_dir_all(Path::new(&config.state_root))
         .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
     let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
-    // The guard's open fd is what holds the OS advisory lock; the call
-    // references the field so it is not considered dead code.
-    assert!(
-        instance_guard.is_valid(),
-        "instance lock file should be accessible"
-    );
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
@@ -400,11 +394,25 @@ pub async fn build_app_state_with_path(
         deps.secret_db.clone(),
     )));
 
+    // `AgentSendTool` durably accepts its target turn through the shared intake.
+    // Register it before the registry is wrapped in `Arc` (linear construction,
+    // no `Arc::get_mut` two-stage init); the intake is bound to the live runtime
+    // once `AppState` exists (below), so the tool never holds a reference back
+    // to the whole `AppState`.
+    let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
+    tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
+        config.agents.clone(),
+        Arc::clone(&deps.db),
+        deps.secret_db.clone(),
+        Arc::clone(&channels),
+        Arc::clone(&agent_send_intake),
+    )));
+
     let tools = Arc::new(tools);
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
-    let mut state = Arc::new(AppState::from_parts(AppStateParts {
+    let state = Arc::new(AppState::from_parts(AppStateParts {
         db: deps.db,
         secret_db: deps.secret_db,
         config,
@@ -421,24 +429,10 @@ pub async fn build_app_state_with_path(
         instance_guard: Arc::clone(&instance_guard),
     }));
 
-    // `AgentSendTool` needs the fully-built `AppState` so it can durably accept
-    // its target turns through the shared intake. Register it after `from_parts`
-    // (its `app_state` is backfilled once below); the backfill uses `&self`
-    // interior mutability so we never need unique ownership of `state` — which
-    // would otherwise create a chicken-and-egg over the `tools` Arc that the
-    // `AppState` owns and that holds this very tool.
-    {
-        let agents = state.config.agents.clone();
-        let db = Arc::clone(state.db_for(crate::agent_loop::ConversationScope::Normal));
-        let secret_db = state.secret_db.as_ref().map(Arc::clone);
-        let channels = Arc::clone(&state.channels);
-        let agent_send = crate::tools::AgentSendTool::new(agents, db, secret_db, channels);
-        let state_mut = Arc::get_mut(&mut state).expect("unique app state at build time");
-        Arc::get_mut(&mut state_mut.tools)
-            .expect("unique tool registry at build time")
-            .register_tool(Box::new(agent_send));
-    }
-    state.tools.init_agent_send_app_state(Arc::clone(&state));
+    // Bind the agent_send intake to the now-fully-built runtime. No
+    // `Arc::get_mut` is needed: the tool was registered during linear
+    // construction above, avoiding the fragile two-stage initialization.
+    agent_send_intake.bind(&state);
 
     state.warm_up_calibrator().await;
 
@@ -598,10 +592,6 @@ pub fn build_sleep_app_state_with_path(
     std::fs::create_dir_all(Path::new(&config.state_root))
         .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
     let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
-    assert!(
-        instance_guard.is_valid(),
-        "instance lock file should be accessible"
-    );
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
@@ -2507,7 +2497,7 @@ mod tests {
         assert!(
             matches!(
                 state.turn_scheduler.submit(turn_b.clone()),
-                ScheduleResult::Queued
+                ScheduleResult::Enqueued
             ),
             "B must be queued behind A"
         );
@@ -2701,7 +2691,7 @@ mod tests {
         ));
         assert!(matches!(
             state.turn_scheduler.submit(turn_b.clone()),
-            ScheduleResult::Queued
+            ScheduleResult::Enqueued
         ));
 
         // Permanent DB failure: the unbounded retry must keep the session
@@ -2774,15 +2764,15 @@ mod tests {
         let accepted = call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
             let scheduled_json = scheduled_json.clone();
             move |db| {
-                db.accept_or_get_turn(
+                db.accept_or_get_turn(crate::storage::AcceptTurnParams {
                     chat_id,
-                    "resume-k",
-                    1,
-                    None,
-                    "h",
-                    None,
-                    Some(&scheduled_json),
-                )
+                    request_key: "resume-k",
+                    config_revision: 1,
+                    config_fingerprint: None,
+                    request_payload_hash: "h",
+                    origin_id: None,
+                    scheduled_request_json: Some(&scheduled_json),
+                })
             }
         })
         .await

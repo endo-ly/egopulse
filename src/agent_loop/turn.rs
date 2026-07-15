@@ -619,15 +619,15 @@ impl TurnExecutor<'_> {
         let config_fingerprint = snapshot.fingerprint.clone();
         let origin_id = self.context.origin_id.clone();
         let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
-            db.accept_or_get_turn(
+            db.accept_or_get_turn(crate::storage::AcceptTurnParams {
                 chat_id,
-                &request_key,
+                request_key: &request_key,
                 config_revision,
-                Some(&config_fingerprint),
-                &payload_hash,
-                Some(&origin_id),
-                None,
-            )
+                config_fingerprint: Some(&config_fingerprint),
+                request_payload_hash: &payload_hash,
+                origin_id: Some(&origin_id),
+                scheduled_request_json: None,
+            })
         })
         .await?;
 

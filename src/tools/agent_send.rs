@@ -4,7 +4,7 @@
 //! The message is displayed as `[From → To] message` and the target agent's
 //! next turn is durably accepted for background execution.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,8 +12,9 @@ use serde_json::json;
 use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::config::{AgentConfig, AgentId};
 use crate::llm::ToolDefinition;
+use crate::runtime::TurnIntake;
+use crate::runtime::turn_scheduler::SubmitOutcome;
 use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
-use crate::runtime::{AppState, channel_input, turn_scheduler::SubmitOutcome};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::send_message::lookup_chat_info;
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
@@ -35,26 +36,13 @@ pub(crate) struct AgentSendTool {
     db: Arc<crate::storage::Database>,
     secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
-    /// Shared durable-turn intake. When present (production runtime), the target
-    /// agent turn is durably accepted (`turn_runs` committed) **before**
-    /// `delivered: true` is returned, closing the crash window where an
-    /// in-memory hand-off could lose the turn. Tests run without an `AppState`
-    /// and report `delivered: false` (the turn is not durably accepted).
-    ///
-    /// Stored as a `Weak<AppState>` in a `OnceLock` so the runtime can backfill
-    /// it *after* the tool has been registered into the registry the `AppState`
-    /// owns, without requiring unique ownership of that `AppState` and without
-    /// forming an `AppState -> ToolRegistry -> AgentSendTool -> AppState`
-    /// strong-reference cycle that would leak the runtime for the process'
-    /// lifetime. The upgrade is best-effort: if the runtime has already been
-    /// dropped, the target turn cannot be durably accepted and `delivered` is
-    /// `false`.
-    app_state: std::sync::OnceLock<Weak<AppState>>,
+    /// Shared durable-turn intake. Injected at construction so the tool never
+    /// holds a reference back to the whole `AppState`: it durably accepts its
+    /// target turn (`turn_runs` committed) **before** `delivered: true` is
+    /// returned, closing the crash window where an in-memory hand-off could
+    /// lose the turn.
+    intake: Arc<TurnIntake>,
 }
-
-/// Stable name of the `agent_send` tool, used by the registry to locate it
-/// when backfilling the runtime `AppState` after registration.
-pub(crate) const AGENT_SEND_NAME: &str = "agent_send";
 
 impl AgentSendTool {
     pub(crate) fn new(
@@ -62,13 +50,14 @@ impl AgentSendTool {
         db: Arc<crate::storage::Database>,
         secret_db: Option<Arc<crate::storage::Database>>,
         channels: Arc<crate::channels::adapter::ChannelRegistry>,
+        intake: Arc<TurnIntake>,
     ) -> Self {
         Self {
             agents,
             db,
             secret_db,
             channels,
-            app_state: std::sync::OnceLock::new(),
+            intake,
         }
     }
 
@@ -113,10 +102,6 @@ fn short_hash(text: &str) -> String {
 impl Tool for AgentSendTool {
     fn name(&self) -> &str {
         "agent_send"
-    }
-
-    fn init_app_state(&self, state: std::sync::Arc<crate::runtime::AppState>) {
-        let _ = self.app_state.set(std::sync::Arc::downgrade(&state));
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -237,20 +222,12 @@ impl Tool for AgentSendTool {
             input: target_input,
         };
 
-        let delivered = match self.app_state.get().and_then(|w| w.upgrade()) {
-            Some(app_state) => {
-                match channel_input::submit_scheduled_turn(&app_state, scheduled).await {
-                    SubmitOutcome::Rejected(reason) => {
-                        tracing::warn!(reason = %reason, "agent_send: target turn rejected");
-                        false
-                    }
-                    SubmitOutcome::Started | SubmitOutcome::Queued => true,
-                }
-            }
-            None => {
-                tracing::error!("agent_send: no AppState bound; cannot durably accept target turn");
+        let delivered = match self.intake.submit(scheduled).await {
+            SubmitOutcome::Rejected(reason) => {
+                tracing::warn!(reason = %reason, "agent_send: target turn rejected");
                 false
             }
+            SubmitOutcome::Started | SubmitOutcome::Queued => true,
         };
 
         if !delivered {
@@ -350,11 +327,17 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        AgentSendTool::new(agents, db, None, channels)
+        AgentSendTool::new(
+            agents,
+            db,
+            None,
+            channels,
+            Arc::new(crate::runtime::TurnIntake::new()),
+        )
     }
 
-    /// Builds a real `AppState` and an `AgentSendTool` bound to it via
-    /// `init_app_state`, so the tool durably accepts its target turns through
+    /// Builds a real `AppState` and an `AgentSendTool` bound to it via a
+    /// `TurnIntake`, so the tool durably accepts its target turns through
     /// the shared intake (the same path production uses). The returned `TempDir`
     /// must outlive `state`.
     fn durable_tool() -> (AgentSendTool, Arc<AppState>, tempfile::TempDir) {
@@ -366,13 +349,15 @@ mod tests {
         // Mirrors `start_channels`, which flips intake on before serving input.
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
+        let intake = Arc::new(crate::runtime::TurnIntake::new());
         let tool = AgentSendTool::new(
             config.agents.clone(),
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
+            Arc::clone(&intake),
         );
-        tool.init_app_state(Arc::clone(&state_arc));
+        intake.bind(&state_arc);
         (tool, state_arc, dir)
     }
 
@@ -637,9 +622,15 @@ mod tests {
         .expect("create log chat");
 
         let agents = test_agents();
-        // No AppState bound: the turn is not durably accepted, so the
-        // channel-log side effect must NOT run.
-        let tool = AgentSendTool::new(agents, Arc::clone(&db), None, channels);
+        // Intake not bound to a runtime: the turn is not durably accepted, so
+        // the channel-log side effect must NOT run.
+        let tool = AgentSendTool::new(
+            agents,
+            Arc::clone(&db),
+            None,
+            channels,
+            Arc::new(crate::runtime::TurnIntake::new()),
+        );
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -695,7 +686,13 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let tool = AgentSendTool::new(test_agents(), Arc::clone(&db), None, channels);
+        let tool = AgentSendTool::new(
+            test_agents(),
+            Arc::clone(&db),
+            None,
+            channels,
+            Arc::new(crate::runtime::TurnIntake::new()),
+        );
         let ctx = ToolExecutionContext {
             chat_id: 1,
             channel: "discord".to_string(),
@@ -775,7 +772,13 @@ mod integration_tests {
     ) -> (AgentSendTool, Arc<crate::storage::Database>) {
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        let tool = AgentSendTool::new(config.agents.clone(), Arc::clone(&db), None, channels);
+        let tool = AgentSendTool::new(
+            config.agents.clone(),
+            Arc::clone(&db),
+            None,
+            channels,
+            Arc::new(crate::runtime::TurnIntake::new()),
+        );
         (tool, db)
     }
 
@@ -787,13 +790,15 @@ mod integration_tests {
             build_sleep_app_state_with_path(config.clone(), None).expect("build sleep state");
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
+        let intake = Arc::new(crate::runtime::TurnIntake::new());
         let tool = AgentSendTool::new(
             config.agents.clone(),
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
+            Arc::clone(&intake),
         );
-        tool.init_app_state(Arc::clone(&state_arc));
+        intake.bind(&state_arc);
         (tool, state_arc)
     }
 

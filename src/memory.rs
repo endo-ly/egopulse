@@ -2,10 +2,13 @@
 //!
 //! The three memory files (`episodic.md`, `semantic.md`, `prospective.md`) are
 //! treated as a single [`MemoryBundle`]. Reads ([`MemoryLoader::load_bundle`])
-//! take a per-agent **read lock** and Sleep publication
-//! ([`MemoryLoader::publish_bundle`]) takes the per-agent **write lock**, so a
-//! reader and a publisher can never run concurrently: readers observe either
-//! the fully old or the fully new bundle, never an in-flight mix.
+//! take a per-agent **read lock** and serve the published bundle from an
+//! in-memory cache (disk is only touched on the first load, before the cache
+//! is warm). Sleep publication ([`MemoryLoader::publish_bundle`]) takes the
+//! per-agent **write lock** and refreshes both the on-disk files and the
+//! in-memory cache, so a reader and a publisher can never run concurrently:
+//! readers observe either the fully old or the fully new bundle, never an
+//! in-flight mix.
 //!
 //! Publication replaces all three files via per-file temp-file + fsync +
 //! rename. Because the renames are sequential, a crash between them can leave a
@@ -74,8 +77,15 @@ impl MemoryFile {
 /// Memory loading, publication, and recovery errors.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MemoryError {
-    #[error("memory_io_failed: {0}")]
-    Io(String),
+    /// Filesystem failure while reading or writing a memory file. The path
+    /// and the underlying [`std::io::Error`] are preserved so the error kind and
+    /// source chain are not lost.
+    #[error("memory_io_failed at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("memory_unsafe_agent_id: {0}")]
     UnsafeAgentId(String),
     /// Publication precondition failed: the on-disk file changed between run
@@ -93,22 +103,29 @@ pub(crate) enum MemoryError {
     },
 }
 
-impl From<std::io::Error> for MemoryError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error.to_string())
-    }
+/// Per-agent lock pair for memory access.
+///
+/// `io_lock` serializes readers against the single writer (publication) so a
+/// reader never observes a half-published bundle. `cache` holds the most
+/// recently published bundle as an `Arc` so the Turn hot path can serve it with
+/// a cheap clone instead of disk I/O. Both are refreshed under `io_lock` write
+/// during publication, and the cache is warmed lazily on the first read after
+/// startup.
+struct MemoryLock {
+    io_lock: RwLock<()>,
+    cache: RwLock<Option<Arc<MemoryBundle>>>,
 }
 
 /// Loads agent long-term memory bundles from `{agents_dir}/{agent_id}/memory/`
 /// and publishes new bundles atomically.
 ///
-/// A per-agent [`RwLock`] serializes readers against the single writer
-/// (publication). The write lock is held only across file I/O, never across
-/// LLM generation, so a Turn can read the published bundle while a Sleep run
-/// is still generating its candidate.
+/// A per-agent [`MemoryLock`] serializes readers against the single writer
+/// (publication). The write lock is held only across file I/O and the cache
+/// refresh, never across LLM generation, so a Turn can read the published
+/// bundle while a Sleep run is still generating its candidate.
 pub(crate) struct MemoryLoader {
     agents_dir: PathBuf,
-    locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    locks: Mutex<HashMap<String, Arc<MemoryLock>>>,
 }
 
 impl MemoryLoader {
@@ -119,21 +136,34 @@ impl MemoryLoader {
         }
     }
 
-    fn lock_for(&self, agent_id: &str) -> Arc<RwLock<()>> {
+    fn lock_for(&self, agent_id: &str) -> Arc<MemoryLock> {
         let mut locks = self.locks.lock().expect("memory locks map lock");
         locks
             .entry(agent_id.to_string())
-            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .or_insert_with(|| {
+                Arc::new(MemoryLock {
+                    io_lock: RwLock::new(()),
+                    cache: RwLock::new(None),
+                })
+            })
             .clone()
     }
 
     /// Loads the current published memory bundle for `agent_id`.
     ///
-    /// Takes the per-agent read lock and reads the three files from disk on
-    /// every call. Memory is only three small files and read at Turn-prompt
-    /// frequency, so an mtime cache is not worth the staleness/complexity it
-    /// would introduce (a stale cache could mask a manual edit or swallow a
-    /// metadata error). Missing files contribute empty strings.
+    /// Takes the per-agent read lock and returns the published bundle from the
+    /// in-memory cache. Disk is read only once, on the first load after startup
+    /// (cache miss); once warmed, every subsequent load on the Turn hot path is
+    /// an `Arc` clone with no disk I/O. The cache is refreshed under the write
+    /// lock by [`MemoryLoader::publish_bundle`] /
+    /// [`MemoryLoader::recover_publication`], so a reader always sees a
+    /// self-consistent, fully-published bundle.
+    ///
+    /// Because the runtime holds the exclusive instance lock and is the sole
+    /// writer, the cache is authoritative for the process lifetime. An external
+    /// edit to the on-disk files is not reflected in turns until the next sleep
+    /// publication (which would detect and refuse it via the precondition) or a
+    /// restart.
     ///
     /// # Errors
     ///
@@ -145,8 +175,15 @@ impl MemoryLoader {
             return Err(MemoryError::UnsafeAgentId(agent_id.to_string()));
         }
         let lock = self.lock_for(agent_id);
-        let _guard = lock.read().expect("memory read lock");
+        let _guard = lock.io_lock.read().expect("memory read lock");
+        // Fast path: serve the cached published bundle without touching disk.
+        if let Some(bundle) = lock.cache.read().expect("memory cache read lock").as_ref() {
+            return Ok(Arc::clone(bundle));
+        }
+        // Cache miss (first load after startup): read once from disk and warm
+        // the cache so subsequent loads stay off the Turn hot path.
         let bundle = Arc::new(read_bundle(&self.memory_dir(agent_id))?);
+        *lock.cache.write().expect("memory cache write lock") = Some(Arc::clone(&bundle));
         Ok(bundle)
     }
 
@@ -174,7 +211,7 @@ impl MemoryLoader {
             return Err(MemoryError::UnsafeAgentId(agent_id.to_string()));
         }
         let lock = self.lock_for(agent_id);
-        let _guard = lock.write().expect("memory write lock");
+        let _guard = lock.io_lock.write().expect("memory write lock");
         metrics::inc_memory_publication("started");
 
         let memory_dir = self.memory_dir(agent_id);
@@ -192,6 +229,9 @@ impl MemoryLoader {
 
         write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, candidate)?;
 
+        // Refresh the in-memory cache so subsequent loads observe the new
+        // bundle without touching disk.
+        *lock.cache.write().expect("memory cache write lock") = Some(Arc::new(candidate.clone()));
         metrics::inc_memory_publication("success");
         Ok(())
     }
@@ -219,7 +259,7 @@ impl MemoryLoader {
             return Err(MemoryError::UnsafeAgentId(agent_id.to_string()));
         }
         let lock = self.lock_for(agent_id);
-        let _guard = lock.write().expect("memory write lock");
+        let _guard = lock.io_lock.write().expect("memory write lock");
 
         let memory_dir = self.memory_dir(agent_id);
         let current = read_bundle(&memory_dir)?;
@@ -238,6 +278,8 @@ impl MemoryLoader {
 
         write_bundle_atomically(&memory_dir, &self.agents_dir, run_id, after)?;
 
+        // Refresh the cache to the recovered post-publication bundle.
+        *lock.cache.write().expect("memory cache write lock") = Some(Arc::new(after.clone()));
         metrics::inc_memory_publication("recovery");
         Ok(())
     }
@@ -261,7 +303,7 @@ fn write_bundle_atomically(
     bundle: &MemoryBundle,
 ) -> Result<(), MemoryError> {
     let newly_created = !memory_dir.exists();
-    std::fs::create_dir_all(memory_dir)?;
+    std::fs::create_dir_all(memory_dir).map_err(io_err(memory_dir))?;
     if newly_created {
         sync_created_ancestors(memory_dir, agents_dir)?;
     }
@@ -274,9 +316,10 @@ fn write_bundle_atomically(
     for file in MemoryFile::ALL {
         let tmp_path = memory_dir.join(format!("{}.{}.tmp", file.file_name(), run_id));
         let content = bundle.file(file);
-        let mut file_handle = std::fs::File::create(&tmp_path)?;
-        std::io::Write::write_all(&mut file_handle, content.as_bytes())?;
-        file_handle.sync_all()?;
+        let mut file_handle = std::fs::File::create(&tmp_path).map_err(io_err(&tmp_path))?;
+        std::io::Write::write_all(&mut file_handle, content.as_bytes())
+            .map_err(io_err(&tmp_path))?;
+        file_handle.sync_all().map_err(io_err(&tmp_path))?;
     }
 
     // Rename after all temp files are written and synced so a crash before the
@@ -284,7 +327,7 @@ fn write_bundle_atomically(
     for file in MemoryFile::ALL {
         let tmp_path = memory_dir.join(format!("{}.{}.tmp", file.file_name(), run_id));
         let dest = memory_dir.join(file.file_name());
-        std::fs::rename(&tmp_path, &dest)?;
+        std::fs::rename(&tmp_path, &dest).map_err(io_err(&dest))?;
     }
 
     sync_directory(memory_dir)?;
@@ -293,12 +336,12 @@ fn write_bundle_atomically(
 
 /// fsyncs the directory so the rename operations survive a crash.
 fn sync_directory(dir: &Path) -> Result<(), MemoryError> {
-    let handle = std::fs::File::open(dir)?;
+    let handle = std::fs::File::open(dir).map_err(io_err(dir))?;
     // sync_all is preferred; if the platform rejects directory fsync, fall back
     // to sync_data rather than failing the whole publication.
     if let Err(error) = handle.sync_all() {
         warn!(error = %error, dir = %dir.display(), "directory sync_all failed; trying sync_data");
-        handle.sync_data()?;
+        handle.sync_data().map_err(io_err(dir))?;
     }
     Ok(())
 }
@@ -339,6 +382,17 @@ fn cleanup_stale_temp_files(memory_dir: &Path) {
     }
 }
 
+/// Builds a one-shot converter that attaches the offending `path` to an
+/// [`std::io::Error`], so each blocking filesystem call site reports a
+/// structured [`MemoryError::Io`] instead of collapsing the error into a
+/// string (which would discard the error kind and source chain).
+fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> MemoryError + '_ {
+    move |source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 fn read_bundle(memory_dir: &Path) -> Result<MemoryBundle, MemoryError> {
     Ok(MemoryBundle {
         episodic: read_file_or_empty(&memory_dir.join(MemoryFile::Episodic.file_name()))?,
@@ -357,10 +411,10 @@ fn read_file_or_empty(path: &Path) -> Result<String, MemoryError> {
         Ok(content) if content.trim().is_empty() => Ok(String::new()),
         Ok(content) => Ok(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(MemoryError::Io(format!(
-            "failed to read {}: {error}",
-            path.display()
-        ))),
+        Err(error) => Err(MemoryError::Io {
+            path: path.to_path_buf(),
+            source: error,
+        }),
     }
 }
 

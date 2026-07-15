@@ -5,6 +5,7 @@
 //! persistence, and scheduled turn submission.
 
 use std::sync::Arc;
+use std::sync::{OnceLock, Weak};
 
 use crate::agent_loop::session::resolve_chat_id;
 use crate::agent_loop::{
@@ -15,8 +16,52 @@ use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
 use crate::runtime::turn_scheduler::{RejectReason, ScheduleResult, SubmitOutcome};
-use crate::storage::AcceptOutcome;
+use crate::storage::{AcceptOutcome, AcceptTurnParams};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
+
+/// Narrow capability for durably accepting and scheduling a target turn.
+///
+/// `AgentSendTool` (and only it) needs to push a target agent turn through the
+/// same durable intake channels use. Rather than handing the whole [`AppState`]
+/// to a tool — which would form an `AppState -> ToolRegistry -> AgentSendTool
+/// -> AppState` strong cycle and force a fragile `Arc::get_mut` two-stage
+/// construction — the tool holds an `Arc<TurnIntake>`. The intake is a thin
+/// deferred handle: it is created up front (so the tool can be registered into
+/// the registry before the registry is wrapped in `Arc`), and bound to the live
+/// runtime once, after [`AppState`] is built.
+///
+/// The single `Weak<AppState>` is the minimal back-reference needed because
+/// turn execution (`execute_scheduled_turn`) still runs inside the runtime that
+/// owns this intake; in production the runtime outlives every tool call, so the
+/// upgrade always succeeds. If it ever cannot (runtime already dropped), the
+/// turn is reported as rejected so the tool surfaces `delivered: false`.
+pub(crate) struct TurnIntake {
+    runtime: OnceLock<Weak<AppState>>,
+}
+
+impl TurnIntake {
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime: OnceLock::new(),
+        }
+    }
+
+    /// Binds the intake to the live runtime. Called exactly once, after
+    /// [`AppState`] is constructed.
+    pub(crate) fn bind(&self, state: &Arc<AppState>) {
+        let _ = self.runtime.set(Arc::downgrade(state));
+    }
+
+    /// Durably accepts and schedules `turn` through the shared intake. Returns
+    /// [`SubmitOutcome::Rejected`] only if the runtime is not (or no longer)
+    /// bound; otherwise it mirrors [`submit_scheduled_turn`].
+    pub(crate) async fn submit(&self, turn: ScheduledTurn) -> SubmitOutcome {
+        match self.runtime.get().and_then(Weak::upgrade) {
+            Some(state) => submit_scheduled_turn(&state, turn).await,
+            None => SubmitOutcome::Rejected(RejectReason::Internal),
+        }
+    }
+}
 
 /// Platform-specific key used to resolve a multi-agent Channel Log chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,13 +321,11 @@ fn schedule_and_spawn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutco
             });
             SubmitOutcome::Started
         }
-        // Busy or at capacity: the turn waits in `turn_runs` for the dispatcher.
-        ScheduleResult::Queued => SubmitOutcome::Queued,
-        ScheduleResult::Rejected(reason) => {
-            tracing::debug!(
-                reason = %reason,
-                "turn deferred: in-memory scheduler at capacity; dispatcher retries"
-            );
+        // Enqueued or already-owned by the scheduler: the turn waits in
+        // `turn_runs` for the dispatcher / completion drain.
+        ScheduleResult::Enqueued | ScheduleResult::AlreadyOwned => SubmitOutcome::Queued,
+        ScheduleResult::DeferredCapacity => {
+            tracing::debug!("turn deferred: in-memory scheduler at capacity; dispatcher retries");
             SubmitOutcome::Queued
         }
     }
@@ -313,15 +356,15 @@ async fn durably_accept_turn(
     let revision = snapshot.revision as i64;
     let fingerprint = snapshot.fingerprint.clone();
     call_blocking(Arc::clone(state.db_for(scope)), move |db| {
-        db.accept_or_get_turn(
+        db.accept_or_get_turn(AcceptTurnParams {
             chat_id,
-            &request_key,
-            revision,
-            Some(&fingerprint),
-            &request_hash,
-            origin_id.as_deref(),
-            Some(&scheduled_json),
-        )
+            request_key: &request_key,
+            config_revision: revision,
+            config_fingerprint: Some(&fingerprint),
+            request_payload_hash: &request_hash,
+            origin_id: origin_id.as_deref(),
+            scheduled_request_json: Some(&scheduled_json),
+        })
     })
     .await
     .map_err(EgoPulseError::from)

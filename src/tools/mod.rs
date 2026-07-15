@@ -198,20 +198,6 @@ pub(crate) trait Tool: Send + Sync {
     fn idempotency_key(&self, _input: &serde_json::Value) -> Option<String> {
         None
     }
-
-    /// Backfill the runtime [`AppState`] once the tool is reachable from the
-    /// live [`AppState`].
-    ///
-    /// Only tools that reach back into the live runtime (e.g. `agent_send`
-    /// durably accepting its target turns through the shared intake) override
-    /// this; the default is a no-op so the vast majority of tools are
-    /// unaffected. It is called exactly once during `build_app_state`, after
-    /// the tool itself has been registered. It takes `&self` (not `&mut self`)
-    /// so the backfill does not require unique ownership of the surrounding
-    /// `AppState`, which would otherwise create a chicken-and-egg over the
-    /// `tools` Arc — the tool is stored inside the registry that the
-    /// `AppState` owns.
-    fn init_app_state(&self, _state: std::sync::Arc<crate::runtime::AppState>) {}
 }
 
 /// Owns all tool instances and dispatches execution by tool name.
@@ -276,22 +262,6 @@ impl ToolRegistry {
         let idx = self.tools.len();
         self.tools.push(tool);
         self.tool_index.insert(name, idx);
-    }
-
-    /// Backfill the runtime `AppState` into the `agent_send` tool after it has
-    /// been registered. No-op if `agent_send` is not present in the registry.
-    /// Takes `&self` so the caller does not need unique ownership of the
-    /// surrounding `AppState`.
-    pub(crate) fn init_agent_send_app_state(
-        &self,
-        state: std::sync::Arc<crate::runtime::AppState>,
-    ) {
-        if let Some(idx) = self
-            .tool_index
-            .get(crate::tools::agent_send::AGENT_SEND_NAME)
-        {
-            self.tools[*idx].init_app_state(state);
-        }
     }
 
     pub(crate) fn set_mcp_manager(
