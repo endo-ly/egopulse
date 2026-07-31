@@ -25,13 +25,6 @@ fn flush(stdout: &mut impl Write) -> Result<(), EgoPulseError> {
 pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let context = SurfaceContext::new(
-        "cli".to_string(),
-        "local_user".to_string(),
-        session.to_string(),
-        "cli".to_string(),
-        state.config.default_agent.to_string(),
-    );
 
     write_line(&mut stdout, format_args!("session: {session}"))?;
     write_line(&mut stdout, format_args!("type `/exit` to leave the chat"))?;
@@ -45,6 +38,15 @@ pub async fn run_chat(state: &AppState, session: &str) -> Result<(), EgoPulseErr
         if trimmed == "/exit" {
             break;
         }
+
+        let config_snapshot = state.config_manager.current_blocking();
+        let context = SurfaceContext::new(
+            "cli".to_string(),
+            "local_user".to_string(),
+            session.to_string(),
+            "cli".to_string(),
+            config_snapshot.config.default_agent.to_string(),
+        );
 
         match process_slash_command(state, &context, trimmed, None).await {
             SlashCommandOutcome::Respond(response) | SlashCommandOutcome::Error(response) => {

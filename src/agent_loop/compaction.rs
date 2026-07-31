@@ -1328,7 +1328,11 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-threshold");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let messages = vec![
             Message::text("user", "msg-1"),
             Message::text("assistant", "reply-1"),
@@ -1372,7 +1376,11 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-recent");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let messages = vec![
             Message::text("user", "old-1"),
             Message::text("assistant", "old-2"),
@@ -1416,7 +1424,11 @@ mod tests {
         let config = test_config_with_compaction(state_root.clone(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 42;
         let messages = vec![
             Message::text("user", "msg-1"),
@@ -1472,7 +1484,11 @@ mod tests {
         ));
         let mut context = cli_context("archive-secret-routing");
         context.scope = ConversationScope::Secret;
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 77;
         let messages = vec![
             Message::text("user", "secret-msg-1"),
@@ -1539,7 +1555,11 @@ mod tests {
         let config = test_config_with_compaction(state_root, 40, 1);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("archive-normal-routing");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 88;
         let messages = vec![
             Message::text("user", "normal-msg-1"),
@@ -1685,7 +1705,11 @@ mod tests {
         config.compaction_threshold_ratio = 0.80;
         let state = build_state(config, Box::new(provider));
         let context = cli_context("calibrated-trigger");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let key = CalibrationKey::new("test", "test-model", "agent_loop", false);
         state.usage_calibrator.record(key, 100, 300).await;
         let messages = vec![

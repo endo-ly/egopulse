@@ -92,6 +92,11 @@ pub(crate) struct ToolExecutionContext {
     pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Storage scope for this turn's DB routing.
     pub scope: ConversationScope,
+    /// Immutable configuration generation used by this tool execution.
+    ///
+    /// Normal turns and Pulse activations populate this at start time. Standalone
+    /// tool calls may leave it unset and use the registry's current manager view.
+    pub config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
 }
 
 /// Uniform result type returned by all tool implementations.
@@ -204,7 +209,7 @@ pub(crate) trait Tool: Send + Sync {
 pub(crate) struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     tool_index: std::collections::HashMap<String, usize>,
-    config_secrets: std::sync::Mutex<Vec<(String, String)>>,
+    config_secrets: Vec<(String, String)>,
     config_manager: Option<Arc<crate::config::ConfigManager>>,
     mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
 }
@@ -222,7 +227,7 @@ impl ToolRegistry {
                 return Self {
                     tool_index: build_tool_index(&tools),
                     tools,
-                    config_secrets: std::sync::Mutex::new(collect_config_secrets(config)),
+                    config_secrets: collect_config_secrets(config),
                     config_manager: None,
                     mcp_manager: None,
                 };
@@ -254,7 +259,7 @@ impl ToolRegistry {
         Self {
             tool_index: build_tool_index(&tools),
             tools,
-            config_secrets: std::sync::Mutex::new(collect_config_secrets(config)),
+            config_secrets: collect_config_secrets(config),
             config_manager: None,
             mcp_manager: None,
         }
@@ -262,9 +267,9 @@ impl ToolRegistry {
 
     /// Binds the registry to the shared configuration manager.
     ///
-    /// The initial secret set is retained and the current snapshot is merged
-    /// into it before each redaction. Retaining previously observed values
-    /// keeps in-flight turns safe when credentials are rotated repeatedly.
+    /// Standalone calls use the current snapshot for redaction. In-flight turns
+    /// additionally supply their immutable start snapshot through
+    /// [`ToolExecutionContext::config_snapshot`].
     pub(crate) fn set_config_manager(&mut self, config_manager: Arc<crate::config::ConfigManager>) {
         self.config_manager = Some(config_manager);
     }
@@ -334,26 +339,27 @@ impl ToolRegistry {
         )
     }
 
-    /// Build the full redaction secret list: static config secrets + current
-    /// turn-scoped skill env values.
+    /// Build the full redaction secret list for the current config generation
+    /// and any turn-scoped skill env values.
     fn redaction_secrets(&self, context: &ToolExecutionContext) -> Vec<(String, String)> {
-        if let Some(config_manager) = &self.config_manager {
-            let current = config_manager.current_blocking();
-            let mut known = self.config_secrets.lock().expect("config secrets lock");
-            for secret in collect_config_secrets(&current.config) {
-                if !known.contains(&secret) {
-                    known.push(secret);
-                }
+        let mut secrets = match (&self.config_manager, &context.config_snapshot) {
+            (Some(config_manager), Some(snapshot)) => {
+                let mut secrets = collect_config_secrets(&snapshot.config);
+                append_unique_secrets(
+                    &mut secrets,
+                    collect_config_secrets(&config_manager.current_blocking().config),
+                );
+                secrets
             }
-        }
-        let mut secrets = self
-            .config_secrets
-            .lock()
-            .expect("config secrets lock")
-            .clone();
+            (Some(config_manager), None) => {
+                collect_config_secrets(&config_manager.current_blocking().config)
+            }
+            (None, Some(snapshot)) => collect_config_secrets(&snapshot.config),
+            (None, None) => self.config_secrets.clone(),
+        };
         let env = context.skill_env.lock().expect("skill env lock");
         for (k, v) in env.iter() {
-            secrets.push((format!("skill_env.{k}"), v.clone()));
+            append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
         }
         secrets
     }
@@ -401,6 +407,14 @@ impl ToolRegistry {
             return self.tools[idx].idempotency_key(input);
         }
         None
+    }
+}
+
+fn append_unique_secrets(secrets: &mut Vec<(String, String)>, additional: Vec<(String, String)>) {
+    for secret in additional {
+        if !secrets.iter().any(|(_, value)| value == &secret.1) {
+            secrets.push(secret);
+        }
     }
 }
 
@@ -845,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn redaction_tracks_current_config_snapshot_secrets() {
+    async fn redaction_includes_turn_and_current_config_secrets() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let mut initial = test_config(dir.path().to_str().expect("utf8"));
@@ -874,13 +888,19 @@ mod tests {
         registry.set_config_manager(manager);
         registry.register_tool(Box::new(StaticTool {
             name: "rotated_secret",
-            result: ToolResult::success("secret=sk-rotated".to_string()),
+            result: ToolResult::success("old=sk-initial current=sk-rotated".to_string()),
         }));
 
+        let mut context = test_context();
+        context.config_snapshot = Some(Arc::new(crate::config::manager::ConfigSnapshot::new(
+            1, initial, None,
+        )));
+
         let result = registry
-            .execute("rotated_secret", json!({}), &test_context())
+            .execute("rotated_secret", json!({}), &context)
             .await;
 
+        assert!(!result.content.contains("sk-initial"));
         assert!(!result.content.contains("sk-rotated"));
         assert!(
             result

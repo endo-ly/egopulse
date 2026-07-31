@@ -2,15 +2,17 @@
 //!
 //! * `ConfigSnapshot` — an immutable point-in-time view of validated config
 //! * `ConfigManager` — owns the current snapshot
-//! * Fingerprint computed from the config file content (SHA-256)
+//! * Fingerprint computed from the persisted YAML and `.env` source (SHA-256)
 //! * Monotonically increasing revision
 //!
-//! A Turn acquires `Arc<ConfigSnapshot>` at start time and holds it until
-//! completion, preventing generation-mixing when config changes mid-flight.
+//! A Turn acquires `Arc<ConfigSnapshot>` at its execution boundary and holds
+//! it until completion, preventing generation-mixing when config changes
+//! mid-flight. Durable queued Turns receive that boundary snapshot from the
+//! dispatcher rather than reacquiring a newer generation after dequeueing.
 //!
-//! The snapshot is taken **once** at Turn start (see `TurnExecutor::run`) and
-//! shared by both `accept_turn` and `prepare_turn`, so the fingerprint stored
-//! in `turn_runs` and the snapshot actually used for Prompt/Provider
+//! The snapshot is captured **once** at the execution boundary and shared by
+//! `accept_turn`, `prepare_turn`, and input persistence, so the fingerprint
+//! stored in `turn_runs` and the snapshot actually used for Prompt/Provider
 //! generation always belong to the same Config generation.
 //!
 //! `ConfigManager` serialises every update so persistence, snapshot exchange,
@@ -32,7 +34,7 @@ use crate::error::{ConfigError, EgoPulseError};
 pub(crate) struct ConfigChange {
     /// Monotonically increasing configuration revision.
     pub revision: u64,
-    /// SHA-256 fingerprint of the persisted YAML source.
+    /// SHA-256 fingerprint of the persisted YAML and `.env` source.
     pub fingerprint: String,
 }
 
@@ -56,29 +58,32 @@ pub(crate) struct ConfigSnapshot {
 impl ConfigSnapshot {
     /// Builds a snapshot from a validated `Config`.
     ///
-    /// When `config_path` is present the **file content** is hashed, so any
-    /// edit to the YAML on disk produces a different fingerprint even if the
-    /// parsed `Config` happens to be equivalent.  This is simpler than a full
-    /// `Serialize` derive for every config sub-struct and more stable than
+    /// When `config_path` is present the persisted source is hashed, so any
+    /// edit to the YAML or `.env` on disk produces a different fingerprint even
+    /// if the parsed `Config` happens to be equivalent. This is simpler than a
+    /// full `Serialize` derive for every config sub-struct and more stable than
     /// `Debug` output.
     ///
     /// When no path is given a fallback deterministic hash of the config
     /// fields is used.
     pub(crate) fn new(revision: u64, config: Config, config_path: Option<&Path>) -> Self {
-        let fingerprint = match config_path {
-            Some(path) => match std::fs::read(path) {
-                Ok(content) => sha256_hex(&content),
-                Err(e) => {
+        let fingerprint = config_path
+            .and_then(|path| match source_fingerprint(path) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
                     tracing::warn!(
-                        error = %e,
+                        error = %error,
                         path = %path.display(),
-                        "failed to read config file for fingerprinting; using fallback fingerprint"
+                        "failed to read config source for fingerprinting; using fallback fingerprint"
                     );
-                    fallback_fingerprint(&config)
+                    None
                 }
-            },
-            None => fallback_fingerprint(&config),
-        };
+            })
+            .unwrap_or_else(|| fallback_fingerprint(&config));
+        Self::with_fingerprint(revision, config, fingerprint)
+    }
+
+    fn with_fingerprint(revision: u64, config: Config, fingerprint: String) -> Self {
         Self {
             revision,
             fingerprint,
@@ -114,7 +119,9 @@ fn fallback_fingerprint(config: &Config) -> String {
         .hash(&mut hasher);
     config.compaction_target_ratio.to_bits().hash(&mut hasher);
     config.default_agent.as_str().hash(&mut hasher);
-    for (k, v) in &config.providers {
+    let mut providers = config.providers.iter().collect::<Vec<_>>();
+    providers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    for (k, v) in providers {
         k.as_str().hash(&mut hasher);
         v.label.hash(&mut hasher);
         v.base_url.hash(&mut hasher);
@@ -125,11 +132,30 @@ fn fallback_fingerprint(config: &Config) -> String {
 
 /// Returns the fingerprint of the persisted configuration source.
 pub(crate) fn source_fingerprint(path: &Path) -> Result<String, ConfigError> {
-    let content = std::fs::read(path).map_err(|source| ConfigError::ConfigReadFailed {
+    let yaml = std::fs::read(path).map_err(|source| ConfigError::ConfigReadFailed {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(sha256_hex(&content))
+    let dotenv = path
+        .parent()
+        .map(super::secret_ref::dotenv_path)
+        .map(|dotenv_path| match std::fs::read(&dotenv_path) {
+            Ok(content) => Ok(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(source) => Err(ConfigError::ConfigReadFailed {
+                path: dotenv_path,
+                source,
+            }),
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut source = Vec::with_capacity(yaml.len() + dotenv.len() + 64);
+    source.extend_from_slice(b"egopulse-config-source-v1\0yaml\0");
+    source.extend_from_slice(&yaml);
+    source.extend_from_slice(b"\0dotenv\0");
+    source.extend_from_slice(&dotenv);
+    Ok(sha256_hex(&source))
 }
 
 /// Owns the current `ConfigSnapshot`.
@@ -197,6 +223,21 @@ impl ConfigManager {
             .into());
         }
 
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or(ConfigError::ConfigPathUnavailable)?;
+        let persisted_fingerprint = source_fingerprint(path)?;
+        if persisted_fingerprint != current.fingerprint {
+            return Err(ConfigError::ConfigConflict {
+                expected: expected_fingerprint
+                    .unwrap_or(current.fingerprint.as_str())
+                    .to_string(),
+                current: persisted_fingerprint,
+            }
+            .into());
+        }
+
         super::loader::validate_runtime_candidate(&candidate)?;
         ensure_reloadable(&current.config, &candidate)?;
 
@@ -205,13 +246,18 @@ impl ConfigManager {
             .checked_add(1)
             .ok_or(ConfigError::ConfigRevisionExhausted)?;
 
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or(ConfigError::ConfigPathUnavailable)?;
-        super::persist::save_config_with_secrets(&candidate, path)?;
+        super::persist::save_config_with_secrets_if_unchanged(
+            &candidate,
+            path,
+            &current.fingerprint,
+        )?;
 
-        let snapshot = Arc::new(ConfigSnapshot::new(revision, candidate, Some(path)));
+        let fingerprint = source_fingerprint(path)?;
+        let snapshot = Arc::new(ConfigSnapshot::with_fingerprint(
+            revision,
+            candidate,
+            fingerprint,
+        ));
         if snapshot.fingerprint == current.fingerprint {
             return Ok(current);
         }
@@ -239,15 +285,24 @@ impl ConfigManager {
             return Ok(current);
         }
 
-        let candidate = Config::load_allow_missing_api_key(Some(path))?;
+        let candidate = Config::load(Some(path))?;
         super::loader::validate_runtime_candidate(&candidate)?;
         ensure_reloadable(&current.config, &candidate)?;
+
+        let stable_fingerprint = source_fingerprint(path)?;
+        if stable_fingerprint != fingerprint {
+            return Err(ConfigError::ConfigSourceChangedDuringReload.into());
+        }
 
         let revision = current
             .revision
             .checked_add(1)
             .ok_or(ConfigError::ConfigRevisionExhausted)?;
-        let snapshot = Arc::new(ConfigSnapshot::new(revision, candidate, Some(path)));
+        let snapshot = Arc::new(ConfigSnapshot::with_fingerprint(
+            revision,
+            candidate,
+            stable_fingerprint,
+        ));
         self.publish(snapshot)
     }
 
@@ -465,6 +520,31 @@ mod tests {
     }
 
     #[test]
+    fn missing_provider_api_key_is_rejected_without_partial_apply() {
+        let (_dir, manager, path) = file_manager();
+        let before = manager.current_blocking();
+        let file_before = std::fs::read(&path).expect("read config");
+        let mut candidate = before.config.clone();
+        candidate
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = None;
+
+        let error = manager
+            .apply_candidate(candidate, Some(&before.fingerprint))
+            .expect_err("missing provider key must fail");
+
+        assert!(matches!(
+            error,
+            EgoPulseError::Config(ConfigError::MissingProviderApiKey { provider })
+                if provider == "openai"
+        ));
+        assert_eq!(manager.current_blocking().revision, before.revision);
+        assert_eq!(std::fs::read(&path).expect("read config"), file_before);
+    }
+
+    #[test]
     fn non_reloadable_candidate_is_rejected_without_partial_apply() {
         let (dir, manager, path) = file_manager();
         let before = manager.current_blocking();
@@ -521,6 +601,77 @@ mod tests {
     }
 
     #[test]
+    fn external_source_change_rejects_api_overwrite() {
+        let (_dir, manager, path) = file_manager();
+        let before = manager.current_blocking();
+
+        let mut external = before.config.clone();
+        external.timezone = "Asia/Tokyo".to_string();
+        crate::config::persist::save_config_with_secrets(&external, &path)
+            .expect("write external config");
+
+        let mut candidate = before.config.clone();
+        candidate.timezone = "America/New_York".to_string();
+        let error = manager
+            .apply_candidate(candidate, Some(&before.fingerprint))
+            .expect_err("external edit must cause a conflict");
+
+        assert!(matches!(
+            error,
+            EgoPulseError::Config(ConfigError::ConfigConflict { .. })
+        ));
+        assert_eq!(manager.current_blocking().revision, before.revision);
+        let persisted = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        assert_eq!(persisted.timezone, "Asia/Tokyo");
+    }
+
+    #[test]
+    fn secret_source_change_advances_snapshot_even_when_yaml_is_unchanged() {
+        let (_dir, manager, _path) = file_manager();
+        let before = manager.current_blocking();
+        let mut first = before.config.clone();
+        first
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(crate::config::secret_ref::env_resolved_value(
+            "OPENAI_API_KEY",
+            "initial-secret",
+        ));
+        let first = manager
+            .apply_candidate(first, Some(&before.fingerprint))
+            .expect("set env-backed provider key");
+
+        let mut second = first.config.clone();
+        second
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(crate::config::secret_ref::env_resolved_value(
+            "OPENAI_API_KEY",
+            "rotated-secret",
+        ));
+        let second = manager
+            .apply_candidate(second, Some(&first.fingerprint))
+            .expect("rotate env-backed provider key");
+
+        assert_eq!(second.revision, first.revision + 1);
+        assert_ne!(second.fingerprint, first.fingerprint);
+        assert_eq!(
+            second
+                .config
+                .providers
+                .get(&crate::config::ProviderId::new("openai"))
+                .expect("provider")
+                .api_key
+                .as_ref()
+                .expect("api key")
+                .value(),
+            "rotated-secret"
+        );
+    }
+
+    #[test]
     fn reload_from_file_swaps_only_after_valid_external_edit() {
         let (_dir, manager, path) = file_manager();
         let before = manager.current_blocking();
@@ -532,5 +683,30 @@ mod tests {
 
         assert_eq!(after.revision, 2);
         assert_eq!(after.config.timezone, "Asia/Tokyo");
+    }
+
+    #[test]
+    fn reload_from_file_rejects_missing_provider_api_key() {
+        let (_dir, manager, path) = file_manager();
+        let before = manager.current_blocking();
+        let mut candidate = before.config.clone();
+        candidate
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = None;
+        crate::config::persist::save_config_with_secrets(&candidate, &path)
+            .expect("write invalid config");
+
+        let error = manager
+            .reload_from_file()
+            .expect_err("missing provider key must reject reload");
+
+        assert!(matches!(
+            error,
+            EgoPulseError::Config(ConfigError::MissingProviderApiKey { provider })
+                if provider == "openai"
+        ));
+        assert_eq!(manager.current_blocking().revision, before.revision);
     }
 }

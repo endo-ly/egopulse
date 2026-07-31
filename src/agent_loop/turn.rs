@@ -179,6 +179,7 @@ struct TurnExecutor<'a> {
     state: &'a TurnRuntime,
     context: &'a SurfaceContext,
     on_event: EventEmitter,
+    config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -253,7 +254,7 @@ pub(crate) async fn process_turn(
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn_inner(state, context, user_input, EventEmitter::none()).await
+    process_turn_inner(state, context, user_input, EventEmitter::none(), None).await
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
@@ -266,7 +267,36 @@ pub(crate) async fn process_turn_with_events<F>(
 where
     F: Fn(AgentEvent) + Send + Sync + 'static,
 {
-    process_turn_inner(state, context, user_input, EventEmitter::new(on_event)).await
+    process_turn_inner(
+        state,
+        context,
+        user_input,
+        EventEmitter::new(on_event),
+        None,
+    )
+    .await
+}
+
+/// Processes a user turn with a caller-supplied Config snapshot and emits
+/// lifecycle events for streaming consumers.
+pub(crate) async fn process_turn_with_events_and_snapshot<F>(
+    state: &TurnRuntime,
+    context: &SurfaceContext,
+    user_input: &str,
+    on_event: F,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+) -> Result<String, EgoPulseError>
+where
+    F: Fn(AgentEvent) + Send + Sync + 'static,
+{
+    process_turn_inner(
+        state,
+        context,
+        user_input,
+        EventEmitter::new(on_event),
+        Some(config_snapshot),
+    )
+    .await
 }
 
 /// Resumes a Turn that previously reached `input_committed` (the user input is
@@ -388,6 +418,7 @@ pub(crate) async fn resume_input_committed_turn(
         state,
         context: &context,
         on_event: EventEmitter::none(),
+        config_snapshot: None,
     };
     executor.resume_run(&persisted.input, &snapshot, &run).await
 }
@@ -423,11 +454,13 @@ async fn process_turn_inner(
     context: &SurfaceContext,
     user_input: &str,
     on_event: EventEmitter,
+    config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
 ) -> Result<String, EgoPulseError> {
     let executor = TurnExecutor {
         state,
         context,
         on_event,
+        config_snapshot,
     };
 
     executor.run(user_input).await
@@ -454,7 +487,10 @@ impl TurnExecutor<'_> {
             // fingerprint stored in `turn_runs` and the snapshot actually used
             // for the Provider/Prompt generation belong to the same Config
             // generation.
-            let snapshot = self.state.config_manager.current_blocking();
+            let snapshot = self
+                .config_snapshot
+                .clone()
+                .unwrap_or_else(|| self.state.config_manager.current_blocking());
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = self.resolve_request_key();
             let payload_hash = crate::agent_loop::canonical_request_hash(self.context, user_input);
@@ -776,6 +812,7 @@ impl TurnExecutor<'_> {
             turn_id: turn_id.to_string(),
             skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             scope: self.context.scope,
+            config_snapshot: Some(Arc::clone(snapshot)),
             tool_call_id: String::new(),
         };
         let config_snapshot = Arc::clone(snapshot);
@@ -840,7 +877,7 @@ impl TurnExecutor<'_> {
             user_input,
             &prepared.channel_llm,
             prompt_ctx,
-            &prepared.config_snapshot.config,
+            prepared.config_snapshot.as_ref(),
         )
         .await
     }
@@ -1383,8 +1420,9 @@ async fn persist_user_turn_with_compaction(
     user_input: &str,
     llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
     prompt_ctx: &PromptContext<'_>,
-    config: &crate::config::Config,
+    config_snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
+    let config = &config_snapshot.config;
     let mut loaded = crate::agent_loop::session::load_messages_for_turn_with_limit(
         state,
         context.scope,
@@ -1423,6 +1461,7 @@ async fn persist_user_turn_with_compaction(
             &candidate_messages,
             loaded.session_revision,
             turn_id,
+            config_snapshot,
         )
         .await;
         let persisted = match persist_result {

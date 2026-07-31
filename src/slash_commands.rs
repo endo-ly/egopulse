@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::agent_loop::compaction::force_compact;
-use crate::agent_loop::session::{load_messages_for_turn, resolve_chat_id};
+use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::error::EgoPulseError;
@@ -218,7 +218,16 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(&state.turn_runtime(), context.scope, chat_id).await {
+    let config_snapshot = state.config_manager.current_blocking();
+    let runtime = state.turn_runtime();
+    let loaded = match load_messages_for_turn_with_limit(
+        &runtime,
+        context.scope,
+        chat_id,
+        config_snapshot.config.max_history_messages,
+    )
+    .await
+    {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
@@ -227,19 +236,18 @@ async fn handle_compact(
     }
 
     let count = loaded.messages.len();
-    let llm = match state.llm_for_context(context) {
+    let llm = match runtime.llm_for_context_with_snapshot(context, &config_snapshot) {
         Ok(llm) => llm,
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
-    let config = state.current_config();
     match force_compact(
-        &state.turn_runtime(),
+        &runtime,
         context,
         chat_id,
         &loaded.messages,
         &llm,
-        &config,
+        &config_snapshot.config,
     )
     .await
     {

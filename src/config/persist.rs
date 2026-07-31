@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::Config;
 use super::ModelConfig;
 use super::secret_ref::{ResolvedValue, dotenv_path, save_dotenv};
-use crate::error::EgoPulseError;
+use crate::error::{ConfigError, EgoPulseError};
 
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -121,6 +121,28 @@ struct SerializableRetry {
 }
 
 #[derive(Serialize)]
+struct SerializablePulse {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enabled: bool,
+    #[serde(skip_serializing_if = "is_default_pulse_tick_interval")]
+    tick_interval: String,
+}
+
+fn is_default_pulse_tick_interval(value: &str) -> bool {
+    value == "1m"
+}
+
+fn format_duration_secs(seconds: u64) -> String {
+    if seconds % 3600 == 0 {
+        format!("{}h", seconds / 3600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[derive(Serialize)]
 struct SerializableBackup {
     #[serde(skip_serializing_if = "is_default_bool_true")]
     enabled: bool,
@@ -177,6 +199,8 @@ struct SerializableConfig {
     timezone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sleep_batch: Option<SerializableSleepBatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pulse: Option<SerializablePulse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     db: Option<SerializableDb>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,6 +514,17 @@ impl From<&Config> for SerializableConfig {
                     })
                 }
             },
+            pulse: {
+                let pulse = &config.pulse;
+                if !pulse.enabled && pulse.tick_interval_secs == 60 {
+                    None
+                } else {
+                    Some(SerializablePulse {
+                        enabled: pulse.enabled,
+                        tick_interval: format_duration_secs(pulse.tick_interval_secs),
+                    })
+                }
+            },
             db: {
                 let defaults = super::types::BackupConfig::default();
                 let bc = &config.db.backup;
@@ -593,6 +628,10 @@ pub(crate) fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseErro
         .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
     let _lock_file = acquire_config_lock(path)?;
 
+    save_yaml_locked(config, path)
+}
+
+fn save_yaml_locked(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
     let yaml = yaml_serde::to_string(&SerializableConfig::from(config))
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     write_atomically(path, &yaml)
@@ -617,6 +656,40 @@ pub(crate) fn save_config_with_secrets(
     save_yaml(config, yaml_path)?;
 
     Ok(())
+}
+
+/// Saves config only if the persisted source still has the expected fingerprint.
+///
+/// The source check is performed while holding the same in-process and
+/// cross-process locks used by the write, closing the check-then-write race
+/// between concurrent ConfigManager updates.
+pub(crate) fn save_config_with_secrets_if_unchanged(
+    config: &Config,
+    yaml_path: &Path,
+    expected_fingerprint: &str,
+) -> Result<(), EgoPulseError> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
+    let _lock_file = acquire_config_lock(yaml_path)?;
+
+    let current_fingerprint = crate::config::manager::source_fingerprint(yaml_path)?;
+    if current_fingerprint != expected_fingerprint {
+        return Err(EgoPulseError::Config(ConfigError::ConfigConflict {
+            expected: expected_fingerprint.to_string(),
+            current: current_fingerprint,
+        }));
+    }
+
+    let dotenv_entries = collect_dotenv_entries(config);
+    if !dotenv_entries.is_empty()
+        && let Some(config_dir) = yaml_path.parent()
+    {
+        let env_path = dotenv_path(config_dir);
+        save_dotenv(&env_path, &dotenv_entries).map_err(EgoPulseError::Config)?;
+    }
+
+    save_yaml_locked(config, yaml_path)
 }
 
 fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
@@ -849,6 +922,26 @@ mod tests {
         assert!(dotenv.contains("OPENAI_API_KEY=sk-test"));
         assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
         assert!(dotenv.contains(&format!("{DISCORD_BOT_TOKEN_ENV_NAME}=discord-token")));
+    }
+
+    #[test]
+    fn save_and_load_preserves_pulse_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let mut config = sample_config();
+        config.pulse.enabled = true;
+        config.pulse.tick_interval_secs = 120;
+
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("pulse:"));
+        assert!(yaml.contains("enabled: true"));
+        assert!(yaml.contains("tick_interval: 2m"));
+
+        let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        assert!(loaded.pulse.enabled);
+        assert_eq!(loaded.pulse.tick_interval_secs, 120);
     }
 
     #[test]

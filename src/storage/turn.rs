@@ -228,10 +228,11 @@ impl Database {
     /// [`AcceptOutcome`] — `Created` proceeds with the normal flow, `Existing`
     /// reuses / resumes / refuses based on the persisted state.
     ///
-    /// `config_revision` / `config_fingerprint` are fixed at acceptance so a
-    /// later recovery can detect a Config generation mismatch. A `0` /
-    /// `None` pair is accepted when the Config identity is not yet known at
-    /// acceptance time.
+    /// `config_revision` / `config_fingerprint` identify the generation seen
+    /// at acceptance. The input commit refreshes these fields to the snapshot
+    /// actually used for execution, so a durably queued Turn records the
+    /// generation that processed its input. A `0` / `None` pair is accepted
+    /// when the Config identity is not yet known at acceptance time.
     ///
     /// # Errors
     ///
@@ -468,7 +469,8 @@ impl Database {
     /// transition, and the `turn_runs.input_message_id` stamp share one SQLite
     /// transaction so a crash between saving the conversation and recording the
     /// Turn state cannot leave the two out of sync. `message.id` is recorded as
-    /// `turn_runs.input_message_id`.
+    /// `turn_runs.input_message_id`, and the supplied Config identity is
+    /// recorded as the generation that processed the input.
     ///
     /// `expected_revision` is the optimistic-concurrency token for the
     /// conversation: `Some(n)` commits only while `chats.revision == n`, while
@@ -487,6 +489,8 @@ impl Database {
         session_json: &str,
         expected_revision: Option<i64>,
         turn_id: &str,
+        config_revision: i64,
+        config_fingerprint: Option<&str>,
     ) -> Result<i64, StorageError> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -504,8 +508,17 @@ impl Database {
         )?;
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
-            "UPDATE turn_runs SET input_message_id = ?2, updated_at = ?3 WHERE turn_id = ?1",
-            params![turn_id, &message.id, &now],
+            "UPDATE turn_runs
+             SET input_message_id = ?2, config_revision = ?3,
+                 config_fingerprint = ?4, updated_at = ?5
+             WHERE turn_id = ?1",
+            params![
+                turn_id,
+                &message.id,
+                config_revision,
+                config_fingerprint,
+                &now
+            ],
         )?;
         tx.commit()?;
         Ok(outcome.revision)
@@ -1207,7 +1220,14 @@ mod tests {
         let mut msg = StoredMessage::user(1, "sender".to_string(), format!("input-{turn_id}"));
         msg.turn_id = Some(turn_id.to_string());
         let rev = db
-            .commit_turn_input_with_conversation(&msg, "[]", *session_revision, turn_id)
+            .commit_turn_input_with_conversation(
+                &msg,
+                "[]",
+                *session_revision,
+                turn_id,
+                1,
+                Some("abc123"),
+            )
             .expect("commit input");
         *session_revision = Some(rev);
         msg.id
@@ -1254,7 +1274,7 @@ mod tests {
 
         // Act: expected_revision mismatches the real revision (5).
         let error = db
-            .commit_turn_input_with_conversation(&msg, "[]", Some(0), &turn_id)
+            .commit_turn_input_with_conversation(&msg, "[]", Some(0), &turn_id, 0, None)
             .expect_err("conflict expected");
         assert!(matches!(error, StorageError::SessionSnapshotConflict));
 
@@ -1273,6 +1293,33 @@ mod tests {
             message_count, 0,
             "message insert must roll back on conflict"
         );
+    }
+
+    #[test]
+    fn commit_turn_input_refreshes_config_generation_atomically() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "config-refresh").turn_id;
+        let mut message = StoredMessage::user(1, "sender".to_string(), "hello".to_string());
+        message.turn_id = Some(turn_id.clone());
+
+        // Act
+        db.commit_turn_input_with_conversation(
+            &message,
+            "[]",
+            None,
+            &turn_id,
+            7,
+            Some("new-fingerprint"),
+        )
+        .expect("commit input");
+
+        // Assert
+        let run = db.get_turn_run(&turn_id).expect("get turn run");
+        assert_eq!(run.state, TurnRunState::InputCommitted);
+        assert_eq!(run.config_revision, 7);
+        assert_eq!(run.config_fingerprint.as_deref(), Some("new-fingerprint"));
+        assert_eq!(run.input_message_id.as_deref(), Some(message.id.as_str()));
     }
 
     #[test]

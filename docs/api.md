@@ -208,7 +208,7 @@ GET /api/config
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `revision` | `number` | 現在の設定世代。設定交換が成功するたびに増加 |
-| `fingerprint` | `string` | 現在の設定 YAML の SHA-256。更新時の楽観的同時実行制御に使用 |
+| `fingerprint` | `string` | 現在の設定 YAML と `.env` を連結したソースの SHA-256。更新時の楽観的同時実行制御に使用 |
 | `default_provider` | `string` | デフォルトプロバイダー ID |
 | `default_model` | `string \| null` | グローバルモデルオーバーライド |
 | `effective_model` | `string` | 解決後の実際のモデル名 |

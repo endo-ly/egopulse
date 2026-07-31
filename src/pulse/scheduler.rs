@@ -72,7 +72,15 @@ pub(crate) async fn run_pulse_scan(state: &AppState) {
     let now = Utc::now();
 
     for agent_id in snapshot.config.agents.keys() {
-        scan_agent(state, state_root, agent_id, timezone, now).await;
+        scan_agent(
+            state,
+            state_root,
+            agent_id,
+            timezone,
+            now,
+            Arc::clone(&snapshot),
+        )
+        .await;
     }
 }
 
@@ -83,6 +91,7 @@ async fn scan_agent(
     agent_id: &AgentId,
     timezone: &str,
     now: chrono::DateTime<Utc>,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) {
     let definition = match super::definition::load_pulse_definition(state_root, agent_id.as_str()) {
         Ok(d) => d,
@@ -101,7 +110,7 @@ async fn scan_agent(
     }
 
     for intention in &definition.intentions {
-        process_intention(
+        process_intention_with_activation_timeout(
             state,
             agent_id,
             intention,
@@ -109,39 +118,16 @@ async fn scan_agent(
             &definition.body,
             timezone,
             now,
+            PULSE_ACTIVATION_TIMEOUT,
+            Arc::clone(&snapshot),
         )
         .await;
     }
 }
 
-/// Process a single intention: check due → gate → create run → resolve surface →
-/// build capsule → activate → handle output.
-async fn process_intention(
-    state: &AppState,
-    agent_id: &AgentId,
-    intention: &super::definition::TemporalIntention,
-    default_delivery: Option<&super::definition::DeliverySpec>,
-    pulse_body: &str,
-    timezone: &str,
-    now: chrono::DateTime<Utc>,
-) {
-    process_intention_with_activation_timeout(
-        state,
-        agent_id,
-        intention,
-        default_delivery,
-        pulse_body,
-        timezone,
-        now,
-        PULSE_ACTIVATION_TIMEOUT,
-    )
-    .await
-}
-
-/// Testable form of [`process_intention`] that accepts an explicit
-/// `activation_timeout`. Production callers go through [`process_intention`]
-/// which always uses [`PULSE_ACTIVATION_TIMEOUT`]; tests pass a short
-/// duration so they do not need to wait the full 30 minutes.
+/// Processes one intention with an explicit activation timeout. Production
+/// passes [`PULSE_ACTIVATION_TIMEOUT`]; tests pass a short duration so they do
+/// not need to wait the full 30 minutes.
 #[allow(clippy::too_many_arguments)]
 async fn process_intention_with_activation_timeout(
     state: &AppState,
@@ -152,6 +138,7 @@ async fn process_intention_with_activation_timeout(
     timezone: &str,
     now: chrono::DateTime<Utc>,
     activation_timeout: Duration,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) {
     let agent_id_str = agent_id.as_str();
 
@@ -299,7 +286,13 @@ async fn process_intention_with_activation_timeout(
 
     // 7. Run activation (guarded by timeout)
     let activation_result = match guard_activation(
-        super::runner::run_activation(state, agent_id_str, &capsule, &home_surface),
+        super::runner::run_activation_with_snapshot(
+            state,
+            agent_id_str,
+            &capsule,
+            &home_surface,
+            snapshot,
+        ),
         activation_timeout,
     )
     .await
@@ -1218,6 +1211,7 @@ intentions:
                 "UTC",
                 now,
                 Duration::from_millis(100),
+                state.config_manager.current_blocking(),
             ),
         )
         .await;
@@ -1276,6 +1270,7 @@ intentions:
                 "UTC",
                 now,
                 Duration::from_secs(60),
+                state.config_manager.current_blocking(),
             ),
         )
         .await;

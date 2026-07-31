@@ -7,11 +7,11 @@ use chrono::{DateTime, Duration, LocalResult, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use tracing::{info, warn};
 
-use crate::config::{AgentConfig, AgentId, Config, SleepBatchConfig};
+use crate::config::{AgentConfig, AgentId, SleepBatchConfig};
 use crate::runtime::AppState;
 use crate::storage::SleepRunTrigger;
 
-use super::{SleepBatchError, recover_memory_publication, run_sleep_batch};
+use super::{SleepBatchError, recover_memory_publication};
 
 /// Returns the next scheduled run as a UTC instant, or `None` if the scheduler
 /// is disabled or the configuration is incomplete.
@@ -97,7 +97,7 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
             continue;
         }
 
-        match run_agent_with_retry(&state, agent_id, &snapshot.config).await {
+        match run_agent_with_retry(&state, agent_id, Arc::clone(&snapshot)).await {
             Ok(()) => {}
             Err(SleepBatchError::AlreadyRunning { .. }) => {
                 info!(agent_id = %agent_id, "scheduled cycle: already running, skipping");
@@ -112,10 +112,10 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
 async fn run_agent_with_retry(
     state: &AppState,
     agent_id: &AgentId,
-    config: &Config,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<(), SleepBatchError> {
-    let max_attempts = config.sleep_batch.retry_max_attempts;
-    let interval = config.sleep_batch.retry_interval_minutes;
+    let max_attempts = snapshot.config.sleep_batch.retry_max_attempts;
+    let interval = snapshot.config.sleep_batch.retry_interval_minutes;
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
@@ -123,7 +123,14 @@ async fn run_agent_with_retry(
             tokio::time::sleep(std::time::Duration::from_secs((interval as u64) * 60)).await;
         }
 
-        match run_sleep_batch(state, Some(agent_id.as_str()), SleepRunTrigger::Scheduled).await {
+        match crate::sleep::orchestrator::run_sleep_batch_with_snapshot(
+            state,
+            Some(agent_id.as_str()),
+            SleepRunTrigger::Scheduled,
+            Arc::clone(&snapshot),
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(SleepBatchError::AlreadyRunning { .. }) => {
                 return Err(

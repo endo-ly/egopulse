@@ -137,7 +137,21 @@ pub async fn run_sleep_batch(
     agent_id: Option<&str>,
     trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
-    let snapshot = state.config_manager.current_blocking();
+    run_sleep_batch_with_snapshot(
+        state,
+        agent_id,
+        trigger,
+        state.config_manager.current_blocking(),
+    )
+    .await
+}
+
+pub(crate) async fn run_sleep_batch_with_snapshot(
+    state: &AppState,
+    agent_id: Option<&str>,
+    trigger: SleepRunTrigger,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+) -> Result<(), SleepBatchError> {
     let resolved_agent = match agent_id {
         Some(id) => id.to_string(),
         None => snapshot.config.default_agent.as_str().to_string(),

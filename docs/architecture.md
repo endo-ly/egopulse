@@ -313,7 +313,7 @@ pub(crate) struct SurfaceContext {
        ├─ Web server 起動 (supervisor 経由)
        ├─ Discord bot 起動 (supervisor 経由 × bot 数)
        ├─ Telegram bot 起動 (supervisor 経由)
-       ├─ Config YAML watcher 起動 (250ms poll + 300ms debounce)
+       ├─ Config source watcher 起動 (YAML + .env, 250ms poll + 300ms debounce)
        ├─ Sleep / Pulse / Backup scheduler 起動 (supervisor 経由)
        │
        └─ 監視ループ (500ms 間隔で critical task 終了をチェック)

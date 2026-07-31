@@ -163,10 +163,11 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
-        let config_snapshot = self
-            .config_manager
-            .as_ref()
-            .map(|manager| manager.current_blocking());
+        let config_snapshot = context.config_snapshot.clone().or_else(|| {
+            self.config_manager
+                .as_ref()
+                .map(|manager| manager.current_blocking())
+        });
         let agents = config_snapshot
             .as_ref()
             .map(|snapshot| &snapshot.config.agents)
@@ -419,6 +420,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         }
     }
 
@@ -674,6 +676,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let result = tool
@@ -736,6 +739,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let _ = tool
@@ -846,6 +850,7 @@ mod integration_tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         }
     }
 
@@ -925,6 +930,7 @@ mod integration_tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let result = tool

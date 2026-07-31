@@ -18,7 +18,8 @@ pub(crate) mod turn_runtime;
 pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
 pub(crate) use turn::{
-    process_turn, process_turn_with_events, resume_input_committed_turn, send_turn,
+    process_turn, process_turn_with_events, process_turn_with_events_and_snapshot,
+    resume_input_committed_turn, send_turn,
 };
 pub(crate) use turn_runtime::TurnRuntime;
 

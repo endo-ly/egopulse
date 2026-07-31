@@ -135,6 +135,8 @@ pub enum ConfigError {
     ConfigParseFailed { path: PathBuf, detail: String },
     #[error("config_conflict: expected_fingerprint={expected} current_fingerprint={current}")]
     ConfigConflict { expected: String, current: String },
+    #[error("config_source_changed_during_reload")]
+    ConfigSourceChangedDuringReload,
     #[error("config_reload_forbidden: field={field}")]
     ConfigReloadForbidden { field: String },
     #[error("config_path_unavailable")]

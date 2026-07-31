@@ -756,7 +756,7 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 | WebUI (`/api/config`) | 現在の snapshot | 公開フィールド | ランタイム中の設定変更 |
 | スラッシュコマンド (`/provider`, `/model`) | 現在の snapshot | プロバイダー・モデル | ランタイム中の動的切替 |
 
-設定ファイルは 250ms 間隔で監視し、300ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
+設定 YAML と同じディレクトリの `.env` は 250ms 間隔で監視し、300ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
 
 Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返す。`PUT /api/config` はリクエストの `expected_fingerprint` が現在値と一致する場合だけ更新し、不一致なら `409 Conflict` を返す。Sleep / Pulse scheduler は設定変更通知を購読し、無効状態から有効状態へ変更された場合も同じプロセス内で動作を開始する。
 
@@ -828,7 +828,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 | フィールド | 役割 |
 |---|---|
 | `revision` | 成功した設定交換ごとに増加する世代番号 |
-| `fingerprint` | 設定 YAML の SHA-256。ファイルを持たないテスト用 snapshot では deterministic fallback を使う |
+| `fingerprint` | 設定 YAML と同じディレクトリの `.env` を連結したソースの SHA-256。ファイルを持たないテスト用 snapshot では deterministic fallback を使う |
 | `config` | validated `Config` |
 
 ### 12.2 更新境界
@@ -837,7 +837,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 1. `expected_fingerprint` と現在 snapshot の fingerprint を比較する。
 2. 候補を検証し、再起動必須フィールドの変更を拒否する。
-3. 設定 YAML と SecretRef を安全に永続化する。
+3. 設定 YAML と SecretRef（値は `.env`）を安全に永続化する。
 4. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
 
 永続化または検証に失敗した場合は snapshot を交換しない。`revision` は成功した交換でのみ進み、同一 fingerprint の更新は no-op になる。

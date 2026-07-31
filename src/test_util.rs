@@ -233,6 +233,7 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         turn_id: String::new(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        config_snapshot: None,
         tool_call_id: String::new(),
     }
 }

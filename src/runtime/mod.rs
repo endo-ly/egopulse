@@ -279,23 +279,6 @@ impl AppState {
             None => Ok(self.current_config()),
         }
     }
-
-    /// Returns the LLM provider resolved for the agent and channel in the given context.
-    pub(crate) fn llm_for_context(
-        &self,
-        context: &crate::agent_loop::SurfaceContext,
-    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        if let Some(provider) = self.llm_override.clone() {
-            return Ok(provider);
-        }
-
-        let snapshot = self.config_manager.current_blocking();
-        let config = &snapshot.config;
-        let agent_id = crate::config::AgentId::new(&context.agent_id);
-        let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        self.cached_provider(&resolved, snapshot.revision)
-    }
-
     pub(crate) fn cached_provider(
         &self,
         resolved: &crate::config::ResolvedLlmConfig,
@@ -1217,7 +1200,15 @@ pub(crate) fn execute_scheduled_turn(
             Some(TurnRunState::InputCommitted) => {
                 resume_input_committed_turn(&runtime, turn.context.scope, &turn.turn_id).await
             }
-            _ => execute_turn_with_progress(state, &turn.context, &turn.input).await,
+            _ => {
+                execute_turn_with_progress_and_snapshot(
+                    state,
+                    &turn.context,
+                    &turn.input,
+                    Arc::clone(&config_snapshot),
+                )
+                .await
+            }
         };
         let duration = started.elapsed().as_secs_f64();
 
@@ -1416,19 +1407,17 @@ pub(crate) async fn execute_observed_turn(
     result
 }
 
-async fn execute_turn_with_progress(
+async fn execute_turn_with_progress_and_snapshot(
     state: &AppState,
     context: &crate::agent_loop::SurfaceContext,
     input: &str,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<String, EgoPulseError> {
     let adapter = state.channels.get(&context.channel);
     let external_chat_id = context.session_key();
     let sink = adapter
         .and_then(|adapter| adapter.tool_progress_sink())
-        .filter(|_| {
-            let config = state.config_manager.current_blocking();
-            tool_progress_enabled(&config.config, context)
-        });
+        .filter(|_| tool_progress_enabled(&config_snapshot.config, context));
 
     let (evt_tx, evt_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
@@ -1439,11 +1428,16 @@ async fn execute_turn_with_progress(
 
     let event_sender = evt_tx.clone();
     let runtime = state.turn_runtime();
-    let result =
-        crate::agent_loop::process_turn_with_events(&runtime, context, input, move |event| {
+    let result = crate::agent_loop::process_turn_with_events_and_snapshot(
+        &runtime,
+        context,
+        input,
+        move |event| {
             let _ = event_sender.send(event);
-        })
-        .await;
+        },
+        config_snapshot,
+    )
+    .await;
 
     if result
         .as_ref()
@@ -2022,7 +2016,12 @@ mod tests {
         // Act: a bounded timeout proves the coordinator never hangs the turn.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_progress(&state, &context, "hello"),
+            execute_turn_with_progress_and_snapshot(
+                &state,
+                &context,
+                "hello",
+                state.config_manager.current_blocking(),
+            ),
         )
         .await;
 
@@ -2044,7 +2043,12 @@ mod tests {
         // Act: the failure path must also drop evt_tx and return bounded.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_progress(&state, &context, "hello"),
+            execute_turn_with_progress_and_snapshot(
+                &state,
+                &context,
+                "hello",
+                state.config_manager.current_blocking(),
+            ),
         )
         .await;
 
@@ -2070,7 +2074,13 @@ mod tests {
         let context = crate::test_util::cli_context("retryable-failure");
 
         // Act
-        let result = execute_turn_with_progress(&state, &context, "hello").await;
+        let result = execute_turn_with_progress_and_snapshot(
+            &state,
+            &context,
+            "hello",
+            state.config_manager.current_blocking(),
+        )
+        .await;
 
         // Assert: the same model iteration is retried up to
         // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
@@ -2190,8 +2200,14 @@ mod tests {
         let state = build_app_state(config).await.expect("build state");
         let context = crate::test_util::cli_context("cache-test");
 
-        let a = state.llm_for_context(&context).expect("llm");
-        let b = state.llm_for_context(&context).expect("llm");
+        let runtime = state.turn_runtime();
+        let snapshot = state.config_manager.current_blocking();
+        let a = runtime
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let b = runtime
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -2204,8 +2220,15 @@ mod tests {
         let cloned = state.clone();
         let context = crate::test_util::cli_context("cache-clone-test");
 
-        let a = state.llm_for_context(&context).expect("llm");
-        let b = cloned.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let a = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let b = cloned
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -2228,7 +2251,11 @@ mod tests {
         );
         let context = crate::test_util::cli_context("override-test");
 
-        let result = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let result = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         assert_eq!(result.provider_name(), expected_provider);
         assert_eq!(result.model_name(), expected_model);
 
@@ -2982,7 +3009,7 @@ mod tests {
         call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
             let msg = msg.clone();
             let turn_id = turn_id.clone();
-            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id)
+            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id, 0, None)
         })
         .await
         .expect("commit input");

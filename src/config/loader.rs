@@ -396,6 +396,19 @@ pub(super) fn validate_runtime_candidate(config: &Config) -> Result<(), ConfigEr
             });
         }
         validate_base_url(&provider.base_url)?;
+        if provider
+            .api_key
+            .as_ref()
+            .is_none_or(|api_key| api_key.value().trim().is_empty())
+            && !crate::llm::codex_auth::provider_allows_empty_api_key(
+                provider_id.as_str(),
+                &provider.base_url,
+            )
+        {
+            return Err(ConfigError::MissingProviderApiKey {
+                provider: provider_id.to_string(),
+            });
+        }
         if provider.default_model.trim().is_empty() {
             return Err(ConfigError::MissingProviderDefaultModel {
                 provider: provider_id.to_string(),
