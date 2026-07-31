@@ -794,11 +794,22 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
                     Ok(turn) => turn,
                     Err(_) => {
                         let failed_turn_id = turn_id.clone();
-                        call_blocking(Arc::clone(&db), move |db| {
+                        let result = call_blocking(Arc::clone(&db), move |db| {
                             db.fail_invalid_durable_turn(&failed_turn_id)
                         })
-                        .await
-                        .map_err(EgoPulseError::from)?;
+                        .await;
+                        match result {
+                            Ok(()) => {}
+                            Err(crate::error::StorageError::Conflict(_)) => {
+                                tracing::debug!(
+                                    scope = %scope,
+                                    turn_id = %turn_id,
+                                    "durable turn state changed before invalid payload terminalization"
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(EgoPulseError::from(error)),
+                        }
                         metrics::inc_durable_payload_invalid();
                         tracing::warn!(
                             scope = %scope,

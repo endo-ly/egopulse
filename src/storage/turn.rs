@@ -839,7 +839,8 @@ impl Database {
         if !matches!(
             current,
             TurnRunState::Accepted | TurnRunState::InputCommitted
-        ) {
+        ) || !TurnRunState::can_transition(current, TurnRunState::Failed)
+        {
             return Err(StorageError::Conflict(format!(
                 "invalid durable turn payload failure rejected from state {current}"
             )));
