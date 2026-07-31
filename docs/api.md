@@ -7,13 +7,15 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
 1. [認証](#1-認証)
 2. [REST API](#2-rest-api)
     - [ヘルスチェック](#21-ヘルスチェック)
-    - [メトリクス](#22-メトリクス)
-    - [設定](#23-設定)
-    - [セッション一覧](#24-セッション一覧)
-    - [メッセージ履歴](#25-メッセージ履歴)
-    - [ストリーミングチャット](#26-ストリーミングチャット)
-    - [Voice turn](#27-voice-turn)
-    - [Webhook](#29-webhook)
+    - [詳細ステータス](#22-詳細ステータス)
+    - [テレメトリー](#23-テレメトリー)
+    - [設定](#24-設定)
+    - [セッション一覧](#25-セッション一覧)
+    - [メッセージ履歴](#26-メッセージ履歴)
+    - [ストリーミングチャット](#27-ストリーミングチャット)
+    - [Voice turn](#28-voice-turn)
+    - [Sleep Batch](#29-sleep-batch)
+    - [Webhook](#210-webhook)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -30,7 +32,7 @@ Authorization: Bearer <token>
 
 ### Web API 認証
 
-`/api/config`、`/api/sessions`、`/api/history`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*` は `channels.web.auth_token` で認証する。
+`/api/config`、`/api/status`、`/api/sessions`、`/api/history`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*`、`/telemetry` は `channels.web.auth_token` で認証する。
 
 ### Voice API 認証
 
@@ -50,10 +52,33 @@ Authorization: Bearer <token>
 
 **認証不要**
 
-チャネル状態、DB 接続、MCP 接続、アクティブターン数、直近エラーを含むフルヘルス情報。
+認証なしで利用できる最小限の liveness probe。内部診断情報は返さない。
 
 ```text
 GET /health
+```
+
+#### レスポンス (200)
+
+```json
+{
+  "ok": true
+}
+```
+
+正常時は `200 OK`、DB 不良、shutdown 中、critical task failure、稼働中チャネルがない場合は `503 Service Unavailable` を返す。いずれの場合もレスポンスは `ok` フィールドだけを含む。
+
+---
+
+### 2.2 詳細ステータス
+
+**認証必須**
+
+runtime の詳細な診断情報を返す。`channels.web.auth_token` の Bearer token が必要。
+
+```text
+GET /api/status
+Authorization: Bearer <channels.web.auth_token>
 ```
 
 #### レスポンス (200)
@@ -80,40 +105,24 @@ GET /health
     "servers": []
   },
   "active_turns": 2,
-  "recent_errors_count": 3
+  "recent_errors_count": 3,
+  "instance_lock": { "held": true }
 }
 ```
 
-| フィールド | 型 | 説明 |
-|-----------|-----|------|
-| `ok` | `boolean` | DB 正常かつ少なくとも 1 チャネル Running かつ受付中（shutdown / critical task failure なし）のとき `true` |
-| `version` | `string` | EgoPulse バージョン |
-| `uptime_secs` | `number` | 起動からの経過秒数 |
-| `pid` | `number` | プロセス ID |
-| `db` | `object` | DB 接続状態（`{ "ok": boolean }`） |
-| `accepting_inputs` | `boolean` | Runtime が新規入力を受付中か。shutdown 開始で `false` |
-| `shutdown_started` | `boolean` | graceful shutdown が開始したか |
-| `critical_task_failure` | `string \| null` | critical 長寿命 task の異常終了要約（なければ `null`） |
-| `owned_task_count` | `number` | supervisor が所有する長寿命 task 数 |
-| `channels` | `object` | 各チャネルの状態。値は `{ state, last_error, last_activity }` |
-| `channels.*.state` | `string` | チャネル状態（`starting` / `running` / `failed` / `stopped`） |
-| `channels.*.last_error` | `string \| null` | 直近のエラーメッセージ |
-| `channels.*.last_activity` | `string \| null` | 直近のアクティビティ時刻（RFC 3339） |
-| `mcp` | `object` | MCP サーバーの接続状態（`{ healthy, failed, servers }`） |
-| `mcp.servers[]` | `array` | MCP サーバー一覧。各要素は `{ name, connected, error? }` |
-| `active_turns` | `number` | 現在実行中のエージェントターン数 |
-| `recent_errors_count` | `number` | 直近のエラー数（リングバッファ、最大 100 件、再起動で消失） |
+`version`、`uptime_secs`、`pid`、DB / channel / task / active turn の状態、MCP の sanitized error summary、recent error 件数、critical task failure を返す。`instance_lock` は lock の保有状態だけを返し、lock file の絶対パスは含めない。
 
 ---
 
-### 2.2 テレメトリー
+### 2.3 テレメトリー
 
-**認証不要**
+**認証必須**
 
-JSON 形式でメトリクス・直近ターン履歴・エラー詳細を返す。AI エージェントの運用監視向け。
+JSON 形式でメトリクス・直近ターン履歴・エラー詳細を返す。`channels.web.auth_token` の Bearer token が必要。
 
 ```text
 GET /telemetry
+Authorization: Bearer <channels.web.auth_token>
 ```
 
 #### レスポンス (200)
@@ -155,7 +164,7 @@ GET /telemetry
 
 ---
 
-### 2.3 設定
+### 2.4 設定
 
 #### 取得
 
@@ -261,7 +270,7 @@ GET と同一形式。
 
 ---
 
-### 2.4 セッション一覧
+### 2.5 セッション一覧
 
 ```text
 GET /api/sessions
@@ -298,7 +307,7 @@ GET /api/sessions
 
 ---
 
-### 2.5 メッセージ履歴
+### 2.6 メッセージ履歴
 
 ```text
 GET /api/history?session_key=main&limit=100
@@ -361,7 +370,7 @@ GET /api/history?session_key=main&limit=100
 
 ---
 
-### 2.6 ストリーミングチャット
+### 2.7 ストリーミングチャット
 
 #### リクエスト送信
 
@@ -436,7 +445,7 @@ RunHub は最大 512 イベント、5 分間の TTL でイベントを保持す�
 
 ---
 
-### 2.7 Voice turn
+### 2.8 Voice turn
 
 STT 済みテキストを通常の agent turn として処理し、応答テキストを同期的に返す。
 
@@ -497,7 +506,7 @@ Content-Type: application/json
 
 ---
 
-### 2.8 Sleep Batch
+### 2.9 Sleep Batch
 
 Sleep Batch の実行履歴とメモリ変更差分を確認するためのエンドポイント。
 
@@ -601,7 +610,7 @@ GET /api/sleep/runs/{run_id}
 
 ---
 
-### 2.9 Webhook
+### 2.10 Webhook
 
 外部イベントを trigger として受け取り、receiver ごとに設定した target channel 上で agent turn を enqueue する。Webhook は会話チャネルではなく、応答は target channel の通常配送経路で送信される。
 

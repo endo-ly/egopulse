@@ -1,6 +1,6 @@
 # EgoPulse WebUI — Metrics Tab
 
-ランタイムの健全性・ターン履歴・エラー詳細を可視化するタブ。`/health` と `/telemetry` のデータを消費し、運用時の異常検知と原因切り分けを支援する。
+ランタイムの健全性・ターン履歴・エラー詳細を可視化するタブ。公開 `/health`、認証済み `/api/status`、認証済み `/telemetry` のデータを消費し、運用時の異常検知と原因切り分けを支援する。
 
 情報密度は **数値カード + エラーリスト** に統一する。
 
@@ -68,7 +68,7 @@ Metrics Tab は4領域で構成される：
 
 ### Polling 間隔
 
-- `/health` と `/telemetry` を **10秒** 毎にポーリング
+- `/health`、`/api/status`、`/telemetry` を **10秒** 毎にポーリング
 - タブがバックグラウンドのときは 30秒に緩める（`document.visibilityState` で切替）
 - ユーザーが手動 Refresh を押した場合は即時再取得
 
@@ -90,19 +90,19 @@ Metrics Tab は4領域で構成される：
 
 | Label | Source | 表示形式 | tone 条件 |
 |---|---|---|---|
-| Active turns | `health.active_turns` | 数値 | `> 0` で live（pulse アニメ） |
+| Active turns | `status.active_turns` | 数値 | `> 0` で live（pulse アニメ） |
 | Total turns | `telemetry.metrics["egopulse_turns_total"]` の総和 | 数値 | 常に default |
-| Recent errors | `health.recent_errors_count` | 数値 | `> 0` で danger、`0` で success |
-| Uptime | `health.uptime_secs` | `Xd Yh Zm` 形式 | 常に default |
-| DB | `health.db.ok` | `true` → `"ok"` / `false` → `"down"` | `true` で success、`false` で danger |
-| MCP | `health.mcp.healthy / failed` | `"{healthy} / {total}"` | `failed > 0` で warning、他 success |
-| Channels | `health.channels` | running / 全チャネル 数 | `failed > 0` で warning、他 success |
+| Recent errors | `status.recent_errors_count` | 数値 | `> 0` で danger、`0` で success |
+| Uptime | `status.uptime_secs` | `Xd Yh Zm` 形式 | 常に default |
+| DB | `status.db.ok` | `true` → `"ok"` / `false` → `"down"` | `true` で success、`false` で danger |
+| MCP | `status.mcp.healthy / failed` | `"{healthy} / {total}"` | `failed > 0` で warning、他 success |
+| Channels | `status.channels` | running / 全チャネル 数 | `failed > 0` で warning、他 success |
 
 ---
 
 ## 4. Channels セクション
 
-`/health` の `channels` オブジェクトを元に、各チャネルの状態をリスト表示。
+`/api/status` の `channels` オブジェクトを元に、各チャネルの状態をリスト表示。
 
 ### 4.1 Item 構成
 
@@ -130,7 +130,7 @@ Metrics Tab は4領域で構成される：
 
 ## 5. Recent Errors セクション
 
-`/telemetry` の `recent_errors` 配列を表示。
+認証済み `/telemetry` の `recent_errors` 配列を表示。
 
 ### 5.1 Item 構成
 
@@ -148,7 +148,7 @@ recent_errors が0件の場合、success トーンの EmptyState（"No recent er
 
 ## 6. Recent Turns セクション
 
-`/telemetry` の `recent_turns` 配列を table 形式で表示。
+認証済み `/telemetry` の `recent_turns` 配列を table 形式で表示。
 
 ### 6.1 Column 構成
 
@@ -180,11 +180,15 @@ recent_turns が0件（ランタイム起動直後等）の場合、EmptyState�
 
 ### 7.1 `GET /health`
 
-変更なし（[api.md §2.1](../api.md#21-ヘルスチェック)）。チャネル状態・DB・MCP・active_turns・recent_errors_count を返す。
+認証不要の最小 liveness probe（[api.md §2.1](../api.md#21-ヘルスチェック)）。`ok` だけを返し、正常時は `200`、異常時は `503`。
 
-### 7.2 `GET /telemetry`
+### 7.2 `GET /api/status`
 
-変更なし（[api.md §2.2](../api.md#22-テレメトリー)）。metrics map・recent_turns・recent_errors を返す。
+`channels.web.auth_token` の Bearer token が必要（[api.md §2.2](../api.md#22-詳細ステータス)）。チャネル状態・DB・MCP・active_turns・recent_errors_count を返す。
+
+### 7.3 `GET /telemetry`
+
+`channels.web.auth_token` の Bearer token が必要（[api.md §2.3](../api.md#23-テレメトリー)）。metrics map・recent_turns・recent_errors を返す。
 
 ---
 
@@ -200,7 +204,7 @@ recent_turns が0件（ランタイム起動直後等）の場合、EmptyState�
 ## 9. Out of Scope
 
 - 時系列グラフ（tokens / turns / errors の推移）
-- MCP サーバー個別詳細表示（`health.mcp.servers[]` の個別展開）
+- MCP サーバー個別詳細表示（`status.mcp.servers[]` の個別展開）
 - ログストリーミング（`tracing` のログを WebUI で見せる機能）
 - アラート設定（特定条件で通知）
 - メトリクスの export / CSV ダウンロード

@@ -333,20 +333,26 @@ journalctl --user -u egopulse --no-pager -o json | jq 'select(.trace_id == "abc1
 
 ### 5.2 ヘルスチェック
 
-`/health` エンドポイントでサービスの稼働状態を確認できる。
+`/health` エンドポイントは認証なしで利用できる最小 liveness probe である。正常時は `200`、DB 不良、shutdown 中、critical task failure、稼働中チャネルがない場合は `503` を返す。
 
 ```bash
-curl -s http://127.0.0.1:10961/health | jq .ok
+curl -sS -w '\n%{http_code}\n' http://127.0.0.1:10961/health
 ```
 
-`ok` が `true` の場合、DB 接続が正常で少なくとも 1 チャネルが稼働中。systemd の `ExecStartPre` や外部監視（Uptime Kuma 等）での利用を想定。
+レスポンスは `{"ok": true}` または `{"ok": false}` のみを含む。systemd の `ExecStartPre` や外部監視（Uptime Kuma 等）ではこの endpoint を使用する。
 
-### 5.3 テレメトリー
+### 5.3 詳細ステータスとテレメトリー
 
-`/telemetry` エンドポイントから JSON 形式でメトリクス・ターン履歴・エラー詳細を取得できる。AI エージェントの運用監視向け。信頼ネットワーク前提で認証は不要。
+詳細な runtime status と telemetry は `channels.web.auth_token` で保護される。認証済みの利用者だけが PID、channel 状態、MCP 状態、recent error、turn history などを取得できる。
 
 ```bash
-curl -s http://127.0.0.1:10961/telemetry | jq .
+curl -sS \
+  -H "Authorization: Bearer <channels.web.auth_token>" \
+  http://127.0.0.1:10961/api/status | jq .
+
+curl -sS \
+  -H "Authorization: Bearer <channels.web.auth_token>" \
+  http://127.0.0.1:10961/telemetry | jq .
 ```
 
 ## 6. リリースプロセス
