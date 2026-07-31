@@ -50,6 +50,7 @@ use crate::llm::{Message, create_provider};
 use crate::memory::MemoryLoader;
 use crate::skills::SkillManager;
 use crate::storage::DISPATCHER_BATCH_LIMIT;
+use crate::storage::DURABLE_PAYLOAD_INVALID_ERROR_KIND;
 use crate::storage::Database;
 use crate::storage::TurnRunState;
 use crate::storage::call_blocking;
@@ -716,10 +717,10 @@ fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: CancellationToken) {
 /// from its persisted request and re-submitted in acceptance order; the
 /// scheduler deduplicates by `turn_id`, so re-scanning a turn that is already
 /// running or queued is an idempotent no-op and no per-process dedup set is
-/// needed. A transient failure (DB read, deserialize) for one turn does not
-/// blacklist it — the next scan retries. Turns the scheduler cannot accept yet
-/// (capacity) stay `accepted`/`input_committed` in the DB and are retried as
-/// capacity frees.
+/// needed. A database failure leaves the row pending so the next scan retries.
+/// An invalid persisted payload is terminalized as `failed`, while turns the
+/// scheduler cannot accept yet (capacity) stay `accepted`/`input_committed` in
+/// the DB and are retried as capacity frees.
 ///
 /// Each tick scans from the head (`("", "")`) with in-tick cursor pagination.
 /// Because the scheduler deduplicates already-owned turns (a cheap HashMap
@@ -791,8 +792,20 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
 
                 let mut turn = match deserialize_scheduled_turn(&json) {
                     Ok(turn) => turn,
-                    Err(error) => {
-                        tracing::warn!(error = %error, turn_id, "failed to deserialize durable turn");
+                    Err(_) => {
+                        let failed_turn_id = turn_id.clone();
+                        call_blocking(Arc::clone(&db), move |db| {
+                            db.fail_invalid_durable_turn(&failed_turn_id)
+                        })
+                        .await
+                        .map_err(EgoPulseError::from)?;
+                        metrics::inc_durable_payload_invalid();
+                        tracing::warn!(
+                            scope = %scope,
+                            turn_id = %turn_id,
+                            error_kind = DURABLE_PAYLOAD_INVALID_ERROR_KIND,
+                            "terminalized durable turn with invalid payload"
+                        );
                         continue;
                     }
                 };
@@ -2717,6 +2730,159 @@ mod tests {
             state.turn_scheduler.global_queued(),
             1,
             "turn B must remain queued (session blocked)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_invalid_durable_payloads_terminalizes_without_execution() {
+        use crate::agent_loop::turn::RecordingProvider;
+        use crate::llm::MessagesResponse;
+        use crate::storage::{AcceptOutcome, AcceptTurnParams};
+
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "must not run".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider.clone()),
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
+            db.resolve_or_create_chat_id("cli", "invalid-payloads", None, "cli", "default")
+        })
+        .await
+        .expect("create chat");
+        let rows = call_blocking(Arc::clone(&state.db), move |db| {
+            let mut turn_ids = Vec::new();
+            for (request_key, payload, origin_id) in [
+                ("malformed", "{malformed", Some("invalid-origin-malformed")),
+                (
+                    "unsupported",
+                    r#"{"version":999}"#,
+                    Some("invalid-origin-version"),
+                ),
+            ] {
+                let run = match db.accept_or_get_turn(AcceptTurnParams {
+                    chat_id,
+                    request_key,
+                    config_revision: 1,
+                    config_fingerprint: Some("fp"),
+                    request_payload_hash: "hash",
+                    origin_id,
+                    scheduled_request_json: Some(payload),
+                })? {
+                    AcceptOutcome::Created(run) => run,
+                    AcceptOutcome::Existing(_) => panic!("expected created"),
+                };
+                turn_ids.push(run.turn_id);
+            }
+            Ok(turn_ids)
+        })
+        .await
+        .expect("accept invalid turns");
+
+        // Act
+        dispatch_durable_turns(&state)
+            .await
+            .expect("dispatch invalid turns");
+
+        // Assert
+        for turn_id in rows {
+            let run = call_blocking(Arc::clone(&state.db), move |db| db.get_turn_run(&turn_id))
+                .await
+                .expect("get failed turn");
+            assert_eq!(run.state, TurnRunState::Failed);
+            assert_eq!(
+                run.error_kind.as_deref(),
+                Some(DURABLE_PAYLOAD_INVALID_ERROR_KIND)
+            );
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("scheduled durable turn payload is invalid")
+            );
+            assert!(
+                !run.error_message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("malformed")
+            );
+        }
+        let pending = call_blocking(Arc::clone(&state.db), |db| db.count_durable_pending())
+            .await
+            .expect("count pending");
+        assert_eq!(pending, 0);
+        assert!(provider.seen_messages().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_retries_invalid_payload_after_storage_read_failure() {
+        use crate::storage::{AcceptOutcome, AcceptTurnParams};
+
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(StubFinalProvider),
+        );
+        let turn_id = call_blocking(Arc::clone(&state.db), |db| {
+            let chat_id = db.resolve_or_create_chat_id(
+                "cli",
+                "invalid-payload-retry",
+                None,
+                "cli",
+                "default",
+            )?;
+            match db.accept_or_get_turn(AcceptTurnParams {
+                chat_id,
+                request_key: "invalid-retry",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: Some("not-json"),
+            })? {
+                AcceptOutcome::Created(run) => Ok(run.turn_id),
+                AcceptOutcome::Existing(_) => panic!("expected created"),
+            }
+        })
+        .await
+        .expect("accept invalid turn");
+        // The dispatcher tolerates a backlog-gauge read failure and continues
+        // scanning, so fail both the gauge read and the pending-row scan.
+        state.db.fault_inject_next_get_conn(2);
+
+        // Act: the first tick cannot read the database; the next tick retries
+        // the still-pending row and can terminalize it.
+        let first = dispatch_durable_turns(&state).await;
+        assert!(first.is_err(), "storage read failure must reach dispatcher");
+        let pending_after_failure = call_blocking(Arc::clone(&state.db), {
+            let turn_id = turn_id.clone();
+            move |db| db.get_turn_run(&turn_id).map(|run| run.state)
+        })
+        .await
+        .expect("get pending turn");
+        assert_eq!(pending_after_failure, TurnRunState::Accepted);
+        dispatch_durable_turns(&state)
+            .await
+            .expect("retry invalid turn");
+
+        // Assert
+        let failed = call_blocking(Arc::clone(&state.db), move |db| db.get_turn_run(&turn_id))
+            .await
+            .expect("get failed turn");
+        assert_eq!(failed.state, TurnRunState::Failed);
+        assert_eq!(
+            failed.error_kind.as_deref(),
+            Some(DURABLE_PAYLOAD_INVALID_ERROR_KIND)
         );
     }
 
