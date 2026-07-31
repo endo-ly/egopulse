@@ -149,7 +149,7 @@ WS 上で配信される事象と UI 側の関心事の対応を以下に示す�
 | Pulse の開始・終了 | Pulse タブのリスト更新・Sidebar の agent live indicator |
 | Sleep の開始・終了 | Sleep タブのリスト更新・Sidebar の agent live indicator |
 
-Health 状態（`/health` 相当）は REST の polling で取得する（[metrics.md](./metrics.md) 参照）。
+公開 liveness (`/health`) と認証済み詳細 status (`/api/status`) は REST polling で取得する（[metrics.md](./metrics.md) 参照）。
 
 ---
 

@@ -81,7 +81,7 @@ egopulse events extract --agent lyre --from 2025-03-01
 
 ### 1.6 `egopulse gateway status`
 
-サービスの稼働状態を表示する。サービスが実行中の場合は `/health` エンドポイントからライブ情報を取得して表示する。`--json` フラグで JSON 形式の出力が得られる。サービスが停止中の場合は `systemctl --user status` の出力にフォールバックする。
+サービスの稼働状態を表示する。サービスが実行中の場合は認証なしの `/health` で liveness を確認し、Bearer 認証付きの `/api/status` と `/telemetry` から詳細情報を取得して表示する。認証失敗、timeout、JSON parse error の場合は `systemctl --user status` の出力にフォールバックする。`--json` フラグで JSON 形式の出力が得られる。
 
 ```bash
 egopulse gateway status        # 人間可読形式

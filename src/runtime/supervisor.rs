@@ -33,7 +33,7 @@
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -168,11 +168,6 @@ impl RuntimeSupervisor {
         );
         supervisor.instance_guard = Some(instance_guard);
         supervisor
-    }
-
-    /// Returns the lock file path backing the held instance guard, if any.
-    pub(crate) fn instance_lock_path(&self) -> Option<PathBuf> {
-        self.instance_guard.as_ref().map(|g| g.path().to_path_buf())
     }
 
     /// Whether this process holds the exclusive instance lock for its state root.
@@ -671,7 +666,6 @@ pub(crate) struct InstanceGuard {
     /// Underscore-prefixed because it is never read — its mere existence (and
     /// Drop) is what holds and releases the lock.
     _file: std::fs::File,
-    path: PathBuf,
 }
 
 impl InstanceGuard {
@@ -705,10 +699,7 @@ impl InstanceGuard {
                 ))
             }
         })?;
-        Ok(Arc::new(Self {
-            _file: file,
-            path: lock_path,
-        }))
+        Ok(Arc::new(Self { _file: file }))
     }
 
     /// Acquires the exclusive instance lock on the exact `lock_path` given.
@@ -739,15 +730,7 @@ impl InstanceGuard {
                 ))
             }
         })?;
-        Ok(Arc::new(Self {
-            _file: file,
-            path: lock_path.to_path_buf(),
-        }))
-    }
-
-    /// Path of the lock file backing this guard.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+        Ok(Arc::new(Self { _file: file }))
     }
 }
 
@@ -805,7 +788,6 @@ mod instance_guard_tests {
         let supervisor =
             RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
         assert!(supervisor.instance_lock_held());
-        assert!(supervisor.instance_lock_path().is_some());
 
         let empty = RuntimeSupervisor::with_drain(
             Arc::new(RuntimeStatus::new()),
@@ -813,6 +795,5 @@ mod instance_guard_tests {
             Duration::from_secs(DEFAULT_TASK_DRAIN_SECS),
         );
         assert!(!empty.instance_lock_held());
-        assert!(empty.instance_lock_path().is_none());
     }
 }

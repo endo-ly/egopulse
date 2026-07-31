@@ -395,28 +395,56 @@ fn restart_service() -> Result<(), EgoPulseError> {
 async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<(String, Option<String>)> {
     let config = resolve_config_for_service(cli_config).ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
-    let port = loaded.web_port();
+    let auth_token = loaded.web_auth_token()?.to_owned();
+    let base_url = format!("http://127.0.0.1:{}", loaded.web_port());
 
+    fetch_live_status_at(&base_url, &auth_token).await
+}
+
+async fn fetch_live_status_at(
+    base_url: &str,
+    auth_token: &str,
+) -> Option<(String, Option<String>)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
 
-    let health_url = format!("http://127.0.0.1:{port}/health");
-    let health_resp = client.get(&health_url).send().await.ok()?;
-    let health_text = if health_resp.status().is_success() {
-        health_resp.text().await.ok()?
-    } else {
+    let health_resp = client.get(format!("{base_url}/health")).send().await.ok()?;
+    if !matches!(
+        health_resp.status(),
+        reqwest::StatusCode::OK | reqwest::StatusCode::SERVICE_UNAVAILABLE
+    ) {
         return None;
-    };
+    }
+    let health_text = health_resp.text().await.ok()?;
+    serde_json::from_str::<serde_json::Value>(&health_text).ok()?;
 
-    let telemetry_url = format!("http://127.0.0.1:{port}/telemetry");
-    let telemetry_text = match client.get(&telemetry_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
-        _ => None,
-    };
+    let status_resp = client
+        .get(format!("{base_url}/api/status"))
+        .bearer_auth(auth_token)
+        .send()
+        .await
+        .ok()?;
+    if !status_resp.status().is_success() {
+        return None;
+    }
+    let status_text = status_resp.text().await.ok()?;
+    serde_json::from_str::<serde_json::Value>(&status_text).ok()?;
 
-    Some((health_text, telemetry_text))
+    let telemetry_resp = client
+        .get(format!("{base_url}/telemetry"))
+        .bearer_auth(auth_token)
+        .send()
+        .await
+        .ok()?;
+    if !telemetry_resp.status().is_success() {
+        return None;
+    }
+    let telemetry_text = telemetry_resp.text().await.ok()?;
+    serde_json::from_str::<serde_json::Value>(&telemetry_text).ok()?;
+
+    Some((status_text, Some(telemetry_text)))
 }
 
 fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
@@ -712,9 +740,9 @@ fn print_gateway_status_text(health_json: &str, telemetry_json: Option<&str>) {
 }
 
 fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
-    use crate::channels::web::health::{GatewayStatusResponse, HealthResponse};
+    use crate::channels::web::health::{DetailedStatusResponse, GatewayStatusResponse};
 
-    let health: HealthResponse = match serde_json::from_str(health_json) {
+    let health: DetailedStatusResponse = match serde_json::from_str(health_json) {
         Ok(h) => h,
         Err(_) => {
             let mut health: serde_json::Value =
@@ -1475,6 +1503,72 @@ mod tests {
         // We only assert it returns without panicking; the value depends on
         // the environment.
         assert!(result.is_none() || result.as_ref().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_status_uses_bearer_token_for_diagnostics() {
+        use wiremock::matchers::{header as wiremock_header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({"ok": false})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .and(wiremock_header("authorization", "Bearer gateway-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "version": "0.1.0",
+                "instance_lock": {"held": true}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/telemetry"))
+            .and(wiremock_header("authorization", "Bearer gateway-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metrics": {},
+                "recent_turns": [],
+                "recent_errors": []
+            })))
+            .mount(&server)
+            .await;
+
+        let (status_json, telemetry_json) = fetch_live_status_at(&server.uri(), "gateway-secret")
+            .await
+            .expect("authenticated diagnostics response");
+        let status: serde_json::Value = serde_json::from_str(&status_json).expect("status json");
+        assert_eq!(status["version"], "0.1.0");
+        assert!(telemetry_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn fetch_live_status_falls_back_on_unauthorized_diagnostics() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        assert!(
+            fetch_live_status_at(&server.uri(), "gateway-secret")
+                .await
+                .is_none()
+        );
     }
 
     #[test]

@@ -159,7 +159,7 @@ Sidebar 最下部、`+ New Session` の下。
 - 小テキスト・muted
 - StatusDot で状態を視覚的に示す
 - hover で Metrics タブへのリンクを表示
-- `/health` を定期的にポーリングして更新（間隔は [metrics.md](./metrics.md) に準拠）
+- `/health` と `/api/status` を定期的にポーリングして更新（間隔は [metrics.md](./metrics.md) に準拠）
 
 #### Health status の定義
 
