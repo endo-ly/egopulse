@@ -266,7 +266,7 @@ impl AppState {
 
     /// 現在の設定スナップショットを返す。
     pub fn current_config(&self) -> Arc<Config> {
-        Arc::new(self.config.clone())
+        Arc::new(self.config_manager.current_blocking().config.clone())
     }
 
     /// 設定ファイルパスがある場合はディスクから再読込した最新設定を返す。

@@ -21,7 +21,8 @@ pub(super) async fn require_http_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(expected_token) = state.app_state.config.web_auth_token() else {
+    let config = state.app_state.current_config();
+    let Some(expected_token) = config.web_auth_token() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({

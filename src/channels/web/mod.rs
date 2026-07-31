@@ -355,6 +355,8 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/agents", get(agents::list_agents))
         .route("/api/sleep/runs", get(sleep::list_sleep_runs))
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
+        .route("/api/status", get(health::status))
+        .route("/telemetry", get(health::telemetry_handler))
         .route_layer(middleware::from_fn_with_state(
             web_state.clone(),
             auth::require_http_auth,
@@ -382,7 +384,6 @@ fn build_router(web_state: WebState) -> Router {
         .route("/", get(index_html))
         .route("/ws", get(ws::ws_handler))
         .route("/health", get(health::health))
-        .route("/telemetry", get(health::telemetry_handler))
         .merge(api_routes);
     if let Some(routes) = voice_routes {
         app = app.merge(routes);
@@ -508,6 +509,132 @@ mod tests {
             run_hub: RunHub::default(),
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn authenticated_web_test_router(dir: &tempfile::TempDir) -> (Router, Arc<AppState>) {
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        let app_state = Arc::new(build_state_with_config(config, None, None, None, None));
+        let router = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+        (router, app_state)
+    }
+
+    #[tokio::test]
+    async fn public_health_returns_only_liveness_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, state) = authenticated_web_test_router(&dir);
+        state
+            .runtime_status
+            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+
+        let response = app
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn detailed_status_requires_web_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, state) = authenticated_web_test_router(&dir);
+        state
+            .runtime_status
+            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/api/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_token = app
+            .clone()
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::AUTHORIZATION, "Bearer web-secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json["pid"].as_u64().is_some());
+        assert!(json["instance_lock"].get("lock_file").is_none());
+    }
+
+    #[tokio::test]
+    async fn telemetry_rejects_unauthorized_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, _) = authenticated_web_test_router(&dir);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/telemetry")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/telemetry")
+                    .header(header::AUTHORIZATION, "Bearer web-secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json.get("metrics").is_some());
+        assert!(json.get("recent_turns").is_some());
+        assert!(json.get("recent_errors").is_some());
     }
 
     #[tokio::test]
