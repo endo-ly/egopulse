@@ -480,6 +480,7 @@ pub(crate) fn default_state_root() -> Result<PathBuf, ConfigError> {
 }
 
 /// Default workspace directory: `~/.egopulse/workspace`.
+#[cfg(test)]
 pub(crate) fn default_workspace_dir() -> Result<PathBuf, ConfigError> {
     default_state_root().map(|root| root.join("workspace"))
 }

@@ -174,7 +174,8 @@ pub(super) async fn ws_handler(
     headers: HeaderMap,
     State(state): State<WebState>,
 ) -> impl IntoResponse {
-    if !auth::is_ws_origin_allowed(&headers, &state.app_state.config) {
+    let snapshot = state.app_state.config_manager.current_blocking();
+    if !auth::is_ws_origin_allowed(&headers, &snapshot.config) {
         return (
             StatusCode::FORBIDDEN,
             "invalid_origin: websocket origin not allowed",
@@ -334,7 +335,8 @@ fn handle_connect(
         .is_err();
     }
 
-    if !auth::is_valid_ws_token(&state.app_state.config, payload.auth_token.as_deref()) {
+    let snapshot = state.app_state.config_manager.current_blocking();
+    if !auth::is_valid_ws_token(&snapshot.config, payload.auth_token.as_deref()) {
         return send_error(
             context.tx,
             id,

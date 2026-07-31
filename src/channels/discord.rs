@@ -167,20 +167,65 @@ struct DiscordTokenResolver {
     bot_token_map: HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
     agent_bot_map: HashMap<String, String>,
+    config_manager: Option<Arc<crate::config::ConfigManager>>,
 }
 
 impl DiscordTokenResolver {
+    #[cfg(test)]
     fn new(bot_token_map: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
         Self {
             bot_token_map,
             agent_bot_map,
+            config_manager: None,
+        }
+    }
+
+    fn with_manager(config_manager: Arc<crate::config::ConfigManager>) -> Self {
+        Self {
+            bot_token_map: HashMap::new(),
+            agent_bot_map: HashMap::new(),
+            config_manager: Some(config_manager),
         }
     }
 
     /// `external_chat_id` から該当する bot token を解決する。
     /// 明示的な `:bot:` セグメントがあればそちらを優先し、
     /// なければ agent バインディング経由で解決する。
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
+        if let Some(config_manager) = &self.config_manager {
+            let snapshot = config_manager.current_blocking();
+            let config = &snapshot.config;
+            let bot_id = if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
+                bot_id.to_string()
+            } else {
+                let agent_id = parse_discord_agent_id(external_chat_id).ok_or_else(|| {
+                    format!(
+                        "Discord external_chat_id '{external_chat_id}' does not identify a bot or agent"
+                    )
+                })?;
+                config
+                    .agents
+                    .get(&crate::config::AgentId::new(agent_id))
+                    .and_then(|agent| agent.discord_bot.as_ref())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        format!(
+                            "no Discord bot binding found for agent '{agent_id}' in external_chat_id '{external_chat_id}'"
+                        )
+                    })?
+            };
+            return config
+                .discord_bots()
+                .into_iter()
+                .find(|bot| bot.bot_id.as_str() == bot_id)
+                .map(|bot| bot.token.to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
+                    )
+                });
+        }
+
         if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
             return self.token_for_bot(bot_id, external_chat_id);
         }
@@ -196,10 +241,10 @@ impl DiscordTokenResolver {
         self.token_for_bot(bot_id, external_chat_id)
     }
 
-    fn token_for_bot(&self, bot_id: &str, external_chat_id: &str) -> Result<&str, String> {
+    fn token_for_bot(&self, bot_id: &str, external_chat_id: &str) -> Result<String, String> {
         self.bot_token_map
             .get(bot_id)
-            .map(String::as_str)
+            .cloned()
             .ok_or_else(|| {
                 format!(
                     "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
@@ -230,21 +275,13 @@ impl Drop for DiscordTypingActivity {
 }
 
 impl DiscordAdapter {
-    pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
-        let bot_tokens: std::collections::HashMap<String, String> = config
-            .discord_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
-            .collect();
-        let agent_bots = config
-            .agents
-            .iter()
-            .filter_map(|(agent_id, agent)| {
-                let bot_id = agent.discord_bot.as_ref()?;
-                Some((agent_id.to_string(), bot_id.to_string()))
-            })
-            .collect();
-        let tokens = Arc::new(DiscordTokenResolver::new(bot_tokens, agent_bots));
+    pub(crate) fn new_for_bots_with_manager(
+        config_manager: Arc<crate::config::ConfigManager>,
+    ) -> Self {
+        Self::from_tokens(Arc::new(DiscordTokenResolver::with_manager(config_manager)))
+    }
+
+    fn from_tokens(tokens: Arc<DiscordTokenResolver>) -> Self {
         let http_client = reqwest::Client::new();
         let sink: Arc<dyn ToolProgressSink> = Arc::new(DiscordToolProgressSink::new(
             Arc::clone(&tokens),
@@ -258,7 +295,7 @@ impl DiscordAdapter {
     }
 
     /// `external_chat_id` から該当する bot token を解決する。
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
         self.tokens.select_token(external_chat_id)
     }
 }
@@ -282,7 +319,7 @@ impl ChannelAdapter for DiscordAdapter {
         external_chat_id: &str,
     ) -> Result<Box<dyn TurnActivity>, String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
-        let token = self.select_token(external_chat_id)?.to_string();
+        let token = self.select_token(external_chat_id)?;
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/typing");
         let client = self.http_client.clone();
 
@@ -571,17 +608,32 @@ impl ToolProgressHandle for DiscordToolProgressHandle {
 struct Handler {
     app_state: Arc<AppState>,
     bot_id: String,
-    default_agent: String,
-    channels: HashMap<u64, DiscordChannelConfig>,
     bot_user_id: OnceLock<UserId>,
     chain_state: Arc<BotChainState>,
     http_client: reqwest::Client,
 }
 
 impl Handler {
+    fn current_channels(&self) -> HashMap<u64, DiscordChannelConfig> {
+        self.app_state
+            .config_manager
+            .current_blocking()
+            .config
+            .discord_channels()
+    }
+
+    fn current_default_agent(&self) -> String {
+        self.app_state
+            .config_manager
+            .current_blocking()
+            .config
+            .default_agent
+            .to_string()
+    }
+
     fn default_agent_response(&self) -> RouteDecision {
         RouteDecision::Respond {
-            agent_id: self.default_agent.clone(),
+            agent_id: self.current_default_agent(),
         }
     }
 
@@ -589,6 +641,8 @@ impl Handler {
     fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
         let bot_id = crate::config::BotId::new(&self.bot_id);
         self.app_state
+            .config_manager
+            .current_blocking()
             .config
             .agents
             .get(agent_id)
@@ -648,7 +702,8 @@ impl Handler {
             return self.default_agent_response();
         }
 
-        let Some(channel_config) = self.channels.get(&channel_id) else {
+        let channels = self.current_channels();
+        let Some(channel_config) = channels.get(&channel_id) else {
             return RouteDecision::Reject;
         };
 
@@ -666,10 +721,11 @@ impl Handler {
     }
 
     fn scope_for_thread(&self, thread: &str) -> ConversationScope {
+        let channels = self.current_channels();
         thread
             .parse::<u64>()
             .ok()
-            .and_then(|cid| self.channels.get(&cid))
+            .and_then(|cid| channels.get(&cid))
             .map(|c| crate::runtime::channel_scope_from_secret(c.secret))
             .unwrap_or(ConversationScope::Normal)
     }
@@ -717,7 +773,8 @@ impl Handler {
         }
 
         if !is_dm {
-            if let Some(config) = self.channels.get(&channel_id) {
+            let channels = self.current_channels();
+            if let Some(config) = channels.get(&channel_id) {
                 if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
                 }
@@ -851,10 +908,8 @@ impl EventHandler for Handler {
             ReceiveDecision::Reject => return,
         }
 
-        let is_multi_agent = self
-            .channels
-            .get(&channel_id)
-            .is_some_and(|c| c.multi_agent);
+        let channels = self.current_channels();
+        let is_multi_agent = channels.get(&channel_id).is_some_and(|c| c.multi_agent);
 
         let channel_log_chat_id = if is_multi_agent && !is_dm {
             crate::runtime::store_human_channel_log_message(
@@ -928,7 +983,8 @@ impl EventHandler for Handler {
 
         info!(
             "Discord bot ({}) connected as {}",
-            self.default_agent, ready.user.name
+            self.current_default_agent(),
+            ready.user.name
         );
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
@@ -1156,20 +1212,24 @@ fn interaction_to_command_text(
     text
 }
 
-/// Discord bot を起動し、共有チャンネル設定とエージェントルーティングを適用する。
+/// Discord bot を起動する。
 #[allow(private_interfaces)]
 pub(crate) async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
-    default_agent: &crate::config::AgentId,
-    channels: &HashMap<u64, DiscordChannelConfig>,
     chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
+    let default_agent = state
+        .config_manager
+        .current_blocking()
+        .config
+        .default_agent
+        .clone();
     info!(
         "Starting Discord bot '{}' (agent {default_agent}) ...",
         bot_id.as_str(),
@@ -1186,8 +1246,6 @@ pub(crate) async fn start_discord_bot_for_bot(
     let handler = Handler {
         app_state: state,
         bot_id: bot_id.to_string(),
-        default_agent: default_agent.to_string(),
-        channels: channels.clone(),
         bot_user_id: OnceLock::new(),
         chain_state,
         http_client,
@@ -1224,27 +1282,44 @@ pub(crate) async fn start_discord_bot_for_bot(
 mod tests {
     use super::*;
 
+    fn test_state(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        default_agent: &str,
+        agents: Option<HashMap<crate::config::AgentId, crate::config::AgentConfig>>,
+    ) -> Arc<crate::runtime::AppState> {
+        let mut config = crate::test_util::test_config(
+            tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .to_str()
+                .expect("utf8"),
+        );
+        config.default_agent = crate::config::AgentId::new(default_agent);
+        if let Some(agents) = agents {
+            config.agents = agents;
+        }
+        config
+            .channels
+            .entry(crate::config::ChannelName::new("discord"))
+            .or_default()
+            .discord_channels = Some(channels);
+        Arc::new(crate::agent_loop::turn::build_state(
+            config,
+            Box::new(crate::agent_loop::turn::FakeProvider {
+                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                }]),
+            }),
+        ))
+    }
+
     fn test_handler(channels: HashMap<u64, DiscordChannelConfig>) -> Handler {
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "main".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: OnceLock::new(),
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1258,25 +1333,8 @@ mod tests {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "main".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1291,25 +1349,8 @@ mod tests {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "bot_a".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: lock,
             chain_state,
             http_client: reqwest::Client::new(),
@@ -1404,30 +1445,9 @@ mod tests {
     ) -> Handler {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
-        let mut config = crate::test_util::test_config(
-            tempfile::tempdir()
-                .expect("tempdir")
-                .path()
-                .to_str()
-                .expect("utf8"),
-        );
-        config.agents = agents;
-        let state = crate::agent_loop::turn::build_state(
-            config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
-                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                    content: "ok".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    usage: None,
-                }]),
-            }),
-        );
         Handler {
-            app_state: Arc::new(state),
+            app_state: test_state(channels, default_agent, Some(agents)),
             bot_id: bot_id.to_string(),
-            default_agent: default_agent.to_string(),
-            channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1815,8 +1835,9 @@ mod tests {
         assert!(route_accepts_channel(&handler, 456));
 
         // Verify config is readable
-        assert!(handler.channels.get(&123).expect("config").require_mention);
-        assert!(!handler.channels.get(&456).expect("config").require_mention);
+        let channels = handler.current_channels();
+        assert!(channels.get(&123).expect("config").require_mention);
+        assert!(!channels.get(&456).expect("config").require_mention);
     }
 
     #[test]

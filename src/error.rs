@@ -133,6 +133,14 @@ pub enum ConfigError {
     },
     #[error("config_parse_failed: {path}: {detail}")]
     ConfigParseFailed { path: PathBuf, detail: String },
+    #[error("config_conflict: expected_fingerprint={expected} current_fingerprint={current}")]
+    ConfigConflict { expected: String, current: String },
+    #[error("config_reload_forbidden: field={field}")]
+    ConfigReloadForbidden { field: String },
+    #[error("config_path_unavailable")]
+    ConfigPathUnavailable,
+    #[error("config_revision_exhausted")]
+    ConfigRevisionExhausted,
     #[error("missing_default_provider")]
     MissingDefaultProvider,
     #[error("missing_providers")]

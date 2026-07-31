@@ -376,6 +376,120 @@ pub(super) fn build_config(
     Ok(config)
 }
 
+/// Validates an already-normalized candidate produced by an in-process
+/// update. File loading performs the same checks while normalizing YAML, but
+/// API and slash-command updates mutate the normalized representation directly.
+pub(super) fn validate_runtime_candidate(config: &Config) -> Result<(), ConfigError> {
+    if config.providers.is_empty() {
+        return Err(ConfigError::MissingProviders);
+    }
+    if !config.providers.contains_key(&config.default_provider) {
+        return Err(ConfigError::InvalidProviderReference {
+            provider: config.default_provider.to_string(),
+        });
+    }
+
+    for (provider_id, provider) in &config.providers {
+        if provider.base_url.trim().is_empty() {
+            return Err(ConfigError::MissingProviderBaseUrl {
+                provider: provider_id.to_string(),
+            });
+        }
+        validate_base_url(&provider.base_url)?;
+        if provider.default_model.trim().is_empty() {
+            return Err(ConfigError::MissingProviderDefaultModel {
+                provider: provider_id.to_string(),
+            });
+        }
+        for (model_name, model_config) in &provider.models {
+            if model_config.model_instructions.is_some()
+                && model_config.model_instructions_file.is_some()
+            {
+                return Err(ConfigError::ModelInstructionsConflict {
+                    provider: provider_id.to_string(),
+                    model: model_name.clone(),
+                });
+            }
+        }
+    }
+
+    validate_agent_id(&config.default_agent)?;
+    if !config.agents.contains_key(&config.default_agent) {
+        return Err(ConfigError::DefaultAgentNotFound {
+            agent_id: config.default_agent.to_string(),
+        });
+    }
+    for agent_id in config.agents.keys() {
+        validate_agent_id(agent_id)?;
+    }
+    validate_agent_provider_references(&config.providers, &config.agents)?;
+    if let Some(provider) = &config.sleep_batch.provider
+        && !config.providers.contains_key(provider)
+    {
+        return Err(ConfigError::InvalidProviderReference {
+            provider: provider.to_string(),
+        });
+    }
+
+    if config.sleep_batch.enabled && config.sleep_batch.schedule.is_none() {
+        return Err(ConfigError::SleepBatchEnabledRequiresSchedule);
+    }
+    if let Some(schedule) = &config.sleep_batch.schedule {
+        validate_schedule(schedule)?;
+    }
+    if let Some(agents) = &config.sleep_batch.agents {
+        for agent_id in agents {
+            if !config.agents.contains_key(agent_id) {
+                return Err(ConfigError::SleepBatchUnknownAgent {
+                    agent_id: agent_id.to_string(),
+                });
+            }
+        }
+    }
+    if config.sleep_batch.retry_max_attempts == 0 {
+        return Err(ConfigError::SleepBatchInvalidRetry {
+            detail: "max_attempts must be at least 1".to_string(),
+        });
+    }
+    if config.pulse.tick_interval_secs == 0 {
+        return Err(ConfigError::PulseInvalidTickInterval {
+            reason: "tick interval must be positive".to_string(),
+        });
+    }
+    validate_timezone(&config.timezone)?;
+
+    if config.web_enabled() && config.web_auth_token().is_none() {
+        return Err(ConfigError::MissingWebAuthToken);
+    }
+    if config.voice_enabled() && !config.web_enabled() {
+        return Err(ConfigError::VoiceRequiresWebChannel);
+    }
+    if config.voice_enabled() && config.voice_auth_token().is_none() {
+        return Err(ConfigError::MissingVoiceAuthToken);
+    }
+
+    if config.db.backup.interval_days == 0 {
+        return Err(ConfigError::InvalidBackupConfig(
+            "interval_days must be at least 1".to_string(),
+        ));
+    }
+    if config.db.backup.max_generations == 0 {
+        return Err(ConfigError::InvalidBackupConfig(
+            "max_generations must be at least 1".to_string(),
+        ));
+    }
+    validate_schedule(&config.db.backup.time).map_err(|_| {
+        ConfigError::InvalidBackupConfig("time must be in HH:MM format".to_string())
+    })?;
+
+    validate_compaction_config(config)?;
+    validate_discord_bot_references(config)?;
+    validate_telegram_bot_references(config)?;
+    validate_webhook_receivers(config)?;
+
+    Ok(())
+}
+
 fn load_dotenv(config_path: Option<&Path>) -> HashMap<String, String> {
     let Some(path) = config_path else {
         return HashMap::new();

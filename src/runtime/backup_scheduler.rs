@@ -58,17 +58,19 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
     clock: Arc<dyn Clock>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), EgoPulseError> {
-    if !state.config.db.backup.scheduler_enabled() {
-        info!("backup scheduler: disabled, exiting loop");
-        return Ok(());
-    }
+    let mut changes = state.config_manager.subscribe();
 
     loop {
+        let snapshot = state.config_manager.current_blocking();
+        if !snapshot.config.db.backup.scheduler_enabled() {
+            info!("backup scheduler: disabled, exiting loop");
+            return Ok(());
+        }
         let now = clock.now();
         let last_run = call_blocking(Arc::clone(&state.db), get_backup_last_run).await?;
         let next = match compute_next_backup_run(
-            &state.config.db.backup,
-            &state.config.timezone,
+            &snapshot.config.db.backup,
+            &snapshot.config.timezone,
             now,
             last_run,
         ) {
@@ -90,10 +92,16 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
                 info!("backup scheduler: shutdown requested, exiting loop");
                 return Ok(());
             }
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
             _ = sleep(delay) => {}
         }
 
-        match run_periodic_backup_once(&state, clock.now()).await {
+        match run_periodic_backup_once_with_config(&state, &snapshot.config, clock.now()).await {
             Ok(outcome) if outcome.integrity_ok => {
                 info!(path = %outcome.path.display(), "backup scheduler: created");
             }
@@ -117,13 +125,23 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
 /// # Errors
 ///
 /// Returns [`EgoPulseError`] when either the backup or the timestamp write fails.
+#[cfg(test)]
 pub(crate) async fn run_periodic_backup_once(
     state: &AppState,
     now: DateTime<Utc>,
 ) -> Result<BackupOutcome, EgoPulseError> {
-    let max_generations = state.config.db.backup.max_generations;
-    let dest_dir = state.config.backup_dir();
-    let tz = state.config.timezone.clone();
+    let snapshot = state.config_manager.current_blocking();
+    run_periodic_backup_once_with_config(state, &snapshot.config, now).await
+}
+
+async fn run_periodic_backup_once_with_config(
+    state: &AppState,
+    config: &crate::config::Config,
+    now: DateTime<Utc>,
+) -> Result<BackupOutcome, EgoPulseError> {
+    let max_generations = config.db.backup.max_generations;
+    let dest_dir = config.backup_dir();
+    let tz = config.timezone.clone();
 
     let outcome = call_blocking(Arc::clone(&state.db), move |db| {
         run_backup(db, &dest_dir, &tz, now, max_generations, "egopulse")
@@ -131,8 +149,8 @@ pub(crate) async fn run_periodic_backup_once(
     .await?;
 
     if let Some(secret_db) = &state.secret_db {
-        let dest_dir = state.config.backup_dir();
-        let tz = state.config.timezone.clone();
+        let dest_dir = config.backup_dir();
+        let tz = config.timezone.clone();
         if let Err(error) = call_blocking(Arc::clone(secret_db), move |db| {
             run_backup(db, &dest_dir, &tz, now, max_generations, "secret")
         })

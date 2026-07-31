@@ -137,9 +137,10 @@ pub async fn run_sleep_batch(
     agent_id: Option<&str>,
     trigger: SleepRunTrigger,
 ) -> Result<(), SleepBatchError> {
+    let snapshot = state.config_manager.current_blocking();
     let resolved_agent = match agent_id {
         Some(id) => id.to_string(),
-        None => state.config.default_agent.as_str().to_string(),
+        None => snapshot.config.default_agent.as_str().to_string(),
     };
 
     let db = Arc::clone(&state.db);
@@ -174,6 +175,7 @@ pub async fn run_sleep_batch(
                 &sessions,
                 &source_chats_json,
                 trigger,
+                snapshot,
             )
             .await
         }
@@ -205,9 +207,10 @@ pub async fn run_events_extract(
     from: Option<&str>,
     to: Option<&str>,
 ) -> Result<(), SleepBatchError> {
+    let snapshot = state.config_manager.current_blocking();
     let resolved_agent = match agent_id {
         Some(id) => id.to_string(),
-        None => state.config.default_agent.as_str().to_string(),
+        None => snapshot.config.default_agent.as_str().to_string(),
     };
 
     let from_owned = from.map(str::to_string);
@@ -231,7 +234,7 @@ pub async fn run_events_extract(
     };
 
     let result = async {
-        let resolved = state
+        let resolved = snapshot
             .config
             .resolve_sleep_batch_llm()
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
@@ -240,13 +243,13 @@ pub async fn run_events_extract(
             if let Some(override_provider) = state.llm_override.clone() {
                 override_provider
             } else {
-                let revision = state.config_manager.current_blocking().revision;
+                let revision = snapshot.revision;
                 state
                     .cached_provider(&resolved, revision)
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
-        let context_tokens = state.config.resolve_context_window_tokens(
+        let context_tokens = snapshot.config.resolve_context_window_tokens(
             &crate::config::ProviderId::new(&resolved.provider),
             &resolved.model,
         );
@@ -418,6 +421,7 @@ struct BatchContext {
     /// finalize; never written to disk mid-run.
     candidate_memory: MemoryBundle,
     context_tokens: usize,
+    config: Arc<crate::config::Config>,
 }
 
 struct MessageStepInput {
@@ -493,6 +497,7 @@ async fn execute_batch(
     sessions: &[AgentSessionInfo],
     source_chats_json: &str,
     trigger: SleepRunTrigger,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<(), SleepBatchError> {
     let run_id = create_sleep_run(&db, agent_id, trigger).await?;
 
@@ -508,7 +513,7 @@ async fn execute_batch(
     .await?;
 
     let result = async {
-        let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id).await?;
+        let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id, &snapshot).await?;
         run_event_extraction_step(&mut ctx, &db, agent_id).await?;
         run_episodic_update_step(&mut ctx, state, &db, agent_id).await?;
         run_memory_update_step(&mut ctx, &db, agent_id).await?;
@@ -565,9 +570,10 @@ async fn prepare_batch_context(
     agent_id: &str,
     sessions: &[AgentSessionInfo],
     run_id: &str,
+    snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<BatchContext, SleepBatchError> {
-    let resolved = state
-        .config
+    let config = Arc::new(snapshot.config.clone());
+    let resolved = config
         .resolve_sleep_batch_llm()
         .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
 
@@ -575,13 +581,13 @@ async fn prepare_batch_context(
     {
         override_provider
     } else {
-        let revision = state.config_manager.current_blocking().revision;
+        let revision = snapshot.revision;
         state
             .cached_provider(&resolved, revision)
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 
-    let context_tokens = state.config.resolve_context_window_tokens(
+    let context_tokens = config.resolve_context_window_tokens(
         &crate::config::ProviderId::new(&resolved.provider),
         &resolved.model,
     );
@@ -597,6 +603,7 @@ async fn prepare_batch_context(
         base_memory: (*memory_before).clone(),
         candidate_memory: (*memory_before).clone(),
         context_tokens,
+        config,
     })
 }
 
@@ -752,7 +759,7 @@ async fn finish_step_skipped(db: &Arc<Database>, run_id: &str, step_name: SleepS
 /// Step 2: Episodic Update — rollup generation and episodic.md rendering.
 async fn run_episodic_update_step(
     ctx: &mut BatchContext,
-    state: &AppState,
+    _state: &AppState,
     db: &Arc<Database>,
     agent_id: &str,
 ) -> Result<Option<String>, SleepBatchError> {
@@ -762,9 +769,9 @@ async fn run_episodic_update_step(
     })
     .await?;
 
-    let tz_str = &state.config.timezone;
+    let tz_str = ctx.config.timezone.clone();
     let tz_chrono: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
-    let tz = resolve_fixed_offset(tz_str);
+    let tz = resolve_fixed_offset(&tz_str);
     let now = chrono::Utc::now().with_timezone(&tz);
     let cw = event_rollup::current_week(now, tz_chrono);
     let cw_start = cw.period_start.to_rfc3339();
@@ -811,7 +818,7 @@ async fn run_episodic_update_step(
     }
 
     let Some(rendered) =
-        episodic_renderer::render_episodic_view(db, agent_id, tz_str, &cw, &current_week_events)
+        episodic_renderer::render_episodic_view(db, agent_id, &tz_str, &cw, &current_week_events)
             .await
     else {
         let error = SleepBatchError::Internal("episodic renderer produced no output".to_string());
@@ -1429,8 +1436,8 @@ async fn finalize_batch(
     let run = call_blocking(Arc::clone(db), move |db| db.get_sleep_run(&run_id_for_load))
         .await?
         .ok_or_else(|| SleepBatchError::Internal(format!("sleep run vanished: {}", ctx.run_id)))?;
-    let groups_dir = state.config.groups_dir();
-    let secrets = crate::tools::collect_config_secrets(&state.config);
+    let groups_dir = ctx.config.groups_dir();
+    let secrets = crate::tools::collect_config_secrets(&ctx.config);
     let provider_name = ctx.provider.provider_name().to_string();
     let db_for_finalize = Arc::clone(db);
     // The post-publication finalization (archive writes, truncation, run
@@ -1738,8 +1745,9 @@ fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPu
             // publication and finalization still converges to the on-success
             // state rather than leaving sessions un-archived. Idempotent: a
             // run the normal path already finalized is a no-op.
-            let groups_dir = state.config.groups_dir();
-            let secrets = crate::tools::collect_config_secrets(&state.config);
+            let config = state.config_manager.current_blocking();
+            let groups_dir = config.config.groups_dir();
+            let secrets = crate::tools::collect_config_secrets(&config.config);
             if let Err(e) =
                 finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None)
             {

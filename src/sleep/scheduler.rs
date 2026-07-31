@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, LocalResult, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use tracing::{info, warn};
 
-use crate::config::{AgentConfig, AgentId, SleepBatchConfig};
+use crate::config::{AgentConfig, AgentId, Config, SleepBatchConfig};
 use crate::runtime::AppState;
 use crate::storage::SleepRunTrigger;
 
@@ -59,7 +59,8 @@ pub(crate) fn resolve_target_agents(
 }
 
 pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
-    let config = &state.config.sleep_batch;
+    let snapshot = state.config_manager.current_blocking();
+    let config = &snapshot.config.sleep_batch;
     if !config.scheduler_enabled() {
         return;
     }
@@ -80,7 +81,11 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
         Err(e) => warn!(error = %e, "scheduled cycle: pending-publication task panicked"),
     }
 
-    let agents = resolve_target_agents(config, &state.config.agents, &state.config.default_agent);
+    let agents = resolve_target_agents(
+        config,
+        &snapshot.config.agents,
+        &snapshot.config.default_agent,
+    );
     if agents.is_empty() {
         info!("scheduled cycle: no agents to process");
         return;
@@ -92,7 +97,7 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
             continue;
         }
 
-        match run_agent_with_retry(&state, agent_id).await {
+        match run_agent_with_retry(&state, agent_id, &snapshot.config).await {
             Ok(()) => {}
             Err(SleepBatchError::AlreadyRunning { .. }) => {
                 info!(agent_id = %agent_id, "scheduled cycle: already running, skipping");
@@ -104,9 +109,13 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
     }
 }
 
-async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<(), SleepBatchError> {
-    let max_attempts = state.config.sleep_batch.retry_max_attempts;
-    let interval = state.config.sleep_batch.retry_interval_minutes;
+async fn run_agent_with_retry(
+    state: &AppState,
+    agent_id: &AgentId,
+    config: &Config,
+) -> Result<(), SleepBatchError> {
+    let max_attempts = config.sleep_batch.retry_max_attempts;
+    let interval = config.sleep_batch.retry_interval_minutes;
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
@@ -142,21 +151,31 @@ async fn run_agent_with_retry(state: &AppState, agent_id: &AgentId) -> Result<()
 /// Runs the scheduler loop until the process is shut down.
 ///
 /// Each iteration calculates the next scheduled run, sleeps until then,
-/// and executes [`run_scheduled_cycle`]. Returns `Ok(())` on normal exit
-/// (e.g. if the scheduler becomes disabled at runtime, or when `shutdown` is
-/// cancelled).
+/// and executes [`run_scheduled_cycle`]. A disabled schedule waits for a
+/// configuration notification so it can become active without a restart.
 pub(crate) async fn run_scheduler_loop(
     state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::error::EgoPulseError> {
+    let mut changes = state.config_manager.subscribe();
     loop {
+        let snapshot = state.config_manager.current_blocking();
         let now = Utc::now();
-        let next = match next_scheduled_run(&state.config.sleep_batch, &state.config.timezone, now)
-        {
-            Some(t) => t,
-            None => {
-                info!("sleep scheduler: disabled or no schedule configured, exiting loop");
-                return Ok(());
+        let Some(next) =
+            next_scheduled_run(&snapshot.config.sleep_batch, &snapshot.config.timezone, now)
+        else {
+            info!("sleep scheduler: disabled or no schedule configured, waiting for change");
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("sleep scheduler: shutdown requested, exiting loop");
+                    return Ok(());
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
         };
 
@@ -171,6 +190,12 @@ pub(crate) async fn run_scheduler_loop(
             _ = shutdown.cancelled() => {
                 info!("sleep scheduler: shutdown requested, exiting loop");
                 return Ok(());
+            }
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                continue;
             }
             _ = tokio::time::sleep(delay) => {}
         }
@@ -675,14 +700,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_loop_exits_when_disabled() {
+    async fn scheduler_loop_waits_for_change_when_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = std::sync::Arc::new(test_util::build_state_with_provider(
             dir.path().to_str().unwrap(),
             Box::new(MockLlm::new()),
         ));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_scheduler_loop(state, task_shutdown));
 
-        let result = run_scheduler_loop(state, tokio_util::sync::CancellationToken::new()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "disabled scheduler should wait for changes"
+        );
+        shutdown.cancel();
+        let result = task.await.expect("scheduler task");
         assert!(result.is_ok());
     }
 }

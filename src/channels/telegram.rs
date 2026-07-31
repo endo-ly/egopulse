@@ -162,16 +162,30 @@ struct TelegramHandler {
     app_state: Arc<AppState>,
     bot_id: String,
     bot_username: String,
-    default_agent: String,
-    channels: HashMap<i64, TelegramChatConfig>,
     chain_state: Arc<BotChainState>,
 }
 
 impl TelegramHandler {
+    fn current_channels(&self) -> HashMap<i64, TelegramChatConfig> {
+        let snapshot = self.app_state.config_manager.current_blocking();
+        snapshot.config.telegram_channels()
+    }
+
+    fn current_default_agent(&self) -> String {
+        self.app_state
+            .config_manager
+            .current_blocking()
+            .config
+            .default_agent
+            .to_string()
+    }
+
     /// 指定エージェントがこの bot にバインドされているかを返す。
     fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
         let bot_id = crate::config::BotId::new(&self.bot_id);
         self.app_state
+            .config_manager
+            .current_blocking()
             .config
             .agents
             .get(agent_id)
@@ -227,11 +241,12 @@ impl TelegramHandler {
     fn route_message(&self, raw_chat_id: i64, is_dm: bool, mentions_bot: bool) -> RouteDecision {
         if is_dm {
             return RouteDecision::Respond {
-                agent_id: self.default_agent.clone(),
+                agent_id: self.current_default_agent(),
             };
         }
 
-        let Some(channel_config) = self.channels.get(&raw_chat_id) else {
+        let channels = self.current_channels();
+        let Some(channel_config) = channels.get(&raw_chat_id) else {
             return RouteDecision::Reject;
         };
 
@@ -265,7 +280,8 @@ impl TelegramHandler {
 
         // 人間のメッセージ: require_mention 設定に従う
         if !is_dm {
-            if let Some(config) = self.channels.get(&raw_chat_id) {
+            let channels = self.current_channels();
+            if let Some(config) = channels.get(&raw_chat_id) {
                 if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
                 }
@@ -282,10 +298,11 @@ impl TelegramHandler {
     }
 
     fn scope_for_thread(&self, thread: &str) -> ConversationScope {
+        let channels = self.current_channels();
         thread
             .parse::<i64>()
             .ok()
-            .and_then(|cid| self.channels.get(&cid))
+            .and_then(|cid| channels.get(&cid))
             .map(|c| crate::runtime::channel_scope_from_secret(c.secret))
             .unwrap_or(ConversationScope::Normal)
     }
@@ -349,20 +366,56 @@ struct TelegramTokenResolver {
     bot_tokens: HashMap<String, String>,
     /// `agent_id → bot_id` のマップ。
     agent_bot_map: HashMap<String, String>,
+    config_manager: Option<Arc<crate::config::ConfigManager>>,
 }
 
 impl TelegramTokenResolver {
+    #[cfg(test)]
     fn new(bot_tokens: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
         Self {
             bot_tokens,
             agent_bot_map,
+            config_manager: None,
+        }
+    }
+
+    fn with_manager(config_manager: Arc<crate::config::ConfigManager>) -> Self {
+        Self {
+            bot_tokens: HashMap::new(),
+            agent_bot_map: HashMap::new(),
+            config_manager: Some(config_manager),
         }
     }
 
     /// Resolve the bot token for a given external_chat_id.
     ///
     /// Extracts agent_id from the `:agent:` segment, maps agent → bot_id → token.
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
+        if let Some(config_manager) = &self.config_manager {
+            let snapshot = config_manager.current_blocking();
+            let config = &snapshot.config;
+            let agent_id = external_chat_id
+                .find(":agent:")
+                .map(|pos| &external_chat_id[pos + ":agent:".len()..])
+                .unwrap_or("");
+            if let Some(bot_id) = config
+                .agents
+                .get(&crate::config::AgentId::new(agent_id))
+                .and_then(|agent| agent.telegram_bot.as_ref())
+            {
+                if let Some(bot) = config
+                    .telegram_bots()
+                    .into_iter()
+                    .find(|bot| *bot.bot_id == *bot_id)
+                {
+                    return Ok(bot.token.to_string());
+                }
+            }
+            return Err(format!(
+                "no Telegram bot binding found for external_chat_id '{external_chat_id}'"
+            ));
+        }
+
         let agent_id = external_chat_id
             .find(":agent:")
             .map(|pos| &external_chat_id[pos + ":agent:".len()..])
@@ -370,7 +423,7 @@ impl TelegramTokenResolver {
         if !agent_id.is_empty() {
             if let Some(bot_id) = self.agent_bot_map.get(agent_id) {
                 if let Some(token) = self.bot_tokens.get(bot_id) {
-                    return Ok(token);
+                    return Ok(token.clone());
                 }
             }
         }
@@ -391,11 +444,24 @@ pub(crate) struct TelegramAdapter {
 }
 
 impl TelegramAdapter {
+    #[cfg(test)]
     pub(crate) fn new_multi(
         bot_tokens: HashMap<String, String>,
         agent_bot_map: HashMap<String, String>,
     ) -> Self {
         let tokens = Arc::new(TelegramTokenResolver::new(bot_tokens, agent_bot_map));
+        Self::from_tokens(tokens)
+    }
+
+    pub(crate) fn new_multi_with_manager(
+        config_manager: Arc<crate::config::ConfigManager>,
+    ) -> Self {
+        Self::from_tokens(Arc::new(TelegramTokenResolver::with_manager(
+            config_manager,
+        )))
+    }
+
+    fn from_tokens(tokens: Arc<TelegramTokenResolver>) -> Self {
         let http_client = reqwest::Client::new();
         let sink: Arc<dyn ToolProgressSink> = Arc::new(TelegramToolProgressSink::new(
             Arc::clone(&tokens),
@@ -409,7 +475,7 @@ impl TelegramAdapter {
     }
 
     /// Resolve the bot token for a given external_chat_id.
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
         self.tokens.select_token(external_chat_id)
     }
 }
@@ -444,7 +510,7 @@ impl ChannelAdapter for TelegramAdapter {
         for chunk in split_text(text, TELEGRAM_MAX_MESSAGE_LEN) {
             send_telegram_api(
                 &self.http_client,
-                token,
+                &token,
                 "sendMessage",
                 serde_json::json!({
                     "chat_id": chat_id,
@@ -509,7 +575,7 @@ impl ChannelAdapter for TelegramAdapter {
 
         send_telegram_multipart(
             &self.http_client,
-            token,
+            &token,
             method,
             file_part_name,
             &filename,
@@ -523,7 +589,7 @@ impl ChannelAdapter for TelegramAdapter {
                 for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
                     send_telegram_api(
                         &self.http_client,
-                        token,
+                        &token,
                         "sendMessage",
                         serde_json::json!({
                             "chat_id": chat_id,
@@ -954,10 +1020,8 @@ async fn handle_message(
     }
 
     // Multi-Agent Room で Channel Log に保存
-    let is_multi_agent = handler
-        .channels
-        .get(&raw_chat_id)
-        .is_some_and(|c| c.multi_agent);
+    let channels = handler.current_channels();
+    let is_multi_agent = channels.get(&raw_chat_id).is_some_and(|c| c.multi_agent);
 
     // ObserveOnly: Channel Log に保存済み、応答はしない
     let Some(agent_id) = route.response_agent_id().map(ToString::to_string) else {
@@ -1065,8 +1129,6 @@ pub(crate) async fn start_telegram_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
-    default_agent: &crate::config::AgentId,
-    channels: &HashMap<i64, TelegramChatConfig>,
     chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bot = Bot::new(token);
@@ -1095,12 +1157,16 @@ pub(crate) async fn start_telegram_bot_for_bot(
         }
     };
 
+    let default_agent = state
+        .config_manager
+        .current_blocking()
+        .config
+        .default_agent
+        .clone();
     let telegram_handler = Arc::new(TelegramHandler {
         app_state: state,
         bot_id: bot_id.to_string(),
         bot_username: bot_username.clone(),
-        default_agent: default_agent.to_string(),
-        channels: channels.clone(),
         chain_state,
     });
 
@@ -1151,28 +1217,45 @@ pub(crate) async fn start_telegram_bot_for_bot(
 mod tests {
     use super::*;
 
+    fn test_state(
+        channels: HashMap<i64, TelegramChatConfig>,
+        default_agent: &str,
+        agents: Option<HashMap<crate::config::AgentId, crate::config::AgentConfig>>,
+    ) -> Arc<crate::runtime::AppState> {
+        let mut config = crate::test_util::test_config(
+            tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .to_str()
+                .expect("utf8"),
+        );
+        config.default_agent = crate::config::AgentId::new(default_agent);
+        if let Some(agents) = agents {
+            config.agents = agents;
+        }
+        config
+            .channels
+            .entry(crate::config::ChannelName::new("telegram"))
+            .or_default()
+            .telegram_channels = Some(channels);
+        Arc::new(crate::agent_loop::turn::build_state(
+            config,
+            Box::new(crate::agent_loop::turn::FakeProvider {
+                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                }]),
+            }),
+        ))
+    }
+
     fn test_handler(channels: HashMap<i64, TelegramChatConfig>) -> TelegramHandler {
         TelegramHandler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "main".to_string(),
             bot_username: "my_bot".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             chain_state: Arc::new(BotChainState::new()),
         }
     }
@@ -1184,31 +1267,10 @@ mod tests {
         default_agent: &str,
         agents: std::collections::HashMap<crate::config::AgentId, crate::config::AgentConfig>,
     ) -> TelegramHandler {
-        let mut config = crate::test_util::test_config(
-            tempfile::tempdir()
-                .expect("tempdir")
-                .path()
-                .to_str()
-                .expect("utf8"),
-        );
-        config.agents = agents;
-        let state = crate::agent_loop::turn::build_state(
-            config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
-                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                    content: "ok".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    usage: None,
-                }]),
-            }),
-        );
         TelegramHandler {
-            app_state: Arc::new(state),
+            app_state: test_state(channels, default_agent, Some(agents)),
             bot_id: bot_id.to_string(),
             bot_username: bot_username.to_string(),
-            default_agent: default_agent.to_string(),
-            channels,
             chain_state: Arc::new(BotChainState::new()),
         }
     }
@@ -1344,11 +1406,11 @@ mod tests {
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:alice"),
-            Ok("token-main")
+            Ok("token-main".to_string())
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:bob"),
-            Ok("token-other")
+            Ok("token-other".to_string())
         );
     }
 

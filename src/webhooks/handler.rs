@@ -19,8 +19,10 @@ pub(crate) async fn receive_webhook(
     body: Bytes,
 ) -> Response {
     let receiver_id = WebhookReceiverId::new(&raw_receiver_id);
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let config = &snapshot.config;
 
-    let Some(receiver) = state.app_state.config.webhook_receivers().get(&receiver_id) else {
+    let Some(receiver) = config.webhook_receivers().get(&receiver_id) else {
         return super::error::webhook_error(
             StatusCode::NOT_FOUND,
             "webhook_receiver_not_found",
@@ -65,8 +67,8 @@ pub(crate) async fn receive_webhook(
         .target
         .agent
         .as_ref()
-        .unwrap_or(&state.app_state.config.default_agent);
-    if !state.app_state.config.agents.contains_key(agent_id) {
+        .unwrap_or(&config.default_agent);
+    if !config.agents.contains_key(agent_id) {
         return super::error::webhook_error(
             StatusCode::BAD_REQUEST,
             "invalid_target",
@@ -95,7 +97,7 @@ pub(crate) async fn receive_webhook(
 
     let input = super::formatter::format_webhook_payload(&receiver_id.to_string(), &payload);
 
-    let context = match build_webhook_context(&state.app_state.config, &receiver_id, receiver) {
+    let context = match build_webhook_context(config, &receiver_id, receiver) {
         Ok(mut context) => {
             context.request_key = webhook_request_key(&receiver_id, &payload, &context.origin_id);
             context

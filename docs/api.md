@@ -178,6 +178,8 @@ GET /api/config
 {
   "ok": true,
   "config": {
+    "revision": 7,
+    "fingerprint": "9f2f...",
     "default_provider": "openrouter",
     "default_model": null,
     "effective_model": "anthropic/claude-sonnet-4",
@@ -198,17 +200,15 @@ GET /api/config
         "models": ["anthropic/claude-sonnet-4", "google/gemini-2.5-pro"],
         "has_api_key": true
       }
-    ],
-    "channel_overrides": {
-      "discord": { "provider": "openrouter", "model": null },
-      "telegram": { "provider": null, "model": null }
-    }
+    ]
   }
 }
 ```
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
+| `revision` | `number` | 現在の設定世代。設定交換が成功するたびに増加 |
+| `fingerprint` | `string` | 現在の設定 YAML の SHA-256。更新時の楽観的同時実行制御に使用 |
 | `default_provider` | `string` | デフォルトプロバイダー ID |
 | `default_model` | `string \| null` | グローバルモデルオーバーライド |
 | `effective_model` | `string` | 解決後の実際のモデル名 |
@@ -234,6 +234,7 @@ PUT /api/config
 {
   "default_provider": "openrouter",
   "default_model": null,
+  "expected_fingerprint": "9f2f...",
   "providers": {
     "openrouter": {
       "label": "OpenRouter",
@@ -245,11 +246,7 @@ PUT /api/config
   },
   "web_enabled": true,
   "web_host": "127.0.0.1",
-  "web_port": 10961,
-  "channel_overrides": {
-    "discord": { "provider": "openrouter", "model": null },
-    "telegram": { "provider": null, "model": null }
-  }
+  "web_port": 10961
 }
 ```
 
@@ -257,16 +254,20 @@ PUT /api/config
 |-----------|:---:|------|
 | `default_provider` | 必須 | |
 | `default_model` | 任意 | `null` 可 |
-| `providers` | 任意 | プロバイダー追加/削除は非対応。既存プロバイダーの編集のみ |
+| `expected_fingerprint` | 任意 | GET で取得した fingerprint。省略時はリクエスト処理開始時の値を使用 |
+| `providers` | 任意 | 既存プロバイダーの編集。新規追加は `base_url` と `default_model` が必要、削除は非対応 |
 | `providers.<id>.api_key` | 任意 | 省略時は変更なし。実値は `.env` に保存、YAML には SecretRef として記録 |
 | `web_enabled` | 必須 | |
 | `web_host` | 必須 | |
-| `web_port` | 必須 | |
-| `channel_overrides` | 任意 | |
+| `web_port` | 必須 | 1 以上 |
 
 ##### レスポンス (200)
 
 GET と同一形式。
+
+##### 競合レスポンス (409)
+
+`expected_fingerprint` が現在の設定と一致しない場合は更新せず、`config_conflict` を返す。GET で最新の snapshot を取得してから再度送信する。
 
 ---
 

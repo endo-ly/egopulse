@@ -4,6 +4,7 @@
 
 pub(crate) mod backup_scheduler;
 pub(crate) mod channel_input;
+pub(crate) mod config_reload;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
@@ -74,6 +75,7 @@ pub struct AppState {
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>>,
+    pub(crate) llm_cache_revision: Arc<Mutex<Option<u64>>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Per-session turn scheduler for concurrency control and ordered execution.
@@ -93,6 +95,7 @@ pub(crate) struct AppStateParts {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
+    pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -131,11 +134,8 @@ impl AppState {
         Self {
             db: parts.db,
             secret_db: parts.secret_db,
-            config: parts.config.clone(),
-            config_manager: Arc::new(ConfigManager::new(
-                parts.config,
-                parts.config_path.as_deref(),
-            )),
+            config: parts.config,
+            config_manager: parts.config_manager,
             config_path: parts.config_path,
             llm_override: parts.llm_override,
             channels: parts.channels,
@@ -146,6 +146,7 @@ impl AppState {
             soul_agents: parts.soul_agents,
             memory_loader: parts.memory_loader,
             llm_cache: Arc::new(Mutex::new(HashMap::new())),
+            llm_cache_revision: Arc::new(Mutex::new(None)),
             active_turns: Arc::new(ActiveTurnTracker::new()),
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
@@ -173,6 +174,7 @@ impl AppState {
             config_path: self.config_path.clone(),
             llm_override: self.llm_override.clone(),
             llm_cache: Arc::clone(&self.llm_cache),
+            llm_cache_revision: Arc::clone(&self.llm_cache_revision),
             tools: Arc::clone(&self.tools),
             skills: Arc::clone(&self.skills),
             soul_agents: Arc::clone(&self.soul_agents),
@@ -300,7 +302,15 @@ impl AppState {
         config_revision: u64,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
         let key = resolved.cache_key_with_revision(config_revision);
+        let mut cache_revision = self
+            .llm_cache_revision
+            .lock()
+            .expect("llm_cache_revision lock");
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
+        if *cache_revision != Some(config_revision) {
+            cache.clear();
+            *cache_revision = Some(config_revision);
+        }
         if let Some(provider) = cache.get(&key) {
             return Ok(Arc::clone(provider));
         }
@@ -346,6 +356,7 @@ pub async fn build_app_state_with_path(
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
+    let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
@@ -356,32 +367,24 @@ pub async fn build_app_state_with_path(
     #[cfg(feature = "channel-discord")]
     if !config.discord_bots().is_empty() {
         channels.register(Arc::new(
-            crate::channels::discord::DiscordAdapter::new_for_bots(&config),
+            crate::channels::discord::DiscordAdapter::new_for_bots_with_manager(Arc::clone(
+                &config_manager,
+            )),
         ));
     }
 
     #[cfg(feature = "channel-telegram")]
     if !config.telegram_bots().is_empty() {
-        let bot_tokens: std::collections::HashMap<String, String> = config
-            .telegram_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
-            .collect();
-        let agent_bots: std::collections::HashMap<String, String> = config
-            .agents
-            .iter()
-            .filter_map(|(agent_id, agent)| {
-                let bot_id = agent.telegram_bot.as_ref()?;
-                Some((agent_id.to_string(), bot_id.to_string()))
-            })
-            .collect();
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
+            crate::channels::telegram::TelegramAdapter::new_multi_with_manager(Arc::clone(
+                &config_manager,
+            )),
         ));
     }
 
     let channels = Arc::new(channels);
     let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
+    tools.set_config_manager(Arc::clone(&config_manager));
 
     let workspace_dir = config.workspace_dir()?;
     let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
@@ -401,12 +404,13 @@ pub async fn build_app_state_with_path(
     // once `AppState` exists (below), so the tool never holds a reference back
     // to the whole `AppState`.
     let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
-    tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
+    tools.register_tool(Box::new(crate::tools::AgentSendTool::new_with_manager(
         config.agents.clone(),
         Arc::clone(&deps.db),
         deps.secret_db.clone(),
         Arc::clone(&channels),
         Arc::clone(&agent_send_intake),
+        Arc::clone(&config_manager),
     )));
 
     let tools = Arc::new(tools);
@@ -417,6 +421,7 @@ pub async fn build_app_state_with_path(
         db: deps.db,
         secret_db: deps.secret_db,
         config,
+        config_manager,
         config_path,
         llm_override: None,
         channels,
@@ -597,7 +602,10 @@ pub fn build_sleep_app_state_with_path(
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
     let channels = Arc::new(ChannelRegistry::new());
-    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&deps.skills)));
+    let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
+    let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
+    tools.set_config_manager(Arc::clone(&config_manager));
+    let tools = Arc::new(tools);
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
@@ -605,6 +613,7 @@ pub fn build_sleep_app_state_with_path(
         db: deps.db,
         secret_db: deps.secret_db,
         config,
+        config_manager,
         config_path,
         llm_override: None,
         channels,
@@ -1087,7 +1096,13 @@ pub(crate) fn execute_scheduled_turn(
             }
         };
 
-        let valid_ids: Vec<&str> = state.config.agents.keys().map(|id| id.as_str()).collect();
+        let config_snapshot = state.config_manager.current_blocking();
+        let valid_ids: Vec<&str> = config_snapshot
+            .config
+            .agents
+            .keys()
+            .map(|id| id.as_str())
+            .collect();
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
@@ -1410,7 +1425,10 @@ async fn execute_turn_with_progress(
     let external_chat_id = context.session_key();
     let sink = adapter
         .and_then(|adapter| adapter.tool_progress_sink())
-        .filter(|_| tool_progress_enabled(&state.config, context));
+        .filter(|_| {
+            let config = state.config_manager.current_blocking();
+            tool_progress_enabled(&config.config, context)
+        });
 
     let (evt_tx, evt_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
@@ -1593,13 +1611,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
     #[cfg(feature = "channel-discord")]
     {
-        let shared_channels = state.config.discord_channels();
-        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .discord_bots()
             .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
+            .map(|b| (b.bot_id.clone(), b.token.to_string()))
             .collect();
 
         if !bot_configs.is_empty() {
@@ -1607,12 +1623,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             let rs = Arc::clone(&state.runtime_status);
             rs.update_channel("discord", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
-            for (bot_id, token, default_agent) in bot_configs {
+            for (bot_id, token) in bot_configs {
                 let discord_state = Arc::clone(&state);
-                info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
+                info!("Starting Discord bot '{bot_id}'...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
-                let channels = shared_channels.clone();
                 let handle_name = format!("discord[{bot_id}]");
                 state.supervisor.spawn_long_lived(
                     TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
@@ -1621,8 +1636,6 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
                             discord_state,
                             &token,
                             &bid,
-                            &default_agent,
-                            &channels,
                             chain_state,
                         )
                         .await
@@ -1645,13 +1658,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     // Telegram bot 起動
     #[cfg(feature = "channel-telegram")]
     {
-        let shared_channels = state.config.telegram_channels();
-        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .telegram_bots()
             .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
+            .map(|b| (b.bot_id.clone(), b.token.to_string()))
             .collect();
 
         if !bot_configs.is_empty() {
@@ -1659,12 +1670,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             let rs = Arc::clone(&state.runtime_status);
             rs.update_channel("telegram", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
-            for (bot_id, token, default_agent) in bot_configs {
+            for (bot_id, token) in bot_configs {
                 let telegram_state = Arc::clone(&state);
-                info!("Starting Telegram bot '{bot_id}' (agent {default_agent})...");
+                info!("Starting Telegram bot '{bot_id}'...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
-                let channels = shared_channels.clone();
                 let handle_name = format!("telegram[{bot_id}]");
                 state.supervisor.spawn_long_lived(
                     TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
@@ -1673,8 +1683,6 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
                             telegram_state,
                             &token,
                             &bid,
-                            &default_agent,
-                            &channels,
                             chain_state,
                         )
                         .await
@@ -1694,54 +1702,61 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
         }
     }
 
+    if state.config_path.is_some() {
+        let reload_state = Arc::clone(&state);
+        let token = state.supervisor.shutdown_token();
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(
+                TaskKind::ConfigReload,
+                "config-reload",
+                Criticality::NonCritical,
+            ),
+            async move { config_reload::run_config_reload_loop(reload_state, token).await },
+        );
+    }
+
     if !has_active_channels {
         return Err(EgoPulseError::Config(
             crate::error::ConfigError::NoActiveChannels,
         ));
     }
 
-    if state.config.sleep_batch.scheduler_enabled() {
-        let scheduler_state = state.clone();
-        let token = state.supervisor.shutdown_token();
-        info!("Starting sleep batch scheduler");
-        state.supervisor.spawn_long_lived(
-            TaskSpec::new(
-                TaskKind::SleepScheduler,
-                "sleep-scheduler",
-                Criticality::NonCritical,
-            ),
-            async move {
-                crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await
-            },
-        );
+    let scheduler_state = state.clone();
+    let token = state.supervisor.shutdown_token();
+    info!("Starting sleep batch scheduler");
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::SleepScheduler,
+            "sleep-scheduler",
+            Criticality::NonCritical,
+        ),
+        async move { crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await },
+    );
+
+    match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
+        db.reap_orphaned_pulse_runs()
+    })
+    .await
+    {
+        Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
     }
 
-    if state.config.pulse().scheduler_enabled() {
-        match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
-            db.reap_orphaned_pulse_runs()
-        })
-        .await
-        {
-            Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
-        }
-
-        let pulse_state = (*state).clone();
-        let token = state.supervisor.shutdown_token();
-        info!("Starting pulse scheduler");
-        state.supervisor.spawn_long_lived(
-            TaskSpec::new(
-                TaskKind::PulseScheduler,
-                "pulse-scheduler",
-                Criticality::NonCritical,
-            ),
-            async move {
-                crate::pulse::scheduler::run_pulse_scheduler(pulse_state, token).await;
-                Ok(())
-            },
-        );
-    }
+    let pulse_state = (*state).clone();
+    let token = state.supervisor.shutdown_token();
+    info!("Starting pulse scheduler");
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::PulseScheduler,
+            "pulse-scheduler",
+            Criticality::NonCritical,
+        ),
+        async move {
+            crate::pulse::scheduler::run_pulse_scheduler(pulse_state, token).await;
+            Ok(())
+        },
+    );
 
     if state.config.db.backup.scheduler_enabled() {
         let backup_state = (*state).clone();

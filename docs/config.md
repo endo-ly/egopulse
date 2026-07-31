@@ -747,73 +747,71 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 
 ## 10. 設定の変更インターフェース
 
-設定の読み取り・書き込みは以下のインターフェースから行える：
+設定の更新は `ConfigManager` の単一の更新境界を通る。YAML、Web API、スラッシュコマンドは同じ検証・永続化・スナップショット交換・通知の経路を共有する。
 
 | インターフェース | 読み取り | 書き込み | 対象 |
 |---------|:---:|:---:|------|
 | YAML 手動編集 | 全フィールド | 全フィールド | `~/.egopulse/egopulse.config.yaml` |
 | Setup Wizard | — | Agent / Provider / Model / Web / Discord / Telegram 初期設定 | 初回セットアップ・再セットアップ |
-| WebUI (`/api/config`) | 公開フィールド | 公開フィールド | ランタイム中の設定変更 |
-| スラッシュコマンド (`/provider`, `/model`) | ○ | ○ | プロバイダー・モデルの動的切替 |
+| WebUI (`/api/config`) | 現在の snapshot | 公開フィールド | ランタイム中の設定変更 |
+| スラッシュコマンド (`/provider`, `/model`) | 現在の snapshot | プロバイダー・モデル | ランタイム中の動的切替 |
+
+設定ファイルは 250ms 間隔で監視し、300ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
+
+Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返す。`PUT /api/config` はリクエストの `expected_fingerprint` が現在値と一致する場合だけ更新し、不一致なら `409 Conflict` を返す。Sleep / Pulse scheduler は設定変更通知を購読し、無効状態から有効状態へ変更された場合も同じプロセス内で動作を開始する。
 
 ---
 
 ## 11. 再起動要否と秘匿フィールド
 
-### 11.1 再起動が必要なフィールド
+### 11.1 再起動なしで反映されるフィールド
 
-以下のフィールドは起動時に固定される（プロセススナップショットから参照、またはネットワーク接続の確立が伴う）。変更後はプロセスの再起動が必要。
+以下のフィールドは妥当な候補が適用されると新しい Config snapshot へ交換され、次の Turn または次のスケジューラ周期から反映される。
+
+| フィールド | 反映範囲 |
+|---|---|
+| `default_provider` / `default_model` / `default_agent` | 新しい Turn の既定値 |
+| `agents.<id>.*` | Agent の provider / model / profile / routing と agent_send の宛先 |
+| `providers.<id>.*` | Provider 定義、credential、model、endpoint。Provider cache は revision ごとに分離 |
+| `timezone` | Sleep / Pulse および Turn の時刻解決 |
+| `compaction_*` / `compact_keep_recent` / `max_history_messages` / `default_context_window_tokens` | 新しい Turn の履歴・コンテキスト処理 |
+| `providers.<id>.models.<model>.context_window_tokens` | 新しい Turn のコンテキスト上限 |
+| `providers.<id>.models.<model>.model_instructions` / `model_instructions_file` | 新しい Turn の system prompt |
+| `sleep_batch.*` / `pulse.*` | Sleep / Pulse scheduler の次回判定 |
+| `channels.web.auth_token` / `allowed_origins` | Web / WebSocket の認証・Origin 判定 |
+| `channels.voice.auth_token` / `default_surface` / `default_session` / `allowed_surfaces` | Voice request の認証・既定値・アクセス制御 |
+| `channels.discord.channels` | Discord のアクセス制御・メンション要件・秘密モード |
+| `channels.telegram.telegram_channels` | Telegram のアクセス制御・メンション要件・秘密モード |
+| `webhooks.receivers.*` | Webhook の receiver・認証・配送先 |
+
+`model_instructions_file` は参照先パスの変更も新しい Turn から反映される。参照先ファイルの内容は Turn ごとに読み込まれる。
+
+### 11.2 再起動が必要なフィールド
+
+以下のフィールドはリスナー、bot 接続、ロガー、バックアップ scheduler、または永続化境界の構築を伴うため、候補全体を拒否する。変更後はプロセスを再起動する。
 
 | フィールド | 理由 |
 |---|---|
-| `timezone` | 各スケジューラが起動時スナップショットを参照 |
 | `log_level` | ロガーの初期化が伴う |
-| `compaction_timeout_secs` / `compaction_threshold_ratio` / `compaction_target_ratio` / `compact_keep_recent` | 起動時スナップショットから参照 |
-| `max_history_messages` | 起動時スナップショットから参照 |
-| `default_context_window_tokens` | 起動時スナップショットから参照 |
-| `sleep_batch.*` | sleep scheduler が起動時スナップショットを参照 |
-| `pulse.*` | pulse scheduler が起動時スナップショットを参照 |
-| `db.backup.*` | backup scheduler が起動時スナップショットを参照 |
-| `web_fetch.*` | ツール起動時に `Arc<Config>` スナップショットを保持 |
-| `providers.<id>.models.<model>.context_window_tokens` | 起動時スナップショットから参照 |
-| `providers.<id>.models.<model>.model_instructions` / `model_instructions_file` | system prompt 構築が起動時スナップショットを参照 |
-| `channels.web.enabled` / `host` / `port` | Web サーバーの起動/停止・バインド変更 |
-| `channels.web.auth_token` / `allowed_origins` | Web 層が起動時スナップショットを参照 |
+| `web_fetch.*` | Tool の静的ランタイム設定 |
+| `db.backup.*` | Backup scheduler の起動設定 |
+| `state_root` / secret DB の要否 | DB・ファイル・ロックの配置境界 |
+| `channels.web.enabled` / `host` / `port` | Web server の起動、停止、bind 変更 |
+| `channels.discord.enabled` / `channels.discord.bots` | Discord bot 接続と bot identity の変更 |
+| `channels.telegram.enabled` / `channels.telegram.telegram_bots` | Telegram bot 接続と bot identity の変更 |
 | `channels.voice.enabled` | Voice route の mount / unmount |
-| `channels.voice.auth_token` | Voice 認証 middleware の credential 更新 |
-| `channels.voice.default_surface` / `default_session` / `allowed_surfaces` | request default / access control の更新 |
-| `channels.discord.enabled` | Discord Bot の接続/切断 |
-| `channels.discord.bots.<bot_id>.token` | Bot 認証の再確立 |
-| `channels.discord.channels` | チャンネルアクセス制御・メンション要件・秘密モードの変更 |
-| `channels.telegram.enabled` | Telegram Bot の接続/切断 |
-| `channels.telegram.telegram_bots` | Bot 定義の更新 |
-| `channels.telegram.telegram_channels` | チャットアクセス制御・メンション要件・秘密モードの変更 |
 
-> **`model_instructions_file` の例外**: フィールド自体（参照先パス）の変更は再起動が必要だが、**参照先ファイルの内容**は毎ターン再読込される。したがってファイル内容の追記・編集は再起動なしで反映される。
-
-### 11.2 起動時スナップショットに含まれるフィールド
-
-以下のフィールドはプロセス起動時に [ConfigManager snapshot](#12-configmanager-と-immutable-snapshot) へ取り込まれ、runtime はその snapshot を参照し続ける。ファイルを編集しても runtime 内の snapshot は更新されないため、変更を反映するには runtime の再起動が必要である。
-
-| フィールド | 理由 |
-|---|---|
-| `default_provider` | 起動時の LLM 解決チェーンが snapshot から解決 |
-| `default_model` | 同上 |
-| `default_agent` | 同上 |
-| `agents.<id>.provider` / `model` / `profiles.*` / `discord_bot` / `telegram_bot` | エージェント定義は snapshot に含まれる |
-| `providers.<id>.label` / `base_url` / `api_key` / `default_model` | プロバイダー定義は snapshot に含まれる。プロバイダークライアントは Config revision を含む cache key でキャッシュされる |
-
-> `/provider` / `/model` スラッシュコマンドは設定ファイルを更新するが、実行中の runtime への反映には再起動が必要である（§10 参照）。
+外部編集で再起動必須フィールドを変更した場合も、現在の snapshot と実行中の runtime は変更されない。API とスラッシュコマンドからはこの候補を作成できない。
 
 ### 11.3 秘匿フィールド
 
-以下のフィールドは API レスポンスでマスクされ、`has_*` 真偽値のみ返却される。
+以下のフィールドは API レスポンスでマスクされ、値そのものを返却しない。
 
 | フィールド | API での表現 |
 |---|---|
 | `providers.<id>.api_key` | `has_api_key: boolean` |
 | `channels.web.auth_token` | `web_auth_enabled: boolean` |
-| `channels.voice.auth_token` | API レスポンスへ返却しない |
+| `channels.voice.auth_token` | 返却なし |
 | `channels.discord.bots.<bot_id>.token` | 返却なし |
 | `channels.telegram.telegram_bots.<bot_id>.token` | 返却なし |
 
@@ -821,7 +819,7 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 
 ## 12. ConfigManager と immutable Snapshot
 
-1つの Turn は開始時に固定した同一世代の Config・Provider・Prompt・Tool Policy を使用する。そのため、設定を immutable snapshot として管理する。
+`ConfigManager` は validated `Config` を `Arc<ConfigSnapshot>` として保持し、更新時の永続化・交換・通知を直列化する。Turn は開始時に取得した snapshot を完了まで保持するため、設定更新の途中で世代が混在しない。
 
 ### 12.1 ConfigSnapshot
 
@@ -829,17 +827,28 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 
 | フィールド | 役割 |
 |---|---|
-| `revision` | 設定世代番号。同一 revision は同一 Config 内容を保証する |
-| `fingerprint` | Config 内容の識別 hash（SHA-256）。ファイル内容または主要 field から算出 |
+| `revision` | 成功した設定交換ごとに増加する世代番号 |
+| `fingerprint` | 設定 YAML の SHA-256。ファイルを持たないテスト用 snapshot では deterministic fallback を使う |
 | `config` | validated `Config` |
 
-### 12.2 Turn での固定
+### 12.2 更新境界
+
+設定更新は次の順序で処理される。
+
+1. `expected_fingerprint` と現在 snapshot の fingerprint を比較する。
+2. 候補を検証し、再起動必須フィールドの変更を拒否する。
+3. 設定 YAML と SecretRef を安全に永続化する。
+4. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
+
+永続化または検証に失敗した場合は snapshot を交換しない。`revision` は成功した交換でのみ進み、同一 fingerprint の更新は no-op になる。
+
+### 12.3 Turn での固定
 
 Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで保持する。Turn 内部から Config ファイルを同期再読込しない。受付時（`accept_or_get_turn`）と実行準備（`prepare_turn`）は同じ snapshot を共有し、`turn_runs` に保存する `revision` / `fingerprint` と実際に使用する Provider・Prompt が同一世代に揃う。
 
 `turn_runs` には snapshot の `revision` と `fingerprint` を保存する。
 
-### 12.3 再起動後の Turn 復旧
+### 12.4 再起動後の Turn 復旧
 
 過去の Config snapshot は DB へ保存しない。起動時の Turn 復旧（[session-lifecycle.md §10.3](./session-lifecycle.md#103-crash-recovery)）は fail-stop であり、未端末 Turn を `config_fingerprint` の一致・不一致に関わらず停止状態へ移す。`config_fingerprint` は受付時の Config 同一性記録として保持されるが、自動再開の判定には用いない。
 
@@ -848,11 +857,11 @@ Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで保持�
 | 未端末 Turn | `accepted` / `input_committed` は `failed`、それ以上の状態は `uncertain` へ停止。fingerprint に関わらず自動再開しない |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-### 12.4 Provider cache
+### 12.5 Provider cache
 
 Provider cache key に Config revision を含める。credential や base URL が変わった場合、新 Turn が旧 Provider instance を使用しない。
 
-### 12.5 3つの「バージョン」概念の区別
+### 12.6 3つの「バージョン」概念の区別
 
 本システムには独立した 3 つの version 概念がある。混同しないこと。
 

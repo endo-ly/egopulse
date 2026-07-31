@@ -97,7 +97,8 @@ pub(crate) async fn require_voice_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.app_state.config.voice_auth_token() else {
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let Some(expected) = snapshot.config.voice_auth_token() else {
         return error(
             StatusCode::NOT_FOUND,
             "voice_channel_disabled",
@@ -160,6 +161,8 @@ async fn process_request(
     state: &AppState,
     request: VoiceTurnRequest,
 ) -> Result<VoiceTurnResponse, Response> {
+    let snapshot = state.config_manager.current_blocking();
+    let config = &snapshot.config;
     let text = request.text.trim();
     if text.is_empty() {
         return Err(error(
@@ -170,17 +173,17 @@ async fn process_request(
     }
     let surface = normalized_component(
         request.surface.as_deref(),
-        state.config.voice_default_surface(),
+        config.voice_default_surface(),
         "surface",
     )
     .map_err(validation_error_response)?;
     let session_key = normalized_component(
         request.session_key.as_deref(),
-        state.config.voice_default_session(),
+        config.voice_default_session(),
         "session_key",
     )
     .map_err(validation_error_response)?;
-    let allowed = state.config.voice_allowed_surfaces();
+    let allowed = config.voice_allowed_surfaces();
     if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == &surface) {
         return Err(error(
             StatusCode::FORBIDDEN,
@@ -192,7 +195,7 @@ async fn process_request(
         .map_err(validation_error_response)?;
     let agent_id = normalized_component(
         request.agent_id.as_deref(),
-        state.config.default_agent.as_str(),
+        config.default_agent.as_str(),
         "agent_id",
     )
     .map_err(validation_error_response)?;

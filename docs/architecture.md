@@ -168,8 +168,8 @@ src/
 pub struct AppState {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,  // None = 秘密モード無効
-    pub(crate) config_manager: Arc<ConfigManager>,  // immutable snapshot
-    pub(crate) config: Config,
+    pub(crate) config_manager: Arc<ConfigManager>,  // snapshot + update boundary
+    pub(crate) config: Config,                     // startup-only structural settings
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -206,7 +206,7 @@ Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnR
 
 ```text
 TurnRuntime
-├── ConfigManager          — immutable Config snapshot（revision / fingerprint）
+├── ConfigManager          — immutable Config snapshot、更新境界、変更通知（revision / fingerprint）
 ├── Database
 │   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
 │   ├── turn.rs            — turn_runs の作成・重複受付防止・状態遷移
@@ -313,6 +313,7 @@ pub(crate) struct SurfaceContext {
        ├─ Web server 起動 (supervisor 経由)
        ├─ Discord bot 起動 (supervisor 経由 × bot 数)
        ├─ Telegram bot 起動 (supervisor 経由)
+       ├─ Config YAML watcher 起動 (250ms poll + 300ms debounce)
        ├─ Sleep / Pulse / Backup scheduler 起動 (supervisor 経由)
        │
        └─ 監視ループ (500ms 間隔で critical task 終了をチェック)

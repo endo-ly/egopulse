@@ -339,7 +339,7 @@ impl PulseConfig {
 /// startup backup always runs (when `enabled`) and is independent of
 /// `interval_days`. `max_generations` bounds the number of `egopulse-*.db`
 /// snapshots retained on disk.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BackupConfig {
     pub enabled: bool,
     pub interval_days: u32,

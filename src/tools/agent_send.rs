@@ -33,6 +33,7 @@ struct AgentSendParams {
 
 pub(crate) struct AgentSendTool {
     agents: std::collections::HashMap<AgentId, AgentConfig>,
+    config_manager: Option<Arc<crate::config::ConfigManager>>,
     db: Arc<crate::storage::Database>,
     secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
@@ -45,6 +46,7 @@ pub(crate) struct AgentSendTool {
 }
 
 impl AgentSendTool {
+    #[cfg(test)]
     pub(crate) fn new(
         agents: std::collections::HashMap<AgentId, AgentConfig>,
         db: Arc<crate::storage::Database>,
@@ -54,6 +56,25 @@ impl AgentSendTool {
     ) -> Self {
         Self {
             agents,
+            config_manager: None,
+            db,
+            secret_db,
+            channels,
+            intake,
+        }
+    }
+
+    pub(crate) fn new_with_manager(
+        agents: std::collections::HashMap<AgentId, AgentConfig>,
+        db: Arc<crate::storage::Database>,
+        secret_db: Option<Arc<crate::storage::Database>>,
+        channels: Arc<crate::channels::adapter::ChannelRegistry>,
+        intake: Arc<TurnIntake>,
+        config_manager: Arc<crate::config::ConfigManager>,
+    ) -> Self {
+        Self {
+            agents,
+            config_manager: Some(config_manager),
             db,
             secret_db,
             channels,
@@ -142,8 +163,17 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
+        let config_snapshot = self
+            .config_manager
+            .as_ref()
+            .map(|manager| manager.current_blocking());
+        let agents = config_snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.config.agents)
+            .unwrap_or(&self.agents);
+
         // Validate: agent must exist in config.agents
-        if !self.agents.contains_key(&AgentId::new(&target_id)) {
+        if !agents.contains_key(&AgentId::new(&target_id)) {
             return ToolResult::error(format!("agent '{target_id}' not found"));
         }
 
@@ -170,8 +200,8 @@ impl Tool for AgentSendTool {
             );
         }
 
-        let from_label = agent_label(&self.agents, &context.agent_id).to_string();
-        let to_label = agent_label(&self.agents, &target_id).to_string();
+        let from_label = agent_label(agents, &context.agent_id).to_string();
+        let to_label = agent_label(agents, &target_id).to_string();
         let display_text = format!("[{from_label} → {to_label}] {}", params.message);
 
         // Durable intake context.

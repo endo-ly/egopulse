@@ -9,7 +9,9 @@ pub(crate) mod web_fetch;
 pub(crate) use loader::is_valid_base_url;
 pub(crate) use manager::ConfigManager;
 pub use resolve::default_config_path;
-pub(crate) use resolve::{default_state_root, default_workspace_dir};
+pub(crate) use resolve::default_state_root;
+#[cfg(test)]
+pub(crate) use resolve::default_workspace_dir;
 pub use types::*;
 
 #[cfg(test)]
