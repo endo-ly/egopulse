@@ -530,12 +530,14 @@ mod tests {
 
     #[tokio::test]
     async fn public_health_returns_only_liveness_fields() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let (app, state) = authenticated_web_test_router(&dir);
         state
             .runtime_status
             .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
 
+        // Act
         let response = app
             .oneshot(
                 Request::get("/health")
@@ -545,6 +547,7 @@ mod tests {
             .await
             .expect("response");
 
+        // Assert
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -554,15 +557,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detailed_status_requires_web_auth() {
+    async fn detailed_status_rejects_missing_credentials() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let (app, state) = authenticated_web_test_router(&dir);
-        state
-            .runtime_status
-            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+        let (app, _) = authenticated_web_test_router(&dir);
 
-        let unauthorized = app
-            .clone()
+        // Act
+        let response = app
             .oneshot(
                 Request::get("/api/status")
                     .body(Body::empty())
@@ -570,10 +571,19 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let wrong_token = app
-            .clone()
+        // Assert
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn detailed_status_rejects_incorrect_credentials() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, _) = authenticated_web_test_router(&dir);
+
+        // Act
+        let response = app
             .oneshot(
                 Request::get("/api/status")
                     .header(header::AUTHORIZATION, "Bearer wrong-token")
@@ -582,9 +592,22 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
 
-        let authorized = app
+        // Assert
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn detailed_status_accepts_valid_credentials() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, state) = authenticated_web_test_router(&dir);
+        state
+            .runtime_status
+            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+
+        // Act
+        let response = app
             .oneshot(
                 Request::get("/api/status")
                     .header(header::AUTHORIZATION, "Bearer web-secret")
@@ -593,8 +616,10 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(authorized.status(), StatusCode::OK);
-        let body = to_bytes(authorized.into_body(), usize::MAX)
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
@@ -604,11 +629,12 @@ mod tests {
 
     #[tokio::test]
     async fn telemetry_rejects_unauthorized_requests() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let (app, _) = authenticated_web_test_router(&dir);
 
-        let unauthorized = app
-            .clone()
+        // Act
+        let response = app
             .oneshot(
                 Request::get("/telemetry")
                     .body(Body::empty())
@@ -616,9 +642,19 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let authorized = app
+        // Assert
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn telemetry_returns_data_with_valid_credentials() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, _) = authenticated_web_test_router(&dir);
+
+        // Act
+        let response = app
             .oneshot(
                 Request::get("/telemetry")
                     .header(header::AUTHORIZATION, "Bearer web-secret")
@@ -627,8 +663,10 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(authorized.status(), StatusCode::OK);
-        let body = to_bytes(authorized.into_body(), usize::MAX)
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");

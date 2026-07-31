@@ -20,10 +20,11 @@ use super::WebState;
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct HealthProbeResponse {
+struct HealthProbeResponse {
     ok: bool,
 }
 
+/// Authenticated runtime diagnostic response within the crate's API boundary.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct DetailedStatusResponse {
     ok: bool,

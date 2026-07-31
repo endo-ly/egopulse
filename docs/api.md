@@ -118,7 +118,7 @@ Authorization: Bearer <channels.web.auth_token>
 
 **認証必須**
 
-JSON 形式でメトリクス・直近ターン履歴・エラー詳細を返す。`channels.web.auth_token` の Bearer token が必要。
+JSON 形式でメトリクス・直近ターン履歴・サニタイズ済みのエラー概要を返す。raw payload・prompt・token は返さない。`channels.web.auth_token` の Bearer token が必要。
 
 ```text
 GET /telemetry
@@ -160,7 +160,7 @@ Authorization: Bearer <channels.web.auth_token>
 |-----------|-----|------|
 | `metrics` | `object` | メトリクス名 → `[{labels, value}]` のマップ |
 | `recent_turns` | `array` | 直近 100 件のターン履歴（新しい順） |
-| `recent_errors` | `array` | 直近 100 件のエラー詳細（`trace_id` 付き） |
+| `recent_errors` | `array` | 直近 100 件のサニタイズ済みエラー概要（`trace_id` 付き） |
 
 ---
 
