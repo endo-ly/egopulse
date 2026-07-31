@@ -4,10 +4,14 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::metrics;
-use crate::runtime::runtime_status::{AuditError, ChannelHealth, ChannelState, TurnRecord};
+use crate::runtime::runtime_status::{
+    AuditError, ChannelHealth, ChannelState, StatusSnapshot, TurnRecord,
+};
 
 use super::WebState;
 
@@ -16,7 +20,12 @@ use super::WebState;
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct HealthResponse {
+pub(crate) struct HealthProbeResponse {
+    ok: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DetailedStatusResponse {
     ok: bool,
     version: String,
     uptime_secs: u64,
@@ -67,19 +76,16 @@ pub(crate) struct MetricEntry {
     value: f64,
 }
 
-/// Runtime instance lock state exposed by the health endpoint. `held` is true
-/// when this process owns the exclusive advisory lock for its state root;
-/// `lock_file` is the path of the lock file backing that ownership.
+/// Runtime instance lock state exposed by the detailed status endpoint.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct InstanceLockStatus {
     held: bool,
-    lock_file: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct GatewayStatusResponse {
     #[serde(flatten)]
-    pub health: HealthResponse,
+    pub health: DetailedStatusResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryResponse>,
 }
@@ -88,25 +94,27 @@ pub(crate) struct GatewayStatusResponse {
 // Endpoints
 // ---------------------------------------------------------------------------
 
-/// Health probe — returns DB, channels, MCP, active turns, and recent errors.
-pub(super) async fn health(state: State<WebState>) -> Json<HealthResponse> {
+/// Public liveness probe that exposes no runtime diagnostics.
+pub(super) async fn health(state: State<WebState>) -> impl IntoResponse {
+    let snapshot = state.app_state.runtime_status.snapshot();
+    let ok = runtime_is_healthy(&snapshot);
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status, Json(HealthProbeResponse { ok }))
+}
+
+/// Authenticated endpoint for detailed runtime diagnostics.
+pub(super) async fn status(state: State<WebState>) -> Json<DetailedStatusResponse> {
     let snapshot = state.app_state.runtime_status.snapshot();
     let active_turns = state.app_state.active_turns.total_active();
 
-    let has_running_channel = snapshot
-        .channels
-        .values()
-        .any(|ch| matches!(ch.state, ChannelState::Running));
-    // `ok` requires a healthy DB, at least one running channel, and that the
-    // runtime is still accepting input (not shutting down and no critical task
-    // failure).
-    let ok = snapshot.db_healthy
-        && has_running_channel
-        && snapshot.accepting_inputs
-        && !snapshot.shutdown_started
-        && snapshot.critical_task_failure.is_none();
+    let ok = runtime_is_healthy(&snapshot);
 
-    Json(HealthResponse {
+    Json(DetailedStatusResponse {
         ok,
         version: snapshot.version,
         uptime_secs: uptime_from_snapshot(&snapshot.started_at),
@@ -124,12 +132,6 @@ pub(super) async fn health(state: State<WebState>) -> Json<HealthResponse> {
         recent_errors_count: snapshot.recent_errors.len(),
         instance_lock: InstanceLockStatus {
             held: state.app_state.supervisor.instance_lock_held(),
-            lock_file: state
-                .app_state
-                .supervisor
-                .instance_lock_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
         },
     })
 }
@@ -147,6 +149,19 @@ pub(super) async fn telemetry_handler(state: State<WebState>) -> Json<TelemetryR
         recent_turns,
         recent_errors,
     })
+}
+
+fn runtime_is_healthy(snapshot: &StatusSnapshot) -> bool {
+    let has_running_channel = snapshot
+        .channels
+        .values()
+        .any(|channel| matches!(channel.state, ChannelState::Running));
+
+    snapshot.db_healthy
+        && has_running_channel
+        && snapshot.accepting_inputs
+        && !snapshot.shutdown_started
+        && snapshot.critical_task_failure.is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +307,8 @@ async fn build_mcp_status(state: &WebState) -> McpStatus {
 mod tests {
     use std::sync::Arc;
 
+    use axum::body::to_bytes;
+
     use super::*;
     use crate::runtime::runtime_status::ChannelState;
 
@@ -318,14 +335,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn health_returns_full_status() {
+    async fn public_health_returns_service_unavailable_when_unhealthy() {
+        let response = health(State(test_state())).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json, serde_json::json!({"ok": false}));
+    }
+
+    #[tokio::test]
+    async fn status_returns_full_status() {
         let state = test_state();
         state
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
 
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
 
         assert!(resp.ok);
         assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
@@ -339,20 +368,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_ok_when_all_healthy() {
+    async fn status_ok_when_all_healthy() {
         let state = test_state();
         state
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
 
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
 
         assert!(resp.ok);
     }
 
     #[tokio::test]
-    async fn health_not_ok_when_db_unhealthy() {
+    async fn status_not_ok_when_db_unhealthy() {
         let state = test_state();
         state
             .app_state
@@ -360,13 +389,13 @@ mod tests {
             .update_channel("discord", ChannelState::Running);
         state.app_state.runtime_status.set_db_healthy(false);
 
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
 
         assert!(!resp.ok);
     }
 
     #[tokio::test]
-    async fn health_not_ok_when_all_channels_failed() {
+    async fn status_not_ok_when_all_channels_failed() {
         let state = test_state();
         state
             .app_state
@@ -377,26 +406,26 @@ mod tests {
             .runtime_status
             .update_channel("discord", ChannelState::Failed);
 
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
 
         assert!(!resp.ok);
     }
 
     #[tokio::test]
-    async fn health_includes_mcp_status() {
+    async fn status_includes_mcp_status() {
         let state = test_state();
         state
             .app_state
             .runtime_status
             .update_channel("web", ChannelState::Running);
 
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("mcp").is_some());
     }
 
     #[tokio::test]
-    async fn health_reports_shutdown_and_critical_failure_fields() {
+    async fn status_reports_shutdown_and_critical_failure_fields() {
         let state = test_state();
         state
             .app_state
@@ -404,7 +433,7 @@ mod tests {
             .update_channel("web", ChannelState::Running);
 
         // Healthy default: accepting input, not shutting down, no critical failure.
-        let Json(resp) = health(State(state.clone())).await;
+        let Json(resp) = status(State(state.clone())).await;
         assert!(resp.accepting_inputs);
         assert!(!resp.shutdown_started);
         assert!(resp.critical_task_failure.is_none());
@@ -414,7 +443,7 @@ mod tests {
         // Simulate shutdown: accepting_inputs flipped off.
         state.app_state.runtime_status.set_accepting_inputs(false);
         state.app_state.runtime_status.set_shutdown_started(true);
-        let Json(resp) = health(State(state.clone())).await;
+        let Json(resp) = status(State(state.clone())).await;
         assert!(!resp.accepting_inputs);
         assert!(resp.shutdown_started);
         assert!(!resp.ok, "shutdown must make health not ok");
@@ -424,7 +453,7 @@ mod tests {
             .app_state
             .runtime_status
             .record_critical_task_failure("web died");
-        let Json(resp) = health(State(state)).await;
+        let Json(resp) = status(State(state)).await;
         assert_eq!(resp.critical_task_failure.as_deref(), Some("web died"));
         assert!(!resp.ok);
     }
