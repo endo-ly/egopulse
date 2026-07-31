@@ -19,6 +19,13 @@ pub(crate) const MAX_DURABLE_PENDING_PER_SCOPE: i64 = 512;
 /// Upper bound on how many durable-pending turns the dispatcher re-enqueues per
 /// scan, so a large backlog cannot turn each 5s tick into a full-table walk.
 pub(crate) const DISPATCHER_BATCH_LIMIT: i64 = 256;
+/// Stable failure classification for a durable scheduled-turn payload that
+/// cannot be reconstructed by the running binary.
+pub(crate) const DURABLE_PAYLOAD_INVALID_ERROR_KIND: &str = "durable_payload_invalid";
+/// Sanitized message persisted for an unrecoverable durable scheduled-turn
+/// payload. Payload contents and deserializer details must not be stored.
+pub(crate) const DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE: &str =
+    "scheduled durable turn payload is invalid";
 
 macro_rules! define_enum {
     (

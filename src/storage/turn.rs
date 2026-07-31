@@ -24,7 +24,8 @@ use rusqlite::params;
 
 use crate::error::StorageError;
 use crate::storage::{
-    Database, DurablePendingTurn, MAX_DURABLE_PENDING_PER_SCOPE, MAX_DURABLE_PENDING_PER_SESSION,
+    DURABLE_PAYLOAD_INVALID_ERROR_KIND, DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE, Database,
+    DurablePendingTurn, MAX_DURABLE_PENDING_PER_SCOPE, MAX_DURABLE_PENDING_PER_SESSION,
     StoredMessage, TurnRunState,
 };
 
@@ -816,6 +817,80 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    /// Atomically terminates a queued durable Turn whose persisted request
+    /// cannot be reconstructed by the running binary.
+    ///
+    /// Only `accepted` and `input_committed` are eligible because neither state
+    /// has started model execution. The stored payload is deliberately left
+    /// untouched for investigation. When the Turn has an origin, its terminal
+    /// stop reason is recorded in the same transaction so the origin cannot be
+    /// resumed without also observing this terminal failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Conflict`] when the Turn is missing from the
+    /// eligible queued states or has already become terminal. Returns
+    /// [`StorageError`] when the database transaction fails.
+    pub(crate) fn fail_invalid_durable_turn(&self, turn_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_state_locked(&tx, turn_id)?;
+        if !matches!(
+            current,
+            TurnRunState::Accepted | TurnRunState::InputCommitted
+        ) || !TurnRunState::can_transition(current, TurnRunState::Failed)
+        {
+            return Err(StorageError::Conflict(format!(
+                "invalid durable turn payload failure rejected from state {current}"
+            )));
+        }
+        let (origin_id, has_payload): (Option<String>, i64) = tx.query_row(
+            "SELECT origin_id, scheduled_request_json IS NOT NULL
+             FROM turn_runs WHERE turn_id = ?1",
+            params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if has_payload == 0 {
+            return Err(StorageError::Conflict(
+                "invalid durable turn payload failure requires a persisted payload".to_string(),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE turn_runs
+             SET state = 'failed',
+                 error_kind = ?2,
+                 error_message = ?3,
+                 finished_at = ?4,
+                 updated_at = ?4
+             WHERE turn_id = ?1",
+            params![
+                turn_id,
+                DURABLE_PAYLOAD_INVALID_ERROR_KIND,
+                DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE,
+                &now
+            ],
+        )?;
+
+        if let Some(origin_id) = origin_id.filter(|origin_id| !origin_id.is_empty()) {
+            tx.execute(
+                "INSERT INTO turn_origins (origin_id, executed_turn_count, terminal_reason, updated_at)
+                 VALUES (?1, 0, ?2, ?3)
+                 ON CONFLICT(origin_id) DO UPDATE SET
+                    terminal_reason = excluded.terminal_reason,
+                    updated_at = excluded.updated_at",
+                params![
+                    origin_id,
+                    DURABLE_PAYLOAD_INVALID_ERROR_KIND,
+                    &now
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
     ///
     /// Used when the turn dispatcher drops a turn because its origin already has a
     /// terminal stop reason, or [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`]
@@ -1580,6 +1655,202 @@ mod tests {
 
         // Assert
         assert!(matches!(error, StorageError::Conflict(_)));
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_marks_accepted_failed_without_changing_payload() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let payload = r#"{"secret":"do-not-leak"}"#;
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "invalid-accepted",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: Some(payload),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+
+        // Act
+        db.fail_invalid_durable_turn(&run.turn_id)
+            .expect("fail invalid payload");
+
+        // Assert
+        let failed = db.get_turn_run(&run.turn_id).expect("get failed turn");
+        assert_eq!(failed.state, TurnRunState::Failed);
+        assert_eq!(
+            failed.error_kind.as_deref(),
+            Some("durable_payload_invalid")
+        );
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("scheduled durable turn payload is invalid")
+        );
+        assert!(failed.finished_at.is_some());
+        assert_eq!(failed.scheduled_request_json.as_deref(), Some(payload));
+        assert!(
+            db.scan_durable_pending_turns_after("", "", 100)
+                .expect("scan")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_marks_input_committed_failed() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "invalid-input-committed",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: Some("not-json"),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        let mut revision = None;
+        commit_input(&db, &run.turn_id, &mut revision);
+
+        // Act
+        db.fail_invalid_durable_turn(&run.turn_id)
+            .expect("fail invalid payload");
+
+        // Assert
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::Failed);
+        assert!(
+            db.scan_durable_pending_turns_after("", "", 100)
+                .expect("scan")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_terminates_origin_atomically() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let origin_id = "invalid-payload-origin";
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "invalid-origin",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: Some(origin_id),
+                scheduled_request_json: Some("{malformed"),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+
+        // Act
+        db.fail_invalid_durable_turn(&run.turn_id)
+            .expect("fail invalid payload");
+
+        // Assert
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::Failed);
+        let origins = db.recover_origin_tracker(3600).expect("recover origins");
+        let origin = origins
+            .iter()
+            .find(|origin| origin.origin_id == origin_id)
+            .expect("origin");
+        assert_eq!(
+            origin.terminal_reason.as_deref(),
+            Some("durable_payload_invalid")
+        );
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_rejects_terminal_rows() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let failed_id = accept(&db, "invalid-terminal-failed").turn_id;
+        db.fail_turn(&failed_id, TurnRunState::Failed, "existing", "existing")
+            .expect("fail");
+        let cancelled_id = accept(&db, "invalid-terminal-cancelled").turn_id;
+        db.cancel_turn(&cancelled_id, "existing", "existing")
+            .expect("cancel");
+        let uncertain_id = accept(&db, "invalid-terminal-uncertain").turn_id;
+        db.fail_turn(
+            &uncertain_id,
+            TurnRunState::Uncertain,
+            "existing",
+            "existing",
+        )
+        .expect("uncertain");
+
+        // Act + Assert
+        for turn_id in [&failed_id, &cancelled_id, &uncertain_id] {
+            let error = db
+                .fail_invalid_durable_turn(turn_id)
+                .expect_err("terminal row must be rejected");
+            assert!(matches!(error, StorageError::Conflict(_)));
+        }
+        assert_eq!(state(&db, &failed_id), TurnRunState::Failed);
+        assert_eq!(state(&db, &cancelled_id), TurnRunState::Cancelled);
+        assert_eq!(state(&db, &uncertain_id), TurnRunState::Uncertain);
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_rejects_legacy_rows_without_payload() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "invalid-legacy").turn_id;
+
+        // Act
+        let error = db
+            .fail_invalid_durable_turn(&turn_id)
+            .expect_err("legacy row must not be marked as a durable payload failure");
+
+        // Assert
+        assert!(matches!(error, StorageError::Conflict(_)));
+        assert_eq!(state(&db, &turn_id), TurnRunState::Accepted);
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_leaves_row_pending_when_storage_fails() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "invalid-storage-failure",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: Some("not-json"),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        db.fault_inject_next_get_conn(1);
+
+        // Act
+        let error = db
+            .fail_invalid_durable_turn(&run.turn_id)
+            .expect_err("storage failure");
+
+        // Assert
+        assert!(matches!(error, StorageError::InitFailed(_)));
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::Accepted);
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub fn init_metrics() -> &'static PrometheusHandle {
             "egopulse_durable_pending_turns",
             "Durably-accepted turns awaiting execution (turn_runs in accepted/input_committed)"
         );
+        describe_counter!(
+            "egopulse_durable_payload_invalid_total",
+            "Durable turns terminated because their scheduled payload was invalid"
+        );
 
         handle
     })
@@ -116,6 +120,10 @@ pub(crate) fn set_turn_queue_depth(count: usize) {
 /// growth (the availability risk flagged for the dispatcher scan path).
 pub(crate) fn set_durable_pending_turns(count: usize) {
     gauge!("egopulse_durable_pending_turns").set(count as f64);
+}
+
+pub(crate) fn inc_durable_payload_invalid() {
+    counter!("egopulse_durable_payload_invalid_total").increment(1);
 }
 
 pub(crate) fn inc_turn_queue_rejections(reason: &str) {
@@ -170,6 +178,7 @@ mod tests {
         inc_turn_errors_total("test-kind", "test-agent");
         inc_llm_tokens_total("input", "openai", 42);
         inc_tool_calls_total("shell", "ok");
+        inc_durable_payload_invalid();
         set_active_turns_gauge(3);
         set_turn_queue_depth(5);
         inc_turn_queue_rejections("session_full");
@@ -198,6 +207,10 @@ mod tests {
         assert!(
             output.contains("egopulse_tool_calls_total"),
             "should contain tool_calls_total: {output}"
+        );
+        assert!(
+            output.contains("egopulse_durable_payload_invalid_total"),
+            "should contain durable_payload_invalid_total: {output}"
         );
         assert!(
             output.contains("egopulse_active_turns"),
@@ -233,6 +246,7 @@ mod tests {
         inc_turn_errors_total("c", "d");
         inc_llm_tokens_total("input", "openai", 1);
         inc_tool_calls_total("shell", "ok");
+        inc_durable_payload_invalid();
         set_active_turns_gauge(0);
         set_turn_queue_depth(0);
         inc_turn_queue_rejections("global_full");

@@ -908,6 +908,7 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
 - 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`Database`（turn.rs））
 - `output_published` が真の Turn は partial output を外部公開済みのため自動 retry しない
 - `UNIQUE(chat_id, request_key)` により同一受付の重複を防止する。再受付時は既存 Turn を返し、`completed` なら保存済み結果を再利用する
+- `accepted` / `input_committed` の `scheduled_request_json` を復元できない場合は、既存の `failed` と `error_kind = durable_payload_invalid` で終端化する。`error_message` は固定の sanitized 文言とし、保存済み payload は調査用に変更しない。`origin_id` がある場合は Turn の失敗と origin の終了理由を同一 transaction で記録する
 - crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)
 
 ---
