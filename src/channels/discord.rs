@@ -659,6 +659,7 @@ impl Handler {
     fn route_message(
         &self,
         snapshot: &ConfigSnapshot,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         channel_id: u64,
         is_dm: bool,
         mentions_bot: bool,
@@ -667,7 +668,6 @@ impl Handler {
             return self.default_agent_response(snapshot);
         }
 
-        let channels = Self::channels(snapshot);
         let Some(channel_config) = channels.get(&channel_id) else {
             return RouteDecision::Reject;
         };
@@ -682,17 +682,20 @@ impl Handler {
     /// [`SurfaceContext`] を構築する。
     fn make_context(
         &self,
-        snapshot: &ConfigSnapshot,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         user: &str,
         thread: &str,
         agent_id: &str,
     ) -> SurfaceContext {
-        let scope = self.scope_for_thread(snapshot, thread);
+        let scope = self.scope_for_thread(channels, thread);
         crate::runtime::build_channel_context("discord", user, thread, "discord", agent_id, scope)
     }
 
-    fn scope_for_thread(&self, snapshot: &ConfigSnapshot, thread: &str) -> ConversationScope {
-        let channels = Self::channels(snapshot);
+    fn scope_for_thread(
+        &self,
+        channels: &HashMap<u64, DiscordChannelConfig>,
+        thread: &str,
+    ) -> ConversationScope {
         thread
             .parse::<u64>()
             .ok()
@@ -723,7 +726,7 @@ impl Handler {
     /// - 人間のメッセージ → `require_mention` 設定に従う
     fn should_process_message(
         &self,
-        snapshot: &ConfigSnapshot,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         author_id: u64,
         author_is_bot: bool,
         is_dm: bool,
@@ -745,7 +748,6 @@ impl Handler {
         }
 
         if !is_dm {
-            let channels = Self::channels(snapshot);
             if let Some(config) = channels.get(&channel_id) {
                 if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
@@ -761,12 +763,12 @@ impl Handler {
         &self,
         ctx: &Context,
         msg: &DiscordMessage,
-        snapshot: &ConfigSnapshot,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         thread: &str,
         agent_id: &str,
         text: &str,
     ) -> bool {
-        let slash_context = self.make_context(snapshot, &msg.author.name, thread, agent_id);
+        let slash_context = self.make_context(channels, &msg.author.name, thread, agent_id);
         let sender_id = msg.author.id.get().to_string();
         let outcome = crate::slash_commands::process_slash_command(
             &self.app_state,
@@ -842,6 +844,7 @@ impl EventHandler for Handler {
         let channel_id = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
         let snapshot = self.app_state.config_manager.current_blocking();
+        let channels = Self::channels(&snapshot);
 
         if self.is_self_message(msg.author.id.get()) {
             return;
@@ -849,7 +852,7 @@ impl EventHandler for Handler {
 
         let text = msg.content.clone();
         let mentions_bot = self.is_bot_mentioned(&msg);
-        let route = self.route_message(&snapshot, channel_id, is_dm, mentions_bot);
+        let route = self.route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot);
         if route.is_rejected() {
             return;
         }
@@ -860,14 +863,14 @@ impl EventHandler for Handler {
         };
 
         if self
-            .process_text_slash_command(&ctx, &msg, &snapshot, &thread, &route_agent_id, &text)
+            .process_text_slash_command(&ctx, &msg, &channels, &thread, &route_agent_id, &text)
             .await
         {
             return;
         }
 
         let decision = self.should_process_message(
-            &snapshot,
+            &channels,
             msg.author.id.get(),
             msg.author.bot,
             is_dm,
@@ -883,7 +886,6 @@ impl EventHandler for Handler {
             ReceiveDecision::Reject => return,
         }
 
-        let channels = Self::channels(&snapshot);
         let is_multi_agent = channels.get(&channel_id).is_some_and(|c| c.multi_agent);
 
         let channel_log_chat_id = if is_multi_agent && !is_dm {
@@ -891,7 +893,7 @@ impl EventHandler for Handler {
                 &self.app_state,
                 HumanChannelLogMessage {
                     key: ChannelLogKey::Discord(channel_id),
-                    scope: self.scope_for_thread(&snapshot, &thread),
+                    scope: self.scope_for_thread(&channels, &thread),
                     id: format!("cl-{}", msg.id.get()),
                     sender_id: format!("user:discord:{}", msg.author.id.get()),
                     content: text.clone(),
@@ -925,7 +927,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let mut context = self.make_context(&snapshot, &msg.author.name, &thread, &agent_id);
+        let mut context = self.make_context(&channels, &msg.author.name, &thread, &agent_id);
         context.channel_log_chat_id = channel_log_chat_id;
         context.origin_id = uuid::Uuid::new_v4().to_string();
         context.request_key = format!("discord:{channel_id}:{}", msg.id.get());
@@ -999,7 +1001,8 @@ impl EventHandler for Handler {
         let channel_id = cmd.channel_id.get();
         let is_dm_int = cmd.guild_id.is_none();
         let snapshot = self.app_state.config_manager.current_blocking();
-        let route = self.route_message(&snapshot, channel_id, is_dm_int, true);
+        let channels = Self::channels(&snapshot);
+        let route = self.route_message(&snapshot, &channels, channel_id, is_dm_int, true);
         if route.is_rejected() {
             let _ = cmd
                 .create_response(
@@ -1034,7 +1037,7 @@ impl EventHandler for Handler {
         let thread = channel_id.to_string();
 
         let slash_context =
-            self.make_context(&snapshot, &cmd.user.name, &thread, &interaction_agent);
+            self.make_context(&channels, &cmd.user.name, &thread, &interaction_agent);
         let sender_id = cmd.user.id.get().to_string();
 
         let response_text = match crate::slash_commands::process_slash_command(
@@ -1352,16 +1355,12 @@ mod tests {
     ) -> Arc<crate::config::ConfigManager> {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
-        config
+        let discord = config
             .channels
             .entry(crate::config::ChannelName::new("discord"))
-            .or_default()
-            .enabled = Some(true);
-        config
-            .channels
-            .get_mut("discord")
-            .expect("discord channel")
-            .discord_bots = Some(
+            .or_default();
+        discord.enabled = Some(true);
+        discord.discord_bots = Some(
             bot_tokens
                 .iter()
                 .map(|(bot_id, token)| {
@@ -1390,6 +1389,9 @@ mod tests {
             },
         );
         for (agent_id, bot_id) in agent_bots {
+            if *agent_id == "developer" {
+                continue;
+            }
             config.agents.insert(
                 crate::config::AgentId::new(agent_id),
                 crate::config::AgentConfig {
@@ -1725,9 +1727,13 @@ mod tests {
         );
 
         assert_eq!(
-            handler
-                .make_context(&snapshot(&handler), "user", "123", "developer")
-                .surface_thread,
+            {
+                let snapshot = snapshot(&handler);
+                let channels = Handler::channels(&snapshot);
+                handler
+                    .make_context(&channels, "user", "123", "developer")
+                    .surface_thread
+            },
             "123"
         );
     }
@@ -1741,7 +1747,9 @@ mod tests {
             "developer",
             agents(&[("developer", Some("main"))]),
         );
-        let context = handler.make_context(&snapshot(&handler), "user", "123", "developer");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let context = handler.make_context(&channels, "user", "123", "developer");
 
         assert_eq!(context.session_key(), "discord:123:agent:developer");
     }
@@ -2179,8 +2187,9 @@ mod tests {
 
     fn route_accepts_channel(handler: &Handler, channel_id: u64) -> bool {
         let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         !handler
-            .route_message(&snapshot, channel_id, false, true)
+            .route_message(&snapshot, &channels, channel_id, false, true)
             .is_rejected()
     }
 
@@ -2191,8 +2200,9 @@ mod tests {
         mentions_bot: bool,
     ) -> Option<String> {
         let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         handler
-            .route_message(&snapshot, channel_id, is_dm, mentions_bot)
+            .route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot)
             .agent_id()
             .map(ToString::to_string)
     }
@@ -2204,8 +2214,9 @@ mod tests {
         mentions_bot: bool,
     ) -> Option<String> {
         let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         handler
-            .route_message(&snapshot, channel_id, is_dm, mentions_bot)
+            .route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot)
             .response_agent_id()
             .map(ToString::to_string)
     }
@@ -2219,8 +2230,9 @@ mod tests {
         mentions_bot: bool,
     ) -> ReceiveDecision {
         let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         handler.should_process_message(
-            &snapshot,
+            &channels,
             author_id,
             author_is_bot,
             is_dm,
@@ -2397,7 +2409,9 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(123u64, secret_channel(&["default"], false, true));
         let handler = test_handler(channels);
-        let ctx = handler.make_context(&snapshot(&handler), "user", "123", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "123", "default");
         assert_eq!(ctx.scope, ConversationScope::Secret);
     }
 
@@ -2406,7 +2420,9 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(456u64, secret_channel(&["default"], false, false));
         let handler = test_handler(channels);
-        let ctx = handler.make_context(&snapshot(&handler), "user", "456", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "456", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
@@ -2414,7 +2430,9 @@ mod tests {
     fn make_context_defaults_to_normal_scope_for_unknown_channel() {
         let channels: HashMap<u64, DiscordChannelConfig> = HashMap::new();
         let handler = test_handler(channels);
-        let ctx = handler.make_context(&snapshot(&handler), "user", "789", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "789", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 

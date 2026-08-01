@@ -319,6 +319,7 @@ pub(crate) async fn resume_input_committed_turn(
     state: &TurnRuntime,
     scope: ConversationScope,
     turn_id: &str,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<String, EgoPulseError> {
     let turn_id_owned = turn_id.to_string();
     let run = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
@@ -379,9 +380,10 @@ pub(crate) async fn resume_input_committed_turn(
     };
     let context = persisted.context;
 
-    // The fingerprint fixed at the original acceptance must match the current
-    // Config generation; otherwise the model/prompt would diverge.
-    let snapshot = state.config_manager.current_blocking();
+    // The fingerprint fixed at the original acceptance must match the
+    // snapshot selected for this scheduled turn; otherwise the model/prompt
+    // would diverge.
+    let snapshot = config_snapshot;
     if let Some(fp) = &run.config_fingerprint {
         if !fp.is_empty() && fp != &snapshot.fingerprint {
             fail_resume_permanently(
@@ -418,7 +420,7 @@ pub(crate) async fn resume_input_committed_turn(
         state,
         context: &context,
         on_event: EventEmitter::none(),
-        config_snapshot: None,
+        config_snapshot: Some(Arc::clone(&snapshot)),
     };
     executor.resume_run(&persisted.input, &snapshot, &run).await
 }
@@ -3122,6 +3124,7 @@ mod tests {
             context: ctx,
             input: "scheduled turn".to_string(),
             origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
         };
 
         crate::runtime::execute_scheduled_turn(&state, turn).await;

@@ -256,7 +256,9 @@ PUT /api/config
 | `default_model` | 任意 | `null` 可 |
 | `expected_fingerprint` | 任意 | GET で取得した fingerprint。省略時はリクエスト処理開始時の値を使用 |
 | `providers` | 任意 | 既存プロバイダーの編集と新規追加。新規追加は `base_url` と `default_model` が必要。削除は非対応 |
+| `providers.<id>.label` | 任意 | プロバイダー表示名。省略時は既存値を維持（新規追加では ID を表示名に使用） |
 | `providers.<id>.api_key` | 任意 | 省略時は変更なし。実値は `.env` に保存、YAML には SecretRef として記録 |
+| `providers.<id>.models` | 任意 | 利用可能なモデル ID の一覧。省略時は既存値を維持し、新規追加ではデフォルトモデルから初期化 |
 | `web_enabled` | 必須 | |
 | `web_host` | 必須 | |
 | `web_port` | 必須 | 1 以上 |
@@ -268,6 +270,18 @@ GET と同一形式。
 ##### 競合レスポンス (409)
 
 `expected_fingerprint` が現在の設定と一致しない場合は更新せず、`config_conflict` を返す。GET で最新の snapshot を取得してから再度送信する。
+
+##### 再起動必須フィールドの拒否 (400)
+
+`web_enabled`、`web_host`、`web_port` の変更は実行中プロセスへ適用できないため、更新せず `400 Bad Request` を返す。これは fingerprint の競合とは異なるエラーである。
+
+```text
+HTTP/1.1 400 Bad Request
+
+config_reload_forbidden: field=channels.web.port; restart required
+```
+
+メッセージには拒否されたフィールド名（`channels.web.enabled`、`channels.web.host`、`channels.web.port` のいずれか）と `restart required` が含まれる。
 
 ---
 

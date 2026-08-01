@@ -230,6 +230,7 @@ impl Tool for AgentSendTool {
             origin_id: context.origin_id.clone(),
             context: target_context,
             input: target_input,
+            config_snapshot: context.config_snapshot.clone(),
         };
 
         let delivered = match self.intake.submit(scheduled).await {
@@ -886,6 +887,158 @@ mod integration_tests {
                     .expect("deserialize scheduled turn")
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_child_turn_executes_with_acceptance_snapshot_after_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("egopulse.config.yaml");
+        let mut config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        config.default_agent = AgentId::new("lyre");
+        config.default_model = Some("old-global-model".to_string());
+        config.max_history_messages = 7;
+        let web = config
+            .channels
+            .get_mut(&crate::config::ChannelName::new("web"))
+            .expect("web channel");
+        web.auth_token = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            "web-test-token".to_string(),
+        ));
+        web.file_auth_token = Some(yaml_serde::Value::String("web-test-token".to_string()));
+        let provider = config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider");
+        provider.default_model = "old-provider-model".to_string();
+        provider.models.insert(
+            "old-provider-model".to_string(),
+            crate::config::ModelConfig::default(),
+        );
+        crate::config::persist::save_config_with_secrets(&config, &config_path)
+            .expect("save initial config");
+
+        let provider = crate::agent_loop::turn::RecordingProvider::new(
+            vec![Ok(crate::llm::MessagesResponse {
+                content: "queued response".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = crate::test_util::build_state_with_config(
+            config.clone(),
+            Some(Arc::new(provider.clone())),
+            Some(config_path.clone()),
+            None,
+            None,
+        );
+        state.supervisor.start_accepting();
+        let state = Arc::new(state);
+        let intake = Arc::new(crate::runtime::TurnIntake::new());
+        let tool = AgentSendTool::new_with_manager(
+            Arc::clone(&state.db),
+            None,
+            Arc::new(ChannelRegistry::new()),
+            Arc::clone(&intake),
+            Arc::clone(&state.config_manager),
+        );
+        intake.bind(&state);
+
+        // Keep the target session busy so agent_send must enqueue its child.
+        let blocker = ScheduledTurn {
+            turn_id: "blocker".to_string(),
+            origin_id: "blocker-origin".to_string(),
+            context: {
+                let mut context = crate::agent_loop::SurfaceContext::new(
+                    "discord".to_string(),
+                    "scheduler".to_string(),
+                    "123".to_string(),
+                    "discord".to_string(),
+                    "vega".to_string(),
+                );
+                context.origin_id = "blocker-origin".to_string();
+                context
+            },
+            input: "blocker".to_string(),
+            config_snapshot: Some(state.config_manager.current_blocking()),
+        };
+        assert!(matches!(
+            state.turn_scheduler.submit(blocker),
+            crate::runtime::turn_scheduler::ScheduleResult::Started(_)
+        ));
+
+        let mut parent_context = test_context_with_agent("lyre");
+        parent_context.turn_id = "parent-turn".to_string();
+        parent_context.origin_id = "parent-origin".to_string();
+        parent_context.config_snapshot = Some(state.config_manager.current_blocking());
+        let result = tool
+            .execute(
+                json!({"to": "vega", "message": "queued with old config"}),
+                &parent_context,
+            )
+            .await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content).expect("tool result")["delivered"],
+            true
+        );
+
+        let mut reloaded = config.clone();
+        reloaded.default_model = Some("new-global-model".to_string());
+        reloaded.max_history_messages = 99;
+        reloaded
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .default_model = "new-provider-model".to_string();
+        reloaded.agents.remove(&AgentId::new("vega"));
+        crate::config::persist::save_config_with_secrets(&reloaded, &config_path)
+            .expect("save reloaded config");
+        state
+            .config_manager
+            .reload_from_file()
+            .expect("reload config");
+
+        let current = state.config_manager.current_blocking();
+        assert!(!current.config.agents.contains_key(&AgentId::new("vega")));
+        assert_eq!(current.config.max_history_messages, 99);
+
+        let child = state
+            .turn_scheduler
+            .on_turn_completed("discord:123:agent:vega")
+            .expect("queued child turn");
+        let queued_snapshot = child.config_snapshot.as_ref().expect("snapshot");
+        assert_eq!(
+            queued_snapshot.config.default_model.as_deref(),
+            Some("old-global-model")
+        );
+        assert_eq!(queued_snapshot.config.max_history_messages, 7);
+        assert_eq!(
+            queued_snapshot
+                .config
+                .providers
+                .get(&crate::config::ProviderId::new("openai"))
+                .expect("old provider")
+                .default_model,
+            "old-provider-model"
+        );
+        assert!(
+            queued_snapshot
+                .config
+                .agents
+                .contains_key(&AgentId::new("vega"))
+        );
+        let queued_run = state.db.get_turn_run(&child.turn_id).expect("queued run");
+        assert_eq!(queued_run.config_revision, queued_snapshot.revision as i64);
+        assert_eq!(
+            queued_run.config_fingerprint.as_deref(),
+            Some(queued_snapshot.fingerprint.as_str())
+        );
+
+        crate::runtime::execute_scheduled_turn(&state, child).await;
+
+        assert_eq!(provider.seen_messages().len(), 1);
     }
 
     #[tokio::test]

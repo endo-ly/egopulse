@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::Config;
 use super::ModelConfig;
-use super::secret_ref::{ResolvedValue, dotenv_path, save_dotenv};
+use super::secret_ref::{CONFIG_SOURCE_GENERATION_PREFIX, ResolvedValue, dotenv_path, save_dotenv};
 use crate::error::{ConfigError, EgoPulseError};
 
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -617,10 +617,11 @@ impl From<&Config> for SerializableConfig {
     }
 }
 
-fn save_yaml_locked(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
+fn save_yaml_locked(config: &Config, path: &Path, generation: &str) -> Result<(), EgoPulseError> {
     let yaml = yaml_serde::to_string(&SerializableConfig::from(config))
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    write_atomically(path, yaml.as_bytes())
+    let contents = format!("{CONFIG_SOURCE_GENERATION_PREFIX}{generation}\n{yaml}");
+    write_atomically(path, contents.as_bytes())
 }
 
 /// Saves config with SecretRef-aware YAML and .env file.
@@ -684,24 +685,21 @@ where
 
 fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
     let dotenv_entries = collect_dotenv_entries(config);
-    let env_path = if dotenv_entries.is_empty() {
-        None
-    } else {
-        yaml_path.parent().map(dotenv_path)
-    };
+    let env_path = yaml_path.parent().map(dotenv_path);
+    let generation = uuid::Uuid::new_v4().to_string();
 
     let yaml_backup = read_file_for_restore(yaml_path)?;
     let env_backup = env_path.as_deref().map(read_file_for_restore).transpose()?;
 
     // Commit YAML first. If it fails, the dotenv source is untouched. If the
     // dotenv commit fails after YAML succeeds, both files are restored below.
-    save_yaml_locked(config, yaml_path)?;
+    save_yaml_locked(config, yaml_path, &generation)?;
 
     let Some(env_path) = env_path else {
         return Ok(());
     };
 
-    if let Err(error) = save_dotenv(&env_path, &dotenv_entries) {
+    if let Err(error) = save_dotenv(&env_path, &dotenv_entries, Some(&generation)) {
         let yaml_restore = restore_file(yaml_path, yaml_backup.as_deref());
         let env_restore = restore_file(
             &env_path,
@@ -723,6 +721,49 @@ fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), E
             )));
         }
         return Err(EgoPulseError::Config(error));
+    }
+
+    Ok(())
+}
+
+fn read_source_generation(path: &Path, allow_missing: bool) -> Result<Option<String>, ConfigError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(ConfigError::ConfigReadFailed {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    Ok(contents.lines().find_map(|line| {
+        line.strip_prefix(CONFIG_SOURCE_GENERATION_PREFIX)
+            .map(str::to_owned)
+    }))
+}
+
+pub(crate) fn validate_source_generation(yaml_path: &Path) -> Result<(), ConfigError> {
+    let yaml_generation = read_source_generation(yaml_path, false)?;
+    let dotenv_path =
+        yaml_path
+            .parent()
+            .map(dotenv_path)
+            .ok_or_else(|| ConfigError::ConfigNotFound {
+                path: yaml_path.to_path_buf(),
+            })?;
+    let dotenv_generation = read_source_generation(&dotenv_path, true)?;
+
+    if yaml_generation != dotenv_generation
+        && (yaml_generation.is_some() || dotenv_generation.is_some())
+    {
+        return Err(ConfigError::ConfigSourceGenerationMismatch {
+            yaml: yaml_generation,
+            dotenv: dotenv_generation,
+        });
     }
 
     Ok(())
@@ -984,6 +1025,50 @@ mod tests {
         assert!(dotenv.contains("OPENAI_API_KEY=sk-test"));
         assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
         assert!(dotenv.contains(&format!("{DISCORD_BOT_TOKEN_ENV_NAME}=discord-token")));
+    }
+
+    #[test]
+    fn save_config_sources_share_a_generation_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+
+        save_config_with_secrets(&sample_config(), &path).expect("save config");
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect("dotenv");
+        let yaml_marker = yaml
+            .lines()
+            .find(|line| line.starts_with(CONFIG_SOURCE_GENERATION_PREFIX))
+            .expect("yaml generation marker");
+        let dotenv_marker = dotenv
+            .lines()
+            .find(|line| line.starts_with(CONFIG_SOURCE_GENERATION_PREFIX))
+            .expect("dotenv generation marker");
+        assert_eq!(yaml_marker, dotenv_marker);
+        validate_source_generation(&path).expect("matching generations");
+    }
+
+    #[test]
+    fn startup_rejects_mismatched_source_generations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+
+        save_config_with_secrets(&sample_config(), &path).expect("save config");
+        let dotenv_path = dir.path().join(".env");
+        let dotenv = fs::read_to_string(&dotenv_path).expect("dotenv");
+        let mismatched = dotenv.replacen(
+            CONFIG_SOURCE_GENERATION_PREFIX,
+            &format!("{CONFIG_SOURCE_GENERATION_PREFIX}different-generation-"),
+            1,
+        );
+        fs::write(&dotenv_path, mismatched).expect("write mismatched dotenv");
+
+        let error = Config::load_allow_missing_api_key(Some(&path))
+            .expect_err("mixed source generations must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::ConfigSourceGenerationMismatch { .. }
+        ));
     }
 
     #[test]

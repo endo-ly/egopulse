@@ -141,9 +141,15 @@ pub enum ConfigError {
     /// the file to become stable and let the watcher retry.
     #[error("config_source_changed_during_reload")]
     ConfigSourceChangedDuringReload,
+    /// YAML and `.env` were written from different persistence generations.
+    #[error("config_source_generation_mismatch: yaml={yaml:?} dotenv={dotenv:?}")]
+    ConfigSourceGenerationMismatch {
+        yaml: Option<String>,
+        dotenv: Option<String>,
+    },
     /// The candidate changes a field that requires a process restart. Restore
     /// the field and restart the process when that change is required.
-    #[error("config_reload_forbidden: field={field}")]
+    #[error("config_reload_forbidden: field={field}; restart required")]
     ConfigReloadForbidden { field: String },
     /// No persisted configuration path is available for a file-backed update.
     /// Use a file-backed runtime or configure the requested path first.

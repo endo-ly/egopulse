@@ -134,6 +134,7 @@ fn fallback_fingerprint(config: &Config) -> String {
 
 /// Returns the fingerprint of the persisted configuration source.
 pub(crate) fn source_fingerprint(path: &Path) -> Result<String, ConfigError> {
+    super::persist::validate_source_generation(path)?;
     let yaml = std::fs::read(path).map_err(|source| ConfigError::ConfigReadFailed {
         path: path.to_path_buf(),
         source,
@@ -269,6 +270,9 @@ impl ConfigManager {
             .lock()
             .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
         let latest = self.current_blocking();
+        if latest.fingerprint == snapshot.fingerprint {
+            return Ok(latest);
+        }
         if latest.revision != current.revision || latest.fingerprint != current.fingerprint {
             return Err(ConfigError::ConfigConflict {
                 expected: current.fingerprint.clone(),
@@ -602,6 +606,7 @@ mod tests {
             .apply_candidate(candidate, Some(&before.fingerprint))
             .expect_err("state root change must fail");
 
+        assert!(error.to_string().contains("restart required"));
         assert!(matches!(
             error,
             EgoPulseError::Config(ConfigError::ConfigReloadForbidden { field })
@@ -682,11 +687,11 @@ mod tests {
         candidate.timezone = "America/New_York".to_string();
         let error = manager
             .apply_candidate(candidate, Some(&before.fingerprint))
-            .expect_err("external dotenv edit must cause a conflict");
+            .expect_err("mixed YAML and dotenv generations must be rejected");
 
         assert!(matches!(
             error,
-            EgoPulseError::Config(ConfigError::ConfigConflict { .. })
+            EgoPulseError::Config(ConfigError::ConfigSourceGenerationMismatch { .. })
         ));
         assert_eq!(manager.current_blocking().revision, before.revision);
         assert_eq!(

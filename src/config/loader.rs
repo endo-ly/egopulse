@@ -238,6 +238,11 @@ pub(super) fn build_config(
 
     let dotenv = load_dotenv(resolved_config_path.as_deref());
 
+    let file_config = read_file_config(resolved_config_path.as_deref())?;
+    if let Some(path) = resolved_config_path.as_deref() {
+        super::persist::validate_source_generation(path)?;
+    }
+
     let FileConfig {
         state_root: file_state_root,
         default_provider: file_default_provider,
@@ -259,7 +264,7 @@ pub(super) fn build_config(
         db: file_db,
         web_fetch: file_web_fetch,
         webhooks: file_webhooks,
-    } = read_file_config(resolved_config_path.as_deref())?;
+    } = file_config;
 
     let default_provider =
         normalize_string(file_default_provider).ok_or(ConfigError::MissingDefaultProvider)?;

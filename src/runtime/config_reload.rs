@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::error::EgoPulseError;
+use crate::error::{ConfigError, EgoPulseError};
 use crate::runtime::AppState;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DEBOUNCE: Duration = Duration::from_millis(300);
+// Two polling intervals keep the debounce window aligned with observation ticks.
+const DEBOUNCE: Duration = Duration::from_millis(500);
 
 struct ReloadDebouncer {
     observed: Option<String>,
@@ -44,6 +45,12 @@ impl ReloadDebouncer {
 
     fn clear_pending(&mut self) {
         self.pending = None;
+    }
+
+    fn retry_pending(&mut self, now: Instant) {
+        if let Some((_, since)) = self.pending.as_mut() {
+            *since = now;
+        }
     }
 
     fn source_unavailable(&mut self) -> bool {
@@ -84,11 +91,12 @@ pub(crate) async fn run_config_reload_loop(
                     }
                 };
 
+                let now = Instant::now();
                 let current = state.config_manager.current_blocking();
                 if !debouncer.observe(
                     &current.fingerprint,
                     &fingerprint,
-                    Instant::now(),
+                    now,
                 ) {
                     continue;
                 }
@@ -111,12 +119,25 @@ pub(crate) async fn run_config_reload_loop(
                     }
                     Err(error) => {
                         warn!(error = %error, "config reload watcher: rejected file change");
+                        if is_retryable_reload_error(&error) {
+                            debouncer.retry_pending(now);
+                            continue;
+                        }
                     }
                 }
                 debouncer.clear_pending();
             }
         }
     }
+}
+
+fn is_retryable_reload_error(error: &EgoPulseError) -> bool {
+    matches!(
+        error,
+        EgoPulseError::Config(
+            ConfigError::ConfigReadFailed { .. } | ConfigError::ConfigSourceChangedDuringReload
+        ) | EgoPulseError::Internal(_)
+    )
 }
 
 #[cfg(test)]
@@ -164,6 +185,37 @@ mod tests {
             "edited",
             start + DEBOUNCE + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn transient_reload_error_retries_after_another_stable_window() {
+        let start = Instant::now();
+        let mut debouncer = ReloadDebouncer::new("initial".to_string());
+
+        assert!(!debouncer.observe("initial", "edited", start));
+        assert!(debouncer.observe("initial", "edited", start + DEBOUNCE));
+        debouncer.retry_pending(start + DEBOUNCE);
+        assert!(!debouncer.observe(
+            "initial",
+            "edited",
+            start + DEBOUNCE + Duration::from_millis(1)
+        ));
+        assert!(debouncer.observe("initial", "edited", start + DEBOUNCE * 2));
+    }
+
+    #[test]
+    fn reload_error_retry_classification_keeps_validation_errors_terminal() {
+        let read_error = EgoPulseError::Config(ConfigError::ConfigReadFailed {
+            path: std::path::PathBuf::from("config.yaml"),
+            source: std::io::Error::other("temporary read failure"),
+        });
+        let validation_error = EgoPulseError::Config(ConfigError::ConfigParseFailed {
+            path: std::path::PathBuf::from("config.yaml"),
+            detail: "invalid".to_string(),
+        });
+
+        assert!(is_retryable_reload_error(&read_error));
+        assert!(!is_retryable_reload_error(&validation_error));
     }
 
     #[test]

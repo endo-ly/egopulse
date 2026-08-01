@@ -1067,7 +1067,10 @@ pub(crate) fn execute_scheduled_turn(
             }
         };
 
-        let config_snapshot = state.config_manager.current_blocking();
+        let config_snapshot = turn
+            .config_snapshot
+            .clone()
+            .unwrap_or_else(|| state.config_manager.current_blocking());
         let valid_ids: Vec<&str> = config_snapshot
             .config
             .agents
@@ -1186,7 +1189,13 @@ pub(crate) fn execute_scheduled_turn(
         let runtime = state.turn_runtime();
         let turn_result = match current_state {
             Some(TurnRunState::InputCommitted) => {
-                resume_input_committed_turn(&runtime, turn.context.scope, &turn.turn_id).await
+                resume_input_committed_turn(
+                    &runtime,
+                    turn.context.scope,
+                    &turn.turn_id,
+                    Arc::clone(&config_snapshot),
+                )
+                .await
             }
             _ => {
                 execute_turn_with_progress_and_snapshot(
@@ -2425,6 +2434,7 @@ mod tests {
             context,
             input: "scheduled secret input".to_string(),
             origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
         };
 
         // Act: execute the scheduled turn
@@ -2553,12 +2563,14 @@ mod tests {
             context: ctx.clone(),
             input: "a".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
             context: ctx.clone(),
             input: "b".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         assert!(
             matches!(
@@ -2625,6 +2637,7 @@ mod tests {
                 context: ctx,
                 input: format!("fill-{i}"),
                 origin_id: format!("fill-{i}"),
+                config_snapshot: None,
             };
             let _ = state.turn_scheduler.submit(turn);
         }
@@ -2643,6 +2656,7 @@ mod tests {
             context: ctx_a,
             input: "blk1-input".to_string(),
             origin_id: "origin-blk1".to_string(),
+            config_snapshot: None,
         };
         let outcome = channel_input::submit_scheduled_turn(&state, turn_a).await;
         assert!(
@@ -2751,12 +2765,14 @@ mod tests {
             context: ctx.clone(),
             input: "a".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
             context: ctx.clone(),
             input: "b".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         assert!(matches!(
             state.turn_scheduler.submit(turn_a.clone()),
@@ -2984,6 +3000,7 @@ mod tests {
             context: context.clone(),
             input: input.clone(),
             origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
         };
         let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
 
@@ -3032,8 +3049,13 @@ mod tests {
         );
 
         // Act: resume the input_committed turn.
-        let result =
-            resume_input_committed_turn(&runtime, ConversationScope::Normal, &turn_id).await;
+        let result = resume_input_committed_turn(
+            &runtime,
+            ConversationScope::Normal,
+            &turn_id,
+            state.config_manager.current_blocking(),
+        )
+        .await;
         assert!(result.is_ok(), "resume should succeed: {result:?}");
 
         // Assert: the model loop ran to completion and the turn is terminal.

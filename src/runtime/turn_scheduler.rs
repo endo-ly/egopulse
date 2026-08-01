@@ -746,6 +746,7 @@ mod tests {
             context: test_context(agent_id),
             input: "hello".to_string(),
             origin_id: origin_id.to_string(),
+            config_snapshot: None,
         }
     }
 
