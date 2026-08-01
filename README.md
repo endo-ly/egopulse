@@ -2,21 +2,21 @@
 
 > Stricter than OpenClaw. Freer than Hermes Agent.
 
-エージェントが記憶し、気づき、並び立つランタイム。Web UI / Discord / Telegram / TUI / CLI に対応。
+A runtime where agents remember, notice, and stand side by side. Supports Web UI / Discord / Telegram / TUI / CLI.
 
-## 特徴
+## Features
 
 ### Agent-First
 
-Session / Memory / Tool / PULSE のすべてが `agent_id` を支配的識別子とする。同じ runtime に複数のエージェントが独立した記憶を持って並立し、互いに委譲し合う。チャネルもツールも、すべてエージェントに紐づく。
+Session / Memory / Tool / PULSE are all keyed by `agent_id` as the dominant identifier. Multiple agents can run side by side on the same runtime, each with independent memory, and delegate to each other. Channels and tools are all bound to agents.
 
 ### Sleep batch & Long time memory
 
-会話履歴を episodic（エピソード記憶）/ semantic（意味記憶）/ prospective（展望記憶）の 3 層に蒸留する。エージェントはSleepバッチで過去を整理し、記憶を長期保持する。
+Conversation history is distilled into three layers: episodic (episodic memory) / semantic (semantic memory) / prospective (prospective memory). Agents organize the past through Sleep batches and retain memory long-term.
 
 ### PULSE
 
-時間・記憶・外界からの signal を受け取り、いま意識へ上げるべきものを選び、短く活性化する。必要なときだけ普段の会話場所で声を出す。「何時に何を実行する」ではなく「何時に何へ注意を向ける」。
+Receives signals from time, memory, and the outside world, selects what should be brought to conscious attention now, and activates it briefly. It speaks in the usual conversation place only when needed. Not "what to run at what time" but "what to pay attention to at what time".
 
 ---
 
@@ -25,55 +25,55 @@ Session / Memory / Tool / PULSE のすべてが `agent_id` を支配的識別子
 ```bash
 curl -fsSL https://raw.githubusercontent.com/endo-ly/egopulse/main/scripts/install.sh | bash
 egopulse setup
-egopulse gateway install   # systemd サービス登録 + 起動
+egopulse gateway install   # register systemd service + start
 ```
 
-起動後、ブラウザで http://127.0.0.1:10961 にアクセスすると WebUI が利用できる。
+After startup, the WebUI is available at http://127.0.0.1:10961 in your browser.
 
-| モード | コマンド | 説明 |
+| Mode | Command | Description |
 |---|---|---|
-| Gateway | `egopulse gateway install` | Web / Discord / Telegram をサービスとして起動 |
-| Gateway 停止 | `egopulse gateway stop` | systemd サービス停止（登録は残す） |
-| CLI chat | `egopulse chat` | ターミナルから直接会話 |
-| TUI | `egopulse` | セッションブラウザ + チャット（対話型では `q` で終了） |
+| Gateway | `egopulse gateway install` | Start Web / Discord / Telegram as a service |
+| Stop gateway | `egopulse gateway stop` | Stop the systemd service (registration is kept) |
+| CLI chat | `egopulse chat` | Chat directly from the terminal |
+| TUI | `egopulse` | Session browser + chat (in interactive mode, press `q` to exit) |
 
-Discord / Telegram の設定は [channels.md](./docs/channels.md) を参照。
+See [channels.md](./docs/channels.md) for Discord / Telegram configuration.
 
 ---
 
 ## Tech Stack
 
-| レイヤー | 技術 |
+| Layer | Technology |
 |---|---|
 | Runtime | Rust (Tokio) |
-| 永続化 | SQLite (WAL モード) |
+| Persistence | SQLite (WAL mode) |
 | Web Server | Axum |
 | Web UI | React, Vite |
-| LLM | OpenAI 互換 API |
+| LLM | OpenAI-compatible API |
 
 ---
 
-## 設定
+## Configuration
 
-設定は `~/.egopulse/egopulse.config.yaml` に YAML で記述する。
-プロバイダ、モデル、チャネル、Sleep スケジュール、PULSE 間隔などを設定できる。
-詳細は [config.md](./docs/config.md) を参照。
+Configuration is written in YAML at `~/.egopulse/egopulse.config.yaml`.
+You can configure providers, models, channels, Sleep schedules, PULSE intervals, and more.
+See [config.md](./docs/config.md) for details.
 
 ---
 
-## ドキュメント
+## Documentation
 
-| トピック | ドキュメント |
+| Topic | Document |
 |---|---|
-| アーキテクチャ概要 | [architecture.md](./docs/architecture.md) |
-| コマンド仕様 | [commands.md](./docs/commands.md) |
-| 設定仕様 | [config.md](./docs/config.md) |
-| チャネル (Web/Discord/Telegram/TUI/CLI) | [channels.md](./docs/channels.md) |
-| セッションライフサイクル | [session-lifecycle.md](./docs/session-lifecycle.md) |
+| Architecture overview | [architecture.md](./docs/architecture.md) |
+| Command reference | [commands.md](./docs/commands.md) |
+| Configuration reference | [config.md](./docs/config.md) |
+| Channels (Web/Discord/Telegram/TUI/CLI) | [channels.md](./docs/channels.md) |
+| Session lifecycle | [session-lifecycle.md](./docs/session-lifecycle.md) |
 | Built-in Tools | [tools.md](./docs/tools.md) |
-| MCP 統合 | [mcp.md](./docs/mcp.md) |
-| System Prompt 構築 | [system-prompt.md](./docs/system-prompt.md) |
-| セキュリティ | [security.md](./docs/security.md) |
-| デプロイ | [deploy.md](./docs/deploy.md) |
-| DB スキーマ | [db.md](./docs/db.md) |
+| MCP integration | [mcp.md](./docs/mcp.md) |
+| System Prompt construction | [system-prompt.md](./docs/system-prompt.md) |
+| Security | [security.md](./docs/security.md) |
+| Deployment | [deploy.md](./docs/deploy.md) |
+| DB schema | [db.md](./docs/db.md) |
 | WebUI API | [api.md](./docs/api.md) |
