@@ -617,24 +617,10 @@ impl From<&Config> for SerializableConfig {
     }
 }
 
-/// Atomically writes the current config to a YAML file.
-///
-/// Uses the global `CONFIG_WRITE_LOCK` for in-process mutual exclusion and an
-/// file-level lock (`fs2`) for cross-process safety. The write is atomic via
-/// temp-file + rename.
-pub(crate) fn save_yaml(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
-    let _guard = CONFIG_WRITE_LOCK
-        .lock()
-        .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
-    let _lock_file = acquire_config_lock(path)?;
-
-    save_yaml_locked(config, path)
-}
-
 fn save_yaml_locked(config: &Config, path: &Path) -> Result<(), EgoPulseError> {
     let yaml = yaml_serde::to_string(&SerializableConfig::from(config))
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
-    write_atomically(path, &yaml)
+    write_atomically(path, yaml.as_bytes())
 }
 
 /// Saves config with SecretRef-aware YAML and .env file.
@@ -645,29 +631,25 @@ pub(crate) fn save_config_with_secrets(
     config: &Config,
     yaml_path: &Path,
 ) -> Result<(), EgoPulseError> {
-    let dotenv_entries = collect_dotenv_entries(config);
-    if !dotenv_entries.is_empty() {
-        if let Some(config_dir) = yaml_path.parent() {
-            let env_path = dotenv_path(config_dir);
-            save_dotenv(&env_path, &dotenv_entries).map_err(EgoPulseError::Config)?;
-        }
-    }
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
+    let _lock_file = acquire_config_lock(yaml_path)?;
 
-    save_yaml(config, yaml_path)?;
-
-    Ok(())
+    save_config_sources_locked(config, yaml_path)
 }
 
 /// Saves config only if the persisted source still has the expected fingerprint.
 ///
 /// The source check is performed while holding the same in-process and
 /// cross-process locks used by the write, closing the check-then-write race
-/// between concurrent ConfigManager updates.
+/// between concurrent ConfigManager updates. YAML and `.env` writes are
+/// rolled back to their previous bytes if the second write fails.
 pub(crate) fn save_config_with_secrets_if_unchanged(
     config: &Config,
     yaml_path: &Path,
     expected_fingerprint: &str,
-) -> Result<(), EgoPulseError> {
+) -> Result<String, EgoPulseError> {
     let _guard = CONFIG_WRITE_LOCK
         .lock()
         .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
@@ -681,15 +663,95 @@ pub(crate) fn save_config_with_secrets_if_unchanged(
         }));
     }
 
+    save_config_sources_locked(config, yaml_path)?;
+    crate::config::manager::source_fingerprint(yaml_path).map_err(EgoPulseError::from)
+}
+
+/// Runs a read operation while excluding configuration persistence.
+///
+/// The same process and file locks are used by the source writer, so a reload
+/// cannot observe the interval between the YAML and `.env` replacements.
+pub(crate) fn with_config_lock<T, F>(yaml_path: &Path, operation: F) -> Result<T, EgoPulseError>
+where
+    F: FnOnce() -> Result<T, EgoPulseError>,
+{
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
+    let _lock_file = acquire_config_lock(yaml_path)?;
+    operation()
+}
+
+fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
     let dotenv_entries = collect_dotenv_entries(config);
-    if !dotenv_entries.is_empty()
-        && let Some(config_dir) = yaml_path.parent()
-    {
-        let env_path = dotenv_path(config_dir);
-        save_dotenv(&env_path, &dotenv_entries).map_err(EgoPulseError::Config)?;
+    let env_path = if dotenv_entries.is_empty() {
+        None
+    } else {
+        yaml_path.parent().map(dotenv_path)
+    };
+
+    let yaml_backup = read_file_for_restore(yaml_path)?;
+    let env_backup = env_path.as_deref().map(read_file_for_restore).transpose()?;
+
+    // Commit YAML first. If it fails, the dotenv source is untouched. If the
+    // dotenv commit fails after YAML succeeds, both files are restored below.
+    save_yaml_locked(config, yaml_path)?;
+
+    let Some(env_path) = env_path else {
+        return Ok(());
+    };
+
+    if let Err(error) = save_dotenv(&env_path, &dotenv_entries) {
+        let yaml_restore = restore_file(yaml_path, yaml_backup.as_deref());
+        let env_restore = restore_file(
+            &env_path,
+            env_backup.as_ref().and_then(|backup| backup.as_deref()),
+        );
+        if let (Err(yaml_error), Err(env_error)) = (&yaml_restore, &env_restore) {
+            return Err(EgoPulseError::Internal(format!(
+                "failed to persist .env ({error}); YAML rollback failed ({yaml_error}); .env rollback failed ({env_error})"
+            )));
+        }
+        if let Err(yaml_error) = yaml_restore {
+            return Err(EgoPulseError::Internal(format!(
+                "failed to persist .env ({error}); YAML rollback failed ({yaml_error})"
+            )));
+        }
+        if let Err(env_error) = env_restore {
+            return Err(EgoPulseError::Internal(format!(
+                "failed to persist .env ({error}); .env rollback failed ({env_error})"
+            )));
+        }
+        return Err(EgoPulseError::Config(error));
     }
 
-    save_yaml_locked(config, yaml_path)
+    Ok(())
+}
+
+fn read_file_for_restore(path: &Path) -> Result<Option<Vec<u8>>, EgoPulseError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EgoPulseError::Internal(format!(
+            "failed to read {} before config persistence: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<(), EgoPulseError> {
+    if let Some(previous) = previous {
+        return write_atomically(path, previous);
+    }
+
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EgoPulseError::Internal(format!(
+            "failed to remove {} during config rollback: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
@@ -762,7 +824,7 @@ fn acquire_config_lock(path: &Path) -> Result<File, EgoPulseError> {
     Ok(lock_file)
 }
 
-fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
+fn write_atomically(path: &Path, content: &[u8]) -> Result<(), EgoPulseError> {
     let parent = path
         .parent()
         .ok_or_else(|| EgoPulseError::Internal("config path has no parent".to_string()))?;
@@ -788,7 +850,7 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), EgoPulseError> {
         .open(&temp_path)
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     temp_file
-        .write_all(content.as_bytes())
+        .write_all(content)
         .map_err(|error| EgoPulseError::Internal(error.to_string()))?;
     temp_file
         .flush()

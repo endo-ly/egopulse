@@ -119,21 +119,6 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
 /// store is enabled. A secret-db backup failure is logged as a warning but
 /// does not prevent the `backup_last_run` timestamp from being recorded.
 ///
-/// Split out of the loop so unit tests can exercise the persistence side
-/// effect without driving the full scheduler cadence.
-///
-/// # Errors
-///
-/// Returns [`EgoPulseError`] when either the backup or the timestamp write fails.
-#[cfg(test)]
-pub(crate) async fn run_periodic_backup_once(
-    state: &AppState,
-    now: DateTime<Utc>,
-) -> Result<BackupOutcome, EgoPulseError> {
-    let snapshot = state.config_manager.current_blocking();
-    run_periodic_backup_once_with_config(state, &snapshot.config, now).await
-}
-
 async fn run_periodic_backup_once_with_config(
     state: &AppState,
     config: &crate::config::Config,
@@ -216,7 +201,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 20, 3, 0, 0).unwrap();
 
         // Act
-        let outcome = run_periodic_backup_once(&state, now).await.expect("backup");
+        let snapshot = state.config_manager.current_blocking();
+        let outcome = run_periodic_backup_once_with_config(&state, &snapshot.config, now)
+            .await
+            .expect("backup");
 
         // Assert
         assert!(outcome.integrity_ok);
@@ -339,7 +327,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 20, 3, 0, 0).unwrap();
 
         // Act
-        let outcome = run_periodic_backup_once(&state, now).await.expect("backup");
+        let snapshot = state.config_manager.current_blocking();
+        let outcome = run_periodic_backup_once_with_config(&state, &snapshot.config, now)
+            .await
+            .expect("backup");
 
         // Assert
         assert!(outcome.integrity_ok);
@@ -365,7 +356,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 20, 3, 0, 0).unwrap();
 
         // Act
-        let outcome = run_periodic_backup_once(&state, now).await.expect("backup");
+        let snapshot = state.config_manager.current_blocking();
+        let outcome = run_periodic_backup_once_with_config(&state, &snapshot.config, now)
+            .await
+            .expect("backup");
 
         // Assert
         assert!(outcome.integrity_ok);

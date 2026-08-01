@@ -32,8 +32,7 @@ struct AgentSendParams {
 }
 
 pub(crate) struct AgentSendTool {
-    agents: std::collections::HashMap<AgentId, AgentConfig>,
-    config_manager: Option<Arc<crate::config::ConfigManager>>,
+    config_manager: Arc<crate::config::ConfigManager>,
     db: Arc<crate::storage::Database>,
     secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
@@ -46,26 +45,11 @@ pub(crate) struct AgentSendTool {
 }
 
 impl AgentSendTool {
-    #[cfg(test)]
-    pub(crate) fn new(
-        agents: std::collections::HashMap<AgentId, AgentConfig>,
-        db: Arc<crate::storage::Database>,
-        secret_db: Option<Arc<crate::storage::Database>>,
-        channels: Arc<crate::channels::adapter::ChannelRegistry>,
-        intake: Arc<TurnIntake>,
-    ) -> Self {
-        Self {
-            agents,
-            config_manager: None,
-            db,
-            secret_db,
-            channels,
-            intake,
-        }
-    }
-
+    /// Constructs an `agent_send` tool that resolves agents from the current
+    /// runtime configuration manager when a Turn has no fixed snapshot. A
+    /// Turn-provided snapshot takes precedence for the duration of that tool
+    /// execution.
     pub(crate) fn new_with_manager(
-        agents: std::collections::HashMap<AgentId, AgentConfig>,
         db: Arc<crate::storage::Database>,
         secret_db: Option<Arc<crate::storage::Database>>,
         channels: Arc<crate::channels::adapter::ChannelRegistry>,
@@ -73,8 +57,7 @@ impl AgentSendTool {
         config_manager: Arc<crate::config::ConfigManager>,
     ) -> Self {
         Self {
-            agents,
-            config_manager: Some(config_manager),
+            config_manager,
             db,
             secret_db,
             channels,
@@ -163,15 +146,11 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
-        let config_snapshot = context.config_snapshot.clone().or_else(|| {
-            self.config_manager
-                .as_ref()
-                .map(|manager| manager.current_blocking())
-        });
-        let agents = config_snapshot
-            .as_ref()
-            .map(|snapshot| &snapshot.config.agents)
-            .unwrap_or(&self.agents);
+        let config_snapshot = context
+            .config_snapshot
+            .clone()
+            .unwrap_or_else(|| self.config_manager.current_blocking());
+        let agents = &config_snapshot.config.agents;
 
         // Validate: agent must exist in config.agents
         if !agents.contains_key(&AgentId::new(&target_id)) {
@@ -355,15 +334,16 @@ mod tests {
 
     fn tool_with_agents(agents: HashMap<AgentId, AgentConfig>) -> AgentSendTool {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8"));
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.agents = agents;
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        AgentSendTool::new(
-            agents,
+        AgentSendTool::new_with_manager(
             db,
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         )
     }
 
@@ -381,12 +361,12 @@ mod tests {
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
         let intake = Arc::new(crate::runtime::TurnIntake::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
             Arc::clone(&intake),
+            Arc::clone(&state_arc.config_manager),
         );
         intake.bind(&state_arc);
         (tool, state_arc, dir)
@@ -470,6 +450,45 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("yourself"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_prefers_turn_snapshot_for_recipient_and_labels() {
+        let (tool, state, _dir) = durable_tool();
+        let mut snapshot_config = state.config_manager.current_blocking().config.clone();
+        snapshot_config
+            .agents
+            .get_mut(&AgentId::new("lyre"))
+            .expect("source agent")
+            .label = "Snapshot Lyre".to_string();
+        snapshot_config.agents.remove(&AgentId::new("vega"));
+        snapshot_config.agents.insert(
+            AgentId::new("snapshot-only"),
+            AgentConfig {
+                label: "Snapshot Only".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let mut context = test_context_with_agent("lyre");
+        context.config_snapshot = Some(Arc::new(crate::config::manager::ConfigSnapshot::new(
+            2,
+            snapshot_config,
+            None,
+        )));
+        let result = tool
+            .execute(
+                json!({"to": "snapshot-only", "message": "use fixed config"}),
+                &context,
+            )
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["delivered"], true);
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].input.contains("[Snapshot Lyre → Snapshot Only]"));
     }
 
     #[tokio::test]
@@ -636,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn agent_send_no_channel_log_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8"));
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
 
@@ -653,15 +672,15 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let agents = test_agents();
+        config.agents = test_agents();
         // Intake not bound to a runtime: the turn is not durably accepted, so
         // the channel-log side effect must NOT run.
-        let tool = AgentSendTool::new(
-            agents,
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         );
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -719,12 +738,14 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let tool = AgentSendTool::new(
-            test_agents(),
+        let mut config = config;
+        config.agents = test_agents();
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         );
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -806,12 +827,12 @@ mod integration_tests {
     ) -> (AgentSendTool, Arc<crate::storage::Database>) {
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config.clone(), None)),
         );
         (tool, db)
     }
@@ -825,12 +846,12 @@ mod integration_tests {
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
         let intake = Arc::new(crate::runtime::TurnIntake::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
             Arc::clone(&intake),
+            Arc::clone(&state_arc.config_manager),
         );
         intake.bind(&state_arc);
         (tool, state_arc)

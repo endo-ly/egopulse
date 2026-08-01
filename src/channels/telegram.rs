@@ -28,6 +28,7 @@ use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{ChannelAdapter, ToolProgressHandle, ToolProgressSink};
 use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::TelegramChatConfig;
+use crate::config::manager::ConfigSnapshot;
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 
@@ -166,26 +167,24 @@ struct TelegramHandler {
 }
 
 impl TelegramHandler {
-    fn current_channels(&self) -> HashMap<i64, TelegramChatConfig> {
-        let snapshot = self.app_state.config_manager.current_blocking();
+    fn channels(snapshot: &ConfigSnapshot) -> HashMap<i64, TelegramChatConfig> {
         snapshot.config.telegram_channels()
     }
 
-    fn current_default_agent(&self) -> String {
-        self.app_state
-            .config_manager
-            .current_blocking()
-            .config
-            .default_agent
-            .to_string()
+    fn default_agent_response(&self, snapshot: &ConfigSnapshot) -> RouteDecision {
+        RouteDecision::Respond {
+            agent_id: snapshot.config.default_agent.to_string(),
+        }
     }
 
     /// 指定エージェントがこの bot にバインドされているかを返す。
-    fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
+    fn agent_uses_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        agent_id: &crate::config::AgentId,
+    ) -> bool {
         let bot_id = crate::config::BotId::new(&self.bot_id);
-        self.app_state
-            .config_manager
-            .current_blocking()
+        snapshot
             .config
             .agents
             .get(agent_id)
@@ -193,24 +192,36 @@ impl TelegramHandler {
     }
 
     /// チャンネル設定内で、この bot にバインドされた最初のエージェントを返す。
-    fn first_agent_for_this_bot(&self, channel_config: &TelegramChatConfig) -> Option<String> {
+    fn first_agent_for_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &TelegramChatConfig,
+    ) -> Option<String> {
         channel_config
             .agents
             .iter()
-            .find(|agent_id| self.agent_uses_this_bot(agent_id))
+            .find(|agent_id| self.agent_uses_this_bot(snapshot, agent_id))
             .map(ToString::to_string)
     }
 
     /// Single-agent チャネルの先頭エージェントがこの bot にバインドされていれば返す。
-    fn primary_agent_for_this_bot(&self, channel_config: &TelegramChatConfig) -> Option<String> {
+    fn primary_agent_for_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &TelegramChatConfig,
+    ) -> Option<String> {
         let agent_id = channel_config.agents.first()?;
-        self.agent_uses_this_bot(agent_id)
+        self.agent_uses_this_bot(snapshot, agent_id)
             .then(|| agent_id.to_string())
     }
 
     /// Single-agent チャネルのルーティングを解決する。
-    fn resolve_single_agent_channel(&self, channel_config: &TelegramChatConfig) -> RouteDecision {
-        match self.primary_agent_for_this_bot(channel_config) {
+    fn resolve_single_agent_channel(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &TelegramChatConfig,
+    ) -> RouteDecision {
+        match self.primary_agent_for_this_bot(snapshot, channel_config) {
             Some(agent_id) => RouteDecision::Respond { agent_id },
             None => RouteDecision::Reject,
         }
@@ -219,6 +230,7 @@ impl TelegramHandler {
     /// Multi-agent room のルーティングを解決する。
     fn resolve_multi_agent_room(
         &self,
+        snapshot: &ConfigSnapshot,
         channel_config: &TelegramChatConfig,
         mentions_bot: bool,
     ) -> RouteDecision {
@@ -231,35 +243,40 @@ impl TelegramHandler {
             };
         }
 
-        match self.first_agent_for_this_bot(channel_config) {
+        match self.first_agent_for_this_bot(snapshot, channel_config) {
             Some(agent_id) => RouteDecision::Respond { agent_id },
             None => RouteDecision::Reject,
         }
     }
 
     /// メッセージの送信先エージェントを決定するルーティング処理。
-    fn route_message(&self, raw_chat_id: i64, is_dm: bool, mentions_bot: bool) -> RouteDecision {
+    fn route_message(
+        &self,
+        snapshot: &ConfigSnapshot,
+        raw_chat_id: i64,
+        is_dm: bool,
+        mentions_bot: bool,
+    ) -> RouteDecision {
         if is_dm {
-            return RouteDecision::Respond {
-                agent_id: self.current_default_agent(),
-            };
+            return self.default_agent_response(snapshot);
         }
 
-        let channels = self.current_channels();
+        let channels = Self::channels(snapshot);
         let Some(channel_config) = channels.get(&raw_chat_id) else {
             return RouteDecision::Reject;
         };
 
         if channel_config.multi_agent {
-            self.resolve_multi_agent_room(channel_config, mentions_bot)
+            self.resolve_multi_agent_room(snapshot, channel_config, mentions_bot)
         } else {
-            self.resolve_single_agent_channel(channel_config)
+            self.resolve_single_agent_channel(snapshot, channel_config)
         }
     }
 
     /// メッセージを処理すべきかを判定する。
     fn should_process_message(
         &self,
+        snapshot: &ConfigSnapshot,
         is_bot: bool,
         is_dm: bool,
         raw_chat_id: i64,
@@ -280,7 +297,7 @@ impl TelegramHandler {
 
         // 人間のメッセージ: require_mention 設定に従う
         if !is_dm {
-            let channels = self.current_channels();
+            let channels = Self::channels(snapshot);
             if let Some(config) = channels.get(&raw_chat_id) {
                 if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
@@ -292,13 +309,19 @@ impl TelegramHandler {
     }
 
     /// [`SurfaceContext`] を構築する。
-    fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let scope = self.scope_for_thread(thread);
+    fn make_context(
+        &self,
+        snapshot: &ConfigSnapshot,
+        user: &str,
+        thread: &str,
+        agent_id: &str,
+    ) -> SurfaceContext {
+        let scope = self.scope_for_thread(snapshot, thread);
         crate::runtime::build_channel_context("telegram", user, thread, "telegram", agent_id, scope)
     }
 
-    fn scope_for_thread(&self, thread: &str) -> ConversationScope {
-        let channels = self.current_channels();
+    fn scope_for_thread(&self, snapshot: &ConfigSnapshot, thread: &str) -> ConversationScope {
+        let channels = Self::channels(snapshot);
         thread
             .parse::<i64>()
             .ok()
@@ -362,70 +385,34 @@ impl TelegramHandler {
 /// `external_chat_id` から Telegram bot token を解決する共有データ。
 /// [`TelegramAdapter`] と進捗 sink が `Arc` で共有する。
 struct TelegramTokenResolver {
-    /// `bot_id → token` のマップ。
-    bot_tokens: HashMap<String, String>,
-    /// `agent_id → bot_id` のマップ。
-    agent_bot_map: HashMap<String, String>,
-    config_manager: Option<Arc<crate::config::ConfigManager>>,
+    config_manager: Arc<crate::config::ConfigManager>,
 }
 
 impl TelegramTokenResolver {
-    #[cfg(test)]
-    fn new(bot_tokens: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
-        Self {
-            bot_tokens,
-            agent_bot_map,
-            config_manager: None,
-        }
-    }
-
     fn with_manager(config_manager: Arc<crate::config::ConfigManager>) -> Self {
-        Self {
-            bot_tokens: HashMap::new(),
-            agent_bot_map: HashMap::new(),
-            config_manager: Some(config_manager),
-        }
+        Self { config_manager }
     }
 
     /// Resolve the bot token for a given external_chat_id.
     ///
     /// Extracts agent_id from the `:agent:` segment, maps agent → bot_id → token.
     fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
-        if let Some(config_manager) = &self.config_manager {
-            let snapshot = config_manager.current_blocking();
-            let config = &snapshot.config;
-            let agent_id = external_chat_id
-                .find(":agent:")
-                .map(|pos| &external_chat_id[pos + ":agent:".len()..])
-                .unwrap_or("");
-            if let Some(bot_id) = config
-                .agents
-                .get(&crate::config::AgentId::new(agent_id))
-                .and_then(|agent| agent.telegram_bot.as_ref())
-            {
-                if let Some(bot) = config
-                    .telegram_bots()
-                    .into_iter()
-                    .find(|bot| *bot.bot_id == *bot_id)
-                {
-                    return Ok(bot.token.to_string());
-                }
-            }
-            return Err(format!(
-                "no Telegram bot binding found for external_chat_id '{external_chat_id}'"
-            ));
-        }
-
+        let snapshot = self.config_manager.current_blocking();
+        let config = &snapshot.config;
         let agent_id = external_chat_id
             .find(":agent:")
             .map(|pos| &external_chat_id[pos + ":agent:".len()..])
             .unwrap_or("");
-        if !agent_id.is_empty() {
-            if let Some(bot_id) = self.agent_bot_map.get(agent_id) {
-                if let Some(token) = self.bot_tokens.get(bot_id) {
-                    return Ok(token.clone());
-                }
-            }
+        if let Some(bot_id) = config
+            .agents
+            .get(&crate::config::AgentId::new(agent_id))
+            .and_then(|agent| agent.telegram_bot.as_ref())
+            && let Some(bot) = config
+                .telegram_bots()
+                .into_iter()
+                .find(|bot| *bot.bot_id == *bot_id)
+        {
+            return Ok(bot.token.to_string());
         }
         Err(format!(
             "no Telegram bot binding found for external_chat_id '{external_chat_id}'"
@@ -444,15 +431,6 @@ pub(crate) struct TelegramAdapter {
 }
 
 impl TelegramAdapter {
-    #[cfg(test)]
-    pub(crate) fn new_multi(
-        bot_tokens: HashMap<String, String>,
-        agent_bot_map: HashMap<String, String>,
-    ) -> Self {
-        let tokens = Arc::new(TelegramTokenResolver::new(bot_tokens, agent_bot_map));
-        Self::from_tokens(tokens)
-    }
-
     pub(crate) fn new_multi_with_manager(
         config_manager: Arc<crate::config::ConfigManager>,
     ) -> Self {
@@ -923,6 +901,7 @@ async fn handle_message(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let text = msg.text().map(str::to_string).unwrap_or_default();
     let raw_chat_id = msg.chat.id.0;
+    let snapshot = handler.app_state.config_manager.current_blocking();
 
     // チャット種別判定
     let is_dm = matches!(&msg.chat.kind, teloxide::types::ChatKind::Private(_));
@@ -949,7 +928,7 @@ async fn handle_message(
     let mentions_bot = handler.is_bot_mentioned_in_text(&text, entities);
 
     // ルーティング
-    let route = handler.route_message(raw_chat_id, is_dm, mentions_bot);
+    let route = handler.route_message(&snapshot, raw_chat_id, is_dm, mentions_bot);
     if route.is_rejected() {
         return Ok(());
     }
@@ -977,7 +956,7 @@ async fn handle_message(
         .unwrap_or_else(|| "user:telegram:unknown".to_string());
 
     let thread = raw_chat_id.to_string();
-    let context = handler.make_context(&sender_name, &thread, &route_agent_id);
+    let context = handler.make_context(&snapshot, &sender_name, &thread, &route_agent_id);
 
     // スラッシュコマンドインターセプト
     if msg.text().is_some()
@@ -1010,7 +989,8 @@ async fn handle_message(
 
     // メッセージ受信可否判定
     let author_is_bot = msg.from.as_ref().is_some_and(|u| u.is_bot);
-    let decision = handler.should_process_message(author_is_bot, is_dm, raw_chat_id, mentions_bot);
+    let decision =
+        handler.should_process_message(&snapshot, author_is_bot, is_dm, raw_chat_id, mentions_bot);
     match decision {
         ReceiveDecision::Accept { reset_chain: true } => {
             handler.chain_state.reset(raw_chat_id);
@@ -1020,7 +1000,7 @@ async fn handle_message(
     }
 
     // Multi-Agent Room で Channel Log に保存
-    let channels = handler.current_channels();
+    let channels = TelegramHandler::channels(&snapshot);
     let is_multi_agent = channels.get(&raw_chat_id).is_some_and(|c| c.multi_agent);
 
     // ObserveOnly: Channel Log に保存済み、応答はしない
@@ -1077,7 +1057,7 @@ async fn handle_message(
             &handler.app_state,
             HumanChannelLogMessage {
                 key: ChannelLogKey::Telegram(raw_chat_id),
-                scope: handler.scope_for_thread(&thread),
+                scope: handler.scope_for_thread(&snapshot, &thread),
                 id: format!("cl-tg-{raw_chat_id}-{}", msg.id.0),
                 sender_id: storage_sender_id,
                 content: combined_text.clone(),
@@ -1089,7 +1069,7 @@ async fn handle_message(
         None
     };
 
-    let mut context = handler.make_context(&sender_name, &thread, &agent_id);
+    let mut context = handler.make_context(&snapshot, &sender_name, &thread, &agent_id);
     context.channel_log_chat_id = channel_log_chat_id;
     context.origin_id = uuid::Uuid::new_v4().to_string();
     context.request_key = format!("telegram:{raw_chat_id}:{}", msg.id.0);
@@ -1275,6 +1255,83 @@ mod tests {
         }
     }
 
+    fn test_config_manager() -> Arc<crate::config::ConfigManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Arc::new(crate::config::ConfigManager::new(
+            crate::test_util::test_config(dir.path().to_str().expect("utf8")),
+            None,
+        ))
+    }
+
+    fn test_adapter() -> TelegramAdapter {
+        TelegramAdapter::new_multi_with_manager(test_config_manager())
+    }
+
+    fn test_manager_with_telegram_config(
+        bot_tokens: &[(&str, &str)],
+        agent_bots: &[(&str, &str)],
+    ) -> Arc<crate::config::ConfigManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        config
+            .channels
+            .entry(crate::config::ChannelName::new("telegram"))
+            .or_default()
+            .enabled = Some(true);
+        config
+            .channels
+            .get_mut("telegram")
+            .expect("telegram channel")
+            .telegram_bots = Some(
+            bot_tokens
+                .iter()
+                .map(|(bot_id, token)| {
+                    (
+                        crate::config::BotId::new(bot_id),
+                        crate::config::TelegramBotConfig {
+                            token: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                                (*token).to_string(),
+                            )),
+                            file_token: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let developer_bot = agent_bots
+            .iter()
+            .find(|(agent_id, _)| *agent_id == "alice")
+            .map(|(_, bot_id)| crate::config::BotId::new(bot_id));
+        config.agents.insert(
+            crate::config::AgentId::new("alice"),
+            crate::config::AgentConfig {
+                label: "Alice".to_string(),
+                telegram_bot: developer_bot,
+                ..Default::default()
+            },
+        );
+        for (agent_id, bot_id) in agent_bots {
+            config.agents.insert(
+                crate::config::AgentId::new(agent_id),
+                crate::config::AgentConfig {
+                    label: (*agent_id).to_string(),
+                    telegram_bot: Some(crate::config::BotId::new(bot_id)),
+                    ..Default::default()
+                },
+            );
+        }
+        Arc::new(crate::config::ConfigManager::new(config, None))
+    }
+
+    fn test_adapter_with_manager_config(
+        bot_tokens: &[(&str, &str)],
+        agent_bots: &[(&str, &str)],
+    ) -> TelegramAdapter {
+        TelegramAdapter::new_multi_with_manager(test_manager_with_telegram_config(
+            bot_tokens, agent_bots,
+        ))
+    }
+
     fn agent_id(id: &str) -> crate::config::AgentId {
         crate::config::AgentId::new(id)
     }
@@ -1321,8 +1378,9 @@ mod tests {
     }
 
     fn route_accepts(handler: &TelegramHandler, chat_id: i64, mentions_bot: bool) -> bool {
+        let snapshot = handler.app_state.config_manager.current_blocking();
         !handler
-            .route_message(chat_id, false, mentions_bot)
+            .route_message(&snapshot, chat_id, false, mentions_bot)
             .is_rejected()
     }
 
@@ -1332,8 +1390,9 @@ mod tests {
         is_dm: bool,
         mentions_bot: bool,
     ) -> Option<String> {
+        let snapshot = handler.app_state.config_manager.current_blocking();
         handler
-            .route_message(chat_id, is_dm, mentions_bot)
+            .route_message(&snapshot, chat_id, is_dm, mentions_bot)
             .agent_id()
             .map(ToString::to_string)
     }
@@ -1344,29 +1403,35 @@ mod tests {
         is_dm: bool,
         mentions_bot: bool,
     ) -> Option<String> {
+        let snapshot = handler.app_state.config_manager.current_blocking();
         handler
-            .route_message(chat_id, is_dm, mentions_bot)
+            .route_message(&snapshot, chat_id, is_dm, mentions_bot)
             .response_agent_id()
             .map(ToString::to_string)
+    }
+
+    fn should_process(
+        handler: &TelegramHandler,
+        is_bot: bool,
+        is_dm: bool,
+        raw_chat_id: i64,
+        mentions_bot: bool,
+    ) -> ReceiveDecision {
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        handler.should_process_message(&snapshot, is_bot, is_dm, raw_chat_id, mentions_bot)
     }
 
     // --- Adapter tests ---
 
     #[test]
     fn adapter_name() {
-        let adapter = TelegramAdapter::new_multi(
-            std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
-            std::collections::HashMap::new(),
-        );
+        let adapter = test_adapter();
         assert_eq!(adapter.name(), "telegram");
     }
 
     #[test]
     fn adapter_chat_type_routes() {
-        let adapter = TelegramAdapter::new_multi(
-            std::collections::HashMap::from([("main".to_string(), "test-token".to_string())]),
-            std::collections::HashMap::new(),
-        );
+        let adapter = test_adapter();
         let routes = adapter.chat_type_routes();
         assert!(routes.len() >= 6);
         assert!(
@@ -1394,15 +1459,9 @@ mod tests {
 
     #[test]
     fn select_token_routes_to_bound_bot() {
-        let adapter = TelegramAdapter::new_multi(
-            std::collections::HashMap::from([
-                ("main".to_string(), "token-main".to_string()),
-                ("other".to_string(), "token-other".to_string()),
-            ]),
-            std::collections::HashMap::from([
-                ("alice".to_string(), "main".to_string()),
-                ("bob".to_string(), "other".to_string()),
-            ]),
+        let adapter = test_adapter_with_manager_config(
+            &[("main", "token-main"), ("other", "token-other")],
+            &[("alice", "main"), ("bob", "other")],
         );
         assert_eq!(
             adapter.select_token("telegram:-100:agent:alice"),
@@ -1416,10 +1475,7 @@ mod tests {
 
     #[test]
     fn select_token_returns_error_for_unknown_agent() {
-        let adapter = TelegramAdapter::new_multi(
-            std::collections::HashMap::from([("main".to_string(), "token-main".to_string())]),
-            std::collections::HashMap::new(),
-        );
+        let adapter = test_adapter_with_manager_config(&[("main", "token-main")], &[]);
         assert!(adapter.select_token("telegram:-100:agent:unknown").is_err());
     }
 
@@ -1500,7 +1556,8 @@ mod tests {
     #[test]
     fn route_accepts_dm_with_default_agent() {
         let handler = test_handler(HashMap::new());
-        let result = handler.route_message(999, true, false);
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let result = handler.route_message(&snapshot, 999, true, false);
         assert_eq!(
             result,
             RouteDecision::Respond {
@@ -1512,7 +1569,12 @@ mod tests {
     #[test]
     fn route_rejects_unauthorized_group() {
         let handler = test_handler(HashMap::new());
-        assert!(handler.route_message(-100123, false, false).is_rejected());
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        assert!(
+            handler
+                .route_message(&snapshot, -100123, false, false)
+                .is_rejected()
+        );
     }
 
     #[test]
@@ -1580,7 +1642,7 @@ mod tests {
     fn should_process_message_human_resets_chain() {
         let handler = test_handler(channels(&[(-100, &["dev"], false, false)]));
         assert_eq!(
-            handler.should_process_message(false, false, -100, true),
+            should_process(&handler, false, false, -100, true),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1589,7 +1651,7 @@ mod tests {
     fn should_process_message_bot_within_depth() {
         let handler = test_handler(HashMap::new());
         assert_eq!(
-            handler.should_process_message(true, false, -200, true),
+            should_process(&handler, true, false, -200, true),
             ReceiveDecision::Accept { reset_chain: false }
         );
     }
@@ -1599,12 +1661,12 @@ mod tests {
         let handler = test_handler(HashMap::new());
         for _ in 0..BOT_CHAIN_MAX_DEPTH {
             assert_eq!(
-                handler.should_process_message(true, false, -200, true),
+                should_process(&handler, true, false, -200, true),
                 ReceiveDecision::Accept { reset_chain: false }
             );
         }
         assert_eq!(
-            handler.should_process_message(true, false, -200, true),
+            should_process(&handler, true, false, -200, true),
             ReceiveDecision::Reject
         );
     }
@@ -1613,7 +1675,7 @@ mod tests {
     fn should_process_message_bot_without_mention_rejected() {
         let handler = test_handler(HashMap::new());
         assert_eq!(
-            handler.should_process_message(true, false, -200, false),
+            should_process(&handler, true, false, -200, false),
             ReceiveDecision::Reject
         );
     }
@@ -1729,7 +1791,8 @@ mod tests {
     #[test]
     fn route_dm_always_uses_default_agent() {
         let handler = test_handler(channels(&[(-100, &["reviewer"], false, false)]));
-        let result = handler.route_message(999, true, false);
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let result = handler.route_message(&snapshot, 999, true, false);
         assert_eq!(
             result,
             RouteDecision::Respond {
@@ -1781,7 +1844,8 @@ mod tests {
     #[test]
     fn make_context_includes_agent_id_in_session_key() {
         let handler = test_handler(HashMap::new());
-        let ctx = handler.make_context("user", "-100123", "alice");
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let ctx = handler.make_context(&snapshot, "user", "-100123", "alice");
         assert_eq!(ctx.session_key(), "telegram:-100123:agent:alice");
     }
 
@@ -1798,12 +1862,12 @@ mod tests {
         assert!(route_accepts(&handler, -100, false));
         // But receive rejects (no mention, single-agent, require_mention=true)
         assert_eq!(
-            handler.should_process_message(false, false, -100, false),
+            should_process(&handler, false, false, -100, false),
             ReceiveDecision::Reject
         );
         // With mention, it's accepted
         assert_eq!(
-            handler.should_process_message(false, false, -100, true),
+            should_process(&handler, false, false, -100, true),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1819,7 +1883,7 @@ mod tests {
         );
         // In multi-agent rooms, human messages are always accepted for channel log
         assert_eq!(
-            handler.should_process_message(false, false, -100, false),
+            should_process(&handler, false, false, -100, false),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1867,7 +1931,8 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(-100123i64, secret_chat_config(&["default"], false, true));
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "-100123", "default");
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let ctx = handler.make_context(&snapshot, "user", "-100123", "default");
         assert_eq!(ctx.scope, ConversationScope::Secret);
     }
 
@@ -1876,7 +1941,8 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(-100456i64, secret_chat_config(&["default"], false, false));
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "-100456", "default");
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let ctx = handler.make_context(&snapshot, "user", "-100456", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
@@ -1884,18 +1950,17 @@ mod tests {
     fn make_context_defaults_to_normal_scope_for_unknown_chat() {
         let channels: HashMap<i64, TelegramChatConfig> = HashMap::new();
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "-100789", "default");
+        let snapshot = handler.app_state.config_manager.current_blocking();
+        let ctx = handler.make_context(&snapshot, "user", "-100789", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
     // --- tool progress sink (Step 5) ---
 
     fn telegram_progress_sink(base_url: String) -> TelegramToolProgressSink {
-        let mut bot_tokens = HashMap::new();
-        bot_tokens.insert("main".to_string(), "tg-token".to_string());
-        let mut agent_bot_map = HashMap::new();
-        agent_bot_map.insert("lyre".to_string(), "main".to_string());
-        let tokens = Arc::new(TelegramTokenResolver::new(bot_tokens, agent_bot_map));
+        let tokens = Arc::new(TelegramTokenResolver::with_manager(
+            test_manager_with_telegram_config(&[("main", "tg-token")], &[("lyre", "main")]),
+        ));
         TelegramToolProgressSink::with_base_url(tokens, reqwest::Client::new(), base_url)
     }
 

@@ -170,6 +170,12 @@ pub(super) async fn api_put_config(
 fn map_config_update_error(error: EgoPulseError) -> (StatusCode, String) {
     let status = match &error {
         EgoPulseError::Config(ConfigError::ConfigConflict { .. }) => StatusCode::CONFLICT,
+        EgoPulseError::Config(
+            ConfigError::ConfigNotFound { .. }
+            | ConfigError::AutoConfigNotFound { .. }
+            | ConfigError::ConfigReadFailed { .. }
+            | ConfigError::ConfigPathUnavailable,
+        ) => StatusCode::INTERNAL_SERVER_ERROR,
         EgoPulseError::Config(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };

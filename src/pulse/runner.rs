@@ -54,9 +54,12 @@ pub(crate) struct ToolPhase {
 ///
 /// This runs the Pulse Capsule through the LLM with tool support.
 /// It does NOT persist to the normal session (that's handled separately).
+/// The supplied configuration snapshot is used consistently for LLM
+/// resolution, system-prompt construction, and tool execution.
 ///
 /// # Errors
-/// Returns `EgoPulseError` when LLM resolution or tool execution fails.
+/// Returns [`EgoPulseError`] when LLM resolution, LLM calls, or tool execution
+/// fails. Usage-recording failures are logged and do not fail the activation.
 pub(crate) async fn run_activation_with_snapshot(
     state: &AppState,
     agent_id: &str,

@@ -15,9 +15,11 @@
 //! stored in `turn_runs` and the snapshot actually used for Prompt/Provider
 //! generation always belong to the same Config generation.
 //!
-//! `ConfigManager` serialises every update so persistence, snapshot exchange,
-//! and notification form one update boundary. Turns keep the `Arc` acquired at
-//! their start and therefore never observe a mixed configuration generation.
+//! `ConfigManager` serialises in-memory snapshot exchange and notification.
+//! Persistence is guarded by process/file locks and source fingerprints so a
+//! slow filesystem operation does not block readers or other in-memory work.
+//! Turns keep the `Arc` acquired at their start and therefore never observe a
+//! mixed configuration generation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,34 +202,39 @@ impl ConfigManager {
     ///
     /// `expected_fingerprint` provides optimistic concurrency control for
     /// callers that built the candidate from a previously observed snapshot.
-    /// The lock covers the comparison, validation, persistence, and snapshot
-    /// exchange, so concurrent callers cannot silently overwrite one another.
+    /// The update lock covers the in-memory comparison and snapshot exchange.
+    /// Persistence uses its own process/file locks and the current fingerprint
+    /// to prevent concurrent callers from silently overwriting one another.
     pub(crate) fn apply_candidate(
         &self,
         candidate: Config,
         expected_fingerprint: Option<&str>,
     ) -> Result<Arc<ConfigSnapshot>, EgoPulseError> {
-        let _update_guard = self
-            .update_lock
-            .lock()
-            .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
-        let current = self.current_blocking();
+        let (current, path) = {
+            let _update_guard = self
+                .update_lock
+                .lock()
+                .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
+            let current = self.current_blocking();
 
-        if let Some(expected) = expected_fingerprint
-            && expected != current.fingerprint
-        {
-            return Err(ConfigError::ConfigConflict {
-                expected: expected.to_string(),
-                current: current.fingerprint.clone(),
+            if let Some(expected) = expected_fingerprint
+                && expected != current.fingerprint
+            {
+                return Err(ConfigError::ConfigConflict {
+                    expected: expected.to_string(),
+                    current: current.fingerprint.clone(),
+                }
+                .into());
             }
-            .into());
-        }
 
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or(ConfigError::ConfigPathUnavailable)?;
-        let persisted_fingerprint = source_fingerprint(path)?;
+            let path = self
+                .config_path
+                .clone()
+                .ok_or(ConfigError::ConfigPathUnavailable)?;
+            (current, path)
+        };
+
+        let persisted_fingerprint = source_fingerprint(&path)?;
         if persisted_fingerprint != current.fingerprint {
             return Err(ConfigError::ConfigConflict {
                 expected: expected_fingerprint
@@ -246,23 +253,34 @@ impl ConfigManager {
             .checked_add(1)
             .ok_or(ConfigError::ConfigRevisionExhausted)?;
 
-        super::persist::save_config_with_secrets_if_unchanged(
+        let fingerprint = super::persist::save_config_with_secrets_if_unchanged(
             &candidate,
-            path,
+            &path,
             &current.fingerprint,
         )?;
-
-        let fingerprint = source_fingerprint(path)?;
         let snapshot = Arc::new(ConfigSnapshot::with_fingerprint(
             revision,
             candidate,
             fingerprint,
         ));
+
+        let _update_guard = self
+            .update_lock
+            .lock()
+            .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
+        let latest = self.current_blocking();
+        if latest.revision != current.revision || latest.fingerprint != current.fingerprint {
+            return Err(ConfigError::ConfigConflict {
+                expected: current.fingerprint.clone(),
+                current: latest.fingerprint.clone(),
+            }
+            .into());
+        }
         if snapshot.fingerprint == current.fingerprint {
             return Ok(current);
         }
 
-        self.publish(snapshot)
+        Ok(self.publish(snapshot))
     }
 
     /// Reloads the persisted configuration without rewriting the source file.
@@ -271,28 +289,39 @@ impl ConfigManager {
     /// current snapshot untouched. A file whose fingerprint is already active
     /// is treated as a no-op.
     pub(crate) fn reload_from_file(&self) -> Result<Arc<ConfigSnapshot>, EgoPulseError> {
-        let _update_guard = self
-            .update_lock
-            .lock()
-            .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
-        let current = self.current_blocking();
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or(ConfigError::ConfigPathUnavailable)?;
-        let fingerprint = source_fingerprint(path)?;
-        if fingerprint == current.fingerprint {
+        let (current, path) = {
+            let _update_guard = self
+                .update_lock
+                .lock()
+                .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
+            let current = self.current_blocking();
+            let path = self
+                .config_path
+                .clone()
+                .ok_or(ConfigError::ConfigPathUnavailable)?;
+            (current, path)
+        };
+
+        let loaded = super::persist::with_config_lock(&path, || {
+            let fingerprint = source_fingerprint(&path)?;
+            if fingerprint == current.fingerprint {
+                return Ok(None);
+            }
+
+            let candidate = Config::load(Some(&path))?;
+            super::loader::validate_runtime_candidate(&candidate)?;
+            ensure_reloadable(&current.config, &candidate)?;
+
+            let stable_fingerprint = source_fingerprint(&path)?;
+            if stable_fingerprint != fingerprint {
+                return Err(ConfigError::ConfigSourceChangedDuringReload.into());
+            }
+
+            Ok(Some((candidate, stable_fingerprint)))
+        })?;
+        let Some((candidate, fingerprint)) = loaded else {
             return Ok(current);
-        }
-
-        let candidate = Config::load(Some(path))?;
-        super::loader::validate_runtime_candidate(&candidate)?;
-        ensure_reloadable(&current.config, &candidate)?;
-
-        let stable_fingerprint = source_fingerprint(path)?;
-        if stable_fingerprint != fingerprint {
-            return Err(ConfigError::ConfigSourceChangedDuringReload.into());
-        }
+        };
 
         let revision = current
             .revision
@@ -301,19 +330,32 @@ impl ConfigManager {
         let snapshot = Arc::new(ConfigSnapshot::with_fingerprint(
             revision,
             candidate,
-            stable_fingerprint,
+            fingerprint,
         ));
-        self.publish(snapshot)
+
+        let _update_guard = self
+            .update_lock
+            .lock()
+            .map_err(|_| EgoPulseError::Internal("config update lock poisoned".to_string()))?;
+        let latest = self.current_blocking();
+        if latest.revision != current.revision || latest.fingerprint != current.fingerprint {
+            return Err(ConfigError::ConfigConflict {
+                expected: current.fingerprint.clone(),
+                current: latest.fingerprint.clone(),
+            }
+            .into());
+        }
+        Ok(self.publish(snapshot))
     }
 
-    fn publish(&self, snapshot: Arc<ConfigSnapshot>) -> Result<Arc<ConfigSnapshot>, EgoPulseError> {
+    fn publish(&self, snapshot: Arc<ConfigSnapshot>) -> Arc<ConfigSnapshot> {
         let change = ConfigChange {
             revision: snapshot.revision,
             fingerprint: snapshot.fingerprint.clone(),
         };
         *self.inner.write().expect("ConfigManager lock") = Arc::clone(&snapshot);
         let _ = self.changes.send(change);
-        Ok(snapshot)
+        snapshot
     }
 }
 
@@ -376,39 +418,43 @@ fn channel_enabled(config: &Config, channel: &str) -> bool {
 }
 
 fn discord_bots(config: &Config) -> Option<Vec<(String, Option<String>)>> {
-    let mut bots = config
-        .channels
-        .get("discord")
-        .and_then(|channel| channel.discord_bots.as_ref())
-        .map(|bots| {
-            bots.iter()
-                .map(|(id, bot)| {
-                    (
-                        id.to_string(),
-                        bot.token.as_ref().map(|token| token.value().to_string()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })?;
-    bots.sort_by(|left, right| left.0.cmp(&right.0));
-    Some(bots)
+    bot_identities(
+        config
+            .channels
+            .get("discord")
+            .and_then(|channel| channel.discord_bots.as_ref())
+            .map(|bots| bots.iter().map(|(id, bot)| (id, bot.token.as_ref()))),
+    )
 }
 
 fn telegram_bots(config: &Config) -> Option<Vec<(String, Option<String>)>> {
-    let mut bots = config
-        .channels
-        .get("telegram")
-        .and_then(|channel| channel.telegram_bots.as_ref())
-        .map(|bots| {
-            bots.iter()
-                .map(|(id, bot)| {
-                    (
-                        id.to_string(),
-                        bot.token.as_ref().map(|token| token.value().to_string()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })?;
+    bot_identities(
+        config
+            .channels
+            .get("telegram")
+            .and_then(|channel| channel.telegram_bots.as_ref())
+            .map(|bots| bots.iter().map(|(id, bot)| (id, bot.token.as_ref()))),
+    )
+}
+
+fn bot_identities<'a, I>(bots: Option<I>) -> Option<Vec<(String, Option<String>)>>
+where
+    I: IntoIterator<
+        Item = (
+            &'a crate::config::BotId,
+            Option<&'a crate::config::secret_ref::ResolvedValue>,
+        ),
+    >,
+{
+    let mut bots = bots?
+        .into_iter()
+        .map(|(id, token)| {
+            (
+                id.to_string(),
+                token.map(|token| sha256_hex(token.value().as_bytes())),
+            )
+        })
+        .collect::<Vec<_>>();
     bots.sort_by(|left, right| left.0.cmp(&right.0));
     Some(bots)
 }
@@ -623,6 +669,30 @@ mod tests {
         assert_eq!(manager.current_blocking().revision, before.revision);
         let persisted = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
         assert_eq!(persisted.timezone, "Asia/Tokyo");
+    }
+
+    #[test]
+    fn external_dotenv_change_rejects_api_overwrite() {
+        let (_dir, manager, path) = file_manager();
+        let before = manager.current_blocking();
+        let env_path = path.parent().expect("config parent").join(".env");
+        std::fs::write(&env_path, "EXTERNAL_SECRET=rotated\n").expect("write dotenv");
+
+        let mut candidate = before.config.clone();
+        candidate.timezone = "America/New_York".to_string();
+        let error = manager
+            .apply_candidate(candidate, Some(&before.fingerprint))
+            .expect_err("external dotenv edit must cause a conflict");
+
+        assert!(matches!(
+            error,
+            EgoPulseError::Config(ConfigError::ConfigConflict { .. })
+        ));
+        assert_eq!(manager.current_blocking().revision, before.revision);
+        assert_eq!(
+            std::fs::read_to_string(env_path).expect("read dotenv"),
+            "EXTERNAL_SECRET=rotated\n"
+        );
     }
 
     #[test]

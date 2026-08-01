@@ -255,7 +255,7 @@ PUT /api/config
 | `default_provider` | 必須 | |
 | `default_model` | 任意 | `null` 可 |
 | `expected_fingerprint` | 任意 | GET で取得した fingerprint。省略時はリクエスト処理開始時の値を使用 |
-| `providers` | 任意 | 既存プロバイダーの編集。新規追加は `base_url` と `default_model` が必要、削除は非対応 |
+| `providers` | 任意 | 既存プロバイダーの編集と新規追加。新規追加は `base_url` と `default_model` が必要。削除は非対応 |
 | `providers.<id>.api_key` | 任意 | 省略時は変更なし。実値は `.env` に保存、YAML には SecretRef として記録 |
 | `web_enabled` | 必須 | |
 | `web_host` | 必須 | |

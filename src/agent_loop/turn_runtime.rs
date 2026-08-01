@@ -35,7 +35,6 @@ pub(crate) struct TurnRuntime {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn LlmProvider>>>>,
-    pub(crate) llm_cache_revision: Arc<Mutex<Option<u64>>>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: Arc<SkillManager>,
     pub(crate) soul_agents: Arc<crate::agent_loop::soul_agents::SoulAgentsLoader>,
@@ -121,15 +120,7 @@ impl TurnRuntime {
         config_revision: u64,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
         let key = resolved.cache_key_with_revision(config_revision);
-        let mut cache_revision = self
-            .llm_cache_revision
-            .lock()
-            .expect("llm_cache_revision lock");
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
-        if *cache_revision != Some(config_revision) {
-            cache.clear();
-            *cache_revision = Some(config_revision);
-        }
         if let Some(provider) = cache.get(&key) {
             return Ok(Arc::clone(provider));
         }

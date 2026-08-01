@@ -756,7 +756,7 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 | WebUI (`/api/config`) | 現在の snapshot | 公開フィールド | ランタイム中の設定変更 |
 | スラッシュコマンド (`/provider`, `/model`) | 現在の snapshot | プロバイダー・モデル | ランタイム中の動的切替 |
 
-設定 YAML と同じディレクトリの `.env` は 250ms 間隔で監視し、300ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
+設定 YAML と同じディレクトリの `.env` を含む設定ソース全体は 250ms 間隔で監視し、300ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
 
 Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返す。`PUT /api/config` はリクエストの `expected_fingerprint` が現在値と一致する場合だけ更新し、不一致なら `409 Conflict` を返す。Sleep / Pulse scheduler は設定変更通知を購読し、無効状態から有効状態へ変更された場合も同じプロセス内で動作を開始する。
 

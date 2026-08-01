@@ -75,7 +75,6 @@ pub struct AppState {
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>>,
-    pub(crate) llm_cache_revision: Arc<Mutex<Option<u64>>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Per-session turn scheduler for concurrency control and ordered execution.
@@ -146,7 +145,6 @@ impl AppState {
             soul_agents: parts.soul_agents,
             memory_loader: parts.memory_loader,
             llm_cache: Arc::new(Mutex::new(HashMap::new())),
-            llm_cache_revision: Arc::new(Mutex::new(None)),
             active_turns: Arc::new(ActiveTurnTracker::new()),
             turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
             turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
@@ -174,7 +172,6 @@ impl AppState {
             config_path: self.config_path.clone(),
             llm_override: self.llm_override.clone(),
             llm_cache: Arc::clone(&self.llm_cache),
-            llm_cache_revision: Arc::clone(&self.llm_cache_revision),
             tools: Arc::clone(&self.tools),
             skills: Arc::clone(&self.skills),
             soul_agents: Arc::clone(&self.soul_agents),
@@ -285,15 +282,7 @@ impl AppState {
         config_revision: u64,
     ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
         let key = resolved.cache_key_with_revision(config_revision);
-        let mut cache_revision = self
-            .llm_cache_revision
-            .lock()
-            .expect("llm_cache_revision lock");
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
-        if *cache_revision != Some(config_revision) {
-            cache.clear();
-            *cache_revision = Some(config_revision);
-        }
         if let Some(provider) = cache.get(&key) {
             return Ok(Arc::clone(provider));
         }
@@ -388,7 +377,6 @@ pub async fn build_app_state_with_path(
     // to the whole `AppState`.
     let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
     tools.register_tool(Box::new(crate::tools::AgentSendTool::new_with_manager(
-        config.agents.clone(),
         Arc::clone(&deps.db),
         deps.secret_db.clone(),
         Arc::clone(&channels),
@@ -1696,6 +1684,12 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
         }
     }
 
+    if !has_active_channels {
+        return Err(EgoPulseError::Config(
+            crate::error::ConfigError::NoActiveChannels,
+        ));
+    }
+
     if state.config_path.is_some() {
         let reload_state = Arc::clone(&state);
         let token = state.supervisor.shutdown_token();
@@ -1707,12 +1701,6 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             ),
             async move { config_reload::run_config_reload_loop(reload_state, token).await },
         );
-    }
-
-    if !has_active_channels {
-        return Err(EgoPulseError::Config(
-            crate::error::ConfigError::NoActiveChannels,
-        ));
     }
 
     let scheduler_state = state.clone();
@@ -2210,6 +2198,25 @@ mod tests {
             .expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn llm_cache_keeps_providers_for_each_config_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let runtime = state.turn_runtime();
+
+        let newer = runtime
+            .cached_provider(&resolved, 2)
+            .expect("newer revision provider");
+        let older = runtime
+            .cached_provider(&resolved, 1)
+            .expect("older revision provider");
+
+        assert!(!Arc::ptr_eq(&newer, &older));
+        assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 2);
     }
 
     #[tokio::test]

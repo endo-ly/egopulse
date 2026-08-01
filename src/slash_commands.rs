@@ -515,23 +515,21 @@ async fn handle_provider_command(
         if scope == ProfileScope::Global {
             return Ok("global scope uses default_provider and cannot reset".to_string());
         }
-        let mut candidate = config.clone();
-        match &scope {
-            ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Agent { agent_id, .. } => {
-                let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
-                    crate::error::ConfigError::AgentNotFound {
-                        agent_id: agent_id.to_string(),
-                    }
-                })?;
-                agent.provider = None;
-                agent.model = None;
+        let (_, resolved) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+            match &scope {
+                ProfileScope::Global => unreachable!("global reset is returned above"),
+                ProfileScope::Agent { agent_id, .. } => {
+                    let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                        crate::error::ConfigError::AgentNotFound {
+                            agent_id: agent_id.to_string(),
+                        }
+                    })?;
+                    agent.provider = None;
+                    agent.model = None;
+                }
             }
-        }
-        let updated = state
-            .config_manager
-            .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
-        let resolved = resolved_for_scope(&updated.config, &scope)?;
+            Ok(())
+        })?;
         return Ok(format!(
             "scope={scope} provider reset -> {}",
             resolved.provider
@@ -542,26 +540,24 @@ async fn handle_provider_command(
     if !config.providers.contains_key(&provider_id) {
         return Ok(format!("unknown provider: {value}"));
     }
-    let mut candidate = config.clone();
-    match &scope {
-        ProfileScope::Global => {
-            candidate.default_provider = provider_id;
-            candidate.default_model = None;
+    let (_, resolved) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+        match &scope {
+            ProfileScope::Global => {
+                candidate.default_provider = provider_id;
+                candidate.default_model = None;
+            }
+            ProfileScope::Agent { agent_id, .. } => {
+                let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                    crate::error::ConfigError::AgentNotFound {
+                        agent_id: agent_id.to_string(),
+                    }
+                })?;
+                agent.provider = Some(value.to_string());
+                agent.model = None;
+            }
         }
-        ProfileScope::Agent { agent_id, .. } => {
-            let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
-                crate::error::ConfigError::AgentNotFound {
-                    agent_id: agent_id.to_string(),
-                }
-            })?;
-            agent.provider = Some(value.to_string());
-            agent.model = None;
-        }
-    }
-    let updated = state
-        .config_manager
-        .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
-    let resolved = resolved_for_scope(&updated.config, &scope)?;
+        Ok(())
+    })?;
     Ok(format!(
         "scope={scope} provider={} model={}",
         resolved.provider, resolved.model
@@ -588,76 +584,91 @@ async fn handle_model_command(
     let value = first_non_scope_arg(&parts[1..]).unwrap_or_default();
     if value == "reset" {
         if scope == ProfileScope::Global {
-            let mut candidate = config.clone();
-            candidate.default_model = None;
-            let updated = state
-                .config_manager
-                .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
-            return Ok(format!(
-                "scope={scope} model reset -> {}",
-                updated.config.global_provider().default_model
-            ));
+            let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+                candidate.default_model = None;
+                Ok(())
+            })?;
+            return Ok(format!("scope={scope} model reset -> {}", effective.model));
         }
-        let mut candidate = config.clone();
+        let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+            match &scope {
+                ProfileScope::Global => unreachable!("global reset is returned above"),
+                ProfileScope::Agent { agent_id, .. } => {
+                    let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                        crate::error::ConfigError::AgentNotFound {
+                            agent_id: agent_id.to_string(),
+                        }
+                    })?;
+                    agent.model = None;
+                }
+            }
+            Ok(())
+        })?;
+        return Ok(format!("scope={scope} model reset -> {}", effective.model));
+    }
+
+    let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
         match &scope {
-            ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Agent { agent_id, .. } => {
+            ProfileScope::Global => {
+                candidate.default_model = Some(value.to_string());
+                let default_provider = candidate.default_provider.clone();
+                if let Some(provider) = candidate.providers.get_mut(&default_provider)
+                    && !provider.models.contains_key(value)
+                {
+                    provider
+                        .models
+                        .insert(value.to_string(), crate::config::ModelConfig::default());
+                }
+            }
+            ProfileScope::Agent { agent_id, channel } => {
+                let provider_name = candidate
+                    .resolve_llm_for_agent_channel(agent_id, channel.as_str())?
+                    .provider;
                 let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
                     crate::error::ConfigError::AgentNotFound {
                         agent_id: agent_id.to_string(),
                     }
                 })?;
-                agent.model = None;
-            }
-        }
-        let updated = state
-            .config_manager
-            .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
-        let effective = resolved_for_scope(&updated.config, &scope)?;
-        return Ok(format!("scope={scope} model reset -> {}", effective.model));
-    }
-
-    let mut candidate = config.clone();
-    match &scope {
-        ProfileScope::Global => {
-            candidate.default_model = Some(value.to_string());
-            let default_provider = candidate.default_provider.clone();
-            if let Some(provider) = candidate.providers.get_mut(&default_provider)
-                && !provider.models.contains_key(value)
-            {
-                provider
-                    .models
-                    .insert(value.to_string(), crate::config::ModelConfig::default());
-            }
-        }
-        ProfileScope::Agent { agent_id, channel } => {
-            let provider_name = candidate
-                .resolve_llm_for_agent_channel(agent_id, channel.as_str())?
-                .provider;
-            let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
-                crate::error::ConfigError::AgentNotFound {
-                    agent_id: agent_id.to_string(),
+                agent.model = Some(value.to_string());
+                if let Some(provider) = candidate.providers.get_mut(provider_name.as_str())
+                    && !provider.models.contains_key(value)
+                {
+                    provider
+                        .models
+                        .insert(value.to_string(), crate::config::ModelConfig::default());
                 }
-            })?;
-            agent.model = Some(value.to_string());
-            if let Some(provider) = candidate.providers.get_mut(provider_name.as_str())
-                && !provider.models.contains_key(value)
-            {
-                provider
-                    .models
-                    .insert(value.to_string(), crate::config::ModelConfig::default());
             }
         }
-    }
-
-    let updated = state
-        .config_manager
-        .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
-    let effective = resolved_for_scope(&updated.config, &scope)?;
+        Ok(())
+    })?;
     Ok(format!(
         "scope={scope} provider={} model={}",
         effective.provider, effective.model
     ))
+}
+
+fn apply_profile_candidate<F>(
+    state: &AppState,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    scope: &ProfileScope,
+    mutate: F,
+) -> Result<
+    (
+        Arc<crate::config::manager::ConfigSnapshot>,
+        crate::config::ResolvedLlmConfig,
+    ),
+    EgoPulseError,
+>
+where
+    F: FnOnce(&mut Config) -> Result<(), EgoPulseError>,
+{
+    let mut candidate = snapshot.config.clone();
+    mutate(&mut candidate)?;
+    let updated = state
+        .config_manager
+        .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
+    let resolved = resolved_for_scope(&updated.config, scope)?;
+    Ok((updated, resolved))
 }
 
 fn command_scope(context: &SurfaceContext) -> ProfileScope {
