@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::secret_ref::{ResolvedValue, env_resolved_value, provider_api_key_env_name};
 use crate::config::{ChannelName, Config, ProviderConfig, ProviderId, default_config_path};
-use crate::error::ConfigError;
+use crate::error::{ConfigError, EgoPulseError};
 
 use super::WebState;
 
@@ -30,6 +30,8 @@ struct ProviderPayload {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct ConfigPayload {
+    revision: u64,
+    fingerprint: String,
     default_provider: String,
     default_model: Option<String>,
     effective_model: String,
@@ -62,6 +64,8 @@ struct ProviderUpdatePayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct ConfigUpdateRequest {
+    #[serde(default)]
+    expected_fingerprint: Option<String>,
     default_provider: String,
     #[serde(default)]
     default_model: Option<String>,
@@ -78,18 +82,12 @@ pub(super) async fn api_get_config(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = config_path_for_save(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let display = match Config::load_allow_missing_api_key(Some(&path)) {
-        Ok(config) => Some(config),
-        Err(ConfigError::ConfigNotFound { .. }) => None,
-        Err(error) => return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
-    };
+    let snapshot = state.app_state.config_manager.current_blocking();
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": match display.as_ref() {
-            Some(display) => payload_from_config(display, &path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            None => default_payload(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-        },
+        "config": payload_from_snapshot(&snapshot, &path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     })))
 }
 
@@ -117,17 +115,8 @@ pub(super) async fn api_put_config(
 
     let path = config_path_for_save(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut config = match Config::load_allow_missing_api_key(Some(&path)) {
-        Ok(config) => config,
-        Err(ConfigError::ConfigNotFound { .. }) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "config file not found; run 'egopulse setup' first".to_string(),
-            ));
-        }
-        Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string())),
-    };
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let mut config = snapshot.config.clone();
 
     config.default_model = request.default_model.as_ref().and_then(|m| {
         let trimmed = m.trim();
@@ -142,9 +131,13 @@ pub(super) async fn api_put_config(
         apply_provider_updates(&mut config, provider_updates);
     }
 
-    if config.providers.contains_key(default_provider) {
-        config.default_provider = ProviderId::new(default_provider);
+    if !config.providers.contains_key(default_provider) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown provider: {default_provider}"),
+        ));
     }
+    config.default_provider = ProviderId::new(default_provider);
 
     let web_enabled = request.web_enabled;
     let web_host = request.web_host.trim().to_string();
@@ -157,17 +150,36 @@ pub(super) async fn api_put_config(
         web.port = Some(web_port);
     }
 
-    config
-        .save_config_with_secrets(&path)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-
-    let display = Config::load_allow_missing_api_key(Some(&path))
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let expected = request
+        .expected_fingerprint
+        .as_deref()
+        .unwrap_or(&snapshot.fingerprint);
+    let updated = state
+        .app_state
+        .config_manager
+        .apply_candidate(config, Some(expected))
+        .map_err(map_config_update_error)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "config": payload_from_config(&display, &path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        "config": payload_from_snapshot(&updated, &path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     })))
+}
+
+fn map_config_update_error(error: EgoPulseError) -> (StatusCode, String) {
+    let status = match &error {
+        EgoPulseError::Config(ConfigError::ConfigConflict { .. }) => StatusCode::CONFLICT,
+        EgoPulseError::Config(
+            ConfigError::ConfigNotFound { .. }
+            | ConfigError::AutoConfigNotFound { .. }
+            | ConfigError::ConfigReadFailed { .. }
+            | ConfigError::ConfigPathUnavailable,
+        ) => StatusCode::INTERNAL_SERVER_ERROR,
+        EgoPulseError::Config(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
 }
 
 fn apply_provider_updates(config: &mut Config, updates: HashMap<String, ProviderUpdatePayload>) {
@@ -295,27 +307,6 @@ fn apply_api_key_update(
     }
 }
 
-fn default_payload(path: &std::path::Path) -> Result<ConfigPayload, ConfigError> {
-    Ok(ConfigPayload {
-        default_provider: String::new(),
-        default_model: None,
-        effective_model: String::new(),
-        state_root: crate::config::default_state_root()?
-            .to_string_lossy()
-            .into_owned(),
-        workspace_dir: crate::config::default_workspace_dir()?
-            .to_string_lossy()
-            .into_owned(),
-        web_enabled: false,
-        web_host: "127.0.0.1".to_string(),
-        web_port: 10961,
-        web_auth_enabled: false,
-        has_api_key: false,
-        config_path: path.display().to_string(),
-        providers: Vec::new(),
-    })
-}
-
 fn config_path_for_save(state: &WebState) -> Result<PathBuf, ConfigError> {
     match &state.config_path {
         Some(path) => Ok(path.clone()),
@@ -323,10 +314,11 @@ fn config_path_for_save(state: &WebState) -> Result<PathBuf, ConfigError> {
     }
 }
 
-fn payload_from_config(
-    config: &Config,
+fn payload_from_snapshot(
+    snapshot: &crate::config::manager::ConfigSnapshot,
     path: &std::path::Path,
 ) -> Result<ConfigPayload, ConfigError> {
+    let config = &snapshot.config;
     let resolved = config.resolve_global_llm();
 
     let providers = config
@@ -343,6 +335,8 @@ fn payload_from_config(
         .collect::<Vec<_>>();
 
     Ok(ConfigPayload {
+        revision: snapshot.revision,
+        fingerprint: snapshot.fingerprint.clone(),
         default_provider: resolved.provider,
         default_model: config.default_model.clone(),
         effective_model: resolved.model,

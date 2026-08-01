@@ -176,12 +176,13 @@ impl TuiApp {
 
     async fn open_new_session(&mut self) -> Result<(), EgoPulseError> {
         let session_id = format!("local-{}", short_uuid());
+        let default_agent = self.state.current_config().default_agent.to_string();
         let context = SurfaceContext::new(
             "tui".to_string(),
             "local_user".to_string(),
             session_id,
             "tui".to_string(),
-            self.state.config.default_agent.to_string(),
+            default_agent,
         );
         let messages =
             agent_loop::load_session_messages(&self.state.turn_runtime(), &context).await?;
@@ -218,12 +219,13 @@ impl TuiApp {
             ))
         })?;
 
+        let default_agent = self.state.current_config().default_agent.to_string();
         let context = SurfaceContext::new(
             chat_info.channel,
             "local_user".to_string(),
             summary.surface_thread.clone(),
             chat_info.chat_type,
-            self.state.config.default_agent.to_string(),
+            default_agent,
         );
         let messages =
             agent_loop::load_session_messages(&self.state.turn_runtime(), &context).await?;

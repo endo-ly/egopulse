@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::agent_loop::ConversationScope;
 use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::prompt_builder::build_system_prompt;
 use crate::agent_loop::tool_phase::{
     MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
     build_tool_result_phase, ignore_delta, send_tool_phase_request,
@@ -55,14 +54,18 @@ pub(crate) struct ToolPhase {
 ///
 /// This runs the Pulse Capsule through the LLM with tool support.
 /// It does NOT persist to the normal session (that's handled separately).
+/// The supplied configuration snapshot is used consistently for LLM
+/// resolution, system-prompt construction, and tool execution.
 ///
 /// # Errors
-/// Returns `EgoPulseError` when LLM resolution or tool execution fails.
-pub(crate) async fn run_activation(
+/// Returns [`EgoPulseError`] when LLM resolution, LLM calls, or tool execution
+/// fails. Usage-recording failures are logged and do not fail the activation.
+pub(crate) async fn run_activation_with_snapshot(
     state: &AppState,
     agent_id: &str,
     capsule: &PulseCapsule,
     home_surface: &HomeSurface,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<ActivationResult, EgoPulseError> {
     state.active_turns.begin_turn(agent_id);
     let _guard = PulseTurnGuard {
@@ -78,14 +81,17 @@ pub(crate) async fn run_activation(
         agent_id.to_string(),
     );
 
-    let channel_llm = state.llm_for_context(&context).inspect_err(|e| {
-        warn!(
-            error_kind = e.error_kind(),
-            error = %e,
-            agent_id,
-            "pulse llm_for_context failed"
-        );
-    })?;
+    let turn_runtime = state.turn_runtime();
+    let channel_llm = turn_runtime
+        .llm_for_context_with_snapshot(&context, &config_snapshot)
+        .inspect_err(|e| {
+            warn!(
+                error_kind = e.error_kind(),
+                error = %e,
+                agent_id,
+                "pulse llm_for_context failed"
+            );
+        })?;
 
     let chat_id = home_surface.chat_id;
     let tool_context = ToolExecutionContext {
@@ -100,10 +106,15 @@ pub(crate) async fn run_activation(
         turn_id: uuid::Uuid::new_v4().to_string(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        config_snapshot: Some(Arc::clone(&config_snapshot)),
         tool_call_id: String::new(),
     };
 
-    let system_prompt = build_system_prompt(&state.turn_runtime(), &context);
+    let system_prompt = crate::agent_loop::prompt_builder::build_system_prompt_with_config(
+        &turn_runtime,
+        &context,
+        &config_snapshot.config,
+    );
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
@@ -380,9 +391,15 @@ mod tests {
             "2026-05-10T09:00:00+09:00",
         );
 
-        let result = run_activation(&state, "default", &capsule, &surface)
-            .await
-            .expect("activation");
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await
+        .expect("activation");
 
         assert_eq!(result.output_kind, PulseOutputKind::Silent);
 

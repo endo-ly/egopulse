@@ -351,7 +351,7 @@ async fn summarize_old_messages(
                     .record(calibration_key, raw_estimate, usage.input_tokens)
                     .await;
             }
-            log_summarizer_usage(state, context, chat_id, llm, &response, raw_estimate);
+            log_summarizer_usage(state, context, chat_id, llm, &response, raw_estimate).await;
             strip_thinking(&response.content)
         }
         Err(SummarizeError::Provider(error)) => {
@@ -397,7 +397,7 @@ async fn send_summary_request(
     .map_err(SummarizeError::Provider)
 }
 
-fn log_summarizer_usage(
+async fn log_summarizer_usage(
     state: &TurnRuntime,
     context: &SurfaceContext,
     chat_id: i64,
@@ -418,23 +418,21 @@ fn log_summarizer_usage(
     let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
-    tokio::spawn(async move {
-        let _ = crate::storage::call_blocking(db, move |db| {
-            db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                chat_id,
-                caller_channel: &channel,
-                provider: &provider,
-                model: &model,
-                input_tokens,
-                output_tokens,
-                request_kind: "compaction",
-                estimated_tokens,
-                has_tools: false,
-            })
+    let _ = crate::storage::call_blocking(db, move |db| {
+        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+            chat_id,
+            caller_channel: &channel,
+            provider: &provider,
+            model: &model,
+            input_tokens,
+            output_tokens,
+            request_kind: "compaction",
+            estimated_tokens,
+            has_tools: false,
         })
-        .await
-        .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
-    });
+    })
+    .await
+    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
 }
 
 fn build_compaction_result(input: CompactionResultInput<'_>) -> Vec<Message> {
@@ -1328,7 +1326,11 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-threshold");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let messages = vec![
             Message::text("user", "msg-1"),
             Message::text("assistant", "reply-1"),
@@ -1372,7 +1374,11 @@ mod tests {
             test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-recent");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let messages = vec![
             Message::text("user", "old-1"),
             Message::text("assistant", "old-2"),
@@ -1416,7 +1422,11 @@ mod tests {
         let config = test_config_with_compaction(state_root.clone(), 40, 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 42;
         let messages = vec![
             Message::text("user", "msg-1"),
@@ -1472,7 +1482,11 @@ mod tests {
         ));
         let mut context = cli_context("archive-secret-routing");
         context.scope = ConversationScope::Secret;
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 77;
         let messages = vec![
             Message::text("user", "secret-msg-1"),
@@ -1539,7 +1553,11 @@ mod tests {
         let config = test_config_with_compaction(state_root, 40, 1);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("archive-normal-routing");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let chat_id: i64 = 88;
         let messages = vec![
             Message::text("user", "normal-msg-1"),
@@ -1685,7 +1703,11 @@ mod tests {
         config.compaction_threshold_ratio = 0.80;
         let state = build_state(config, Box::new(provider));
         let context = cli_context("calibrated-trigger");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let key = CalibrationKey::new("test", "test-model", "agent_loop", false);
         state.usage_calibrator.record(key, 100, 300).await;
         let messages = vec![

@@ -92,6 +92,11 @@ pub(crate) struct ToolExecutionContext {
     pub skill_env: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Storage scope for this turn's DB routing.
     pub scope: ConversationScope,
+    /// Immutable configuration generation used by this tool execution.
+    ///
+    /// Normal turns and Pulse activations populate this at start time. Standalone
+    /// tool calls may leave it unset and use the registry's current manager view.
+    pub config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
 }
 
 /// Uniform result type returned by all tool implementations.
@@ -205,6 +210,7 @@ pub(crate) struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
+    config_manager: Option<Arc<crate::config::ConfigManager>>,
     mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
 }
 
@@ -222,6 +228,7 @@ impl ToolRegistry {
                     tool_index: build_tool_index(&tools),
                     tools,
                     config_secrets: collect_config_secrets(config),
+                    config_manager: None,
                     mcp_manager: None,
                 };
             }
@@ -253,8 +260,18 @@ impl ToolRegistry {
             tool_index: build_tool_index(&tools),
             tools,
             config_secrets: collect_config_secrets(config),
+            config_manager: None,
             mcp_manager: None,
         }
+    }
+
+    /// Binds the registry to the shared configuration manager.
+    ///
+    /// Standalone calls use the current snapshot for redaction. In-flight turns
+    /// additionally supply their immutable start snapshot through
+    /// [`ToolExecutionContext::config_snapshot`].
+    pub(crate) fn set_config_manager(&mut self, config_manager: Arc<crate::config::ConfigManager>) {
+        self.config_manager = Some(config_manager);
     }
 
     pub(crate) fn register_tool(&mut self, tool: Box<dyn Tool>) {
@@ -322,13 +339,27 @@ impl ToolRegistry {
         )
     }
 
-    /// Build the full redaction secret list: static config secrets + current
-    /// turn-scoped skill env values.
+    /// Build the full redaction secret list for the current config generation
+    /// and any turn-scoped skill env values.
     fn redaction_secrets(&self, context: &ToolExecutionContext) -> Vec<(String, String)> {
-        let mut secrets = self.config_secrets.clone();
+        let mut secrets = match (&self.config_manager, &context.config_snapshot) {
+            (Some(config_manager), Some(snapshot)) => {
+                let mut secrets = collect_config_secrets(&snapshot.config);
+                append_unique_secrets(
+                    &mut secrets,
+                    collect_config_secrets(&config_manager.current_blocking().config),
+                );
+                secrets
+            }
+            (Some(config_manager), None) => {
+                collect_config_secrets(&config_manager.current_blocking().config)
+            }
+            (None, Some(snapshot)) => collect_config_secrets(&snapshot.config),
+            (None, None) => self.config_secrets.clone(),
+        };
         let env = context.skill_env.lock().expect("skill env lock");
         for (k, v) in env.iter() {
-            secrets.push((format!("skill_env.{k}"), v.clone()));
+            append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
         }
         secrets
     }
@@ -376,6 +407,14 @@ impl ToolRegistry {
             return self.tools[idx].idempotency_key(input);
         }
         None
+    }
+}
+
+fn append_unique_secrets(secrets: &mut Vec<(String, String)>, additional: Vec<(String, String)>) {
+    for secret in additional {
+        if !secrets.iter().any(|(_, value)| value == &secret.1) {
+            secrets.push(secret);
+        }
     }
 }
 
@@ -815,6 +854,58 @@ mod tests {
             result
                 .content
                 .contains("[REDACTED:channel.discord.auth_token]")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redaction_includes_turn_and_current_config_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut initial = test_config(dir.path().to_str().expect("utf8"));
+        let mut current = initial.clone();
+        initial
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            "sk-initial".to_string(),
+        ));
+        current
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            "sk-rotated".to_string(),
+        ));
+        let manager = Arc::new(crate::config::ConfigManager::new(current, None));
+        let skills_dir = initial.skills_dir().expect("skills_dir");
+        let skills = Arc::new(SkillManager::from_dirs(
+            initial.user_skills_dir().expect("user skills dir"),
+            skills_dir,
+        ));
+        let mut registry = ToolRegistry::new(&initial, skills);
+        registry.set_config_manager(manager);
+        registry.register_tool(Box::new(StaticTool {
+            name: "rotated_secret",
+            result: ToolResult::success("old=sk-initial current=sk-rotated".to_string()),
+        }));
+
+        let mut context = test_context();
+        context.config_snapshot = Some(Arc::new(crate::config::manager::ConfigSnapshot::new(
+            1, initial, None,
+        )));
+
+        let result = registry
+            .execute("rotated_secret", json!({}), &context)
+            .await;
+
+        assert!(!result.content.contains("sk-initial"));
+        assert!(!result.content.contains("sk-rotated"));
+        assert!(
+            result
+                .content
+                .contains("[REDACTED:provider.openai.api_key]")
         );
     }
 

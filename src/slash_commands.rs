@@ -3,11 +3,10 @@
 //! 公開 API を提供し、各チャネルから渡されたコマンドテキストを対応するハンドラに振り分ける。
 //! `is_slash_command` で判定し、`handle_slash_command` で実行結果のメッセージを返す。
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent_loop::compaction::force_compact;
-use crate::agent_loop::session::{load_messages_for_turn, resolve_chat_id};
+use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::error::EgoPulseError;
@@ -219,7 +218,16 @@ async fn handle_compact(
     chat_id: i64,
     context: &SurfaceContext,
 ) -> Option<String> {
-    let loaded = match load_messages_for_turn(&state.turn_runtime(), context.scope, chat_id).await {
+    let config_snapshot = state.config_manager.current_blocking();
+    let runtime = state.turn_runtime();
+    let loaded = match load_messages_for_turn_with_limit(
+        &runtime,
+        context.scope,
+        chat_id,
+        config_snapshot.config.max_history_messages,
+    )
+    .await
+    {
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
@@ -228,19 +236,18 @@ async fn handle_compact(
     }
 
     let count = loaded.messages.len();
-    let llm = match state.llm_for_context(context) {
+    let llm = match runtime.llm_for_context_with_snapshot(context, &config_snapshot) {
         Ok(llm) => llm,
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
 
-    let config = state.current_config();
     match force_compact(
-        &state.turn_runtime(),
+        &runtime,
         context,
         chat_id,
         &loaded.messages,
         &llm,
-        &config,
+        &config_snapshot.config,
     )
     .await
     {
@@ -273,10 +280,8 @@ async fn handle_status(
     context: &SurfaceContext,
     sender_id: Option<&str>,
 ) -> Option<String> {
-    let config = match state.try_current_config() {
-        Ok(config) => config,
-        Err(e) => return Some(format!("Failed to load config: {e}")),
-    };
+    let snapshot = state.config_manager.current_blocking();
+    let config = &snapshot.config;
     let agent_id = crate::config::AgentId::new(&context.agent_id);
     let resolved = match config.resolve_llm_for_agent_channel(&agent_id, &context.channel) {
         Ok(r) => r,
@@ -440,9 +445,10 @@ async fn handle_command(
 
     match command {
         "/providers" => {
-            let config = state.try_current_config()?;
+            let snapshot = state.config_manager.current_blocking();
+            let config = &snapshot.config;
             let scope = command_scope(context);
-            let effective = resolved_for_scope(&config, &scope)?;
+            let effective = resolved_for_scope(config, &scope)?;
             let lines = config
                 .providers
                 .iter()
@@ -464,9 +470,10 @@ async fn handle_command(
             .await
             .map(Some),
         "/models" => {
-            let config = state.try_current_config()?;
-            let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
-            let resolved = resolved_for_scope(&config, &scope)?;
+            let snapshot = state.config_manager.current_blocking();
+            let config = &snapshot.config;
+            let scope = parse_scope(&parts[1..], command_scope(context), config)?;
+            let resolved = resolved_for_scope(config, &scope)?;
             let provider = config
                 .providers
                 .get(resolved.provider.as_str())
@@ -491,11 +498,12 @@ async fn handle_provider_command(
     context: &SurfaceContext,
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
-    let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
+    let snapshot = state.config_manager.current_blocking();
+    let config = &snapshot.config;
+    let scope = parse_scope(&parts[1..], command_scope(context), config)?;
 
     if parts.len() == 1 {
-        let resolved = resolved_for_scope(&config, &scope)?;
+        let resolved = resolved_for_scope(config, &scope)?;
         return Ok(format!(
             "scope={scope} provider={} model={}",
             resolved.provider, resolved.model
@@ -507,23 +515,21 @@ async fn handle_provider_command(
         if scope == ProfileScope::Global {
             return Ok("global scope uses default_provider and cannot reset".to_string());
         }
-        let path = config_path(state)?;
-        let mut config = Config::load_allow_missing_api_key(Some(path))?;
-        match &scope {
-            ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Agent { agent_id, .. } => {
-                let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
-                    crate::error::ConfigError::AgentNotFound {
-                        agent_id: agent_id.to_string(),
-                    }
-                })?;
-                agent.provider = None;
-                agent.model = None;
+        let (_, resolved) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+            match &scope {
+                ProfileScope::Global => unreachable!("global reset is returned above"),
+                ProfileScope::Agent { agent_id, .. } => {
+                    let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                        crate::error::ConfigError::AgentNotFound {
+                            agent_id: agent_id.to_string(),
+                        }
+                    })?;
+                    agent.provider = None;
+                    agent.model = None;
+                }
             }
-        }
-        config.save_config_with_secrets(path)?;
-        let updated = Config::load_allow_missing_api_key(Some(path))?;
-        let resolved = resolved_for_scope(&updated, &scope)?;
+            Ok(())
+        })?;
         return Ok(format!(
             "scope={scope} provider reset -> {}",
             resolved.provider
@@ -534,26 +540,24 @@ async fn handle_provider_command(
     if !config.providers.contains_key(&provider_id) {
         return Ok(format!("unknown provider: {value}"));
     }
-    let path = config_path(state)?;
-    let mut config = Config::load_allow_missing_api_key(Some(path))?;
-    match &scope {
-        ProfileScope::Global => {
-            config.default_provider = provider_id;
-            config.default_model = None;
+    let (_, resolved) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+        match &scope {
+            ProfileScope::Global => {
+                candidate.default_provider = provider_id;
+                candidate.default_model = None;
+            }
+            ProfileScope::Agent { agent_id, .. } => {
+                let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                    crate::error::ConfigError::AgentNotFound {
+                        agent_id: agent_id.to_string(),
+                    }
+                })?;
+                agent.provider = Some(value.to_string());
+                agent.model = None;
+            }
         }
-        ProfileScope::Agent { agent_id, .. } => {
-            let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
-                crate::error::ConfigError::AgentNotFound {
-                    agent_id: agent_id.to_string(),
-                }
-            })?;
-            agent.provider = Some(value.to_string());
-            agent.model = None;
-        }
-    }
-    config.save_config_with_secrets(path)?;
-    let updated = Config::load_allow_missing_api_key(Some(path))?;
-    let resolved = resolved_for_scope(&updated, &scope)?;
+        Ok(())
+    })?;
     Ok(format!(
         "scope={scope} provider={} model={}",
         resolved.provider, resolved.model
@@ -565,9 +569,10 @@ async fn handle_model_command(
     context: &SurfaceContext,
     parts: &[&str],
 ) -> Result<String, EgoPulseError> {
-    let config = state.try_current_config()?;
-    let scope = parse_scope(&parts[1..], command_scope(context), &config)?;
-    let resolved = resolved_for_scope(&config, &scope)?;
+    let snapshot = state.config_manager.current_blocking();
+    let config = &snapshot.config;
+    let scope = parse_scope(&parts[1..], command_scope(context), config)?;
+    let resolved = resolved_for_scope(config, &scope)?;
 
     if parts.len() == 1 {
         return Ok(format!(
@@ -579,81 +584,91 @@ async fn handle_model_command(
     let value = first_non_scope_arg(&parts[1..]).unwrap_or_default();
     if value == "reset" {
         if scope == ProfileScope::Global {
-            let mut config = Config::load_allow_missing_api_key(Some(config_path(state)?))?;
-            config.default_model = None;
-            config.save_config_with_secrets(config_path(state)?)?;
-            return Ok(format!(
-                "scope={scope} model reset -> {}",
-                config.global_provider().default_model
-            ));
+            let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+                candidate.default_model = None;
+                Ok(())
+            })?;
+            return Ok(format!("scope={scope} model reset -> {}", effective.model));
         }
-        let path = config_path(state)?;
-        let mut config = Config::load_allow_missing_api_key(Some(path))?;
+        let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
+            match &scope {
+                ProfileScope::Global => unreachable!("global reset is returned above"),
+                ProfileScope::Agent { agent_id, .. } => {
+                    let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
+                        crate::error::ConfigError::AgentNotFound {
+                            agent_id: agent_id.to_string(),
+                        }
+                    })?;
+                    agent.model = None;
+                }
+            }
+            Ok(())
+        })?;
+        return Ok(format!("scope={scope} model reset -> {}", effective.model));
+    }
+
+    let (_, effective) = apply_profile_candidate(state, &snapshot, &scope, |candidate| {
         match &scope {
-            ProfileScope::Global => unreachable!("global reset is returned above"),
-            ProfileScope::Agent { agent_id, .. } => {
-                let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
+            ProfileScope::Global => {
+                candidate.default_model = Some(value.to_string());
+                let default_provider = candidate.default_provider.clone();
+                if let Some(provider) = candidate.providers.get_mut(&default_provider)
+                    && !provider.models.contains_key(value)
+                {
+                    provider
+                        .models
+                        .insert(value.to_string(), crate::config::ModelConfig::default());
+                }
+            }
+            ProfileScope::Agent { agent_id, channel } => {
+                let provider_name = candidate
+                    .resolve_llm_for_agent_channel(agent_id, channel.as_str())?
+                    .provider;
+                let agent = candidate.agents.get_mut(agent_id).ok_or_else(|| {
                     crate::error::ConfigError::AgentNotFound {
                         agent_id: agent_id.to_string(),
                     }
                 })?;
-                agent.model = None;
-            }
-        }
-        config.save_config_with_secrets(path)?;
-        let updated = Config::load_allow_missing_api_key(Some(path))?;
-        let effective = resolved_for_scope(&updated, &scope)?;
-        return Ok(format!("scope={scope} model reset -> {}", effective.model));
-    }
-
-    let path = config_path(state)?;
-    let mut config = Config::load_allow_missing_api_key(Some(path))?;
-    match &scope {
-        ProfileScope::Global => {
-            config.default_model = Some(value.to_string());
-            let default_provider = config.default_provider.clone();
-            if let Some(provider) = config.providers.get_mut(&default_provider)
-                && !provider.models.contains_key(value)
-            {
-                provider
-                    .models
-                    .insert(value.to_string(), crate::config::ModelConfig::default());
-            }
-        }
-        ProfileScope::Agent { agent_id, channel } => {
-            let provider_name = config
-                .resolve_llm_for_agent_channel(agent_id, channel.as_str())?
-                .provider;
-            let agent = config.agents.get_mut(agent_id).ok_or_else(|| {
-                crate::error::ConfigError::AgentNotFound {
-                    agent_id: agent_id.to_string(),
+                agent.model = Some(value.to_string());
+                if let Some(provider) = candidate.providers.get_mut(provider_name.as_str())
+                    && !provider.models.contains_key(value)
+                {
+                    provider
+                        .models
+                        .insert(value.to_string(), crate::config::ModelConfig::default());
                 }
-            })?;
-            agent.model = Some(value.to_string());
-            if let Some(provider) = config.providers.get_mut(provider_name.as_str())
-                && !provider.models.contains_key(value)
-            {
-                provider
-                    .models
-                    .insert(value.to_string(), crate::config::ModelConfig::default());
             }
         }
-    }
-
-    config.save_config_with_secrets(path)?;
-    let updated = Config::load_allow_missing_api_key(Some(path))?;
-    let effective = resolved_for_scope(&updated, &scope)?;
+        Ok(())
+    })?;
     Ok(format!(
         "scope={scope} provider={} model={}",
         effective.provider, effective.model
     ))
 }
 
-fn config_path(state: &AppState) -> Result<&Path, EgoPulseError> {
-    state
-        .config_path
-        .as_deref()
-        .ok_or_else(|| EgoPulseError::Internal("config path is unavailable".to_string()))
+fn apply_profile_candidate<F>(
+    state: &AppState,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    scope: &ProfileScope,
+    mutate: F,
+) -> Result<
+    (
+        Arc<crate::config::manager::ConfigSnapshot>,
+        crate::config::ResolvedLlmConfig,
+    ),
+    EgoPulseError,
+>
+where
+    F: FnOnce(&mut Config) -> Result<(), EgoPulseError>,
+{
+    let mut candidate = snapshot.config.clone();
+    mutate(&mut candidate)?;
+    let updated = state
+        .config_manager
+        .apply_candidate(candidate, Some(&snapshot.fingerprint))?;
+    let resolved = resolved_for_scope(&updated.config, scope)?;
+    Ok((updated, resolved))
 }
 
 fn command_scope(context: &SurfaceContext) -> ProfileScope {

@@ -238,6 +238,11 @@ pub(super) fn build_config(
 
     let dotenv = load_dotenv(resolved_config_path.as_deref());
 
+    let file_config = read_file_config(resolved_config_path.as_deref())?;
+    if let Some(path) = resolved_config_path.as_deref() {
+        super::persist::validate_source_generation(path)?;
+    }
+
     let FileConfig {
         state_root: file_state_root,
         default_provider: file_default_provider,
@@ -259,7 +264,7 @@ pub(super) fn build_config(
         db: file_db,
         web_fetch: file_web_fetch,
         webhooks: file_webhooks,
-    } = read_file_config(resolved_config_path.as_deref())?;
+    } = file_config;
 
     let default_provider =
         normalize_string(file_default_provider).ok_or(ConfigError::MissingDefaultProvider)?;
@@ -374,6 +379,90 @@ pub(super) fn build_config(
     }
 
     Ok(config)
+}
+
+/// Validates an already-normalized candidate produced by an in-process
+/// update. File loading performs the same checks while normalizing YAML, but
+/// API and slash-command updates mutate the normalized representation directly.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when provider, agent, scheduler, authentication,
+/// backup, compaction, bot, webhook, or timezone constraints are violated.
+pub(super) fn validate_runtime_candidate(config: &Config) -> Result<(), ConfigError> {
+    if config.providers.is_empty() {
+        return Err(ConfigError::MissingProviders);
+    }
+    if !config.providers.contains_key(&config.default_provider) {
+        return Err(ConfigError::InvalidProviderReference {
+            provider: config.default_provider.to_string(),
+        });
+    }
+
+    for (provider_id, provider) in &config.providers {
+        if provider.base_url.trim().is_empty() {
+            return Err(ConfigError::MissingProviderBaseUrl {
+                provider: provider_id.to_string(),
+            });
+        }
+        validate_base_url(&provider.base_url)?;
+        if provider
+            .api_key
+            .as_ref()
+            .is_none_or(|api_key| api_key.value().trim().is_empty())
+            && !crate::llm::codex_auth::provider_allows_empty_api_key(
+                provider_id.as_str(),
+                &provider.base_url,
+            )
+        {
+            return Err(ConfigError::MissingProviderApiKey {
+                provider: provider_id.to_string(),
+            });
+        }
+        if provider.default_model.trim().is_empty() {
+            return Err(ConfigError::MissingProviderDefaultModel {
+                provider: provider_id.to_string(),
+            });
+        }
+        validate_model_instructions(provider_id.as_str(), &provider.models)?;
+    }
+
+    validate_agent_id(&config.default_agent)?;
+    if !config.agents.contains_key(&config.default_agent) {
+        return Err(ConfigError::DefaultAgentNotFound {
+            agent_id: config.default_agent.to_string(),
+        });
+    }
+    for agent_id in config.agents.keys() {
+        validate_agent_id(agent_id)?;
+    }
+    validate_agent_provider_references(&config.providers, &config.agents)?;
+    validate_sleep_batch_config(&config.sleep_batch, &config.providers, &config.agents)?;
+    if config.pulse.tick_interval_secs == 0 {
+        return Err(ConfigError::PulseInvalidTickInterval {
+            reason: "tick interval must be positive".to_string(),
+        });
+    }
+    validate_timezone(&config.timezone)?;
+
+    if config.web_enabled() && config.web_auth_token().is_none() {
+        return Err(ConfigError::MissingWebAuthToken);
+    }
+    if config.voice_enabled() && !config.web_enabled() {
+        return Err(ConfigError::VoiceRequiresWebChannel);
+    }
+    if config.voice_enabled() && config.voice_auth_token().is_none() {
+        return Err(ConfigError::MissingVoiceAuthToken);
+    }
+
+    validate_backup_config(&config.db.backup)?;
+
+    validate_compaction_config(config)?;
+    validate_discord_bot_references(config)?;
+    validate_telegram_bot_references(config)?;
+    validate_webhook_receivers(config)?;
+
+    Ok(())
 }
 
 fn load_dotenv(config_path: Option<&Path>) -> HashMap<String, String> {
@@ -722,24 +811,9 @@ fn normalize_sleep_batch(
     };
 
     let provider = normalize_string(fb.provider).map(|p| ProviderId::new(&p));
-    if let Some(ref pid) = provider {
-        if !providers.contains_key(pid) {
-            return Err(ConfigError::InvalidProviderReference {
-                provider: pid.to_string(),
-            });
-        }
-    }
 
     let enabled = fb.enabled.unwrap_or(false);
     let schedule = normalize_string(fb.schedule);
-
-    if enabled && schedule.is_none() {
-        return Err(ConfigError::SleepBatchEnabledRequiresSchedule);
-    }
-
-    if let Some(ref sched) = schedule {
-        validate_schedule(sched)?;
-    }
 
     let mut resolved_agents = normalize_agent_list(fb.agents, agents)?;
     if let Some(ref mut list) = resolved_agents {
@@ -749,13 +823,7 @@ fn normalize_sleep_batch(
     let retry = fb.retry.unwrap_or_default();
     let retry_max_attempts = retry.max_attempts.unwrap_or(3);
     let retry_interval_minutes = retry.interval_minutes.unwrap_or(5);
-    if retry_max_attempts == 0 {
-        return Err(ConfigError::SleepBatchInvalidRetry {
-            detail: "max_attempts must be at least 1".to_string(),
-        });
-    }
-
-    Ok(SleepBatchConfig {
+    let config = SleepBatchConfig {
         provider,
         model: normalize_string(fb.model),
         enabled,
@@ -763,7 +831,46 @@ fn normalize_sleep_batch(
         agents: resolved_agents,
         retry_max_attempts,
         retry_interval_minutes,
-    })
+    };
+    validate_sleep_batch_config(&config, providers, agents)?;
+
+    Ok(config)
+}
+
+fn validate_sleep_batch_config(
+    config: &SleepBatchConfig,
+    providers: &HashMap<ProviderId, ProviderConfig>,
+    agents: &HashMap<AgentId, AgentConfig>,
+) -> Result<(), ConfigError> {
+    if let Some(provider) = &config.provider
+        && !providers.contains_key(provider)
+    {
+        return Err(ConfigError::InvalidProviderReference {
+            provider: provider.to_string(),
+        });
+    }
+    if config.enabled && config.schedule.is_none() {
+        return Err(ConfigError::SleepBatchEnabledRequiresSchedule);
+    }
+    if let Some(schedule) = &config.schedule {
+        validate_schedule(schedule)?;
+    }
+    if let Some(agent_ids) = &config.agents {
+        for agent_id in agent_ids {
+            if !agents.contains_key(agent_id) {
+                return Err(ConfigError::SleepBatchUnknownAgent {
+                    agent_id: agent_id.to_string(),
+                });
+            }
+        }
+    }
+    if config.retry_max_attempts == 0 {
+        return Err(ConfigError::SleepBatchInvalidRetry {
+            detail: "max_attempts must be at least 1".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_schedule(schedule: &str) -> Result<(), ConfigError> {
@@ -832,6 +939,12 @@ fn normalize_db(file: Option<FileDatabaseConfig>) -> Result<DatabaseConfig, Conf
             .unwrap_or(defaults.max_generations),
     };
 
+    validate_backup_config(&backup)?;
+
+    Ok(DatabaseConfig { backup })
+}
+
+fn validate_backup_config(backup: &super::types::BackupConfig) -> Result<(), ConfigError> {
     if backup.interval_days == 0 {
         return Err(ConfigError::InvalidBackupConfig(
             "interval_days must be at least 1".to_string(),
@@ -842,11 +955,8 @@ fn normalize_db(file: Option<FileDatabaseConfig>) -> Result<DatabaseConfig, Conf
             "max_generations must be at least 1".to_string(),
         ));
     }
-    validate_schedule(&backup.time).map_err(|_| {
-        ConfigError::InvalidBackupConfig("time must be in HH:MM format".to_string())
-    })?;
-
-    Ok(DatabaseConfig { backup })
+    validate_schedule(&backup.time)
+        .map_err(|_| ConfigError::InvalidBackupConfig("time must be in HH:MM format".to_string()))
 }
 
 fn normalize_agent_list(
@@ -921,16 +1031,7 @@ fn normalize_provider_map(
             models.insert(default_model.clone(), ModelConfig::default());
         }
 
-        for (model_name, model_config) in &models {
-            if model_config.model_instructions.is_some()
-                && model_config.model_instructions_file.is_some()
-            {
-                return Err(ConfigError::ModelInstructionsConflict {
-                    provider: key.to_string(),
-                    model: model_name.clone(),
-                });
-            }
-        }
+        validate_model_instructions(key.as_str(), &models)?;
 
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
         if !allow_missing_api_key
@@ -955,6 +1056,24 @@ fn normalize_provider_map(
     }
 
     Ok(normalized)
+}
+
+fn validate_model_instructions(
+    provider: &str,
+    models: &HashMap<String, ModelConfig>,
+) -> Result<(), ConfigError> {
+    for (model_name, model_config) in models {
+        if model_config.model_instructions.is_some()
+            && model_config.model_instructions_file.is_some()
+        {
+            return Err(ConfigError::ModelInstructionsConflict {
+                provider: provider.to_string(),
+                model: model_name.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_base_url(value: &str) -> Result<(), ConfigError> {

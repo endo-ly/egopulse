@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use secrecy::ExposeSecret;
 use serial_test::serial;
 
-use super::{Config, default_state_root, default_workspace_dir};
+use super::{Config, default_state_root};
 use crate::error::ConfigError;
 use crate::test_env::EnvVarGuard;
 
@@ -69,7 +69,7 @@ fn loads_provider_based_config() {
     );
     assert_eq!(
         config.workspace_dir().unwrap(),
-        default_workspace_dir().unwrap()
+        default_state_root().unwrap().join("workspace")
     );
     assert_eq!(
         config.skills_dir().unwrap(),

@@ -147,6 +147,7 @@ pub(crate) async fn commit_user_turn_input(
     messages: &[Message],
     session_revision: Option<i64>,
     turn_id: &str,
+    config_snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<PersistedTurn, EgoPulseError> {
     store_phase_snapshot_with_turn_input(
         state,
@@ -155,6 +156,7 @@ pub(crate) async fn commit_user_turn_input(
         messages.to_vec(),
         session_revision,
         turn_id,
+        config_snapshot,
     )
     .await
     .map_err(EgoPulseError::Storage)
@@ -385,6 +387,7 @@ async fn store_phase_snapshot_with_turn_input(
     snapshot_messages: Vec<Message>,
     session_revision: Option<i64>,
     turn_id: &str,
+    config_snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<PersistedTurn, StorageError> {
     let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
         .await
@@ -393,12 +396,16 @@ async fn store_phase_snapshot_with_turn_input(
             other => StorageError::TaskJoin(other.to_string()),
         })?;
     let turn_id_owned = turn_id.to_string();
+    let config_revision = config_snapshot.revision as i64;
+    let config_fingerprint_owned = config_snapshot.fingerprint.clone();
     let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
         db.commit_turn_input_with_conversation(
             &message,
             &session_json,
             session_revision,
             &turn_id_owned,
+            config_revision,
+            Some(config_fingerprint_owned.as_str()),
         )
     })
     .await?;

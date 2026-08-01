@@ -194,7 +194,13 @@ async fn resolve_new_web_session(
     raw_session_key: &str,
     actor: &str,
 ) -> Result<(String, SurfaceContext), (StatusCode, String)> {
-    let default_agent = state.app_state.config.default_agent.to_string();
+    let default_agent = state
+        .app_state
+        .config_manager
+        .current_blocking()
+        .config
+        .default_agent
+        .to_string();
     let surface_thread = web_session_key(raw_session_key);
     let context = SurfaceContext::new(
         "web".to_string(),

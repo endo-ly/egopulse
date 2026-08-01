@@ -18,7 +18,8 @@ pub(super) struct AgentInfo {
 pub(super) async fn list_agents(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let config = &state.app_state.config;
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let config = &snapshot.config;
     let default_agent = &config.default_agent;
 
     let mut agents: Vec<AgentInfo> = config

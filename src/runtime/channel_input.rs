@@ -178,6 +178,7 @@ pub(crate) async fn submit_agent_turn(
             origin_id: context.origin_id.clone(),
             context,
             input,
+            config_snapshot: None,
         },
     )
     .await
@@ -201,6 +202,10 @@ pub(crate) async fn submit_scheduled_turn(
     state: &AppState,
     mut scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
+    if scheduled.config_snapshot.is_none() {
+        scheduled.config_snapshot = Some(state.config_manager.current_blocking());
+    }
+
     // An empty request_key would collide on UNIQUE(chat_id, request_key) and
     // make every keyless turn on the same chat look like a duplicate. Assign a
     // stable key before the request is persisted so recovery reuses the same
@@ -350,7 +355,10 @@ async fn durably_accept_turn(
     let chat_id = resolve_chat_id(&state.turn_runtime(), &scheduled.context).await?;
     let request_hash = canonical_request_hash(&scheduled.context, &scheduled.input);
     let scheduled_json = serialize_scheduled_turn(scheduled)?;
-    let snapshot = state.config_manager.current_blocking();
+    let snapshot = scheduled
+        .config_snapshot
+        .clone()
+        .unwrap_or_else(|| state.config_manager.current_blocking());
     let request_key = scheduled.context.request_key.clone();
     let origin_id = if scheduled.origin_id.is_empty() {
         None

@@ -29,6 +29,7 @@ use crate::channels::adapter::{
 };
 use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::DiscordChannelConfig;
+use crate::config::manager::ConfigSnapshot;
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 
 /// Discord API リクエストのタイムアウト (秒)。
@@ -163,43 +164,44 @@ impl RouteDecision {
 /// `external_chat_id` から Discord bot token を解決する共有データ。
 /// [`DiscordAdapter`] と進捗 sink が `Arc` で共有する。
 struct DiscordTokenResolver {
-    /// `bot_id → token` のマップ（[`Config::discord_bots`] から構築）。
-    bot_token_map: HashMap<String, String>,
-    /// `agent_id → bot_id` のマップ。
-    agent_bot_map: HashMap<String, String>,
+    config_manager: Arc<crate::config::ConfigManager>,
 }
 
 impl DiscordTokenResolver {
-    fn new(bot_token_map: HashMap<String, String>, agent_bot_map: HashMap<String, String>) -> Self {
-        Self {
-            bot_token_map,
-            agent_bot_map,
-        }
+    fn with_manager(config_manager: Arc<crate::config::ConfigManager>) -> Self {
+        Self { config_manager }
     }
 
     /// `external_chat_id` から該当する bot token を解決する。
     /// 明示的な `:bot:` セグメントがあればそちらを優先し、
     /// なければ agent バインディング経由で解決する。
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
-        if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
-            return self.token_for_bot(bot_id, external_chat_id);
-        }
-
-        let agent_id = parse_discord_agent_id(external_chat_id).ok_or_else(|| {
-            format!(
-                "Discord external_chat_id '{external_chat_id}' does not identify a bot or agent"
-            )
-        })?;
-        let bot_id = self.agent_bot_map.get(agent_id).ok_or_else(|| {
-            format!("no Discord bot binding found for agent '{agent_id}' in external_chat_id '{external_chat_id}'")
-        })?;
-        self.token_for_bot(bot_id, external_chat_id)
-    }
-
-    fn token_for_bot(&self, bot_id: &str, external_chat_id: &str) -> Result<&str, String> {
-        self.bot_token_map
-            .get(bot_id)
-            .map(String::as_str)
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
+        let snapshot = self.config_manager.current_blocking();
+        let config = &snapshot.config;
+        let bot_id = if let Some(bot_id) = parse_explicit_discord_bot_id(external_chat_id) {
+            bot_id.to_string()
+        } else {
+            let agent_id = parse_discord_agent_id(external_chat_id).ok_or_else(|| {
+                format!(
+                    "Discord external_chat_id '{external_chat_id}' does not identify a bot or agent"
+                )
+            })?;
+            config
+                .agents
+                .get(&crate::config::AgentId::new(agent_id))
+                .and_then(|agent| agent.discord_bot.as_ref())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "no Discord bot binding found for agent '{agent_id}' in external_chat_id '{external_chat_id}'"
+                    )
+                })?
+        };
+        config
+            .discord_bots()
+            .into_iter()
+            .find(|bot| bot.bot_id.as_str() == bot_id)
+            .map(|bot| bot.token.to_string())
             .ok_or_else(|| {
                 format!(
                     "no Discord bot token found for bot '{bot_id}' in external_chat_id '{external_chat_id}'"
@@ -230,21 +232,13 @@ impl Drop for DiscordTypingActivity {
 }
 
 impl DiscordAdapter {
-    pub(crate) fn new_for_bots(config: &crate::config::Config) -> Self {
-        let bot_tokens: std::collections::HashMap<String, String> = config
-            .discord_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
-            .collect();
-        let agent_bots = config
-            .agents
-            .iter()
-            .filter_map(|(agent_id, agent)| {
-                let bot_id = agent.discord_bot.as_ref()?;
-                Some((agent_id.to_string(), bot_id.to_string()))
-            })
-            .collect();
-        let tokens = Arc::new(DiscordTokenResolver::new(bot_tokens, agent_bots));
+    pub(crate) fn new_for_bots_with_manager(
+        config_manager: Arc<crate::config::ConfigManager>,
+    ) -> Self {
+        Self::from_tokens(Arc::new(DiscordTokenResolver::with_manager(config_manager)))
+    }
+
+    fn from_tokens(tokens: Arc<DiscordTokenResolver>) -> Self {
         let http_client = reqwest::Client::new();
         let sink: Arc<dyn ToolProgressSink> = Arc::new(DiscordToolProgressSink::new(
             Arc::clone(&tokens),
@@ -258,7 +252,7 @@ impl DiscordAdapter {
     }
 
     /// `external_chat_id` から該当する bot token を解決する。
-    fn select_token(&self, external_chat_id: &str) -> Result<&str, String> {
+    fn select_token(&self, external_chat_id: &str) -> Result<String, String> {
         self.tokens.select_token(external_chat_id)
     }
 }
@@ -282,7 +276,7 @@ impl ChannelAdapter for DiscordAdapter {
         external_chat_id: &str,
     ) -> Result<Box<dyn TurnActivity>, String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
-        let token = self.select_token(external_chat_id)?.to_string();
+        let token = self.select_token(external_chat_id)?;
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/typing");
         let client = self.http_client.clone();
 
@@ -571,24 +565,30 @@ impl ToolProgressHandle for DiscordToolProgressHandle {
 struct Handler {
     app_state: Arc<AppState>,
     bot_id: String,
-    default_agent: String,
-    channels: HashMap<u64, DiscordChannelConfig>,
     bot_user_id: OnceLock<UserId>,
     chain_state: Arc<BotChainState>,
     http_client: reqwest::Client,
 }
 
 impl Handler {
-    fn default_agent_response(&self) -> RouteDecision {
+    fn channels(snapshot: &ConfigSnapshot) -> HashMap<u64, DiscordChannelConfig> {
+        snapshot.config.discord_channels()
+    }
+
+    fn default_agent_response(&self, snapshot: &ConfigSnapshot) -> RouteDecision {
         RouteDecision::Respond {
-            agent_id: self.default_agent.clone(),
+            agent_id: snapshot.config.default_agent.to_string(),
         }
     }
 
     /// 指定エージェントがこの bot にバインドされているかを返す。
-    fn agent_uses_this_bot(&self, agent_id: &crate::config::AgentId) -> bool {
+    fn agent_uses_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        agent_id: &crate::config::AgentId,
+    ) -> bool {
         let bot_id = crate::config::BotId::new(&self.bot_id);
-        self.app_state
+        snapshot
             .config
             .agents
             .get(agent_id)
@@ -596,24 +596,36 @@ impl Handler {
     }
 
     /// チャンネル設定内で、この bot にバインドされた最初のエージェントを返す。
-    fn first_agent_for_this_bot(&self, channel_config: &DiscordChannelConfig) -> Option<String> {
+    fn first_agent_for_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &DiscordChannelConfig,
+    ) -> Option<String> {
         channel_config
             .agents
             .iter()
-            .find(|agent_id| self.agent_uses_this_bot(agent_id))
+            .find(|agent_id| self.agent_uses_this_bot(snapshot, agent_id))
             .map(ToString::to_string)
     }
 
     /// チャンネルの先頭エージェントがこの bot にバインドされていれば返す（single-agent channel 用）。
-    fn primary_agent_for_this_bot(&self, channel_config: &DiscordChannelConfig) -> Option<String> {
+    fn primary_agent_for_this_bot(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &DiscordChannelConfig,
+    ) -> Option<String> {
         let agent_id = channel_config.agents.first()?;
-        self.agent_uses_this_bot(agent_id)
+        self.agent_uses_this_bot(snapshot, agent_id)
             .then(|| agent_id.to_string())
     }
 
     /// Single-agent チャンネルのルーティングを解決する。
-    fn resolve_single_agent_channel(&self, channel_config: &DiscordChannelConfig) -> RouteDecision {
-        match self.primary_agent_for_this_bot(channel_config) {
+    fn resolve_single_agent_channel(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channel_config: &DiscordChannelConfig,
+    ) -> RouteDecision {
+        match self.primary_agent_for_this_bot(snapshot, channel_config) {
             Some(agent_id) => RouteDecision::Respond { agent_id },
             None => RouteDecision::Reject,
         }
@@ -623,6 +635,7 @@ impl Handler {
     /// mention がなければ ObserveOnly、あればこの bot にバインドされたエージェントが応答する。
     fn resolve_multi_agent_room(
         &self,
+        snapshot: &ConfigSnapshot,
         channel_config: &DiscordChannelConfig,
         mentions_bot: bool,
     ) -> RouteDecision {
@@ -635,7 +648,7 @@ impl Handler {
             };
         }
 
-        match self.first_agent_for_this_bot(channel_config) {
+        match self.first_agent_for_this_bot(snapshot, channel_config) {
             Some(agent_id) => RouteDecision::Respond { agent_id },
             None => RouteDecision::Reject,
         }
@@ -643,33 +656,50 @@ impl Handler {
 
     /// メッセージの送信先エージェントを決定するルーティング処理。
     /// DM → デフォルトエージェント、ギルド → チャンネル設定に基づく振り分け。
-    fn route_message(&self, channel_id: u64, is_dm: bool, mentions_bot: bool) -> RouteDecision {
+    fn route_message(
+        &self,
+        snapshot: &ConfigSnapshot,
+        channels: &HashMap<u64, DiscordChannelConfig>,
+        channel_id: u64,
+        is_dm: bool,
+        mentions_bot: bool,
+    ) -> RouteDecision {
         if is_dm {
-            return self.default_agent_response();
+            return self.default_agent_response(snapshot);
         }
 
-        let Some(channel_config) = self.channels.get(&channel_id) else {
+        let Some(channel_config) = channels.get(&channel_id) else {
             return RouteDecision::Reject;
         };
 
         if channel_config.multi_agent {
-            self.resolve_multi_agent_room(channel_config, mentions_bot)
+            self.resolve_multi_agent_room(snapshot, channel_config, mentions_bot)
         } else {
-            self.resolve_single_agent_channel(channel_config)
+            self.resolve_single_agent_channel(snapshot, channel_config)
         }
     }
 
     /// [`SurfaceContext`] を構築する。
-    fn make_context(&self, user: &str, thread: &str, agent_id: &str) -> SurfaceContext {
-        let scope = self.scope_for_thread(thread);
+    fn make_context(
+        &self,
+        channels: &HashMap<u64, DiscordChannelConfig>,
+        user: &str,
+        thread: &str,
+        agent_id: &str,
+    ) -> SurfaceContext {
+        let scope = self.scope_for_thread(channels, thread);
         crate::runtime::build_channel_context("discord", user, thread, "discord", agent_id, scope)
     }
 
-    fn scope_for_thread(&self, thread: &str) -> ConversationScope {
+    fn scope_for_thread(
+        &self,
+        channels: &HashMap<u64, DiscordChannelConfig>,
+        thread: &str,
+    ) -> ConversationScope {
         thread
             .parse::<u64>()
             .ok()
-            .and_then(|cid| self.channels.get(&cid))
+            .and_then(|cid| channels.get(&cid))
             .map(|c| crate::runtime::channel_scope_from_secret(c.secret))
             .unwrap_or(ConversationScope::Normal)
     }
@@ -696,6 +726,7 @@ impl Handler {
     /// - 人間のメッセージ → `require_mention` 設定に従う
     fn should_process_message(
         &self,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         author_id: u64,
         author_is_bot: bool,
         is_dm: bool,
@@ -717,7 +748,7 @@ impl Handler {
         }
 
         if !is_dm {
-            if let Some(config) = self.channels.get(&channel_id) {
+            if let Some(config) = channels.get(&channel_id) {
                 if config.require_mention && !config.multi_agent && !mentions_bot {
                     return ReceiveDecision::Reject;
                 }
@@ -732,11 +763,12 @@ impl Handler {
         &self,
         ctx: &Context,
         msg: &DiscordMessage,
+        channels: &HashMap<u64, DiscordChannelConfig>,
         thread: &str,
         agent_id: &str,
         text: &str,
     ) -> bool {
-        let slash_context = self.make_context(&msg.author.name, thread, agent_id);
+        let slash_context = self.make_context(channels, &msg.author.name, thread, agent_id);
         let sender_id = msg.author.id.get().to_string();
         let outcome = crate::slash_commands::process_slash_command(
             &self.app_state,
@@ -811,6 +843,8 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: DiscordMessage) {
         let channel_id = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
+        let snapshot = self.app_state.config_manager.current_blocking();
+        let channels = Self::channels(&snapshot);
 
         if self.is_self_message(msg.author.id.get()) {
             return;
@@ -818,7 +852,7 @@ impl EventHandler for Handler {
 
         let text = msg.content.clone();
         let mentions_bot = self.is_bot_mentioned(&msg);
-        let route = self.route_message(channel_id, is_dm, mentions_bot);
+        let route = self.route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot);
         if route.is_rejected() {
             return;
         }
@@ -829,13 +863,14 @@ impl EventHandler for Handler {
         };
 
         if self
-            .process_text_slash_command(&ctx, &msg, &thread, &route_agent_id, &text)
+            .process_text_slash_command(&ctx, &msg, &channels, &thread, &route_agent_id, &text)
             .await
         {
             return;
         }
 
         let decision = self.should_process_message(
+            &channels,
             msg.author.id.get(),
             msg.author.bot,
             is_dm,
@@ -851,17 +886,14 @@ impl EventHandler for Handler {
             ReceiveDecision::Reject => return,
         }
 
-        let is_multi_agent = self
-            .channels
-            .get(&channel_id)
-            .is_some_and(|c| c.multi_agent);
+        let is_multi_agent = channels.get(&channel_id).is_some_and(|c| c.multi_agent);
 
         let channel_log_chat_id = if is_multi_agent && !is_dm {
             crate::runtime::store_human_channel_log_message(
                 &self.app_state,
                 HumanChannelLogMessage {
                     key: ChannelLogKey::Discord(channel_id),
-                    scope: self.scope_for_thread(&thread),
+                    scope: self.scope_for_thread(&channels, &thread),
                     id: format!("cl-{}", msg.id.get()),
                     sender_id: format!("user:discord:{}", msg.author.id.get()),
                     content: text.clone(),
@@ -895,7 +927,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let mut context = self.make_context(&msg.author.name, &thread, &agent_id);
+        let mut context = self.make_context(&channels, &msg.author.name, &thread, &agent_id);
         context.channel_log_chat_id = channel_log_chat_id;
         context.origin_id = uuid::Uuid::new_v4().to_string();
         context.request_key = format!("discord:{channel_id}:{}", msg.id.get());
@@ -925,10 +957,11 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         let _ = self.bot_user_id.set(ready.user.id);
+        let snapshot = self.app_state.config_manager.current_blocking();
 
         info!(
             "Discord bot ({}) connected as {}",
-            self.default_agent, ready.user.name
+            snapshot.config.default_agent, ready.user.name
         );
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
@@ -967,7 +1000,9 @@ impl EventHandler for Handler {
 
         let channel_id = cmd.channel_id.get();
         let is_dm_int = cmd.guild_id.is_none();
-        let route = self.route_message(channel_id, is_dm_int, true);
+        let snapshot = self.app_state.config_manager.current_blocking();
+        let channels = Self::channels(&snapshot);
+        let route = self.route_message(&snapshot, &channels, channel_id, is_dm_int, true);
         if route.is_rejected() {
             let _ = cmd
                 .create_response(
@@ -1001,7 +1036,8 @@ impl EventHandler for Handler {
         };
         let thread = channel_id.to_string();
 
-        let slash_context = self.make_context(&cmd.user.name, &thread, &interaction_agent);
+        let slash_context =
+            self.make_context(&channels, &cmd.user.name, &thread, &interaction_agent);
         let sender_id = cmd.user.id.get().to_string();
 
         let response_text = match crate::slash_commands::process_slash_command(
@@ -1156,20 +1192,24 @@ fn interaction_to_command_text(
     text
 }
 
-/// Discord bot を起動し、共有チャンネル設定とエージェントルーティングを適用する。
+/// Discord bot を起動する。
 #[allow(private_interfaces)]
 pub(crate) async fn start_discord_bot_for_bot(
     state: Arc<AppState>,
     token: &str,
     bot_id: &crate::config::BotId,
-    default_agent: &crate::config::AgentId,
-    channels: &HashMap<u64, DiscordChannelConfig>,
     chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
+    let default_agent = state
+        .config_manager
+        .current_blocking()
+        .config
+        .default_agent
+        .clone();
     info!(
         "Starting Discord bot '{}' (agent {default_agent}) ...",
         bot_id.as_str(),
@@ -1186,8 +1226,6 @@ pub(crate) async fn start_discord_bot_for_bot(
     let handler = Handler {
         app_state: state,
         bot_id: bot_id.to_string(),
-        default_agent: default_agent.to_string(),
-        channels: channels.clone(),
         bot_user_id: OnceLock::new(),
         chain_state,
         http_client,
@@ -1224,27 +1262,44 @@ pub(crate) async fn start_discord_bot_for_bot(
 mod tests {
     use super::*;
 
+    fn test_state(
+        channels: HashMap<u64, DiscordChannelConfig>,
+        default_agent: &str,
+        agents: Option<HashMap<crate::config::AgentId, crate::config::AgentConfig>>,
+    ) -> Arc<crate::runtime::AppState> {
+        let mut config = crate::test_util::test_config(
+            tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .to_str()
+                .expect("utf8"),
+        );
+        config.default_agent = crate::config::AgentId::new(default_agent);
+        if let Some(agents) = agents {
+            config.agents = agents;
+        }
+        config
+            .channels
+            .entry(crate::config::ChannelName::new("discord"))
+            .or_default()
+            .discord_channels = Some(channels);
+        Arc::new(crate::agent_loop::turn::build_state(
+            config,
+            Box::new(crate::agent_loop::turn::FakeProvider {
+                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                    content: "ok".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                }]),
+            }),
+        ))
+    }
+
     fn test_handler(channels: HashMap<u64, DiscordChannelConfig>) -> Handler {
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "main".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: OnceLock::new(),
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1258,25 +1313,8 @@ mod tests {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "main".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1291,56 +1329,88 @@ mod tests {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
         Handler {
-            app_state: Arc::new(crate::agent_loop::turn::build_state_with_provider(
-                tempfile::tempdir()
-                    .expect("tempdir")
-                    .path()
-                    .to_str()
-                    .expect("utf8")
-                    .to_string(),
-                Box::new(crate::agent_loop::turn::FakeProvider {
-                    responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                        content: "ok".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        usage: None,
-                    }]),
-                }),
-            )),
+            app_state: test_state(channels, "developer", None),
             bot_id: "bot_a".to_string(),
-            default_agent: "developer".to_string(),
-            channels,
             bot_user_id: lock,
             chain_state,
             http_client: reqwest::Client::new(),
         }
     }
 
-    fn test_adapter() -> DiscordAdapter {
-        DiscordAdapter {
-            tokens: Arc::new(DiscordTokenResolver::new(HashMap::new(), HashMap::new())),
-            http_client: reqwest::Client::new(),
-            tool_progress_sink: None,
-        }
+    fn test_config_manager() -> Arc<crate::config::ConfigManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Arc::new(crate::config::ConfigManager::new(
+            crate::test_util::test_config(dir.path().to_str().expect("utf8")),
+            None,
+        ))
     }
 
-    fn test_adapter_with_tokens(
+    fn test_adapter() -> DiscordAdapter {
+        DiscordAdapter::new_for_bots_with_manager(test_config_manager())
+    }
+
+    fn test_manager_with_discord_config(
+        bot_tokens: &[(&str, &str)],
+        agent_bots: &[(&str, &str)],
+    ) -> Arc<crate::config::ConfigManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        let discord = config
+            .channels
+            .entry(crate::config::ChannelName::new("discord"))
+            .or_default();
+        discord.enabled = Some(true);
+        discord.discord_bots = Some(
+            bot_tokens
+                .iter()
+                .map(|(bot_id, token)| {
+                    (
+                        crate::config::BotId::new(bot_id),
+                        crate::config::DiscordBotConfig {
+                            token: Some(crate::config::secret_ref::ResolvedValue::Literal(
+                                (*token).to_string(),
+                            )),
+                            file_token: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let developer_bot = agent_bots
+            .iter()
+            .find(|(agent_id, _)| *agent_id == "developer")
+            .map(|(_, bot_id)| crate::config::BotId::new(bot_id));
+        config.agents.insert(
+            crate::config::AgentId::new("developer"),
+            crate::config::AgentConfig {
+                label: "Developer".to_string(),
+                discord_bot: developer_bot,
+                ..Default::default()
+            },
+        );
+        for (agent_id, bot_id) in agent_bots {
+            if *agent_id == "developer" {
+                continue;
+            }
+            config.agents.insert(
+                crate::config::AgentId::new(agent_id),
+                crate::config::AgentConfig {
+                    label: (*agent_id).to_string(),
+                    discord_bot: Some(crate::config::BotId::new(bot_id)),
+                    ..Default::default()
+                },
+            );
+        }
+        Arc::new(crate::config::ConfigManager::new(config, None))
+    }
+
+    fn test_adapter_with_manager_config(
         bot_tokens: &[(&str, &str)],
         agent_bots: &[(&str, &str)],
     ) -> DiscordAdapter {
-        let bot_token_map: HashMap<String, String> = bot_tokens
-            .iter()
-            .map(|(bot_id, token)| ((*bot_id).to_string(), (*token).to_string()))
-            .collect();
-        let agent_bot_map: HashMap<String, String> = agent_bots
-            .iter()
-            .map(|(agent_id, bot_id)| ((*agent_id).to_string(), (*bot_id).to_string()))
-            .collect();
-        DiscordAdapter {
-            tokens: Arc::new(DiscordTokenResolver::new(bot_token_map, agent_bot_map)),
-            http_client: reqwest::Client::new(),
-            tool_progress_sink: None,
-        }
+        DiscordAdapter::new_for_bots_with_manager(test_manager_with_discord_config(
+            bot_tokens, agent_bots,
+        ))
     }
 
     fn agent_id(id: &str) -> crate::config::AgentId {
@@ -1404,30 +1474,9 @@ mod tests {
     ) -> Handler {
         let lock = OnceLock::new();
         lock.set(UserId::new(bot_user_id)).expect("OnceLock set");
-        let mut config = crate::test_util::test_config(
-            tempfile::tempdir()
-                .expect("tempdir")
-                .path()
-                .to_str()
-                .expect("utf8"),
-        );
-        config.agents = agents;
-        let state = crate::agent_loop::turn::build_state(
-            config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
-                responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
-                    content: "ok".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    usage: None,
-                }]),
-            }),
-        );
         Handler {
-            app_state: Arc::new(state),
+            app_state: test_state(channels, default_agent, Some(agents)),
             bot_id: bot_id.to_string(),
-            default_agent: default_agent.to_string(),
-            channels,
             bot_user_id: lock,
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
@@ -1497,7 +1546,7 @@ mod tests {
 
     #[test]
     fn select_token_uses_explicit_bot_id() {
-        let adapter = test_adapter_with_tokens(
+        let adapter = test_adapter_with_manager_config(
             &[("main", "token-main"), ("other", "token-other")],
             &[("developer", "other")],
         );
@@ -1512,7 +1561,7 @@ mod tests {
 
     #[test]
     fn select_token_resolves_agent_binding_without_bot_segment() {
-        let adapter = test_adapter_with_tokens(
+        let adapter = test_adapter_with_manager_config(
             &[("main", "token-main"), ("other", "token-other")],
             &[("developer", "other")],
         );
@@ -1527,7 +1576,8 @@ mod tests {
 
     #[test]
     fn select_token_rejects_chat_id_without_bot_or_agent() {
-        let adapter = test_adapter_with_tokens(&[("main", "token-main")], &[("developer", "main")]);
+        let adapter =
+            test_adapter_with_manager_config(&[("main", "token-main")], &[("developer", "main")]);
 
         assert!(
             adapter.select_token("discord:123").is_err(),
@@ -1537,7 +1587,7 @@ mod tests {
 
     #[test]
     fn select_token_rejects_agent_without_bot_binding() {
-        let adapter = test_adapter_with_tokens(&[("main", "token-main")], &[]);
+        let adapter = test_adapter_with_manager_config(&[("main", "token-main")], &[]);
 
         assert!(
             adapter.select_token("discord:123:agent:developer").is_err(),
@@ -1547,8 +1597,10 @@ mod tests {
 
     #[test]
     fn select_token_rejects_bound_bot_without_token() {
-        let adapter =
-            test_adapter_with_tokens(&[("main", "token-main")], &[("developer", "missing")]);
+        let adapter = test_adapter_with_manager_config(
+            &[("main", "token-main")],
+            &[("developer", "missing")],
+        );
 
         assert!(
             adapter.select_token("discord:123:agent:developer").is_err(),
@@ -1675,9 +1727,13 @@ mod tests {
         );
 
         assert_eq!(
-            handler
-                .make_context("user", "123", "developer")
-                .surface_thread,
+            {
+                let snapshot = snapshot(&handler);
+                let channels = Handler::channels(&snapshot);
+                handler
+                    .make_context(&channels, "user", "123", "developer")
+                    .surface_thread
+            },
             "123"
         );
     }
@@ -1691,7 +1747,9 @@ mod tests {
             "developer",
             agents(&[("developer", Some("main"))]),
         );
-        let context = handler.make_context("user", "123", "developer");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let context = handler.make_context(&channels, "user", "123", "developer");
 
         assert_eq!(context.session_key(), "discord:123:agent:developer");
     }
@@ -1815,8 +1873,9 @@ mod tests {
         assert!(route_accepts_channel(&handler, 456));
 
         // Verify config is readable
-        assert!(handler.channels.get(&123).expect("config").require_mention);
-        assert!(!handler.channels.get(&456).expect("config").require_mention);
+        let channels = Handler::channels(&snapshot(&handler));
+        assert!(channels.get(&123).expect("config").require_mention);
+        assert!(!channels.get(&456).expect("config").require_mention);
     }
 
     #[test]
@@ -1926,7 +1985,7 @@ mod tests {
         assert!(!handler.is_self_message(1000));
 
         assert_eq!(
-            handler.should_process_message(9999, true, false, 100, false),
+            should_process(&handler, 9999, true, false, 100, false),
             ReceiveDecision::Reject
         );
     }
@@ -1936,7 +1995,7 @@ mod tests {
         let handler = test_handler_with_bot_id(channels(&[(100, &[], false, false)]), 9999);
 
         assert_eq!(
-            handler.should_process_message(1000, false, false, 100, false),
+            should_process(&handler, 1000, false, false, 100, false),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1946,7 +2005,7 @@ mod tests {
         let handler = test_handler_with_bot_id(channels(&[(100, &[], false, true)]), 9999);
 
         assert_eq!(
-            handler.should_process_message(1000, false, false, 100, false),
+            should_process(&handler, 1000, false, false, 100, false),
             ReceiveDecision::Reject
         );
     }
@@ -1957,7 +2016,7 @@ mod tests {
             test_handler_with_bot_id(channels(&[(100, &["lyre", "vega"], true, true)]), 9999);
 
         assert_eq!(
-            handler.should_process_message(1000, false, false, 100, false),
+            should_process(&handler, 1000, false, false, 100, false),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1967,7 +2026,7 @@ mod tests {
         let handler = test_handler_with_bot_id(channels(&[(100, &[], false, true)]), 9999);
 
         assert_eq!(
-            handler.should_process_message(1000, false, false, 100, true),
+            should_process(&handler, 1000, false, false, 100, true),
             ReceiveDecision::Accept { reset_chain: true }
         );
     }
@@ -1978,7 +2037,7 @@ mod tests {
 
         // mentions_bot=false: this bot is not mentioned (other bot mentioned instead)
         assert_eq!(
-            handler.should_process_message(1000, false, false, 100, false),
+            should_process(&handler, 1000, false, false, 100, false),
             ReceiveDecision::Reject
         );
     }
@@ -1994,7 +2053,7 @@ mod tests {
 
         // Human message should request chain reset
         assert_eq!(
-            handler.should_process_message(1000, false, true, 100, false),
+            should_process(&handler, 1000, false, true, 100, false),
             ReceiveDecision::Accept { reset_chain: true }
         );
 
@@ -2013,7 +2072,7 @@ mod tests {
         let handler = test_handler_with_bot_id(HashMap::new(), 9999);
 
         assert_eq!(
-            handler.should_process_message(1111, true, false, 200, true),
+            should_process(&handler, 1111, true, false, 200, true),
             ReceiveDecision::Accept { reset_chain: false }
         );
     }
@@ -2023,7 +2082,7 @@ mod tests {
         let handler = test_handler_with_bot_id(HashMap::new(), 9999);
 
         assert_eq!(
-            handler.should_process_message(1111, true, false, 100, false),
+            should_process(&handler, 1111, true, false, 100, false),
             ReceiveDecision::Reject
         );
     }
@@ -2034,13 +2093,13 @@ mod tests {
 
         for _ in 0..BOT_CHAIN_MAX_DEPTH {
             assert_eq!(
-                handler.should_process_message(1111, true, false, 200, true),
+                should_process(&handler, 1111, true, false, 200, true),
                 ReceiveDecision::Accept { reset_chain: false }
             );
         }
 
         assert_eq!(
-            handler.should_process_message(1111, true, false, 200, true),
+            should_process(&handler, 1111, true, false, 200, true),
             ReceiveDecision::Reject
         );
     }
@@ -2051,7 +2110,7 @@ mod tests {
 
         // Bot messages are rejected by sender-type judgment regardless of content
         assert_eq!(
-            handler.should_process_message(1111, true, false, 100, false),
+            should_process(&handler, 1111, true, false, 100, false),
             ReceiveDecision::Reject
         );
 
@@ -2069,13 +2128,13 @@ mod tests {
         let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
 
         assert_eq!(
-            handler1.should_process_message(1111, true, false, 500, true),
+            should_process(&handler1, 1111, true, false, 500, true),
             ReceiveDecision::Accept { reset_chain: false },
             "handler1: first bot mention on channel 500 should be accepted"
         );
 
         assert_eq!(
-            handler2.should_process_message(3333, true, false, 500, true),
+            should_process(&handler2, 3333, true, false, 500, true),
             ReceiveDecision::Accept { reset_chain: false },
             "handler2: second bot mention on same channel 500 should see depth 2"
         );
@@ -2101,7 +2160,7 @@ mod tests {
 
         for _ in 0..BOT_CHAIN_MAX_DEPTH {
             assert_eq!(
-                handler1.should_process_message(1111, true, false, 100, true),
+                should_process(&handler1, 1111, true, false, 100, true),
                 ReceiveDecision::Accept { reset_chain: false },
                 "fill channel 100 to max depth"
             );
@@ -2114,7 +2173,7 @@ mod tests {
 
         let handler2 = test_handler_with_chain(HashMap::new(), 2002, Arc::clone(&shared));
         assert_eq!(
-            handler2.should_process_message(3333, true, false, 200, true),
+            should_process(&handler2, 3333, true, false, 200, true),
             ReceiveDecision::Accept { reset_chain: false },
             "channel 200 should be independent and start at depth 1"
         );
@@ -2122,8 +2181,16 @@ mod tests {
 
     // --- route_message tests ---
 
+    fn snapshot(handler: &Handler) -> Arc<ConfigSnapshot> {
+        handler.app_state.config_manager.current_blocking()
+    }
+
     fn route_accepts_channel(handler: &Handler, channel_id: u64) -> bool {
-        !handler.route_message(channel_id, false, true).is_rejected()
+        let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
+        !handler
+            .route_message(&snapshot, &channels, channel_id, false, true)
+            .is_rejected()
     }
 
     fn route_agent_id(
@@ -2132,8 +2199,10 @@ mod tests {
         is_dm: bool,
         mentions_bot: bool,
     ) -> Option<String> {
+        let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         handler
-            .route_message(channel_id, is_dm, mentions_bot)
+            .route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot)
             .agent_id()
             .map(ToString::to_string)
     }
@@ -2144,10 +2213,32 @@ mod tests {
         is_dm: bool,
         mentions_bot: bool,
     ) -> Option<String> {
+        let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
         handler
-            .route_message(channel_id, is_dm, mentions_bot)
+            .route_message(&snapshot, &channels, channel_id, is_dm, mentions_bot)
             .response_agent_id()
             .map(ToString::to_string)
+    }
+
+    fn should_process(
+        handler: &Handler,
+        author_id: u64,
+        author_is_bot: bool,
+        is_dm: bool,
+        channel_id: u64,
+        mentions_bot: bool,
+    ) -> ReceiveDecision {
+        let snapshot = snapshot(handler);
+        let channels = Handler::channels(&snapshot);
+        handler.should_process_message(
+            &channels,
+            author_id,
+            author_is_bot,
+            is_dm,
+            channel_id,
+            mentions_bot,
+        )
     }
 
     #[test]
@@ -2318,7 +2409,9 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(123u64, secret_channel(&["default"], false, true));
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "123", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "123", "default");
         assert_eq!(ctx.scope, ConversationScope::Secret);
     }
 
@@ -2327,7 +2420,9 @@ mod tests {
         let mut channels = HashMap::new();
         channels.insert(456u64, secret_channel(&["default"], false, false));
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "456", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "456", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
@@ -2335,18 +2430,18 @@ mod tests {
     fn make_context_defaults_to_normal_scope_for_unknown_channel() {
         let channels: HashMap<u64, DiscordChannelConfig> = HashMap::new();
         let handler = test_handler(channels);
-        let ctx = handler.make_context("user", "789", "default");
+        let snapshot = snapshot(&handler);
+        let channels = Handler::channels(&snapshot);
+        let ctx = handler.make_context(&channels, "user", "789", "default");
         assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 
     // --- tool progress sink (Steps 4-6) ---
 
     fn progress_sink(base_url: String) -> DiscordToolProgressSink {
-        let mut bot_token_map = HashMap::new();
-        bot_token_map.insert("main".to_string(), "TOKEN".to_string());
-        let mut agent_bot_map = HashMap::new();
-        agent_bot_map.insert("lyre".to_string(), "main".to_string());
-        let tokens = Arc::new(DiscordTokenResolver::new(bot_token_map, agent_bot_map));
+        let tokens = Arc::new(DiscordTokenResolver::with_manager(
+            test_manager_with_discord_config(&[("main", "TOKEN")], &[("lyre", "main")]),
+        ));
         DiscordToolProgressSink::with_base_url(tokens, reqwest::Client::new(), base_url)
     }
 

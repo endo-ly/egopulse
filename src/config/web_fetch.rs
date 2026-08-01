@@ -15,7 +15,7 @@ const DEFAULT_MAX_SCAN_BYTES: usize = 64 * 1024;
 // ---------------------------------------------------------------------------
 
 /// Top-level web_fetch configuration.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct WebFetchConfig {
     /// Allowed URL schemes. Default: `["https"]`

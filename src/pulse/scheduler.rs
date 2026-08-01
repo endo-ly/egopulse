@@ -60,18 +60,27 @@ fn extract_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// 3. If parse error for one agent → warn and continue to next agent
 /// 4. If execution error for one intention → warn and continue to next intention
 pub(crate) async fn run_pulse_scan(state: &AppState) {
-    let pulse_cfg = state.config.pulse();
+    let snapshot = state.config_manager.current_blocking();
+    let pulse_cfg = snapshot.config.pulse();
     if !pulse_cfg.scheduler_enabled() {
         return;
     }
 
-    let timezone = state.config.timezone.as_str();
+    let timezone = snapshot.config.timezone.as_str();
 
-    let state_root = Path::new(&state.config.state_root);
+    let state_root = Path::new(&snapshot.config.state_root);
     let now = Utc::now();
 
-    for agent_id in state.config.agents.keys() {
-        scan_agent(state, state_root, agent_id, timezone, now).await;
+    for agent_id in snapshot.config.agents.keys() {
+        scan_agent(
+            state,
+            state_root,
+            agent_id,
+            timezone,
+            now,
+            Arc::clone(&snapshot),
+        )
+        .await;
     }
 }
 
@@ -82,6 +91,7 @@ async fn scan_agent(
     agent_id: &AgentId,
     timezone: &str,
     now: chrono::DateTime<Utc>,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) {
     let definition = match super::definition::load_pulse_definition(state_root, agent_id.as_str()) {
         Ok(d) => d,
@@ -100,7 +110,7 @@ async fn scan_agent(
     }
 
     for intention in &definition.intentions {
-        process_intention(
+        process_intention_with_activation_timeout(
             state,
             agent_id,
             intention,
@@ -108,39 +118,16 @@ async fn scan_agent(
             &definition.body,
             timezone,
             now,
+            PULSE_ACTIVATION_TIMEOUT,
+            Arc::clone(&snapshot),
         )
         .await;
     }
 }
 
-/// Process a single intention: check due → gate → create run → resolve surface →
-/// build capsule → activate → handle output.
-async fn process_intention(
-    state: &AppState,
-    agent_id: &AgentId,
-    intention: &super::definition::TemporalIntention,
-    default_delivery: Option<&super::definition::DeliverySpec>,
-    pulse_body: &str,
-    timezone: &str,
-    now: chrono::DateTime<Utc>,
-) {
-    process_intention_with_activation_timeout(
-        state,
-        agent_id,
-        intention,
-        default_delivery,
-        pulse_body,
-        timezone,
-        now,
-        PULSE_ACTIVATION_TIMEOUT,
-    )
-    .await
-}
-
-/// Testable form of [`process_intention`] that accepts an explicit
-/// `activation_timeout`. Production callers go through [`process_intention`]
-/// which always uses [`PULSE_ACTIVATION_TIMEOUT`]; tests pass a short
-/// duration so they do not need to wait the full 30 minutes.
+/// Processes one intention with an explicit activation timeout. Production
+/// passes [`PULSE_ACTIVATION_TIMEOUT`]; tests pass a short duration so they do
+/// not need to wait the full 30 minutes.
 #[allow(clippy::too_many_arguments)]
 async fn process_intention_with_activation_timeout(
     state: &AppState,
@@ -151,6 +138,7 @@ async fn process_intention_with_activation_timeout(
     timezone: &str,
     now: chrono::DateTime<Utc>,
     activation_timeout: Duration,
+    snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) {
     let agent_id_str = agent_id.as_str();
 
@@ -298,7 +286,13 @@ async fn process_intention_with_activation_timeout(
 
     // 7. Run activation (guarded by timeout)
     let activation_result = match guard_activation(
-        super::runner::run_activation(state, agent_id_str, &capsule, &home_surface),
+        super::runner::run_activation_with_snapshot(
+            state,
+            agent_id_str,
+            &capsule,
+            &home_surface,
+            snapshot,
+        ),
         activation_timeout,
     )
     .await
@@ -422,16 +416,39 @@ pub(crate) async fn run_pulse_scheduler(
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let tick_interval = state.config.pulse().tick_interval_secs;
-    info!("pulse scheduler starting with {tick_interval}s tick interval");
+    let mut changes = state.config_manager.subscribe();
+    info!("pulse scheduler started");
 
     loop {
+        let snapshot = state.config_manager.current_blocking();
+        let pulse = snapshot.config.pulse();
+        if !pulse.scheduler_enabled() {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("pulse scheduler: shutdown requested, exiting loop");
+                    return;
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+
         tokio::select! {
             _ = shutdown.cancelled() => {
                 info!("pulse scheduler: shutdown requested, exiting loop");
                 return;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(tick_interval)) => {}
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                continue;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(pulse.tick_interval_secs)) => {}
         }
         run_pulse_scan(&state).await;
     }
@@ -1194,6 +1211,7 @@ intentions:
                 "UTC",
                 now,
                 Duration::from_millis(100),
+                state.config_manager.current_blocking(),
             ),
         )
         .await;
@@ -1252,6 +1270,7 @@ intentions:
                 "UTC",
                 now,
                 Duration::from_secs(60),
+                state.config_manager.current_blocking(),
             ),
         )
         .await;

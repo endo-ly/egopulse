@@ -135,6 +135,7 @@ pub(crate) fn provider_api_key_env_name(provider_id: &str) -> String {
 pub(crate) const WEB_AUTH_TOKEN_ENV_NAME: &str = "WEB_AUTH_TOKEN";
 pub(crate) const DISCORD_BOT_TOKEN_ENV_NAME: &str = "DISCORD_BOT_TOKEN";
 pub(crate) const TELEGRAM_BOT_TOKEN_ENV_NAME: &str = "TELEGRAM_BOT_TOKEN";
+pub(crate) const CONFIG_SOURCE_GENERATION_PREFIX: &str = "# egopulse-config-generation: ";
 
 pub(crate) fn resolve_string_or_ref(
     value: Option<StringOrRef>,
@@ -312,7 +313,11 @@ pub(crate) fn dotenv_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join(".env")
 }
 
-pub(crate) fn save_dotenv(path: &Path, entries: &[(String, String)]) -> Result<(), ConfigError> {
+pub(crate) fn save_dotenv(
+    path: &Path,
+    entries: &[(String, String)],
+    generation: Option<&str>,
+) -> Result<(), ConfigError> {
     let mut existing = read_dotenv(path);
 
     for (key, value) in entries {
@@ -334,7 +339,10 @@ pub(crate) fn save_dotenv(path: &Path, entries: &[(String, String)]) -> Result<(
         .collect();
     lines.sort();
 
-    let content = format!("{}\n", lines.join("\n"));
+    let generation_line = generation
+        .map(|value| format!("{CONFIG_SOURCE_GENERATION_PREFIX}{value}\n"))
+        .unwrap_or_default();
+    let content = format!("{generation_line}{}\n", lines.join("\n"));
 
     let temp_path = parent.join(format!(
         ".{}.tmp-{}",
@@ -583,10 +591,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
 
-        save_dotenv(&path, &[("EXISTING_KEY".into(), "existing-value".into())])
-            .expect("save first");
+        save_dotenv(
+            &path,
+            &[("EXISTING_KEY".into(), "existing-value".into())],
+            None,
+        )
+        .expect("save first");
 
-        save_dotenv(&path, &[("NEW_KEY".into(), "new-value".into())]).expect("save second");
+        save_dotenv(&path, &[("NEW_KEY".into(), "new-value".into())], None).expect("save second");
 
         let map = read_dotenv(&path);
         assert_eq!(
@@ -601,7 +613,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
 
-        save_dotenv(&path, &[("TEST_KEY".into(), "test-value".into())]).expect("save");
+        save_dotenv(&path, &[("TEST_KEY".into(), "test-value".into())], None).expect("save");
 
         #[cfg(unix)]
         {
@@ -617,8 +629,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
 
-        let error =
-            save_dotenv(&path, &[("TEST_KEY".into(), "line1\nline2".into())]).expect_err("save");
+        let error = save_dotenv(&path, &[("TEST_KEY".into(), "line1\nline2".into())], None)
+            .expect_err("save");
 
         assert!(matches!(error, ConfigError::SecretRefUnresolved { .. }));
     }
@@ -635,7 +647,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
         }
 
-        save_dotenv(&path, &[("TEST_KEY".into(), "new-value".into())]).expect("save");
+        save_dotenv(&path, &[("TEST_KEY".into(), "new-value".into())], None).expect("save");
 
         #[cfg(unix)]
         {

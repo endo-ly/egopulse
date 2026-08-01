@@ -32,7 +32,7 @@ struct AgentSendParams {
 }
 
 pub(crate) struct AgentSendTool {
-    agents: std::collections::HashMap<AgentId, AgentConfig>,
+    config_manager: Arc<crate::config::ConfigManager>,
     db: Arc<crate::storage::Database>,
     secret_db: Option<Arc<crate::storage::Database>>,
     channels: Arc<crate::channels::adapter::ChannelRegistry>,
@@ -45,15 +45,19 @@ pub(crate) struct AgentSendTool {
 }
 
 impl AgentSendTool {
-    pub(crate) fn new(
-        agents: std::collections::HashMap<AgentId, AgentConfig>,
+    /// Constructs an `agent_send` tool that resolves agents from the current
+    /// runtime configuration manager when a Turn has no fixed snapshot. A
+    /// Turn-provided snapshot takes precedence for the duration of that tool
+    /// execution.
+    pub(crate) fn new_with_manager(
         db: Arc<crate::storage::Database>,
         secret_db: Option<Arc<crate::storage::Database>>,
         channels: Arc<crate::channels::adapter::ChannelRegistry>,
         intake: Arc<TurnIntake>,
+        config_manager: Arc<crate::config::ConfigManager>,
     ) -> Self {
         Self {
-            agents,
+            config_manager,
             db,
             secret_db,
             channels,
@@ -142,8 +146,14 @@ impl Tool for AgentSendTool {
             return ToolResult::error("parameter 'to' must not be empty".to_string());
         }
 
+        let config_snapshot = context
+            .config_snapshot
+            .clone()
+            .unwrap_or_else(|| self.config_manager.current_blocking());
+        let agents = &config_snapshot.config.agents;
+
         // Validate: agent must exist in config.agents
-        if !self.agents.contains_key(&AgentId::new(&target_id)) {
+        if !agents.contains_key(&AgentId::new(&target_id)) {
             return ToolResult::error(format!("agent '{target_id}' not found"));
         }
 
@@ -170,8 +180,8 @@ impl Tool for AgentSendTool {
             );
         }
 
-        let from_label = agent_label(&self.agents, &context.agent_id).to_string();
-        let to_label = agent_label(&self.agents, &target_id).to_string();
+        let from_label = agent_label(agents, &context.agent_id).to_string();
+        let to_label = agent_label(agents, &target_id).to_string();
         let display_text = format!("[{from_label} → {to_label}] {}", params.message);
 
         // Durable intake context.
@@ -220,6 +230,7 @@ impl Tool for AgentSendTool {
             origin_id: context.origin_id.clone(),
             context: target_context,
             input: target_input,
+            config_snapshot: context.config_snapshot.clone(),
         };
 
         let delivered = match self.intake.submit(scheduled).await {
@@ -324,15 +335,16 @@ mod tests {
 
     fn tool_with_agents(agents: HashMap<AgentId, AgentConfig>) -> AgentSendTool {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8"));
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.agents = agents;
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        AgentSendTool::new(
-            agents,
+        AgentSendTool::new_with_manager(
             db,
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         )
     }
 
@@ -350,12 +362,12 @@ mod tests {
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
         let intake = Arc::new(crate::runtime::TurnIntake::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
             Arc::clone(&intake),
+            Arc::clone(&state_arc.config_manager),
         );
         intake.bind(&state_arc);
         (tool, state_arc, dir)
@@ -389,6 +401,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         }
     }
 
@@ -438,6 +451,45 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("yourself"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_prefers_turn_snapshot_for_recipient_and_labels() {
+        let (tool, state, _dir) = durable_tool();
+        let mut snapshot_config = state.config_manager.current_blocking().config.clone();
+        snapshot_config
+            .agents
+            .get_mut(&AgentId::new("lyre"))
+            .expect("source agent")
+            .label = "Snapshot Lyre".to_string();
+        snapshot_config.agents.remove(&AgentId::new("vega"));
+        snapshot_config.agents.insert(
+            AgentId::new("snapshot-only"),
+            AgentConfig {
+                label: "Snapshot Only".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let mut context = test_context_with_agent("lyre");
+        context.config_snapshot = Some(Arc::new(crate::config::manager::ConfigSnapshot::new(
+            2,
+            snapshot_config,
+            None,
+        )));
+        let result = tool
+            .execute(
+                json!({"to": "snapshot-only", "message": "use fixed config"}),
+                &context,
+            )
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["delivered"], true);
+        let turns = accepted_turns(&state);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].input.contains("[Snapshot Lyre → Snapshot Only]"));
     }
 
     #[tokio::test]
@@ -604,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn agent_send_no_channel_log_without_app_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8"));
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
 
@@ -621,15 +673,15 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let agents = test_agents();
+        config.agents = test_agents();
         // Intake not bound to a runtime: the turn is not durably accepted, so
         // the channel-log side effect must NOT run.
-        let tool = AgentSendTool::new(
-            agents,
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         );
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -644,6 +696,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let result = tool
@@ -686,12 +739,14 @@ mod tests {
         .await
         .expect("create log chat");
 
-        let tool = AgentSendTool::new(
-            test_agents(),
+        let mut config = config;
+        config.agents = test_agents();
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config, None)),
         );
         let ctx = ToolExecutionContext {
             chat_id: 1,
@@ -706,6 +761,7 @@ mod tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let _ = tool
@@ -772,12 +828,12 @@ mod integration_tests {
     ) -> (AgentSendTool, Arc<crate::storage::Database>) {
         let db = Arc::new(crate::storage::Database::new(&config.db_path()).expect("db"));
         let channels = Arc::new(ChannelRegistry::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&db),
             None,
             channels,
             Arc::new(crate::runtime::TurnIntake::new()),
+            Arc::new(crate::config::ConfigManager::new(config.clone(), None)),
         );
         (tool, db)
     }
@@ -791,12 +847,12 @@ mod integration_tests {
         state.supervisor.start_accepting();
         let state_arc = Arc::new(state);
         let intake = Arc::new(crate::runtime::TurnIntake::new());
-        let tool = AgentSendTool::new(
-            config.agents.clone(),
+        let tool = AgentSendTool::new_with_manager(
             Arc::clone(&state_arc.db),
             None,
             Arc::new(ChannelRegistry::new()),
             Arc::clone(&intake),
+            Arc::clone(&state_arc.config_manager),
         );
         intake.bind(&state_arc);
         (tool, state_arc)
@@ -816,6 +872,7 @@ mod integration_tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         }
     }
 
@@ -830,6 +887,158 @@ mod integration_tests {
                     .expect("deserialize scheduled turn")
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_child_turn_executes_with_acceptance_snapshot_after_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("egopulse.config.yaml");
+        let mut config = multi_agent_config(dir.path().to_str().expect("utf8"));
+        config.default_agent = AgentId::new("lyre");
+        config.default_model = Some("old-global-model".to_string());
+        config.max_history_messages = 7;
+        let web = config
+            .channels
+            .get_mut(&crate::config::ChannelName::new("web"))
+            .expect("web channel");
+        web.auth_token = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            "web-test-token".to_string(),
+        ));
+        web.file_auth_token = Some(yaml_serde::Value::String("web-test-token".to_string()));
+        let provider = config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider");
+        provider.default_model = "old-provider-model".to_string();
+        provider.models.insert(
+            "old-provider-model".to_string(),
+            crate::config::ModelConfig::default(),
+        );
+        crate::config::persist::save_config_with_secrets(&config, &config_path)
+            .expect("save initial config");
+
+        let provider = crate::agent_loop::turn::RecordingProvider::new(
+            vec![Ok(crate::llm::MessagesResponse {
+                content: "queued response".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = crate::test_util::build_state_with_config(
+            config.clone(),
+            Some(Arc::new(provider.clone())),
+            Some(config_path.clone()),
+            None,
+            None,
+        );
+        state.supervisor.start_accepting();
+        let state = Arc::new(state);
+        let intake = Arc::new(crate::runtime::TurnIntake::new());
+        let tool = AgentSendTool::new_with_manager(
+            Arc::clone(&state.db),
+            None,
+            Arc::new(ChannelRegistry::new()),
+            Arc::clone(&intake),
+            Arc::clone(&state.config_manager),
+        );
+        intake.bind(&state);
+
+        // Keep the target session busy so agent_send must enqueue its child.
+        let blocker = ScheduledTurn {
+            turn_id: "blocker".to_string(),
+            origin_id: "blocker-origin".to_string(),
+            context: {
+                let mut context = crate::agent_loop::SurfaceContext::new(
+                    "discord".to_string(),
+                    "scheduler".to_string(),
+                    "123".to_string(),
+                    "discord".to_string(),
+                    "vega".to_string(),
+                );
+                context.origin_id = "blocker-origin".to_string();
+                context
+            },
+            input: "blocker".to_string(),
+            config_snapshot: Some(state.config_manager.current_blocking()),
+        };
+        assert!(matches!(
+            state.turn_scheduler.submit(blocker),
+            crate::runtime::turn_scheduler::ScheduleResult::Started(_)
+        ));
+
+        let mut parent_context = test_context_with_agent("lyre");
+        parent_context.turn_id = "parent-turn".to_string();
+        parent_context.origin_id = "parent-origin".to_string();
+        parent_context.config_snapshot = Some(state.config_manager.current_blocking());
+        let result = tool
+            .execute(
+                json!({"to": "vega", "message": "queued with old config"}),
+                &parent_context,
+            )
+            .await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content).expect("tool result")["delivered"],
+            true
+        );
+
+        let mut reloaded = config.clone();
+        reloaded.default_model = Some("new-global-model".to_string());
+        reloaded.max_history_messages = 99;
+        reloaded
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .default_model = "new-provider-model".to_string();
+        reloaded.agents.remove(&AgentId::new("vega"));
+        crate::config::persist::save_config_with_secrets(&reloaded, &config_path)
+            .expect("save reloaded config");
+        state
+            .config_manager
+            .reload_from_file()
+            .expect("reload config");
+
+        let current = state.config_manager.current_blocking();
+        assert!(!current.config.agents.contains_key(&AgentId::new("vega")));
+        assert_eq!(current.config.max_history_messages, 99);
+
+        let child = state
+            .turn_scheduler
+            .on_turn_completed("discord:123:agent:vega")
+            .expect("queued child turn");
+        let queued_snapshot = child.config_snapshot.as_ref().expect("snapshot");
+        assert_eq!(
+            queued_snapshot.config.default_model.as_deref(),
+            Some("old-global-model")
+        );
+        assert_eq!(queued_snapshot.config.max_history_messages, 7);
+        assert_eq!(
+            queued_snapshot
+                .config
+                .providers
+                .get(&crate::config::ProviderId::new("openai"))
+                .expect("old provider")
+                .default_model,
+            "old-provider-model"
+        );
+        assert!(
+            queued_snapshot
+                .config
+                .agents
+                .contains_key(&AgentId::new("vega"))
+        );
+        let queued_run = state.db.get_turn_run(&child.turn_id).expect("queued run");
+        assert_eq!(queued_run.config_revision, queued_snapshot.revision as i64);
+        assert_eq!(
+            queued_run.config_fingerprint.as_deref(),
+            Some(queued_snapshot.fingerprint.as_str())
+        );
+
+        crate::runtime::execute_scheduled_turn(&state, child).await;
+
+        assert_eq!(provider.seen_messages().len(), 1);
     }
 
     #[tokio::test]
@@ -895,6 +1104,7 @@ mod integration_tests {
             skill_env: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_call_id: String::new(),
             scope: ConversationScope::Normal,
+            config_snapshot: None,
         };
 
         let result = tool

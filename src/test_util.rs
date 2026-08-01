@@ -89,6 +89,10 @@ pub(crate) fn build_state_with_config(
     db: Option<Arc<Database>>,
     channels: Option<Arc<ChannelRegistry>>,
 ) -> AppState {
+    let config_manager = Arc::new(crate::config::ConfigManager::new(
+        config.clone(),
+        config_path.as_deref(),
+    ));
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
@@ -103,6 +107,7 @@ pub(crate) fn build_state_with_config(
             None
         },
         config: config.clone(),
+        config_manager,
         config_path,
         llm_override,
         channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
@@ -160,6 +165,10 @@ pub(crate) fn build_state_for_restart_simulation(
     db: Option<Arc<Database>>,
     channels: Option<Arc<ChannelRegistry>>,
 ) -> AppState {
+    let config_manager = Arc::new(crate::config::ConfigManager::new(
+        config.clone(),
+        config_path.as_deref(),
+    ));
     let skills = Arc::new(SkillManager::from_dirs(
         config.user_skills_dir().expect("user_skills_dir"),
         config.skills_dir().expect("skills_dir"),
@@ -174,6 +183,7 @@ pub(crate) fn build_state_for_restart_simulation(
             None
         },
         config: config.clone(),
+        config_manager,
         config_path,
         llm_override,
         channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
@@ -223,6 +233,7 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         turn_id: String::new(),
         skill_env: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         scope: ConversationScope::Normal,
+        config_snapshot: None,
         tool_call_id: String::new(),
     }
 }

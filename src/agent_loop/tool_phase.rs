@@ -879,7 +879,11 @@ mod tests {
             Box::new(provider),
         );
         let context = cli_context("usage-calibration");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         let tools = Arc::new(vec![ToolDefinition {
             name: "read".to_string(),
             description: "Read a file".to_string(),
@@ -939,7 +943,11 @@ mod tests {
             Box::new(provider),
         );
         let context = cli_context("usage-calibration-none");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {
@@ -997,7 +1005,11 @@ mod tests {
             Box::new(provider),
         );
         let context = cli_context("usage-calibration-empty-tools");
-        let llm = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         // Act
         let response = send_tool_phase_request(ToolPhaseRequest {

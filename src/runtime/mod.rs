@@ -4,6 +4,7 @@
 
 pub(crate) mod backup_scheduler;
 pub(crate) mod channel_input;
+pub(crate) mod config_reload;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
@@ -93,6 +94,7 @@ pub(crate) struct AppStateParts {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config: Config,
+    pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn crate::llm::LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -131,11 +133,8 @@ impl AppState {
         Self {
             db: parts.db,
             secret_db: parts.secret_db,
-            config: parts.config.clone(),
-            config_manager: Arc::new(ConfigManager::new(
-                parts.config,
-                parts.config_path.as_deref(),
-            )),
+            config: parts.config,
+            config_manager: parts.config_manager,
             config_path: parts.config_path,
             llm_override: parts.llm_override,
             channels: parts.channels,
@@ -277,23 +276,6 @@ impl AppState {
             None => Ok(self.current_config()),
         }
     }
-
-    /// Returns the LLM provider resolved for the agent and channel in the given context.
-    pub(crate) fn llm_for_context(
-        &self,
-        context: &crate::agent_loop::SurfaceContext,
-    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        if let Some(provider) = self.llm_override.clone() {
-            return Ok(provider);
-        }
-
-        let snapshot = self.config_manager.current_blocking();
-        let config = &snapshot.config;
-        let agent_id = crate::config::AgentId::new(&context.agent_id);
-        let resolved = config.resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        self.cached_provider(&resolved, snapshot.revision)
-    }
-
     pub(crate) fn cached_provider(
         &self,
         resolved: &crate::config::ResolvedLlmConfig,
@@ -346,6 +328,7 @@ pub async fn build_app_state_with_path(
     metrics::set_instance_lock_held(true);
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
+    let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
 
     let mut channels = ChannelRegistry::new();
     channels.register(Arc::new(WebAdapter));
@@ -356,32 +339,24 @@ pub async fn build_app_state_with_path(
     #[cfg(feature = "channel-discord")]
     if !config.discord_bots().is_empty() {
         channels.register(Arc::new(
-            crate::channels::discord::DiscordAdapter::new_for_bots(&config),
+            crate::channels::discord::DiscordAdapter::new_for_bots_with_manager(Arc::clone(
+                &config_manager,
+            )),
         ));
     }
 
     #[cfg(feature = "channel-telegram")]
     if !config.telegram_bots().is_empty() {
-        let bot_tokens: std::collections::HashMap<String, String> = config
-            .telegram_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.to_string(), b.token.to_string()))
-            .collect();
-        let agent_bots: std::collections::HashMap<String, String> = config
-            .agents
-            .iter()
-            .filter_map(|(agent_id, agent)| {
-                let bot_id = agent.telegram_bot.as_ref()?;
-                Some((agent_id.to_string(), bot_id.to_string()))
-            })
-            .collect();
         channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi(bot_tokens, agent_bots),
+            crate::channels::telegram::TelegramAdapter::new_multi_with_manager(Arc::clone(
+                &config_manager,
+            )),
         ));
     }
 
     let channels = Arc::new(channels);
     let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
+    tools.set_config_manager(Arc::clone(&config_manager));
 
     let workspace_dir = config.workspace_dir()?;
     let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
@@ -401,12 +376,12 @@ pub async fn build_app_state_with_path(
     // once `AppState` exists (below), so the tool never holds a reference back
     // to the whole `AppState`.
     let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
-    tools.register_tool(Box::new(crate::tools::AgentSendTool::new(
-        config.agents.clone(),
+    tools.register_tool(Box::new(crate::tools::AgentSendTool::new_with_manager(
         Arc::clone(&deps.db),
         deps.secret_db.clone(),
         Arc::clone(&channels),
         Arc::clone(&agent_send_intake),
+        Arc::clone(&config_manager),
     )));
 
     let tools = Arc::new(tools);
@@ -417,6 +392,7 @@ pub async fn build_app_state_with_path(
         db: deps.db,
         secret_db: deps.secret_db,
         config,
+        config_manager,
         config_path,
         llm_override: None,
         channels,
@@ -597,7 +573,10 @@ pub fn build_sleep_app_state_with_path(
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
     let channels = Arc::new(ChannelRegistry::new());
-    let tools = Arc::new(ToolRegistry::new(&config, Arc::clone(&deps.skills)));
+    let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
+    let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
+    tools.set_config_manager(Arc::clone(&config_manager));
+    let tools = Arc::new(tools);
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
@@ -605,6 +584,7 @@ pub fn build_sleep_app_state_with_path(
         db: deps.db,
         secret_db: deps.secret_db,
         config,
+        config_manager,
         config_path,
         llm_override: None,
         channels,
@@ -1087,7 +1067,16 @@ pub(crate) fn execute_scheduled_turn(
             }
         };
 
-        let valid_ids: Vec<&str> = state.config.agents.keys().map(|id| id.as_str()).collect();
+        let config_snapshot = turn
+            .config_snapshot
+            .clone()
+            .unwrap_or_else(|| state.config_manager.current_blocking());
+        let valid_ids: Vec<&str> = config_snapshot
+            .config
+            .agents
+            .keys()
+            .map(|id| id.as_str())
+            .collect();
         let chain_depth = turn.context.chain_depth;
         let agent_id = &turn.context.agent_id;
 
@@ -1200,9 +1189,23 @@ pub(crate) fn execute_scheduled_turn(
         let runtime = state.turn_runtime();
         let turn_result = match current_state {
             Some(TurnRunState::InputCommitted) => {
-                resume_input_committed_turn(&runtime, turn.context.scope, &turn.turn_id).await
+                resume_input_committed_turn(
+                    &runtime,
+                    turn.context.scope,
+                    &turn.turn_id,
+                    Arc::clone(&config_snapshot),
+                )
+                .await
             }
-            _ => execute_turn_with_progress(state, &turn.context, &turn.input).await,
+            _ => {
+                execute_turn_with_progress_and_snapshot(
+                    state,
+                    &turn.context,
+                    &turn.input,
+                    Arc::clone(&config_snapshot),
+                )
+                .await
+            }
         };
         let duration = started.elapsed().as_secs_f64();
 
@@ -1401,16 +1404,17 @@ pub(crate) async fn execute_observed_turn(
     result
 }
 
-async fn execute_turn_with_progress(
+async fn execute_turn_with_progress_and_snapshot(
     state: &AppState,
     context: &crate::agent_loop::SurfaceContext,
     input: &str,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<String, EgoPulseError> {
     let adapter = state.channels.get(&context.channel);
     let external_chat_id = context.session_key();
     let sink = adapter
         .and_then(|adapter| adapter.tool_progress_sink())
-        .filter(|_| tool_progress_enabled(&state.config, context));
+        .filter(|_| tool_progress_enabled(&config_snapshot.config, context));
 
     let (evt_tx, evt_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
@@ -1421,11 +1425,16 @@ async fn execute_turn_with_progress(
 
     let event_sender = evt_tx.clone();
     let runtime = state.turn_runtime();
-    let result =
-        crate::agent_loop::process_turn_with_events(&runtime, context, input, move |event| {
+    let result = crate::agent_loop::process_turn_with_events_and_snapshot(
+        &runtime,
+        context,
+        input,
+        move |event| {
             let _ = event_sender.send(event);
-        })
-        .await;
+        },
+        config_snapshot,
+    )
+    .await;
 
     if result
         .as_ref()
@@ -1593,13 +1602,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
     #[cfg(feature = "channel-discord")]
     {
-        let shared_channels = state.config.discord_channels();
-        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .discord_bots()
             .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
+            .map(|b| (b.bot_id.clone(), b.token.to_string()))
             .collect();
 
         if !bot_configs.is_empty() {
@@ -1607,12 +1614,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             let rs = Arc::clone(&state.runtime_status);
             rs.update_channel("discord", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
-            for (bot_id, token, default_agent) in bot_configs {
+            for (bot_id, token) in bot_configs {
                 let discord_state = Arc::clone(&state);
-                info!("Starting Discord bot '{bot_id}' (agent {default_agent})...");
+                info!("Starting Discord bot '{bot_id}'...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
-                let channels = shared_channels.clone();
                 let handle_name = format!("discord[{bot_id}]");
                 state.supervisor.spawn_long_lived(
                     TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
@@ -1621,8 +1627,6 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
                             discord_state,
                             &token,
                             &bid,
-                            &default_agent,
-                            &channels,
                             chain_state,
                         )
                         .await
@@ -1645,13 +1649,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     // Telegram bot 起動
     #[cfg(feature = "channel-telegram")]
     {
-        let shared_channels = state.config.telegram_channels();
-        let default_agent = state.config.default_agent.clone();
         let bot_configs: Vec<_> = state
             .config
             .telegram_bots()
             .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string(), default_agent.clone()))
+            .map(|b| (b.bot_id.clone(), b.token.to_string()))
             .collect();
 
         if !bot_configs.is_empty() {
@@ -1659,12 +1661,11 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             let rs = Arc::clone(&state.runtime_status);
             rs.update_channel("telegram", ChannelState::Starting);
             let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
-            for (bot_id, token, default_agent) in bot_configs {
+            for (bot_id, token) in bot_configs {
                 let telegram_state = Arc::clone(&state);
-                info!("Starting Telegram bot '{bot_id}' (agent {default_agent})...");
+                info!("Starting Telegram bot '{bot_id}'...");
                 let bid = bot_id.clone();
                 let chain_state = Arc::clone(&shared_chain_state);
-                let channels = shared_channels.clone();
                 let handle_name = format!("telegram[{bot_id}]");
                 state.supervisor.spawn_long_lived(
                     TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
@@ -1673,8 +1674,6 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
                             telegram_state,
                             &token,
                             &bid,
-                            &default_agent,
-                            &channels,
                             chain_state,
                         )
                         .await
@@ -1700,48 +1699,55 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
         ));
     }
 
-    if state.config.sleep_batch.scheduler_enabled() {
-        let scheduler_state = state.clone();
+    if state.config_path.is_some() {
+        let reload_state = Arc::clone(&state);
         let token = state.supervisor.shutdown_token();
-        info!("Starting sleep batch scheduler");
         state.supervisor.spawn_long_lived(
             TaskSpec::new(
-                TaskKind::SleepScheduler,
-                "sleep-scheduler",
+                TaskKind::ConfigReload,
+                "config-reload",
                 Criticality::NonCritical,
             ),
-            async move {
-                crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await
-            },
+            async move { config_reload::run_config_reload_loop(reload_state, token).await },
         );
     }
 
-    if state.config.pulse().scheduler_enabled() {
-        match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
-            db.reap_orphaned_pulse_runs()
-        })
-        .await
-        {
-            Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
-        }
+    let scheduler_state = state.clone();
+    let token = state.supervisor.shutdown_token();
+    info!("Starting sleep batch scheduler");
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::SleepScheduler,
+            "sleep-scheduler",
+            Criticality::NonCritical,
+        ),
+        async move { crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await },
+    );
 
-        let pulse_state = (*state).clone();
-        let token = state.supervisor.shutdown_token();
-        info!("Starting pulse scheduler");
-        state.supervisor.spawn_long_lived(
-            TaskSpec::new(
-                TaskKind::PulseScheduler,
-                "pulse-scheduler",
-                Criticality::NonCritical,
-            ),
-            async move {
-                crate::pulse::scheduler::run_pulse_scheduler(pulse_state, token).await;
-                Ok(())
-            },
-        );
+    match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
+        db.reap_orphaned_pulse_runs()
+    })
+    .await
+    {
+        Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
     }
+
+    let pulse_state = (*state).clone();
+    let token = state.supervisor.shutdown_token();
+    info!("Starting pulse scheduler");
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(
+            TaskKind::PulseScheduler,
+            "pulse-scheduler",
+            Criticality::NonCritical,
+        ),
+        async move {
+            crate::pulse::scheduler::run_pulse_scheduler(pulse_state, token).await;
+            Ok(())
+        },
+    );
 
     if state.config.db.backup.scheduler_enabled() {
         let backup_state = (*state).clone();
@@ -2007,7 +2013,12 @@ mod tests {
         // Act: a bounded timeout proves the coordinator never hangs the turn.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_progress(&state, &context, "hello"),
+            execute_turn_with_progress_and_snapshot(
+                &state,
+                &context,
+                "hello",
+                state.config_manager.current_blocking(),
+            ),
         )
         .await;
 
@@ -2029,7 +2040,12 @@ mod tests {
         // Act: the failure path must also drop evt_tx and return bounded.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_turn_with_progress(&state, &context, "hello"),
+            execute_turn_with_progress_and_snapshot(
+                &state,
+                &context,
+                "hello",
+                state.config_manager.current_blocking(),
+            ),
         )
         .await;
 
@@ -2055,7 +2071,13 @@ mod tests {
         let context = crate::test_util::cli_context("retryable-failure");
 
         // Act
-        let result = execute_turn_with_progress(&state, &context, "hello").await;
+        let result = execute_turn_with_progress_and_snapshot(
+            &state,
+            &context,
+            "hello",
+            state.config_manager.current_blocking(),
+        )
+        .await;
 
         // Assert: the same model iteration is retried up to
         // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
@@ -2175,10 +2197,35 @@ mod tests {
         let state = build_app_state(config).await.expect("build state");
         let context = crate::test_util::cli_context("cache-test");
 
-        let a = state.llm_for_context(&context).expect("llm");
-        let b = state.llm_for_context(&context).expect("llm");
+        let runtime = state.turn_runtime();
+        let snapshot = state.config_manager.current_blocking();
+        let a = runtime
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let b = runtime
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn llm_cache_keeps_providers_for_each_config_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let runtime = state.turn_runtime();
+
+        let newer = runtime
+            .cached_provider(&resolved, 2)
+            .expect("newer revision provider");
+        let older = runtime
+            .cached_provider(&resolved, 1)
+            .expect("older revision provider");
+
+        assert!(!Arc::ptr_eq(&newer, &older));
+        assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 2);
     }
 
     #[tokio::test]
@@ -2189,8 +2236,15 @@ mod tests {
         let cloned = state.clone();
         let context = crate::test_util::cli_context("cache-clone-test");
 
-        let a = state.llm_for_context(&context).expect("llm");
-        let b = cloned.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let a = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let b = cloned
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
 
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -2213,7 +2267,11 @@ mod tests {
         );
         let context = crate::test_util::cli_context("override-test");
 
-        let result = state.llm_for_context(&context).expect("llm");
+        let snapshot = state.config_manager.current_blocking();
+        let result = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
         assert_eq!(result.provider_name(), expected_provider);
         assert_eq!(result.model_name(), expected_model);
 
@@ -2376,6 +2434,7 @@ mod tests {
             context,
             input: "scheduled secret input".to_string(),
             origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
         };
 
         // Act: execute the scheduled turn
@@ -2504,12 +2563,14 @@ mod tests {
             context: ctx.clone(),
             input: "a".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
             context: ctx.clone(),
             input: "b".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         assert!(
             matches!(
@@ -2576,6 +2637,7 @@ mod tests {
                 context: ctx,
                 input: format!("fill-{i}"),
                 origin_id: format!("fill-{i}"),
+                config_snapshot: None,
             };
             let _ = state.turn_scheduler.submit(turn);
         }
@@ -2594,6 +2656,7 @@ mod tests {
             context: ctx_a,
             input: "blk1-input".to_string(),
             origin_id: "origin-blk1".to_string(),
+            config_snapshot: None,
         };
         let outcome = channel_input::submit_scheduled_turn(&state, turn_a).await;
         assert!(
@@ -2702,12 +2765,14 @@ mod tests {
             context: ctx.clone(),
             input: "a".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
             context: ctx.clone(),
             input: "b".to_string(),
             origin_id: ctx.origin_id.clone(),
+            config_snapshot: None,
         };
         assert!(matches!(
             state.turn_scheduler.submit(turn_a.clone()),
@@ -2935,6 +3000,7 @@ mod tests {
             context: context.clone(),
             input: input.clone(),
             origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
         };
         let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
 
@@ -2967,7 +3033,7 @@ mod tests {
         call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
             let msg = msg.clone();
             let turn_id = turn_id.clone();
-            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id)
+            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id, 0, None)
         })
         .await
         .expect("commit input");
@@ -2983,8 +3049,13 @@ mod tests {
         );
 
         // Act: resume the input_committed turn.
-        let result =
-            resume_input_committed_turn(&runtime, ConversationScope::Normal, &turn_id).await;
+        let result = resume_input_committed_turn(
+            &runtime,
+            ConversationScope::Normal,
+            &turn_id,
+            state.config_manager.current_blocking(),
+        )
+        .await;
         assert!(result.is_ok(), "resume should succeed: {result:?}");
 
         // Assert: the model loop ran to completion and the turn is terminal.

@@ -18,13 +18,15 @@ pub(crate) mod turn_runtime;
 pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
 pub(crate) use turn::{
-    process_turn, process_turn_with_events, resume_input_committed_turn, send_turn,
+    process_turn, process_turn_with_events, process_turn_with_events_and_snapshot,
+    resume_input_committed_turn, send_turn,
 };
 pub(crate) use turn_runtime::TurnRuntime;
 
 use crate::error::EgoPulseError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 /// A turn submitted to the [`crate::runtime::turn_scheduler::TurnScheduler`] for ordered execution.
 ///
@@ -39,6 +41,12 @@ pub(crate) struct ScheduledTurn {
     pub input: String,
     /// Origin ID: UUID tracking all turns caused by a single human input.
     pub origin_id: String,
+    /// Immutable configuration selected at turn acceptance.
+    ///
+    /// This is populated for live turns before durable acceptance and carried
+    /// through the in-memory scheduler so a queued turn does not switch to a
+    /// newer configuration generation before execution.
+    pub config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
 }
 
 impl ScheduledTurn {
@@ -153,6 +161,7 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
         context: payload.context.clone(),
         input: payload.input,
         origin_id: payload.context.origin_id.clone(),
+        config_snapshot: None,
     })
 }
 
@@ -342,6 +351,7 @@ mod tests {
             context,
             input: "hello world".to_string(),
             origin_id: "origin-1".to_string(),
+            config_snapshot: None,
         };
 
         // Act

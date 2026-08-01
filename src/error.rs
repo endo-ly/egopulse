@@ -133,6 +133,32 @@ pub enum ConfigError {
     },
     #[error("config_parse_failed: {path}: {detail}")]
     ConfigParseFailed { path: PathBuf, detail: String },
+    /// The persisted configuration changed after the caller read it. Refresh
+    /// the current snapshot and retry the update with its fingerprint.
+    #[error("config_conflict: expected_fingerprint={expected} current_fingerprint={current}")]
+    ConfigConflict { expected: String, current: String },
+    /// The source changed while it was being loaded for hot reload. Wait for
+    /// the file to become stable and let the watcher retry.
+    #[error("config_source_changed_during_reload")]
+    ConfigSourceChangedDuringReload,
+    /// YAML and `.env` were written from different persistence generations.
+    #[error("config_source_generation_mismatch: yaml={yaml:?} dotenv={dotenv:?}")]
+    ConfigSourceGenerationMismatch {
+        yaml: Option<String>,
+        dotenv: Option<String>,
+    },
+    /// The candidate changes a field that requires a process restart. Restore
+    /// the field and restart the process when that change is required.
+    #[error("config_reload_forbidden: field={field}; restart required")]
+    ConfigReloadForbidden { field: String },
+    /// No persisted configuration path is available for a file-backed update.
+    /// Use a file-backed runtime or configure the requested path first.
+    #[error("config_path_unavailable")]
+    ConfigPathUnavailable,
+    /// The configuration revision counter cannot represent another revision.
+    /// Restart the process with a fresh runtime state.
+    #[error("config_revision_exhausted")]
+    ConfigRevisionExhausted,
     #[error("missing_default_provider")]
     MissingDefaultProvider,
     #[error("missing_providers")]
