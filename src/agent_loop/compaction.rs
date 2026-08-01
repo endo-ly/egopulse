@@ -351,7 +351,7 @@ async fn summarize_old_messages(
                     .record(calibration_key, raw_estimate, usage.input_tokens)
                     .await;
             }
-            log_summarizer_usage(state, context, chat_id, llm, &response, raw_estimate);
+            log_summarizer_usage(state, context, chat_id, llm, &response, raw_estimate).await;
             strip_thinking(&response.content)
         }
         Err(SummarizeError::Provider(error)) => {
@@ -397,7 +397,7 @@ async fn send_summary_request(
     .map_err(SummarizeError::Provider)
 }
 
-fn log_summarizer_usage(
+async fn log_summarizer_usage(
     state: &TurnRuntime,
     context: &SurfaceContext,
     chat_id: i64,
@@ -418,23 +418,21 @@ fn log_summarizer_usage(
     let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
-    tokio::spawn(async move {
-        let _ = crate::storage::call_blocking(db, move |db| {
-            db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
-                chat_id,
-                caller_channel: &channel,
-                provider: &provider,
-                model: &model,
-                input_tokens,
-                output_tokens,
-                request_kind: "compaction",
-                estimated_tokens,
-                has_tools: false,
-            })
+    let _ = crate::storage::call_blocking(db, move |db| {
+        db.log_llm_usage(&crate::storage::LlmUsageLogEntry {
+            chat_id,
+            caller_channel: &channel,
+            provider: &provider,
+            model: &model,
+            input_tokens,
+            output_tokens,
+            request_kind: "compaction",
+            estimated_tokens,
+            has_tools: false,
         })
-        .await
-        .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
-    });
+    })
+    .await
+    .inspect_err(|e| warn!(error = %e, "llm usage logging failed"));
 }
 
 fn build_compaction_result(input: CompactionResultInput<'_>) -> Vec<Message> {
