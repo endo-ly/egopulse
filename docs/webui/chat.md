@@ -139,7 +139,7 @@ Timeline 内キーワード検索機能。
 
 ### 4.5 Pulse 通知の識別
 
-Pulse によって Home Surface へ送信されたメッセージは、通常の assistant メッセージとして保存される（[pulse.md §10](../pulse.md#10-出力仕様)）。
+Pulse によって Home Surface へ送信されたメッセージは、通常の assistant メッセージとして保存される（[pulse.md §9](../pulse.md#9-出力保存仕様)）。
 
 `/api/history` レスポンスの各メッセージに `message_kind` フィールドを追加し、Pulse 由来のメッセージには `message_kind: "pulse_notification"` を付ける。バックエンド側で `messages` テーブルの `message_kind` カラム値を返す。
 

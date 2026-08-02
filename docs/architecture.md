@@ -22,7 +22,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 ```text
 ┌──────────────────────────────────────────────────────────┐
 │                        main.rs                           │
-│   CLI エントリポイント (chat / run / ask / setup / gateway)  │
+│   CLI エントリポイント (ask/chat/run/setup/gateway/update/sleep/events)  │
 └────────────┬──────────────────────────┬──────────────────┘
              │                          │
     ┌────────▼────────┐        ┌────────▼────────┐
@@ -76,9 +76,12 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 
 ```
 src/
-├── main.rs              # CLI エントリポイント
+├── main.rs              # CLI エントリポイント (ask / chat / run / setup / gateway / update / sleep / events)
 ├── lib.rs               # 全モジュールの公開インターフェース
 ├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
+├── assets/              # 組み込みスキル等のアセット実体
+├── builtin_skills.rs    # 組み込みスキル定義
+├── default_soul.md      # デフォルト SOUL.md テンプレート
 │
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, build_app_state(), start_channels()
@@ -86,6 +89,7 @@ src/
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
 │   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
+│   ├── config_reload.rs # Config ホットリロード（YAML + .env 監視）
 │   ├── tool_progress.rs # ツール進捗表示コーディネータ
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
@@ -96,8 +100,13 @@ src/
 ├── agent_loop/          # エージェントループ
 │   ├── mod.rs           # SurfaceContext, process_turn()
 │   ├── turn.rs          # LLM 呼び出し、ツール実行、compaction
+│   ├── turn_runtime.rs  # TurnRuntime (Turn の受付・状態遷移・model/tool loop・復旧判断)
+│   ├── tool_phase.rs    # Tool 実行 phase
 │   ├── session.rs       # セッションロード・保存、競合解決
+│   ├── session_snapshot.rs # セッションスナップショット構築
+│   ├── event.rs         # AgentEvent 型
 │   ├── prompt_builder.rs # システムプロンプト構築
+│   ├── prompts/         # プロンプトテンプレート
 │   ├── compaction.rs    # コンテキスト圧縮 + アーカイブ
 │   ├── formatting.rs    # 出力フォーマット
 │   ├── guards.rs        # 各種チェック
@@ -110,29 +119,53 @@ src/
 │   ├── discord.rs       # Discord ボット
 │   ├── telegram.rs      # Telegram ボット
 │   ├── tui.rs           # TUI チャネル
+│   ├── voice.rs         # Voice チャネル (Bearer 認証 REST)
 │   ├── web/             # Web サーバー (Axum, SSE, WebSocket)
 │   └── utils/           # チャネル共通ユーティリティ
 │
+├── webhooks/            # Webhook Trigger
+│   ├── mod.rs           # モジュール公開
+│   ├── handler.rs       # Webhook 受付・request_key 導出・Turn 投入
+│   ├── formatter.rs     # 応答フォーマット
+│   └── error.rs         # エラー型
+│
 ├── llm/                 # LLM プロバイダー抽象化
-│   ├── mod.rs           # LlmProvider trait, OpenAI 互換クライアント
+│   ├── mod.rs           # LlmProvider trait
+│   ├── openai.rs        # OpenAI 互換クライアント
+│   ├── responses.rs     # Responses API 呼び出し
+│   ├── messages.rs      # Messages API 呼び出し
+│   ├── sse.rs           # SSE ストリーム解析
+│   ├── calibration.rs   # prompt token 推定補正 (EMA)
 │   └── codex_auth.rs    # Codex auth 解決、AUTH_CACHE
 │
 ├── config/              # 設定管理
 │   ├── mod.rs           # 型定義、公開ファサード
+│   ├── types.rs         # Config 型定義
+│   ├── manager.rs       # ConfigManager (snapshot + 更新境界)
 │   ├── loader.rs        # YAML 読み込み、正規化、検証
 │   ├── persist.rs       # YAML 書き出し、アトミック書込
 │   ├── resolve.rs       # モデル解決、チャネルアクセサ
-│   └── secret_ref.rs    # SecretRef 型、.env 読み書き
+│   ├── web_fetch.rs     # Web Fetch 設定
+│   ├── secret_ref.rs    # SecretRef 型、.env 読み書き
+│   └── tests.rs         # 設定テスト
 │
 ├── storage/             # SQLite 永続化
 │   ├── mod.rs           # Database struct, 型定義, new(), call_blocking()
 │   ├── migration.rs     # スキーマ DDL, バージョン管理マイグレーション
-│   └── queries.rs       # 全 CRUD クエリ (chats, messages, sessions, tool_calls, LLM usage)
+│   ├── chat.rs          # chats / messages / sessions クエリ
+│   ├── turn.rs          # turn_runs / turn_origins クエリ
+│   ├── tool.rs          # tool_calls 実行台帳クエリ
+│   ├── sleep.rs         # sleep 系クエリ
+│   ├── pulse.rs         # pulse 系クエリ
+│   ├── episode.rs       # episode 系クエリ
+│   ├── llm_usage.rs     # LLM usage クエリ
+│   └── backup.rs        # VACUUM INTO バックアップ
 │
 ├── tools/               # ツールシステム
 │   ├── mod.rs           # ToolRegistry, Tool trait, is_read_only()
 │   ├── mcp.rs           # MCP クライアント (外部ツールサーバー接続)
 │   ├── activate_skill.rs # スキル遅延読み込み
+│   ├── agent_send.rs    # エージェント間通信ツール
 │   ├── command_guard.rs # bash コマンド検閲
 │   ├── path_guard.rs    # 機密パスブロック
 │   ├── sanitizer.rs     # 出力リダクション
@@ -140,17 +173,34 @@ src/
 │   ├── send_message.rs  # メッセージ送信ツール
 │   ├── shell.rs         # bash 実行ツール
 │   ├── files.rs         # read / write / edit ツール
-│   └── text.rs          # テキスト処理ツール
+│   ├── text.rs          # テキスト処理ツール
+│   └── web_fetch/       # web_fetch ツール (URL 検証・コンテンツ整形)
+│
+├── pulse/               # Pulse（注意活性化）
+│   ├── mod.rs           # モジュール公開
+│   ├── scheduler.rs     # 時間・due_key 判定の Scheduler
+│   ├── definition.rs    # PULSE.md パース・検証
+│   ├── capsule.rs       # Pulse Capsule 構築・実行
+│   ├── runner.rs        # Activation 実行・PULSE_OK 判定
+│   ├── output.rs        # 出力・保存処理
+│   └── pulse_core_contract.md # Pulse Core Contract（LLM 用）
 │
 ├── setup/               # 初回セットアップウィザード
+│
+├── sleep/               # Sleep Batch（長期記憶処理）
+│   ├── mod.rs           # エラー型（SleepBatchError）
+│   ├── orchestrator.rs  # Sleep batch 実行・排他制御
+│   ├── scheduler.rs     # 自動 scheduler による定期実行
+│   ├── event_extraction.rs # Step 1: イベント抽出
+│   ├── event_rollup.rs  # Step 2: 週次/月次ロールアップ
+│   ├── episodic_renderer.rs # エピソード記憶の描画
+│   ├── memory_update.rs # Step 3: 長期記憶更新
+│   ├── prompt.rs        # プロンプト構築
+│   └── prompts/         # LLM 用プロンプト本文
 │
 ├── memory.rs            # 長期記憶 bundle の読み込み・公開・クラッシュリカバリ
 ├── skills.rs            # スキル管理 (発見・読み込み・カタログ生成)
 ├── slash_commands.rs    # slash command dispatcher、LLM プロファイル管理
-├── sleep/               # sleep batch 実行・scheduler
-│   ├── batch.rs         # 手動 sleep batch の排他実行と監査記録
-│   ├── scheduler.rs     # 自動 scheduler による定期 sleep batch 実行
-│   └── prompt.md        # sleep batch 用プロンプト本文
 ├── error.rs             # エラー型
 ├── test_env.rs          # テスト用 EnvVarGuard、ENV_MUTEX
 └── test_util.rs         # テストユーティリティ
@@ -168,8 +218,8 @@ src/
 pub struct AppState {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,  // None = 秘密モード無効
-    pub(crate) config_manager: Arc<ConfigManager>,  // snapshot + update boundary
     pub(crate) config: Config,                     // startup-only structural settings
+    pub(crate) config_manager: Arc<ConfigManager>,  // snapshot + update boundary
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -181,10 +231,12 @@ pub struct AppState {
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn LlmProvider>>>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
-    pub(crate) turn_sender: mpsc::Sender<PendingAgentTurn>,
     pub(crate) turn_scheduler: Arc<TurnScheduler>,
     pub(crate) turn_tracker: Arc<TurnTracker>,
     pub(crate) runtime_status: Arc<RuntimeStatus>,  // インメモリヘルスサマリー
+    pub(crate) supervisor: Arc<RuntimeSupervisor>,  // 長寿命 task と Turn の所有
+    pub(crate) usage_calibrator: Arc<UsageCalibrator>, // token 推定補正
+    _sealed: (),
 }
 
 impl AppState {
@@ -209,9 +261,9 @@ TurnRuntime
 ├── ConfigManager          — immutable Config snapshot、更新境界、変更通知（revision / fingerprint）
 ├── Database
 │   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
-│   ├── turn.rs            — turn_runs の作成・重複受付防止・状態遷移
+│   ├── turn.rs            — turn_runs / turn_origins の作成・重複受付防止・状態遷移
 │   └── tool.rs            — tool_calls の claim・状態更新・結果再利用
-├── ProviderRegistry       — Config snapshot 対応の Provider 解決と cache
+├── llm_cache              — Config snapshot 対応の Provider 解決と cache（resolve_llm_for_agent_channel）
 └── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
 ```
 
@@ -237,7 +289,7 @@ pub(crate) struct SurfaceContext {
 }
 ```
 
-`channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §3](./config.md#3-モデル解決チェーン)）。
+`channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §4](./config.md#4-モデル解決チェーン)）。
 
 ---
 
@@ -313,7 +365,7 @@ pub(crate) struct SurfaceContext {
        ├─ Web server 起動 (supervisor 経由)
        ├─ Discord bot 起動 (supervisor 経由 × bot 数)
        ├─ Telegram bot 起動 (supervisor 経由)
-       ├─ Config source watcher 起動 (YAML + .env, 250ms poll + 300ms debounce)
+       ├─ Config source watcher 起動 (YAML + .env, 250ms poll + 500ms debounce)
        ├─ Sleep / Pulse / Backup scheduler 起動 (supervisor 経由)
        │
        └─ 監視ループ (500ms 間隔で critical task 終了をチェック)
@@ -364,10 +416,10 @@ deadline 付きで停止する。
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
-| **Sleep Batch** | `sleep/batch.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
+| **Sleep Batch** | `sleep/orchestrator.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
-| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / scope（DB）単位 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
+| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
 | **Conversation Scope Routing** | `runtime/` / `agent_loop/turn_runtime.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnRuntime::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
@@ -375,24 +427,24 @@ deadline 付きで停止する。
 
 ---
 
-## 7.1 ConversationScope（ストレージ境界）
+### 7.1 ConversationScope（ストレージ境界）
 
 `ConversationScope` は、turn 全体のストレージ境界を決定する内部抽象である。YAML 設定の `secret: true` はユーザー向け API であり、内部では `ConversationScope::Secret` に変換される。
 
-### スコープの種類
+#### スコープの種類
 
 | スコープ | YAML 設定 | DB ファイル | Archive ディレクトリ | 用途 |
 |---|---|---|---|---|
 | `Normal` | `secret: false`（デフォルト） | `egopulse.db` | `runtime/groups/` | 通常の会話永続化 |
 | `Secret` | `secret: true` | `secret.db` | `runtime/secret_groups/` | 秘匿会話の物理隔離 |
 
-### ライフサイクル
+#### ライフサイクル
 
 1. **コンテキスト構築**: チャネルアダプタが YAML 設定の `secret: true` を読み取り、`SurfaceContext.scope = ConversationScope::Secret` を設定
 2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`TurnRuntime::storage_for(scope)` で DB + archive root を一意に解決
 3. **Turn 全体への伝播**: `SurfaceContext.scope` が `ToolExecutionContext.scope` 経由で turn 全体に伝播し、session 読込・message 保存・compaction・LLM usage log のすべてが同じスコープの DB にルーティングされる
 
-### 構造的保証
+#### 構造的保証
 
 - Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`secret.db` には接続しない
 - スコープはコンテキスト構築時に決定され、turn 中に変更されることはない

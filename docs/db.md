@@ -8,6 +8,8 @@ SQLite データベースのスキーマ・テーブル定義・マイグレー�
 2. [テーブル定義](#2-テーブル定義)
 3. [Rust 構造体マッピング](#3-rust-構造体マッピング)
 4. [設計上の注意点](#4-設計上の注意点)
+5. [secret.db（秘匿会話用データベース）](#5-secretdb秘匿会話用データベース)
+6. [バックアップ・復元](#6-バックアップ復元)
 
 ---
 
@@ -29,19 +31,14 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 ├── episode_events           — エピソード記憶台帳（Event Extraction で蓄積）
 ├── episode_rollups          — エピソード記憶の週次/月次派生要約（Call2 で生成）
 ├── memory_snapshots         — スリープ実行中のメモリファイル更新履歴（run×file log）
-└── turn_runs                — Turn実行状態機械（durable turn lifecycle）
+├── turn_runs                — Turn実行状態機械（durable turn lifecycle）
+└── turn_origins             — origin（人間入力の chain）ごとの実行 turn 数・終端理由
 ```
 
 | 項目 | 値 |
 |------|----|
-| テーブル数 | 15（データテーブル 13 + マイグレーション基盤テーブル 2） |
-| インデックス数 | 24 |
-| 外部キー制約 | 3（tool_calls.chat_id → chats.chat_id, sleep_run_steps.sleep_run_id → sleep_runs.id, memory_snapshots.run_id → sleep_runs.id） |
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数、現行 v13） |
-| DBライブラリ | rusqlite 0.37（bundled） |
-| DBファイル | `{data_dir}/egopulse.db` |
-| 接続ラッパー | `Mutex<Connection>` |
-| PRAGMA | `journal_mode=WAL`, `busy_timeout=5s` |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数）。詳細は [§4](#4-設計上の注意点) |
+| DBファイル | `{state_root}/runtime/egopulse.db` |
 
 ---
 
@@ -168,24 +165,11 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 
 ## 2. テーブル定義
 
+DDL の正本は `src/storage/migration.rs`。本節は各テーブルのカラムの意味・制約・操作を説明する。
+
 ### chats
 
 チャットメタデータとチャンネル横断のアイデンティティマッピング。
-
-```sql
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id INTEGER PRIMARY KEY,
-    chat_title TEXT,
-    chat_type TEXT NOT NULL DEFAULT 'private',
-    last_message_time TEXT NOT NULL,
-    channel TEXT,
-    external_chat_id TEXT,
-agent_id TEXT NOT NULL DEFAULT 'default'
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
-    ON chats(channel, external_chat_id);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -198,6 +182,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_channel_external_chat_id
 | agent_id | TEXT | NOT NULL DEFAULT 'default' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紜付けに使用 |
 | revision | INTEGER | NOT NULL DEFAULT 0 | 会話変更ごとに増加する整数CAS。timestamp を競合判定から排除 |
 | next_message_seq | INTEGER | NOT NULL DEFAULT 1 | 次に発行する chat 内 message sequence |
+
+**制約**:
+- `(channel, external_chat_id)` の UNIQUE インデックス。channel 横断で同じ外部チャットを二重登録しない
 
 **操作**:
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
@@ -221,30 +208,13 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 
 全チャンネルのメッセージ履歴。
 
-```sql
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
-    sender_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    sender_kind TEXT NOT NULL DEFAULT 'user',
-    timestamp TEXT NOT NULL,
-    message_kind TEXT NOT NULL DEFAULT 'message',
-    recipient_agent_id TEXT,
-    PRIMARY KEY (id, chat_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
-    ON messages(chat_id, timestamp);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | id | TEXT | PK（複合） | プラットフォーム固有のメッセージID |
 | chat_id | INTEGER | PK（複合） | chats.chat_id への参照 |
 | sender_id | TEXT | NOT NULL | 統一送信者識別子（例: `"lyre"`, `"user:discord:123"`, `"system"`, `"pulse"`） |
 | content | TEXT | NOT NULL | メッセージ本文 |
-| sender_kind | TEXT | NOT NULL DEFAULT 'user' | 送信者種別（`user`, `assistant`, `system`）。`tool` はエージェント間通信（`agent_send`）専用のレガシー値 |
+| sender_kind | TEXT | NOT NULL | 送信者種別（`user`, `assistant`, `system`）。`tool` はエージェント間通信（`agent_send`）専用のレガシー値 |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 | message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`） |
 | recipient_agent_id | TEXT | nullable | 受信エージェント ID。Multi-Agent Room で使用 |
@@ -253,12 +223,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
 | parent_message_id | TEXT | nullable | Tool Result 等が参照する親 message |
 
 **制約**:
-
-```sql
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_seq
-    ON messages(chat_id, seq)
-    WHERE seq IS NOT NULL;
-```
+- `(chat_id, seq)` の部分 UNIQUE インデックス（`WHERE seq IS NOT NULL`）
 
 NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未割当行が複数存在しても衝突しない。
 
@@ -283,14 +248,6 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 
 セッションのスナップショット。LLM の会話コンテキスト全体（ツールブロック含む）を JSON として格納。
 
-```sql
-CREATE TABLE IF NOT EXISTS sessions (
-    chat_id INTEGER PRIMARY KEY,
-    messages_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | chat_id | INTEGER | PK | chats.chat_id と1:1 |
@@ -314,26 +271,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 LLM ツール/ファンクション呼び出しの実行記録。
 
-```sql
-CREATE TABLE IF NOT EXISTS tool_calls (
-    id TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
-    message_id TEXT NOT NULL,
-    tool_name TEXT NOT NULL,
-    tool_input TEXT NOT NULL,
-    tool_output TEXT,
-    timestamp TEXT NOT NULL,
-    PRIMARY KEY (id, chat_id, message_id),
-    FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
-    ON tool_calls(chat_id);
-
-CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
-    ON tool_calls(chat_id, message_id);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | id | TEXT | NOT NULL, composite PK | プロバイダ由来のツール呼び出しID |
@@ -354,12 +291,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
 | error_message | TEXT | nullable | sanitized error 概要 |
 
 **制約**:
-
-```sql
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_turn_id
-    ON tool_calls(turn_id, id)
-    WHERE turn_id IS NOT NULL;
-```
+- `(turn_id, id)` の部分 UNIQUE インデックス（`WHERE turn_id IS NOT NULL`）
 
 `turn_id + tool_call_id` で Tool Call を一意にし、成功結果を再利用する。NULL の `turn_id`（legacy 行）は index 対象外。
 
@@ -380,29 +312,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_turn_id
 ### llm_usage_logs
 
 LLM API の使用量ログ。トークン消費の追跡とコスト管理に使用。
-
-```sql
-CREATE TABLE IF NOT EXISTS llm_usage_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    caller_channel TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    total_tokens INTEGER NOT NULL,
-    request_kind TEXT NOT NULL DEFAULT 'agent_loop',
-    estimated_tokens INTEGER NOT NULL DEFAULT 0,
-    has_tools INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_llm_usage_chat_created
-    ON llm_usage_logs(chat_id, created_at);
-
-CREATE INDEX IF NOT EXISTS idx_llm_usage_created
-    ON llm_usage_logs(created_at);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -430,29 +339,6 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_created
 ### sleep_runs
 
 スリープバッチ（記憶整理処理）の実行履歴。
-
-```sql
-CREATE TABLE sleep_runs (
-    id                  TEXT PRIMARY KEY,
-    agent_id            TEXT NOT NULL,
-    status              TEXT NOT NULL,
-    trigger_type        TEXT NOT NULL,
-    started_at          TEXT NOT NULL,
-    finished_at         TEXT,
-    source_chats_json   TEXT NOT NULL DEFAULT '[]',
-    source_digest_md    TEXT,
-    input_tokens        INTEGER NOT NULL DEFAULT 0,
-    output_tokens       INTEGER NOT NULL DEFAULT 0,
-    total_tokens        INTEGER NOT NULL DEFAULT 0,
-    error_message       TEXT
-);
-
-CREATE INDEX idx_sleep_runs_agent_started
-    ON sleep_runs(agent_id, started_at);
-
-CREATE INDEX idx_sleep_runs_agent_status
-    ON sleep_runs(agent_id, status);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -491,25 +377,6 @@ CREATE INDEX idx_sleep_runs_agent_status
 
 Sleep Batch の step 別実行 log。run 内の各処理工程（event_extraction, episodic_update, semantic_update, prospective_update）の status/token/error を保持。
 
-```sql
-CREATE TABLE IF NOT EXISTS sleep_run_steps (
-    sleep_run_id    TEXT NOT NULL,
-    step_name       TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update', 'prospective_update')),
-    status          TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
-    started_at      TEXT,
-    finished_at     TEXT,
-    input_tokens    INTEGER NOT NULL DEFAULT 0,
-    output_tokens   INTEGER NOT NULL DEFAULT 0,
-    error_message   TEXT,
-    metadata_json   TEXT,
-    PRIMARY KEY (sleep_run_id, step_name),
-    FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
-    ON sleep_run_steps(step_name, status, started_at);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | sleep_run_id | TEXT | PK（複合）, FK CASCADE | sleep_runs.id への参照 |
@@ -534,25 +401,6 @@ CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
 ### sleep_step_checkpoints
 
 agent×step×source 単位の処理 checkpoint。各 step が次回どこから入力を再開するかを保持する state テーブル。
-
-```sql
-CREATE TABLE IF NOT EXISTS sleep_step_checkpoints (
-    agent_id     TEXT NOT NULL,
-    step_name    TEXT NOT NULL,
-    source_kind  TEXT NOT NULL,
-    source_id    TEXT NOT NULL,
-    cursor_at    TEXT NOT NULL,
-    cursor_id    TEXT NOT NULL,
-    updated_at   TEXT NOT NULL,
-    PRIMARY KEY (agent_id, step_name, source_kind, source_id),
-    CHECK (step_name IN ('event_extraction', 'semantic_update', 'prospective_update')),
-    CHECK (source_kind IN ('messages', 'episode_events')),
-    CHECK (
-        (step_name IN ('event_extraction', 'prospective_update') AND source_kind = 'messages')
-        OR (step_name = 'semantic_update' AND source_kind = 'episode_events')
-    )
-);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -580,38 +428,12 @@ CREATE TABLE IF NOT EXISTS sleep_step_checkpoints (
 
 Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知紐づけに使用。
 
-```sql
-CREATE TABLE IF NOT EXISTS pulse_runs (
-    id            TEXT PRIMARY KEY,
-    agent_id      TEXT NOT NULL,
-    intention_id  TEXT NOT NULL,
-    due_key       TEXT NOT NULL,
-    chat_id       INTEGER,
-    message_id    TEXT,
-    status        TEXT NOT NULL,
-    started_at    TEXT NOT NULL,
-    finished_at   TEXT,
-    output_kind   TEXT,
-    output_text   TEXT,
-    error_message TEXT
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pulse_runs_due
-    ON pulse_runs(agent_id, intention_id, due_key);
-
-CREATE INDEX IF NOT EXISTS idx_pulse_runs_agent_started
-    ON pulse_runs(agent_id, started_at);
-
-CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
-    ON pulse_runs(chat_id);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | id | TEXT | PK | UUID v4 |
 | agent_id | TEXT | NOT NULL | エージェント識別子 |
 | intention_id | TEXT | NOT NULL | due になった intention の ID |
-| due_key | TEXT | NOT NULL | 重複実行防止キー |
+| due_key | TEXT | NOT NULL, UNIQUE* | 重複実行防止キー |
 | chat_id | INTEGER | nullable | 通知先の通常 chat_id。silent の場合 null |
 | message_id | TEXT | nullable | 保存した assistant message ID。silent の場合 null |
 | status | TEXT | NOT NULL | 実行状態（running/success/failed/skipped） |
@@ -620,6 +442,8 @@ CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
 | output_kind | TEXT | nullable | 出力種別（silent/notify） |
 | output_text | TEXT | nullable | LLM 出力テキスト |
 | error_message | TEXT | nullable | エラーメッセージ |
+
+*UNIQUE 制約は `(agent_id, intention_id, due_key)` の複合。同一 intention の同一 due の二重実行を防ぐ。
 
 **操作**:
 - `try_create_pulse_run(agent_id, intention_id, due_key)` — INSERT（status=running, id/started_at 自動生成）
@@ -635,27 +459,6 @@ CREATE INDEX IF NOT EXISTS idx_pulse_runs_chat_id
 ### memory_snapshots
 
 スリープ実行中のメモリファイル更新履歴。各 run についてファイル単位の aggregate snapshot（before/after）を記録する。
-
-```sql
-CREATE TABLE memory_snapshots (
-    id              TEXT PRIMARY KEY,
-    run_id          TEXT NOT NULL,
-    agent_id        TEXT NOT NULL,
-    file            TEXT NOT NULL,
-    content_before  TEXT NOT NULL,
-    content_after   TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE (run_id, file),
-    FOREIGN KEY (run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE,
-    CHECK (file IN ('episodic', 'semantic', 'prospective'))
-);
-
-CREATE INDEX idx_memory_snapshots_run_id
-    ON memory_snapshots(run_id);
-
-CREATE INDEX idx_memory_snapshots_agent_created
-    ON memory_snapshots(agent_id, created_at);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -687,42 +490,6 @@ CREATE INDEX idx_memory_snapshots_agent_created
 ### episode_events
 
 エピソード記憶の台帳（正本）。Sleep Batch の Event Extraction で append-only に蓄積される。
-
-```sql
-CREATE TABLE IF NOT EXISTS episode_events (
-    id               TEXT PRIMARY KEY,
-    agent_id         TEXT NOT NULL,
-    experienced_at   TEXT NOT NULL,
-    encoded_at       TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    title            TEXT NOT NULL,
-    body_md          TEXT NOT NULL,
-    ripple_strength  INTEGER NOT NULL DEFAULT 3,
-    certainty        TEXT NOT NULL DEFAULT 'stated',
-    sleep_run_id     TEXT NOT NULL,
-    source_refs_json TEXT,
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL,
-    CHECK (kind IN (
-        'self', 'relationship', 'world', 'feat',
-        'anomaly', 'decision', 'insight', 'rhythm'
-    )),
-    CHECK (ripple_strength BETWEEN 1 AND 5),
-    CHECK (certainty IN ('stated', 'derived', 'tentative'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
-    ON episode_events(agent_id, experienced_at);
-
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced
-    ON episode_events(agent_id, kind, experienced_at);
-
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced
-    ON episode_events(agent_id, ripple_strength, experienced_at);
-
-CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
-    ON episode_events(sleep_run_id);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -765,32 +532,6 @@ CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
 Call2 (Episodic View Materialization) で生成される週次・月次の派生要約。
 `episode_events` から再生成可能な派生キャッシュ。正本は `episode_events`。
 
-```sql
-CREATE TABLE IF NOT EXISTS episode_rollups (
-    id                   TEXT PRIMARY KEY,
-    agent_id             TEXT NOT NULL,
-    granularity          TEXT NOT NULL,
-    period_key           TEXT NOT NULL,
-    period_start         TEXT NOT NULL,
-    period_end_exclusive TEXT NOT NULL,
-    summary_md           TEXT NOT NULL,
-    max_ripple           INTEGER NOT NULL DEFAULT 3,
-    event_count          INTEGER NOT NULL DEFAULT 0,
-    generated_run_id     TEXT NOT NULL,
-    created_at           TEXT NOT NULL,
-    updated_at           TEXT NOT NULL,
-    CHECK (granularity IN ('week', 'month')),
-    CHECK (max_ripple BETWEEN 1 AND 5),
-    UNIQUE(agent_id, granularity, period_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_period
-    ON episode_rollups(agent_id, granularity, period_start);
-
-CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
-    ON episode_rollups(agent_id, granularity, max_ripple, period_start);
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|-----|------|------|
 | id | TEXT | PK | UUID v4 |
@@ -824,45 +565,6 @@ CREATE INDEX IF NOT EXISTS idx_episode_rollups_agent_ripple
 
 Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実行・完了・失敗・uncertain のライフサイクルを永続化し、重複受付防止と安全な再試行・復旧判断を可能にする。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
 
-```sql
-CREATE TABLE IF NOT EXISTS turn_runs (
-    turn_id TEXT PRIMARY KEY,
-    chat_id INTEGER NOT NULL,
-    request_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN (
-        'accepted','input_committed','model_pending','model_completed',
-        'tools_pending','tools_completed','completed','failed','cancelled','uncertain'
-    )),
-    current_iteration INTEGER NOT NULL DEFAULT 0,
-    input_message_id TEXT,
-    final_message_id TEXT,
-    config_revision INTEGER NOT NULL DEFAULT 0,
-    config_fingerprint TEXT,
-    model_request_hash TEXT,
-    model_attempt INTEGER NOT NULL DEFAULT 0,
-    output_published INTEGER NOT NULL DEFAULT 0,
-    error_kind TEXT,
-    error_message TEXT,
-    accepted_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    finished_at TEXT,
-    request_payload_hash TEXT,
-    scheduled_request_json TEXT,
-    origin_id TEXT,
-    origin_stop_reason TEXT,
-    UNIQUE(chat_id, request_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_turn_runs_chat ON turn_runs(chat_id);
-CREATE INDEX IF NOT EXISTS idx_turn_runs_state ON turn_runs(state);
-CREATE INDEX IF NOT EXISTS idx_turn_runs_dispatch
-    ON turn_runs(state, accepted_at, turn_id)
-    WHERE scheduled_request_json IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
-    ON turn_runs(origin_id, accepted_at)
-    WHERE origin_id IS NOT NULL;
-```
-
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | turn_id | TEXT | PK | Turn 一意ID（UUID v4） |
@@ -885,7 +587,6 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
 | request_payload_hash | TEXT | nullable | 受付時の user input 本文 hash。再受付で同一 `request_key` に異なる本文が渡された場合に拒否する |
 | scheduled_request_json | TEXT | nullable | accepted Turn の実行要求（`PersistedScheduledTurn` の versioned JSON）。再起動後に Dispatcher がこれから再実行する |
 | origin_id | TEXT | nullable | Agent Send chain の identity。root Turn は自身の `turn_id`、子 Turn は親の `origin_id` を継承する |
-| origin_stop_reason | TEXT | nullable | chain を停止させた理由（LLM 失敗・深さ超過など）。terminal した chain の再開抑止に用いる |
 
 *UNIQUE 制約は `(chat_id, request_key)` の複合。同じ受付を再受付した場合は新規 Turn を作らず既存 Turn を返す。
 
@@ -913,16 +614,27 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_origin
 
 ---
 
+### turn_origins
+
+origin（人間入力の chain）の実行状態の正本。chain が停止条件（LLM failure / chain depth / turn count / invalid agent）に到達した際、その理由を永続化し、再起動後に `TurnTracker` が rehydrate することで終了した chain の再実行を防ぐ。詳細は [session-lifecycle.md §1.5](./session-lifecycle.md#15-turnscheduler-による同時実行制御) を参照。
+
+| カラム | 型 | 制約 | 説明 |
+|--------|----|------|------|
+| origin_id | TEXT | PK | chain の identity（UUID） |
+| executed_turn_count | INTEGER | NOT NULL DEFAULT 0 | この origin で実行された Turn 数 |
+| terminal_reason | TEXT | nullable | chain を停止させた理由（`chain_depth_exceeded` / `turn_count_exceeded` / `agent_not_found` / `llm_failure`） |
+| updated_at | TEXT | NOT NULL | 最終更新時刻 |
+
+**設計ポイント**:
+- Turn の失敗と origin の終端理由は同一 transaction で記録される
+- `origin_id` が `turn_runs` から `turn_origins` を引け、終端済み chain の再実行を防ぐ
+- Normal / Secret 両 DB に適用される
+
+---
+
 ### db_meta
 
 スキーマバージョンの key-value ストア。現在は `schema_version` のみ格納。
-
-```sql
-CREATE TABLE IF NOT EXISTS db_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -938,14 +650,6 @@ CREATE TABLE IF NOT EXISTS db_meta (
 ### schema_migrations
 
 マイグレーションの適用履歴。各バージョンの適用日時と注記を保持。
-
-```sql
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL,
-    note TEXT
-);
-```
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
@@ -1000,7 +704,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `12`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `15`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -1011,122 +715,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-```rust
-// 現行の v2 -> v3 例（storage.rs 内）
-// if version < 3 {
-//     let tx = conn.unchecked_transaction()?;
-//     tx.execute_batch(
-//         "DROP INDEX IF EXISTS idx_tool_calls_chat_id;
-//         DROP INDEX IF EXISTS idx_tool_calls_chat_message_id;
-//
-//         CREATE TABLE IF NOT EXISTS tool_calls_v3 (
-//             id TEXT NOT NULL,
-//             chat_id INTEGER NOT NULL,
-//             message_id TEXT NOT NULL,
-//             tool_name TEXT NOT NULL,
-//             tool_input TEXT NOT NULL,
-//             tool_output TEXT,
-//             timestamp TEXT NOT NULL,
-//             PRIMARY KEY (id, chat_id, message_id),
-//             FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-//         );
-//
-//         INSERT OR IGNORE INTO tool_calls_v3
-//             (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
-//         SELECT
-//             id,
-//             COALESCE(chat_id, 0),
-//             COALESCE(message_id, ''),
-//             COALESCE(tool_name, ''),
-//             COALESCE(tool_input, ''),
-//             tool_output,
-//             COALESCE(timestamp, '')
-//         FROM tool_calls;
-//
-//         DROP TABLE tool_calls;
-//         ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
-//
-//         CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_id
-//             ON tool_calls(chat_id);
-//
-//         CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_message_id
-//             ON tool_calls(chat_id, message_id);",
-//     )?;
-//     set_schema_version_in_tx(&tx, 3, "scope tool call uniqueness to chat and assistant message")?;
-//     tx.commit()?;
-//     version = 3;
-// }
-//
-// // v3 -> v4: agent_id カラム追加
-// if version < 4 {
-//     conn.execute_batch(
-//         "ALTER TABLE chats ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default';",
-//     )?;
-//     set_schema_version_in_tx(&tx, 4, "add NOT NULL agent_id to chats (default: default)")?;
-//     version = 4;
-// }
-```
-
-> **Note**: v8/v9 は旧系統のマイグレーション履歴（参照用）。現行のコードラインでは v1 から v13 までを順に適用する。
-
-#### v8: remove bot_id from Discord session external_chat_id (旧系統)
-
-Discord Multi-Agent Room の二層セッションアーキテクチャ導入に伴い、`chats.external_chat_id` から `:bot:<bot_id>` セグメントを除去する。
-
-**変換例**: `discord:123:bot:main:agent:lyre` → `discord:123:agent:lyre`
-
-**対象**: `channel = 'discord'` かつ `external_chat_id LIKE '%:bot:%:agent:%'` のレコード
-
-**処理**:
-1. `pragma_table_info` で `external_chat_id` カラムの存在を確認（v1 DB からの段階的マイグレーション対応）
-2. 対象レコードをフェッチし、Rust 側で `:bot:<bot_id>` セグメントを除去
-3. `UPDATE chats SET external_chat_id = ? WHERE rowid = ?`
-
-**非対象**: `channel != 'discord'` のレコード、既に新形式のレコードは変更なし
-
-**特徴**:
-- 外部ファイル（SQL マイグレーションファイル）なし。DDL は Rust コードに直接埋め込み
-- 外部クレート（refinery, sqlx 等）への依存なし
-- 再起動時は適用済みバージョンまでスキップされる（冪等）
-
-#### v9: add pulse_runs table (旧系統)
-
-Pulse Phase 1 (Temporal Activation) の実行履歴テーブルを追加。
+> **Note**: 現行のコードラインでは v1 から v15 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 
 Event Extraction の保存先として `episode_events` テーブルを新規追加。CHECK 制約と 4 つの複合インデックスを含む。
-
-```sql
-CREATE TABLE IF NOT EXISTS episode_events (
-    id               TEXT PRIMARY KEY,
-    agent_id         TEXT NOT NULL,
-    experienced_at   TEXT NOT NULL,
-    encoded_at       TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    title            TEXT NOT NULL,
-    body_md          TEXT NOT NULL,
-    ripple_strength  INTEGER NOT NULL DEFAULT 3,
-    certainty        TEXT NOT NULL DEFAULT 'stated',
-    sleep_run_id     TEXT NOT NULL,
-    source_refs_json TEXT,
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL,
-    CHECK (kind IN ('self', 'relationship', 'world', 'feat',
-                    'anomaly', 'decision', 'insight', 'rhythm')),
-    CHECK (ripple_strength BETWEEN 1 AND 5),
-    CHECK (certainty IN ('stated', 'derived', 'tentative'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_experienced
-    ON episode_events(agent_id, experienced_at);
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_kind_experienced
-    ON episode_events(agent_id, kind, experienced_at);
-CREATE INDEX IF NOT EXISTS idx_episode_events_agent_ripple_experienced
-    ON episode_events(agent_id, ripple_strength, experienced_at);
-CREATE INDEX IF NOT EXISTS idx_episode_events_sleep_run
-    ON episode_events(sleep_run_id);
-```
 
 **特徴**:
 - CHECK 制約で kind（8種）、ripple_strength（1-5）、certainty（3種）を DB レベルで検証
@@ -1165,9 +758,9 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 明示的な FK は `tool_calls.chat_id`、`sleep_run_steps.sleep_run_id`、`memory_snapshots.run_id` の 3 つ。`messages.chat_id` や `sessions.chat_id` には FK がない。整合性はアプリケーション層で担保。
 
-### CASCADE なし
+### CASCADE の適用範囲
 
-`ON DELETE` が一切定義されていない。チャット削除時に messages / sessions / tool_calls を手動でクリーンアップする必要がある。
+`ON DELETE CASCADE` は `sleep_run_steps.sleep_run_id` と `memory_snapshots.run_id` の 2 箇所に定義されている（親の `sleep_runs` 削除時に子を連鎖削除）。`messages.chat_id` や `sessions.chat_id`、`tool_calls.chat_id` には CASCADE がないため、チャット削除時に messages / sessions / tool_calls は手動でクリーンアップする必要がある。
 
 ---
 
@@ -1179,12 +772,9 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 | 項目 | 値 |
 |------|----|
-| ファイルパス | `{data_dir}/secret.db` |
+| ファイルパス | `{state_root}/runtime/secret.db` |
 | 初期化条件 | `channels.discord.channels.*` または `channels.telegram.telegram_channels.*` に `secret: true` エントリが1件以上ある場合 |
-| テーブル数 | 8（`chats`, `messages`, `sessions`, `tool_calls`, `llm_usage_logs`, `turn_runs`, `db_meta`, `schema_migrations`） |
-| スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数（現行 v4）。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
-| DBライブラリ | `egopulse.db` と同一（rusqlite 0.37 bundled） |
-| PRAGMA | `journal_mode=WAL`, `busy_timeout=5s` |
+| スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
 
 ### 5.2 テーブル構成
 
@@ -1197,6 +787,8 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 | `sessions` | `egopulse.db.sessions` と同 schema | `messages_json` に tool call block も包含されるため LLM context 復元に影響なし |
 | `tool_calls` | `egopulse.db.tool_calls` と同 schema | Secret スコープの Tool 実行台帳。claim・input hash・状態遷移・結果保存を担い、Secret Tool の入出力が通常 DB へ漏れない |
 | `llm_usage_logs` | `egopulse.db.llm_usage_logs` と同 schema | この DB 内のレコードはすべて Secret スコープとして扱われる |
+| `turn_runs` | `egopulse.db.turn_runs` と同 schema | Secret スコープの Turn 状態機械 |
+| `turn_origins` | `egopulse.db.turn_origins` と同 schema | Secret スコープの origin 実行状態 |
 | `db_meta` | `egopulse.db.db_meta` と同 schema | `SECRET_SCHEMA_VERSION` を管理 |
 | `schema_migrations` | `egopulse.db.schema_migrations` と同 schema | |
 
@@ -1207,10 +799,6 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 ### 5.3 マイグレーション
 
 `run_migrations()` とは別に `run_secret_migrations()` を使用。`Database::new_secret()` 経由で起動時に呼ばれる。
-
-```rust
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 4;
-```
 
 `egopulse.db` 側の `SCHEMA_VERSION` と衝突しないよう、別定数・別関数で管理する。
 
@@ -1240,7 +828,7 @@ EgoPulse は SQLite の `VACUUM INTO` コマンドで一貫性スナップショ
 - **起動時バックアップ**: マイグレーション前に1回だけ実行（既存 DB が存在する場合のみ）。最も危険な瞬間（スキーマ変更前）の保険。
 - **定期バックアップ**: デフォルトで 7 日ごと 03:00（タイムゾーンは `Config.timezone`）。設定で間隔と時刻を変更可能。
 
-詳細は [config.md §2.9](./config.md#29-db-バックアップ設定dbbackup) を参照。
+詳細は [config.md §3.9](./config.md#39-db-バックアップ設定dbbackup) を参照。
 
 ### 6.3 保存先と命名規則
 

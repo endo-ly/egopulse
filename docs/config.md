@@ -363,7 +363,7 @@ STT 済みテキストを同期 HTTP API で agent runtime へ接続する設定
 - `enabled: true` かつ `channels.web.enabled: false` の場合は起動エラー
 - `auth_token` は `channels.web.auth_token` へ fallback しない
 
-HTTP 契約は [api.md §2.7](./api.md#27-voice-turn)、責務境界と session identity は [voice-channel.md](./voice-channel.md) を参照。設定例は §2 の完全 YAML 例を参照。
+HTTP 契約と責務境界は [api.md §2.8](./api.md#28-voice-turn) を参照。設定例は §2 の完全 YAML 例を参照。
 
 ### 3.7 Sleep Batch 設定（`sleep_batch`）
 
@@ -391,7 +391,7 @@ Pulse（注意活性化）のスケジューラ設定。
 
 ### 3.9 DB バックアップ設定（`db.backup`）
 
-SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md#5-バックアップ復元) も参照。
+SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md#6-バックアップ復元) も参照。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|

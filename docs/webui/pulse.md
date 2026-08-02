@@ -135,7 +135,7 @@ Sleep に準拠（`started_at` 降順、`limit` デフォルト50、EmptyState �
 
 ### 4.3 Tool 実行の表示
 
-Pulse Activation はツール使用可能（[pulse.md §14](../pulse.md#phase-1-implementation-decisions)）。LLM がツールを呼んだ場合、Chat Tab と同じ Tool Card を Output Section の下に表示する（折りたたみ inline、[chat.md §5](./chat.md#5-tool-実行カード) に従う）。
+Pulse Activation はツール使用可能（[pulse.md §8.3](../pulse.md#83-tools)）。LLM がツールを呼んだ場合、Chat Tab と同じ Tool Card を Output Section の下に表示する（折りたたみ inline、[chat.md §5](./chat.md#5-tool-実行カード) に従う）。
 
 ただし、Pulse Capsule の内部ログ（system prompt への注入内容・Recent Visible Context・Core Contract 等）は監査対象外。ユーザーに見える通知本文とツール実行結果のみを表示する。
 
@@ -200,7 +200,7 @@ Run 一覧。
 }
 ```
 
-> **注記**: `pulse_runs` テーブルにトークン量（input/output/total）のカラムは存在しない（[pulse.md §11](../pulse.md#11-db-最小仕様)）。Run 一覧・詳細でもトークン量は返さない。
+> **注記**: `pulse_runs` テーブルにトークン量（input/output/total）のカラムは存在しない（[pulse.md §10](../pulse.md#10-db-仕様)）。Run 一覧・詳細でもトークン量は返さない。
 ```
 
 #### フィールド補足
@@ -228,7 +228,7 @@ Sleep と同様、Pulse の開始・終了 WS イベント受信でキャッシ�
 
 ## 7. Pulse 通知の Chat Tab での表示
 
-Pulse が Home Surface へ通知を送った場合、そのメッセージは通常 session（chat_id）へ assistant message として保存される（[pulse.md §10](../pulse.md#10-出力仕様)）。
+Pulse が Home Surface へ通知を送った場合、そのメッセージは通常 session（chat_id）へ assistant message として保存される（[pulse.md §9](../pulse.md#9-出力保存仕様)）。
 
 Chat Tab で当該 session を開いたとき、このメッセージは [chat.md §4.5](./chat.md#45-pulse-通知の識別) に従い、通常 assistant bubble と同じレイアウトで表示される。Pulse 識別の方法は chat.md 側に委ねる。
 

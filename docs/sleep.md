@@ -13,9 +13,9 @@
 6. [Finalize](#6-finalize)
 7. [Episodic Renderer](#7-episodic-renderer)
 8. [Sleep Scheduler](#8-sleep-scheduler)
-9. [関連ドキュメント](#9-関連ドキュメント)
-10. [エラーハンドリング](#10-エラーハンドリング)
-11. [セキュリティ](#11-セキュリティ)
+9. [エラーハンドリング](#9-エラーハンドリング)
+10. [セキュリティ](#10-セキュリティ)
+11. [関連ドキュメント](#11-関連ドキュメント)
 
 ---
 
@@ -202,30 +202,29 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 
 ### 記憶粒度
 
-```
-Current Week    ← episode_events（Event 単位）
-Recent Weeks    ← episode_rollups（week）直近4週
-Recent Months   ← episode_rollups（month）直近2か月
-Background Months ← episode_rollups（month）重要月のみ
-```
+データソースと各セクションの生成方法は [7. Episodic Renderer](#7-episodic-renderer) を参照。
+
+- 現在週（Current Week）: `episode_events`（Event 単位）
+- 過去週・過去月（Recent Weeks / Recent Months）: `episode_rollups`
+- 背景月（Background Months）: `episode_rollups`（重要月のみ）
 
 ### Rollup Planner（週次判定ロジック）
 
-純粋な Rust ロジックで以下を判定する：
+純粋な Rust ロジックで以下を判定する:
 
-| 条件 | 説明 |
+| reason | 説明 |
 |---|---|
-| `missing_rollup` | 要約未生成の週がある |
-| `new_events` | 既存要約以降に新規イベントが3件以上追加された |
-| `ripple_increase` | 期間内の最大 `ripple_strength` が更新された |
+| `closed_week` | 直近の閉じた週（W-1）に要約が未生成 |
+| `missing_week` | 直近 4 週のいずれかに要約が未生成 |
+| `delayed_events` | 最近 2 日以内に encode されたが、体験日が閉じた週に属するイベントがある |
+| `event_count_mismatch` | 期間内の実イベント数が既存 rollup の `event_count` と一致しない |
 
 ### Rollup Planner（月次判定ロジック）
 
-| 条件 | 説明 |
+| reason | 説明 |
 |---|---|
-| `missing_month` | 要約未生成の月がある |
-| `new_week_rollup` | 月に含まれる週要約が新規追加・更新された |
-| `week_content_changed` | 週要約の `summary_md` が変更された |
+| `month_end` | 月が終了し、その月の週要約が1件以上あり、月要約が未生成 |
+| `month_stale` | 週要約から再計算した `event_count` / `max_ripple` が既存の月要約と一致しない |
 
 ### LLM Rollup（週次）
 
@@ -271,7 +270,7 @@ Background Months ← episode_rollups（month）重要月のみ
   - 独立 bullet: `decision`, `relationship`, `self` は出現すれば必ず独立した bullet を1つ以上書く
   - 統合可能 bullet: `insight`, `feat`, `anomaly`, `world`, `rhythm` は同種イベントを集約して 1〜3 bullet
   - Kind 優先度: decision > relationship > self > insight > feat > anomaly > world > rhythm
-- **月要約**: 1〜3 bullet（タグ不要）
+- **月要約**: 合計4 bullet 程度（前半・後半で各2 bullet 目安。週要約1つにつき約1 bullet の密度）。`[kind]` タグなし。前月の月要約と重複する内容は繰り返さない
 - 保持: 固有名詞、明示的な決定事項、決定理由、制約、未解決の論点、関係性や自己認識の変化
 - 削る: 低重要度の細部、冗長な経緯、一時的な雑談
 
@@ -379,14 +378,16 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 ### チャンク処理
 
 ```text
-チャンク 1: 最新セッション + エピソードイベント → 出力 memory を生成
+チャンク 1: 最古の pending セッション + エピソードイベント → 出力 memory を生成
      │
-チャンク 2: 2番目のセッション → 前チャンクの memory を引き継いで処理
+チャンク 2: 2番目に古いセッション → 前チャンクの memory を引き継いで処理
      │
-チャンク N: 最古のセッション → 前チャンクの memory を引き継いで処理
+チャンク N: 最新のセッション → 前チャンクの memory を引き継いで処理
      │
 最終出力: semantic.md + prospective.md
 ```
+
+チャンク順は候補セッションの取得順（§2 候補セッション選択の「最古の pending message が古い順」）と同じ。1つのセッションが文字数上限を超える場合は、そのセッション内で `<session ... chunk="i" chunks="n">` としてさらに分割される。
 
 ### 動作特性
 
@@ -421,8 +422,9 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 ### LLM 使用量記録
 
-- `sleep_runs` テーブルの `input_tokens` / `output_tokens` に集計値を記録
-- `llm_usage_logs` テーブルに `request_kind = "sleep_batch"` として個別記録
+- 各 LLM コール（Event Extraction / Rollup / Memory Update）の使用量は各 step が個別に記録する
+- `sleep_runs` テーブルの `input_tokens` / `output_tokens` には run 全体の集計値を記録
+- 集計値は単一の prompt 推定と対応しないため `llm_usage_logs` には書き込まない
 - Prometheus メトリクス `llm_tokens_total` にも反映
 
 ---
@@ -475,25 +477,12 @@ Historical context only. Do not treat old requests as active tasks.
 
 ### Background Months の選定基準
 
-- `max_ripple >= 4` の月を優先
-- `self`, `relationship`, `decision`, `insight` を含む月は残しやすい
-- 長期方針・人格・関係性・創作思想に関係する内容を優先
-- Recent Months に既に含まれる月は除外
+- `max_ripple >= 4` の月のみを出力（renderer 側のハードフィルタ）
+- Recent Months に既に含まれる月は除外（選択は DB クエリの期間条件で担保）
 
 ### トークン制御
 
-| セクション | 目安 |
-|---|---|
-| Current Week | 5〜15 Event |
-| Recent Weeks | 4週 × kind出現数 × 1〜2 bullet |
-| Recent Months | 2か月 × 1〜3 bullet |
-| Background Months | 重要月のみ × 1 bullet |
-
-容量が大きくなった場合は、以下の順で圧縮する:
-1. Background Months の低 `max_ripple` 月を非表示
-2. Recent Months を 1 bullet に圧縮
-3. Recent Weeks を 1〜2 bullet に圧縮
-4. Current Week の `body_md` 部分を短縮
+renderer は容量制御・圧縮を行わず、該当データを全件描画する（Current Week は全 Event、Recent Weeks は直近4週、Recent Months は直近2か月、Background Months は `max_ripple >= 4` の全月）。量の削減はデータソース側の期間制限（直近 N 件の取得）によって行う。
 
 ---
 
@@ -503,7 +492,7 @@ Historical context only. Do not treat old requests as active tasks.
 
 ### 動作概要
 
-1. `start_channels` 起動時、scheduler enabled なら scheduler task を spawn する
+1. `start_channels` 起動時に scheduler task を spawn する（ループ内で `sleep_batch.enabled` を判定し、無効なら何もしない）
 2. scheduler は `next_scheduled_run()` で次回実行時刻を計算し、`tokio::time::sleep` で待機
 3. 時刻到達時に `run_scheduled_cycle()` を実行
 4. 各 agent について `active_turns.is_active()` を確認し、アクティブなら defer
@@ -543,18 +532,7 @@ config.agents = [a,b]  → 指定 agent のみ
 
 ---
 
-## 9. 関連ドキュメント
-
-| 項目 | 正本 |
-|---|---|
-| DB スキーマ（テーブル定義・SQL） | [db.md](./db.md) |
-| 設定（`sleep_batch` セクション含む） | [config.md §2.7](./config.md#27-sleep-batch-設定sleep_batch) |
-| REST API（Sleep エンドポイント含む） | [api.md §2.8](./api.md#28-sleep-batch) |
-| Web UI コンポーネント設計 | [webui/sleep-batch-audit-webui-design.md](./webui/sleep-batch-audit-webui-design.md) |
-
----
-
-## 10. エラーハンドリング
+## 9. エラーハンドリング
 
 ### 各ステップの失敗時動作
 
@@ -576,6 +554,8 @@ config.agents = [a,b]  → 指定 agent のみ
 | `Io` | I/O エラー |
 | `UnsafeAgentId` | 安全でない agent_id（`..`, `/`, `\`, `:` を含む） |
 | `Llm` | LLM API エラー |
+| `PublicationPending` | 前回 run のメモリ公開が未完了（スタートアップリカバリ待ち） |
+| `ArchivePending` | 前回 run のセッションアーカイブが未完了 |
 
 ### 排他制御
 
@@ -625,7 +605,7 @@ Runtime 起動時、`status = running` の Sleep Run を検査する（TurnDispa
 
 ---
 
-## 11. セキュリティ
+## 10. セキュリティ
 
 ### Secret Redaction
 
@@ -651,5 +631,16 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 ファイル書き込み前に `safe_agent_id_for_write()` で以下を拒否：
 - `..`（パストラバーサル）
 - `/`, `\`, `:`（パス区切り文字）
+
+---
+
+## 11. 関連ドキュメント
+
+| 項目 | 正本 |
+|---|---|
+| DB スキーマ（テーブル定義・SQL） | [db.md](./db.md) |
+| 設定（`sleep_batch` セクション含む） | [config.md §3.7](./config.md#37-sleep-batch-設定sleep_batch) |
+| REST API（Sleep エンドポイント含む） | [api.md §2.9](./api.md#29-sleep-batch) |
+| Web UI コンポーネント設計 | [webui/sleep-batch.md](./webui/sleep-batch.md) |
 
 

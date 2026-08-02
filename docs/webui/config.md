@@ -205,11 +205,11 @@ API key 実体は `.env` に保存され、YAML には SecretRef として記録
 
 ### 9.1 `GET /api/config`
 
-[api.md §2.3](../api.md#23-設定) に従う。変更なし。
+[api.md §2.4](../api.md#24-設定) に従う。変更なし。
 
 ### 9.2 `PUT /api/config`
 
-[api.md §2.3](../api.md#23-設定) に従う。変更なし。
+[api.md §2.4](../api.md#24-設定) に従う。変更なし。
 
 ---
 

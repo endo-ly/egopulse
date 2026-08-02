@@ -14,6 +14,7 @@
 8. [Conversation Scope による DB Routing](#8-conversation-scope-による-db-routing)
 9. [Conflict Retry](#9-conflict-retry)
 10. [Durable Turn State](#10-durable-turn-state)
+11. [設定リファレンス](#11-設定リファレンス)
 
 ---
 
@@ -30,6 +31,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 | Discord | `discord:<channel_id>:agent:<agent_id>` | テキストチャンネル毎 | `1234567890` |
 | Telegram | `telegram:<chat_id>` | DM: ユーザー毎 / グループ: グループ毎 | `987654321` / `-1001234567890` |
 | TUI | `tui:<thread>` | セッション毎 | `tui:default` |
+| Voice | `voice:{surface}:{session_key}` | surface × session 毎 | `voice:stackchan:main` |
 
 ### 1.2 エージェント対応セッションアイデンティティ
 
@@ -120,12 +122,12 @@ execute_scheduled_turn():
 ### `chats`
 
 - 役割: chat の論理 ID と surface との対応付け
-- 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`
+- 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`, `agent_id`
 
 ### `messages`
 
 - 役割: 表示用・一覧用の message レコード（**append-only**）
-- 主な列: `id`, `chat_id`, `sender_name`, `content`, `is_from_bot`, `timestamp`
+- 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`
 - `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
 
 ### `sessions`
@@ -232,12 +234,12 @@ compaction は保存の別系統ではなく、「保存前に session を整形
 
 **要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も目標サイズを超える場合は、recent を保護したまま summary 本文だけをさらに縮める。
 
-**要約呼び出し**: 専用 system prompt（[system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
+**要約呼び出し**: 専用 system prompt（[system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
 
-**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照。
+**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照。
 
 **Compact 後の形**:
-1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §6](./system-prompt.md#6-compaction-用プロンプト)参照）
+1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）
 2. Tail messages（直近メッセージ・tool block をそのまま保持）
 
 **Role 補正**: 同じ role の plain-text message で `tool_calls` 空かつ `tool_call_id` が `None` の場合のみ merge。末尾が assistant なら除去。
@@ -365,7 +367,7 @@ Turn の受付・入力保存・model iteration・Tool 実行・完了を `turn_
 | Discord | channel／thread／platform message ID |
 | Telegram | chat ID／platform message ID |
 | Web | client request ID または user message ID |
-| Webhook | receiver ID／外部 event ID（存在しない場合は受付時 UUID） |
+| Webhook | receiver ID／payload の `event_id`・`id`・`message_id` のいずれか／存在しない場合は payload の SHA-256（先頭 8 hex、ゼロ hash 時のみ受付時 UUID） |
 | CLI / TUI | 1回の明示入力ごとに UUID |
 | Agent 間 Turn | origin ID／派生元 Turn ID／派生 sequence |
 
@@ -420,9 +422,9 @@ Dispatcher が保存済み `scheduled_request_json` の JSON 構文、必須フ�
 
 ---
 
-## 設定リファレンス
+## 11. 設定リファレンス
 
-Session Lifecycle に関連する設定フィールドは [config.md §2.1](./config.md#21-グローバル設定) を参照。
+Session Lifecycle に関連する設定フィールドは [config.md §3.1](./config.md#31-グローバル設定) を参照。
 
 | 設定 | デフォルト | 役割 |
 |------|-----------:|------|

@@ -24,7 +24,7 @@
 
 ## 1. 前提
 
-- 実装本体: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+- 実装本体: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 - workspace ルート: `~/.egopulse/workspace`
 - skills ルート: `~/.egopulse/workspace/skills`
 - path 解決は workspace 配下に制限される
@@ -75,7 +75,7 @@ MCP が有効な場合、`McpManager.create_tool_adapters()` が各 MCP tool を
 - `mcp_db_query_1_` — `query(1)` の `(` `)` が `_` に置換される
 - `mcp_a1b2c3d4` — server/tool 名の合計が 64 文字を超える場合のハッシュ短縮
 
-実装: [egopulse/src/tools/mcp_adapter.rs](../../egopulse/src/tools/mcp_adapter.rs)
+実装: [egopulse/src/tools/mcp.rs](../../egopulse/src/tools/mcp.rs)
 
 MCP の詳細は以下を参照。
 
@@ -140,7 +140,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Offset ... is beyond end of file`
   - `Failed to read file: file is not valid UTF-8 text or a supported image.`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
 
 ## 4. `write`
 
@@ -160,7 +160,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to create directories: ...`
   - `Failed to write file: ...`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
 
 ## 5. `edit`
 
@@ -194,7 +194,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `edits[i] and edits[j] overlap in <path>. Merge them into one edit or target disjoint regions.`
   - `No changes made to <path>. ...`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
 
 ## 6. `bash`
 
@@ -221,7 +221,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Command timed out after N seconds`
   - `Command exited with code N`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/shell.rs](../../egopulse/src/tools/shell.rs)
 
 ## 7. `grep`
 
@@ -253,7 +253,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to run ripgrep: ...`
   - `ripgrep exited with code N`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
 
 ## 8. `find`
 
@@ -280,7 +280,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to run fd: ...`
   - `fd exited with code N`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
 
 ## 9. `ls`
 
@@ -304,7 +304,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Not a directory: ...`
   - `Cannot read directory: ...`
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs)
+実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
 
 ## 10. `activate_skill`
 
@@ -366,7 +366,7 @@ Environment variables:
   ✗ API_SECRET (not found in env or dotenv)
 ```
 
-実装: [egopulse/src/tools.rs](../../egopulse/src/tools.rs) · [egopulse/src/skills.rs](../../egopulse/src/skills.rs)
+実装: [egopulse/src/tools/activate_skill.rs](../../egopulse/src/tools/activate_skill.rs) · [egopulse/src/skills.rs](../../egopulse/src/skills.rs)
 
 ## 11. `send_message`
 

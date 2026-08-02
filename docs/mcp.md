@@ -9,7 +9,7 @@ MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様
 3. [Config](#3-config)
 4. [Transport](#4-transport)
 5. [Tool の公開と実行](#5-tool-の公開と実行)
-6. [障害と制約](#6-障害と制約)
+6. [障害とリカバリ](#6-障害とリカバリ)
 
 ---
 

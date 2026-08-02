@@ -56,7 +56,7 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 | `--agent <AGENT>` | 対象エージェント ID。省略時は `config.default_agent` を使用 |
 | 必須設定 | `egopulse.config.yaml` が存在し、有効な provider 設定があること |
 | 終了コード | 成功時 `0`、AlreadyRunning 時 `1`（stderr にメッセージ出力） |
-| 動作 | 新規メッセージ数が閾値（≤ 16）以下の場合はスキップして終了 |
+| 動作 | 新規メッセージ数が閾値（≤ 64）以下の場合はスキップして終了 |
 
 ### 1.5 `egopulse events extract`
 
@@ -142,7 +142,7 @@ Telegram / Discord / CLI チャット / TUI / Web チャット のいずれか�
 | コマンド | 引数 | 説明 |
 |---|---|---|
 | `/status` | なし | 現在のセッション・チャネル状態を表示（provider/model/session/skills） |
-| `/restart` | なし | プロセスを再起動 |
+| `/restart` | なし | プロセスを再起動（未実装。`Not implemented yet.` を返す） |
 
 ### 2.3 各コマンドの動作詳細
 
@@ -157,9 +157,9 @@ Telegram / Discord / CLI チャット / TUI / Web チャット のいずれか�
 
 1. 現在のセッションの全メッセージを読み込み
 2. Safety Compaction の閾値チェックをバイパス（メッセージ数や推定 token に関わらず実行）
-3. Head / Middle / Tail に分割し、Middle を reference-only summary へ畳み込み
-4. アーカイブファイル（Markdown）を `data_dir/groups/<channel>/<chat_id>/conversations/` に出力
-5. 確認メッセージを返信: `"Compacted N messages."`
+3. old / recent の 2 領域に分割し、old を reference-only summary へ畳み込み（recent はそのまま保持。詳細は [session-lifecycle.md §5](./session-lifecycle.md#5-safety-compaction) 参照）
+4. アーカイブファイル（Markdown）を `<state_root>/runtime/groups/<channel>/<chat_id>/conversations/` に出力
+5. 確認メッセージを返信: `"Compacted N messages to M."`
 
 #### `/status`
 
@@ -175,13 +175,7 @@ Session: active (12 messages)
 
 #### `/restart`
 
-| 実行環境 | 動作 |
-|---|---|
-| systemd サービス (`egopulse gateway`) | `systemctl restart egopulse` を実行 |
-| フォアグラウンド (`egopulse run`) | `std::process::exit(0)` で終了（supervisor が再起動） |
-| TUI / CLI チャット | `std::process::exit(0)` で終了 |
-
-再起動後、既存のセッションは DB に永続化されているため自動的に復元される。
+未実装。`"Not implemented yet."` を返すだけで、プロセス再起動・systemd 操作は行わない。
 
 #### `/skills`
 

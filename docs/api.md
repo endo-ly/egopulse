@@ -58,15 +58,7 @@ Authorization: Bearer <token>
 GET /health
 ```
 
-#### レスポンス (200)
-
-```json
-{
-  "ok": true
-}
-```
-
-正常時は `200 OK`、DB 不良、shutdown 中、critical task failure、稼働中チャネルがない場合は `503 Service Unavailable` を返す。いずれの場合もレスポンスは `ok` フィールドだけを含む。
+正常時は `200 OK`（`{"ok": true}`）、DB 不良、shutdown 中、critical task failure、稼働中チャネルがない場合は `503 Service Unavailable` を返す。いずれの場合もレスポンスは `ok` フィールドだけを含む。
 
 ---
 
@@ -99,11 +91,7 @@ Authorization: Bearer <channels.web.auth_token>
     "discord": { "state": "starting", "last_error": null, "last_activity": null },
     "telegram": { "state": "failed", "last_error": "bot token rejected", "last_activity": null }
   },
-  "mcp": {
-    "healthy": 1,
-    "failed": 0,
-    "servers": []
-  },
+  "mcp": { "healthy": 1, "failed": 0, "servers": [] },
   "active_turns": 2,
   "recent_errors_count": 3,
   "instance_lock": { "held": true }
@@ -125,42 +113,11 @@ GET /telemetry
 Authorization: Bearer <channels.web.auth_token>
 ```
 
-#### レスポンス (200)
-
-```json
-{
-  "metrics": {
-    "egopulse_turns_total": [
-      { "labels": { "agent": "alice", "channel": "discord" }, "value": 42.0 }
-    ],
-    "egopulse_turn_errors_total": [
-      { "labels": { "kind": "llm", "agent": "alice" }, "value": 3.0 }
-    ],
-    "egopulse_llm_tokens_total": [
-      { "labels": { "direction": "input", "provider": "openrouter" }, "value": 15000.0 },
-      { "labels": { "direction": "output", "provider": "openrouter" }, "value": 3200.0 }
-    ],
-    "egopulse_tool_calls_total": [
-      { "labels": { "tool": "shell", "status": "ok" }, "value": 28.0 }
-    ],
-    "egopulse_active_turns": [
-      { "labels": {}, "value": 2.0 }
-    ]
-  },
-  "recent_turns": [
-    { "trace_id": "abc-123", "agent_id": "alice", "channel": "discord", "started_at": "2025-05-22T10:30:00Z", "duration_secs": 5.2, "ok": true }
-  ],
-  "recent_errors": [
-    { "at": "2025-05-22T10:31:00Z", "trace_id": "def-456", "error_kind": "turn_failure", "agent_id": "alice", "channel": "discord", "summary": "rate limited" }
-  ]
-}
-```
-
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `metrics` | `object` | メトリクス名 → `[{labels, value}]` のマップ |
-| `recent_turns` | `array` | 直近 100 件のターン履歴（新しい順） |
-| `recent_errors` | `array` | 直近 100 件のサニタイズ済みエラー概要（`trace_id` 付き） |
+| `metrics` | `object` | メトリクス名 → `[{labels, value}]` のマップ（`egopulse_turns_total`, `egopulse_turn_errors_total`, `egopulse_llm_tokens_total`, `egopulse_tool_calls_total`, `egopulse_active_turns`） |
+| `recent_turns` | `array` | 直近 100 件のターン履歴（新しい順）。各要素: `trace_id`, `agent_id`, `channel`, `started_at`, `duration_secs`, `ok` |
+| `recent_errors` | `array` | 直近 100 件のサニタイズ済みエラー概要。各要素: `at`, `trace_id`, `error_kind`, `agent_id`, `channel`, `summary` |
 
 ---
 
@@ -170,39 +127,6 @@ Authorization: Bearer <channels.web.auth_token>
 
 ```text
 GET /api/config
-```
-
-##### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "config": {
-    "revision": 7,
-    "fingerprint": "9f2f...",
-    "default_provider": "openrouter",
-    "default_model": null,
-    "effective_model": "anthropic/claude-sonnet-4",
-    "state_root": "/home/user/.egopulse",
-    "workspace_dir": "/home/user/.egopulse/workspace",
-    "web_enabled": true,
-    "web_host": "127.0.0.1",
-    "web_port": 10961,
-    "web_auth_enabled": true,
-    "has_api_key": true,
-    "config_path": "/home/user/.egopulse/egopulse.config.yaml",
-    "providers": [
-      {
-        "id": "openrouter",
-        "label": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "default_model": "anthropic/claude-sonnet-4",
-        "models": ["anthropic/claude-sonnet-4", "google/gemini-2.5-pro"],
-        "has_api_key": true
-      }
-    ]
-  }
-}
 ```
 
 | フィールド | 型 | 説明 |
@@ -220,34 +144,13 @@ GET /api/config
 | `web_auth_enabled` | `boolean` | 認証の有無（`auth_token` 設定時 `true`） |
 | `has_api_key` | `boolean` | デフォルトプロバイダーの API キー設定有無 |
 | `config_path` | `string` | 設定ファイルパス |
+| `providers` | `array` | プロバイダー設定一覧。各要素: `id`, `label`, `base_url`, `default_model`, `models`, `has_api_key` |
 | `providers[].has_api_key` | `boolean` | プロバイダーごとの API キー有無 |
 
 #### 更新
 
 ```text
 PUT /api/config
-```
-
-##### リクエスト
-
-```json
-{
-  "default_provider": "openrouter",
-  "default_model": null,
-  "expected_fingerprint": "9f2f...",
-  "providers": {
-    "openrouter": {
-      "label": "OpenRouter",
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key": "sk-or-v1-...",
-      "default_model": "anthropic/claude-sonnet-4",
-      "models": ["anthropic/claude-sonnet-4"]
-    }
-  },
-  "web_enabled": true,
-  "web_host": "127.0.0.1",
-  "web_port": 10961
-}
 ```
 
 | フィールド | 必須 | 備考 |
@@ -273,15 +176,7 @@ GET と同一形式。
 
 ##### 再起動必須フィールドの拒否 (400)
 
-`web_enabled`、`web_host`、`web_port` の変更は実行中プロセスへ適用できないため、更新せず `400 Bad Request` を返す。これは fingerprint の競合とは異なるエラーである。
-
-```text
-HTTP/1.1 400 Bad Request
-
-config_reload_forbidden: field=channels.web.port; restart required
-```
-
-メッセージには拒否されたフィールド名（`channels.web.enabled`、`channels.web.host`、`channels.web.port` のいずれか）と `restart required` が含まれる。
+`web_enabled`、`web_host`、`web_port` の変更は実行中プロセスへ適用できないため、更新せず `400 Bad Request` を返す。これは fingerprint の競合とは異なるエラーである。メッセージには拒否されたフィールド名（`channels.web.enabled`、`channels.web.host`、`channels.web.port` のいずれか）と `restart required` が含まれる。
 
 ---
 
@@ -289,25 +184,6 @@ config_reload_forbidden: field=channels.web.port; restart required
 
 ```text
 GET /api/sessions
-```
-
-#### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "sessions": [
-    {
-      "session_key": "chat:1",
-      "label": "web:main:agent:lyre",
-      "chat_id": 1,
-      "channel": "web",
-      "agent_id": "lyre",
-      "last_message_time": "2026-04-12T14:03:58Z",
-      "last_message_preview": "最新メッセージの先頭..."
-    }
-  ]
-}
 ```
 
 | フィールド | 型 | 説明 |
@@ -343,22 +219,6 @@ GET /api/history?session_key=main&limit=100
   "session_key": "chat:1",
   "messages": [
     {
-      "id": "m1",
-      "sender_id": "user:web",
-      "sender_kind": "user",
-      "content": "こんにちは",
-      "timestamp": "2026-04-12T14:00:00Z",
-      "message_kind": "message"
-    },
-    {
-      "id": "m2",
-      "sender_id": "lyre",
-      "sender_kind": "assistant",
-      "content": "こんにちは！何かお手伝いできますか？",
-      "timestamp": "2026-04-12T14:00:05Z",
-      "message_kind": "message"
-    },
-    {
       "id": "tool:call_1",
       "sender_id": "assistant",
       "sender_kind": "assistant",
@@ -393,24 +253,8 @@ GET /api/history?session_key=main&limit=100
 POST /api/send_stream
 ```
 
-##### リクエスト
-
-```json
-{
-  "session_key": "main",
-  "message": "今日の天気は？"
-}
-```
-
-##### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "run_id": "550e8400-e29b-41d4-a716-446655440000",
-  "session_key": "main"
-}
-```
+- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）
+- レスポンス: `ok: true`, `run_id`（UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
 
 #### SSE イベント受信
 
@@ -446,11 +290,8 @@ GET /api/stream?run_id=550e8400-e29b-41d4-a716-446655440000&last_event_id=0
 event: delta
 data: {"text": "今日の東京の天気は"}
 
-event: delta
-data: {"text": "晴れです。気温は..."}
-
 event: done
-data: {"message": {"role": "assistant", "content": "今日の東京の天気は晴れです。..."}, "session_key": "main"}
+data: {"message": {"role": "assistant", "content": "今日の東京の天気は晴れです。..."}, "session_key": "chat:1"}
 ```
 
 ##### 再接続
@@ -468,19 +309,6 @@ STT 済みテキストを通常の agent turn として処理し、応答テキ�
 POST /api/voice/turn
 Authorization: Bearer <channels.voice.auth_token>
 Content-Type: application/json
-```
-
-#### リクエスト
-
-```json
-{
-  "surface": "stackchan",
-  "session_key": "main",
-  "user_id": "local-speaker",
-  "text": "聞こえていますか",
-  "source": "stackchan-wake",
-  "agent_id": "default"
-}
 ```
 
 | フィールド | 必須 | デフォルト | 説明 |
@@ -506,18 +334,7 @@ Content-Type: application/json
 }
 ```
 
-履歴は `channel=voice`、`surface_thread={surface}:{session_key}` の通常 user / assistant message として保存される。LLM の user message 本文へ渡すのは `text` のみ。
-
-#### Voice API エラー
-
-| コード | HTTP | 説明 |
-|---|:---:|---|
-| `unauthorized` | 401 | Voice token がない、または一致しない |
-| `invalid_params` | 400 | text または identity component が不正 |
-| `surface_not_allowed` | 403 | surface が `allowed_surfaces` に含まれない |
-| `turn_failed` | 500 | agent turn 処理に失敗 |
-
-責務境界、session identity、voice client との接続契約は [voice-channel.md](./voice-channel.md) を正本とする。
+履歴は `channel=voice`、`surface_thread={surface}:{session_key}` の通常 user / assistant message として保存される。LLM の user message 本文へ渡すのは `text` のみ。エラーコードは [§4](#4-エラーレスポンス) を参照。
 
 ---
 
@@ -531,16 +348,7 @@ Sleep Batch の実行履歴とメモリ変更差分を確認するためのエ�
 GET /api/agents
 ```
 
-Sleep Batch 実行履歴がある agent ID の一覧を返す。
-
-##### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "agents": ["default", "alice"]
-}
-```
+Sleep Batch 実行履歴がある agent ID の一覧を返す（`ok: true`, `agents: [id, ...]`）。
 
 ---
 
@@ -557,26 +365,7 @@ GET /api/sleep/runs?agent_id={agent_id}&limit={limit}
 | `agent_id` | 必須 | — | エージェント ID |
 | `limit` | 任意 | `20` | 最大取得件数 |
 
-##### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "runs": [
-    {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "agent_id": "default",
-      "status": "success",
-      "trigger_type": "scheduled",
-      "started_at": "2026-06-01T04:00:00+09:00",
-      "finished_at": "2026-06-01T04:02:30+09:00",
-      "input_tokens": 15000,
-      "output_tokens": 5000,
-      "session_count": 3
-    }
-  ]
-}
-```
+レスポンスの `runs` 配列の各要素: `id`, `agent_id`, `status`, `trigger_type`, `started_at`, `finished_at`, `input_tokens`, `output_tokens`, `session_count`。
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
@@ -590,32 +379,6 @@ GET /api/sleep/runs?agent_id={agent_id}&limit={limit}
 
 ```text
 GET /api/sleep/runs/{run_id}
-```
-
-##### レスポンス (200)
-
-```json
-{
-  "ok": true,
-  "run": {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "agent_id": "default",
-    "status": "success",
-    "trigger_type": "scheduled",
-    "started_at": "2026-06-01T04:00:00+09:00",
-    "finished_at": "2026-06-01T04:02:30+09:00",
-    "input_tokens": 15000,
-    "output_tokens": 5000,
-    "error_message": null
-  },
-  "snapshots": [
-    {
-      "file": "semantic",
-      "content_before": "# Semantic\n\n- fact A",
-      "content_after": "# Semantic\n\n- fact A\n- fact B"
-    }
-  ]
-}
 ```
 
 | フィールド | 型 | 説明 |
@@ -639,15 +402,7 @@ Content-Type: application/json
 
 成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返る。commit 後に in-memory scheduler の同時実行上限に達しても拒否とは扱わず、dispatcher への deferred（容量が空き次第の再投入）として同じ `202` を返す。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop から resume）の2状態のみで、モデル反復開始後（`model_pending` 以降）は再実行対象外となる。
 
-受付拒否時は理由コード違いで一律 `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、受付処理の内部エラーや同一 `request_key` へ異なる本文の再受付は `internal`）。
-
-```json
-{
-  "ok": true,
-  "receiver": "egograph",
-  "status": "accepted"
-}
-```
+受付拒否時は理由コード違いで一律 `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、受付処理の内部エラーや同一 `request_key` へ異なる本文の再受付は `internal`）。エラーコード一覧は [§4](#4-エラーレスポンス) を参照。
 
 #### Target 解決
 
@@ -681,23 +436,6 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 - 解決後 agent が `config.agents` に存在
 - 非 Web target の `target.thread` が空でない
 - Discord / Telegram target の `target.thread` が `channels.<channel>` の登録エントリに解決できること（数値として parse 可能・未登録 thread・channel map 欠落は拒否。`Normal` への降格なし）
-
-#### Webhook エラー
-
-| コード | HTTP | 説明 |
-|---|:---:|---|
-| `webhook_receiver_not_found` | 404 | receiver が未定義 |
-| `unauthorized` | 401 | receiver token 不一致 |
-| `invalid_params` | 400 | JSON 不正 |
-| `payload_too_large` | 413 | payload が 64KB を超過 |
-| `invalid_target` | 400 | target channel 未登録・voice・agent 不在・thread 空 |
-| `invalid_target_scope` | 400 | Discord / Telegram target thread が channel map に解決できない |
-| `session_queue_full` | 429 | 対象セッションの durable pending（`accepted`/`input_committed`）が上限（32）に達し、INSERT と同一トランザクションで受付を拒否した |
-| `global_queue_full` | 429 | Runtime 全体の durable pending が上限（512）に達し、INSERT と同一トランザクションで受付を拒否した |
-| `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
-| `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
-| `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
-| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
 
 ---
 
@@ -882,6 +620,18 @@ JSON-RPC 風の双方向メッセージング。
 | `invalid_params` | 400 | リクエストパラメータが不正 |
 | `surface_not_allowed` | 403 | Voice surface が allowlist 外 |
 | `turn_failed` | 500 | Voice agent turn の処理失敗 |
+| `config_conflict` | 409 | `expected_fingerprint` が現在の設定と不一致（PUT /api/config） |
+| `config_reload_forbidden` | 400 | 再起動必須フィールドの実行中変更（PUT /api/config） |
+| `webhook_receiver_not_found` | 404 | receiver が未定義 |
+| `payload_too_large` | 413 | payload が 64KB を超過 |
+| `invalid_target` | 400 | Webhook target channel 未登録・voice・agent 不在・thread 空 |
+| `invalid_target_scope` | 400 | Webhook の Discord / Telegram target thread が channel map に解決できない |
+| `session_queue_full` | 429 | 対象セッションの durable pending（`accepted`/`input_committed`）が上限（32）に達し、INSERT と同一トランザクションで受付を拒否した |
+| `global_queue_full` | 429 | Runtime 全体の durable pending が上限（512）に達し、INSERT と同一トランザクションで受付を拒否した |
+| `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
+| `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
+| `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
+| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
 | `internal_error` | 500 | サーバー内部エラー |
 
 ---

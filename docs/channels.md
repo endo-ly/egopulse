@@ -55,7 +55,7 @@ Discord / Telegram などの受信チャネルは、プラットフォーム固�
 | プロバイダー / モデル | Agent設定 | Agent設定 | Agent設定 | Agent設定 |
 | 人格 (`SOUL.md`) | ○ | ○ | ○ | ○ |
 
-モデル解決の優先順位は [config.md §3](./config.md#3-モデル解決チェーン) を参照。
+モデル解決の優先順位は [config.md §4](./config.md#4-モデル解決チェーン) を参照。
 
 ---
 
@@ -271,6 +271,8 @@ stackchan-bridge
 
 ### セッション識別
 
+session identity の概念と正本は [session-lifecycle.md §1](./session-lifecycle.md#1-session-identity) を参照。Voice チャネルでは以下の値を設定する。
+
 | SurfaceContext | 値 |
 |---|---|
 | `channel` | `voice` |
@@ -291,7 +293,6 @@ stackchan-bridge
 - EgoPulse 起点の自発発話は非対応
 - Voice route は `channels.voice.enabled: false` の場合 mount されず 404
 - LLM の user message 本文には request の `text` だけを渡す
-- Voice の詳細な HTTP 契約と責務境界は [voice-channel.md](./voice-channel.md) を正本とする
 
 ---
 
@@ -351,7 +352,7 @@ Webhook は会話チャネルではなく、外部イベントの trigger とし
 
 ### 接続方式
 
-HTTP POST `POST /api/webhooks/{receiver_id}`。認証・payload 仕様・target validation は [api.md](./api.md) §2.10 を、設定は [config.md](./config.md) §3.12 を参照。
+HTTP POST `POST /api/webhooks/{receiver_id}`。認証・payload 仕様・target validation・エラーコードは [api.md §2.10](./api.md#210-webhook) を、設定は [config.md §3.12](./config.md#312-webhook-設定) を参照。
 
 ### データフロー
 
@@ -361,15 +362,15 @@ Webhook sender
   → receiver token 認証
   → payload 整形 (EgoGraph / generic JSON)
   → target channel / thread / agent から SurfaceContext を生成
-  → TurnScheduler へ enqueue (Started / Queued / Rejected)
-  ├─ Started / Queued → 202 Accepted
-  └─ Rejected (queue full) → 429 Too Many Requests
+  → turn を turn_runs へ accepted commit（同一トランザクションで容量・chain 終端判定）
+  ├─ commit 成功 → 202 Accepted（turn は永続化済み。クラッシュ後は Dispatcher が再開）
+  └─ commit 前に拒否 → 429 Too Many Requests（理由コード付き）
   → agent response は target channel adapter で送信
 ```
 
-`202` は in-memory scheduler への受付成功（即時開始 or キュー投入）のみを意味し、Webhook job の永続化は行わない。スケジューラのキューが満杯（セッション単位 32 / Runtime 全体 512）の場合は `429`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。詳細は [api.md](./api.md) §2.10 を参照。
+`202` は in-memory scheduler への受付成功ではなく、`turn_runs` への accepted commit 完了を意味する。commit 後の in-memory 容量不足は拒否とは扱わず、dispatcher が deferred で再投入する。`429` の理由コード・recovery 範囲などの契約詳細は [api.md §2.10](./api.md#210-webhook) に一元化している。
 
-`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。Discord / Telegram target の scope は、`target.thread` が `channels.<channel>` の登録エントリに解決できた場合のみ、その channel の `secret` 値から決定する（`secret: true` なら `ConversationScope::Secret`）。解決できない thread（数値 parse 不能・未登録・channel map 欠落）は `Normal` へ降格せず `400 invalid_target_scope` で拒否し、agent turn を enqueue しない。
+`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。scope（Secret / Normal）の決定規則は [api.md §2.10](./api.md#210-webhook) の Target 解決・Validation を参照。
 
 ### Channel Log
 
