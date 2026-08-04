@@ -156,7 +156,7 @@ LLM に見える名前は `mcp_{server}_{tool}` 形式。英数字と `_` 以外
 
 出力が空なら `(no output)`。
 
-MCP tool は built-in tool と異なり出力サイズを自己規制しないため、`50KB`（`DEFAULT_MAX_BYTES`）を超える場合は head 側を切断し `... (output truncated to 51200 bytes)` を付加する。built-in tool は各自が同限値で切断済みであるため、このセーフティネットは実質 MCP にのみ作用する。
+MCP tool は built-in tool と異なり出力サイズを自己規制しないため、`100KB`（`DEFAULT_MAX_BYTES`）を超える場合は head 側を切断し `... (output truncated to 102400 bytes)` を付加する。built-in tool は各自が同限値で切断済みであるため、このセーフティネットは実質 MCP にのみ作用する。
 
 ## 6. 障害とリカバリ
 

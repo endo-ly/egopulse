@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn truncate_to_max_bytes_preserves_utf8_boundaries() {
-        let large = "あ".repeat(20_000);
+        let large = "あ".repeat(super::super::DEFAULT_MAX_BYTES / "あ".len() + 1);
         let result = truncate_to_max_bytes(large);
         assert!(result.contains("... (output truncated to"));
         let first_line = result.lines().next().expect("content before notice");

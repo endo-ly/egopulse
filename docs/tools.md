@@ -129,9 +129,9 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - テキストに加えて `png` / `jpg` / `jpeg` / `gif` / `webp` を画像として判定する
   - 画像ファイルは base64 data URL にエンコードし、`MessageContent::Parts` (InputText + InputImage) として LLM に渡す
   - マルチモーダル tool result を含むメッセージ履歴は OpenAI Responses API に自動ルーティングされる
-  - テキスト出力は最大 `2000` 行または `50KB`
+  - テキスト出力は最大 `2000` 行または `100KB`
   - 続きがある場合は `offset=...` の continuation hint を返す
-  - 先頭 1 行だけで `50KB` を超える場合は `bash` fallback を促す
+  - 先頭 1 行だけで `100KB` を超える場合は `bash` fallback を促す
 - `details`:
   - `truncation`
 - 主な失敗:
@@ -205,7 +205,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
 - 挙動:
   - workspace を cwd にして `bash -lc` で実行する
   - stdout / stderr は 1 つのログに結合する
-  - 出力は末尾側を最大 `2000` 行または `50KB` に tail truncation する
+  - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する
   - truncation が発生した場合は full output を temp file に保存する
   - 最後の 1 行だけで byte limit を超える場合は、その行の末尾だけを返す special case がある
 - `details`:
@@ -239,7 +239,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - workspace 配下の path のみ検索
   - `limit` は最低でも `1`
   - 1 行は最大 `500` 文字に短縮
-  - 結果全体は head 側を `50KB` で truncation
+  - 結果全体は head 側を `100KB` で truncation
   - マッチ 0 件は success 扱いで `No matches found`
   - result limit や line truncation が起きた場合は notice を追記する
 - `details`:
@@ -268,7 +268,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - 検索ルート配下の nested `.gitignore` も `--ignore-file` で明示的に渡す
   - 結果パスは検索ルート相対に正規化し、`/` 区切りに揃える
   - 結果が空なら `No files found matching pattern`
-  - 結果全体は head 側を `50KB` で truncation
+  - 結果全体は head 側を `100KB` で truncation
   - result limit に達した場合は `Use limit=... for more, or refine pattern` を追記する
 - `details`:
   - `truncation`
@@ -294,7 +294,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - dotfiles を含む
   - case-insensitive に sort する
   - 空 directory は `(empty directory)`
-  - 結果全体は head 側を `50KB` で truncation
+  - 結果全体は head 側を `100KB` で truncation
   - entry limit に達した場合は `Use limit=... for more` を追記する
 - `details`:
   - `truncation`

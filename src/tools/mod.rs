@@ -38,7 +38,7 @@ use crate::llm::ToolDefinition;
 use crate::skills::SkillManager;
 
 const DEFAULT_MAX_LINES: usize = 2000;
-const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+const DEFAULT_MAX_BYTES: usize = 100 * 1024;
 const DEFAULT_FIND_LIMIT: usize = 1000;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_LS_LIMIT: usize = 500;

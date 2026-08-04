@@ -113,7 +113,7 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".to_string(),
-            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.".to_string(),
+            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 100KB (whichever is hit first). Long lines are truncated to 500 chars.".to_string(),
             parameters: schema_object(
                 json!({
                     "pattern": {
@@ -383,7 +383,7 @@ impl Tool for FindTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "find".to_string(),
-            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).".to_string(),
+            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 100KB (whichever is hit first).".to_string(),
             parameters: schema_object(
                 json!({
                     "pattern": {
@@ -608,7 +608,7 @@ impl Tool for LsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "ls".to_string(),
-            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).".to_string(),
+            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 100KB (whichever is hit first).".to_string(),
             parameters: schema_object(
                 json!({
                     "path": {
