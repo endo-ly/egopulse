@@ -215,12 +215,26 @@ async fn resolve_new_web_session(
     Ok((format!("chat:{chat_id}"), context))
 }
 
+fn web_surface_thread_from_external_chat_id(external_chat_id: &str, agent_id: &str) -> String {
+    let thread = external_chat_id
+        .strip_prefix("web:")
+        .unwrap_or(external_chat_id);
+    let agent_suffix = format!(":agent:{agent_id}");
+    thread
+        .strip_suffix(&agent_suffix)
+        .unwrap_or(thread)
+        .to_string()
+}
+
 fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -> SurfaceContext {
-    let surface_thread = info
-        .external_chat_id
-        .strip_prefix(&format!("{}:", info.channel))
-        .unwrap_or(&info.external_chat_id)
-        .to_string();
+    let surface_thread = if info.channel == "web" {
+        web_surface_thread_from_external_chat_id(&info.external_chat_id, &info.agent_id)
+    } else {
+        info.external_chat_id
+            .strip_prefix(&format!("{}:", info.channel))
+            .unwrap_or(&info.external_chat_id)
+            .to_string()
+    };
     SurfaceContext::new(
         info.channel,
         actor.to_string(),
@@ -488,6 +502,28 @@ mod tests {
         assert_eq!(context.surface_thread, "stored-thread");
         assert_eq!(context.chat_type, "dm");
         assert_eq!(context.agent_id, "non-default-agent");
+    }
+
+    #[test]
+    fn agent_scoped_web_context_round_trips_to_same_session_key() {
+        // Arrange
+        let info = crate::storage::ChatInfo {
+            chat_id: 42,
+            channel: "web".to_string(),
+            external_chat_id: "web:stored-thread:agent:non-default-agent".to_string(),
+            chat_type: "web".to_string(),
+            agent_id: "non-default-agent".to_string(),
+        };
+
+        // Act
+        let context = surface_context_from_chat_info(info, "web-user");
+
+        // Assert
+        assert_eq!(context.surface_thread, "stored-thread");
+        assert_eq!(
+            context.session_key(),
+            "web:stored-thread:agent:non-default-agent"
+        );
     }
 
     #[test]
