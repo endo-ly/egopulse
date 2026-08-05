@@ -2443,7 +2443,7 @@ mod tests {
         // Assert: secret DB has the bot response
         let secret_messages = call_blocking(
             Arc::clone(state.secret_db.as_ref().expect("secret db")),
-            move |db| db.get_channel_log_messages(log_chat_id, 10),
+            move |db| db.get_recent_messages(log_chat_id, 10),
         )
         .await
         .expect("read secret channel log");
@@ -2457,7 +2457,7 @@ mod tests {
 
         // Assert: normal DB has no entries from this turn
         let normal_messages = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_channel_log_messages(log_chat_id, 10)
+            db.get_recent_messages(log_chat_id, 10)
         })
         .await
         .expect("read normal channel log");

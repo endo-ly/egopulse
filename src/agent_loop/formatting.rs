@@ -2,7 +2,7 @@
 
 use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
-use crate::storage::{SenderKind, StoredMessage};
+use crate::storage::StoredMessage;
 
 pub(crate) fn format_tool_result(
     tool_call: &ToolCall,
@@ -262,12 +262,13 @@ pub(crate) fn strip_thinking(text: &str) -> String {
 }
 
 pub(crate) fn format_channel_log_message(msg: &StoredMessage) -> String {
-    match msg.sender_kind {
-        SenderKind::User => format!("[{}] {}", msg.sender_id, msg.content),
-        SenderKind::Assistant => format!("[{}] {}", msg.sender_id, msg.content),
-        SenderKind::System => format!("[system] {}", msg.content),
-        SenderKind::Tool => format!("[tool/{}] {}", msg.sender_id, msg.content),
-    }
+    let sender = msg.sender_id.as_str();
+    let recipient = msg.recipient_agent_id.as_deref().unwrap_or("-");
+
+    format!(
+        "[room-event kind={} sender={} recipient={} sender-kind={}]\n{}",
+        msg.message_kind, sender, recipient, msg.sender_kind, msg.content
+    )
 }
 
 #[cfg(test)]
@@ -473,19 +474,28 @@ mod tests {
     #[test]
     fn format_channel_log_message_user() {
         let msg = StoredMessage::user(1, "Alice".to_string(), "hello".to_string());
-        assert_eq!(format_channel_log_message(&msg), "[Alice] hello");
+        assert_eq!(
+            format_channel_log_message(&msg),
+            "[room-event kind=message sender=Alice recipient=- sender-kind=user]\nhello"
+        );
     }
 
     #[test]
     fn format_channel_log_message_assistant() {
         let msg = StoredMessage::assistant(1, "lyre".to_string(), "response".to_string());
-        assert_eq!(format_channel_log_message(&msg), "[lyre] response");
+        assert_eq!(
+            format_channel_log_message(&msg),
+            "[room-event kind=message sender=lyre recipient=- sender-kind=assistant]\nresponse"
+        );
     }
 
     #[test]
     fn format_channel_log_message_system() {
         let msg = StoredMessage::system(1, "boot complete".to_string());
-        assert_eq!(format_channel_log_message(&msg), "[system] boot complete");
+        assert_eq!(
+            format_channel_log_message(&msg),
+            "[room-event kind=message sender=system recipient=- sender-kind=system]\nboot complete"
+        );
     }
 
     #[test]
@@ -496,7 +506,10 @@ mod tests {
             "vega".to_string(),
             "sent".to_string(),
         );
-        assert_eq!(format_channel_log_message(&msg), "[tool/lyre] sent");
+        assert_eq!(
+            format_channel_log_message(&msg),
+            "[room-event kind=message sender=lyre recipient=vega sender-kind=tool]\nsent"
+        );
     }
 
     #[test]

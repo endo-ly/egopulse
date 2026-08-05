@@ -1167,12 +1167,12 @@ mod tests {
             .content
             .as_text_lossy();
         assert!(
-            final_request.starts_with("[Current time: "),
-            "expected last message to include timestamp prefix, got: {final_request}",
+            final_request.starts_with("<direct-input>\n[Current time: "),
+            "expected last message to include direct-input timestamp boundary, got: {final_request}",
         );
         assert!(
-            final_request.ends_with("fresh question"),
-            "expected last message to end with 'fresh question', got: {final_request}",
+            final_request.contains("\nfresh question\n</direct-input>"),
+            "expected last message to contain the direct input, got: {final_request}",
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(
@@ -1276,12 +1276,12 @@ mod tests {
             .content
             .as_text_lossy();
         assert!(
-            final_request.starts_with("[Current time: "),
-            "expected last message to include timestamp prefix, got: {final_request}",
+            final_request.starts_with("<direct-input>\n[Current time: "),
+            "expected last message to include direct-input timestamp boundary, got: {final_request}",
         );
         assert!(
-            final_request.ends_with("fresh question"),
-            "expected last message to end with 'fresh question', got: {final_request}",
+            final_request.contains("\nfresh question\n</direct-input>"),
+            "expected last message to contain the direct input, got: {final_request}",
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(

@@ -887,6 +887,7 @@ impl EventHandler for Handler {
         }
 
         let is_multi_agent = channels.get(&channel_id).is_some_and(|c| c.multi_agent);
+        let response_agent_id = route.response_agent_id().map(ToString::to_string);
 
         let channel_log_chat_id = if is_multi_agent && !is_dm {
             crate::runtime::store_human_channel_log_message(
@@ -898,6 +899,7 @@ impl EventHandler for Handler {
                     sender_id: format!("user:discord:{}", msg.author.id.get()),
                     content: text.clone(),
                     timestamp: msg.timestamp.to_string(),
+                    recipient_agent_id: response_agent_id.clone(),
                 },
             )
             .await
@@ -906,7 +908,7 @@ impl EventHandler for Handler {
         };
 
         // Multi-Agent Room with no agent resolved: save to Channel Log only, do not respond
-        let Some(agent_id) = route.response_agent_id().map(ToString::to_string) else {
+        let Some(agent_id) = response_agent_id else {
             return;
         };
 

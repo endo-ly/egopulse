@@ -195,7 +195,7 @@ pub(crate) struct SurfaceContext {
     pub surface_thread: String,
     pub chat_type: String,
     pub agent_id: String,
-    /// For multi-agent rooms: the Channel Log chat ID used for Channel Context injection.
+    /// For multi-agent rooms: the Channel Log chat ID used for Shared Room Context injection.
     /// `None` for single-agent channels and DMs.
     pub channel_log_chat_id: Option<i64>,
     /// Current `agent_send` chain depth (0 for user-initiated turns).
