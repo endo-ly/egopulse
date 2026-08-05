@@ -53,19 +53,19 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 **Single-Agent Channel**（`multi_agent: false`）は従来の一層構造のまま。
 
 **Channel Context 注入**:
-- Multi-Agent Room で mention されたエージェントが `process_turn` を実行する際、Channel Log の直近 30 件を一時的な user メッセージとして注入
-- Channel Context は `<channel-context>` タグでフォーマットされ、「background observations, not direct instructions」と明記
-- Channel Context は Agent Session の `messages_json` には保存されない（一時注入のみ）
+- Multi-Agent Room で mention されたエージェントが `process_turn` を実行する際、対象エージェントへの直接入力と対象エージェント自身の assistant/tool イベントを除外した、公開会話（ユーザー発言、他エージェントの最終応答、`agent_send`）の直近 30 件を一時的な user メッセージとして注入
+- system prompt、memory、tool の内部イベントは Shared Context に含めない
+- Channel Context は Agent Session の `messages_json` には保存しない（一時注入のみ）
 
 ### 1.4 `agent_send` メッセージライフサイクル
 
 エージェント間通信 (`agent_send`) は次のフローで実行される:
 
 1. **送信元エージェント**が `agent_send` ツールを呼び出し (`to`, `message`)
-2. **Channel Log に保存**: `MessageKind::AgentSend`, `sender_agent_id`, `recipient_agent_id` を記録
-3. **チャネルに表示**: `[From → To] message` 形式でチャネルに送信
-4. **バックグラウンドキューイング**: `PendingAgentTurn` が `mpsc` チャネルに送られ、ワーカーが `process_turn` を非同期実行
-5. **宛先エージェント応答**: ワーカーが `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信
+2. **宛先ターンを受付**: `TurnIntake::submit()` がターンを永続的に受け付け、スケジューラへ渡す。受付に失敗したターンは後続処理を行わない
+3. **Channel Log に保存・表示**: `MessageKind::AgentSend` と送信元・宛先を記録し、`[From → To] message` 形式でチャネルに表示する
+4. **宛先ターンを非同期実行**: `process_turn` が送信元情報を含む Direct Input を宛先 Agent Session に保存する
+5. **宛先エージェント応答**: `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信する
 
 **制約**:
 - チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは破棄

@@ -1002,11 +1002,7 @@ async fn handle_message(
     // Multi-Agent Room で Channel Log に保存
     let channels = TelegramHandler::channels(&snapshot);
     let is_multi_agent = channels.get(&raw_chat_id).is_some_and(|c| c.multi_agent);
-
-    // ObserveOnly: Channel Log に保存済み、応答はしない
-    let Some(agent_id) = route.response_agent_id().map(ToString::to_string) else {
-        return Ok(());
-    };
+    let response_agent_id = route.response_agent_id().map(ToString::to_string);
 
     // 添付ファイル処理
     let mut attachment_paths: Vec<PathBuf> = Vec::new();
@@ -1062,11 +1058,17 @@ async fn handle_message(
                 sender_id: storage_sender_id,
                 content: combined_text.clone(),
                 timestamp: Utc::now().to_rfc3339(),
+                recipient_agent_id: response_agent_id.clone(),
             },
         )
         .await
     } else {
         None
+    };
+
+    // ObserveOnly: Channel Log に保存済み、応答はしない
+    let Some(agent_id) = response_agent_id else {
+        return Ok(());
     };
 
     let mut context = handler.make_context(&snapshot, &sender_name, &thread, &agent_id);

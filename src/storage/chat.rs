@@ -693,17 +693,47 @@ impl Database {
         self.resolve_or_create_chat_id("telegram", &external_id, None, "channel_log", "")
     }
 
-    /// Returns the most recent messages from a Channel Log, ordered oldest-first.
-    pub(crate) fn get_channel_log_messages(
+    /// Returns recent public Channel Log events projected for one target agent.
+    ///
+    /// Events already delivered to the target are omitted because the target
+    /// session owns their Direct Input. The target's own assistant/tool
+    /// events are omitted for the same reason: they are already in that
+    /// session and would otherwise be reintroduced through the room log.
+    /// Internal tool and system events are never part of the shared context.
+    pub(crate) fn get_channel_log_messages_for_agent(
         &self,
         chat_id: i64,
+        agent_id: &str,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StorageError> {
-        self.get_recent_messages(chat_id, limit)
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+             FROM messages
+             WHERE chat_id = ?1
+               AND (recipient_agent_id IS NULL OR recipient_agent_id <> ?2)
+               AND NOT (sender_id = ?2 AND sender_kind IN ('assistant', 'tool'))
+               AND (
+                    (message_kind = 'message' AND sender_kind IN ('user', 'assistant'))
+                    OR message_kind = 'agent_send'
+               )
+             ORDER BY seq DESC
+             LIMIT ?3",
+        )?;
+
+        let mut messages = stmt
+            .query_map(
+                params![chat_id, agent_id, limit as i64],
+                row_to_stored_message,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.reverse();
+        Ok(messages)
     }
 
     /// Stores a message without touching the session snapshot.
-    /// Used for Channel Log entries (agent_send, system events) that have no session.
+    /// Used for Channel Log entries that have no Agent Session snapshot.
     pub(crate) fn store_message_only(&self, message: &StoredMessage) -> Result<(), StorageError> {
         self.store_channel_log_message(message).map(|_| ())
     }
@@ -1196,7 +1226,7 @@ mod tests {
         let chat_id = db.resolve_channel_log_chat_id(100).expect("create");
         store_msg(&db, "cl-1", chat_id, "hello", "2025-01-01T00:00:00Z");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello");
     }
@@ -1216,10 +1246,114 @@ mod tests {
             );
         }
 
-        let msgs = db.get_channel_log_messages(chat_id, 3).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 3).expect("messages");
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 2");
         assert_eq!(msgs[2].content, "msg 4");
+    }
+
+    #[test]
+    fn channel_log_projection_excludes_target_delivery_and_own_events() {
+        let (db, _dir) = test_db();
+        let chat_id = db.resolve_channel_log_chat_id(201).expect("create");
+
+        let mut target_input = StoredMessage::user(
+            chat_id,
+            "user:discord:1".to_string(),
+            "target direct input".to_string(),
+        );
+        target_input.recipient_agent_id = Some("vega".to_string());
+
+        let mut other_input = StoredMessage::user(
+            chat_id,
+            "user:discord:2".to_string(),
+            "other direct input".to_string(),
+        );
+        other_input.recipient_agent_id = Some("lyre".to_string());
+
+        let ambient_input = StoredMessage::user(
+            chat_id,
+            "user:discord:3".to_string(),
+            "ambient room input".to_string(),
+        );
+        let own_response =
+            StoredMessage::assistant(chat_id, "vega".to_string(), "vega response".to_string());
+        let own_tool = StoredMessage::tool(
+            chat_id,
+            "vega".to_string(),
+            "lyre".to_string(),
+            "vega tool event".to_string(),
+        );
+        let other_response =
+            StoredMessage::assistant(chat_id, "lyre".to_string(), "lyre response".to_string());
+        let mut other_tool = StoredMessage::tool(
+            chat_id,
+            "lyre".to_string(),
+            "shell".to_string(),
+            "private tool result".to_string(),
+        );
+        other_tool.message_kind = MessageKind::ToolCall;
+        let mut system_event = StoredMessage::system(chat_id, "private system event".to_string());
+        system_event.message_kind = MessageKind::SystemEvent;
+        let mut send_to_target = StoredMessage::tool(
+            chat_id,
+            "lyre".to_string(),
+            "vega".to_string(),
+            "send to vega".to_string(),
+        );
+        send_to_target.message_kind = MessageKind::AgentSend;
+        let mut send_to_other = StoredMessage::tool(
+            chat_id,
+            "lyre".to_string(),
+            "lyre".to_string(),
+            "send to lyre".to_string(),
+        );
+        send_to_other.message_kind = MessageKind::AgentSend;
+
+        for message in [
+            target_input,
+            other_input,
+            ambient_input,
+            own_response,
+            own_tool,
+            other_response,
+            other_tool,
+            system_event,
+            send_to_target,
+            send_to_other,
+        ] {
+            db.store_message_only(&message)
+                .expect("store channel event");
+        }
+
+        let projected = db
+            .get_channel_log_messages_for_agent(chat_id, "vega", 20)
+            .expect("project channel log");
+        let contents: Vec<_> = projected
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+
+        assert!(contents.contains(&"other direct input"));
+        assert!(contents.contains(&"ambient room input"));
+        assert!(contents.contains(&"lyre response"));
+        assert!(contents.contains(&"send to lyre"));
+        assert!(!contents.contains(&"target direct input"));
+        assert!(!contents.contains(&"vega response"));
+        assert!(!contents.contains(&"vega tool event"));
+        assert!(!contents.contains(&"private tool result"));
+        assert!(!contents.contains(&"private system event"));
+        assert!(!contents.contains(&"send to vega"));
+
+        let conn = db.get_conn().expect("pool");
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("session count");
+        assert_eq!(session_count, 0, "Channel Log must not create a session");
     }
 
     // ---- System Event tests ----
@@ -1235,7 +1369,7 @@ mod tests {
         )
         .expect("store");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message_kind, MessageKind::SystemEvent);
     }
@@ -1251,7 +1385,7 @@ mod tests {
         )
         .expect("store");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         let parsed: serde_json::Value = serde_json::from_str(&msgs[0].content).expect("valid json");
         assert!(parsed.get("reason").is_some());
     }
@@ -1267,7 +1401,7 @@ mod tests {
         )
         .expect("store");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs[0].sender_id, "system");
         assert_eq!(msgs[0].sender_kind, SenderKind::System);
     }
@@ -1413,7 +1547,7 @@ mod tests {
         )
         .expect("store");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs[0].sender_id, "system");
         assert_eq!(msgs[0].sender_kind, SenderKind::System);
         assert_eq!(msgs[0].message_kind, MessageKind::SystemEvent);
@@ -1427,7 +1561,7 @@ mod tests {
         db.store_channel_log_bot_response(chat_id, "lyre", "Hello from agent")
             .expect("store");
 
-        let msgs = db.get_channel_log_messages(chat_id, 10).expect("messages");
+        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs[0].sender_id, "lyre");
         assert_eq!(msgs[0].sender_kind, SenderKind::Assistant);
         assert_eq!(msgs[0].content, "Hello from agent");
