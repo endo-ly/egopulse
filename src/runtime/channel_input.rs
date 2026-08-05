@@ -83,6 +83,7 @@ pub(crate) struct HumanChannelLogMessage {
     pub(crate) sender_id: String,
     pub(crate) content: String,
     pub(crate) timestamp: String,
+    pub(crate) recipient_agent_id: Option<String>,
 }
 
 /// Returns the storage scope represented by a channel's `secret` flag.
@@ -136,7 +137,7 @@ pub(crate) async fn store_human_channel_log_message(
                 sender_kind: SenderKind::User,
                 timestamp: message.timestamp,
                 message_kind: MessageKind::Message,
-                recipient_agent_id: None,
+                recipient_agent_id: message.recipient_agent_id,
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
@@ -434,6 +435,7 @@ mod tests {
                 sender_id: "user:discord:7".to_string(),
                 content: "hello".to_string(),
                 timestamp: "2026-06-25T00:00:00Z".to_string(),
+                recipient_agent_id: Some("lyre".to_string()),
             },
         )
         .await
@@ -441,12 +443,13 @@ mod tests {
 
         let messages = state
             .db_for(ConversationScope::Normal)
-            .get_channel_log_messages(chat_id, 10)
+            .get_recent_messages(chat_id, 10)
             .expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "cl-42");
         assert_eq!(messages[0].sender_id, "user:discord:7");
         assert_eq!(messages[0].sender_kind, SenderKind::User);
         assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("lyre"));
     }
 }

@@ -709,7 +709,7 @@ mod tests {
         );
 
         let messages = call_blocking(Arc::clone(&db), move |db| {
-            db.get_channel_log_messages(log_chat_id, 10)
+            db.get_recent_messages(log_chat_id, 10)
         })
         .await
         .expect("get messages");
@@ -769,7 +769,7 @@ mod tests {
             .await;
 
         let messages = call_blocking(Arc::clone(&db), move |db| {
-            db.get_channel_log_messages(log_chat_id, 10)
+            db.get_recent_messages(log_chat_id, 10)
         })
         .await
         .expect("messages");
@@ -1113,7 +1113,7 @@ mod integration_tests {
         assert!(!result.is_error, "{}", result.content);
 
         let messages = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_channel_log_messages(log_chat_id, 10)
+            db.get_recent_messages(log_chat_id, 10)
         })
         .await
         .expect("messages");
@@ -1176,7 +1176,7 @@ mod integration_tests {
         assert_eq!(parsed["delivered"], false);
 
         let messages = call_blocking(Arc::clone(&db), move |db| {
-            db.get_channel_log_messages(log_chat_id, 10)
+            db.get_recent_messages(log_chat_id, 10)
         })
         .await
         .expect("messages");

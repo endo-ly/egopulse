@@ -200,7 +200,8 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 - `agent_id`: `""`（空文字）
 - `session` 行は持たない（`messages` テーブルのみ使用）
 - `resolve_channel_log_chat_id(channel_id)` で作成・取得
-- `get_channel_log_messages(chat_id, limit)` で直近 N 件を取得
+- `get_recent_messages(chat_id, limit)` で直近 N 件を取得
+- `get_channel_log_messages_for_agent(chat_id, agent_id, limit)` で対象エージェント向けの公開会話コンテキストを取得（ユーザー発言、最終 assistant 応答、`agent_send` のみ）
 
 ---
 

@@ -152,7 +152,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 
 #### Channel Context
 
-Agent Session の LLM 呼び出し時に、Channel Log の直近 30 件を一時的に注入。エージェントはルーム全体の会話を背景情報として認識するが、実際に応答するのは `<direct-input>` でラップされたユーザー入力に対してのみ。
+Agent Session の LLM 呼び出し時に、対象エージェントへの直接入力と対象エージェント自身の assistant/tool イベントを除外した Channel Log の直近 30 件を一時的に注入する。Shared Context に含めるのはユーザー発言、他エージェントの最終応答、`agent_send` だけで、system/tool の内部イベントは含めない。エージェントはルーム全体の公開会話を背景情報として認識するが、実際に応答するのは `<direct-input>` でラップされたユーザー入力に対してのみ。
 
 #### メッセージ保存ルール
 
