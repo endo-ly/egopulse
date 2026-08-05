@@ -21,6 +21,10 @@ use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_
 
 use super::sanitize_tool_result;
 
+const AGENT_SEND_SYSTEM_INSTRUCTION: &str = "\
+[System: This message was delivered from another agent via agent_send. \
+To reply, use the agent_send tool to respond to the sender.]";
+
 #[derive(serde::Deserialize)]
 struct AgentSendParams {
     to: String,
@@ -207,10 +211,7 @@ impl Tool for AgentSendTool {
             ),
         };
 
-        let target_input = format!(
-            "[agent-send from={from_label} to={to_label}]\n{}",
-            params.message
-        );
+        let target_input = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n{display_text}");
 
         // Durable acceptance through the shared intake. The target turn is
         // committed to `turn_runs` (`accepted`) *before* `delivered: true` is
@@ -488,11 +489,7 @@ mod tests {
         assert_eq!(parsed["delivered"], true);
         let turns = accepted_turns(&state);
         assert_eq!(turns.len(), 1);
-        assert!(
-            turns[0]
-                .input
-                .contains("[agent-send from=Snapshot Lyre to=Snapshot Only]")
-        );
+        assert!(turns[0].input.contains("[Snapshot Lyre → Snapshot Only]"));
     }
 
     #[tokio::test]
@@ -605,16 +602,13 @@ mod tests {
             .await;
         let turns = accepted_turns(&state);
         assert_eq!(turns.len(), 1);
-        assert!(
-            turns[0]
-                .input
-                .starts_with("[agent-send from=Lyre to=Vega]\n")
-        );
+        assert!(turns[0].input.starts_with("[System:"));
+        assert!(turns[0].input.contains("[Lyre → Vega]"));
         assert!(turns[0].input.contains("check this"));
     }
 
     #[tokio::test]
-    async fn agent_send_target_input_includes_provenance() {
+    async fn agent_send_target_input_includes_system_instruction() {
         let (tool, state, _dir) = durable_tool();
         let ctx = test_context_with_agent("lyre");
         let _ = tool
@@ -622,13 +616,15 @@ mod tests {
             .await;
         let turns = accepted_turns(&state);
         assert_eq!(turns.len(), 1);
+        let expected_prefix = format!("{AGENT_SEND_SYSTEM_INSTRUCTION}\n\n");
         assert!(
-            turns[0]
-                .input
-                .starts_with("[agent-send from=Lyre to=Vega]\n"),
-            "target input should preserve source and target provenance"
+            turns[0].input.starts_with(&expected_prefix),
+            "target input should start with system instruction followed by blank line"
         );
-        assert!(!turns[0].input.contains("[System:"));
+        assert!(
+            turns[0].input[expected_prefix.len()..].starts_with("[Lyre → Vega]"),
+            "display text should follow system instruction"
+        );
     }
 
     #[tokio::test]
