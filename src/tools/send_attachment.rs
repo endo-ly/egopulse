@@ -30,6 +30,12 @@ pub(crate) struct SendAttachmentTool {
 }
 
 impl SendAttachmentTool {
+    /// Creates an attachment tool bound to the workspace, channel registry,
+    /// and normal and secret-scope databases.
+    ///
+    /// Relative attachment paths are resolved from `workspace_dir`, files are
+    /// delivered through `channels`, and `secret_db` is used for secret-scope
+    /// conversations when available.
     pub(crate) fn new(
         workspace_dir: PathBuf,
         channels: Arc<ChannelRegistry>,
