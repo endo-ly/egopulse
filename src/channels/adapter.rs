@@ -103,11 +103,10 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     async fn send_attachment(
         &self,
         external_chat_id: &str,
-        text: Option<&str>,
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<(), String> {
-        let _ = (external_chat_id, text, file_path, caption);
+        let _ = (external_chat_id, file_path, caption);
         Err("file attachments not supported on this channel".to_string())
     }
 }

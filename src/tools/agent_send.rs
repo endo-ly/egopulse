@@ -16,7 +16,6 @@ use crate::runtime::TurnIntake;
 use crate::runtime::turn_scheduler::SubmitOutcome;
 use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
-use crate::tools::send_message::lookup_chat_info;
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
 
 use super::sanitize_tool_result;
@@ -275,7 +274,10 @@ impl Tool for AgentSendTool {
         }
 
         // 2. Display in channel
-        let chat_info = lookup_chat_info(Arc::clone(self.db_for(context.scope)), chat_id).await;
+        let chat_info = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
+            db.get_chat_by_id(chat_id)
+        })
+        .await;
         if let Ok(Some(info)) = chat_info {
             if let Some(adapter) = self.channels.get(&info.channel) {
                 if let Err(error) = adapter

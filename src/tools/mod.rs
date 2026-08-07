@@ -12,7 +12,7 @@ pub(crate) mod mcp;
 mod path_guard;
 mod sanitizer;
 mod search;
-mod send_message;
+mod send_attachment;
 mod shell;
 mod text;
 mod web_fetch;
@@ -20,7 +20,7 @@ mod web_fetch;
 pub(crate) use files::*;
 pub(crate) use sanitizer::*;
 pub(crate) use search::*;
-pub(crate) use send_message::*;
+pub(crate) use send_attachment::*;
 pub(crate) use shell::*;
 pub(crate) use text::*;
 

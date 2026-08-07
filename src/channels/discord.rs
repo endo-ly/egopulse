@@ -328,7 +328,6 @@ impl ChannelAdapter for DiscordAdapter {
     async fn send_attachment(
         &self,
         external_chat_id: &str,
-        text: Option<&str>,
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<(), String> {
@@ -345,7 +344,7 @@ impl ChannelAdapter for DiscordAdapter {
             .await
             .map_err(|e| format!("failed to read file: {e}"))?;
 
-        let content = text.or(caption).unwrap_or("");
+        let content = caption.unwrap_or("");
 
         send_discord_api(&self.http_client, |client| {
             let part = Part::bytes(file_bytes.clone())

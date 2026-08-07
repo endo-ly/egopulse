@@ -363,7 +363,7 @@ pub async fn build_app_state_with_path(
     let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
     tools.set_mcp_manager(Arc::clone(&mcp_arc));
 
-    tools.register_tool(Box::new(crate::tools::SendMessageTool::new(
+    tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
         workspace_dir.clone(),
         Arc::clone(&channels),
         Arc::clone(&deps.db),

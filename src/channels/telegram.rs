@@ -504,7 +504,6 @@ impl ChannelAdapter for TelegramAdapter {
     async fn send_attachment(
         &self,
         external_chat_id: &str,
-        text: Option<&str>,
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<(), String> {
@@ -527,7 +526,7 @@ impl ChannelAdapter for TelegramAdapter {
             .to_ascii_lowercase();
         let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp");
 
-        let caption_text = caption.or(text).unwrap_or("");
+        let caption_text = caption.unwrap_or("");
         let caption_value = if caption_text.len() > 1024 {
             let mut end = 1024;
             while end > 0 && !caption_text.is_char_boundary(end) {
@@ -561,23 +560,6 @@ impl ChannelAdapter for TelegramAdapter {
             &field_refs,
         )
         .await?;
-
-        if let Some(t) = text {
-            if caption.is_some() && !t.is_empty() {
-                for chunk in split_text(t, TELEGRAM_MAX_MESSAGE_LEN) {
-                    send_telegram_api(
-                        &self.http_client,
-                        &token,
-                        "sendMessage",
-                        serde_json::json!({
-                            "chat_id": chat_id,
-                            "text": chunk,
-                        }),
-                    )
-                    .await?;
-                }
-            }
-        }
 
         Ok(())
     }

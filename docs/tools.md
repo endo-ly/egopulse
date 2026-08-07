@@ -14,7 +14,7 @@
 8. [find](#8-find)
 9. [ls](#9-ls)
 10. [activate_skill](#10-activate_skill)
-11. [send_message](#11-send_message)
+11. [send_attachment](#11-send_attachment)
 12. [agent_send](#12-agent_send)
 13. [Skill Catalog](#13-skill-catalog)
 14. [web_fetch](#14-web_fetch)
@@ -50,7 +50,7 @@ registry に登録される tool は次の通り。`agent_send` は常に登録�
 - `find`
 - `ls`
 - `activate_skill`
-- `send_message`
+- `send_attachment`
 - `web_fetch`
 
 #### 条件付き登録
@@ -368,28 +368,26 @@ Environment variables:
 
 実装: [egopulse/src/tools/activate_skill.rs](../../egopulse/src/tools/activate_skill.rs) · [egopulse/src/skills.rs](../../egopulse/src/skills.rs)
 
-## 11. `send_message`
+## 11. `send_attachment`
 
-- 目的: テキストメッセージまたはファイル添付を明示的にチャネルへ送信する
+- 目的: ファイルを明示的に現在の会話チャネルへ添付送信する
 - 入力:
-  - `text: string` 任意。送信するメッセージ本文（`attachment_path` 未指定時は必須）
-  - `attachment_path: string` 任意。添付ファイルのローカルパス
-  - `caption: string` 任意。添付ファイルのキャプション（`attachment_path` 指定時のみ使用）
+  - `attachment_path: string` 必須。添付ファイルのローカルパス
+  - `caption: string` 任意。添付ファイルと一緒に送信するキャプション
 - 挙動:
-  - 通常のテキスト応答はランタイムが自動送信するため、このツールはファイル添付が必要な場合に使用する
-  - `attachment_path` がある場合: パスを解決し、ファイル存在確認後、channel adapter 経由で添付送信
-  - `attachment_path` がない場合: `text` を channel adapter 経由で送信
-  - `text` も `attachment_path` も空の場合はエラー
+  - 通常の最終テキスト応答はランタイムが自動送信するため、このツールはファイル配布時に使用する
+  - パスを解決し、ファイル存在確認後、channel adapter 経由で添付送信
+  - テキストだけの送信には使用しない
 - 成功時:
-  - `"Message sent successfully"`
+  - `"Attachment sent successfully"`
 - 主な失敗:
-  - `"At least one of 'text' or 'attachment_path' must be provided"`
+  - `"Missing required parameter: attachment_path"`
   - `"no chat found for chat_id <id>"`
   - `"no adapter for channel '<name>'"`
   - `"File not found: <path>"`
-  - `"Failed to send message: <reason>"`
+  - `"Failed to send attachment: <reason>"`
 
-実装: [egopulse/src/tools/send_message.rs](../../egopulse/src/tools/send_message.rs)
+実装: [egopulse/src/tools/send_attachment.rs](../../egopulse/src/tools/send_attachment.rs)
 
 ## 12. `agent_send`
 
