@@ -1559,7 +1559,10 @@ enum PersistConflictOutcome {
 ///
 /// A provider response with no displayable assistant content is handled by the
 /// shared tool-phase runtime guard before this transient-error retry policy is
-/// applied. That recovery is limited to one guarded request per iteration.
+/// applied when no delta has been published. That recovery is limited to one
+/// guarded request per iteration. If a delta was already published, the guard
+/// is skipped and the Turn becomes `uncertain` instead of making another LLM
+/// request.
 ///
 /// If a delta escaped before the error, retry is refused and the caller routes
 /// the Turn to `uncertain`. The `output_published` flag on [`ModelRequestError`]
@@ -1627,6 +1630,7 @@ async fn send_model_request_with_retry(
                 on_delta: &on_delta,
             },
             &mut empty_reply_retry_attempted,
+            Some(output_published.as_ref()),
         )
         .await
         {
@@ -2032,10 +2036,54 @@ impl crate::llm::LlmProvider for DeltaThenFailProvider {
 }
 
 #[cfg(test)]
+pub(crate) struct DeltaThenThinkingProvider {
+    pub(crate) delta: String,
+    pub(crate) calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::llm::LlmProvider for DeltaThenThinkingProvider {
+    async fn send_message(
+        &self,
+        _: &str,
+        _: Arc<Vec<Message>>,
+        _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        unreachable!("agent loop uses the streaming path")
+    }
+
+    async fn send_message_streaming(
+        &self,
+        _: &str,
+        _: Arc<Vec<Message>>,
+        _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        on_delta(self.delta.clone());
+        Ok(crate::llm::MessagesResponse {
+            content: "<thinking>internal</thinking>".to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn provider_name(&self) -> &str {
+        "delta-thinking"
+    }
+
+    fn model_name(&self) -> &str {
+        "delta-thinking-model"
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        DeltaEmittingProvider, FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
-        build_state_with_provider, cli_context,
+        DeltaEmittingProvider, DeltaThenThinkingProvider, FailingProvider, FakeProvider,
+        RecordingProvider, SurfaceContext, build_state_with_provider, cli_context,
     };
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
@@ -4238,6 +4286,60 @@ mod tests {
                 "cli",
                 "cli:partial-delta:agent:default",
                 Some("partial-delta"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let (state_str, output_published): (String, i64) = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state, output_published FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn_run row");
+        assert_eq!(state_str, "uncertain", "published output -> uncertain");
+        assert_eq!(output_published, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn thinking_only_response_after_delta_skips_empty_guard_and_marks_uncertain() {
+        // Arrange: the provider publishes a delta, then returns only hidden
+        // thinking. The partial output makes a guarded retry unsafe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(DeltaThenThinkingProvider {
+                delta: "partial".to_string(),
+                calls: std::sync::Arc::clone(&calls),
+            }),
+        );
+        let context = context_with_request_key("thinking-only-after-delta", "cli:thinking-only:1");
+
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect_err("should fail after published output");
+
+        // Assert: the empty-response guard must not issue a second LLM call,
+        // and the Turn must stop as uncertain because output was published.
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry a thinking-only response after a delta"
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:thinking-only-after-delta:agent:default",
+                Some("thinking-only-after-delta"),
                 "cli",
                 "default",
             )

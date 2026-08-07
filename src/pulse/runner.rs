@@ -139,6 +139,7 @@ pub(crate) async fn run_activation_with_snapshot(
                 on_delta: &ignore_delta,
             },
             &mut empty_reply_retry_attempted,
+            None,
         )
         .await
         .map_err(|error| error.into_error())?;

@@ -1,6 +1,7 @@
 //! Shared LLM tool-phase utilities used by normal turns and Pulse activations.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::future::join_all;
 use tracing::warn;
@@ -229,15 +230,25 @@ pub(crate) async fn send_tool_phase_request(
 /// for a visible answer again. Tool phases are not re-executed by this helper;
 /// only the LLM request is repeated. If the guarded request fails with a
 /// retryable error, the returned error retains the guarded message list so the
-/// caller can retry the same request.
+/// caller can retry the same request. When the caller has already published
+/// output for the iteration, the empty response is returned without sending a
+/// guard request because the partial output cannot be safely replayed.
 pub(crate) async fn send_tool_phase_request_with_empty_retry(
     request: ToolPhaseRequest<'_>,
     empty_retry_attempted: &mut bool,
+    output_published: Option<&AtomicBool>,
 ) -> Result<ToolPhaseResponse, ToolPhaseRequestError> {
     let first_response = send_tool_phase_request(request.clone()).await;
     if !tool_phase_response_is_empty(&first_response) {
         return first_response
             .map_err(|error| ToolPhaseRequestError::new(error, Arc::clone(&request.messages)));
+    }
+
+    if output_published.is_some_and(|published| published.load(Ordering::SeqCst)) {
+        return Err(ToolPhaseRequestError::new(
+            empty_response_after_published_output(),
+            Arc::clone(&request.messages),
+        ));
     }
 
     if *empty_retry_attempted {
@@ -294,6 +305,12 @@ fn tool_phase_response_is_empty(response: &Result<ToolPhaseResponse, EgoPulseErr
 fn empty_response_after_retry() -> EgoPulseError {
     EgoPulseError::Llm(LlmError::InvalidResponse(
         "assistant content was empty after retry".to_string(),
+    ))
+}
+
+fn empty_response_after_published_output() -> EgoPulseError {
+    EgoPulseError::Llm(LlmError::InvalidResponse(
+        "assistant content was empty after output was published".to_string(),
     ))
 }
 
@@ -1079,6 +1096,7 @@ mod tests {
                 on_delta: &ignore_delta,
             },
             &mut retry_attempted,
+            None,
         )
         .await
         .expect("empty response should recover");
@@ -1139,6 +1157,7 @@ mod tests {
                 on_delta: &ignore_delta,
             },
             &mut retry_attempted,
+            None,
         )
         .await;
         let error = match result {
