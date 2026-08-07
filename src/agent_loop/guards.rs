@@ -2,6 +2,10 @@
 
 use crate::llm::Message;
 
+/// Runtime instruction appended once when a model response has no user-visible
+/// text and no executable tool call.
+pub(crate) const EMPTY_REPLY_RUNTIME_GUARD: &str = "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.";
+
 pub(crate) fn runtime_guard_messages(
     messages: &[Message],
     assistant_text: &str,

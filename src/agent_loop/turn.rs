@@ -16,7 +16,7 @@ use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
     AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks,
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
-    send_tool_phase_request,
+    send_tool_phase_request_with_empty_retry,
 };
 use crate::agent_loop::{
     ConversationScope, SurfaceContext, TurnRuntime, deserialize_scheduled_turn,
@@ -148,7 +148,6 @@ struct TurnLoopState {
     messages: Arc<Vec<Message>>,
     session_revision: Option<i64>,
     retry_messages: Option<Arc<Vec<Message>>>,
-    empty_reply_retry_attempted: bool,
     declarative_retry_attempted: bool,
 }
 
@@ -158,7 +157,6 @@ impl TurnLoopState {
             messages,
             session_revision,
             retry_messages: None,
-            empty_reply_retry_attempted: false,
             declarative_retry_attempted: false,
         }
     }
@@ -170,7 +168,6 @@ impl TurnLoopState {
     }
 
     fn reset_retry_guards_after_tool_phase(&mut self) {
-        self.empty_reply_retry_attempted = false;
         self.declarative_retry_attempted = false;
     }
 }
@@ -979,7 +976,6 @@ impl TurnExecutor<'_> {
                 match evaluate_end_turn(
                     &response.content,
                     response.reasoning_content.as_deref(),
-                    &mut loop_state.empty_reply_retry_attempted,
                     &mut loop_state.declarative_retry_attempted,
                     &loop_state.messages,
                 )? {
@@ -1128,23 +1124,11 @@ fn request_messages_for_iteration(
 fn evaluate_end_turn(
     raw_content: &str,
     reasoning_content: Option<&str>,
-    empty_reply_retry_attempted: &mut bool,
     declarative_retry_attempted: &mut bool,
     messages: &[Message],
 ) -> Result<TurnAction, EgoPulseError> {
     let visible_text = strip_thinking(raw_content.trim());
     let has_displayable_output = !visible_text.trim().is_empty();
-
-    if !has_displayable_output && !*empty_reply_retry_attempted {
-        *empty_reply_retry_attempted = true;
-        warn!("empty visible reply; injecting runtime guard and retrying once");
-        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
-            messages,
-            raw_content,
-            reasoning_content,
-            "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
-        )))));
-    }
 
     if has_displayable_output
         && !*declarative_retry_attempted
@@ -1573,6 +1557,13 @@ enum PersistConflictOutcome {
 ///   tracks publication),
 /// * the attempt budget is not exhausted.
 ///
+/// A provider response with no displayable assistant content is handled by the
+/// shared tool-phase runtime guard before this transient-error retry policy is
+/// applied when no delta has been published. That recovery is limited to one
+/// guarded request per iteration. If a delta was already published, the guard
+/// is skipped and the Turn becomes `uncertain` instead of making another LLM
+/// request.
+///
 /// If a delta escaped before the error, retry is refused and the caller routes
 /// the Turn to `uncertain`. The `output_published` flag on [`ModelRequestError`]
 /// communicates that decision.
@@ -1611,6 +1602,8 @@ async fn send_model_request_with_retry(
     }
 
     let output_published = Arc::new(AtomicBool::new(false));
+    let mut empty_reply_retry_attempted = false;
+    let mut retry_messages = Arc::clone(&request_messages);
     for attempt in 1..=MAX_LLM_RETRIES {
         let delta_emitter = on_event.clone();
         let flag = Arc::clone(&output_published);
@@ -1619,26 +1612,32 @@ async fn send_model_request_with_retry(
             delta_emitter.emit(AgentEvent::Delta { text });
         };
 
-        match send_tool_phase_request(ToolPhaseRequest {
-            state,
-            llm: prepared.channel_llm.as_ref(),
-            system_prompt: &prepared.system_prompt,
-            messages: Arc::clone(&request_messages),
-            tools: Some(Arc::clone(&prepared.tool_defs)),
-            chat_id: prepared.chat_id,
-            caller_channel: &context.channel,
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration,
-            scope: context.scope,
-            on_delta: &on_delta,
-        })
+        match send_tool_phase_request_with_empty_retry(
+            ToolPhaseRequest {
+                state,
+                llm: prepared.channel_llm.as_ref(),
+                system_prompt: &prepared.system_prompt,
+                messages: Arc::clone(&retry_messages),
+                tools: Some(Arc::clone(&prepared.tool_defs)),
+                chat_id: prepared.chat_id,
+                caller_channel: &context.channel,
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration,
+                scope: context.scope,
+                on_delta: &on_delta,
+            },
+            &mut empty_reply_retry_attempted,
+            Some(output_published.as_ref()),
+        )
         .await
         {
             Ok(response) => return Ok(response),
-            Err(error) => {
+            Err(request_error) => {
+                let (error, next_retry_messages) = request_error.into_parts();
+                retry_messages = next_retry_messages;
                 let published = output_published.load(Ordering::SeqCst);
                 let retryable = matches!(&error, EgoPulseError::Llm(e) if e.is_retryable());
                 if retryable && !published && attempt < MAX_LLM_RETRIES {
@@ -2037,10 +2036,54 @@ impl crate::llm::LlmProvider for DeltaThenFailProvider {
 }
 
 #[cfg(test)]
+struct DeltaThenThinkingProvider {
+    delta: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::llm::LlmProvider for DeltaThenThinkingProvider {
+    async fn send_message(
+        &self,
+        _: &str,
+        _: Arc<Vec<Message>>,
+        _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        unreachable!("agent loop uses the streaming path")
+    }
+
+    async fn send_message_streaming(
+        &self,
+        _: &str,
+        _: Arc<Vec<Message>>,
+        _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        on_delta(self.delta.clone());
+        Ok(crate::llm::MessagesResponse {
+            content: "<thinking>internal</thinking>".to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn provider_name(&self) -> &str {
+        "delta-thinking"
+    }
+
+    fn model_name(&self) -> &str {
+        "delta-thinking-model"
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        DeltaEmittingProvider, FailingProvider, FakeProvider, RecordingProvider, SurfaceContext,
-        build_state_with_provider, cli_context,
+        DeltaEmittingProvider, DeltaThenThinkingProvider, FailingProvider, FakeProvider,
+        RecordingProvider, SurfaceContext, build_state_with_provider, cli_context,
     };
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
@@ -4157,6 +4200,60 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn empty_guard_retry_reuses_guard_messages_after_transient_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered after guarded retry".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = context_with_request_key("empty-guard-transient", "cli:empty-guard:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn should recover with the guarded request");
+
+        // Assert
+        assert_eq!(reply, "recovered after guarded retry");
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 3);
+        let first_guard = seen_messages[1].last().expect("first guard message");
+        let second_guard = seen_messages[2].last().expect("second guard message");
+        assert!(
+            crate::agent_loop::formatting::message_to_text(first_guard)
+                .contains("no user-visible text")
+        );
+        assert_eq!(
+            crate::agent_loop::formatting::message_to_text(first_guard),
+            crate::agent_loop::formatting::message_to_text(second_guard)
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn partial_delta_published_prevents_retry_and_marks_uncertain() {
         // Arrange: a provider that emits a delta then fails with a retryable
         // error. Because output was published, retry is refused.
@@ -4189,6 +4286,60 @@ mod tests {
                 "cli",
                 "cli:partial-delta:agent:default",
                 Some("partial-delta"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let (state_str, output_published): (String, i64) = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state, output_published FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn_run row");
+        assert_eq!(state_str, "uncertain", "published output -> uncertain");
+        assert_eq!(output_published, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn thinking_only_response_after_delta_skips_empty_guard_and_marks_uncertain() {
+        // Arrange: the provider publishes a delta, then returns only hidden
+        // thinking. The partial output makes a guarded retry unsafe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(DeltaThenThinkingProvider {
+                delta: "partial".to_string(),
+                calls: std::sync::Arc::clone(&calls),
+            }),
+        );
+        let context = context_with_request_key("thinking-only-after-delta", "cli:thinking-only:1");
+
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect_err("should fail after published output");
+
+        // Assert: the empty-response guard must not issue a second LLM call,
+        // and the Turn must stop as uncertain because output was published.
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry a thinking-only response after a delta"
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:thinking-only-after-delta:agent:default",
+                Some("thinking-only-after-delta"),
                 "cli",
                 "default",
             )

@@ -29,7 +29,7 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     fn name(&self) -> &str;
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)>;
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
-    async fn send_attachment(&self, external_chat_id: &str, text: Option<&str>, file_path: &Path, caption: Option<&str>) -> Result<(), String>;
+    async fn send_attachment(&self, external_chat_id: &str, text: Option<&str>, attachment: &PreparedAttachment) -> Result<(), String>;
 }
 ```
 
@@ -215,7 +215,6 @@ Agent Session の LLM 呼び出し時に、対象エージェントへの直接�
 ### 制約
 
 - 1 メッセージ 4096 文字（自動分割）
-- キャプション 1024 文字
 - グループでは `channels` マップ外のチャットに応答しない
 - `require_mention: true` のチャットでは @mention なしで応答しない
 - チャネル（Channel）メッセージは無視

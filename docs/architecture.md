@@ -170,7 +170,7 @@ src/
 │   ├── path_guard.rs    # 機密パスブロック
 │   ├── sanitizer.rs     # 出力リダクション
 │   ├── search.rs        # grep / find / ls ツール
-│   ├── send_message.rs  # メッセージ送信ツール
+│   ├── send_attachment.rs # ファイル添付ツール
 │   ├── shell.rs         # bash 実行ツール
 │   ├── files.rs         # read / write / edit ツール
 │   ├── text.rs          # テキスト処理ツール
