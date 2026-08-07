@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{
-    ChannelAdapter, ToolProgressHandle, ToolProgressSink, TurnActivity,
+    ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink, TurnActivity,
 };
 use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::DiscordChannelConfig;
@@ -43,6 +43,15 @@ const DISCORD_RETRY_AFTER_FALLBACK_SECS: u64 = 2;
 
 /// Discord メッセージ長制限 (文字数)。
 const DISCORD_MAX_MESSAGE_LEN: usize = 2000;
+
+fn validate_attachment_text(text: &str) -> Result<(), String> {
+    if text.chars().count() > DISCORD_MAX_MESSAGE_LEN {
+        return Err(format!(
+            "attachment text exceeds Discord's {DISCORD_MAX_MESSAGE_LEN}-character limit"
+        ));
+    }
+    Ok(())
+}
 
 /// Discord typing indicator の更新間隔 (秒)。
 const DISCORD_TYPING_REFRESH_SECS: u64 = 8;
@@ -329,22 +338,22 @@ impl ChannelAdapter for DiscordAdapter {
         &self,
         external_chat_id: &str,
         text: Option<&str>,
-        file_path: &Path,
+        attachment: &PreparedAttachment,
     ) -> Result<(), String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
         let token = self.select_token(external_chat_id)?;
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
 
-        let filename = file_path
+        let content = text.unwrap_or("");
+        validate_attachment_text(content)?;
+
+        let filename = attachment
+            .path()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let file_bytes = tokio::fs::read(file_path)
-            .await
-            .map_err(|e| format!("failed to read file: {e}"))?;
-
-        let content = text.unwrap_or("");
+        let file_bytes = attachment.bytes().to_vec();
 
         send_discord_api(&self.http_client, |client| {
             let part = Part::bytes(file_bytes.clone())
@@ -1497,6 +1506,16 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].0, "discord");
         assert_eq!(routes[0].1, ConversationKind::Private);
+    }
+
+    #[test]
+    fn attachment_text_limit_counts_unicode_scalar_values_without_truncation() {
+        let within_limit = "あ".repeat(DISCORD_MAX_MESSAGE_LEN);
+        assert!(validate_attachment_text(&within_limit).is_ok());
+
+        let over_limit = format!("{within_limit}a");
+        let error = validate_attachment_text(&over_limit).expect_err("over-limit text");
+        assert!(error.contains("2000-character limit"));
     }
 
     #[test]

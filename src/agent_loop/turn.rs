@@ -2036,9 +2036,9 @@ impl crate::llm::LlmProvider for DeltaThenFailProvider {
 }
 
 #[cfg(test)]
-pub(crate) struct DeltaThenThinkingProvider {
-    pub(crate) delta: String,
-    pub(crate) calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+struct DeltaThenThinkingProvider {
+    delta: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]

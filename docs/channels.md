@@ -29,9 +29,17 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     fn name(&self) -> &str;
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)>;
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
-    async fn send_attachment(&self, external_chat_id: &str, text: Option<&str>, file_path: &Path) -> Result<(), String>;
+    async fn send_attachment(&self, external_chat_id: &str, text: Option<&str>, attachment: &PreparedAttachment) -> Result<(), String>;
 }
 ```
+
+`PreparedAttachment` はツール側でワークスペース内への解決、パス検査、ファイル読み込みを完了した値であり、アダプターは `path` を再読しない。
+
+`send_attachment` の `text` は、ファイルと同じ送信リクエストに含める任意のテキストである。空白だけの値はツール側で省略する。チャネルごとの契約は次のとおり。
+
+- **Discord**: `content` として送信する。最大 2000 Unicode スカラー値で、上限内は切り詰めずそのまま渡す。上限超過時は送信エラーとし、暗黙に切り詰めない。
+- **Telegram**: `caption` として送信する。最大 1024 UTF-8 バイトで、超過時は UTF-8 文字境界まで切り詰めて残りを破棄する。超過自体はエラーにしない。
+- **その他のチャネル**: 添付送信非対応としてエラーを返す。
 
 ### Channel Input Boundary
 
@@ -110,6 +118,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 ### 制約
 
 - 1 メッセージ 2000 文字（自動分割）
+- 添付送信の `text`: 最大 2000 Unicode スカラー値。超過時は切り詰めず送信エラー
 - HTTP タイムアウト 10 秒
 - レート制限時は 3 回までリトライ
 - `channels` マップに含まれるチャンネルのみ応答。マップが空の場合ギルドメッセージは全拒否（DM は常に許可）
@@ -215,7 +224,7 @@ Agent Session の LLM 呼び出し時に、対象エージェントへの直接�
 ### 制約
 
 - 1 メッセージ 4096 文字（自動分割）
-- キャプション 1024 文字
+- 添付送信の `text`（caption）: 最大 1024 UTF-8 バイト。超過時は文字境界で切り詰め、残りを破棄
 - グループでは `channels` マップ外のチャットに応答しない
 - `require_mention: true` のチャットでは @mention なしで応答しない
 - チャネル（Channel）メッセージは無視

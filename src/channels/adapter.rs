@@ -11,7 +11,7 @@ pub(crate) enum ConversationKind {
 }
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +22,29 @@ pub(crate) trait TurnActivity: Send {}
 struct NoopTurnActivity;
 
 impl TurnActivity for NoopTurnActivity {}
+
+/// A workspace-validated attachment whose bytes are fixed before channel delivery.
+pub(crate) struct PreparedAttachment {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl PreparedAttachment {
+    /// Creates an attachment from its validated path and already-read bytes.
+    pub(crate) fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        Self { path, bytes }
+    }
+
+    /// Returns the canonical path used to prepare the attachment.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the stable attachment bytes.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 
 /// Displays tool execution progress for a single turn.
 ///
@@ -92,23 +115,26 @@ pub(crate) trait ChannelAdapter: Send + Sync {
         None
     }
 
-    /// Sends a file attachment to the specified chat.
+    /// Sends a prepared file attachment to the specified chat.
     ///
-    /// When provided, `text` is delivered alongside the attachment.
+    /// When provided, `text` is delivered alongside the attachment. Discord
+    /// forwards up to 2000 Unicode scalar values without truncation and
+    /// rejects longer text. Telegram truncates at 1024 UTF-8 bytes on a
+    /// character boundary and discards the remainder.
     ///
     /// Returns an error if the channel does not support file attachments.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the channel lacks attachment support, the file cannot
-    /// be read, or the upstream API rejects the request.
+    /// Returns `Err` if the channel lacks attachment support, the channel's
+    /// text contract rejects the request, or the upstream API rejects it.
     async fn send_attachment(
         &self,
         external_chat_id: &str,
         text: Option<&str>,
-        file_path: &Path,
+        attachment: &PreparedAttachment,
     ) -> Result<(), String> {
-        let _ = (external_chat_id, text, file_path);
+        let _ = (external_chat_id, text, attachment);
         Err("file attachments not supported on this channel".to_string())
     }
 }

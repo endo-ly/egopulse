@@ -376,12 +376,17 @@ Environment variables:
   - `text: string` 任意。添付ファイルと一緒に送信するテキスト
 - 挙動:
   - 通常の最終テキスト応答はランタイムが自動送信するため、このツールはファイル配布時に使用する
-  - パスを解決し、ファイル存在確認後、channel adapter 経由で添付送信
+  - パスをワークスペース内へ解決・固定し、検証済みのファイル内容を channel adapter 経由で添付送信
   - テキストだけの送信には使用しない
+- `text` のチャネル別契約:
+  - Discord: `content` として最大 2000 Unicode スカラー値まで完全に送信する。上限超過時は切り詰めずエラーにする
+  - Telegram: `caption` として最大 1024 UTF-8 バイトまで送信する。超過時は UTF-8 文字境界で切り詰めて残りを破棄し、エラーにはしない
 - 成功時:
   - `"Attachment sent successfully"`
 - 主な失敗:
   - `"Missing required parameter: attachment_path"`
+  - `"Attachment path must stay within workspace: <path>"`
+  - `"Failed to read attachment: <reason>"`
   - `"no chat found for chat_id <id>"`
   - `"no adapter for channel '<name>'"`
   - `"File not found: <path>"`

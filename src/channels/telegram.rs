@@ -25,8 +25,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
-use crate::channels::adapter::{ChannelAdapter, ToolProgressHandle, ToolProgressSink};
-use crate::channels::utils::text::{keep_tail, split_text};
+use crate::channels::adapter::{
+    ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink,
+};
+use crate::channels::utils::text::{floor_char_boundary, keep_tail, split_text};
 use crate::config::TelegramChatConfig;
 use crate::config::manager::ConfigSnapshot;
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
@@ -34,6 +36,14 @@ use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 
 /// Telegram メッセージ長制限 (文字数)。
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+
+/// Telegram 添付キャプションの最大長 (UTF-8バイト数)。
+const TELEGRAM_MAX_ATTACHMENT_TEXT_BYTES: usize = 1024;
+
+fn truncate_attachment_text(text: &str) -> &str {
+    let end = floor_char_boundary(text, TELEGRAM_MAX_ATTACHMENT_TEXT_BYTES);
+    &text[..end]
+}
 
 /// Bot-to-bot 連鎖の最大深さ（チャット単位）。
 const BOT_CHAIN_MAX_DEPTH: u32 = 5;
@@ -505,21 +515,20 @@ impl ChannelAdapter for TelegramAdapter {
         &self,
         external_chat_id: &str,
         text: Option<&str>,
-        file_path: &Path,
+        attachment: &PreparedAttachment,
     ) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
         let token = self.select_token(external_chat_id)?;
 
-        let filename = file_path
+        let filename = attachment
+            .path()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let file_bytes = tokio::fs::read(file_path)
-            .await
-            .map_err(|e| format!("failed to read file: {e}"))?;
 
-        let extension = file_path
+        let extension = attachment
+            .path()
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -527,15 +536,7 @@ impl ChannelAdapter for TelegramAdapter {
         let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp");
 
         let text_content = text.unwrap_or("");
-        let text_value = if text_content.len() > 1024 {
-            let mut end = 1024;
-            while end > 0 && !text_content.is_char_boundary(end) {
-                end -= 1;
-            }
-            &text_content[..end]
-        } else {
-            text_content
-        };
+        let text_value = truncate_attachment_text(text_content);
 
         let method = if is_image {
             "sendPhoto"
@@ -556,7 +557,7 @@ impl ChannelAdapter for TelegramAdapter {
             method,
             file_part_name,
             &filename,
-            &file_bytes,
+            attachment.bytes(),
             &field_refs,
         )
         .await?;
@@ -1509,6 +1510,17 @@ mod tests {
         let text = "";
         let combined = crate::channels::utils::media::format_attachment_text(&paths, text);
         assert_eq!(combined, "[attachment: /workspace/media/inbound/voice.ogg]");
+    }
+
+    #[test]
+    fn telegram_attachment_text_truncates_at_utf8_byte_boundary() {
+        let text = "あ".repeat(342);
+
+        let truncated = truncate_attachment_text(&text);
+
+        assert_eq!(truncated, "あ".repeat(341));
+        assert!(truncated.len() <= TELEGRAM_MAX_ATTACHMENT_TEXT_BYTES);
+        assert!(truncated.len() < text.len());
     }
 
     #[test]
