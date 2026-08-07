@@ -504,8 +504,8 @@ impl ChannelAdapter for TelegramAdapter {
     async fn send_attachment(
         &self,
         external_chat_id: &str,
+        text: Option<&str>,
         file_path: &Path,
-        caption: Option<&str>,
     ) -> Result<(), String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
         let token = self.select_token(external_chat_id)?;
@@ -526,15 +526,15 @@ impl ChannelAdapter for TelegramAdapter {
             .to_ascii_lowercase();
         let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp");
 
-        let caption_text = caption.unwrap_or("");
-        let caption_value = if caption_text.len() > 1024 {
+        let text_content = text.unwrap_or("");
+        let text_value = if text_content.len() > 1024 {
             let mut end = 1024;
-            while end > 0 && !caption_text.is_char_boundary(end) {
+            while end > 0 && !text_content.is_char_boundary(end) {
                 end -= 1;
             }
-            &caption_text[..end]
+            &text_content[..end]
         } else {
-            caption_text
+            text_content
         };
 
         let method = if is_image {
@@ -545,8 +545,8 @@ impl ChannelAdapter for TelegramAdapter {
         let file_part_name = if is_image { "photo" } else { "document" };
 
         let mut fields: Vec<(&str, String)> = vec![("chat_id", chat_id.to_string())];
-        if !caption_value.is_empty() {
-            fields.push(("caption", caption_value.to_string()));
+        if !text_value.is_empty() {
+            fields.push(("caption", text_value.to_string()));
         }
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
 

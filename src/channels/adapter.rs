@@ -94,6 +94,8 @@ pub(crate) trait ChannelAdapter: Send + Sync {
 
     /// Sends a file attachment to the specified chat.
     ///
+    /// When provided, `text` is delivered alongside the attachment.
+    ///
     /// Returns an error if the channel does not support file attachments.
     ///
     /// # Errors
@@ -103,10 +105,10 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     async fn send_attachment(
         &self,
         external_chat_id: &str,
+        text: Option<&str>,
         file_path: &Path,
-        caption: Option<&str>,
     ) -> Result<(), String> {
-        let _ = (external_chat_id, file_path, caption);
+        let _ = (external_chat_id, text, file_path);
         Err("file attachments not supported on this channel".to_string())
     }
 }

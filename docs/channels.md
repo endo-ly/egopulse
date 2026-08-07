@@ -29,7 +29,7 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     fn name(&self) -> &str;
     fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)>;
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String>;
-    async fn send_attachment(&self, external_chat_id: &str, file_path: &Path, caption: Option<&str>) -> Result<(), String>;
+    async fn send_attachment(&self, external_chat_id: &str, text: Option<&str>, file_path: &Path) -> Result<(), String>;
 }
 ```
 

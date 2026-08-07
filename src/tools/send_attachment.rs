@@ -18,7 +18,7 @@ use super::path_guard;
 use super::search::resolve_workspace_path;
 use super::{Tool, ToolExecutionContext, ToolResult, schema_object};
 
-/// Tool for sending file attachments with an optional caption to the conversation channel.
+/// Tool for sending file attachments with optional text to the conversation channel.
 ///
 /// Normal text responses are auto-sent by the runtime; this tool exists only for
 /// cases that require explicit file attachment delivery.
@@ -70,14 +70,14 @@ impl Tool for SendAttachmentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_attachment".to_string(),
-            description: "Send a file attachment to the current conversation, optionally with a caption. Use this when you need to deliver a file to the user. For normal text responses, just write your reply — do not use this tool.".to_string(),
+            description: "Send a file attachment to the current conversation, optionally with text. Use this when you need to deliver a file to the user. For normal text responses, just write your reply — do not use this tool.".to_string(),
             parameters: schema_object(
                 json!({
                     "attachment_path": {
                         "type": "string",
                         "description": "Local file path to send as an attachment (required)"
                     },
-                    "caption": {
+                    "text": {
                         "type": "string",
                         "description": "Optional text to include with the attached file"
                     }
@@ -98,7 +98,7 @@ impl Tool for SendAttachmentTool {
             #[serde(default)]
             attachment_path: Option<String>,
             #[serde(default)]
-            caption: Option<String>,
+            text: Option<String>,
         }
 
         let params: Params = match super::parse_params(input) {
@@ -113,7 +113,7 @@ impl Tool for SendAttachmentTool {
                 );
             }
         };
-        let caption = params.caption.filter(|s| !s.trim().is_empty());
+        let text = params.text.filter(|s| !s.trim().is_empty());
 
         let chat_id = context.chat_id;
         let chat_info = match call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
@@ -152,7 +152,7 @@ impl Tool for SendAttachmentTool {
         }
 
         match adapter
-            .send_attachment(&chat_info.external_chat_id, &resolved, caption.as_deref())
+            .send_attachment(&chat_info.external_chat_id, text.as_deref(), &resolved)
             .await
         {
             Ok(()) => ToolResult::success("Attachment sent successfully".to_string()),
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_requires_attachment_path_and_exposes_caption() {
+    fn definition_requires_attachment_path_and_exposes_text() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = test_tool(dir.path());
 
@@ -193,12 +193,12 @@ mod tests {
                 .get("attachment_path")
                 .is_some()
         );
-        assert!(definition.parameters["properties"].get("caption").is_some());
-        assert!(definition.parameters["properties"].get("text").is_none());
+        assert!(definition.parameters["properties"].get("text").is_some());
+        assert!(definition.parameters["properties"].get("caption").is_none());
     }
 
     #[tokio::test]
-    async fn execute_rejects_missing_or_legacy_text_input() {
+    async fn execute_requires_attachment_path_even_with_text() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = test_tool(dir.path());
         let context = crate::test_util::test_tool_context();
@@ -210,8 +210,20 @@ mod tests {
             "Missing required parameter: attachment_path"
         );
 
-        let legacy_text = tool.execute(json!({"text": "hello"}), &context).await;
-        assert!(legacy_text.is_error);
-        assert!(legacy_text.content.contains("unknown field"));
+        let text_without_path = tool.execute(json!({"text": "hello"}), &context).await;
+        assert!(text_without_path.is_error);
+        assert_eq!(
+            text_without_path.content,
+            "Missing required parameter: attachment_path"
+        );
+
+        let caption_input = tool
+            .execute(
+                json!({"attachment_path": "file.txt", "caption": "hello"}),
+                &context,
+            )
+            .await;
+        assert!(caption_input.is_error);
+        assert!(caption_input.content.contains("unknown field"));
     }
 }
