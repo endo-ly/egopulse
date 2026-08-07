@@ -308,6 +308,17 @@ pub enum LlmError {
 }
 
 impl LlmError {
+    /// Returns `true` when the provider returned no displayable content or
+    /// executable tool call.
+    pub(crate) fn is_empty_response(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidResponse(message)
+                if message == "assistant content was empty"
+                    || message.starts_with("assistant content was empty (")
+        )
+    }
+
     /// Returns `true` when the error represents a transient failure that is
     /// safe to retry without side effects: a network/timeout failure before
     /// the provider returned any body, or a 429 / 5xx response.

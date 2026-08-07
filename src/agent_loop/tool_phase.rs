@@ -9,11 +9,12 @@ use crate::agent_loop::ConversationScope;
 use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
-    format_tool_result, message_to_text, sanitize_assistant_response_text,
+    format_tool_result, message_to_text, sanitize_assistant_response_text, strip_thinking,
     summarize_tool_calls_with_content, tool_message_content,
 };
+use crate::agent_loop::guards::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
 use crate::channels::utils::text::truncate_by_chars;
-use crate::error::EgoPulseError;
+use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::storage::call_blocking;
@@ -69,6 +70,7 @@ pub(crate) enum ToolPhaseResponse {
     ToolCalls(AssistantToolPhase),
 }
 
+#[derive(Clone)]
 pub(crate) struct ToolPhaseRequest<'a> {
     pub(crate) state: &'a TurnRuntime,
     pub(crate) llm: &'a dyn LlmProvider,
@@ -84,6 +86,32 @@ pub(crate) struct ToolPhaseRequest<'a> {
     pub(crate) iteration: usize,
     pub(crate) scope: ConversationScope,
     pub(crate) on_delta: &'a (dyn Fn(String) + Send + Sync),
+}
+
+/// A tool-phase error together with the request payload that can be retried.
+#[derive(Debug)]
+pub(crate) struct ToolPhaseRequestError {
+    error: EgoPulseError,
+    retry_messages: Arc<Vec<Message>>,
+}
+
+impl ToolPhaseRequestError {
+    fn new(error: EgoPulseError, retry_messages: Arc<Vec<Message>>) -> Self {
+        Self {
+            error,
+            retry_messages,
+        }
+    }
+
+    /// Returns the underlying error when the caller has no retry policy.
+    pub(crate) fn into_error(self) -> EgoPulseError {
+        self.error
+    }
+
+    /// Returns the underlying error and the exact messages for the next retry.
+    pub(crate) fn into_parts(self) -> (EgoPulseError, Arc<Vec<Message>>) {
+        (self.error, self.retry_messages)
+    }
 }
 
 pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str) -> Vec<ToolCall> {
@@ -191,6 +219,82 @@ pub(crate) async fn send_tool_phase_request(
         response.reasoning_content,
         valid_tool_calls,
     )))
+}
+
+/// Sends one tool phase and recovers once from an empty assistant response.
+///
+/// The same recovery contract is used by normal Turns and Pulse activations.
+/// A parser-level empty response and a parsed response containing only hidden
+/// thinking are handled identically: append a runtime guard and ask the model
+/// for a visible answer again. Tool phases are not re-executed by this helper;
+/// only the LLM request is repeated. If the guarded request fails with a
+/// retryable error, the returned error retains the guarded message list so the
+/// caller can retry the same request.
+pub(crate) async fn send_tool_phase_request_with_empty_retry(
+    request: ToolPhaseRequest<'_>,
+    empty_retry_attempted: &mut bool,
+) -> Result<ToolPhaseResponse, ToolPhaseRequestError> {
+    let first_response = send_tool_phase_request(request.clone()).await;
+    if !tool_phase_response_is_empty(&first_response) {
+        return first_response
+            .map_err(|error| ToolPhaseRequestError::new(error, Arc::clone(&request.messages)));
+    }
+
+    if *empty_retry_attempted {
+        return Err(ToolPhaseRequestError::new(
+            empty_response_after_retry(),
+            Arc::clone(&request.messages),
+        ));
+    }
+
+    *empty_retry_attempted = true;
+    warn!("empty assistant response; injecting runtime guard and retrying once");
+
+    let (assistant_text, reasoning_content) = match &first_response {
+        Ok(ToolPhaseResponse::Final(response)) => (
+            response.content.as_str(),
+            response.reasoning_content.as_deref(),
+        ),
+        _ => ("", None),
+    };
+    let retry_messages = Arc::new(runtime_guard_messages(
+        &request.messages,
+        assistant_text,
+        reasoning_content,
+        EMPTY_REPLY_RUNTIME_GUARD,
+    ));
+    let retry_messages_for_error = Arc::clone(&retry_messages);
+    let retry_response = send_tool_phase_request(ToolPhaseRequest {
+        messages: retry_messages,
+        ..request
+    })
+    .await;
+
+    if tool_phase_response_is_empty(&retry_response) {
+        Err(ToolPhaseRequestError::new(
+            empty_response_after_retry(),
+            retry_messages_for_error,
+        ))
+    } else {
+        retry_response.map_err(|error| ToolPhaseRequestError::new(error, retry_messages_for_error))
+    }
+}
+
+fn tool_phase_response_is_empty(response: &Result<ToolPhaseResponse, EgoPulseError>) -> bool {
+    match response {
+        Err(EgoPulseError::Llm(error)) => error.is_empty_response(),
+        Ok(ToolPhaseResponse::Final(response)) => {
+            strip_thinking(response.content.trim()).trim().is_empty()
+        }
+        Ok(ToolPhaseResponse::MalformedToolCalls(_)) | Ok(ToolPhaseResponse::ToolCalls(_)) => false,
+        Err(_) => false,
+    }
+}
+
+fn empty_response_after_retry() -> EgoPulseError {
+    EgoPulseError::Llm(LlmError::InvalidResponse(
+        "assistant content was empty after retry".to_string(),
+    ))
 }
 
 pub(crate) fn build_assistant_tool_phase(
@@ -922,6 +1026,134 @@ mod tests {
             ))
             .await;
         assert!(factor > DEFAULT_FACTOR);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_response_retries_once_with_shared_runtime_guard() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(crate::error::LlmError::InvalidResponse(
+                    "assistant content was empty (output_items=1)".to_string(),
+                )),
+                Ok(MessagesResponse {
+                    content: "recovered response".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("empty-response-retry");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let mut retry_attempted = false;
+
+        // Act
+        let response = send_tool_phase_request_with_empty_retry(
+            ToolPhaseRequest {
+                state: &state.turn_runtime(),
+                llm: llm.as_ref(),
+                system_prompt: "system prompt",
+                messages: Arc::new(vec![Message::text("user", "hello")]),
+                tools: None,
+                chat_id: 1,
+                caller_channel: "cli",
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration: 1,
+                scope: ConversationScope::Normal,
+                on_delta: &ignore_delta,
+            },
+            &mut retry_attempted,
+        )
+        .await
+        .expect("empty response should recover");
+
+        // Assert
+        assert!(retry_attempted);
+        assert!(matches!(
+            response,
+            ToolPhaseResponse::Final(response) if response.content == "recovered response"
+        ));
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        let retry_message = seen_messages[1].last().expect("runtime guard message");
+        assert_eq!(retry_message.role, "user");
+        assert!(message_to_text(retry_message).contains("no user-visible text"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_empty_invalid_response_is_not_retried_by_empty_guard() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Err(crate::error::LlmError::InvalidResponse(
+                "choices[0] missing".to_string(),
+            ))],
+            vec![0],
+        );
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("non-empty-invalid-response");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_runtime()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let mut retry_attempted = false;
+
+        // Act
+        let result = send_tool_phase_request_with_empty_retry(
+            ToolPhaseRequest {
+                state: &state.turn_runtime(),
+                llm: llm.as_ref(),
+                system_prompt: "system prompt",
+                messages: Arc::new(vec![Message::text("user", "hello")]),
+                tools: None,
+                chat_id: 1,
+                caller_channel: "cli",
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration: 1,
+                scope: ConversationScope::Normal,
+                on_delta: &ignore_delta,
+            },
+            &mut retry_attempted,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("non-empty invalid response should remain an error"),
+            Err(error) => error.into_error(),
+        };
+
+        // Assert
+        assert!(!retry_attempted);
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(message))
+                if message == "choices[0] missing"
+        ));
+        assert_eq!(observer.seen_messages().len(), 1);
     }
 
     #[tokio::test]

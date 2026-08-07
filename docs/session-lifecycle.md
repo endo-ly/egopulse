@@ -180,6 +180,9 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 - error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout）
 - 試行回数が上限（3 回）以内
 
+空の assistant response は上記の retryable error とは別に扱う。同一 tool phase 内で runtime guard を 1 回だけ追加して再要求し、Turn と Pulse は同じ回復処理を使用する。再要求でも空の場合は `assistant content was empty after retry` で終了する。
+ガード付きの再要求自体が一時的な通信エラーになった場合も、Turn は元の要求に戻らず、同じガード付きメッセージ列を再送する。
+
 **再試行禁止**（いずれか該当で `failed` または `uncertain` へ遷移）:
 
 - partial output を外部へ公開済み（`output_published = true`）

@@ -675,7 +675,7 @@ src/
 | timezone helper | now / local date / due 判定補助 |
 | active_turn defer | agent active 中は defer |
 | shutdown 連動 | runtime 停止時に scheduler も止まる |
-| retry utility | 必要になったら共通化 |
+| retry utility | Turn と Pulse の tool phase で共通利用 |
 
 ### 11.3 分けるもの
 

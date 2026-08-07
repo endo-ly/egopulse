@@ -16,7 +16,7 @@ use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
     AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks,
     ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
-    send_tool_phase_request,
+    send_tool_phase_request_with_empty_retry,
 };
 use crate::agent_loop::{
     ConversationScope, SurfaceContext, TurnRuntime, deserialize_scheduled_turn,
@@ -148,7 +148,6 @@ struct TurnLoopState {
     messages: Arc<Vec<Message>>,
     session_revision: Option<i64>,
     retry_messages: Option<Arc<Vec<Message>>>,
-    empty_reply_retry_attempted: bool,
     declarative_retry_attempted: bool,
 }
 
@@ -158,7 +157,6 @@ impl TurnLoopState {
             messages,
             session_revision,
             retry_messages: None,
-            empty_reply_retry_attempted: false,
             declarative_retry_attempted: false,
         }
     }
@@ -170,7 +168,6 @@ impl TurnLoopState {
     }
 
     fn reset_retry_guards_after_tool_phase(&mut self) {
-        self.empty_reply_retry_attempted = false;
         self.declarative_retry_attempted = false;
     }
 }
@@ -979,7 +976,6 @@ impl TurnExecutor<'_> {
                 match evaluate_end_turn(
                     &response.content,
                     response.reasoning_content.as_deref(),
-                    &mut loop_state.empty_reply_retry_attempted,
                     &mut loop_state.declarative_retry_attempted,
                     &loop_state.messages,
                 )? {
@@ -1128,23 +1124,11 @@ fn request_messages_for_iteration(
 fn evaluate_end_turn(
     raw_content: &str,
     reasoning_content: Option<&str>,
-    empty_reply_retry_attempted: &mut bool,
     declarative_retry_attempted: &mut bool,
     messages: &[Message],
 ) -> Result<TurnAction, EgoPulseError> {
     let visible_text = strip_thinking(raw_content.trim());
     let has_displayable_output = !visible_text.trim().is_empty();
-
-    if !has_displayable_output && !*empty_reply_retry_attempted {
-        *empty_reply_retry_attempted = true;
-        warn!("empty visible reply; injecting runtime guard and retrying once");
-        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
-            messages,
-            raw_content,
-            reasoning_content,
-            "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.",
-        )))));
-    }
 
     if has_displayable_output
         && !*declarative_retry_attempted
@@ -1573,6 +1557,10 @@ enum PersistConflictOutcome {
 ///   tracks publication),
 /// * the attempt budget is not exhausted.
 ///
+/// A provider response with no displayable assistant content is handled by the
+/// shared tool-phase runtime guard before this transient-error retry policy is
+/// applied. That recovery is limited to one guarded request per iteration.
+///
 /// If a delta escaped before the error, retry is refused and the caller routes
 /// the Turn to `uncertain`. The `output_published` flag on [`ModelRequestError`]
 /// communicates that decision.
@@ -1611,6 +1599,8 @@ async fn send_model_request_with_retry(
     }
 
     let output_published = Arc::new(AtomicBool::new(false));
+    let mut empty_reply_retry_attempted = false;
+    let mut retry_messages = Arc::clone(&request_messages);
     for attempt in 1..=MAX_LLM_RETRIES {
         let delta_emitter = on_event.clone();
         let flag = Arc::clone(&output_published);
@@ -1619,26 +1609,31 @@ async fn send_model_request_with_retry(
             delta_emitter.emit(AgentEvent::Delta { text });
         };
 
-        match send_tool_phase_request(ToolPhaseRequest {
-            state,
-            llm: prepared.channel_llm.as_ref(),
-            system_prompt: &prepared.system_prompt,
-            messages: Arc::clone(&request_messages),
-            tools: Some(Arc::clone(&prepared.tool_defs)),
-            chat_id: prepared.chat_id,
-            caller_channel: &context.channel,
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration,
-            scope: context.scope,
-            on_delta: &on_delta,
-        })
+        match send_tool_phase_request_with_empty_retry(
+            ToolPhaseRequest {
+                state,
+                llm: prepared.channel_llm.as_ref(),
+                system_prompt: &prepared.system_prompt,
+                messages: Arc::clone(&retry_messages),
+                tools: Some(Arc::clone(&prepared.tool_defs)),
+                chat_id: prepared.chat_id,
+                caller_channel: &context.channel,
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration,
+                scope: context.scope,
+                on_delta: &on_delta,
+            },
+            &mut empty_reply_retry_attempted,
+        )
         .await
         {
             Ok(response) => return Ok(response),
-            Err(error) => {
+            Err(request_error) => {
+                let (error, next_retry_messages) = request_error.into_parts();
+                retry_messages = next_retry_messages;
                 let published = output_published.load(Ordering::SeqCst);
                 let retryable = matches!(&error, EgoPulseError::Llm(e) if e.is_retryable());
                 if retryable && !published && attempt < MAX_LLM_RETRIES {
@@ -4152,6 +4147,60 @@ mod tests {
             provider.seen_messages().len(),
             3,
             "LLM must be called 3 times (2 retries + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_guard_retry_reuses_guard_messages_after_transient_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered after guarded retry".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = context_with_request_key("empty-guard-transient", "cli:empty-guard:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn should recover with the guarded request");
+
+        // Assert
+        assert_eq!(reply, "recovered after guarded retry");
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 3);
+        let first_guard = seen_messages[1].last().expect("first guard message");
+        let second_guard = seen_messages[2].last().expect("second guard message");
+        assert!(
+            crate::agent_loop::formatting::message_to_text(first_guard)
+                .contains("no user-visible text")
+        );
+        assert_eq!(
+            crate::agent_loop::formatting::message_to_text(first_guard),
+            crate::agent_loop::formatting::message_to_text(second_guard)
         );
     }
 

@@ -6,7 +6,7 @@ use crate::agent_loop::ConversationScope;
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::tool_phase::{
     MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
-    build_tool_result_phase, ignore_delta, send_tool_phase_request,
+    build_tool_result_phase, ignore_delta, send_tool_phase_request_with_empty_retry,
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
@@ -120,23 +120,28 @@ pub(crate) async fn run_activation_with_snapshot(
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        let phase_response = send_tool_phase_request(ToolPhaseRequest {
-            state: &state.turn_runtime(),
-            llm: channel_llm.as_ref(),
-            system_prompt: &system_prompt,
-            messages: Arc::clone(&messages),
-            tools: Some(Arc::clone(&tool_defs)),
-            chat_id,
-            caller_channel: &context.channel,
-            request_kind: "pulse",
-            usage_log_failure: "pulse llm usage logging failed",
-            log_scope: "pulse",
-            send_failure_log: "pulse LLM send_message failed",
-            iteration,
-            scope: ConversationScope::Normal,
-            on_delta: &ignore_delta,
-        })
-        .await?;
+        let mut empty_reply_retry_attempted = false;
+        let phase_response = send_tool_phase_request_with_empty_retry(
+            ToolPhaseRequest {
+                state: &state.turn_runtime(),
+                llm: channel_llm.as_ref(),
+                system_prompt: &system_prompt,
+                messages: Arc::clone(&messages),
+                tools: Some(Arc::clone(&tool_defs)),
+                chat_id,
+                caller_channel: &context.channel,
+                request_kind: "pulse",
+                usage_log_failure: "pulse llm usage logging failed",
+                log_scope: "pulse",
+                send_failure_log: "pulse LLM send_message failed",
+                iteration,
+                scope: ConversationScope::Normal,
+                on_delta: &ignore_delta,
+            },
+            &mut empty_reply_retry_attempted,
+        )
+        .await
+        .map_err(|error| error.into_error())?;
 
         let assistant_phase = match phase_response {
             ToolPhaseResponse::Final(response) => {
@@ -205,6 +210,7 @@ mod tests {
     use crate::pulse::capsule::HomeSurface;
     use crate::pulse::capsule::build_capsule;
     use crate::pulse::definition::{TemporalIntention, TemporalSchedule};
+    use serial_test::serial;
 
     fn test_intention() -> TemporalIntention {
         TemporalIntention {
@@ -423,5 +429,72 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("pulse llm usage log was not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_reuses_shared_empty_response_recovery() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+        let provider = crate::agent_loop::turn::RecordingProvider::new(
+            vec![
+                Err(crate::error::LlmError::InvalidResponse(
+                    "assistant content was empty (output_items=1)".to_string(),
+                )),
+                Ok(crate::llm::MessagesResponse {
+                    content: "PULSE_OK".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let observer = provider.clone();
+        let config = crate::test_util::test_config(&state_root);
+        let state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let surface = HomeSurface {
+            chat_id: 1,
+            channel: "cli".to_string(),
+            external_chat_id: "test-pulse-empty-recovery".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        // Act
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await
+        .expect("activation should recover");
+
+        // Assert
+        assert_eq!(result.output_kind, PulseOutputKind::Silent);
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        let retry_message = seen_messages[1].last().expect("runtime guard message");
+        assert_eq!(retry_message.role, "user");
+        assert!(
+            crate::agent_loop::formatting::message_to_text(retry_message)
+                .contains("no user-visible text")
+        );
     }
 }
