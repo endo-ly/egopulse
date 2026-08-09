@@ -6,7 +6,8 @@ use crate::agent_loop::ConversationScope;
 use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::tool_phase::{
     MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
-    build_tool_result_phase, ignore_delta, send_tool_phase_request_with_empty_retry,
+    build_tool_result_phase, ignore_delta, messages_for_iteration,
+    send_tool_phase_request_with_empty_retry,
 };
 use crate::error::EgoPulseError;
 use crate::llm::Message;
@@ -121,12 +122,13 @@ pub(crate) async fn run_activation_with_snapshot(
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let mut empty_reply_retry_attempted = false;
+        let request_messages = messages_for_iteration(&messages, iteration);
         let phase_response = send_tool_phase_request_with_empty_retry(
             ToolPhaseRequest {
                 state: &state.turn_runtime(),
                 llm: channel_llm.as_ref(),
                 system_prompt: &system_prompt,
-                messages: Arc::clone(&messages),
+                messages: request_messages,
                 tools: Some(Arc::clone(&tool_defs)),
                 chat_id,
                 caller_channel: &context.channel,
@@ -353,6 +355,97 @@ mod tests {
             PulseOutputKind::Notify
         );
         assert_eq!(classify_output(""), PulseOutputKind::Silent);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn late_tool_loop_requests_final_response_at_hard_cap() {
+        // Arrange: keep the activation in the Tool phase until the shared
+        // warning boundary, then return a response after the shared guards.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut responses =
+            Vec::with_capacity(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2);
+        for iteration in 1..=(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1) {
+            responses.push(Ok(crate::llm::MessagesResponse {
+                content: format!("Checking result {iteration}"),
+                reasoning_content: None,
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: format!("pulse-ls-{iteration}"),
+                    name: "ls".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            }));
+        }
+        responses.push(Ok(crate::llm::MessagesResponse {
+            content: "The Pulse result is ready.".to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }));
+        let provider = crate::agent_loop::turn::RecordingProvider::new(
+            responses,
+            vec![0; crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2],
+        );
+        let observer = provider.clone();
+        let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        let state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let surface = HomeSurface {
+            chat_id: 1,
+            channel: "cli".to_string(),
+            external_chat_id: "late-pulse".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        // Act
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await
+        .expect("late Pulse tool loop should finalize");
+
+        // Assert: Pulse uses the same final-response guards as a normal Turn.
+        assert_eq!(result.output_text, "The Pulse result is ready.");
+        assert_eq!(result.output_kind, PulseOutputKind::Notify);
+        let seen_messages = observer.seen_messages();
+        let warning_message = seen_messages
+            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION - 1]
+            .last()
+            .expect("warning guard message");
+        assert!(
+            warning_message
+                .content
+                .as_text_lossy()
+                .contains(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_GUARD)
+        );
+        let final_guard_message = seen_messages
+            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1]
+            .last()
+            .expect("final guard message");
+        assert!(
+            final_guard_message
+                .content
+                .as_text_lossy()
+                .contains(crate::agent_loop::tool_phase::FINAL_RESPONSE_GUARD)
+        );
     }
 
     #[tokio::test]

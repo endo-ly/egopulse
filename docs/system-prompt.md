@@ -367,6 +367,8 @@ process_turn()         ──→  llm.send_message(&system_prompt, messages, Som
                          API body の "tools" フィールド
 ```
 
+通常 Turn と Pulse Activation は、tool loop の48回目に終了警告を追加し、49〜50回目は最終回答を優先する指示を追加する。
+
 **System prompt vs Tools の役割**:
 - **System prompt**: 「何が使えるか」を自然言語で説明
 - **Tools (JSON body)**: 「どう呼び出すか」を `name`, `description`, `parameters` (JSON Schema) で定義
